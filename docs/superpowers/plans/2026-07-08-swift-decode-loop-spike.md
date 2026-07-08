@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove (or disprove) that a Swift + mlx-swift decode loop, using fast-mlx's ported single-owner-actor design under Swift 6 strict concurrency, hits **within ~10–15% of the Zig engine's decode tok/s** on one MoE model on the M3 Ultra 256GB — the go/no-go gate for building the whole platform in Swift.
+**Goal:** Prove (or disprove) that a Swift + mlx-swift decode loop, using fast-mlx's ported single-owner-actor design under Swift 6 strict concurrency, hits **within ~10–15% of the Zig engine's decode tok/s** on one MoE model on the **M5 Max 128GB** bench box (`llmbench@192.168.1.252`) — the go/no-go gate for building the whole platform in Swift. Concrete target: **Qwen3-30B-A3B-Instruct-2507-4bit**, where the Zig engine measures **151.8 tok/s decode** on this box → **GO ≥ ~129 tok/s**, **wall ≤ ~76 tok/s**.
 
 **Architecture:** Reuse `mlx-swift-lm` only for model/arch/tokenizer *loading* (banking the 59-arch head-start); **replace its generation loop** (the code with the 7.3× MoE regression) with our own single-owner `InferenceActor` that submits work async and never blocks on a synchronous per-token GPU→CPU readback. Measure decode tok/s + TTFT with a stream-timed, warmup-dropped bench, verify token-equivalence vs Python `mlx-lm` at temp=0, and record a verdict against the gate.
 
-**Tech Stack:** Swift 6 (strict concurrency), SwiftPM, `ml-explore/mlx-swift`, `ml-explore/mlx-swift-lm`, `huggingface/swift-transformers` (tokenizer, transitive), Python `mlx-lm` (reference only), Xcode/Instruments (profiling). Target model: **Qwen3-30B-A3B-Instruct-2507 4-bit** (Tier A primary). Reference perf baseline: the Zig `mlx-serve` engine run on the same box.
+**Tech Stack:** Swift 6 (strict concurrency), SwiftPM, `ml-explore/mlx-swift`, `ml-explore/mlx-swift-lm`, `huggingface/swift-transformers` (tokenizer, transitive), Python `mlx-lm` (reference only), Xcode/Instruments (profiling). Target model: **Qwen3-30B-A3B-Instruct-2507 4-bit** (Tier A primary; already cached on the box). Reference perf baseline: the Zig `mlx-serve` engine's **151.8 tok/s decode** on the same M5 Max 128GB box (archived `bench-matrix-2026-07-06.csv`). **Execution is remote:** develop in this repo, deploy + run on `llmbench@192.168.1.252` over SSH (the session host is a 24GB monitoring M5 — too small to run the model).
 
 **This is a spike, not the engine.** Code here is throwaway-quality by intent — the deliverable is a *measured verdict*, not production code. But it is written test-first where correctness matters (token-equivalence, bench math) because those tests carry forward into the real engine.
 
@@ -14,12 +14,19 @@
 
 ---
 
-## Prerequisites (human, before Task 1)
+## Prerequisites (on the M5 Max 128GB bench box — `llmbench@192.168.1.252`)
 
-- On the **M3 Ultra 256GB** dev box (this is the reference hardware; a laptop invalidates the comparison).
-- Xcode 26+ / Swift 6.x toolchain installed (`swift --version` shows 6.x).
-- Python `mlx-lm` installed for the reference (`pip install mlx-lm`), and the Zig `mlx-serve` binary built `-Doptimize=ReleaseFast` and runnable (for the perf baseline).
-- Model present locally: `Qwen3-30B-A3B-Instruct-2507-4bit` (MLX format) in `~/.cache/huggingface` or a known path. If absent, `mlx_lm.convert` or download an MLX-community 4-bit build first.
+**Reference hardware = the M5 Max 128GB (`ssh llmbench@192.168.1.252`).** The Zig baseline was measured on this exact box, so the Swift spike must run here (the session host is a 24GB monitoring M5 — too small). Develop in this repo; deploy + run on llmbench over SSH.
+
+State verified 2026-07-08, and gaps to close first:
+- ✅ Apple M5 Max, 128GB, macOS 26.5.2; **Swift 6.3.3** present; `iogpu.wired_limit_mb=117760` (115GB) already set; 3.2TB free (ample for SSD-streaming experiments).
+- ✅ Target model **`Qwen3-30B-A3B-Instruct-2507-4bit`** already cached (`~/.cache/huggingface/hub`), plus Qwen3-32B 4/8-bit, Qwen3.6-27B, Llama-3.3-70B-4bit, Gemma-4 MoE, the EAGLE-3 speculator, dspark checkpoints.
+- ✅ Zig `mlx-serve` present as a **prebuilt binary at `~/mlx-serve-macos-arm64/mlx-serve`** (not a source build — no `bench.sh`/`zig-out`).
+- ❌ **BLOCKER — no full Xcode** (only CommandLineTools). mlx-swift's Metal shaders require `xcodebuild`; `swift build` alone cannot compile them. **Install Xcode 26+ before Task 1.**
+- ❌ **BLOCKER — Python `mlx-lm` not importable** (import failed). **`pip install mlx-lm` before Task 6** (equivalence reference).
+- ⚠️ **PRODUCTION IS LIVE** — `mlx-serve` is serving **Qwen3-32B-bf16 (~65GB) on port 11234** (caffeinated; the Concierge assistant). A Swift spike + Zig bench will contend for GPU/memory and **skew both the spike numbers and production latency**. Run the timed bench in a coordinated quiet window (or briefly stop the daemon) — never bench against a live load.
+
+**Baseline to beat (measured on THIS box, warm, median-of-4, 256-token decode):** `Qwen3-30B-A3B-Instruct-2507-4bit` → **decode 151.8 tok/s** (prefill 1987). Gate: Swift ≥ ~129 tok/s (−15%) = **GO**; ≤ ~76 tok/s (≥1.5× gap) = **wall**. A *fast* MoE (3.3B active) — the ideal stress test, since fast small-active-param decode is exactly where a sloppy host loop hurts most.
 
 ---
 
@@ -527,8 +534,13 @@ git commit -m "spike: stream-timed warmup-dropped decode bench (release-guarded)
 #!/usr/bin/env bash
 set -euo pipefail
 MODEL="$1"; PROMPT="${2:-Explain how continuous batching improves LLM serving throughput.}"
-echo "== Zig mlx-serve =="   # ReleaseFast binary; stream-timed decode tok/s
-ZIG=$( ~/Projects/mlx-serve/tests/bench.sh --family qwen36 2>/dev/null | rg -o 'decode[^0-9]*([0-9.]+)' | head -1 || echo "MANUAL" )
+echo "== Zig mlx-serve baseline =="
+# On llmbench the engine is the PREBUILT binary ~/mlx-serve-macos-arm64/mlx-serve (no source bench.sh).
+# Archived same-box baseline for this model is 151.8 tok/s decode (bench-matrix-2026-07-06.csv).
+# For a same-session number, in the quiet window boot the prebuilt binary on a spare port and
+# stream-time a matched 256-token decode (same prompt/temp as the Swift bench):
+#   ~/mlx-serve-macos-arm64/mlx-serve --model "$MODEL" --serve --port 11299 &   # then curl -N the SSE, time first->last
+ZIG=151.8   # replace with the same-session measurement if re-run
 echo "zig_decode_tok_s=$ZIG"
 echo "== Swift spike =="
 SWIFT=$( .build/release/spike-cli bench --model "$MODEL" --prompt "$PROMPT" --max-tokens 256 --runs 3 | rg -o '[0-9.]+' | tail -1 )
