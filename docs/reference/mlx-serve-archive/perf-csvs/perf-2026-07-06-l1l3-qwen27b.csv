@@ -1,0 +1,5 @@
+label,model,temp,spec,concurrency,prompt,prefill_tps,decode_tps,aggregate_tps,prompt_toks,completion_toks
+int-27b,Qwen3.6-27B-4bit,0.7,none,1,decode,353.44,33.71,33.71,31,128
+int-27b,Qwen3.6-27B-4bit,0.7,pld,1,echo,4991.46,80.05,80.05,311,128
+base-27b,Qwen3.6-27B-4bit,0.7,none,1,decode,349.25,33.25,33.25,31,128
+base-27b,Qwen3.6-27B-4bit,0.7,pld,1,echo,4931.11,77.35,77.35,311,128

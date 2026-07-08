@@ -1,0 +1,4 @@
+label,model,temp,spec,concurrency,prompt,prefill_tps,decode_tps,aggregate_tps,prompt_toks,completion_toks
+l1b-drafter,gemma-4-e2b-it-4bit,0.7,drafter,1,echo,23670.7,280.58,280.58,306,256
+integration-drafter,gemma-4-e2b-it-4bit,0.7,drafter,1,echo,23509.38,273.21,273.21,306,256
+l1b-pld,gemma-4-e2b-it-4bit,0.7,pld,1,echo,27316.04,593.91,593.91,306,260

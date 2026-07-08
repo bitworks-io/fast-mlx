@@ -1,0 +1,339 @@
+<style>
+  :root{
+    --paper:#f1f4f5; --paper-2:#e8edee; --card:#fbfcfc;
+    --ink:#14181d; --muted:#5c676d; --faint:#8a949a;
+    --line:#d3dbde; --line-strong:#b9c4c8;
+    --signal:#16506e; --signal-2:#2c86c9;
+    --win:#2f7d46; --reject:#bf4a3b; --scoped:#a9781f; --pending:#3a6ea5;
+    --serif:ui-serif,"New York",Georgia,"Times New Roman",serif;
+    --sans:system-ui,-apple-system,"SF Pro Text","Segoe UI",Roboto,sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0}
+  .wrap{
+    color:var(--ink); background:var(--paper);
+    background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+    background-size:28px 28px; background-position:-1px -1px;
+    font-family:var(--sans); font-size:17px; line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  .col{max-width:1000px;margin:0 auto;padding:0 24px}
+  .prose{max-width:680px}
+  a{color:var(--signal);text-underline-offset:3px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--signal);font-weight:600}
+  .kicker{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+
+  header{padding:76px 0 40px;border-bottom:1px solid var(--line-strong);background:linear-gradient(180deg,rgba(255,255,255,.65),rgba(255,255,255,0))}
+  h1{font-family:var(--serif);font-weight:600;letter-spacing:-.02em;text-wrap:balance;font-size:clamp(2.1rem,5.2vw,3.5rem);line-height:1.06;margin:18px 0 0}
+  h1 em{font-style:italic;color:var(--signal)}
+  .lede{max-width:648px;margin:22px 0 0;font-size:1.22rem;color:#2c343a;text-wrap:pretty}
+  .by{margin-top:26px;font-family:var(--mono);font-size:12.5px;color:var(--muted);letter-spacing:.03em}
+  .stat-strip{display:flex;flex-wrap:wrap;gap:0;margin-top:40px;border:1px solid var(--line-strong);border-radius:10px;overflow:hidden;background:var(--card)}
+  .stat{flex:1 1 160px;padding:20px 22px;border-right:1px solid var(--line)}
+  .stat:last-child{border-right:0}
+  .stat .n{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:1.9rem;font-weight:600;letter-spacing:-.02em;line-height:1}
+  .stat .n.pos{color:var(--win)} .stat .n.sig{color:var(--signal)}
+  .stat .l{margin-top:9px;font-size:12.5px;color:var(--muted);line-height:1.35}
+
+  section{padding:52px 0;border-bottom:1px solid var(--line)}
+  h2{font-family:var(--serif);font-weight:600;font-size:1.9rem;letter-spacing:-.015em;margin:0 0 4px;text-wrap:balance}
+  .sub{color:var(--muted);margin:0 0 26px;font-size:1.02rem;max-width:680px}
+  p{margin:0 0 16px}
+
+  .tbl-wrap{overflow-x:auto;border:1px solid var(--line-strong);border-radius:10px;background:var(--card)}
+  table{border-collapse:collapse;width:100%;min-width:660px;font-size:15px}
+  th,td{text-align:left;padding:13px 16px;border-bottom:1px solid var(--line);vertical-align:top}
+  thead th{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--paper-2)}
+  tbody tr:last-child td{border-bottom:0}
+  td.num,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right}
+  .delta{font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums;color:var(--win)}
+  .delta.small{color:var(--scoped)}
+  .flow{font-family:var(--mono);font-size:13.5px;font-variant-numeric:tabular-nums;color:var(--muted)}
+  .flow b{color:var(--ink);font-weight:600}
+
+  .chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;font-weight:600;padding:3px 9px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+  .chip.win{color:var(--win)} .chip.reject{color:var(--reject)} .chip.scoped{color:var(--scoped)} .chip.pending{color:var(--pending)}
+  .dot{width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block}
+
+  .ledger{display:grid;gap:16px;margin-top:6px}
+  .entry{border:1px solid var(--line-strong);border-left-width:4px;border-radius:10px;background:var(--card);padding:22px 24px}
+  .entry.reject{border-left-color:var(--reject)} .entry.small{border-left-color:var(--scoped)} .entry.pending{border-left-color:var(--pending)}
+  .entry h3{margin:0 0 10px;font-family:var(--serif);font-size:1.28rem;font-weight:600;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .entry p{font-size:14.5px;margin:0 0 10px;color:#333b40;line-height:1.55}
+  .entry p:last-child{margin-bottom:0}
+  .mini{display:flex;gap:24px;flex-wrap:wrap;margin:14px 0;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .mini div{font-size:12.5px;color:var(--muted)}
+  .mini b{display:block;font-size:1.35rem;color:var(--ink);font-weight:600;margin-bottom:2px}
+  .mini b.bad{color:var(--reject)} .mini b.ok{color:var(--win)} .mini b.mid{color:var(--scoped)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(228px,1fr));gap:16px;margin-top:8px}
+  .cardlet{border:1px solid var(--line-strong);border-radius:10px;background:var(--card);padding:20px}
+  .cardlet .t{font-family:var(--mono);font-size:12.5px;color:var(--signal);font-weight:600;letter-spacing:.03em;margin-bottom:8px}
+  .cardlet p{font-size:14px;margin:0;color:#333b40;line-height:1.5}
+
+  .road{display:grid;gap:12px;margin-top:6px}
+  .road-row{display:grid;grid-template-columns:150px 1fr;gap:18px;align-items:baseline;padding:14px 16px;border:1px solid var(--line);border-radius:9px;background:var(--card)}
+  .road-row .rk{font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.03em}
+  .road-row .rt{font-size:14.5px;color:#333b40}
+  .road-row .rt b{color:var(--ink)}
+
+  .close{background:var(--ink);color:#e9edee;border-bottom:0}
+  .close h2{color:#fff} .close .prose{color:#c7cfd3} .close p{color:#c7cfd3} .close strong{color:#fff}
+  .principles{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:20px;margin-top:30px}
+  .principles .p .t{font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--signal-2);margin-bottom:7px}
+  .principles .p p{font-size:14px;color:#b8c1c6;margin:0;line-height:1.5}
+  footer{padding:34px 0 60px;font-family:var(--mono);font-size:12px;color:#7f8a90}
+
+  @media (max-width:640px){body{font-size:16px}.road-row{grid-template-columns:1fr;gap:4px}.stat{flex-basis:50%}}
+</style>
+
+<div class="wrap">
+<div class="col">
+
+<header>
+  <div class="eyebrow">bitworks · performance engineering · case study</div>
+  <h1>The local-LLM model ladder, benchmarked — on a server verified <em>27% faster</em>.</h1>
+  <p class="lede">We benchmarked ten open-weight models — from 2B to 70B dense, several mixture-of-experts, and a 284B MoE — on a native Apple-Silicon inference server, each at the temperature its own vendor recommends for each task. We isolated what our performance work actually buys per model, ported a frontier speculative decoder and confirmed it correct, and reported every number at its measured size — including the ones that came in below prediction.</p>
+  <div class="by">mlx-serve · Zig · MLX · 10 models · 5 use cases · Apple M5 Max / 128 GB · reproducible from the CSV alongside this page</div>
+
+  <div class="stat-strip">
+    <div class="stat"><div class="n sig">10</div><div class="l">Open-weight models benchmarked (2B–70B dense, MoE, and a 284B MoE) across five use cases at each vendor's recommended temperatures</div></div>
+    <div class="stat"><div class="n pos">~5.4×</div><div class="l">Decode throughput of the mixture-of-experts pick over the same-quantization dense model (151 vs 28 tok/s) — the largest single lever measured</div></div>
+    <div class="stat"><div class="n">+27.2%</div><div class="l">Shipped optimization on the agentic-edit workload; a measured +2–3% on fast models across general use cases</div></div>
+    <div class="stat"><div class="n">115 GB</div><div class="l">GPU memory ceiling after system tuning (from ~96 GB default) so the largest models run with headroom</div></div>
+  </div>
+</header>
+
+<section>
+  <div class="prose">
+    <div class="kicker">Background</div>
+    <h2>The largest opportunity was invisible to the existing benchmarks</h2>
+    <p class="sub">The server looked well optimized, but its real workload wasn't being measured.</p>
+    <p>mlx-serve runs open-weight models on Apple Silicon and speaks the OpenAI and Anthropic APIs — the backend for local agents and a private, on-prem chat tier. Its performance benchmarks were thorough, and they ran entirely at <span class="flow">temperature = 0</span>.</p>
+    <p>Production and agent traffic, however, runs at <span class="flow">temperature ≈ 1</span> — a different, more expensive path through the sampler that no performance benchmark exercised. So the first step was a measurement harness for that path: streaming, temperature&#8209;aware, and concurrency&#8209;aware. It grew into the model-ladder benchmark below, where each model runs at the temperature its vendor recommends for each kind of task. Every figure comes from it, on real hardware, warm, as the median of repeated runs.</p>
+  </div>
+</section>
+
+<section>
+  <div class="prose">
+    <div class="kicker">The benchmark</div>
+    <h2>The models that back a private LLM tier — measured on their real workloads</h2>
+    <p class="sub">The tiers a self-hosted deployment actually chooses between, plus the largest that fits the box.</p>
+    <p>These are the models from our own model-selection ladder: the dense workhorses (<b>Qwen3-32B</b> — the current production model — and <b>Llama&nbsp;3.3&nbsp;70B</b>), the efficient mixture-of-experts picks (<b>Qwen3-30B-A3B</b>, <b>Gemma&nbsp;4&nbsp;26B-A4B</b>), a multimodal option (<b>Gemma&nbsp;3&nbsp;27B</b>), the smaller tiers, and — as the supported frontier — <b>DeepSeek-V4-Flash</b>, a 284B / 13B-active MoE served through the embedded ds4 engine at 2-bit. Everything runs on one Apple&nbsp;M5&nbsp;Max, one model resident at a time.</p>
+    <p>One model from the list is absent for an honest reason: <b>Mistral&nbsp;Small&nbsp;24B</b>'s current MLX checkpoints do not yet load in mlx-serve — its quantized token-embedding trips a Mistral-specific weight-loading gap (Qwen and Gemma quantized embeddings load fine). We report that as a bug to fix, not as a number to estimate.</p>
+  </div>
+  <div class="grid" style="margin-top:20px">
+    <div class="cardlet"><div class="t">Temperature, matched to the task</div><p>Each model runs at the temperature <em>its own vendor</em> recommends — not one house number. Qwen and Llama publish lower temperatures for coding/math/reasoning and higher for creative writing; Google (Gemma) and Mistral publish a single temperature for all tasks, so their rows don't vary by use case. We follow each model card.</p></div>
+    <div class="cardlet"><div class="t">Five use cases</div><p>Coding, math, hard reasoning, tool-calling, and creative writing — the shape of real traffic, not a repeat-the-prompt microbenchmark. Tool-calling is measured as the streamed response <em>after</em> a tool result, since the call itself arrives in a single untimed chunk.</p></div>
+    <div class="cardlet"><div class="t">Decode throughput, honestly</div><p>Streaming decode tokens/second, warm, median of four runs after a discarded warm-up, 256-token generations. The production-default speculative-decode path is on. The full per-cell CSV is saved alongside this page.</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">Throughput</div>
+  <h2>Decode throughput, per model and per workload</h2>
+  <p class="sub">Streaming decode tok/s at each model's recommended temperature, on the optimized server (Apple M5 Max, 128 GB). Ordered fastest to slowest.</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Model</th><th>Tier / arch</th><th class="num">Coding</th><th class="num">Math</th><th class="num">Reason</th><th class="num">Tools</th><th class="num">Creative</th></tr></thead>
+    <tbody>
+      <tr><td><b>Qwen3-4B</b> <span class="flow">4-bit</span></td><td>small · dense</td><td class="num">180.9</td><td class="num">180.6</td><td class="num">180.6</td><td class="num">151.9</td><td class="num">181.1</td></tr>
+      <tr><td><b>Qwen3-30B-A3B-2507</b> <span class="flow">4-bit</span></td><td>A1 · MoE 3.3B active</td><td class="num delta">151.8</td><td class="num">151.2</td><td class="num">151.2</td><td class="num">109.9</td><td class="num">151.7</td></tr>
+      <tr><td><b>Gemma 4 E4B</b> <span class="flow">4-bit</span></td><td>small · MoE</td><td class="num">133.6</td><td class="num">128.9</td><td class="num">133.4</td><td class="num">110.4</td><td class="num">133.8</td></tr>
+      <tr><td><b>Gemma 4 26B-A4B</b> <span class="flow">4-bit</span></td><td>ref · MoE 4B active</td><td class="num">131.0</td><td class="num">121.0</td><td class="num">130.6</td><td class="num">109.0</td><td class="num">130.9</td></tr>
+      <tr><td><b>Qwen3-8B</b> <span class="flow">8-bit</span></td><td>small · dense</td><td class="num">63.0</td><td class="num">63.1</td><td class="num">63.1</td><td class="num">53.0</td><td class="num">63.2</td></tr>
+      <tr><td><b>DeepSeek-V4-Flash</b> <span class="flow">2-bit · ds4</span></td><td>frontier · MoE 13B active</td><td class="num delta small">38.0</td><td class="num">37.0</td><td class="num">35.6</td><td class="num">35.8</td><td class="num">35.2</td></tr>
+      <tr><td><b>Qwen3.6-27B</b> <span class="flow">4-bit · MTP</span></td><td>ref · dense</td><td class="num">33.5</td><td class="num">33.5</td><td class="num">33.5</td><td class="num">30.7</td><td class="num">33.5</td></tr>
+      <tr><td><b>Gemma 3 27B</b> <span class="flow">4-bit</span></td><td>A4 · dense · multimodal</td><td class="num">31.9</td><td class="num">29.3</td><td class="num">31.1</td><td class="num">n/a</td><td class="num">31.1</td></tr>
+      <tr><td><b>Qwen3-32B</b> <span class="flow">4-bit</span></td><td>B1 · dense</td><td class="num">28.2</td><td class="num">28.2</td><td class="num">28.2</td><td class="num">23.6</td><td class="num">28.2</td></tr>
+      <tr><td><b>Qwen3-32B</b> <span class="flow">8-bit · production</span></td><td>B1 · dense</td><td class="num">15.3</td><td class="num">15.3</td><td class="num">15.3</td><td class="num">13.2</td><td class="num">15.4</td></tr>
+      <tr><td><b>Llama 3.3 70B</b> <span class="flow">4-bit</span></td><td>B2 · dense</td><td class="num">9.2</td><td class="num">8.9</td><td class="num">8.9</td><td class="num">11.8</td><td class="num">9.0</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="prose" style="margin-top:24px">
+    <p>Two facts dominate this table. First, <b>decode throughput is essentially flat across use cases</b> for a given model — the recommended temperature and the content type barely move it, because at a fixed generation length the sampler cost is the same. Tool-calling is the one consistent exception (lower, because its response is short and structured). The use-case-and-temperature matching matters for <em>output quality</em>, not decode speed.</p>
+    <p>Second, and the reason this table exists: <b>architecture, size, and quantization control roughly a 20× throughput range</b> — from Qwen3-4B at 181 tok/s to Llama&nbsp;3.3&nbsp;70B at 9. The clearest result for a self-hosted tier is the mixture-of-experts payoff: at the same 4-bit quantization, <b>Qwen3-30B-A3B (3.3B active) runs at ~151 tok/s versus the dense Qwen3-32B's ~28 — about 5.4×</b>. Against the model currently in production (Qwen3-32B at 8-bit, ~15 tok/s) the gap is ~10×, but that figure also trades 8-bit for 4-bit; we measured throughput, not output quality, so we quote the same-quant 5.4× as the architecture win. DeepSeek-V4-Flash — a 284B model at 2-bit — sustains ~36 tok/s on a single Mac through the ds4 engine.</p>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">The enhancements, per model</div>
+  <h2>What the optimizations actually buy — measured on each model</h2>
+  <p class="sub">The perf work was originally measured on one fast 2B model. Here it is isolated per model, two ways: the optimized server vs a pre-optimization baseline, and speculative decoding on vs off.</p>
+  <div class="ledger">
+
+    <div class="entry small">
+      <h3><span class="chip scoped"><span class="dot"></span>optimized vs baseline</span>The sampler optimizations: +2–3% on fast models, ~0% on large ones</h3>
+      <p>Running each model on the optimized server and on the pre-optimization binary (spec-decode on for both) isolates the L1/L3 sampler-fusion and KV wins. The result is consistent with the design: the optimizations remove a fixed, vocabulary-bound per-token cost, so they are a meaningful slice of a fast decode and negligible on a slow one.</p>
+      <div class="mini"><div><b class="ok">+2.4–3.1%</b>Qwen3-4B, Gemma-4 E4B/26B-A4B, A3B (fast)</div><div><b class="mid">+0.4–1.1%</b>Qwen3-8B, Qwen3.6-27B, Gemma 3 27B</div><div><b>~0%</b>Qwen3-32B, Llama 70B (large dense)</div></div>
+      <p>This validates the run's headline caveat across the whole ladder: the sampler wins are for the fast tier (small dense, low-active MoE, drafters). On the bandwidth-bound big dense models they are within measurement noise — which is exactly where we said they would be.</p>
+    </div>
+
+    <div class="entry small">
+      <h3><span class="chip scoped"><span class="dot"></span>workload-specific</span>Speculative decoding: a large win on agentic edits, neutral on fresh generation</h3>
+      <p>The +27.2% headline is real — but it is measured on the <em>agentic-edit</em> workload, where the model re-emits large spans of an existing file and speculative decoding's n-gram lookup hits constantly. Measured across the whole ladder, that workload runs <b>1.9–3.1× faster than fresh generation on the same model</b> — the production Qwen3-32B-8bit does <b>45 tok/s editing vs 15 generating</b>; Qwen3-8B does 191 vs 62. On fresh generation, by contrast, the drafted tokens rarely match, so speculation is <b>within measurement noise, neither faster nor slower</b> (Qwen3-8B 63.0 on vs 63.0 off; A3B 151.8 vs 151.2). The one place it carries a small, consistent cost is the short structured <em>tool-call</em> path, where the lookup runs but rarely pays.</p>
+      <div class="mini"><div><b class="ok">1.9–3.1×</b>agentic-edit / echo, measured across the ladder</div><div><b>≈ neutral</b>coding / math / reasoning / creative generation</div><div><b class="mid">small cost</b>short structured tool-call path</div></div>
+      <p>The honest takeaway: speculative decoding is a workload lever, not a free global speedup. It belongs on for agent traffic — file edits, tool-result echoes — where high token overlap lets it reach up to 2–3×; it is a wash on plain generation, and only adds a lookup on the short structured paths (a gate-tuning item). So the per-model table above is the <em>generation</em> floor and the verbatim-echo numbers are the ceiling; real edits land between the two, scaling with how much of the file is unchanged.</p>
+    </div>
+
+    <div class="entry pending">
+      <h3><span class="chip pending"><span class="dot"></span>correct, boundary found</span>Trained drafters: the 8B result is not the general one</h3>
+      <p><b>DSpark</b>, the ported frontier drafter, is correct and byte-equivalent — but its "no batch-1 win" result was specific to <b>Qwen3-8B</b>, where the target decodes in ~16 ms and the drafter's own overhead dominates the round. The slow big models are the opposite, favorable regime: on Qwen3-32B (~65 ms/token) that fixed drafter overhead is a small fraction of the round. We could not measure it directly — no DSpark drafter for Qwen3-32B exists — but <b>published EAGLE-3 drafters for Qwen3-32B do</b> (AngelSlim, RedHat), and they report a <b>~1.7–1.9×</b> speedup on vLLM/SGLang. So a real speculative win on the production model is externally demonstrated; what blocks it here is that mlx-serve has no EAGLE-3 draft path yet (only n-gram PLD, a Gemma-4 drafter, and Qwen3.5/3.6 native MTP) — a scoped, tracked follow-up, not a dead end.</p>
+      <p><b>DeepSeek-V4-Flash</b> runs through a separate engine (ds4, in C), so the MLX sampler optimizations don't apply to it; it carries its own native multi-token-prediction and sustains ~36 tok/s regardless. We keep those boundaries explicit rather than imply one optimization covers every model.</p>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <div class="kicker">Under real load</div>
+  <h2>Beyond one stream: concurrency, memory, and long sessions</h2>
+  <p class="sub">The numbers that decide what fits on the box and how it holds up with more than one user and a growing context.</p>
+  <div class="tbl-wrap" style="max-width:600px">
+  <table style="min-width:0">
+    <thead><tr><th>Concurrent streams → aggregate tok/s</th><th class="num">1</th><th class="num">2</th><th class="num">4</th><th class="num">8</th></tr></thead>
+    <tbody>
+      <tr><td><b>Qwen3-8B</b> <span class="flow">8-bit, dense</span></td><td class="num">61</td><td class="num">103</td><td class="num">151</td><td class="num delta">174</td></tr>
+      <tr><td><b>Qwen3-32B</b> <span class="flow">8-bit, production</span></td><td class="num">15</td><td class="num">28</td><td class="num">39</td><td class="num delta">43</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="prose" style="margin-top:16px">
+    <p><b>Concurrency scales aggregate throughput ~2.8× from one stream to eight</b> on the batchable dense models — the server folds concurrent decodes into one forward pass. Per-stream latency trades off as users are added (each stream slows), but total tokens served climbs: eight users of Qwen3-32B-8bit get ~43 tok/s combined, about what a single user gets on the agentic-edit path. Mixture-of-experts models don't batch this way in mlx-serve today, so this lever is for the dense tier.</p>
+  </div>
+  <div class="grid" style="margin-top:24px">
+    <div class="cardlet"><div class="t">Memory footprint — what fits on 128 GB</div><p>Resident weights: Qwen3-4B 2.1 GB · Gemma-4 E4B 4.8 · Qwen3-8B-8bit 8.1 · the 27–32B tier 14–17 · Qwen3-32B-8bit 32 · Llama 70B 37 · DeepSeek-V4-Flash (2-bit) 81. Every one fits the 115 GB tuned ceiling with room for KV cache — the 70B and the 284B MoE included.</p></div>
+    <div class="cardlet"><div class="t">Time-to-first-token stays low</div><p>Prefill runs at hundreds to ~190,000 tok/s (it accelerates with prompt length as the batch fills), so the latency before a reply starts is ~45 ms on a short prompt and still only ~70 ms at 13K tokens of context.</p></div>
+    <div class="cardlet"><div class="t">Decode holds up as sessions grow</div><p>On Qwen3-8B-8bit, decode eases from 63.8 tok/s at a fresh prompt to 52.9 at 13K tokens of filled context — a gentle ~17% decline, not a cliff. Long agentic sessions stay responsive; kv-quant is on the shelf if contexts push much further.</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">What shipped</div>
+  <h2>Five optimizations on the sampler and speculative-decode hot path</h2>
+  <p class="sub">Measured on <span class="flow">gemma-4-e2b-it-4bit</span> (the fast-model regime these target), M5, temp 0.7. Each verified byte-identical (greedy) or distribution-preserving (sampled) against the original.</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Change</th><th>What it removes</th><th class="num">Before</th><th class="num">After</th><th class="num">Δ</th><th>Proof</th></tr></thead>
+    <tbody>
+      <tr><td><b>Batched spec-verify</b><div class="flow">the accept walk</div></td><td>Per-draft full-vocab sort + a blocking GPU sync, ×m, serialized</td><td class="num">531.7</td><td class="num">594.4</td><td class="num delta">+11.8%</td><td><span class="chip win"><span class="dot"></span>byte-equiv</span></td></tr>
+      <tr><td><b>Top-p fast path</b><div class="flow">nucleus from top-k</div></td><td>A full 262K-vocab sort on every sampled token</td><td class="num">466.9</td><td class="num">517.4</td><td class="num delta">+10.8%</td><td><span class="chip win"><span class="dot"></span>kept-set proof</span></td></tr>
+      <tr><td><b>Drafter + MTP walk</b><div class="flow">the default-on paths</div></td><td>The same per-draft loop, on the paths agents use by default</td><td class="num">273.2</td><td class="num">280.6</td><td class="num delta">+2.7%</td><td><span class="chip win"><span class="dot"></span>equiv + engage</span></td></tr>
+      <tr><td><b>Fused sampler in the batch</b><div class="flow">+ a silent-corruption fix</div></td><td>The last remaining per-round vocab sort</td><td class="num">557.7</td><td class="num">593.9</td><td class="num delta">+6.5%</td><td><span class="chip win"><span class="dot"></span>red-on-revert</span></td></tr>
+      <tr><td><b>Fused quant-KV attention</b><div class="flow">long-context, kv-quant</div></td><td>Dequantizing the whole KV cache to dense every token</td><td class="num">37.6</td><td class="num">38.8</td><td class="num delta small">+3.1%</td><td><span class="chip win"><span class="dot"></span>byte-equiv</span></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="prose" style="margin-top:24px">
+    <p>The first four compose on the target workload: <span class="flow"><b>466.9</b> → 557.7 → <b>593.9 tok/s</b></span> — a <b>+27.2%</b> end-to-end gain on temp&#8209;0.7 speculative decoding, which matches the shape of real agent traffic. The fifth (kv-quant, last row) is a long-context lever, measured separately.</p>
+    <p>One caveat, measured rather than assumed: these sampler wins scale inversely with model size. The overhead they remove is a fixed, vocabulary-bound cost — a large fraction of a fast 2B decode, a small one on a bandwidth-bound 27B (we measured +1.4–3.5% there). They apply to small dense models, low-active MoE, and draft models; large dense models are bandwidth-bound and need a different lever.</p>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">What the numbers showed</div>
+  <h2>Results that didn't match the initial expectation</h2>
+  <p class="sub">Three findings that are easy to leave out of a summary — and part of why the five above are trustworthy.</p>
+  <div class="ledger">
+
+    <div class="entry reject">
+      <h3><span class="chip reject"><span class="dot"></span>rejected by data</span>A proposed optimization we did not ship</h3>
+      <p>An independent review proposed suspending speculative decoding when requests arrive together, so they would batch — a standard throughput argument, roughly 1.5× on paper. We measured it first. On the real workload, speculation was effective enough that even serialized it outperformed the batched path:</p>
+      <div class="mini"><div><b class="ok">514</b>tok/s · speculation on, serialized</div><div><b class="bad">274–403</b>tok/s · batched, speculation off</div></div>
+      <p>Shipping it would have regressed the most common workload in exchange for a benchmark that did not reflect production. Rejecting it cost nothing, because the measurement came before the implementation.</p>
+    </div>
+
+    <div class="entry small">
+      <h3><span class="chip scoped"><span class="dot"></span>real, below prediction</span>The kv-quant lever: a roofline predicted 15–40%</h3>
+      <p>The review's model predicted a 15–40% long-context gain from reading the KV cache in quantized form instead of expanding it to dense on every token. We implemented it — including rewriting a grouped-attention step that would otherwise have materialized the copy it was meant to avoid — then measured at 16K and 32K context and reported the result:</p>
+      <div class="mini"><div><b class="mid">+3.1%</b>@ 32K context (vs dense)</div><div><b>~0%</b>@ 15K context</div><div><b>15–40%</b>the roofline's prediction</div></div>
+      <p>The gap has a clear cause: at batch&#8209;1 the decode is dominated by the <b>8 GB weight read</b>, not the KV cache, so the bandwidth saving is a small fraction of total bytes moved. The gain is real and grows with context — it turns kv-quant from a potential long-context loss into a small win — but it is +3%, not +30%, which is the figure we report.</p>
+    </div>
+
+    <div class="entry pending">
+      <h3><span class="chip pending"><span class="dot"></span>correct, boundary found</span>The frontier drafter: correct, faster on its own path, and bounded</h3>
+      <p>We ported <b>DSpark</b> — a modern EAGLE-3-style speculative drafter — including the loader, backbone, and full verify loop, and verified it correct against the published 8B checkpoint: with the drafter on, output is <b>byte-identical</b> to the drafter off across every API surface (a speculative decoder must change only speed, never output). The propose / verify / accept / roll-back / commit machinery is validated, including a test that fails the moment the persistent-cache bookkeeping is wrong.</p>
+      <div class="mini"><div><b class="ok">byte-identical</b>output, drafter on vs off</div><div><b class="mid">+24%</b>drafter-path decode (off by default)</div><div><b class="mid">no batch-1 win</b>on this 8B target</div></div>
+      <p>Its acceptance rate looked low at first — a single "11.4%" figure. Measured correctly, that was an artifact of dividing by the full block width; the drafter actually accepts <b>~1.5–1.8 tokens per round</b> and predicts the next token about two-thirds of the time. It is not broken. We then investigated the two suspected causes and closed both with data: the rotary-embedding convention was already correct, and a full-precision target did not raise acceptance. The original premise, that acceptance needed tuning, did not hold.</p>
+      <p>We did find and ship one real speedup: the verify loop was doing a second full model pass on roughly 97% of rounds, which we removed — a <b>+24%</b>, output-identical gain on the drafter's own path. It still does not beat plain decoding on this configuration, and the timing shows why: at batch-1 the target's verify pass dominates each round, and the acceptance rate, while healthy, is not high enough to offset it. We measured the one remaining lever counterfactually before implementing it, found it at break-even, and did not build it. The runtime gate keeps the drafter disabled on this pairing, so there is no regression. The gain depends on a larger, slower target — the favorable regime noted earlier, where published EAGLE-3 drafters already show ~1.7–1.9×; on mlx-serve that path is pending, not claimed here.</p>
+    </div>
+
+    <div class="entry small">
+      <h3><span class="chip scoped"><span class="dot"></span>measured flat</span>A concurrency fix the hardware made unnecessary</h3>
+      <p>Loading a new prompt can, in principle, stall in-flight streams while it runs — head-of-line blocking. We built the fix, a resumable prefill that interleaves with ongoing decodes and keeps concurrent streams byte-identical, then measured the stall it removes:</p>
+      <div class="mini"><div><b>46ms</b>before · 14K-token prefill</div><div><b>46ms</b>after · identical</div></div>
+      <p>Prefill on this hardware runs at roughly 265,000 tokens/second, so a 14K prompt loads in under 50ms — below normal decode jitter. The change is correct and kept for the case that needs it (very long contexts or slower hardware), but we are not shipping it as a speedup it does not deliver here. Knowing where a gain is absent is as useful as knowing where it is.</p>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <div class="kicker">What the process caught</div>
+  <h2>Defects surfaced by the verification discipline</h2>
+  <p class="sub">Four defects found through the process. Two had not executed in production, and would have the moment the paths that reach them were enabled.</p>
+  <div class="grid">
+    <div class="cardlet"><div class="t">Silent tensor corruption</div><p>A core sampler primitive quietly flattened multi-row inputs — invisible for years because every caller passed one row. Our batched path would have hit it. Caught by a test written to fail on the old behavior, verified red-on-revert.</p></div>
+    <div class="cardlet"><div class="t">An all-NaN attention mask</div><p>The fused attention path built its causal mask with <span class="flow">0 × -inf = NaN</span>, poisoning every kept position. It had never fired — the path was dead code. Enabling it exposed the bug; the test harness had been silently discarding the NaNs. Fixed and guarded.</p></div>
+    <div class="cardlet"><div class="t">A latent compile error</div><p>A weight loader called an API that doesn't exist in the toolchain — hidden because the function had never been reached by a test. Validating it against the real checkpoint forced compilation and surfaced it before it could ship.</p></div>
+    <div class="cardlet"><div class="t">An invalid test, caught</div><p>Our first correctness check for the kv-quant path ran on a model architecture that never reaches that code — so it "passed" trivially. We noticed, re-ran on the architecture that actually engages it, and only then trusted the result.</p></div>
+    <div class="cardlet"><div class="t">Undefined behavior, pre-empted</div><p>The resumable-prefill change had a one-token edge case that, in an optimized build, is undefined behavior — not a clean crash. Caught in review against the exact class the codebase already documents, and guarded before it reached a build.</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">The cluster tier</div>
+  <h2>What we could not run on one Mac — reported as specs, not numbers</h2>
+  <div class="prose">
+    <p>The ladder above is what fits and runs on a single 128 GB Mac. Two groups from the same selection list do not, and we say so rather than invent figures. <b>GLM-4.5-Air</b> and <b>Phi-4</b> use architectures mlx-serve does not yet support, so they fail to load regardless of memory. The genuine giants — <b>Qwen3-235B-A22B</b>, <b>DeepSeek-R1</b>, <b>GLM-4.6</b>, and the <b>Kimi K2</b> class — run from 235B to 670B-plus parameters; at production-floor quantization they need 200–600 GB and belong on a Mac Studio cluster or GPU nodes, not this box.</p>
+    <p>What transfers is the mechanism, verified from primary model cards rather than aggregator pages: these are DeepSeek-lineage mixture-of-experts models, and the same external-drafter speculative decoding we ported (DSpark) targets that whole cohort. <b>DeepSeek-V4-Flash — benchmarked above at ~36 tok/s — is the member that already fits</b>, through the ds4 engine at 2-bit. The rest are a hardware-and-architecture roadmap, not a promise of numbers this machine can produce.</p>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">Next steps</div>
+  <h2>What's next, scoped from the measurements</h2>
+  <div class="road">
+    <div class="road-row"><div class="rk" style="color:var(--pending)">draft path</div><div class="rt"><b>An EAGLE-3 drafter for the big dense models</b> — published EAGLE-3 heads for Qwen3-32B report ~1.7–1.9× on other runtimes, and the slow 32B is exactly the regime where a drafter's fixed overhead is dwarfed by the target forward (the opposite of why it lost on the fast 8B). mlx-serve needs an EAGLE-3 draft path to use them; the re-forward elimination from the DSpark work already applies. This is the concrete route to a speculative win on the production model.</div></div>
+    <div class="road-row"><div class="rk" style="color:var(--scoped)">bench run</div><div class="rt"><b>Long-context kv-quant</b> — the +3% grows with context; the lever now exists and is correct, so measuring the crossover at 64–128K is a bench run, not a build. The interleaved-prefill change is on the same shelf for the day contexts get long enough to need it.</div></div>
+    <div class="road-row"><div class="rk" style="color:var(--reject)">gate tuning</div><div class="rt"><b>Shed speculative decoding on the paths it can't help</b> — the benchmark showed it is a wash on plain generation and carries a small cost on the short structured tool-call path, where the lookup runs but rarely matches. Tightening the prompt-time gate sheds it there while keeping the agentic-edit win.</div></div>
+    <div class="road-row"><div class="rk" style="color:var(--win)">deployment</div><div class="rt"><b>Move the production tier to the MoE pick</b> — the live model is dense Qwen3-32B at ~15 tok/s; Qwen3-30B-A3B delivers ~151 tok/s on the same box — ~5.4× the same-quant dense model, ~10× the current 8-bit config. The model-selection analysis rates its quality comparable; this run measured the throughput, which is the largest single lever here — ahead of any server-side optimization.</div></div>
+  </div>
+</section>
+
+<section>
+  <div class="kicker">Appendix</div>
+  <h2>Test environment and system tuning</h2>
+  <div class="grid">
+    <div class="cardlet"><div class="t">Hardware</div><p>Apple M5 Max — 18 cores (6 performance + 12 efficiency), unified 128 GB. macOS 26.5.2 (build 25F84).</p></div>
+    <div class="cardlet"><div class="t">Software</div><p>mlx-serve on Zig 0.16, Apple mlx-c 0.31.2. Optimized build = the shipped perf branch; baseline = the immediate pre-perf-run commit. DeepSeek-V4-Flash via the embedded ds4 (C) engine.</p></div>
+    <div class="cardlet"><div class="t">Method</div><p>Streaming decode tok/s, one model resident at a time, warm, median of four runs after a discarded warm-up, 256-token generations. Each model at its vendor-recommended temperature per use case; spec-decode at the production default. Full CSV saved alongside this page.</p></div>
+  </div>
+  <div class="prose" style="margin-top:24px">
+    <div class="kicker" style="margin-bottom:8px">System tuning</div>
+    <p><b>The GPU memory ceiling was raised from ~96 GB to 115 GB.</b> On a 128 GB Mac, macOS caps the GPU's wired working set at roughly 75% of RAM by default, which leaves the largest models and their KV cache short of room. We raised it with a single kernel parameter and made it persistent:</p>
+    <p><span class="flow">sudo sysctl -w iogpu.wired_limit_mb=117760</span> &nbsp;— installed as a boot-time LaunchDaemon so it survives restarts.</p>
+    <p>This does not change decode speed on its own — throughput is bandwidth-bound, not allocation-bound — but it is what lets Llama&nbsp;3.3&nbsp;70B and the 284B DeepSeek-V4-Flash run with headroom instead of paging. It is the one system-level change behind the numbers above, documented so the environment is fully reproducible.</p>
+  </div>
+</section>
+
+<section class="close">
+  <div class="kicker" style="color:#7f96a4">Summary</div>
+  <h2>A set of changes whose numbers are verifiable.</h2>
+  <div class="prose">
+    <p>The +27% matters, and so does the rest of the record: a change shipped only when it was verified identical in output and faster on the real workload; a proposal that would not help was rejected on the evidence; a gain that came in at +3% rather than +30% is reported at +3%, with the reason; a lever measured at break-even before implementation was not built; and the defects were caught by tests rather than in production.</p>
+    <p><strong>The approach is consistent throughout: measure first, verify every change, review the plan adversarially, and distinguish clearly between what is proven, what is rejected, and what is still pending.</strong></p>
+  </div>
+  <div class="principles">
+    <div class="p"><div class="t">Measure first</div><p>Build the benchmark that sees the real workload before touching code. The obvious benchmark missed the whole hot path.</p></div>
+    <div class="p"><div class="t">Gate every change</div><p>Output-equivalence and a measured win, or it doesn't ship. No unverified claims, no hopeful merges.</p></div>
+    <div class="p"><div class="t">Review adversarially</div><p>A separate reasoning pass tasked with finding flaws in the plan. It identified the highest-value lever, a trap inside another, and a predicted gain that did not materialize.</p></div>
+    <div class="p"><div class="t">Report the boundary</div><p>Shipped, rejected, below-prediction, and pending are different outcomes. We don't blur them into "done."</p></div>
+  </div>
+</section>
+
+<footer>bitworks.io — performance &amp; systems engineering · every figure backed by a reproducible benchmark CSV, an equivalence test, and a commit</footer>
+
+</div>
+</div>

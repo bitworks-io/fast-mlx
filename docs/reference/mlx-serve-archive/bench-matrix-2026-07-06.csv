@@ -1,0 +1,156 @@
+label,spec,tier,model,family,use_case,temp,top_p,top_k,decode_tps,prefill_tps,ttft_s,prompt_toks,completion_toks
+opt,default,B1,"Qwen3-32B (8-bit, production)",qwen3,coding,0.6,0.95,20,15.3,237,0.194,46,256
+opt,default,B1,"Qwen3-32B (8-bit, production)",qwen3,math,0.6,0.95,20,15.3,395,0.192,76,256
+opt,default,B1,"Qwen3-32B (8-bit, production)",qwen3,reasoning,0.6,0.95,20,15.3,408,0.194,79,256
+opt,default,B1,"Qwen3-32B (8-bit, production)",qwen3,tools,0.6,0.95,20,13.2,1898,0.248,382,57
+opt,default,B1,"Qwen3-32B (8-bit, production)",qwen3,creative,0.7,0.8,20,15.4,207,0.193,40,256
+opt,default,B1,Qwen3-32B (4-bit),qwen3,coding,0.6,0.95,20,28.2,442,0.104,46,256
+opt,default,B1,Qwen3-32B (4-bit),qwen3,math,0.6,0.95,20,28.2,730,0.104,76,256
+opt,default,B1,Qwen3-32B (4-bit),qwen3,reasoning,0.6,0.95,20,28.2,759,0.104,79,256
+opt,default,B1,Qwen3-32B (4-bit),qwen3,tools,0.6,0.95,20,23.6,4970,0.077,382,68
+opt,default,B1,Qwen3-32B (4-bit),qwen3,creative,0.7,0.8,20,28.2,384,0.104,40,256
+opt,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,coding,0.7,0.8,20,151.8,1987,0.021,42,256
+opt,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,math,0.7,0.8,20,151.2,3387,0.021,72,256
+opt,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,reasoning,0.7,0.8,20,151.2,3523,0.021,75,256
+opt,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,tools,0.7,0.8,20,109.9,24106,0.017,398,47
+opt,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,creative,0.7,0.8,20,151.7,1694,0.021,36,256
+opt,default,A4,Gemma 3 27B (4-bit),gemma,coding,1.0,0.95,64,31.9,516,0.091,47,256
+opt,default,A4,Gemma 3 27B (4-bit),gemma,math,1.0,0.95,64,29.3,1149,0.066,76,256
+opt,default,A4,Gemma 3 27B (4-bit),gemma,reasoning,1.0,0.95,64,31.1,821,0.094,77,256
+opt,default,A4,Gemma 3 27B (4-bit),gemma,tools,1.0,0.95,64,28000000.0,426,0.740,315,29
+opt,default,A4,Gemma 3 27B (4-bit),gemma,creative,1.0,0.95,64,31.1,394,0.094,37,256
+opt,default,B2,Llama 3.3 70B (4-bit),llama,coding,0.2,0.9,,9.2,328,0.226,74,256
+opt,default,B2,Llama 3.3 70B (4-bit),llama,math,0.2,0.9,,8.9,461,0.226,104,256
+opt,default,B2,Llama 3.3 70B (4-bit),llama,reasoning,0.2,0.9,,8.9,477,0.224,107,256
+opt,default,B2,Llama 3.3 70B (4-bit),llama,tools,0.2,0.9,,11.8,1258,0.273,336,19
+opt,default,B2,Llama 3.3 70B (4-bit),llama,creative,0.6,0.9,,9.0,302,0.225,68,255
+opt,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,coding,0.6,0.95,20,33.5,522,0.088,46,256
+opt,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,math,0.6,0.95,20,33.5,859,0.088,76,256
+opt,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,reasoning,0.6,0.95,20,33.5,893,0.088,79,256
+opt,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,tools,0.6,0.95,20,30.7,8393,0.065,548,67
+opt,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,creative,1.0,0.95,20,33.5,452,0.089,40,256
+opt,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,coding,1.0,0.95,64,131.0,2155,0.023,50,256
+opt,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,math,1.0,0.95,64,121.0,4533,0.017,79,256
+opt,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,reasoning,1.0,0.95,64,130.6,3430,0.023,80,256
+opt,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,tools,1.0,0.95,64,109.0,5472,0.053,292,51
+opt,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,creative,1.0,0.95,64,130.9,1720,0.023,40,256
+opt,default,small,Qwen3-8B (8-bit),qwen3,coding,0.6,0.95,20,63.0,942,0.049,46,256
+opt,default,small,Qwen3-8B (8-bit),qwen3,math,0.6,0.95,20,63.1,1717,0.044,76,256
+opt,default,small,Qwen3-8B (8-bit),qwen3,reasoning,0.6,0.95,20,63.1,1790,0.044,79,256
+opt,default,small,Qwen3-8B (8-bit),qwen3,tools,0.6,0.95,20,53.0,10345,0.037,381,46
+opt,default,small,Qwen3-8B (8-bit),qwen3,creative,0.7,0.8,20,63.2,906,0.044,40,256
+opt,default,small,Gemma 4 E4B (4-bit),gemma,coding,1.0,0.95,64,133.6,2182,0.021,46,256
+opt,default,small,Gemma 4 E4B (4-bit),gemma,math,1.0,0.95,64,128.9,4475,0.017,75,256
+opt,default,small,Gemma 4 E4B (4-bit),gemma,reasoning,1.0,0.95,64,133.4,3595,0.021,76,256
+opt,default,small,Gemma 4 E4B (4-bit),gemma,tools,1.0,0.95,64,110.4,5981,0.049,291,48
+opt,default,small,Gemma 4 E4B (4-bit),gemma,creative,1.0,0.95,64,133.8,1707,0.021,36,256
+opt,default,small,Qwen3-4B (4-bit),qwen3,coding,0.6,0.95,20,180.9,3002,0.015,46,256
+opt,default,small,Qwen3-4B (4-bit),qwen3,math,0.6,0.95,20,180.6,4968,0.015,76,256
+opt,default,small,Qwen3-4B (4-bit),qwen3,reasoning,0.6,0.95,20,180.6,5169,0.015,79,256
+opt,default,small,Qwen3-4B (4-bit),qwen3,tools,0.6,0.95,20,151.9,25388,0.015,381,72
+opt,default,small,Qwen3-4B (4-bit),qwen3,creative,0.7,0.8,20,181.1,2726,0.015,40,256
+opt,default,V4-Flash,"DeepSeek-V4-Flash (IQ2, ds4)",ds4,coding,0.3,1.0,,38.0,62,0.612,38,256
+opt,default,V4-Flash,"DeepSeek-V4-Flash (IQ2, ds4)",ds4,math,0.3,1.0,,37.0,86,0.747,64,253
+opt,default,V4-Flash,"DeepSeek-V4-Flash (IQ2, ds4)",ds4,reasoning,0.3,1.0,,35.6,84,0.846,71,256
+opt,default,V4-Flash,"DeepSeek-V4-Flash (IQ2, ds4)",ds4,tools,0.3,1.0,,35.8,208,1.825,380,101
+opt,default,V4-Flash,"DeepSeek-V4-Flash (IQ2, ds4)",ds4,creative,1.0,1.0,,35.2,77,0.379,29,256
+opt,off,B1,"Qwen3-32B (8-bit, production)",qwen3,coding,0.6,0.95,20,15.4,238,0.194,46,256
+opt,off,B1,"Qwen3-32B (8-bit, production)",qwen3,math,0.6,0.95,20,15.3,391,0.194,76,256
+opt,off,B1,"Qwen3-32B (8-bit, production)",qwen3,reasoning,0.6,0.95,20,15.3,410,0.193,79,256
+opt,off,B1,"Qwen3-32B (8-bit, production)",qwen3,tools,0.6,0.95,20,14.9,1410,0.308,382,66
+opt,off,B1,"Qwen3-32B (8-bit, production)",qwen3,creative,0.7,0.8,20,15.3,208,0.192,40,256
+opt,off,B1,Qwen3-32B (4-bit),qwen3,coding,0.6,0.95,20,28.2,441,0.104,46,256
+opt,off,B1,Qwen3-32B (4-bit),qwen3,math,0.6,0.95,20,28.2,726,0.105,76,256
+opt,off,B1,Qwen3-32B (4-bit),qwen3,reasoning,0.6,0.95,20,28.2,753,0.105,79,256
+opt,off,B1,Qwen3-32B (4-bit),qwen3,tools,0.6,0.95,20,27.3,3510,0.109,382,56
+opt,off,B1,Qwen3-32B (4-bit),qwen3,creative,0.7,0.8,20,28.2,383,0.104,40,256
+opt,off,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,coding,0.7,0.8,20,151.2,1973,0.021,42,256
+opt,off,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,math,0.7,0.8,20,150.7,3353,0.021,72,256
+opt,off,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,reasoning,0.7,0.8,20,150.6,3484,0.022,75,256
+opt,off,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,tools,0.7,0.8,20,144.5,17405,0.023,398,47
+opt,off,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,creative,0.7,0.8,20,151.1,1676,0.021,36,256
+opt,off,A4,Gemma 3 27B (4-bit),gemma,coding,1.0,0.95,64,32.0,511,0.092,47,256
+opt,off,A4,Gemma 3 27B (4-bit),gemma,math,1.0,0.95,64,31.2,805,0.094,76,256
+opt,off,A4,Gemma 3 27B (4-bit),gemma,reasoning,1.0,0.95,64,31.2,824,0.093,77,256
+opt,off,A4,Gemma 3 27B (4-bit),gemma,tools,1.0,0.95,64,27000000.0,309,1.020,315,28
+opt,off,A4,Gemma 3 27B (4-bit),gemma,creative,1.0,0.95,64,31.2,396,0.093,37,256
+opt,off,B2,Llama 3.3 70B (4-bit),llama,coding,0.2,0.9,,9.2,225,0.329,74,256
+opt,off,B2,Llama 3.3 70B (4-bit),llama,math,0.2,0.9,,9.2,316,0.329,104,256
+opt,off,B2,Llama 3.3 70B (4-bit),llama,reasoning,0.2,0.9,,9.2,326,0.328,107,256
+opt,off,B2,Llama 3.3 70B (4-bit),llama,tools,0.2,0.9,,8.7,935,0.332,310,23
+opt,off,B2,Llama 3.3 70B (4-bit),llama,creative,0.6,0.9,,9.1,207,0.329,68,249
+opt,off,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,coding,0.6,0.95,20,33.5,521,0.088,46,256
+opt,off,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,math,0.6,0.95,20,33.5,861,0.088,76,256
+opt,off,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,reasoning,0.6,0.95,20,33.5,893,0.088,79,256
+opt,off,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,tools,0.6,0.95,20,32.8,5938,0.092,548,67
+opt,off,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,creative,1.0,0.95,20,33.5,453,0.088,40,256
+opt,off,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,coding,1.0,0.95,64,131.2,2155,0.023,50,256
+opt,off,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,math,1.0,0.95,64,130.9,3398,0.023,79,256
+opt,off,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,reasoning,1.0,0.95,64,130.8,3434,0.023,80,256
+opt,off,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,tools,1.0,0.95,64,137.7,5151,0.057,292,52
+opt,off,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,creative,1.0,0.95,64,131.3,1719,0.023,40,256
+opt,off,small,Qwen3-8B (8-bit),qwen3,coding,0.6,0.95,20,63.0,1037,0.044,46,256
+opt,off,small,Qwen3-8B (8-bit),qwen3,math,0.6,0.95,20,63.0,1722,0.044,76,256
+opt,off,small,Qwen3-8B (8-bit),qwen3,reasoning,0.6,0.95,20,63.0,1770,0.045,79,256
+opt,off,small,Qwen3-8B (8-bit),qwen3,tools,0.6,0.95,20,61.4,7896,0.048,381,46
+opt,off,small,Qwen3-8B (8-bit),qwen3,creative,0.7,0.8,20,63.0,904,0.044,40,256
+opt,off,small,Gemma 4 E4B (4-bit),gemma,coding,1.0,0.95,64,133.5,2182,0.021,46,256
+opt,off,small,Gemma 4 E4B (4-bit),gemma,math,1.0,0.95,64,133.3,3566,0.021,75,256
+opt,off,small,Gemma 4 E4B (4-bit),gemma,reasoning,1.0,0.95,64,133.3,3597,0.021,76,256
+opt,off,small,Gemma 4 E4B (4-bit),gemma,tools,1.0,0.95,64,47000000.0,393,0.381,150,48
+opt,off,small,Gemma 4 E4B (4-bit),gemma,creative,1.0,0.95,64,133.7,1707,0.021,36,256
+opt,off,small,Qwen3-4B (4-bit),qwen3,coding,0.6,0.95,20,180.8,3016,0.015,46,256
+opt,off,small,Qwen3-4B (4-bit),qwen3,math,0.6,0.95,20,180.4,4975,0.015,76,256
+opt,off,small,Qwen3-4B (4-bit),qwen3,reasoning,0.6,0.95,20,180.4,5181,0.015,79,256
+opt,off,small,Qwen3-4B (4-bit),qwen3,tools,0.6,0.95,20,175.2,14825,0.035,381,72
+opt,off,small,Qwen3-4B (4-bit),qwen3,creative,0.7,0.8,20,180.9,2709,0.015,40,256
+baseline,default,B1,"Qwen3-32B (8-bit, production)",qwen3,coding,0.6,0.95,20,15.3,238,0.193,46,256
+baseline,default,B1,"Qwen3-32B (8-bit, production)",qwen3,math,0.6,0.95,20,15.3,392,0.194,76,256
+baseline,default,B1,"Qwen3-32B (8-bit, production)",qwen3,reasoning,0.6,0.95,20,15.3,409,0.193,79,256
+baseline,default,B1,"Qwen3-32B (8-bit, production)",qwen3,tools,0.6,0.95,20,13.3,2754,0.139,382,68
+baseline,default,B1,"Qwen3-32B (8-bit, production)",qwen3,creative,0.7,0.8,20,15.3,207,0.193,40,256
+baseline,default,B1,Qwen3-32B (4-bit),qwen3,coding,0.6,0.95,20,28.1,440,0.105,46,256
+baseline,default,B1,Qwen3-32B (4-bit),qwen3,math,0.6,0.95,20,28.1,726,0.105,76,256
+baseline,default,B1,Qwen3-32B (4-bit),qwen3,reasoning,0.6,0.95,20,28.0,754,0.105,79,256
+baseline,default,B1,Qwen3-32B (4-bit),qwen3,tools,0.6,0.95,20,23.9,4948,0.077,382,58
+baseline,default,B1,Qwen3-32B (4-bit),qwen3,creative,0.7,0.8,20,28.1,382,0.105,40,256
+baseline,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,coding,0.7,0.8,20,148.4,1966,0.021,42,256
+baseline,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,math,0.7,0.8,20,147.5,3322,0.022,72,256
+baseline,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,reasoning,0.7,0.8,20,147.6,3486,0.022,75,256
+baseline,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,tools,0.7,0.8,20,108.0,23714,0.017,398,47
+baseline,default,A1,Qwen3-30B-A3B-2507 (4-bit),qwen3_2507,creative,0.7,0.8,20,148.0,1670,0.022,36,256
+baseline,default,A4,Gemma 3 27B (4-bit),gemma,coding,1.0,0.95,64,31.8,514,0.091,47,256
+baseline,default,A4,Gemma 3 27B (4-bit),gemma,math,1.0,0.95,64,29.2,1152,0.066,76,256
+baseline,default,A4,Gemma 3 27B (4-bit),gemma,reasoning,1.0,0.95,64,31.0,821,0.094,77,256
+baseline,default,A4,Gemma 3 27B (4-bit),gemma,tools,1.0,0.95,64,28000000.0,423,0.745,315,29
+baseline,default,A4,Gemma 3 27B (4-bit),gemma,creative,1.0,0.95,64,30.9,392,0.094,37,256
+baseline,default,B2,Llama 3.3 70B (4-bit),llama,coding,0.2,0.9,,9.3,327,0.226,74,256
+baseline,default,B2,Llama 3.3 70B (4-bit),llama,math,0.2,0.9,,8.9,462,0.225,104,256
+baseline,default,B2,Llama 3.3 70B (4-bit),llama,reasoning,0.2,0.9,,8.9,478,0.224,107,256
+baseline,default,B2,Llama 3.3 70B (4-bit),llama,tools,0.2,0.9,,17.2,1117,0.325,363,16
+baseline,default,B2,Llama 3.3 70B (4-bit),llama,creative,0.6,0.9,,9.1,303,0.224,68,256
+baseline,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,coding,0.6,0.95,20,33.2,517,0.089,46,256
+baseline,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,math,0.6,0.95,20,33.2,855,0.089,76,256
+baseline,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,reasoning,0.6,0.95,20,33.2,888,0.089,79,256
+baseline,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,tools,0.6,0.95,20,30.5,8408,0.065,548,67
+baseline,default,ref,"Qwen3.6-27B (4-bit, MTP)",qwen36,creative,1.0,0.95,20,33.2,450,0.089,40,256
+baseline,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,coding,1.0,0.95,64,127.1,2109,0.024,50,256
+baseline,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,math,1.0,0.95,64,117.0,4422,0.018,79,256
+baseline,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,reasoning,1.0,0.95,64,126.8,3368,0.024,80,256
+baseline,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,tools,1.0,0.95,64,108.3,5352,0.055,292,50
+baseline,default,ref,"Gemma 4 26B-A4B (4-bit, MoE)",gemma,creative,1.0,0.95,64,127.2,1688,0.024,40,256
+baseline,default,small,Qwen3-8B (8-bit),qwen3,coding,0.6,0.95,20,62.4,1032,0.045,46,256
+baseline,default,small,Qwen3-8B (8-bit),qwen3,math,0.6,0.95,20,62.4,1700,0.045,76,256
+baseline,default,small,Qwen3-8B (8-bit),qwen3,reasoning,0.6,0.95,20,62.4,1770,0.045,79,256
+baseline,default,small,Qwen3-8B (8-bit),qwen3,tools,0.6,0.95,20,52.5,10139,0.038,381,46
+baseline,default,small,Qwen3-8B (8-bit),qwen3,creative,0.7,0.8,20,62.4,898,0.045,40,256
+baseline,default,small,Gemma 4 E4B (4-bit),gemma,coding,1.0,0.95,64,129.8,2145,0.021,46,256
+baseline,default,small,Gemma 4 E4B (4-bit),gemma,math,1.0,0.95,64,124.9,4366,0.017,75,256
+baseline,default,small,Gemma 4 E4B (4-bit),gemma,reasoning,1.0,0.95,64,129.6,3543,0.021,76,256
+baseline,default,small,Gemma 4 E4B (4-bit),gemma,tools,1.0,0.95,64,111.1,15054,0.019,292,46
+baseline,default,small,Gemma 4 E4B (4-bit),gemma,creative,1.0,0.95,64,130.1,1675,0.021,36,256
+baseline,default,small,Qwen3-4B (4-bit),qwen3,coding,0.6,0.95,20,175.8,2926,0.016,46,256
+baseline,default,small,Qwen3-4B (4-bit),qwen3,math,0.6,0.95,20,175.6,4733,0.016,76,256
+baseline,default,small,Qwen3-4B (4-bit),qwen3,reasoning,0.6,0.95,20,175.5,5018,0.016,79,256
+baseline,default,small,Qwen3-4B (4-bit),qwen3,tools,0.6,0.95,20,148.2,16111,0.033,381,72
+baseline,default,small,Qwen3-4B (4-bit),qwen3,creative,0.7,0.8,20,176.1,2668,0.015,40,256

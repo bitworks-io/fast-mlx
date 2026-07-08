@@ -1,0 +1,33 @@
+# Project-scoped Codex override.
+# Mode: full-auto
+# Codex ignores profile selection in project-local config files;
+# write concrete supported settings here instead.
+
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
+
+[agents]
+max_threads = 6
+max_depth = 1
+job_max_runtime_seconds = 1800
+
+[agents.codebase_explorer]
+config_file = "agents/codebase-explorer.toml"
+
+[agents.docs_researcher]
+config_file = "agents/docs-researcher.toml"
+
+[agents.implementation_worker]
+config_file = "agents/implementation-worker.toml"
+
+[agents.reviewer]
+config_file = "agents/reviewer.toml"
+
+[agents.verifier]
+config_file = "agents/verifier.toml"
+
+[projects."/Users/braymond/Projects/fast-mlx"]
+trust_level = "trusted"

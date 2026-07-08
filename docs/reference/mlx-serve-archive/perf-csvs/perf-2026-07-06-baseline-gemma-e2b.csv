@@ -1,0 +1,10 @@
+label,model,temp,spec,concurrency,prompt,prefill_tps,decode_tps,aggregate_tps,prompt_toks,completion_toks
+baseline,gemma-4-e2b-it-4bit,0.7,pld,1,echo,26633.59,531.73,531.73,306,260
+baseline,gemma-4-e2b-it-4bit,0.7,none,1,echo,22349.43,205.03,205.03,306,256
+baseline,gemma-4-e2b-it-4bit,0.0,pld,1,echo,27514.48,584.23,584.23,306,260
+baseline,gemma-4-e2b-it-4bit,0.7,pld,1,decode,2489.35,208.85,208.85,28,256
+baseline,gemma-4-e2b-it-4bit,0.7,pld,2,echo,17721.28,264.6,514.1,306,260
+baseline,gemma-4-e2b-it-4bit,0.7,none,2,echo,11627.67,140.53,273.67,306,256
+baseline,gemma-4-e2b-it-4bit,0.7,pld,4,echo,6696.84,132.23,514.32,306,260
+baseline,gemma-4-e2b-it-4bit,0.7,none,4,echo,6665.96,102.22,402.82,306,256
+baseline,gemma-4-e2b-it-4bit,0.7,none,1,decode,2155.61,211.83,211.83,28,256

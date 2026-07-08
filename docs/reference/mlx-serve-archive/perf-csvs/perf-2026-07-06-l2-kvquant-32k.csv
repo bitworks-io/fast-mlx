@@ -1,0 +1,4 @@
+label,model,temp,spec,concurrency,prompt,prefill_tps,decode_tps,aggregate_tps,prompt_toks,completion_toks
+dense-32k,Qwen3-8B-8bit,0.0,none,1,decode,381479.88,37.64,37.64,38432,96
+dense4bit-32k,Qwen3-8B-8bit,0.0,none,1,decode,388114.14,38.3,38.3,38432,96
+fused4bit-32k,Qwen3-8B-8bit,0.0,none,1,decode,392570.86,38.81,38.81,38432,96

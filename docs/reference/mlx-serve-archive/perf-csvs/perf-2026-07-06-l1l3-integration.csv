@@ -1,0 +1,3 @@
+label,model,temp,spec,concurrency,prompt,prefill_tps,decode_tps,aggregate_tps,prompt_toks,completion_toks
+l1l3-integration,gemma-4-e2b-it-4bit,0.7,pld,1,echo,27157.95,557.73,557.73,306,260
+l1l3-integration,gemma-4-e2b-it-4bit,0.7,none,1,decode,2161.74,211.51,211.51,28,256
