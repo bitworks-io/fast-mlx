@@ -35,7 +35,7 @@ fast-mlx is a **maximally-optimized MLX inference platform for Apple Silicon** (
 | NVIDIA / cloud | **Via the Python plane + engine-agnostic API** | `mlx[cuda]` is the mature cross-hardware path; the OpenAI-API + dial let NVIDIA customers be served without a C++ engine. Objective, not a hard threshold |
 | TurboQuant | **Defer to v1.1 2-bit tier** | The engine's "turbo" is QuaRot-family, not Google TurboQuant; real TurboQuant only helps at 2-bit |
 
-The engine language is settled **pending the Swift decode-loop spike (Task 1)** empirically confirming serving-perf parity.
+The engine language is settled: the **Swift decode-loop spike (2026-07-08) returned CONDITIONAL GO** — Swift 6 strict concurrency held with **zero unsafe escape hatches (and the compiler caught a real bug)**; decode was **−18% vs the Zig engine on the *fastest* model** (30B-A3B, the worst case; root cause = addressable ARC/binding overhead, *not* the eval-loop stall — that design works), still market-leading vs competitors. Proceed on Swift; close the host-overhead gap (allocation reduction + op fusion) as an early optimization task and re-measure on dense Qwen3-32B. Full detail: [spike verdict](../verdicts/2026-07-08-swift-spike-verdict.md).
 
 ---
 

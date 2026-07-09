@@ -1,0 +1,2 @@
+model,quant,max_tokens,runs,decode_tok_s_avg,ttft_ms_avg
+Qwen3-30B-A3B-Instruct-2507-4bit,4bit,256,3,127.07,52.1
