@@ -91,6 +91,27 @@ actor HarnessEngineActor {
         }
         return rows
     }
+
+    /// Sampled variant: runs the SAME forward loop over the full forced continuation (causal
+    /// decoding requires every intermediate token as context regardless), but only converts+keeps
+    /// a full-vocab row at `positions` — a long-context entry can be thousands of positions, and
+    /// materializing every row would be ~0.6MB/row x thousands x 2 drivers. `positions` must be
+    /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
+    func teacherForcedLogprobsAtPositions(prompt: [Int], forced: [Int], positions: [Int]) -> [[Float]] {
+        let wanted = Set(positions)
+        let cache = model.newCache(parameters: nil)
+        var rows: [[Float]] = []
+        rows.reserveCapacity(positions.count)
+        var y = MLXArray(prompt).reshaped([1, prompt.count])
+        for (i, tok) in forced.enumerated() {
+            let logits = model(y, cache: cache)
+            if wanted.contains(i) {
+                rows.append(logits[0..., -1, 0...].asType(.float32).asArray(Float.self))
+            }
+            y = MLXArray([tok]).reshaped([1, 1])
+        }
+        return rows
+    }
 }
 
 /// In-process `EngineDriver` over the compiled decode core — the only MLX-touching harness impl.
@@ -117,6 +138,11 @@ struct SwiftEngineDriver: EngineDriver {
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
         try Self.requireSupported(config)
         return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation)
+    }
+
+    func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
+        try Self.requireSupported(config)
+        return await engine.teacherForcedLogprobsAtPositions(prompt: prompt, forced: forcedContinuation, positions: positions)
     }
 
     private static func requireSupported(_ config: RunConfig) throws {

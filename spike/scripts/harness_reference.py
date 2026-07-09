@@ -24,20 +24,36 @@ Exactly len(force) positions are emitted and tokens echoes the forced ids. Two d
 the SAME forced continuation therefore score IDENTICAL contexts at every position — the
 context-locked basis the KL/perplexity metrics are defined on.
 
+SAMPLED mode (--sample-positions '[...]', only valid with --force-tokens): the forward loop still
+runs over the FULL forced continuation (causal decoding needs every intermediate token as
+context regardless), but only positions in the given (ascending) list are converted to numpy and
+written out — for a long-context entry with thousands of forced positions, materializing a
+full-vocab row at every one of them would exhaust memory (~0.6MB/row x thousands x 2 drivers).
+`positions` in the emitted header is then len(sample-positions), not len(force-tokens).
+
 Prompts are passed as token ids (--tokens-json) by the harness so tokenizer differences can't
 desynchronize the comparison; --prompt (text) is kept for manual use.
 
 Usage:
     harness_reference.py --model PATH (--tokens-json '[1,2,3]' | --prompt TEXT) --n N \
-        [--eos-id ID] [--logits-out FILE.f32] [--force-tokens '[4,5,6]']
+        [--eos-id ID] [--logits-out FILE.f32] [--force-tokens '[4,5,6]'] \
+        [--sample-positions '[0,3,5]']
 """
 import argparse
+import importlib.metadata
 import json
 
 import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
+
+
+def _version(pkg: str) -> str:
+    try:
+        return importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def main() -> None:
@@ -52,11 +68,17 @@ def main() -> None:
                     help="write raw little-endian float32 [positions x vocab] logits here")
     ap.add_argument("--force-tokens", default=None,
                     help="teacher-force this JSON array of token ids instead of greedy decoding")
+    ap.add_argument("--sample-positions", default=None,
+                    help="only materialize+emit rows at these (ascending) indices into "
+                         "--force-tokens; the forward loop still runs the full continuation")
     args = ap.parse_args()
+    if args.sample_positions and not args.force_tokens:
+        ap.error("--sample-positions requires --force-tokens")
 
     model, tok = load(args.model)
     ids = json.loads(args.tokens_json) if args.tokens_json else tok.encode(args.prompt)
     force = json.loads(args.force_tokens) if args.force_tokens else None
+    sample_positions = set(json.loads(args.sample_positions)) if args.sample_positions else None
     cache = make_prompt_cache(model)
 
     out_tokens: list[int] = []
@@ -64,10 +86,10 @@ def main() -> None:
     vocab = None
     y = mx.array(ids)[None]
     if force is not None:
-        for t in force:
+        for i, t in enumerate(force):
             logits = model(y, cache=cache)[:, -1, :]  # [1, vocab] raw logits
             vocab = int(logits.shape[-1])
-            if rows is not None:
+            if rows is not None and (sample_positions is None or i in sample_positions):
                 rows.append(np.array(logits.astype(mx.float32)).reshape(-1))
             out_tokens.append(int(t))  # echo the FORCED id: it is position k's context-builder
             y = mx.array([[int(t)]])
@@ -86,7 +108,16 @@ def main() -> None:
 
     if rows is not None:
         np.stack(rows).astype("<f4").tofile(args.logits_out)
-    print(json.dumps({"tokens": out_tokens, "positions": len(out_tokens), "vocab": vocab}))
+    # "positions" gates the expected logits byte count on the Swift side: it must be len(rows)
+    # (the number of rows actually written), which differs from len(out_tokens) under
+    # --sample-positions (the loop still runs the full continuation but only some rows are kept).
+    positions = len(rows) if rows is not None else len(out_tokens)
+    # mlx/mlx-lm versions (Task 5 provenance): the Swift side reads these off the header so a
+    # result record names the EXACT reference-side versions that produced it, not an assumption.
+    print(json.dumps({
+        "tokens": out_tokens, "positions": positions, "vocab": vocab,
+        "mlx_version": _version("mlx"), "mlx_lm_version": _version("mlx-lm"),
+    }))
 
 
 if __name__ == "__main__":

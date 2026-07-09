@@ -73,6 +73,38 @@ public func teacherForcedScores(
     return TeacherForcedScores(continuation: continuation, candidateRows: c, referenceRows: r)
 }
 
+/// Like `TeacherForcedScores` but for an EXPLICIT continuation scored at a bounded, sampled
+/// subset of positions — the long-context path. Instead of generating a short continuation and
+/// forcing it, a long-context corpus entry is teacher-forced AGAINST ITSELF (its own tokenized
+/// text is the continuation, wikitext-perplexity style): this is what makes a >=4K-token entry
+/// meaningful — quantization loss accrues with context, so the signal lives deep in the
+/// sequence, not in a handful of positions appended to a long prompt.
+public struct TeacherForcedScoresAtPositions: Sendable {
+    public let positions: [Int]           // ascending indices into `continuation`
+    public let forcedTokens: [Int]        // continuation[p] for each scored position p
+    public let candidateRows: [[Float]]   // full-vocab raw logits, one row per position
+    public let referenceRows: [[Float]]
+}
+
+public func teacherForcedScoresAtSampledPositions(
+    driver: EngineDriver, reference: EngineDriver,
+    prompt: [Int], continuation: [Int], positions: [Int], config: RunConfig
+) async throws -> TeacherForcedScoresAtPositions {
+    guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
+    let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: config)
+    guard c.count == positions.count else {
+        throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: positions.count)
+    }
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: config)
+    guard r.count == positions.count else {
+        throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: positions.count)
+    }
+    return TeacherForcedScoresAtPositions(
+        positions: positions,
+        forcedTokens: positions.map { continuation[$0] },
+        candidateRows: c, referenceRows: r)
+}
+
 /// Median per-position KL of the candidate's next-token distribution vs the reference's,
 /// TEACHER-FORCED on the reference's greedy continuation: all N positions are context-locked
 /// by construction, so every position contributes a meaningful sample (no divergence

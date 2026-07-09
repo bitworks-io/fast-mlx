@@ -49,6 +49,23 @@ public protocol EngineDriver: Sendable {
     /// diverge (at 2-bit after ~1 token) and would compare distributions over different
     /// contexts, which is not a quality signal.
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]]
+    /// Like `logprobs(prompt:forcedContinuation:config:)` but only materializes rows at
+    /// `positions` (ascending indices into `forcedContinuation`) — for long sequences (a
+    /// long-context corpus entry teacher-forced against itself can be thousands of positions)
+    /// where materializing a full-vocab row at EVERY position would exhaust memory (~0.6MB/row x
+    /// thousands of positions x 2 drivers). Returned rows are ordered to match `positions`;
+    /// `rows.count == positions.count`. The default implementation (below) computes the full
+    /// result and filters — correct but NOT memory-saving; drivers that can skip discarded rows
+    /// inside their forward loop (SwiftEngineDriver, the Python reference) override this for the
+    /// real saving.
+    func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]]
+}
+
+public extension EngineDriver {
+    func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
+        let full = try await logprobs(prompt: prompt, forcedContinuation: forcedContinuation, config: config)
+        return positions.map { full[$0] }
+    }
 }
 
 public struct ScriptedDriver: EngineDriver {
