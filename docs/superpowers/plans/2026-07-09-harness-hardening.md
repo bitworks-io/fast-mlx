@@ -50,4 +50,14 @@
 ## After this lands
 The harness can honestly quantify **Google TurboQuant** (2-bit KV) on the measured KL + perplexity frontier at long context, with reproducible provenance. Then: implement the TurboQuant KV-quant kernel in the engine (its own plan) → run it through this hardened harness → promote to a dial tier or shelve with a dated negative result. FAST-FOLLOW items (spec-decode telemetry for DFlash, sweep runner, memory metrics, seeded sampling) follow as the queue demands.
 
-**Content:** per the standing practice, write a `docs/content/` piece when Chunk A lands — "auditing the instrument that measures everything" (the free-running-KL flaw + teacher-forcing) is a strong, honest story.
+**Content:** per the standing practice, write a `docs/content/` piece when Chunk A lands — "auditing the instrument that measures everything" (the free-running-KL flaw + teacher-forcing) is a strong, honest story. *(Written: `docs/content/2026-07-09-trusting-the-instrument.md`.)*
+
+## Findings during execution (2026-07-09) — carry forward before TurboQuant
+
+Chunk A committed (`8e253d4`,`5d30a63`): teacher-forced KL + perplexity — trustworthy at short/medium context. Chunk B committed (`388d3ab`,`7cc999a`,`3470429`,`b3f2931`): versioned corpus, lossy-tier triad + canary, provenance/JSONL. 61/61 tests. Three findings that bear on TurboQuant (whose value is 2-bit KV at LONG context):
+
+1. **ENGINE ~7K-token context ceiling (BLOCKING for long-context measurement — engine work, not harness).** Teacher-forcing beyond ~6700–7100 *input* tokens SIGKILLs with zero output (bisected: input-length-driven, not sample-count — a fixed KV-cache/preallocation limit in `CompiledMLXDecoder`/`CompiledKVCache`). The harness surfaced a real engine limitation: the compiled path **cannot serve >~7K context at all today.** Caps "long-context" measurement at ~5K, blocking the 64K/128K regime that is TurboQuant's actual use case. Must be fixed engine-side before TurboQuant's max-context value can be measured — and it's a fundamental serving limitation regardless.
+2. **Long-context KL statistic (harness refinement).** Median KL over natural long text reads *below* the noise floor (function-word tokens both quants agree on dominate the median; the signal is in the **tail** — pooled p95 0.69 vs median 6e-05). Chunk B's stopgap (headline = median of per-entry medians) stops swamping but leaves the long-context entry contributing ~nothing. A **tail-aware statistic (p95 / tail-weighted) for long-context entries** is needed so KV-quant loss (a long-context, tail phenomenon) is captured. Fast-follow.
+3. **`harnessGitSHA` provenance gap.** Defaults to `"unknown"` on llmbench unless the caller exports `HARNESS_GIT_SHA` (rsync'd source has no `.git`). Quick fix in the deploy step.
+
+**Still scoped-open:** Task 6 (fp16 reference) — and a real **bf16 Qwen3-32B is already on the box** (`~/.mlx-serve/models/mlx-community/Qwen3-32B-bf16`, from the retired daemon), so the "vs fp16" reference is a quick close, replacing the INT8 proxy.
