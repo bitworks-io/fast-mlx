@@ -1,6 +1,6 @@
 # fast-mlx — System-Aware Context Operability Spec
 
-- **Status:** DRAFT for owner review
+- **Status:** DRAFT for owner review — **§7 in-scope items landed on `main` (2026-07-09)**: the §2 memory model (spine), §3 host profiler, §3.1 cacheLimit policy, and the §4/§5 tunable+advisor logic ship as `HarnessCore` + `SystemProfiler` + the `fastmlx-capacity` CLI, verified on-host. Consuming surfaces (admin API, tooltips, macOS app) + the named backlog remain.
 - **Date:** 2026-07-09
 - **Owner:** brian@bitworks.io
 - **Parent spec:** [`docs/superpowers/specs/2026-07-08-fast-mlx-platform-design.md`](2026-07-08-fast-mlx-platform-design.md) (§4 dial, §5 eval loop, §9 catalog)
@@ -159,12 +159,12 @@ Discriminator: does the lever cut **steady-state KV/token** (extends what fits),
 
 ## 7. Scope line + backlog gates
 
-**In scope now:**
-1. The **§2 per-arch KV memory model** as tested pure `HarnessCore` logic (the spine).
-2. The **§3 system-introspection profiler** (chip/cores/RAM/wired-limit/usage/disk; NVMe-detect + `os_proc_available_memory` shim may land incrementally).
-3. The **§3.1 cacheLimit invariant** wired into any wired-limit raise.
-4. The **§4 context tunable** semantics (default/effectiveDefault/ceiling) + **§5 capacity-advisor** classification & binding-constraint naming, as config-time logic.
-5. The **catalog update** (§2.2/§2.3 → parent §9).
+**In scope now — LANDED on `main` 2026-07-09:**
+1. ✅ The **§2 per-arch KV memory model** — pure `HarnessCore` `CapacityModel`/`ModelArchProfile`/`SystemProfile`, 98 tests, verified vs confirmed numbers (merge `7f9c088`).
+2. ✅ The **§3 system-introspection profiler** — `SystemProfiler.probe()` (chip/cores/RAM/wired-limit/GPU-alloc/disk via Metal+sysctl, MLX-free), on-host verified (merge `2cdef35`). *Remaining increments:* NVMe/interconnect (IOKit) + `os_proc_available_memory` shim — left as marked TODOs.
+3. ✅ The **§3.1 cacheLimit invariant** — pure `recommendedCacheLimitBytes` policy (merge `2cdef35`). *Remaining:* the one-line MLX application (`Memory.cacheLimit = …`) wired into the actual engine startup on any wired-limit raise — **engine work, deferred** with the engine.
+4. ✅ The **§4 context tunable** + **§5 capacity-advisor** logic — `effectiveDefaultContext`/`contextCeiling`/`classify` (green/yellow/red + binding constraint) exposed via the **`fastmlx-capacity` CLI** (live host + `--box` planning). *Remaining:* the admin API / tooltips / macOS-app surfaces that consume this — deferred with those components.
+5. ✅ The **catalog update** (§2.2/§2.3 → parent §9, merge `520ff99`).
 
 **Named backlog (with gates):**
 - **Runtime admission control** — `WiredMemoryManager` ticket/admission + hysteresis. *Gate:* confirm `mlx_set_wired_limit` ↔ sysctl relationship from MLX core source first (§3.1).
