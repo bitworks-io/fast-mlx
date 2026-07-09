@@ -35,7 +35,7 @@ let benchPrompt = "Explain how continuous batching improves LLM serving throughp
 /// prompts. Never falls back to a hardcoded list on failure — a silently-substituted corpus would
 /// make the recorded `corpusId` a lie.
 func loadMeasurementCorpus(_ flags: Flags) throws -> MeasurementCorpus {
-    let path = flags.string("corpus", default: "corpus/measurement-corpus-v1.json")
+    let path = flags.string("corpus", default: "corpus/measurement-corpus-v2.json")
     let data = try Data(contentsOf: URL(fileURLWithPath: path))
     return try MeasurementCorpusLoader.load(from: data)
 }
@@ -483,7 +483,7 @@ struct Harness {
           bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
-                 [--corpus <FILE=corpus/measurement-corpus-v1.json>]
+                 [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
 
         common flags: --python <PY=~/harness-venv/bin/python> --script <scripts/harness_reference.py>

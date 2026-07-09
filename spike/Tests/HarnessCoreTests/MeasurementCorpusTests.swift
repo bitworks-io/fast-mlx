@@ -115,6 +115,31 @@ final class MeasurementCorpusTests: XCTestCase {
             XCTAssertGreaterThan(e.text.count, 16_000, "\(e.id) too short to plausibly clear 4K tokens")
         }
     }
+
+    func testRealCheckedInCorpusV2AddsA16KTokenEntry() throws {
+        // v2 = v1's entries + one >=16K-TOKEN natural-prose entry (the TurboQuant regime needs
+        // context an order of magnitude past v1's ~5.8K-token ceiling-era entry). Same
+        // character-count proxy: >=64K chars comfortably clears 16K tokens for technical prose.
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var found: URL?
+        for _ in 0..<8 {
+            let candidate = dir.appendingPathComponent("corpus/measurement-corpus-v2.json")
+            if FileManager.default.fileExists(atPath: candidate.path) { found = candidate; break }
+            dir = dir.deletingLastPathComponent()
+        }
+        guard let path = found else {
+            return XCTFail("could not locate spike/corpus/measurement-corpus-v2.json by walking up from \(#filePath)")
+        }
+        let corpus = try MeasurementCorpusLoader.load(from: try Data(contentsOf: path))
+        XCTAssertEqual(corpus.corpusId, "measurement-corpus-v2")
+        XCTAssertFalse(corpus.entries(tagged: .prose).isEmpty)
+        XCTAssertFalse(corpus.entries(tagged: .code).isEmpty)
+        let longEntries = corpus.entries(tagged: .longContext)
+        XCTAssertEqual(longEntries.count, 2, "v2 keeps v1's long entry and adds the 16K one")
+        XCTAssertTrue(
+            longEntries.contains { $0.text.count >= 64_000 },
+            "v2 must contain a >=64K-char (>=16K-token) long-context entry")
+    }
 }
 
 final class PositionSamplingTests: XCTestCase {
