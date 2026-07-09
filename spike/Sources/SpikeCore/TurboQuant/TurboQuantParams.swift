@@ -34,3 +34,36 @@ public struct TurboQuantParams {
         self.scaledCentroids = MLXArray(c)
     }
 }
+
+/// The v1 TurboQuant KV tiers: **uniform** `baseBits` Lloyd-Max bits + 1 QJL bit per element,
+/// plus the fp16 residual norm γ amortized over head_dim. Honest naming (plan §"Design
+/// decisions"): the paper's sub-integer "2.5-bit"/"3.5-bit" labels require the deferred
+/// outlier-channel mixing, so the tiers are named by their base bits. They occupy the harness's
+/// `tq2.5`/`tq3.5` recording slots — **never report a tqB3 result under a "2.5-bit" label**;
+/// tqB2 is ~3 bits/element and tqB3 ~4 bits/element until outlier channels land.
+public enum TurboQuantTier: String, Sendable, CaseIterable {
+    case tqB2  // 2 base + 1 QJL — occupies the harness "tq2.5" slot (uniform-bit v1)
+    case tqB3  // 3 base + 1 QJL — occupies the harness "tq3.5" slot (uniform-bit v1)
+
+    public var baseBits: Int {
+        switch self {
+        case .tqB2: 2
+        case .tqB3: 3
+        }
+    }
+
+    /// The harness `kvQuant` recording slot this tier fills (v1 is uniform-bit; the sub-integer
+    /// slot names await outlier channels — see type doc).
+    public var harnessSlot: String {
+        switch self {
+        case .tqB2: "tq2.5"
+        case .tqB3: "tq3.5"
+        }
+    }
+
+    /// Honest storage cost per KV element: base bits + 1 QJL sign bit + the per-row fp16
+    /// γ = ‖r‖₂ amortized over head_dim.
+    public func bitsPerElement(headDim: Int) -> Double {
+        Double(baseBits) + 1.0 + 16.0 / Double(headDim)
+    }
+}

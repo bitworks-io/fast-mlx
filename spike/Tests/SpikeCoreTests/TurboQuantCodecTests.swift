@@ -95,6 +95,18 @@ final class TurboQuantCodecTests: XCTestCase {
                 "d·D_prod at \(baseBits + 1) total bits must reproduce the paper's distortion table")
         }
     }
+
+    // MARK: Task 5 — tier config + honest bits/element accounting
+
+    func testTierBitsPerElementIsHonest() {
+        XCTAssertEqual(TurboQuantTier.tqB2.baseBits, 2)
+        XCTAssertEqual(TurboQuantTier.tqB3.baseBits, 3)
+        // base bits + 1 QJL bit + the fp16 γ=‖r‖₂ amortized over head_dim.
+        XCTAssertEqual(TurboQuantTier.tqB2.bitsPerElement(headDim: 128), 3 + 16.0 / 128)
+        XCTAssertEqual(TurboQuantTier.tqB3.bitsPerElement(headDim: 128), 4 + 16.0 / 128)
+        XCTAssertEqual(TurboQuantTier.tqB2.harnessSlot, "tq2.5")
+        XCTAssertEqual(TurboQuantTier.tqB3.harnessSlot, "tq3.5")
+    }
 }
 
 /// Rows scaled to unit L2 norm (test fixture: KV head-vectors are treated as unit-norm
