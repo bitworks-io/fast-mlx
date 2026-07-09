@@ -30,10 +30,16 @@ public enum HarnessCorpus {
     public static func process(_ raw: String) -> CorpusProcessed {
         var text = raw
 
-        // Strip <think>...</think> blocks (including their content).
-        while let openRange = text.range(of: "<think>"), let closeRange = text.range(of: "</think>") {
-            guard closeRange.lowerBound >= openRange.upperBound else { break }
-            text.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
+        // Strip <think>...</think> blocks (including their content). An UNCLOSED trailing <think>
+        // (truncated generation — e.g. hit max-tokens mid-reasoning) is stripped from the tag to the
+        // end of the text so reasoning never leaks into visible output.
+        while let openRange = text.range(of: "<think>") {
+            if let closeRange = text.range(of: "</think>", range: openRange.upperBound..<text.endIndex) {
+                text.removeSubrange(openRange.lowerBound..<closeRange.upperBound)
+            } else {
+                text.removeSubrange(openRange.lowerBound..<text.endIndex)
+                break
+            }
         }
 
         // Lift a <tool_call>...</tool_call> block into its own field; remove it from visible text.
@@ -83,6 +89,12 @@ public enum HarnessCorpus {
             name: "hostile_bytes",
             raw: "<think>\u{0000}\u{202E}garbage</think>Résult\u{0301}: \u{1F600} done.",
             expectedVisible: "Résult\u{0301}: \u{1F600} done."
+        ),
+        // Truncated generation: max-tokens hit mid-reasoning, so </think> never arrives. Must not leak.
+        CorpusEntry(
+            name: "unclosed_think_truncated",
+            raw: "<think>reasoning that got cut off mid-generation",
+            expectedVisible: ""
         ),
     ]
 }

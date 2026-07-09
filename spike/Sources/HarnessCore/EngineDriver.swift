@@ -28,7 +28,10 @@ public struct RunResult: Sendable {
 /// The seam. In-process (SwiftEngineDriver) now; HTTP/OpenAI later. Reference impl (mlx-lm) via ReferenceDriver.
 public protocol EngineDriver: Sendable {
     func generate(prompt: [Int], config: RunConfig) async throws -> RunResult
-    /// Top-k logprobs per generated position (temp=0), for KL. Empty if unsupported.
+    /// Full-vocab logprobs per generated position (temp=0), for KL. Each inner array is ordered by
+    /// token id — index == token id — so two drivers' outputs can be aligned by index directly.
+    /// NOT top-k: under top-k, index i names a different token per model/run, which would make
+    /// index-aligned KL meaningless. Empty if unsupported.
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]]
 }
 

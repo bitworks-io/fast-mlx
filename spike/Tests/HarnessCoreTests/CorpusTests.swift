@@ -8,6 +8,7 @@ final class CorpusTests: XCTestCase {
       XCTAssertFalse(out.visibleText.contains("<|"), "control-tag leak in \(e.name)")
       if let args = out.toolArgsJSON { XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(args.utf8))) }
       if let exp = e.expectedVisible { XCTAssertEqual(out.visibleText, exp, e.name) }
+      if let exp = e.expectedTool { XCTAssertEqual(out.toolArgsJSON, exp, e.name) }
     }
   }
 }
