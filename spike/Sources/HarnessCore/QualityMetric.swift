@@ -14,6 +14,21 @@ public protocol QualityMetric: Sendable { var name: String { get }
     /// Measure candidate-vs-reference over a fixed corpus using the driver's logprobs. Lower = closer to reference.
     func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double }
 
+/// Per-position KLs between two full-vocab RAW-LOGITS matrices (softmaxed here) — the metric's
+/// inner loop, exposed so the CLI can report per-position detail (p95, aligned-prefix stats)
+/// from the SAME computation the headline median comes from, not a reimplementation.
+public func perPositionKLs(reference: [[Float]], candidate: [[Float]]) -> [Double] {
+    (0..<min(candidate.count, reference.count)).map {
+        klDivergence(reference: softmax(reference[$0]), candidate: softmax(candidate[$0]))
+    }
+}
+
+/// The metric's median convention (sorted, upper-middle element). Exposed for the same reason.
+public func medianOf(_ values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted(); return sorted[sorted.count / 2]
+}
+
 /// Median per-position KL of the candidate's next-token distribution vs the fp16 reference's.
 public struct KLDivergenceMetric: QualityMetric {
     public let name = "kl_median"; public init() {}
@@ -22,9 +37,9 @@ public struct KLDivergenceMetric: QualityMetric {
         for p in prompts {
             let c = try await driver.logprobs(prompt: p, config: config)
             let r = try await reference.logprobs(prompt: p, config: config)
-            for i in 0..<min(c.count, r.count) { kls.append(klDivergence(reference: softmax(r[i]), candidate: softmax(c[i]))) }
+            kls.append(contentsOf: perPositionKLs(reference: r, candidate: c))
         }
-        kls.sort(); return kls.isEmpty ? 0 : kls[kls.count/2]
+        return medianOf(kls)
     }
 }
 func softmax(_ x: [Float]) -> [Float] { let m = x.max() ?? 0; let e = x.map { expf($0 - m) }; let s = e.reduce(0,+); return e.map { $0/s } }

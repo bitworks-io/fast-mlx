@@ -77,11 +77,12 @@ public struct BenchRunner: Sendable {
         cell: Cell,
         iterations: Int,
         nonce: String,
+        basePrompt: String,
         rate: (_ run: Int, _ saltedPrompt: String) async throws -> Double?
     ) async rethrows -> RateAggregate {
         var rates: [Double?] = []
         for i in 0..<iterations {
-            let salted = saltPrompt(run: i, nonce: nonce, cell.model)
+            let salted = saltPrompt(run: i, nonce: nonce, basePrompt)
             rates.append(try await rate(i, salted))
         }
         return aggregateRates(rates)
