@@ -82,6 +82,17 @@ public struct ModelArchProfile: Sendable {
     /// (and unused) for every other class.
     public var nLocalLayers: Int { nLayers - nAttnLayers }
 
+    /// Whether this model's TOTAL KV cost is derivable from confirmed config. `false` when the
+    /// growing-attention-layer count is an unconfirmed sentinel (`nAttnLayers == 0`, used for
+    /// hybrid-Mamba2+MoE where the spec flags the count "unconfirmed — do not multiply blind") or
+    /// the architecture is out of scope (novel-compressed, `ds4`-only). In those cases the capacity
+    /// model MUST surface "not derivable" rather than return a one-layer under-count or a fabricated
+    /// zero that could make an unservable model look like it fits (spec §2.1/§8, the honesty cases).
+    /// Adapts automatically: confirm the attention-layer count later and the entry becomes derivable.
+    public var isKVDerivable: Bool {
+        modelType != .novelCompressedUnsupported && nAttnLayers > 0
+    }
+
     private static let gib = 1024 * 1024 * 1024
 
     /// Full catalog, spec §2.2 table verbatim. GiB values are converted to bytes at load time;

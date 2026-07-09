@@ -137,4 +137,46 @@ final class CapacityModelTests: XCTestCase {
         assertClose(int8, fp16 / 2, "int8 vs fp16/2")
         XCTAssertLessThan(turbo4, int8, "turbo4 must be strictly below int8")
     }
+
+    // MARK: - honesty: derivability + hard model-capability limits
+
+    /// KV is derivable for confirmed arches; NOT derivable where the attention-layer count is an
+    /// unconfirmed sentinel (Nemotron `nemotron_h`) or the arch is out of scope (V4-Flash). Spec §2.1/§8.
+    func testIsKVDerivable() {
+        XCTAssertTrue(model("Qwen3-30B-A3B-2507").isKVDerivable, "uniform-GQA is derivable")
+        XCTAssertTrue(model("DeepSeek-R1").isKVDerivable, "MLA-as-implemented is derivable")
+        XCTAssertFalse(model("Nemotron-3-Ultra").isKVDerivable, "unconfirmed attn-layer count → not derivable")
+        XCTAssertFalse(model("DeepSeek-V4-Flash").isKVDerivable, "out-of-scope arch → not derivable")
+    }
+
+    /// A non-derivable model must classify as `.kvNotDerivable` — NOT a fit color built on a
+    /// one-layer under-count or a fabricated zero (the silent-wrong this tool exists to prevent).
+    func testClassify_NotDerivable_ReturnsKVNotDerivable() {
+        for id in ["Nemotron-3-Ultra", "DeepSeek-V4-Flash"] {
+            let m = model(id)
+            let prediction = CapacityModel.predictPeakBytes(
+                model: m, context: 32768, concurrency: 1, kvQuant: .fp16, profile: .m3Ultra512)
+            let verdict = CapacityModel.classify(prediction, profile: .m3Ultra512, weightsBytes: Double(m.weightsBytes4bitEstimate))
+            XCTAssertEqual(verdict.bindingConstraint, .kvNotDerivable, "\(id) KV must be flagged non-derivable, not under-counted")
+            XCTAssertEqual(verdict.color, .red, "\(id): cannot claim a fit we can't derive")
+        }
+    }
+
+    /// A context beyond the model's native max is red with `.modelNativeMax` regardless of memory —
+    /// a hard model-capability limit, not a hardware one (spec §4). Even on a 512GB box.
+    func testClassify_ContextExceedsNativeMax_BindingModelNativeMax() {
+        let m = model("Qwen3-30B-A3B-2507") // native max 262,144
+        let prediction = CapacityModel.predictPeakBytes(
+            model: m, context: 300_000, concurrency: 1, kvQuant: .fp16, profile: .m3Ultra512)
+        let verdict = CapacityModel.classify(prediction, profile: .m3Ultra512, weightsBytes: Double(m.weightsBytes4bitEstimate))
+        XCTAssertEqual(verdict.color, .red)
+        XCTAssertEqual(verdict.bindingConstraint, .modelNativeMax)
+    }
+
+    /// The default-selection advisory names `.nativeMaxBelowDefault` for a model that tops out below
+    /// 32K (Phi-4), and `nil` for one that clears it (spec §4/§8).
+    func testDefaultContextAdvisory() {
+        XCTAssertEqual(CapacityModel.defaultContextAdvisory(model("Phi-4-14B")), .nativeMaxBelowDefault)
+        XCTAssertNil(CapacityModel.defaultContextAdvisory(model("Qwen3-30B-A3B-2507")))
+    }
 }

@@ -48,6 +48,10 @@ public enum BindingConstraint: String, Sendable {
     /// The architecture's own KV formula is the wall (DeepSeek-R1 as-implemented: 152.5 GiB @32K)
     /// — no hardware on the roadmap holds it until absorbed-MLA (spec §7 backlog) ships.
     case mlaAsImplemented
+    /// The model's KV cost is NOT derivable from confirmed config (unconfirmed attention-layer
+    /// count, or an out-of-scope arch) — we cannot honestly say whether it fits. Reported instead
+    /// of a misleading under-count (spec §2.1 "do not multiply blind"; §8).
+    case kvNotDerivable
 }
 
 public enum CapacityColor: String, Sendable { case green, yellow, red }
@@ -77,6 +81,10 @@ public struct CapacityPrediction: Sendable {
     public let kvBytes: Double
     public let transientPrefillPeakBytes: Double
     public let allocatorHeadroomBytes: Double
+    /// `false` when `kvBytes` is not trustworthy (the model's attention-layer count is unconfirmed
+    /// or the arch is out of scope — `ModelArchProfile.isKVDerivable`). `classify` checks this
+    /// first and refuses to return a fit color built on an under-count.
+    public let derivable: Bool
     public var totalBytes: Double { weightsBytes + kvBytes + transientPrefillPeakBytes + allocatorHeadroomBytes }
 }
 
@@ -193,7 +201,8 @@ public enum CapacityModel {
         return CapacityPrediction(
             modelID: model.id, modelType: model.modelType, nativeMaxContext: model.nativeMaxContext,
             context: context, concurrency: concurrency, weightsBytes: weights, kvBytes: kv,
-            transientPrefillPeakBytes: transient, allocatorHeadroomBytes: allocatorHeadroomBytes
+            transientPrefillPeakBytes: transient, allocatorHeadroomBytes: allocatorHeadroomBytes,
+            derivable: model.isKVDerivable
         )
     }
 
@@ -206,6 +215,21 @@ public enum CapacityModel {
         _ prediction: CapacityPrediction, profile: SystemProfile, weightsBytes: Double,
         thresholds: CapacityThresholds = .default
     ) -> CapacityVerdict {
+        // Model-capability checks first — independent of the box:
+        // 1. A context beyond the model's native max cannot be served at all, regardless of memory.
+        if prediction.context > prediction.nativeMaxContext {
+            return CapacityVerdict(
+                color: .red, bindingConstraint: .modelNativeMax, ratio: .infinity,
+                suggestedMitigation: mitigation(for: .modelNativeMax))
+        }
+        // 2. If the KV cost isn't derivable (unconfirmed arch), refuse to build a fit color on an
+        //    under-count — say so honestly instead (spec §2.1/§8).
+        guard prediction.derivable else {
+            return CapacityVerdict(
+                color: .red, bindingConstraint: .kvNotDerivable, ratio: .nan,
+                suggestedMitigation: mitigation(for: .kvNotDerivable))
+        }
+
         let headroom = profile.hardwareHoldsBytes(
             weightsBytes: Int(weightsBytes), osReserveBytes: thresholds.osReserveBytes)
 
@@ -252,6 +276,8 @@ public enum CapacityModel {
             return "requested context exceeds the model's native max — reduce context; no hardware change helps"
         case .nativeMaxBelowDefault:
             return "model's native max is below the 32K tunable default — effective default is the native max"
+        case .kvNotDerivable:
+            return "KV cost not derivable (unconfirmed attention-layer count or out-of-scope arch) — confirm the model config before trusting any fit estimate"
         case .wiredLimit, .physicalRAM:
             return "drop KV to a lossy quant tier, then reduce concurrency, then pick a lighter-footprint model"
         }
@@ -261,6 +287,14 @@ public enum CapacityModel {
     /// (16,384 native) therefore defaults to 16K, not 32K.
     public static func effectiveDefaultContext(_ m: ModelArchProfile) -> Int {
         min(32768, m.nativeMaxContext)
+    }
+
+    /// The advisory that pairs with `effectiveDefaultContext`: `.nativeMaxBelowDefault` when the
+    /// model tops out below the 32K default (Phi-4 = 16K), else `nil`. This is surfaced by the
+    /// default-selection surface, not `classify` (which assesses memory headroom, not the
+    /// default-vs-native-max relationship) — spec §4/§8.
+    public static func defaultContextAdvisory(_ m: ModelArchProfile) -> BindingConstraint? {
+        m.nativeMaxContext < 32768 ? .nativeMaxBelowDefault : nil
     }
 
     /// `min(model.nativeMax, largest context that still fits under headroom)` — the tunable's true
