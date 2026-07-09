@@ -1,0 +1,99 @@
+import Foundation
+import HarnessCore
+
+/// `EngineDriver` that shells to `scripts/harness_reference.py` (Python mlx-lm) — the
+/// equivalence + KL reference implementation.
+///
+/// Contract parity with every other driver: `logprobs` returns full-vocab RAW LOGITS in
+/// token-id order (index == token id). Logits cross the process boundary as raw
+/// little-endian float32 `[positions x vocab]` in a temp file — exact bytes, no text
+/// round-trip precision loss — while tokens come back as small JSON on stdout.
+/// Prompts are passed as TOKEN IDS (not text), so tokenizer differences between Swift and
+/// Python cannot desynchronize the comparison; the Swift-side eos id is passed down for
+/// identical stopping semantics.
+struct ReferenceDriver: EngineDriver {
+    var pythonPath: String
+    var scriptPath: String
+    var modelPath: String
+    var eos: Int
+
+    struct Header: Decodable {
+        let tokens: [Int]
+        let positions: Int
+        let vocab: Int
+    }
+
+    enum ReferenceError: Error, CustomStringConvertible {
+        case unsupportedConfig(String)
+        case processFailed(status: Int32, stderr: String)
+        case badOutput(String)
+        var description: String {
+            switch self {
+            case .unsupportedConfig(let what): return "ReferenceDriver: unsupported config: \(what)"
+            case .processFailed(let status, let stderr): return "harness_reference.py exited \(status): \(stderr)"
+            case .badOutput(let what): return "harness_reference.py bad output: \(what)"
+            }
+        }
+    }
+
+    func generate(prompt: [Int], config: RunConfig) async throws -> RunResult {
+        let header = try run(prompt: prompt, config: config, logitsOut: nil)
+        return RunResult(tokens: header.tokens) // reference is untimed; engagement n/a
+    }
+
+    func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("harness-ref-logits-\(UUID().uuidString).f32")
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let header = try run(prompt: prompt, config: config, logitsOut: tmp.path)
+        let data = try Data(contentsOf: tmp)
+        let expectedBytes = header.positions * header.vocab * MemoryLayout<Float32>.size
+        guard data.count == expectedBytes else {
+            throw ReferenceError.badOutput("logits file is \(data.count) bytes, expected \(expectedBytes)")
+        }
+        var flat = [Float](repeating: 0, count: header.positions * header.vocab)
+        flat.withUnsafeMutableBytes { _ = data.copyBytes(to: $0) } // alignment-safe copy
+        return (0..<header.positions).map { Array(flat[$0 * header.vocab ..< ($0 + 1) * header.vocab]) }
+    }
+
+    private func run(prompt: [Int], config: RunConfig, logitsOut: String?) throws -> Header {
+        guard config.temperature == 0 else {
+            throw ReferenceError.unsupportedConfig("temperature=\(config.temperature) (reference is greedy-only)")
+        }
+        let tokensJSON = "[" + prompt.map(String.init).joined(separator: ",") + "]"
+        var args = [
+            scriptPath,
+            "--model", modelPath,
+            "--tokens-json", tokensJSON,
+            "--n", String(config.maxTokens),
+            "--eos-id", String(eos),
+        ]
+        if let logitsOut { args += ["--logits-out", logitsOut] }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonPath)
+        process.arguments = args
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        try process.run()
+        // Read both pipes to EOF before waiting, so a chatty child can't deadlock on a full pipe.
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw ReferenceError.processFailed(
+                status: process.terminationStatus,
+                stderr: String(data: errData, encoding: .utf8) ?? "<non-utf8 stderr>")
+        }
+        // stdout may carry stray library warnings before the JSON; the header is the LAST non-empty line.
+        guard let text = String(data: outData, encoding: .utf8),
+              let line = text.split(separator: "\n").last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+              let header = try? JSONDecoder().decode(Header.self, from: Data(line.utf8))
+        else {
+            throw ReferenceError.badOutput(String(data: outData, encoding: .utf8) ?? "<non-utf8 stdout>")
+        }
+        return header
+    }
+}

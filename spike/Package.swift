@@ -56,7 +56,15 @@ let package = Package(
         // Only the executable pulls in SpikeCore (MLX); SwiftEngineDriver.swift lives HERE, not in HarnessCore.
         .executableTarget(
             name: "fastmlx-harness",
-            dependencies: ["HarnessCore", "SpikeCore"],
+            dependencies: [
+                "HarnessCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
