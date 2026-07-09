@@ -88,4 +88,59 @@ public struct KLDivergenceMetric: QualityMetric {
         return medianOf(kls)
     }
 }
+// MARK: - Perplexity (Layer 2, same teacher-forced pass as KL)
+
+/// Mean negative log-likelihood in NATS of `tokens[i]` under softmax(rows[i]).
+/// Rows are raw logits (shift-invariant): NLL_i = logSumExp(row) - row[token_i].
+public func meanNLL(rows: [[Float]], tokens: [Int]) -> Double {
+    precondition(rows.count == tokens.count, "one forced token per scored row")
+    precondition(!rows.isEmpty, "no positions to score")
+    var total = 0.0
+    for (row, tok) in zip(rows, tokens) {
+        precondition(row.indices.contains(tok), "forced token id \(tok) outside vocab \(row.count)")
+        let m = Double(row.max() ?? 0)
+        let logZ = m + log(row.reduce(0.0) { $0 + exp(Double($1) - m) })
+        total += logZ - Double(row[tok])
+    }
+    return total / Double(rows.count)
+}
+
+/// Pooled teacher-forced perplexities: exp(total NLL / total forced positions) across all
+/// prompts, for candidate and reference from the SAME forward pass (same forced continuation).
+public struct PerplexityPair: Sendable {
+    public let candidate: Double
+    public let reference: Double
+    public init(candidate: Double, reference: Double) {
+        self.candidate = candidate; self.reference = reference
+    }
+    /// The dial's instrument: relative ppl delta, gate "<= 1%" i.e. 0.01. 0 = parity;
+    /// negative = candidate assigns the reference's continuation HIGHER likelihood.
+    public var relativeDelta: Double { (candidate - reference) / reference }
+}
+
+public func teacherForcedPerplexities(
+    driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig
+) async throws -> PerplexityPair {
+    var candTotal = 0.0, refTotal = 0.0, positions = 0
+    for p in prompts {
+        let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: p, config: config)
+        let n = Double(s.continuation.count)
+        candTotal += meanNLL(rows: s.candidateRows, tokens: s.continuation) * n
+        refTotal += meanNLL(rows: s.referenceRows, tokens: s.continuation) * n
+        positions += s.continuation.count
+    }
+    return PerplexityPair(
+        candidate: exp(candTotal / Double(positions)),
+        reference: exp(refTotal / Double(positions)))
+}
+
+/// Relative perplexity delta of the candidate vs the reference over the reference's greedy
+/// continuation (teacher-forced, pooled across prompts). Lower = closer; the dial gates on 1%.
+public struct PerplexityMetric: QualityMetric {
+    public let name = "ppl_delta"; public init() {}
+    public func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double {
+        try await teacherForcedPerplexities(driver: driver, reference: reference, prompts: prompts, config: config).relativeDelta
+    }
+}
+
 func softmax(_ x: [Float]) -> [Float] { let m = x.max() ?? 0; let e = x.map { expf($0 - m) }; let s = e.reduce(0,+); return e.map { $0/s } }

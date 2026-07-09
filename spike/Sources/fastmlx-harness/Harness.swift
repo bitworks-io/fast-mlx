@@ -206,6 +206,7 @@ func runKL(_ flags: Flags) async {
         print("# TEACHER-FORCED: both sides score the reference's greedy continuation, so every position is context-locked.")
 
         var allKLs: [Double] = []
+        var candNLLTotal = 0.0, refNLLTotal = 0.0, totalPositions = 0
         var spotChecked = false
         for (text, prompt) in zip(klPrompts, prompts) {
             // teacherForcedScores + perPositionKLs + medianOf ARE KLDivergenceMetric's own
@@ -229,6 +230,12 @@ func runKL(_ flags: Flags) async {
             // the reference did, given the reference's context? (Top-1 agreement, not a gate.)
             let agree = zip(s.candidateRows.map(argmaxIndex), s.continuation).filter(==).count
             allKLs.append(contentsOf: kls)
+            // Perplexity pools NLL over positions from the SAME rows (identical math to
+            // teacherForcedPerplexities — one forward pass serves both metrics).
+            let n = Double(s.continuation.count)
+            candNLLTotal += meanNLL(rows: s.candidateRows, tokens: s.continuation) * n
+            refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.continuation) * n
+            totalPositions += s.continuation.count
             print("prompt \(String(reflecting: text)): forced-positions=\(kls.count), top1-agreement=\(agree)/\(s.continuation.count), median KL=\(sci(medianOf(kls)))")
         }
 
@@ -236,6 +243,13 @@ func runKL(_ flags: Flags) async {
         let p95 = allKLs[min(Int(Double(allKLs.count - 1) * 0.95), allKLs.count - 1)]
         print("kl_median (KLDivergenceMetric, teacher-forced, all \(allKLs.count) positions): \(sci(medianOf(allKLs))) nats")
         print("kl_p95    (teacher-forced, all positions): \(sci(p95)) nats")
+
+        let pplPair = PerplexityPair(
+            candidate: exp(candNLLTotal / Double(totalPositions)),
+            reference: exp(refNLLTotal / Double(totalPositions)))
+        print("ppl_candidate (teacher-forced, pooled \(totalPositions) positions): \(fmt(pplPair.candidate, 4))")
+        print("ppl_reference (its own greedy continuation): \(fmt(pplPair.reference, 4))")
+        print("ppl_delta (PerplexityMetric): \(String(format: "%+.2f%%", pplPair.relativeDelta * 100)) (dial gate: <= 1%)")
     } catch {
         print("kl FAILED: \(error)")
         exit(1)
