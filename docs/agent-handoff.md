@@ -1,65 +1,60 @@
 # Agent Handoff
 
-Last reviewed: YYYY-MM-DD
+Last reviewed: 2026-07-09
 
-This document is intended for Codex, Claude Code, or another implementation agent taking over the project. Keep it current when architecture, workflows, verification commands, deployment/release steps, operational assumptions, security posture, or known risks change.
+For the next Codex/Claude Code/human agent. Decision-focused; links to the durable specs rather than duplicating them.
 
 ## Project Purpose
 
-Describe what this project does, who uses it, and the production or operational context that matters.
+**fast-mlx** — the fastest, most-optimized MLX inference platform for Apple Silicon, superseding the incumbent Zig `mlx-serve`. A Swift engine + macOS app + Python train/research plane + an engine-agnostic conformance/precision-loss harness. The product wedge is the **optimization dial with quantified precision loss** ("dial in speed, see exactly what accuracy you trade"); the moat is the **technique-integration flywheel** (absorb a new inference technique → measure its speed↔quality frontier → promote to a dial tier or shelve with a dated negative result). First production deployment: **Concierge** (bitworks' shopping assistant). Dev/bench box: **M5 Max 128GB** (`llmbench@192.168.1.252`); production target up to M3 Ultra 512GB. Full design: [`docs/superpowers/specs/2026-07-08-fast-mlx-platform-design.md`](superpowers/specs/2026-07-08-fast-mlx-platform-design.md).
 
-## Current Feature Set
+## Current state (2026-07-09)
 
-- List the major user-facing and operator-facing capabilities that exist today.
-- Note important feature flags, integrations, platform support, or intentionally unsupported behavior.
+**Shipped to `main`:**
+- **Engine seed** (`spike/`): compiled decode core (`CompiledMLXDecoder` + `CompiledKVCache`) at 155.4 tok/s (≥ Zig), single-owner `InferenceActor`, Swift 6 strict-concurrency clean.
+- **The harness spine** (`HarnessCore`, pure/Foundation): equivalence+engagement+acceptance triad, teacher-forced KL + perplexity + long-context tail-p95, versioned corpus (incl. a 24,151-token entry), provenance/JSONL. Established baseline: **4-bit affine KV vs bf16 = tail-p95 1.665 nats @24K, ppl +21.4%**.
+- **System-aware context operability**: the per-arch KV **capacity memory model** (`HarnessCore/CapacityModel.swift` — dispatches KV/token by `model_type`; naive formula is wrong 4×–71× for hybrid-linear/SWA/MLA/Mamba2), the `SystemProfiler` (real host introspection, MLX-free), and the **`fastmlx-capacity` CLI** (`swift run fastmlx-capacity [--box …]`). Spec: [`2026-07-09-system-aware-context-operability.md`](superpowers/specs/2026-07-09-system-aware-context-operability.md). Catalog (context caps + memory + Nemotron-3-Ultra/Ornith resolved) in platform spec §9.
 
-## User Stories And Acceptance Evidence
+**In flight — `feat/turboquant` branch (NOT merged):** implementing Google TurboQuant KV-quant (the flywheel's first novel technique) per [`docs/superpowers/plans/2026-07-09-turboquant-kv-quant.md`](superpowers/plans/2026-07-09-turboquant-kv-quant.md).
+- **Phase 1A + 1B COMPLETE + reviewed** (commits `7f85f67`→`e094c60`): `LloydMaxCodebook` (pure, matches paper constants); the MLX quantizer core (`SpikeCore/TurboQuant/{TurboQuantParams,TurboQuantCodec}.swift`) — Haar Π + Lloyd-Max LUT + QJL residual + `TurboQuantTier{tqB2,tqB3}`. **Spike A (make-or-break) PASSED**: the codec reproduces the paper's Theorem-2 distortion table (d·D_prod 0.175/0.0514 vs paper 0.18/0.047), unbiasedness slope 0.9959, correlated-regime margin 2.855×. 13 SpikeCoreTests green on-box. Spike A resolution recorded in [`docs/reference/turboquant-algorithm.md`](reference/turboquant-algorithm.md#spike-a-resolution).
 
-Use this table for durable scenario coverage. Keep it focused on the workflows a user, operator, customer, or maintainer would expect to keep working.
-
-| Story | Acceptance Criteria | Automated Proof | Manual/Smoke Proof | Last Verified | Gaps |
-| --- | --- | --- | --- | --- | --- |
-| As a user/operator, I need ... | Observable outcome, including key edge or failure behavior. | Command, test, or CI check. | Browser, simulator, hosted smoke, screenshot, log, or artifact check. | YYYY-MM-DD | Known skipped checks or residual risk. |
+### ▶ RESUME HERE — TurboQuant Phase 2 (next)
+On `feat/turboquant`, per the plan's Phase 2/3:
+1. **Task 6a (do first — flagged by Phase 1B):** the codec is proven for **unit-norm** inputs; real K/V vectors are not unit-norm. Extend the codec to store per-vector `‖x‖` and normalize before quantize / rescale on dequant (paper §1.1 approach), with a non-unit-norm round-trip test.
+2. **Task 6:** `TurboQuantKVCache` — store `(idx, signs, γ, ‖x‖)` per token, dequant-on-read → materialize K/V (materialize-then-attend); parallel `CompiledKVCache`, keep fixed-shape/chunked buffers, apply the 8 GiB `Memory.cacheLimit` bound.
+3. **Task 7:** wire into the decode path behind the `tqB2`/`tqB3` tier; lossy-triad equivalence on a **real Qwen3-32B checkpoint** (non-crash + short-prefix + canary + engagement-delta).
+4. **Task 8 (Phase 3):** measure `tqB2`/`tqB3` KL/ppl/tail-p95 vs bf16 on corpus v2 + KV bytes/token; **promote to a dial tier iff it beats the 1.665@24K baseline at smaller KV size, else shelve** with a dated negative result. Then a content-library piece.
+- Route Phase 2+ to **deep-reasoner (fable)** — engine/MLX-coupled. Fresh session recommended (this one is long).
 
 ## Key Components
 
-- `path/or/module`: describe its responsibility and key contracts.
-- `path/or/module`: describe external dependencies, data ownership, or operational assumptions.
+- `spike/Sources/SpikeCore/` — the MLX engine (decode core, KV caches, TurboQuant codec). **Non-Sendable MLX state is actor-confined** (`MLXArray` is a non-Sendable class; `@unchecked`/`nonisolated(unsafe)` are BANNED).
+- `spike/Sources/HarnessCore/` — **pure, Foundation-only** (no MLX): triad, quality metrics, corpus, provenance, `CapacityModel`/`ModelArchProfile`/`SystemProfile`, `LloydMaxCodebook`. Builds+tests off-box.
+- `spike/Sources/SystemProfiler/` — Metal+Darwin host introspection (MLX-free). `spike/Sources/fastmlx-capacity/` — the capacity CLI.
+- `spike/Sources/fastmlx-harness/` — the measurement CLI (`verify`/`bench`/`kl`) + `SwiftEngineDriver` (MLX). `scripts/harness_reference.py` — the bf16 Python reference.
 
-## Local And Hosted Test Commands
-
-```sh
-# Narrow checks first
-```
+## Test Commands
 
 ```sh
-# Broader checks, browser/simulator/integration checks, or hosted smoke tests
+# Off-box (this host / FluffyMBA) — pure HarnessCore + capacity CLI:
+cd spike && swift test --filter HarnessCoreTests
+swift run fastmlx-capacity --box m3Ultra512
 ```
+```sh
+# On-box (llmbench) — anything importing MLX (SpikeCore, the engine). swift test CANNOT load the MLX metallib; xcodebuild is required:
+bash spike/scripts/sync_llmbench.sh
+ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
+```
+Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit + bf16 reference staged). Python: `~/harness-venv` (transformers<5).
 
-## Review Findings
+## Known Risks / Open Items
 
-- Summarize recent implementation reviews, acceptance passes, bug fixes, and unresolved observations.
-- Include dates and environments when useful.
-- Link to or summarize relevant entries from `docs/verification-evidence.md` when they explain what was actually proven.
+- **TurboQuant norm handling** (Phase 2 Task 6a, above) — the one correctness gap before the cache is built.
+- **Model routing:** haiku=scout, sonnet=builder, opus=main/judgment, fable=deep-reasoner; always pass `model` explicitly; re-route UP one tier on failure. Engine/MLX-coupled work → deep-reasoner (builders have escalated on it).
+- **cacheLimit invariant:** whenever `iogpu.wired_limit_mb` is raised, set an explicit `Memory.cacheLimit` (never the 1.5× default — the "7K wall" mechanism). Policy: `CapacityModel.recommendedCacheLimitBytes`.
+- **Backlog** (`docs/task-inbox/`): absorbed-MLA KV cache (71× DeepSeek-R1 lever, unbuilt); chunked-prefill capacity measurement gate; runtime admission control.
+- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 4 pieces so far.
 
-## Security Posture
+## Commit / Checkin
 
-- Record auth, permission, input-validation, secrets, telemetry, dependency, and data-retention considerations.
-- Note known threat model boundaries and checks that must be rerun for risky changes.
-
-## Operational Notes
-
-- Document recurring jobs, queues, background workers, observability, deployment assumptions, rollback steps, and local-only escape hatches.
-- Call out files that are intentionally local, generated, or excluded from release artifacts.
-
-## Context Handoff Hygiene
-
-- Keep durable context short and decision-focused: current architecture, contracts, operational assumptions, verification commands, known risks, and unresolved blockers.
-- Link to detailed logs, screenshots, traces, reports, or release artifacts instead of pasting bulky output.
-- Move exploratory notes, abandoned approaches, and raw command output out of this document unless they explain a current risk or decision.
-- When a chat grows long, summarize only the accepted decisions, changed files, verification evidence, and remaining work needed for the next agent to continue safely.
-
-## Commit And Release Guidance
-
-- Document version bump rules, generated artifacts, release packaging, deployment smoke tests, and checkin boundaries.
-- Note any multi-repo coordination rules or files that should not be committed.
+Docs → `main`. Features → branch, merge `--no-ff` after verification. Commit messages end with a `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` trailer. Never commit secrets, runtime cache paths, or machine-local state.
