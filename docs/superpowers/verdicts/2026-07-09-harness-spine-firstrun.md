@@ -117,3 +117,53 @@ $BIN kl     --model ~/perf-work/models/Qwen3-32B-4bit --reference-model ~/perf-w
 Pure-core tests: `cd spike && swift test --filter HarnessCoreTests` → 14/14 pass (off-box).
 Swift 6 strict concurrency clean; zero `@unchecked Sendable` / `nonisolated(unsafe)` (one
 sanctioned `sending` model transfer into the engine actor, as in the spike).
+
+---
+
+## Addendum (2026-07-09, harness-hardening follow-on): the real vs-fp16 long-context baseline
+
+The two caveats above — INT8-as-proxy reference and a short-prompt corpus — are now closed
+(commits `a7c3cd9`..`90c97d5`; findings resolution in the hardening plan). The ~7K-context
+SIGKILL that capped long-context measurement was root-caused to an O(context²) MLX
+allocator-cache blowup in BOTH measurement processes (NOT a `CompiledMLXDecoder`/
+`CompiledKVCache` limit — the compiled serving path was never the problem) and fixed with
+chunked teacher-forced scoring + an 8GB allocator-cache bound on both sides.
+
+**Run 3 — the dial's contract measurement: Qwen3-32B-4bit (candidate) vs Qwen3-32B-bf16
+(true fp16-class reference), teacher-forced, corpus `measurement-corpus-v2`** (3 short
+entries × 24 positions + 5,338-token and 24,151-token natural-prose entries × 128 sampled
+positions). Evidence: `harness-evidence-2026-07-09-hardening.jsonl` (real git SHA now
+recorded).
+
+| stat | same-weights floor (4bit vs 4bit) | 4-bit vs bf16 |
+|---|---|---|
+| kl_median (short entries) | 1.342e-03 nats | **1.945e-01 nats** (~145× floor) |
+| kl_long_context_tail_p95 (headline) | 4.182e-03 nats | **1.665e+00 nats** (~400× floor) |
+| — long entry p95 @ 5,338 tok | 1.835e-03 | 3.115e-01 |
+| — long entry p95 @ 24,151 tok | 4.182e-03 | 1.665e+00 |
+| — long entry median @ 24,151 tok | 9.147e-04 | 1.337e-01 |
+| ppl_delta (pooled 328 positions) | −0.01% | **+21.37%** |
+| top-1 agreement (short entries) | 24/24 all | 17–20/24 |
+
+Reading it: 4-bit weight quantization loss **accrues with context** (tail p95 0.31 → 1.67
+nats from 5.3K → 24K tokens; at 24K even the *median* clears the floor at 0.134 nats) and
+lives in the tail — the new `kl_long_context_tail_p95` headline captures what the old median
+headline read as sub-noise. This is the baseline row TurboQuant's 2-bit KV tier will be
+measured against, on the same instrument.
+
+**Memory profile** (M5 Max 128GB, `iogpu.wired_limit_mb=117760`): Swift candidate ~18GB
+resident during scoring (peak 33.8GB at a 32K-token probe, allocator cache pinned at 8GB);
+bf16 Python reference at 24,151 tokens: 64.8GB max RSS / 81.3GB peak footprint
+(`/usr/bin/time -l`), 52s wall. Peak co-residency ~106GB — inside physical RAM, zero jetsam
+events (the pre-fix runs produced JetsamEvent reports at 112GB+88GB).
+
+**Max context now demonstrated:** measurement path 32,768 tokens in 78s (33.8GB peak);
+compiled serving path 32,768-token prefill + decode (39.4GB peak, coherent tokens). Headroom
+at 128GB RAM extends to ~64K–128K (KV cache is the only per-token active cost:
+~0.26MB/token for Qwen3-32B fp16 KV).
+
+**Perf/equivalence preserved after the fix:** `verify` exact triad PASS (60/60 identical
+prefix, temp=0); `bench` Qwen3-30B-A3B-Instruct-2507-4bit decode **155.41 tok/s**
+(155.35–155.47 across 3 runs, ttft 54ms) — the compiled-step + no-sync-readback path is
+untouched by construction (scoring is a separate measurement path). Swift 6 strict
+concurrency clean; zero `@unchecked Sendable` / `nonisolated(unsafe)`.
