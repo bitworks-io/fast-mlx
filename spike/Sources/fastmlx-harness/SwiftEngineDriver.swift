@@ -81,37 +81,51 @@ actor HarnessEngineActor {
     /// free-running variant (plain forward, fresh cache) — the perf path's compiled-step +
     /// no-sync-readback design lives untouched in `generate`.
     func teacherForcedLogprobs(prompt: [Int], forced: [Int]) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: nil)
+    }
+
+    /// Sampled variant: same chunked forward over the full forced continuation (causal decoding
+    /// requires every intermediate token as context regardless), but only converts+keeps a
+    /// full-vocab row at `positions` — a long-context entry can be thousands of positions, and
+    /// materializing every row would be ~0.6MB/row x thousands x 2 drivers. `positions` must be
+    /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
+    func teacherForcedLogprobsAtPositions(prompt: [Int], forced: [Int], positions: [Int]) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: positions)
+    }
+
+    /// CHUNKED teacher-forced scoring (`forcedScoringPlan` in HarnessCore holds the pure
+    /// bookkeeping): multi-token chunk forwards instead of one forward per forced token.
+    ///
+    /// WHY (the ~7K-context SIGKILL root cause): single-token stepping makes every step's
+    /// transient buffers slightly LARGER than the last step's (the stock cache returns growing
+    /// K/V slices), so MLX's buffer cache can never reuse a freed buffer and grows as
+    /// O(context²) — measured 43GB of dead cache (active flat at 17GB) by position 6750 on
+    /// Qwen3-32B-4bit, which, with the Python reference process ballooning identically, is
+    /// exactly the ~6.7–7.1K jetsam SIGKILL ceiling the harness hit. Chunk forwards keep
+    /// transients same-shaped chunk to chunk (cache reuse works, memory stays flat) and score
+    /// at prefill speed instead of decode speed. The per-chunk `eval` bounds the lazy graph so
+    /// pending work cannot pile up across chunks.
+    private func scoreForced(prompt: [Int], forced: [Int], wanted: [Int]?) -> [[Float]] {
         let cache = model.newCache(parameters: nil)
+        let input = prompt + forced.dropLast()
+        let plan = forcedScoringPlan(
+            promptCount: prompt.count, forcedCount: forced.count,
+            wantedPositions: wanted, chunkSize: Self.scoringChunkSize)
         var rows: [[Float]] = []
-        var y = MLXArray(prompt).reshaped([1, prompt.count])
-        for tok in forced {
-            let logits = model(y, cache: cache)
-            rows.append(logits[0..., -1, 0...].asType(.float32).asArray(Float.self))
-            y = MLXArray([tok]).reshaped([1, 1])
+        for chunk in plan.chunks {
+            let ids = MLXArray(Array(input[chunk.inputRange])).reshaped([1, chunk.inputRange.count])
+            let logits = model(ids, cache: cache)
+            eval(logits)
+            for sel in chunk.rows {
+                rows.append(logits[0..., sel.localIndex, 0...].asType(.float32).asArray(Float.self))
+            }
         }
         return rows
     }
 
-    /// Sampled variant: runs the SAME forward loop over the full forced continuation (causal
-    /// decoding requires every intermediate token as context regardless), but only converts+keeps
-    /// a full-vocab row at `positions` — a long-context entry can be thousands of positions, and
-    /// materializing every row would be ~0.6MB/row x thousands x 2 drivers. `positions` must be
-    /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
-    func teacherForcedLogprobsAtPositions(prompt: [Int], forced: [Int], positions: [Int]) -> [[Float]] {
-        let wanted = Set(positions)
-        let cache = model.newCache(parameters: nil)
-        var rows: [[Float]] = []
-        rows.reserveCapacity(positions.count)
-        var y = MLXArray(prompt).reshaped([1, prompt.count])
-        for (i, tok) in forced.enumerated() {
-            let logits = model(y, cache: cache)
-            if wanted.contains(i) {
-                rows.append(logits[0..., -1, 0...].asType(.float32).asArray(Float.self))
-            }
-            y = MLXArray([tok]).reshaped([1, 1])
-        }
-        return rows
-    }
+    /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
+    /// against forward-call count; matches mlx-lm's default prefill step size.
+    private static let scoringChunkSize = 512
 }
 
 /// In-process `EngineDriver` over the compiled decode core — the only MLX-touching harness impl.
@@ -163,6 +177,13 @@ struct SwiftEngineDriver: EngineDriver {
 /// actor init — detaching it from the region that transfers — so CPU-side encode/decode stays
 /// usable afterward (same region discipline as the spike's `loadActor`).
 func loadSwiftDriver(modelPath: String) async throws -> (driver: SwiftEngineDriver, tokenizer: MLXLMCommon.Tokenizer, eos: Int) {
+    // Bound MLX's buffer cache for the measurement process. The default cache limit tracks the
+    // (raised) GPU memory limit, so unreusable transients can hoard tens of GB before anything
+    // evicts — and the harness runs a Python reference process with its own allocator on the
+    // same box. 8GB is far above any measurement path's steady-state reuse working set (decode
+    // transients are MBs; a scoring chunk's logits are ~150MB) but keeps two co-resident
+    // processes comfortably inside physical RAM. harness_reference.py sets the same bound.
+    Memory.cacheLimit = 8 << 30
     let ctx = try await loadModel(
         from: URL(fileURLWithPath: modelPath),
         using: #huggingFaceTokenizerLoader()

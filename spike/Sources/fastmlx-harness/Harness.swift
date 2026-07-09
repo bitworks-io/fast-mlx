@@ -449,6 +449,7 @@ struct Harness {
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
         case "kl": await runKL(flags)
+        case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
             exit(2)

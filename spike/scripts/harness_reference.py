@@ -75,6 +75,12 @@ def main() -> None:
     if args.sample_positions and not args.force_tokens:
         ap.error("--sample-positions requires --force-tokens")
 
+    # Bound the allocator's buffer cache. The default limit tracks the (raised) GPU memory
+    # limit, so unreusable transients can hoard tens of GB before anything evicts — this
+    # process runs co-resident with the Swift harness on the same box, and their combined
+    # ballooning was the harness's ~7K-context jetsam SIGKILL. Mirrors the Swift side's bound.
+    mx.set_cache_limit(8 << 30)
+
     model, tok = load(args.model)
     ids = json.loads(args.tokens_json) if args.tokens_json else tok.encode(args.prompt)
     force = json.loads(args.force_tokens) if args.force_tokens else None
@@ -86,13 +92,27 @@ def main() -> None:
     vocab = None
     y = mx.array(ids)[None]
     if force is not None:
-        for i, t in enumerate(force):
-            logits = model(y, cache=cache)[:, -1, :]  # [1, vocab] raw logits
+        # CHUNKED teacher-forced scoring (mirrors SwiftEngineDriver.scoreForced): the row for
+        # forced position k is the model output at input index len(ids)-1+k over the full input
+        # ids + force[:-1], so multi-token chunk forwards produce every row directly. Single-token
+        # stepping made each step's transients slightly larger than the last (growing K/V
+        # slices), so the buffer cache could never reuse a freed buffer and grew O(context^2) —
+        # the other half of the ~7K jetsam ceiling. Chunks keep transients same-shaped (reused),
+        # and score at prefill speed. 512 matches mlx-lm's default prefill step size.
+        CHUNK = 512
+        p = len(ids)
+        full = list(ids) + [int(t) for t in force[:-1]]
+        for a in range(0, len(full), CHUNK):
+            b = min(a + CHUNK, len(full))
+            logits = model(mx.array(full[a:b])[None], cache=cache)  # [1, b-a, vocab] raw logits
+            mx.eval(logits)  # bound the lazy graph chunk by chunk
             vocab = int(logits.shape[-1])
-            if rows is not None and (sample_positions is None or i in sample_positions):
-                rows.append(np.array(logits.astype(mx.float32)).reshape(-1))
-            out_tokens.append(int(t))  # echo the FORCED id: it is position k's context-builder
-            y = mx.array([[int(t)]])
+            if rows is not None:
+                for li in range(a, b):
+                    pos = li - (p - 1)
+                    if 0 <= pos < len(force) and (sample_positions is None or pos in sample_positions):
+                        rows.append(np.array(logits[:, li - a, :].astype(mx.float32)).reshape(-1))
+        out_tokens = [int(t) for t in force]  # echo the FORCED ids: they are the context-builders
     else:
         for _ in range(args.n):
             logits = model(y, cache=cache)[:, -1, :]  # [1, vocab] raw logits
