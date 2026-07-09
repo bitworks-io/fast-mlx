@@ -1,2 +1,4 @@
 CLAUDE.local.md
 .agent-reports/
+# SwiftPM build artifacts (local `swift test` runs in spike/)
+.build/
