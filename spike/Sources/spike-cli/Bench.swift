@@ -6,7 +6,7 @@ import SpikeCore
 /// warmup and its rate is dropped; each run's prompt is salted with a unique nonce so
 /// the KV cache / tokenizer can't trivially reuse a cached run; rate is computed from the
 /// live token stream timestamps (DecodeMetrics), not from any self-reported usage field.
-func bench(modelPath: String, prompt: String, maxTokens: Int, runs: Int) async {
+func bench(modelPath: String, prompt: String, maxTokens: Int, runs: Int, engine: Engine) async {
     #if DEBUG
     print("bench FAILED: Debug build — perf numbers are meaningless. Build with -configuration Release.")
     exit(1)
@@ -18,7 +18,7 @@ func bench(modelPath: String, prompt: String, maxTokens: Int, runs: Int) async {
         // twice — see InferenceActor.resetForNewRun() / MLXDecoder.reset(). This also
         // means runs don't see each other's tokens as false KV-cache history.
         let (model, tokenizer, eosId) = try await loadModelAndTokenizer(modelPath: modelPath)
-        let actor = InferenceActor(decoder: MLXDecoder(model: model, cache: model.newCache(parameters: nil)))
+        let actor = makeActor(model: model, engine: engine)
         let nonce = Int.random(in: 0..<1_000_000)
 
         var decodeRates: [Double] = []
@@ -58,9 +58,9 @@ func bench(modelPath: String, prompt: String, maxTokens: Int, runs: Int) async {
         let avgRate = decodeRates.reduce(0, +) / Double(decodeRates.count)
         let avgTtft = ttfts.reduce(0, +) / Double(ttfts.count)
 
-        print("model,quant,max_tokens,runs,decode_tok_s_avg,ttft_ms_avg")
+        print("model,engine,max_tokens,runs,decode_tok_s_avg,ttft_ms_avg")
         let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
-        print("\(modelName),n/a,\(maxTokens),\(runs),\(String(format: "%.2f", avgRate)),\(String(format: "%.1f", avgTtft * 1000))")
+        print("\(modelName),\(engine.rawValue),\(maxTokens),\(runs),\(String(format: "%.2f", avgRate)),\(String(format: "%.1f", avgTtft * 1000))")
     } catch {
         print("bench FAILED: \(error)")
         exit(1)

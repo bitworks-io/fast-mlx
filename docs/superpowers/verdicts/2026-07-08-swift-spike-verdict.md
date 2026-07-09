@@ -210,3 +210,26 @@ mlx-swift call path) or a fixed cost to accept.
 - Checkpoint: if a focused optimization pass can't get the fast-MoE within ~15% AND the dense models aren't near-parity, revisit. Otherwise Swift stands.
 
 **Net:** the language decision holds. Proceed to author the harness-spine + engine plans in Swift; fold the host-overhead optimization into the engine's first perf milestone.
+
+## RESOLVED 2026-07-09 — gap closed, GO (unconditional on perf)
+
+The host-overhead optimization succeeded. **Swift now reaches parity-and-slightly-ahead of Zig on the worst-case model**, with the host tax eliminated.
+
+| Config | decode tok/s | ms/step | vs same-session Zig 153.65 |
+|---|---|---|---|
+| Swift baseline (re-confirmed) | 127.1 | 7.81 (submit 6.70 + readback 1.11) | −17.3% |
+| Python mlx-lm 0.31.3 (calibration) | 148.2 | 6.75 | −3.5% |
+| Zig `mlx-serve`, fresh same-session | 153.65 | 6.51 | — |
+| **Swift + compiled decode step** | **155.5** (155.50/155.52/155.59; 155.58 head-to-head) | 6.32 (submit 6.32 + readback **0.00**) | **+1.3%** |
+
+vs archived Zig (151.8): **+2.5%**. Honest framing: session-to-session Zig moves ~1%, so this is **parity, edging ahead this session** — and the *durable* result is that **the host-loop overhead is gone: decode is now GPU-bound** (decode-thread CPU ~3.8ms against a 6.32ms GPU step → ~2.5ms/step headroom).
+
+**The lever:** `MLX.compile` of the single-token decode step — trace the forward graph once, replay the cached graph per token. **The hypothesis in the diagnosis above was WRONG (recorded for honesty):** Instruments showed the 6.7ms was **not** Swift ARC (`swift_retain/release` ~0.2%) — it was **81.7% in C++ `mlx_async_eval → eval_impl`** (per-token graph re-traversal + synchronous Metal kernel re-encoding of ~2k lazy nodes), 17.6% Swift graph construction. Compiling the step eliminates exactly that. So **Swift itself was never the bottleneck** — the per-token graph rebuild was, and it's a general MLX cost that compilation removes.
+
+**Original engineering required** (mlx-lm has *no* compiled step to copy — its `generate_step` rebuilds the graph per token): a new **`CompiledKVCache`** that keeps all per-step state in-graph (fixed `[1,kvHeads,capacity,headDim]` buffers, in-graph int32 offset advance, `putAlong` scatter update, `mlx_fast_rope_dynamic`, boolean-mask attention over the fixed buffer), chunked (256) growth → one retrace per chunk, `resetInPlace()` reusing array identities so bench runs never retrace. Plus **`CompiledMLXDecoder`** (compiled step around the stock `Qwen3MoEModel` forward + in-graph argmax; uncompiled prefill; submit-first lookahead retained). **This compiled decode path is the real engine's decode core.**
+
+**Invariants re-verified this session:** temp=0 equivalence PASS (dense Qwen3-4B 40/40, target MoE 60/60, 3 reset rounds byte-identical, baseline regression still 127.35); Swift 6 strict concurrency clean, **zero unsafe escape hatches** (one sanctioned `sending` param); no-sync-readback retained (readback now 0.00ms). New `CompiledKVCacheTests`; all 4 suites pass.
+
+**Residual (future levers, ~1–3% each; not blocking):** one-time ~300ms trace+compile on first request + per 256-token chunk growth (absorb in warmup); masked full-buffer SDPA reads `capacity` not valid-length (~0.1ms@512); `ensure_row_contiguous_matrix` copies in GatherQMM (~3% thread CPU). **Open:** re-measure on dense Qwen3-32B (Concierge's production model — expected easier; same engine path applies unchanged).
+
+**Verdict upgraded: GO.** Swift is validated on both axes — safety (Claude-authored + limited review: strict-concurrency clean, compiler caught a real bug) and performance (≥ Zig, GPU-bound) — on the hardest model.

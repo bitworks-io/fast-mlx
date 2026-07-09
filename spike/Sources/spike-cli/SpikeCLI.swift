@@ -28,15 +28,32 @@ struct Flags {
     func int(_ key: String, default def: Int) -> Int { values[key].flatMap(Int.init) ?? def }
 }
 
+/// Engine selector: `baseline` = per-token lazy graph build (MLXDecoder),
+/// `compiled` = MLX.compile'd decode step (CompiledMLXDecoder).
+enum Engine: String {
+    case baseline
+    case compiled
+}
+
 /// Loads model + tokenizer and builds a ready-to-submit InferenceActor + eos id.
 /// Bind the (Sendable) tokenizer into its own local before constructing the decoder:
-/// MLXDecoder captures ctx.model (a non-Sendable class ref) and is `sending` into the
+/// the decoder captures ctx.model (a non-Sendable class ref) and is `sending` into the
 /// actor init, which merges ctx's whole region into the actor's isolation. Detaching
 /// `tokenizer` first keeps CPU-side encode/decode usable afterward without a race.
-func loadActor(modelPath: String) async throws -> (actor: InferenceActor, tokenizer: MLXLMCommon.Tokenizer, eos: Int) {
+func loadActor(modelPath: String, engine: Engine) async throws -> (actor: InferenceActor, tokenizer: MLXLMCommon.Tokenizer, eos: Int) {
     let (model, tokenizer, eosId) = try await loadModelAndTokenizer(modelPath: modelPath)
-    let actor = InferenceActor(decoder: MLXDecoder(model: model, cache: model.newCache(parameters: nil)))
+    let actor = makeActor(model: model, engine: engine)
     return (actor, tokenizer, eosId)
+}
+
+func makeActor(model: sending any LanguageModel, engine: Engine) -> InferenceActor {
+    switch engine {
+    case .baseline:
+        return InferenceActor(
+            decoder: MLXDecoder(model: model, cache: model.newCache(parameters: nil)))
+    case .compiled:
+        return InferenceActor(decoder: CompiledMLXDecoder(model: model))
+    }
 }
 
 /// Loads model + tokenizer once, without pinning a cache/actor to it — used by `bench`,
@@ -54,9 +71,9 @@ func loadModelAndTokenizer(modelPath: String) async throws -> (model: any Langua
     return (ctx.model, tokenizer, eosId)
 }
 
-func runPrompt(modelPath: String, prompt: String, maxTokens: Int) async {
+func runPrompt(modelPath: String, prompt: String, maxTokens: Int, engine: Engine) async {
     do {
-        let (actor, tokenizer, eosId) = try await loadActor(modelPath: modelPath)
+        let (actor, tokenizer, eosId) = try await loadActor(modelPath: modelPath, engine: engine)
         let promptTokens = tokenizer.encode(text: prompt)
         for try await id in await actor.submit(promptTokens: promptTokens, maxTokens: maxTokens, eos: eosId) {
             print(tokenizer.decode(tokenIds: [id], skipSpecialTokens: true), terminator: "")
@@ -70,17 +87,23 @@ func runPrompt(modelPath: String, prompt: String, maxTokens: Int) async {
 
 /// Dumps the first-N greedy token ids as a JSON array, for diffing against
 /// scripts/reference_tokens.py (Python mlx-lm, the equivalence reference).
-func equiv(modelPath: String, prompt: String, n: Int) async {
+/// With `rounds > 1`, repeats generation on the SAME actor via resetForNewRun()
+/// between rounds — proving the reset + (for the compiled engine) in-place cache
+/// reset + compiled-graph replay reproduce identical greedy tokens.
+func equiv(modelPath: String, prompt: String, n: Int, engine: Engine, rounds: Int = 1) async {
     do {
-        let (actor, tokenizer, eosId) = try await loadActor(modelPath: modelPath)
+        let (actor, tokenizer, eosId) = try await loadActor(modelPath: modelPath, engine: engine)
         let promptTokens = tokenizer.encode(text: prompt)
-        var ids: [Int] = []
-        for try await id in await actor.submit(promptTokens: promptTokens, maxTokens: n, eos: eosId) {
-            ids.append(id)
-            if ids.count >= n { break }
+        for round in 0 ..< max(rounds, 1) {
+            if round > 0 { await actor.resetForNewRun() }
+            var ids: [Int] = []
+            for try await id in await actor.submit(promptTokens: promptTokens, maxTokens: n, eos: eosId) {
+                ids.append(id)
+                if ids.count >= n { break }
+            }
+            let data = try JSONEncoder().encode(ids)
+            print(String(data: data, encoding: .utf8)!)
         }
-        let data = try JSONEncoder().encode(ids)
-        print(String(data: data, encoding: .utf8)!)
     } catch {
         print("equiv FAILED: \(error)")
         exit(1)
@@ -135,6 +158,10 @@ struct SpikeCLI {
         }
         let sub = arguments[1]
         let flags = Flags(Array(arguments.dropFirst(2)))
+        guard let engine = Engine(rawValue: flags.string("engine", default: "baseline")) else {
+            print("unknown --engine (use: baseline | compiled)")
+            exit(1)
+        }
 
         switch sub {
         case "api-check":
@@ -151,7 +178,7 @@ struct SpikeCLI {
             }
             let prompt = flags.string("prompt", default: "Explain unified memory on Apple Silicon in one paragraph.")
             let maxTokens = flags.int("max-tokens", default: 128)
-            await runPrompt(modelPath: modelPath, prompt: prompt, maxTokens: maxTokens)
+            await runPrompt(modelPath: modelPath, prompt: prompt, maxTokens: maxTokens, engine: engine)
 
         case "equiv":
             guard let modelPath = flags.string("model") else {
@@ -160,7 +187,8 @@ struct SpikeCLI {
             }
             let prompt = flags.string("prompt", default: "Write a haiku about unified memory.")
             let n = flags.int("n", default: 40)
-            await equiv(modelPath: modelPath, prompt: prompt, n: n)
+            let rounds = flags.int("rounds", default: 1)
+            await equiv(modelPath: modelPath, prompt: prompt, n: n, engine: engine, rounds: rounds)
 
         case "tokenize":
             guard let modelPath = flags.string("model") else {
@@ -177,7 +205,7 @@ struct SpikeCLI {
             }
             let prompt = flags.string("prompt", default: "Explain how continuous batching improves LLM serving throughput.")
             let steps = flags.int("steps", default: 100)
-            await phaseTimingDiagnostic(modelPath: modelPath, prompt: prompt, steps: steps)
+            await phaseTimingDiagnostic(modelPath: modelPath, prompt: prompt, steps: steps, engine: engine)
 
         case "bench":
             guard let modelPath = flags.string("model") else {
@@ -187,7 +215,7 @@ struct SpikeCLI {
             let prompt = flags.string("prompt", default: "Explain how continuous batching improves LLM serving throughput.")
             let maxTokens = flags.int("max-tokens", default: 256)
             let runs = flags.int("runs", default: 3)
-            await bench(modelPath: modelPath, prompt: prompt, maxTokens: maxTokens, runs: runs)
+            await bench(modelPath: modelPath, prompt: prompt, maxTokens: maxTokens, runs: runs, engine: engine)
 
         default:
             print("spike ok: \(Spike.ok)")

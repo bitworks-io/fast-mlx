@@ -3,8 +3,9 @@
 # model, same prompt, temp=0, max-tokens=256. Run on llmbench@192.168.1.252.
 set -euo pipefail
 
-MODEL="${1:?usage: run_spike_comparison.sh <model_path> [prompt]}"
+MODEL="${1:?usage: run_spike_comparison.sh <model_path> [prompt] [engine]}"
 PROMPT="${2:-Explain how continuous batching improves LLM serving throughput.}"
+ENGINE="${3:-${ENGINE:-compiled}}" # baseline | compiled
 SPIKE_BIN="${SPIKE_BIN:-$(find "$HOME/Library/Developer/Xcode/DerivedData" -name spike-cli -path "*Release*" -type f 2>/dev/null | head -1)}"
 ZIG_PORT="${ZIG_PORT:-11299}"
 ARCHIVED_ZIG_TOK_S="151.8" # bench-matrix-2026-07-06.csv, this model, this box
@@ -72,8 +73,8 @@ kill "$ZIG_PID" 2>/dev/null || true
 trap - EXIT
 sleep 1
 
-echo "== Swift spike =="
-SWIFT_LINE=$("$SPIKE_BIN" bench --model "$MODEL" --prompt "$PROMPT" --max-tokens 256 --runs 3 | tail -1)
+echo "== Swift spike (engine=${ENGINE}) =="
+SWIFT_LINE=$("$SPIKE_BIN" bench --model "$MODEL" --prompt "$PROMPT" --max-tokens 256 --runs 3 --engine "$ENGINE" | tail -1)
 SWIFT_TOK_S=$(echo "$SWIFT_LINE" | cut -d',' -f5)
 echo "swift_decode_tok_s=${SWIFT_TOK_S}"
 
