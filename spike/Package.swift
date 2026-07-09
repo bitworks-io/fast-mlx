@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
         .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"]),
+        .executable(name: "fastmlx-capacity", targets: ["fastmlx-capacity"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", exact: "0.31.6"),
@@ -70,6 +71,18 @@ let package = Package(
         .testTarget(
             name: "HarnessCoreTests",
             dependencies: ["HarnessCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // MLX-free by design: real host introspection (sysctlbyname, Metal) so the capacity
+        // advisor builds and runs on any Mac without the full inference-engine toolchain.
+        .target(
+            name: "SystemProfiler",
+            dependencies: ["HarnessCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .executableTarget(
+            name: "fastmlx-capacity",
+            dependencies: ["SystemProfiler", "HarnessCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

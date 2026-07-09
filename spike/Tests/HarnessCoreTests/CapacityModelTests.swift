@@ -179,4 +179,30 @@ final class CapacityModelTests: XCTestCase {
         XCTAssertEqual(CapacityModel.defaultContextAdvisory(model("Phi-4-14B")), .nativeMaxBelowDefault)
         XCTAssertNil(CapacityModel.defaultContextAdvisory(model("Qwen3-30B-A3B-2507")))
     }
+
+    // MARK: - §3.1 cacheLimit invariant — explicit, far below MLX's 1.5x-wired-limit default.
+
+    /// llmbench-shaped: 115 GiB wired limit -> 1/8th = 14.375 GiB, in-range (not the ~172 GiB the
+    /// 1.5x default would allow) — the exact "7K wall" mechanism the invariant exists to prevent.
+    func testRecommendedCacheLimitBytes_MidRange_IsOneEighthOfWiredLimit() {
+        let wiredLimit = Int(115 * gib)
+        let cacheLimit = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: wiredLimit)
+        assertClose(Double(cacheLimit) / gib, 14.375, "115GiB wired limit -> cacheLimit")
+    }
+
+    /// A tiny box (8 GiB wired limit) floors at 4 GiB rather than shrinking to an unusably small
+    /// cache (1 GiB via the raw 1/8th formula).
+    func testRecommendedCacheLimitBytes_SmallBox_FloorsAt4GiB() {
+        let wiredLimit = Int(8 * gib)
+        let cacheLimit = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: wiredLimit)
+        XCTAssertEqual(cacheLimit, 4 * Int(gib))
+    }
+
+    /// A huge box (512 GiB wired limit) caps at 24 GiB rather than letting the cache hoard 64 GiB
+    /// via the raw 1/8th formula — the anti-hoard cap.
+    func testRecommendedCacheLimitBytes_HugeBox_CapsAt24GiB() {
+        let wiredLimit = Int(512 * gib)
+        let cacheLimit = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: wiredLimit)
+        XCTAssertEqual(cacheLimit, 24 * Int(gib))
+    }
 }
