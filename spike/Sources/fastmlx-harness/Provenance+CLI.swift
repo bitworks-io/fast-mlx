@@ -36,12 +36,20 @@ enum ProvenanceCLI {
     /// and more honest than a fragile `Package.resolved` file-read that assumes a specific CWD.
     static let mlxSwiftVersion = "0.31.6"
 
-    /// Prefers an explicit `HARNESS_GIT_SHA` (set by the caller when the binary runs somewhere
-    /// without a `.git` directory, e.g. rsync'd to a bench host without history); falls back to
-    /// `git rev-parse HEAD` in the current directory; "unknown" if neither works. A result record
-    /// with an honest "unknown" is better than a hard failure blocking every subcommand.
+    /// Gathers the three SHA sources and applies the pure precedence (`resolveHarnessGitSHA`,
+    /// TDD'd in HarnessCore): explicit `HARNESS_GIT_SHA` env override -> the deploy-written
+    /// `.harness-sha` file (`scripts/sync_llmbench.sh` captures `git rev-parse HEAD` at sync
+    /// time, because an rsync'd bench host has no `.git` for the fallback below to read) ->
+    /// `git rev-parse HEAD` in the current directory -> "unknown". A record with an honest
+    /// "unknown" is better than a hard failure blocking every subcommand.
     static func harnessGitSHA() -> String {
-        if let env = ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"], !env.isEmpty { return env }
+        resolveHarnessGitSHA(
+            env: ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"],
+            shaFile: try? String(contentsOfFile: ".harness-sha", encoding: .utf8),
+            gitOutput: gitRevParseHEAD())
+    }
+
+    private static func gitRevParseHEAD() -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["git", "rev-parse", "HEAD"]
@@ -52,13 +60,10 @@ enum ProvenanceCLI {
             try process.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            guard process.terminationStatus == 0,
-                  let sha = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !sha.isEmpty
-            else { return "unknown" }
-            return sha
+            guard process.terminationStatus == 0 else { return nil }
+            return String(data: data, encoding: .utf8)
         } catch {
-            return "unknown"
+            return nil
         }
     }
 

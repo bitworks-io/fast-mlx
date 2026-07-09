@@ -5,3 +5,5 @@ CLAUDE.local.md
 # harness runtime evidence (Task 5): generated per-run, not source
 spike/harness-evidence.jsonl
 spike/*.csv
+# deploy-time git provenance written by scripts/sync_llmbench.sh, not source
+spike/.harness-sha

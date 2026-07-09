@@ -106,4 +106,31 @@ final class ProvenanceTests: XCTestCase {
         let b = try ResultRecord(subcommand: "kl", provenance: sampleProvenance(nonce: "n2"), payload: SamplePayload(klMedian: 0.1, positions: 1)).jsonLine()
         XCTAssertNotEqual(a, b, "nonce differs -> encoded record must differ")
     }
+
+    // MARK: harness git SHA resolution (deployed hosts have no .git; the deploy step writes
+    // a .harness-sha file the binary reads — env var stays the explicit override)
+
+    func testSHAResolutionPrefersEnv() {
+        XCTAssertEqual(
+            resolveHarnessGitSHA(env: "aaa111", shaFile: "bbb222\n", gitOutput: "ccc333"),
+            "aaa111")
+    }
+
+    func testSHAResolutionFallsBackToShaFileThenGit() {
+        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: "bbb222\n", gitOutput: "ccc333"), "bbb222")
+        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: nil, gitOutput: "ccc333\n"), "ccc333")
+    }
+
+    func testSHAResolutionTrimsAndRejectsEmptyOrMultilineValues() {
+        XCTAssertEqual(resolveHarnessGitSHA(env: "  ", shaFile: "  bbb222  \n", gitOutput: nil), "bbb222")
+        // a multi-line "SHA" is not a SHA (e.g. an error message captured into the file)
+        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: "fatal: not a git repo\nbbb\n", gitOutput: nil), "unknown")
+        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: nil, gitOutput: nil), "unknown")
+    }
+
+    func testSHAResolutionKeepsDirtySuffix() {
+        XCTAssertEqual(
+            resolveHarnessGitSHA(env: nil, shaFile: "60d84fa-dirty\n", gitOutput: nil),
+            "60d84fa-dirty")
+    }
 }

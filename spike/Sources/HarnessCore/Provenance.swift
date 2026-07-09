@@ -40,6 +40,21 @@ public enum ModelQuantInfoLoader {
     }
 }
 
+/// Pure precedence for resolving the harness git SHA (the I/O lives in the CLI): an explicit
+/// `HARNESS_GIT_SHA` env value wins; then the deploy-written `.harness-sha` file (rsync'd bench
+/// hosts have no `.git`, so the deploy step captures the SHA at sync time); then local
+/// `git rev-parse HEAD` output; "unknown" if none yields a usable value. A usable value is a
+/// single non-empty line after trimming — a multi-line value is an error message, not a SHA.
+public func resolveHarnessGitSHA(env: String?, shaFile: String?, gitOutput: String?) -> String {
+    for candidate in [env, shaFile, gitOutput] {
+        guard let candidate else { continue }
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\n") else { continue }
+        return trimmed
+    }
+    return "unknown"
+}
+
 /// Everything needed to trace a result back to the exact conditions that produced it — date,
 /// hardware, code versions on both sides of the language boundary, the model actually measured,
 /// the corpus actually used, and a nonce for byte-level replay identification. Every subcommand
