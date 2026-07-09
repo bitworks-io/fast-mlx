@@ -30,6 +30,16 @@ public struct TurboQuantCode {
     public let idx: MLXArray  // [n, d] base-bit centroid indices
     public let signs: MLXArray  // [n, d] ±1 (1 bit/element)
     public let norms: MLXArray  // [n, 1] γ = ‖r‖₂ per row
+    /// [n, 1] per-row input L2 norm ‖x‖ (paper §1.1). Set by `quantizeProdNormalized`;
+    /// nil for raw unit-norm codes from `quantizeProd`. Distinct from `norms` (the residual γ).
+    public let xNorm: MLXArray?
+
+    public init(idx: MLXArray, signs: MLXArray, norms: MLXArray, xNorm: MLXArray? = nil) {
+        self.idx = idx
+        self.signs = signs
+        self.norms = norms
+        self.xNorm = xNorm
+    }
 }
 
 extension TurboQuantCodec {
@@ -50,5 +60,30 @@ extension TurboQuantCodec {
         let scale = Float((Double.pi / 2).squareRoot() / Double(p.headDim))
         let qjlTerm = c.signs.matmul(p.qjl) * c.norms * scale  // rows: (√(π/2)/d)·γ·(Sᵀ·signs)
         return base + qjlTerm
+    }
+}
+
+extension TurboQuantCodec {
+    /// Non-unit-norm wrapper (paper §1.1): the codebook and Theorem-2 guarantees hold for unit
+    /// vectors, so store ‖x‖ per row, quantize the direction x/‖x‖ with the proven `_prod`
+    /// codec, and rescale on dequant. Zero rows are safe: the clamped divisor avoids NaN and
+    /// the stored ‖x‖ = 0 reconstructs them exactly to zero.
+    public static func quantizeProdNormalized(_ x: MLXArray, params p: TurboQuantParams)
+        -> TurboQuantCode
+    {
+        let xNorm = MLX.sqrt((x * x).sum(axis: -1, keepDims: true))  // [n, 1] true input norm
+        let u = x / MLX.maximum(xNorm, MLXArray(Float.leastNormalMagnitude))
+        let c = quantizeProd(u, params: p)
+        return TurboQuantCode(idx: c.idx, signs: c.signs, norms: c.norms, xNorm: xNorm)
+    }
+
+    /// Inverse of `quantizeProdNormalized`: unit-sphere reconstruction rescaled by the stored ‖x‖.
+    public static func dequantizeProdNormalized(_ c: TurboQuantCode, params p: TurboQuantParams)
+        -> MLXArray
+    {
+        guard let xNorm = c.xNorm else {
+            preconditionFailure("dequantizeProdNormalized requires a code from quantizeProdNormalized (xNorm set)")
+        }
+        return xNorm * dequantizeProd(c, params: p)
     }
 }

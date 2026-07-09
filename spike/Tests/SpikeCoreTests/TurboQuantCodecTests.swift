@@ -96,6 +96,59 @@ final class TurboQuantCodecTests: XCTestCase {
         }
     }
 
+    // MARK: Task 6a — non-unit-norm handling (paper §1.1: store ‖x‖, normalize, rescale)
+
+    /// Real K/V head-vectors are not unit-norm; the codec's codebook is sized for unit vectors.
+    /// The normalized wrapper must round-trip rows of varying norm with *relative* RMSE
+    /// comparable to the proven unit-norm reconstruction (which Spike A validated).
+    func testNormalizedRoundTripHandlesVaryingNorms() {
+        let d = 128
+        let n = 512
+        let unit = l2normalizeRows(MLXRandom.normal([n, d], key: MLXRandom.key(11)))
+        // norms in [0.5, 5] — the non-unit regime Phase 1B flagged as the correctness gap
+        let scales = MLXRandom.uniform(low: Float(0.5), high: Float(5.0), [n, 1], key: MLXRandom.key(12))
+        let x = unit * scales
+        let p = TurboQuantParams(headDim: d, baseBits: 3, seed: 0)
+
+        // Reference: the proven codec's reconstruction RMSE on the SAME directions at unit norm.
+        let unitCode = TurboQuantCodec.quantizeProd(unit, params: p)
+        let unitRMSE = (unit - TurboQuantCodec.dequantizeProd(unitCode, params: p))
+            .square().mean().sqrt().item(Float.self)
+
+        let code = TurboQuantCodec.quantizeProdNormalized(x, params: p)
+        XCTAssertEqual(code.xNorm?.shape, [n, 1], "per-row ‖x‖ must be stored as [n, 1]")
+        let xr = TurboQuantCodec.dequantizeProdNormalized(code, params: p)
+        // Per-row relative residual: dividing by the true norm makes this directly comparable
+        // to the unit-norm RMSE (for exact normalize/rescale they are the same quantity).
+        let relRMSE = ((x - xr) / scales).square().mean().sqrt().item(Float.self)
+        print("turboquant 6a: relative RMSE \(relRMSE) vs unit-norm RMSE \(unitRMSE)")
+        XCTAssertLessThan(
+            relRMSE, unitRMSE * 1.2,
+            "normalized round-trip must match the unit-norm reconstruction quality")
+        // Stored ‖x‖ must be the actual input norm (this is what the γ-vs-‖x‖ split protects).
+        let xNormErr = (code.xNorm! - scales).abs().max().item(Float.self)
+        XCTAssertLessThan(xNormErr, 1e-4, "xNorm must be the per-row input L2 norm")
+    }
+
+    /// Scaling the input by c must scale the reconstruction by exactly c (up to float rounding):
+    /// x/‖x‖ is scale-invariant, so codes are identical and only the stored ‖x‖ changes.
+    func testNormalizedReconstructionIsNormCovariant() {
+        let d = 64
+        let n = 128
+        let x = MLXRandom.normal([n, d], key: MLXRandom.key(21))
+        let c: Float = 3.7
+        let p = TurboQuantParams(headDim: d, baseBits: 2, seed: 0)
+
+        let r1 = TurboQuantCodec.dequantizeProdNormalized(
+            TurboQuantCodec.quantizeProdNormalized(x, params: p), params: p)
+        let r2 = TurboQuantCodec.dequantizeProdNormalized(
+            TurboQuantCodec.quantizeProdNormalized(x * c, params: p), params: p)
+        let covErr = (r2 - r1 * c).abs().max().item(Float.self)
+        let scale = r1.abs().max().item(Float.self) * c
+        print("turboquant 6a covariance: max |recon(c·x) − c·recon(x)| = \(covErr) (scale \(scale))")
+        XCTAssertLessThan(covErr, scale * 1e-4, "reconstruction must be norm-covariant")
+    }
+
     // MARK: Task 5 — tier config + honest bits/element accounting
 
     func testTierBitsPerElementIsHonest() {
