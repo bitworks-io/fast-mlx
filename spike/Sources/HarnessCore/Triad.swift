@@ -28,6 +28,58 @@ public struct AcceptanceCheck: Sendable {
     public func passed(rate: Double) -> Bool { rate >= floor }
 }
 
+// MARK: - lossy-tier triad variant (Task 4)
+
+/// The equivalence bar an aggressive-quantization tier (e.g. a 2-bit KV cache) is actually held
+/// to. `exact` is today's identical-prefix gate — appropriate while KV stays at fp16/int8, where a
+/// short prefix signals a real bug. `lossy` accepts that a short prefix is EXPECTED at aggressive
+/// tiers and substitutes a different floor: did it crash, did it emit non-finite logits, and does
+/// a fixed known-answer canary still land.
+public enum TriadMode: String, Sendable, Equatable, CaseIterable {
+    case exact
+    case lossy
+}
+
+/// Selects `exact` vs `lossy` by KV-quant tier. `nil`/`"fp16"` is today's only implemented tier
+/// (exact-capable); any other named tier (a future 2-bit TurboQuant tier, say) uses the lossy bar
+/// instead of failing `minPrefix` outright — which is exactly what happens today (`verify` at a
+/// 2-bit tier just fails `minPrefix=30`, collapsing "expected quantization loss" and "real bug"
+/// into the same failure).
+public func triadMode(forKVQuantTier tier: String?) -> TriadMode {
+    switch tier {
+    case nil, "fp16": return .exact
+    default: return .lossy
+    }
+}
+
+/// A fixed prompt/expected-substring pair — the lossy tier's cheap "still basically working"
+/// signal when a full identical-prefix match is not the right bar. Reuses the harness's existing
+/// known-good prompt/answer from the equivalence work (`knownGoodPrompt` in the CLI) rather than
+/// inventing a new one.
+public struct CoherenceCanary: Sendable {
+    public let prompt: String
+    public let mustContain: String
+    public init(prompt: String, mustContain: String) { self.prompt = prompt; self.mustContain = mustContain }
+    public func passed(_ output: String) -> Bool { output.contains(mustContain) }
+    public static let capitalOfFrance = CoherenceCanary(prompt: "The capital of France is", mustContain: "Paris")
+}
+
+/// Lossy-tier equivalence: non-crash (produced at least `minPrefix` tokens), non-NaN (no
+/// non-finite value anywhere in the scored logits), and the coherence canary's answer still
+/// contains the expected substring. All three must hold — any one failing is a real regression,
+/// not expected quantization loss.
+public struct LossyEquivalenceCheck: Sendable {
+    public let minPrefix: Int
+    public init(minPrefix: Int = 1) { self.minPrefix = minPrefix }
+    public func evaluate(prefix: Int, allFinite: Bool, canaryPassed: Bool) -> (passed: Bool, reasons: [String]) {
+        var reasons: [String] = []
+        if prefix < minPrefix { reasons.append("prefix \(prefix) < minPrefix \(minPrefix) (crashed or produced no tokens)") }
+        if !allFinite { reasons.append("non-finite (NaN/Inf) value in scored logits") }
+        if !canaryPassed { reasons.append("coherence canary failed (answer missing expected substring)") }
+        return (reasons.isEmpty, reasons)
+    }
+}
+
 public struct TriadVerdict: Sendable {
     /// Caller computes this via `EquivalenceCheck.evaluate(...).passed` — the verdict never derives
     /// pass/fail from a raw prefix count itself (a token count is always >= 0, which made the prior
