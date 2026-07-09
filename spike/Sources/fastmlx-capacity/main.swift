@@ -132,19 +132,44 @@ func takeValue(for flag: String, in args: inout [String]) -> String? {
     return value
 }
 
+/// Resolve `--box` to the profile capacity is computed against. Defaults to the live host; the
+/// named presets let an operator plan for a target box they aren't currently running on (e.g.
+/// sizing a 512GB-Ultra deployment from a laptop) — capacity planning, not just current-box report.
+func resolveBox(_ arg: String?, hostReport: HostReport) -> (SystemProfile, String) {
+    switch arg {
+    case nil, "host": return (hostReport.systemProfile, "host")
+    case "m5Max128": return (.m5Max128, "m5Max128")
+    case "m3Ultra256": return (.m3Ultra256, "m3Ultra256")
+    case "m3Ultra512": return (.m3Ultra512, "m3Ultra512")
+    default:
+        FileHandle.standardError.write(
+            "error: unknown --box '\(arg!)'\nvalid: host, m5Max128, m3Ultra256, m3Ultra512\n".data(using: .utf8)!)
+        exit(1)
+    }
+}
+
 var args = Array(CommandLine.arguments.dropFirst())
 let modelID = takeValue(for: "--model", in: &args)
 let contextArg = takeValue(for: "--context", in: &args).flatMap { Int($0) }
 let concurrencyArg = takeValue(for: "--concurrency", in: &args).flatMap { Int($0) } ?? 1
 let kvQuantArg = takeValue(for: "--kv-quant", in: &args).flatMap { KVQuantTier(rawValue: $0) } ?? .fp16
+let boxArg = takeValue(for: "--box", in: &args)
 
 let hostReport = SystemProfiler.probe()
 printHostHeader(hostReport)
 
+// The live host is always profiled + printed above (spec: "understand the system the tool is
+// running on"); `--box` retargets the capacity math to a preset for planning a different box.
+let (targetProfile, targetLabel) = resolveBox(boxArg, hostReport: hostReport)
+if targetLabel != "host" {
+    print("Capacity computed for: \(targetLabel) — \(gibString(targetProfile.totalRAMBytes)) RAM, "
+        + "\(gibString(targetProfile.wiredLimitBytes)) wired — NOT the live host\n")
+}
+
 if let modelID {
     runDetail(
         modelID: modelID, context: contextArg, concurrency: concurrencyArg, kvQuant: kvQuantArg,
-        profile: hostReport.systemProfile)
+        profile: targetProfile)
 } else {
-    runCatalogTable(profile: hostReport.systemProfile)
+    runCatalogTable(profile: targetProfile)
 }
