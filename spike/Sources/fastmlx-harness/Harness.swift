@@ -56,8 +56,11 @@ struct VerifyPayload: Codable, Sendable {
 }
 
 struct KLPayload: Codable, Sendable {
+    /// Headline: median of PER-ENTRY medians (equal weight per entry). NOT a position-weighted
+    /// pool -- see the pooled diagnostics below, which exist for visibility only.
     let klMedianNats: Double
-    let klP95Nats: Double
+    let klPooledMedianNats: Double
+    let klPooledP95Nats: Double
     let pplCandidate: Double
     let pplReference: Double
     let pplDeltaPct: Double
@@ -296,6 +299,12 @@ func runKL(_ flags: Flags) async {
         print("# TEACHER-FORCED: both sides score the reference's greedy continuation, so every position is context-locked.")
 
         var allKLs: [Double] = []
+        // One median per ENTRY, not per position — the headline. Pooling raw per-position KLs
+        // across entries with wildly different position counts (three ~24-position prompts vs a
+        // 128-sampled-position long-context entry) lets the larger entry's positions dominate the
+        // pooled median even though it is exactly one measurement among four; per-entry medians
+        // give every entry equal weight regardless of how many positions it was scored at.
+        var entryMedians: [Double] = []
         var candNLLTotal = 0.0, refNLLTotal = 0.0, totalPositions = 0
         var spotChecked = false
         for entry in shortEntries {
@@ -321,6 +330,7 @@ func runKL(_ flags: Flags) async {
             // the reference did, given the reference's context? (Top-1 agreement, not a gate.)
             let agree = zip(s.candidateRows.map(argmaxIndex), s.continuation).filter(==).count
             allKLs.append(contentsOf: kls)
+            entryMedians.append(medianOf(kls))
             // Perplexity pools NLL over positions from the SAME rows (identical math to
             // teacherForcedPerplexities — one forward pass serves both metrics).
             let n = Double(s.continuation.count)
@@ -348,6 +358,7 @@ func runKL(_ flags: Flags) async {
                 positions: sampled, config: config)
             let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
             allKLs.append(contentsOf: kls)
+            entryMedians.append(medianOf(kls))
             let n = Double(s.forcedTokens.count)
             candNLLTotal += meanNLL(rows: s.candidateRows, tokens: s.forcedTokens) * n
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.forcedTokens) * n
@@ -356,9 +367,15 @@ func runKL(_ flags: Flags) async {
         }
 
         allKLs.sort()
-        let p95 = allKLs[min(Int(Double(allKLs.count - 1) * 0.95), allKLs.count - 1)]
-        print("kl_median (KLDivergenceMetric, teacher-forced, all \(allKLs.count) positions): \(sci(medianOf(allKLs))) nats")
-        print("kl_p95    (teacher-forced, all positions): \(sci(p95)) nats")
+        let pooledP95 = allKLs[min(Int(Double(allKLs.count - 1) * 0.95), allKLs.count - 1)]
+        let headlineMedian = medianOf(entryMedians)
+        // HEADLINE: median of PER-ENTRY medians (equal weight per entry, regardless of how many
+        // positions that entry was scored at). The pooled numbers below are a diagnostic only —
+        // do not use them as the headline, since a heavily-sampled entry (the long-context one)
+        // would otherwise dominate a position-weighted pool.
+        print("kl_median (headline, median of \(entryMedians.count) per-entry medians): \(sci(headlineMedian)) nats")
+        print("kl_pooled_median (diagnostic, position-weighted, all \(allKLs.count) positions -- do NOT use as headline): \(sci(medianOf(allKLs))) nats")
+        print("kl_pooled_p95    (diagnostic, position-weighted, all positions): \(sci(pooledP95)) nats")
 
         let pplPair = PerplexityPair(
             candidate: exp(candNLLTotal / Double(totalPositions)),
@@ -370,8 +387,8 @@ func runKL(_ flags: Flags) async {
         let referenceVersions = await reference.versionSink.versions
         let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: corpus)
         let payload = KLPayload(
-            klMedianNats: medianOf(allKLs), klP95Nats: p95, pplCandidate: pplPair.candidate,
-            pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
+            klMedianNats: headlineMedian, klPooledMedianNats: medianOf(allKLs), klPooledP95Nats: pooledP95,
+            pplCandidate: pplPair.candidate, pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
             totalPositions: totalPositions, entryCount: corpus.entries.count)
         appendJSONLRecord(ResultRecord(subcommand: "kl", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch {
