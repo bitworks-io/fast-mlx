@@ -114,7 +114,10 @@ public enum SystemProfiler {
         guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: size)
         guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
-        return String(cString: buffer)
+        // Decode up to the first NUL as UTF-8 (the `[CChar]` `String(cString:)` overload is
+        // deprecated in Swift 6.3): sysctl returns a NUL-terminated C string.
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
