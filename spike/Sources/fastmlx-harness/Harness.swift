@@ -40,6 +40,41 @@ func loadMeasurementCorpus(_ flags: Flags) throws -> MeasurementCorpus {
     return try MeasurementCorpusLoader.load(from: data)
 }
 
+// MARK: - provenance (Task 5): every subcommand appends one JSONL record to --evidence.
+
+func evidencePath(_ flags: Flags) -> String { flags.string("evidence", default: "harness-evidence.jsonl") }
+
+struct VerifyPayload: Codable, Sendable {
+    let prompt: String
+    let promptTokens: Int
+    let n: Int
+    let mode: String
+    let kvQuantTier: String
+    let equivalencePassed: Bool
+    let engaged: Bool
+    let triadPassed: Bool
+}
+
+struct KLPayload: Codable, Sendable {
+    let klMedianNats: Double
+    let klP95Nats: Double
+    let pplCandidate: Double
+    let pplReference: Double
+    let pplDeltaPct: Double
+    let totalPositions: Int
+    let entryCount: Int
+}
+
+struct BenchPayload: Codable, Sendable {
+    let label: String
+    let workload: String
+    let mode: String
+    let decodeTokS: Double
+    let ttftMs: Double
+    let quant: String
+    let concurrency: Int
+}
+
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
     ReferenceDriver(
         pythonPath: (flags.string("python", default: "~/harness-venv/bin/python") as NSString).expandingTildeInPath,
@@ -87,7 +122,7 @@ func runCorpus() {
 
 func runVerify(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant <TIER>] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>]")
+        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant <TIER>] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     let prompt = flags.string("prompt", default: knownGoodPrompt)
@@ -108,10 +143,12 @@ func runVerify(_ flags: Flags) async {
         let engaged = EngagementCheck(marker: "decode", floor: 1).passed(before: 0, after: decodeCount)
 
         let verdict: TriadVerdict
+        var referenceVersions: ReferenceDriver.ReferenceVersions?
         switch mode {
         case .exact:
             let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
             let refRun = try await reference.generate(prompt: promptTokens, config: config)
+            referenceVersions = await reference.versionSink.versions
             let eq = EquivalenceCheck(minPrefix: minPrefix)
                 .evaluate(candidate: candidate.tokens, reference: refRun.tokens)
             let comparable = min(candidate.tokens.count, refRun.tokens.count)
@@ -146,6 +183,14 @@ func runVerify(_ flags: Flags) async {
         print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
         print("acceptance:  n/a (no spec-decode configured)")
         print("triad: \(verdict.passed ? "PASS" : "FAIL")")
+
+        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: nil)
+        let payload = VerifyPayload(
+            prompt: prompt, promptTokens: promptTokens.count, n: n, mode: mode.rawValue,
+            kvQuantTier: kvQuantTier ?? "fp16", equivalencePassed: verdict.equivalenceOK,
+            engaged: verdict.engaged, triadPassed: verdict.passed)
+        appendJSONLRecord(ResultRecord(subcommand: "verify", provenance: provenance, payload: payload), to: evidencePath(flags))
+
         if !verdict.passed { exit(1) }
     } catch {
         print("verify FAILED: \(error)")
@@ -157,7 +202,7 @@ func runVerify(_ flags: Flags) async {
 
 func runBench(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness bench --model <PATH> [--prompt <TEXT>] [--max-tokens 256] [--runs 3] [--label <L>] [--csv <FILE>]")
+        print("usage: fastmlx-harness bench --model <PATH> [--prompt <TEXT>] [--max-tokens 256] [--runs 3] [--label <L>] [--csv <FILE>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -169,8 +214,10 @@ func runBench(_ flags: Flags) async {
         let (driver, tokenizer, _) = try await loadSwiftDriver(modelPath: modelPath)
 
         let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
-        let lower = modelName.lowercased()
-        let quant = lower.contains("8bit") ? "int8" : lower.contains("4bit") ? "int4" : "fp16"
+        // Task 5: the model's OWN declared quantization (config.json), not a dirname-substring
+        // guess — a mislabeled checkpoint directory can no longer record the wrong tier.
+        let quant = ProvenanceCLI.modelConfig(at: modelPath).quant.label
+        let hardware = ProvenanceCLI.chipBrand()
         let cell = Cell(workload: .decode, mode: .none, model: modelName, quant: quant, concurrency: 1)
         let nonce = String(Int.random(in: 0..<1_000_000))
 
@@ -196,7 +243,7 @@ func runBench(_ flags: Flags) async {
         let row = BenchRow(
             label: label, workload: .decode, mode: .none, model: modelName,
             decodeTokS: (agg.mean * 100).rounded() / 100, ttftMs: (avgTtftMs * 10).rounded() / 10,
-            quant: quant, concurrency: 1)
+            quant: quant, concurrency: 1, hardware: hardware)
         print(BenchRow.csvHeader)
         print(row.csvLine)
         if let csvPath = flags.string("csv") {
@@ -207,6 +254,12 @@ func runBench(_ flags: Flags) async {
             try content.write(to: url, atomically: true, encoding: String.Encoding.utf8)
             print("# appended to \(csvPath)")
         }
+
+        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: nil, corpus: nil)
+        let payload = BenchPayload(
+            label: label, workload: Workload.decode.rawValue, mode: Mode.none.rawValue,
+            decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant, concurrency: 1)
+        appendJSONLRecord(ResultRecord(subcommand: "bench", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch BenchGuardError.debugBuild {
         print("bench FAILED: Debug build — perf numbers would be meaningless. Build with -configuration Release.")
         exit(1)
@@ -220,7 +273,7 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--python <PY>] [--script <REF.py>]")
+        print("usage: fastmlx-harness kl --model <PATH> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -313,6 +366,14 @@ func runKL(_ flags: Flags) async {
         print("ppl_candidate (teacher-forced, pooled \(totalPositions) positions): \(fmt(pplPair.candidate, 4))")
         print("ppl_reference (its own greedy continuation): \(fmt(pplPair.reference, 4))")
         print("ppl_delta (PerplexityMetric): \(String(format: "%+.2f%%", pplPair.relativeDelta * 100)) (dial gate: <= 1%)")
+
+        let referenceVersions = await reference.versionSink.versions
+        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: corpus)
+        let payload = KLPayload(
+            klMedianNats: medianOf(allKLs), klP95Nats: p95, pplCandidate: pplPair.candidate,
+            pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
+            totalPositions: totalPositions, entryCount: corpus.entries.count)
+        appendJSONLRecord(ResultRecord(subcommand: "kl", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch {
         print("kl FAILED: \(error)")
         exit(1)

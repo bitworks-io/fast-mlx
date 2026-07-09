@@ -45,6 +45,9 @@ public func assertReleaseBuild() throws {
 
 /// One CSV row of a bench run. Rate is expected to come from stream-timed metrics
 /// (e.g. `DecodeMetrics` in the executable target), never usage/summary fields.
+/// `hardware` is spec §6.3's mandated durable-evidence dimension ("enough dimensions... to diff
+/// programmatically against a prior run"): label/mode/concurrency/model were already present;
+/// hardware was the missing one (Task 5).
 public struct BenchRow: Sendable {
     public let label: String
     public let workload: Workload
@@ -54,16 +57,18 @@ public struct BenchRow: Sendable {
     public let ttftMs: Double
     public let quant: String
     public let concurrency: Int
+    public let hardware: String
 
-    public init(label: String, workload: Workload, mode: Mode, model: String, decodeTokS: Double, ttftMs: Double, quant: String, concurrency: Int) {
+    public init(label: String, workload: Workload, mode: Mode, model: String, decodeTokS: Double, ttftMs: Double, quant: String, concurrency: Int, hardware: String) {
         self.label = label; self.workload = workload; self.mode = mode; self.model = model
         self.decodeTokS = decodeTokS; self.ttftMs = ttftMs; self.quant = quant; self.concurrency = concurrency
+        self.hardware = hardware
     }
 
-    public static let csvHeader = "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency"
+    public static let csvHeader = "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency,hardware"
 
     public var csvLine: String {
-        "\(label),\(workload.rawValue),\(mode.rawValue),\(model),\(decodeTokS),\(ttftMs),\(quant),\(concurrency)"
+        "\(label),\(workload.rawValue),\(mode.rawValue),\(model),\(decodeTokS),\(ttftMs),\(quant),\(concurrency),\(hardware)"
     }
 }
 
