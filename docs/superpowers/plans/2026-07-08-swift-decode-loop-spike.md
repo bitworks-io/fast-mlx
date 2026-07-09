@@ -24,7 +24,7 @@ State verified 2026-07-08, and gaps to close first:
 - ✅ Zig `mlx-serve` present as a **prebuilt binary at `~/mlx-serve-macos-arm64/mlx-serve`** (not a source build — no `bench.sh`/`zig-out`).
 - ❌ **BLOCKER — no full Xcode** (only CommandLineTools). mlx-swift's Metal shaders require `xcodebuild`; `swift build` alone cannot compile them. **Install Xcode 26+ before Task 1.**
 - ❌ **BLOCKER — Python `mlx-lm` not importable** (import failed). **`pip install mlx-lm` before Task 6** (equivalence reference).
-- ⚠️ **PRODUCTION IS LIVE** — `mlx-serve` is serving **Qwen3-32B-bf16 (~65GB) on port 11234** (caffeinated; the Concierge assistant). A Swift spike + Zig bench will contend for GPU/memory and **skew both the spike numbers and production latency**. Run the timed bench in a coordinated quiet window (or briefly stop the daemon) — never bench against a live load.
+- ✅ **RESOLVED 2026-07-08 — box is now dedicated to fast-mlx.** Concierge is not yet operational and fast-mlx will take over serving its model, so the `io.mlx-serve` LaunchDaemon (Qwen3-32B-bf16, port 11234) was **stopped and disabled** (`launchctl bootout` + plist moved to `.disabled`, reversible), freeing ~65GB and the GPU. `xcode-select` now points at Xcode 26.6. The box is clean for the spike — no production contention.
 
 **Baseline to beat (measured on THIS box, warm, median-of-4, 256-token decode):** `Qwen3-30B-A3B-Instruct-2507-4bit` → **decode 151.8 tok/s** (prefill 1987). Gate: Swift ≥ ~129 tok/s (−15%) = **GO**; ≤ ~76 tok/s (≥1.5× gap) = **wall**. A *fast* MoE (3.3B active) — the ideal stress test, since fast small-active-param decode is exactly where a sloppy host loop hurts most.
 

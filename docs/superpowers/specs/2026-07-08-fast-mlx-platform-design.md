@@ -10,7 +10,7 @@
 
 ## 1. What fast-mlx is (and is not)
 
-fast-mlx is a **maximally-optimized MLX inference platform for Apple Silicon** (dev on M3 Ultra 256GB; target up to 512GB), built to drive commercial portfolio products. It is a **platform, not a single binary**: a Swift inference engine, a native macOS app, a Python train/research plane, and — the spine that ties them together and makes the whole thing safe to iterate — an **engine-agnostic conformance + precision-loss harness**.
+fast-mlx is a **maximally-optimized MLX inference platform for Apple Silicon** (primary dev/bench box: **M5 Max 128GB** / `llmbench`; production target up to M3 Ultra 512GB), built to drive commercial portfolio products. Its **first production deployment is Concierge** (bitworks' AI shopping assistant) — fast-mlx will take over model serving on the M5 Max box that runs the now-retired mlx-serve daemon. It is a **platform, not a single binary**: a Swift inference engine, a native macOS app, a Python train/research plane, and — the spine that ties them together and makes the whole thing safe to iterate — an **engine-agnostic conformance + precision-loss harness**.
 
 **The differentiator is measurement, not raw speed.** The competitive scan is unambiguous: nobody has an independently-reproduced single-stream decode win over MLX, and the whole field *advertises* speed while **nobody quantifies the accuracy they trade for it**. fast-mlx's wedge is the **tunable optimization dial with quantified precision loss** — "dial in the speed you want, see exactly what accuracy you trade, defaulting to the fastest setting with loss you won't notice." That is engine-agnostic product/measurement work, and it is open white space.
 
