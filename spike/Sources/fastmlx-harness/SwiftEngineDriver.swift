@@ -73,6 +73,65 @@ actor HarnessEngineActor {
         }
         return rows
     }
+
+    /// TEACHER-FORCED `logprobs`: row i is the next-token distribution given
+    /// context = prompt + forced[0..<i]; forced[i] is fed as the next input regardless of
+    /// argmax, and eos does NOT stop the loop (the forced continuation already encodes where
+    /// its producer stopped). Exactly forced.count rows. Same measurement path as the
+    /// free-running variant (plain forward, fresh cache) — the perf path's compiled-step +
+    /// no-sync-readback design lives untouched in `generate`.
+    func teacherForcedLogprobs(prompt: [Int], forced: [Int]) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: nil)
+    }
+
+    /// Sampled variant: same chunked forward over the full forced continuation (causal decoding
+    /// requires every intermediate token as context regardless), but only converts+keeps a
+    /// full-vocab row at `positions` — a long-context entry can be thousands of positions, and
+    /// materializing every row would be ~0.6MB/row x thousands x 2 drivers. `positions` must be
+    /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
+    func teacherForcedLogprobsAtPositions(prompt: [Int], forced: [Int], positions: [Int]) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: positions)
+    }
+
+    /// CHUNKED teacher-forced scoring (`forcedScoringPlan` in HarnessCore holds the pure
+    /// bookkeeping): multi-token chunk forwards instead of one forward per forced token.
+    ///
+    /// WHY (the ~7K-context SIGKILL root cause): single-token stepping makes every step's
+    /// transient buffers slightly LARGER than the last step's (the stock cache returns growing
+    /// K/V slices), so MLX's buffer cache can never reuse a freed buffer and grows as
+    /// O(context²) — measured 43GB of dead cache (active flat at 17GB) by position 6750 on
+    /// Qwen3-32B-4bit, which, with the Python reference process ballooning identically, is
+    /// exactly the ~6.7–7.1K jetsam SIGKILL ceiling the harness hit.
+    ///
+    /// The fix is BOTH layers, each necessary: chunking cuts the number of growing-transient
+    /// events by the chunk factor and scores at prefill speed instead of decode speed (24K
+    /// tokens: ~1 min/side instead of ~10), but the materialized K/V slices still grow chunk to
+    /// chunk, so unbounded the cache still reaches ~62GB by 16K context (measured, ctxprobe
+    /// `score` mode) — it is the allocator-cache bound in `loadSwiftDriver` that guarantees
+    /// flat memory by evicting those unreusable buffers (32K tokens: 33.8GB peak footprint,
+    /// cache pinned at 8GB). The per-chunk `eval` bounds the lazy graph so pending work cannot
+    /// pile up across chunks.
+    private func scoreForced(prompt: [Int], forced: [Int], wanted: [Int]?) -> [[Float]] {
+        let cache = model.newCache(parameters: nil)
+        let input = prompt + forced.dropLast()
+        let plan = forcedScoringPlan(
+            promptCount: prompt.count, forcedCount: forced.count,
+            wantedPositions: wanted, chunkSize: Self.scoringChunkSize)
+        var rows: [[Float]] = []
+        for chunk in plan.chunks {
+            let ids = MLXArray(Array(input[chunk.inputRange])).reshaped([1, chunk.inputRange.count])
+            let logits = model(ids, cache: cache)
+            eval(logits)
+            for sel in chunk.rows {
+                rows.append(logits[0..., sel.localIndex, 0...].asType(.float32).asArray(Float.self))
+            }
+        }
+        return rows
+    }
+
+    /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
+    /// against forward-call count; matches mlx-lm's default prefill step size.
+    private static let scoringChunkSize = 512
 }
 
 /// In-process `EngineDriver` over the compiled decode core — the only MLX-touching harness impl.
@@ -96,6 +155,16 @@ struct SwiftEngineDriver: EngineDriver {
         return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos)
     }
 
+    func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
+        try Self.requireSupported(config)
+        return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation)
+    }
+
+    func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
+        try Self.requireSupported(config)
+        return await engine.teacherForcedLogprobsAtPositions(prompt: prompt, forced: forcedContinuation, positions: positions)
+    }
+
     private static func requireSupported(_ config: RunConfig) throws {
         guard config.temperature == 0 else {
             throw SwiftEngineDriverError.unsupportedConfig("temperature=\(config.temperature) (greedy-only engine)")
@@ -114,6 +183,13 @@ struct SwiftEngineDriver: EngineDriver {
 /// actor init — detaching it from the region that transfers — so CPU-side encode/decode stays
 /// usable afterward (same region discipline as the spike's `loadActor`).
 func loadSwiftDriver(modelPath: String) async throws -> (driver: SwiftEngineDriver, tokenizer: MLXLMCommon.Tokenizer, eos: Int) {
+    // Bound MLX's buffer cache for the measurement process. The default cache limit tracks the
+    // (raised) GPU memory limit, so unreusable transients can hoard tens of GB before anything
+    // evicts — and the harness runs a Python reference process with its own allocator on the
+    // same box. 8GB is far above any measurement path's steady-state reuse working set (decode
+    // transients are MBs; a scoring chunk's logits are ~150MB) but keeps two co-resident
+    // processes comfortably inside physical RAM. harness_reference.py sets the same bound.
+    Memory.cacheLimit = 8 << 30
     let ctx = try await loadModel(
         from: URL(fileURLWithPath: modelPath),
         using: #huggingFaceTokenizerLoader()

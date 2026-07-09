@@ -20,6 +20,8 @@ After each notable spike / investigation / optimization, write one piece here **
 | Date | Piece | Whitepaper theme(s) |
 |---|---|---|
 | 2026-07-09 | [The bottleneck wasn't the language: closing an 18% Swift-vs-Zig MLX inference gap](2026-07-09-closing-the-swift-mlx-gap.md) | Building a high-performance MLX engine in Swift |
+| 2026-07-09 | [Who measures the measurer? Auditing a precision-loss harness that was quietly lying](2026-07-09-trusting-the-instrument.md) | The optimization dial — quantified precision-loss tuning |
+| 2026-07-09 | [The 7K wall that wasn't: jetsam forensics, a quadratic allocator, and the statistic hiding in the tail](2026-07-09-the-wall-that-wasnt.md) | The optimization dial — quantified precision-loss tuning |
 
 ## Candidate whitepaper themes (aggregations)
 
