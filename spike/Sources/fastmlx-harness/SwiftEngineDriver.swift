@@ -73,6 +73,24 @@ actor HarnessEngineActor {
         }
         return rows
     }
+
+    /// TEACHER-FORCED `logprobs`: row i is the next-token distribution given
+    /// context = prompt + forced[0..<i]; forced[i] is fed as the next input regardless of
+    /// argmax, and eos does NOT stop the loop (the forced continuation already encodes where
+    /// its producer stopped). Exactly forced.count rows. Same measurement path as the
+    /// free-running variant (plain forward, fresh cache) — the perf path's compiled-step +
+    /// no-sync-readback design lives untouched in `generate`.
+    func teacherForcedLogprobs(prompt: [Int], forced: [Int]) -> [[Float]] {
+        let cache = model.newCache(parameters: nil)
+        var rows: [[Float]] = []
+        var y = MLXArray(prompt).reshaped([1, prompt.count])
+        for tok in forced {
+            let logits = model(y, cache: cache)
+            rows.append(logits[0..., -1, 0...].asType(.float32).asArray(Float.self))
+            y = MLXArray([tok]).reshaped([1, 1])
+        }
+        return rows
+    }
 }
 
 /// In-process `EngineDriver` over the compiled decode core — the only MLX-touching harness impl.
@@ -94,6 +112,11 @@ struct SwiftEngineDriver: EngineDriver {
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
         try Self.requireSupported(config)
         return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos)
+    }
+
+    func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
+        try Self.requireSupported(config)
+        return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation)
     }
 
     private static func requireSupported(_ config: RunConfig) throws {

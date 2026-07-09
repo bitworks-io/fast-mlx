@@ -29,15 +29,61 @@ public func medianOf(_ values: [Double]) -> Double {
     let sorted = values.sorted(); return sorted[sorted.count / 2]
 }
 
-/// Median per-position KL of the candidate's next-token distribution vs the fp16 reference's.
+public enum QualityMetricError: Error, CustomStringConvertible, Sendable {
+    /// The reference generated no tokens for a prompt: zero scoreable positions. Reporting
+    /// "0.0" here would be a vacuous pass, so the metric refuses instead.
+    case emptyContinuation(prompt: [Int])
+    /// A driver returned a different number of teacher-forced rows than forced positions —
+    /// it is not fulfilling the contract, and a silently truncated score would lie.
+    case rowCountMismatch(side: String, got: Int, expected: Int)
+    public var description: String {
+        switch self {
+        case .emptyContinuation(let prompt):
+            return "reference produced an empty continuation for prompt \(prompt) — no positions to score"
+        case .rowCountMismatch(let side, let got, let expected):
+            return "\(side) returned \(got) teacher-forced rows for \(expected) forced positions"
+        }
+    }
+}
+
+/// One teacher-forced scoring pass: the REFERENCE's greedy continuation is generated once,
+/// then BOTH drivers score that same continuation position-by-position. Every row therefore
+/// compares distributions over IDENTICAL context — the context-locked basis both the KL and
+/// perplexity metrics are defined on. (Free-running comparison compared diverged contexts:
+/// 33x distortion on the first real dial point, and no signal at all at 2-bit.)
+public struct TeacherForcedScores: Sendable {
+    public let continuation: [Int]        // the reference's greedy tokens (may end with eos)
+    public let candidateRows: [[Float]]   // full-vocab raw logits, one row per forced position
+    public let referenceRows: [[Float]]
+}
+
+public func teacherForcedScores(
+    driver: EngineDriver, reference: EngineDriver, prompt: [Int], config: RunConfig
+) async throws -> TeacherForcedScores {
+    let continuation = try await reference.generate(prompt: prompt, config: config).tokens
+    guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
+    let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, config: config)
+    guard c.count == continuation.count else {
+        throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: continuation.count)
+    }
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, config: config)
+    guard r.count == continuation.count else {
+        throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: continuation.count)
+    }
+    return TeacherForcedScores(continuation: continuation, candidateRows: c, referenceRows: r)
+}
+
+/// Median per-position KL of the candidate's next-token distribution vs the reference's,
+/// TEACHER-FORCED on the reference's greedy continuation: all N positions are context-locked
+/// by construction, so every position contributes a meaningful sample (no divergence
+/// starvation, no diverged-context distortion).
 public struct KLDivergenceMetric: QualityMetric {
     public let name = "kl_median"; public init() {}
     public func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double {
         var kls: [Double] = []
         for p in prompts {
-            let c = try await driver.logprobs(prompt: p, config: config)
-            let r = try await reference.logprobs(prompt: p, config: config)
-            kls.append(contentsOf: perPositionKLs(reference: r, candidate: c))
+            let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: p, config: config)
+            kls.append(contentsOf: perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows))
         }
         return medianOf(kls)
     }

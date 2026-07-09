@@ -183,7 +183,7 @@ func runBench(_ flags: Flags) async {
     }
 }
 
-// MARK: - kl (KLDivergenceMetric: candidate vs reference)
+// MARK: - kl (KLDivergenceMetric: candidate vs reference, TEACHER-FORCED)
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
@@ -203,14 +203,15 @@ func runKL(_ flags: Flags) async {
         print(sameWeights
             ? "# SAME weights both sides -> this is a PIPELINE PROOF (cross-implementation float-reduction noise), not a quantization-loss measurement."
             : "# DIFFERENT weights -> candidate-vs-reference quantization/behavior divergence measurement.")
+        print("# TEACHER-FORCED: both sides score the reference's greedy continuation, so every position is context-locked.")
 
         var allKLs: [Double] = []
-        var alignedKLs: [Double] = []
         var spotChecked = false
         for (text, prompt) in zip(klPrompts, prompts) {
-            let c = try await driver.logprobs(prompt: prompt, config: config)
-            let r = try await reference.logprobs(prompt: prompt, config: config)
-            guard let c0 = c.first, let r0 = r.first else {
+            // teacherForcedScores + perPositionKLs + medianOf ARE KLDivergenceMetric's own
+            // internals: the headline below equals metric.measure on the same prompts.
+            let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: prompt, config: config)
+            guard let c0 = s.candidateRows.first, let r0 = s.referenceRows.first else {
                 print("kl FAILED: empty logprobs for prompt \(String(reflecting: text))")
                 exit(1)
             }
@@ -219,31 +220,22 @@ func runKL(_ flags: Flags) async {
                 exit(1)
             }
             if !spotChecked {
+                // Position 0's context is the bare prompt on both sides — shared by construction.
                 spotCheckOrdering(candidateRow: c0, referenceRow: r0, eos: eos, sameWeights: sameWeights)
                 spotChecked = true
             }
-            // Greedy tokens are recoverable from the rows themselves (argmax; fp16->fp32 is exact).
-            let candTokens = c.map(argmaxIndex)
-            let refTokens = r.map(argmaxIndex)
-            let prefix = identicalPrefix(candTokens, refTokens)
-            let kls = perPositionKLs(reference: r, candidate: c)
-            // Positions 0...prefix have IDENTICAL contexts on both sides (the token at `prefix`
-            // differs, but its producing context is the shared prefix). Beyond that, each side's
-            // own greedy path diverges and per-position KL compares different contexts.
-            let alignedCount = min(prefix + 1, kls.count)
+            let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
+            // Diagnostic: at how many positions would the candidate have picked the same token
+            // the reference did, given the reference's context? (Top-1 agreement, not a gate.)
+            let agree = zip(s.candidateRows.map(argmaxIndex), s.continuation).filter(==).count
             allKLs.append(contentsOf: kls)
-            alignedKLs.append(contentsOf: kls.prefix(alignedCount))
-            print("prompt \(String(reflecting: text)): positions=\(kls.count), identical-prefix=\(prefix)/\(min(candTokens.count, refTokens.count)), median KL=\(sci(medianOf(kls)))")
+            print("prompt \(String(reflecting: text)): forced-positions=\(kls.count), top1-agreement=\(agree)/\(s.continuation.count), median KL=\(sci(medianOf(kls)))")
         }
 
-        // Headline = KLDivergenceMetric's exact computation (perPositionKLs + medianOf are the
-        // metric's own internals, so this equals KLDivergenceMetric.measure on the same rows).
         allKLs.sort()
-        alignedKLs.sort()
         let p95 = allKLs[min(Int(Double(allKLs.count - 1) * 0.95), allKLs.count - 1)]
-        print("kl_median (KLDivergenceMetric, all \(allKLs.count) positions): \(sci(medianOf(allKLs))) nats")
-        print("kl_p95    (all positions): \(sci(p95)) nats")
-        print("kl_median (context-aligned positions only, \(alignedKLs.count)): \(sci(medianOf(alignedKLs))) nats")
+        print("kl_median (KLDivergenceMetric, teacher-forced, all \(allKLs.count) positions): \(sci(medianOf(allKLs))) nats")
+        print("kl_p95    (teacher-forced, all positions): \(sci(p95)) nats")
     } catch {
         print("kl FAILED: \(error)")
         exit(1)

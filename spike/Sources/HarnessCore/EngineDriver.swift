@@ -32,16 +32,36 @@ public protocol EngineDriver: Sendable {
     /// token id — index == token id — so two drivers' outputs can be aligned by index directly.
     /// NOT top-k: under top-k, index i names a different token per model/run, which would make
     /// index-aligned KL meaningless. Empty if unsupported.
+    ///
+    /// FREE-RUNNING: the driver follows its own greedy path, so two drivers' rows share context
+    /// only while their token streams still agree. For cross-driver quality metrics use the
+    /// teacher-forced variant below — this one remains for single-driver introspection.
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]]
+    /// TEACHER-FORCED variant: instead of following its own greedy path, the driver scores a
+    /// fixed continuation. Row i is the full-vocab raw-logits next-token distribution given
+    /// context = prompt + forcedContinuation[0..<i]; forcedContinuation[i] is then fed as the
+    /// next input token REGARDLESS of argmax (and eos does not stop the loop — the continuation
+    /// already encodes where its producer stopped). Returns exactly forcedContinuation.count
+    /// rows, same index==token-id full-vocab ordering as `logprobs(prompt:config:)`.
+    ///
+    /// Two drivers scoring the SAME forced continuation therefore score IDENTICAL contexts at
+    /// every position — the context-locked basis KL/perplexity require. Free-running paths
+    /// diverge (at 2-bit after ~1 token) and would compare distributions over different
+    /// contexts, which is not a quality signal.
+    func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]]
 }
 
 public struct ScriptedDriver: EngineDriver {
-    let tokens: [Int]; let engagement: [String: Int]; let lp: [[Float]]
-    public init(tokens: [Int], engagement: [String: Int] = [:], logprobs: [[Float]] = []) {
-        self.tokens = tokens; self.engagement = engagement; self.lp = logprobs
+    let tokens: [Int]; let engagement: [String: Int]; let lp: [[Float]]; let forcedLp: [[Float]]?
+    public init(tokens: [Int], engagement: [String: Int] = [:], logprobs: [[Float]] = [],
+                forcedLogprobs: [[Float]]? = nil) {
+        self.tokens = tokens; self.engagement = engagement; self.lp = logprobs; self.forcedLp = forcedLogprobs
     }
     public func generate(prompt: [Int], config: RunConfig) async throws -> RunResult {
         RunResult(tokens: tokens, engagement: .init(engagement))
     }
     public func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] { lp }
+    public func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
+        forcedLp ?? lp
+    }
 }

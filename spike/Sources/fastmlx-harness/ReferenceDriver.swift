@@ -42,10 +42,21 @@ struct ReferenceDriver: EngineDriver {
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
+        try readLogits(prompt: prompt, config: config, forceTokens: nil)
+    }
+
+    /// Teacher-forced contract: `--force-tokens` makes the Python side feed each forced token
+    /// instead of its own argmax, so row i's context is prompt + forcedContinuation[0..<i] —
+    /// identical to what any other driver scores for the same continuation.
+    func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
+        try readLogits(prompt: prompt, config: config, forceTokens: forcedContinuation)
+    }
+
+    private func readLogits(prompt: [Int], config: RunConfig, forceTokens: [Int]?) throws -> [[Float]] {
         let tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("harness-ref-logits-\(UUID().uuidString).f32")
         defer { try? FileManager.default.removeItem(at: tmp) }
-        let header = try run(prompt: prompt, config: config, logitsOut: tmp.path)
+        let header = try run(prompt: prompt, config: config, logitsOut: tmp.path, forceTokens: forceTokens)
         let data = try Data(contentsOf: tmp)
         let expectedBytes = header.positions * header.vocab * MemoryLayout<Float32>.size
         guard data.count == expectedBytes else {
@@ -56,7 +67,7 @@ struct ReferenceDriver: EngineDriver {
         return (0..<header.positions).map { Array(flat[$0 * header.vocab ..< ($0 + 1) * header.vocab]) }
     }
 
-    private func run(prompt: [Int], config: RunConfig, logitsOut: String?) throws -> Header {
+    private func run(prompt: [Int], config: RunConfig, logitsOut: String?, forceTokens: [Int]? = nil) throws -> Header {
         guard config.temperature == 0 else {
             throw ReferenceError.unsupportedConfig("temperature=\(config.temperature) (reference is greedy-only)")
         }
@@ -69,6 +80,9 @@ struct ReferenceDriver: EngineDriver {
             "--eos-id", String(eos),
         ]
         if let logitsOut { args += ["--logits-out", logitsOut] }
+        if let forceTokens {
+            args += ["--force-tokens", "[" + forceTokens.map(String.init).joined(separator: ",") + "]"]
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: pythonPath)
