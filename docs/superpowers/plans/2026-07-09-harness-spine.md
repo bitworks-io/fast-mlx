@@ -21,7 +21,7 @@
 - `spike/Sources/HarnessCore/Corpus.swift` — `CorpusEntry`, the universal invariants, `runCorpus`.
 - `spike/Sources/HarnessCore/QualityMetric.swift` — `QualityMetric` protocol; `KLDivergenceMetric`.
 - `spike/Sources/HarnessCore/BenchMatrix.swift` — `Workload`, `Mode`, `Cell`, `BenchRunner`, `BenchRow` (CSV), release-build guard.
-- `spike/Sources/HarnessCore/SwiftEngineDriver.swift` — in-process `EngineDriver` over `CompiledMLXDecoder` (the only MLX-touching file).
+- `spike/Sources/fastmlx-harness/SwiftEngineDriver.swift` — in-process `EngineDriver` over `CompiledMLXDecoder` (the only MLX-touching file; lives in the executable target, NOT in pure `HarnessCore`).
 - `spike/Sources/fastmlx-harness/Harness.swift` — `@main` CLI: `verify` (triad on a model vs mlx-lm), `bench` (cell matrix), `corpus` (hermetic run), `kl` (metric on a dial point).
 - `spike/Tests/HarnessCoreTests/{TriadTests,CorpusTests,KLTests,BenchMatrixTests}.swift` — all pure, `ScriptedDriver`-backed.
 - `spike/scripts/harness_reference.py` — mlx-lm reference: greedy first-N tokens + per-position top-k logprobs (for equivalence + KL).
@@ -38,8 +38,10 @@
 
 ```swift
 // in targets: [...]
-.target(name: "HarnessCore", dependencies: ["SpikeCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
-.executableTarget(name: "fastmlx-harness", dependencies: ["HarnessCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
+// HarnessCore is PURE — NO MLX/SpikeCore dependency — so it (and HarnessCoreTests) build+test off-box with `swift test`.
+.target(name: "HarnessCore", dependencies: [], swiftSettings: [.swiftLanguageMode(.v6)]),
+// Only the executable pulls in SpikeCore (MLX); SwiftEngineDriver.swift lives HERE, not in HarnessCore.
+.executableTarget(name: "fastmlx-harness", dependencies: ["HarnessCore", "SpikeCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
 .testTarget(name: "HarnessCoreTests", dependencies: ["HarnessCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
 // in products: add .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"])
 ```
@@ -306,7 +308,7 @@ final class BenchMatrixTests: XCTestCase {
 
 The one MLX-touching file. Wraps `CompiledMLXDecoder`/`InferenceActor` to satisfy `EngineDriver`. Code specifics follow the spike's `docs/api/mlx-swift-api-notes.md`; verify on llmbench.
 
-**Files:** Create `spike/Sources/HarnessCore/SwiftEngineDriver.swift`; Modify `spike/Sources/fastmlx-harness/Harness.swift`
+**Files:** Create `spike/Sources/fastmlx-harness/SwiftEngineDriver.swift` (in the executable target — it imports both `HarnessCore` and `SpikeCore`/MLX); Modify `spike/Sources/fastmlx-harness/Harness.swift`
 
 - [ ] **Step 1: Implement `SwiftEngineDriver`** — holds a loaded model + `InferenceActor` (per spike); `generate` runs greedy decode returning tokens + `submitTime`/`tokenTimes` (reuse the bench path) + engagement counters (start with `{"decode": nTokens}`; spec-decode markers wired when spec-decode lands); `logprobs` runs the forward and returns top-k logits per position (temp=0). Preserve the compiled-step + no-sync-readback path; Swift 6 clean.
 - [ ] **Step 2: Reference driver.** `scripts/harness_reference.py` (extend the spike's `reference_tokens.py`): greedy first-N token ids AND per-position top-k logprobs from mlx-lm, JSON out. A `ReferenceDriver: EngineDriver` shells to it (or the harness reads its JSON) so equivalence + KL compare against fp16 mlx-lm.
