@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
+        .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", exact: "0.31.6"),
@@ -44,6 +45,23 @@ let package = Package(
         .testTarget(
             name: "SpikeCoreTests",
             dependencies: ["SpikeCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // HarnessCore is PURE — NO MLX/SpikeCore dependency — so it (and HarnessCoreTests) build+test off-box with `swift test`.
+        .target(
+            name: "HarnessCore",
+            dependencies: [],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Only the executable pulls in SpikeCore (MLX); SwiftEngineDriver.swift lives HERE, not in HarnessCore.
+        .executableTarget(
+            name: "fastmlx-harness",
+            dependencies: ["HarnessCore", "SpikeCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "HarnessCoreTests",
+            dependencies: ["HarnessCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
