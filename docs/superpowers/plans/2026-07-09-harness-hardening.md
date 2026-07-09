@@ -15,15 +15,15 @@
 ### Task 1: Teacher-forced logprobs contract + `KLDivergenceMetric` redefinition
 **Files:** `spike/Sources/HarnessCore/EngineDriver.swift`, `QualityMetric.swift`; `spike/Sources/fastmlx-harness/{SwiftEngineDriver,ReferenceDriver}.swift`, `spike/scripts/harness_reference.py`; tests in `HarnessCoreTests`.
 
-- [ ] **Contract (pure):** add a teacher-forced variant to `EngineDriver` — `logprobs(prompt:forcedContinuation:config:)` returns full-vocab logits at each of the N *forced* positions (index==token id), i.e. feed `forcedContinuation[i]` as the next token rather than argmax, so BOTH sides score the SAME contexts. Keep the free-running `logprobs` too (used elsewhere) or deprecate it — but the KL metric must use the forced one.
-- [ ] **Metric (pure) — TDD:** redefine `KLDivergenceMetric.measure` to (a) get the reference's greedy continuation for each prompt, (b) score both driver and reference teacher-forced on that continuation, (c) compute per-position KL over ALL N positions (no divergence starvation). Test with `ScriptedDriver`s that a known aligned KL is computed over all positions (the current CLI-only aligned computation becomes the metric's definition).
-- [ ] **Drivers (engine, on llmbench):** implement forced continuation in `SwiftEngineDriver.logprobs` (~5-line loop change: use forced token, not argmax) and `harness_reference.py --force-tokens`. Verify the ordering spot-check still holds.
-- [ ] **Verify on llmbench:** re-run the INT4-vs-INT8 Qwen3-32B comparison — now over ALL positions, not 8/72. Expect a STABLE median (the 33× all-vs-aligned distortion gone). Record it.
-- [ ] Commit.
+- [x] **Contract (pure):** add a teacher-forced variant to `EngineDriver` — `logprobs(prompt:forcedContinuation:config:)` returns full-vocab logits at each of the N *forced* positions (index==token id), i.e. feed `forcedContinuation[i]` as the next token rather than argmax, so BOTH sides score the SAME contexts. Keep the free-running `logprobs` too (used elsewhere) or deprecate it — but the KL metric must use the forced one.
+- [x] **Metric (pure) — TDD:** redefine `KLDivergenceMetric.measure` to (a) get the reference's greedy continuation for each prompt, (b) score both driver and reference teacher-forced on that continuation, (c) compute per-position KL over ALL N positions (no divergence starvation). Test with `ScriptedDriver`s that a known aligned KL is computed over all positions (the current CLI-only aligned computation becomes the metric's definition).
+- [x] **Drivers (engine, on llmbench):** implement forced continuation in `SwiftEngineDriver.logprobs` (~5-line loop change: use forced token, not argmax) and `harness_reference.py --force-tokens`. Verify the ordering spot-check still holds. *(Spot-check re-confirmed: argmax id identical, sampled raw logits within |diff| ≤ 0.19 fp16 noise.)*
+- [x] **Verify on llmbench:** re-run the INT4-vs-INT8 Qwen3-32B comparison — now over ALL positions, not 8/72. Expect a STABLE median (the 33× all-vs-aligned distortion gone). Record it. *(All 72 positions: median 1.192e-01 nats, p95 1.223; repeat run byte-identical. Same-weights noise floor 1.314e-03 nats. Old free-running: 14.2 all / 0.428 on 8 aligned.)*
+- [x] Commit. *(8e253d4)*
 
 ### Task 2: Perplexity-delta metric
 **Files:** `QualityMetric.swift` + test.
-- [ ] TDD: `PerplexityMetric: QualityMetric` — mean NLL (in nats or bits) of the forced tokens, from the same teacher-forced forward pass as Task 1 (nearly free). Delta = candidate ppl vs reference ppl. Test the pure math with `ScriptedDriver` logits. Wire into the CLI `kl`/a `quality` subcommand. Commit.
+- [x] TDD: `PerplexityMetric: QualityMetric` — mean NLL (in nats or bits) of the forced tokens, from the same teacher-forced forward pass as Task 1 (nearly free). Delta = candidate ppl vs reference ppl. Test the pure math with `ScriptedDriver` logits. Wire into the CLI `kl`/a `quality` subcommand. Commit. *(5d30a63 — measured: same-weights delta −0.24% (noise, inside the 1% gate); INT4-vs-INT8 +39.59%.)*
 
 ---
 
