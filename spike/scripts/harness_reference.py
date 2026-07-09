@@ -97,8 +97,10 @@ def main() -> None:
         # ids + force[:-1], so multi-token chunk forwards produce every row directly. Single-token
         # stepping made each step's transients slightly larger than the last (growing K/V
         # slices), so the buffer cache could never reuse a freed buffer and grew O(context^2) —
-        # the other half of the ~7K jetsam ceiling. Chunks keep transients same-shaped (reused),
-        # and score at prefill speed. 512 matches mlx-lm's default prefill step size.
+        # the other half of the ~7K jetsam ceiling. Chunking scores at prefill speed and cuts
+        # the growing-transient churn by the chunk factor; the set_cache_limit bound above is
+        # what guarantees flat memory (the K/V slices still grow chunk to chunk).
+        # 512 matches mlx-lm's default prefill step size.
         CHUNK = 512
         p = len(ids)
         full = list(ids) + [int(t) for t in force[:-1]]

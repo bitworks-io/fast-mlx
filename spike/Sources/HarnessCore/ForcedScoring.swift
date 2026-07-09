@@ -16,11 +16,13 @@ public struct RowSelection: Sendable, Equatable {
 /// every step's transient buffers (returned KV slices, attention intermediates) slightly LARGER
 /// than the last step's, so MLX's buffer cache can never reuse a freed buffer — the cache grows
 /// as the sum of all step sizes, i.e. O(context^2) bytes. Measured on Qwen3-32B-4bit: ~23GB of
-/// dead cached buffers by position 5000, ~48GB extrapolated at 7200 — which, with the Python
-/// reference process ballooning identically, is exactly the ~7K jetsam SIGKILL ceiling the
-/// harness hit. Chunked prefill scoring replaces N single-token forwards with N/chunkSize
-/// multi-token forwards whose transients are same-shaped chunk to chunk (so the cache reuses
-/// them), and is prefill-fast instead of decode-slow.
+/// dead cached buffers by position 5000, 43GB at 6750 — which, with the Python reference
+/// process ballooning identically, is exactly the ~7K jetsam SIGKILL ceiling the harness hit.
+/// Chunked prefill scoring replaces N single-token forwards with N/chunkSize multi-token
+/// forwards: prefill-fast instead of decode-slow, and the growing-transient churn shrinks by
+/// the chunk factor. (It does not vanish — the materialized K/V slices still grow chunk to
+/// chunk — so the driver pairs this with a bounded allocator cache; see
+/// `SwiftEngineDriver.scoreForced` for the measured numbers.)
 ///
 /// Semantics: the full input is prompt + forced.dropLast() (the last forced token is never fed —
 /// its ROW is produced by the token before it). The row for forced position i is the model's

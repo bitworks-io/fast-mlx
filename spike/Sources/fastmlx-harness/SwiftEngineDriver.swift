@@ -101,10 +101,16 @@ actor HarnessEngineActor {
     /// K/V slices), so MLX's buffer cache can never reuse a freed buffer and grows as
     /// O(context²) — measured 43GB of dead cache (active flat at 17GB) by position 6750 on
     /// Qwen3-32B-4bit, which, with the Python reference process ballooning identically, is
-    /// exactly the ~6.7–7.1K jetsam SIGKILL ceiling the harness hit. Chunk forwards keep
-    /// transients same-shaped chunk to chunk (cache reuse works, memory stays flat) and score
-    /// at prefill speed instead of decode speed. The per-chunk `eval` bounds the lazy graph so
-    /// pending work cannot pile up across chunks.
+    /// exactly the ~6.7–7.1K jetsam SIGKILL ceiling the harness hit.
+    ///
+    /// The fix is BOTH layers, each necessary: chunking cuts the number of growing-transient
+    /// events by the chunk factor and scores at prefill speed instead of decode speed (24K
+    /// tokens: ~1 min/side instead of ~10), but the materialized K/V slices still grow chunk to
+    /// chunk, so unbounded the cache still reaches ~62GB by 16K context (measured, ctxprobe
+    /// `score` mode) — it is the allocator-cache bound in `loadSwiftDriver` that guarantees
+    /// flat memory by evicting those unreusable buffers (32K tokens: 33.8GB peak footprint,
+    /// cache pinned at 8GB). The per-chunk `eval` bounds the lazy graph so pending work cannot
+    /// pile up across chunks.
     private func scoreForced(prompt: [Int], forced: [Int], wanted: [Int]?) -> [[Float]] {
         let cache = model.newCache(parameters: nil)
         let input = prompt + forced.dropLast()
