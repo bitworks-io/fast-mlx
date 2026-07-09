@@ -56,9 +56,15 @@ struct VerifyPayload: Codable, Sendable {
 }
 
 struct KLPayload: Codable, Sendable {
-    /// Headline: median of PER-ENTRY medians (equal weight per entry). NOT a position-weighted
-    /// pool -- see the pooled diagnostics below, which exist for visibility only.
+    /// Headline for SHORT entries: median of PER-ENTRY medians (equal weight per entry). NOT a
+    /// position-weighted pool -- see the pooled diagnostics below, which exist for visibility only.
     let klMedianNats: Double
+    /// Headline for LONG-CONTEXT entries: median across long entries of the per-entry p95
+    /// (`longContextTailKL`). Over natural long text the per-position median sits BELOW the
+    /// same-weights noise floor (easy tokens dominate); KV-quant divergence is a TAIL
+    /// phenomenon, so the tail statistic is the honest long-context headline. nil when the
+    /// corpus has no long-context entries.
+    let klLongContextTailP95Nats: Double?
     let klPooledMedianNats: Double
     let klPooledP95Nats: Double
     let pplCandidate: Double
@@ -344,6 +350,7 @@ func runKL(_ flags: Flags) async {
         // style, no "generate a continuation" step) at a SAMPLED subset of positions — a >=4K
         // token entry scored at every position would exhaust memory (~0.6MB/row x thousands of
         // positions x 2 drivers).
+        var longEntryKLs: [[Double]] = []
         for entry in longEntries {
             let docTokens = tokenizer.encode(text: entry.text)
             guard docTokens.count > 1 else {
@@ -358,22 +365,28 @@ func runKL(_ flags: Flags) async {
                 positions: sampled, config: config)
             let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
             allKLs.append(contentsOf: kls)
-            entryMedians.append(medianOf(kls))
+            longEntryKLs.append(kls)
             let n = Double(s.forcedTokens.count)
             candNLLTotal += meanNLL(rows: s.candidateRows, tokens: s.forcedTokens) * n
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.forcedTokens) * n
             totalPositions += s.forcedTokens.count
-            print("entry \(entry.id) (long-context, \(docTokens.count) doc tokens): sampled-positions=\(kls.count)/\(continuation.count), median KL=\(sci(medianOf(kls)))")
+            // The long-context ENTRY headline is the TAIL (p95), not the median: over natural
+            // long text the median sits below the same-weights noise floor (easy tokens both
+            // quants agree on dominate it), while KV-quant loss accrues in the tail.
+            print("entry \(entry.id) (long-context, \(docTokens.count) doc tokens): sampled-positions=\(kls.count)/\(continuation.count), p95 KL=\(sci(quantile(kls, 0.95))), median KL=\(sci(medianOf(kls)))")
         }
 
-        allKLs.sort()
-        let pooledP95 = allKLs[min(Int(Double(allKLs.count - 1) * 0.95), allKLs.count - 1)]
+        let pooledP95 = quantile(allKLs, 0.95)
         let headlineMedian = medianOf(entryMedians)
-        // HEADLINE: median of PER-ENTRY medians (equal weight per entry, regardless of how many
-        // positions that entry was scored at). The pooled numbers below are a diagnostic only —
-        // do not use them as the headline, since a heavily-sampled entry (the long-context one)
-        // would otherwise dominate a position-weighted pool.
-        print("kl_median (headline, median of \(entryMedians.count) per-entry medians): \(sci(headlineMedian)) nats")
+        let longContextTail: Double? = longEntryKLs.isEmpty ? nil : longContextTailKL(perEntryKLs: longEntryKLs)
+        // HEADLINES: short entries -> median of PER-ENTRY medians (equal weight per entry);
+        // long-context entries -> median of PER-ENTRY p95s (`longContextTailKL`), because the
+        // KV-quant divergence signal lives in the tail at long context. The pooled numbers below
+        // are a diagnostic only — a heavily-sampled entry would dominate a position-weighted pool.
+        print("kl_median (headline, SHORT entries, median of \(entryMedians.count) per-entry medians): \(sci(headlineMedian)) nats")
+        if let longContextTail {
+            print("kl_long_context_tail_p95 (headline, LONG-CONTEXT entries, median of \(longEntryKLs.count) per-entry p95s): \(sci(longContextTail)) nats")
+        }
         print("kl_pooled_median (diagnostic, position-weighted, all \(allKLs.count) positions -- do NOT use as headline): \(sci(medianOf(allKLs))) nats")
         print("kl_pooled_p95    (diagnostic, position-weighted, all positions): \(sci(pooledP95)) nats")
 
@@ -387,7 +400,8 @@ func runKL(_ flags: Flags) async {
         let referenceVersions = await reference.versionSink.versions
         let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: corpus)
         let payload = KLPayload(
-            klMedianNats: headlineMedian, klPooledMedianNats: medianOf(allKLs), klPooledP95Nats: pooledP95,
+            klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
+            klPooledMedianNats: medianOf(allKLs), klPooledP95Nats: pooledP95,
             pplCandidate: pplPair.candidate, pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
             totalPositions: totalPositions, entryCount: corpus.entries.count)
         appendJSONLRecord(ResultRecord(subcommand: "kl", provenance: provenance, payload: payload), to: evidencePath(flags))

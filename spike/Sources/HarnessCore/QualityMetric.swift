@@ -29,6 +29,29 @@ public func medianOf(_ values: [Double]) -> Double {
     let sorted = values.sorted(); return sorted[sorted.count / 2]
 }
 
+/// Deterministic quantile: sorted value at index CEIL(q * (n-1)). The ceiling convention is
+/// deliberate for a lossiness instrument: with a divergence tail of exactly (1-q) mass, the
+/// floor index lands on the last easy-token value and reads noise — under-reporting loss at the
+/// exact boundary the statistic exists to catch. Ceiling errs toward reporting divergence.
+/// Empty input yields 0 (mirrors `medianOf`).
+public func quantile(_ values: [Double], _ q: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let index = min(Int((Double(sorted.count - 1) * q).rounded(.up)), sorted.count - 1)
+    return sorted[max(index, 0)]
+}
+
+/// Tail-aware headline for LONG-CONTEXT entries: per-entry tail quantile (default p95), median
+/// across entries. Over natural long text, the per-position KL median sits BELOW the
+/// same-weights noise floor — easy function-word tokens that both quants agree on dominate it —
+/// while KV-quant divergence is a tail phenomenon (first lossy run: pooled p95 0.69 nats vs
+/// median 6e-5). A median headline would therefore report a lossy KV cache as indistinguishable
+/// from lossless at exactly the context lengths where its loss accrues; the tail headline is
+/// the number that captures it. Short prompts keep their median headline (`medianOf`).
+public func longContextTailKL(perEntryKLs: [[Double]], q: Double = 0.95) -> Double {
+    medianOf(perEntryKLs.map { quantile($0, q) })
+}
+
 public enum QualityMetricError: Error, CustomStringConvertible, Sendable {
     /// The reference generated no tokens for a prompt: zero scoreable positions. Reporting
     /// "0.0" here would be a vacuous pass, so the metric refuses instead.
