@@ -297,6 +297,24 @@ public enum CapacityModel {
         m.nativeMaxContext < 32768 ? .nativeMaxBelowDefault : nil
     }
 
+    /// The `MLX.Memory.cacheLimit` the engine MUST set explicitly whenever it raises
+    /// `iogpu.wired_limit_mb` (spec §3.1's invariant) — MLX's own default (`memoryLimit` = 1.5x the
+    /// wired limit, `cacheLimit` = `memoryLimit`) is exactly the "7K wall" mechanism: raising the
+    /// sysctl silently entitles the allocator's buffer cache to hoard ~all of it, and an O(context²)
+    /// allocation pattern turns that into an OOM. This is a **conservative starting policy to be
+    /// tuned by soak measurement**, not a derived constant — the key property is that it is
+    /// explicit and far below the 1.5x default, not that 1/8th is the "correct" fraction.
+    ///
+    /// `min(max(wiredLimitBytes / 8, 4 GiB), 24 GiB)`: ~12.5% of the wired limit, floored at 4 GiB
+    /// (usable on small boxes where 1/8th alone would starve the cache) and capped at 24 GiB
+    /// (anti-hoard on big boxes, where 1/8th alone would still let the cache claim tens of GiB).
+    public static func recommendedCacheLimitBytes(wiredLimitBytes: Int) -> Int {
+        let gib = 1024 * 1024 * 1024
+        let floor = 4 * gib
+        let cap = 24 * gib
+        return min(max(wiredLimitBytes / 8, floor), cap)
+    }
+
     /// `min(model.nativeMax, largest context that still fits under headroom)` — the tunable's true
     /// ceiling (spec §4). Binary-searches the largest context whose predicted peak stays at or
     /// under 100% of headroom (i.e., not red) at the given concurrency/kv_quant.
