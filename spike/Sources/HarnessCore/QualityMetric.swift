@@ -80,16 +80,21 @@ public struct TeacherForcedScores: Sendable {
     public let referenceRows: [[Float]]
 }
 
+/// `referenceConfig` (default: same as `config`) lets the CANDIDATE run a lossy feature the
+/// reference must not — e.g. a `kvQuant` tier the reference engine has no notion of. The
+/// reference side always scores at its own baseline; candidate-only knobs never leak into it.
 public func teacherForcedScores(
-    driver: EngineDriver, reference: EngineDriver, prompt: [Int], config: RunConfig
+    driver: EngineDriver, reference: EngineDriver, prompt: [Int], config: RunConfig,
+    referenceConfig: RunConfig? = nil
 ) async throws -> TeacherForcedScores {
-    let continuation = try await reference.generate(prompt: prompt, config: config).tokens
+    let refConfig = referenceConfig ?? config
+    let continuation = try await reference.generate(prompt: prompt, config: refConfig).tokens
     guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
     let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, config: config)
     guard c.count == continuation.count else {
         throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: continuation.count)
     }
-    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, config: config)
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, config: refConfig)
     guard r.count == continuation.count else {
         throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: continuation.count)
     }
@@ -109,16 +114,19 @@ public struct TeacherForcedScoresAtPositions: Sendable {
     public let referenceRows: [[Float]]
 }
 
+/// `referenceConfig` as on `teacherForcedScores`: candidate-only knobs (e.g. `kvQuant`)
+/// never leak to the reference side.
 public func teacherForcedScoresAtSampledPositions(
     driver: EngineDriver, reference: EngineDriver,
-    prompt: [Int], continuation: [Int], positions: [Int], config: RunConfig
+    prompt: [Int], continuation: [Int], positions: [Int], config: RunConfig,
+    referenceConfig: RunConfig? = nil
 ) async throws -> TeacherForcedScoresAtPositions {
     guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
     let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: config)
     guard c.count == positions.count else {
         throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: positions.count)
     }
-    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: config)
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: referenceConfig ?? config)
     guard r.count == positions.count else {
         throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: positions.count)
     }

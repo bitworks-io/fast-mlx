@@ -61,9 +61,12 @@ public enum TurboQuantTier: String, Sendable, CaseIterable {
         }
     }
 
-    /// Honest storage cost per KV element: base bits + 1 QJL sign bit + the per-row fp16
-    /// γ = ‖r‖₂ amortized over head_dim.
+    /// Honest storage cost per KV element: base bits + 1 QJL sign bit + TWO per-row fp16
+    /// scalars amortized over head_dim — γ = ‖r‖₂ (Algorithm 2) and ‖x‖ (the Task-6a
+    /// non-unit-norm handling, paper §1.1). This is the FORMAT's design width; the v1
+    /// in-memory cache stores byte-aligned codes (uint8 idx + int8 sign), so it does not
+    /// realize this footprint yet — bit-packing is deferred engineering.
     public func bitsPerElement(headDim: Int) -> Double {
-        Double(baseBits) + 1.0 + 16.0 / Double(headDim)
+        Double(baseBits) + 1.0 + 32.0 / Double(headDim)
     }
 }

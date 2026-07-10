@@ -154,9 +154,10 @@ final class TurboQuantCodecTests: XCTestCase {
     func testTierBitsPerElementIsHonest() {
         XCTAssertEqual(TurboQuantTier.tqB2.baseBits, 2)
         XCTAssertEqual(TurboQuantTier.tqB3.baseBits, 3)
-        // base bits + 1 QJL bit + the fp16 γ=‖r‖₂ amortized over head_dim.
-        XCTAssertEqual(TurboQuantTier.tqB2.bitsPerElement(headDim: 128), 3 + 16.0 / 128)
-        XCTAssertEqual(TurboQuantTier.tqB3.bitsPerElement(headDim: 128), 4 + 16.0 / 128)
+        // base bits + 1 QJL bit + TWO fp16 per-row scalars amortized over head_dim:
+        // γ = ‖r‖₂ (Algorithm 2) and ‖x‖ (Task 6a non-unit-norm handling).
+        XCTAssertEqual(TurboQuantTier.tqB2.bitsPerElement(headDim: 128), 3 + 32.0 / 128)
+        XCTAssertEqual(TurboQuantTier.tqB3.bitsPerElement(headDim: 128), 4 + 32.0 / 128)
         XCTAssertEqual(TurboQuantTier.tqB2.harnessSlot, "tq2.5")
         XCTAssertEqual(TurboQuantTier.tqB3.harnessSlot, "tq3.5")
     }

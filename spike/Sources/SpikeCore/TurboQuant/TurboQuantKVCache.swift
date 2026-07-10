@@ -106,7 +106,7 @@ public final class TurboQuantKVCache: KVCache, Updatable {
         let kCode = encode(keys)
         let vCode = encode(values)
         if kIdx == nil {
-            allocate(like: keys, idxDType: kCode.idx.dtype)
+            allocate(like: keys)
             outDType = keys.dtype
         }
 
@@ -184,14 +184,17 @@ public final class TurboQuantKVCache: KVCache, Updatable {
     }
 
     /// Flatten `[B, H, n, d]` to codec rows, quantize (float32 math), reshape the code
-    /// fields back to scatter shape.
+    /// fields back to scatter shape. Storage dtypes are narrow and EXACT: centroid indices
+    /// (< 2^baseBits ≤ 256) as uint8, ±1 signs as int8 — both cast back losslessly on read.
+    /// Still byte-aligned, not the format's bit-packed design width (see bitsPerElement),
+    /// but it keeps a 24K-token scoring cache in single-digit GB instead of tens.
     private func encode(_ x: MLXArray) -> StoredCode {
         let (b, h, n, d) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
         let code = TurboQuantCodec.quantizeProdNormalized(
             x.asType(.float32).reshaped([-1, d]), params: params)
         return StoredCode(
-            idx: code.idx.reshaped([b, h, n, d]),
-            signs: code.signs.reshaped([b, h, n, d]),
+            idx: code.idx.asType(.uint8).reshaped([b, h, n, d]),
+            signs: code.signs.asType(.int8).reshaped([b, h, n, d]),
             gamma: code.norms.reshaped([b, h, n, 1]),
             xNorm: code.xNorm!.reshaped([b, h, n, 1]))
     }
@@ -203,8 +206,8 @@ public final class TurboQuantKVCache: KVCache, Updatable {
     ) -> MLXArray {
         let (b, h, cap, d) = (idx.dim(0), idx.dim(1), idx.dim(2), idx.dim(3))
         let code = TurboQuantCode(
-            idx: idx.reshaped([-1, d]),
-            signs: signs.reshaped([-1, d]),
+            idx: idx.asType(.int32).reshaped([-1, d]),  // uint8 storage -> gather-friendly int32
+            signs: signs.asType(.float32).reshaped([-1, d]),  // int8 ±1 -> codec matmul dtype
             norms: gamma.reshaped([-1, 1]),
             xNorm: xNorm.reshaped([-1, 1]))
         return TurboQuantCodec.dequantizeProdNormalized(code, params: params)
@@ -212,15 +215,16 @@ public final class TurboQuantKVCache: KVCache, Updatable {
             .asType(outDType ?? .float32)
     }
 
-    private func allocate(like keys: MLXArray, idxDType: DType) {
+    private func allocate(like keys: MLXArray) {
+        precondition(params.baseBits <= 8, "uint8 index storage requires baseBits <= 8")
         let (b, h) = (keys.dim(0), keys.dim(1))
         let d = params.headDim
-        kIdx = MLXArray.zeros([b, h, capacity, d], dtype: idxDType)
-        kSigns = MLXArray.zeros([b, h, capacity, d], dtype: .float32)
+        kIdx = MLXArray.zeros([b, h, capacity, d], dtype: .uint8)
+        kSigns = MLXArray.zeros([b, h, capacity, d], dtype: .int8)
         kGamma = MLXArray.zeros([b, h, capacity, 1], dtype: .float32)
         kXNorm = MLXArray.zeros([b, h, capacity, 1], dtype: .float32)
-        vIdx = MLXArray.zeros([b, h, capacity, d], dtype: idxDType)
-        vSigns = MLXArray.zeros([b, h, capacity, d], dtype: .float32)
+        vIdx = MLXArray.zeros([b, h, capacity, d], dtype: .uint8)
+        vSigns = MLXArray.zeros([b, h, capacity, d], dtype: .int8)
         vGamma = MLXArray.zeros([b, h, capacity, 1], dtype: .float32)
         vXNorm = MLXArray.zeros([b, h, capacity, 1], dtype: .float32)
     }
