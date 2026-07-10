@@ -76,6 +76,36 @@ final class TurboQuantKVCacheTests: XCTestCase {
         XCTAssertEqual(mv[0..., 0..., 4..., 0...].abs().max().item(Float.self), 0)
     }
 
+    // MARK: Task 7 — tier selection plumbing
+
+    func testKVCacheKindMappingAndFactory() {
+        XCTAssertEqual(KVCacheKind(kvQuant: nil), .fp16)
+        XCTAssertEqual(KVCacheKind(kvQuant: "fp16"), .fp16)
+        XCTAssertEqual(KVCacheKind(kvQuant: "tq2.5"), .turboQuant(.tqB2))
+        XCTAssertEqual(KVCacheKind(kvQuant: "tq3.5"), .turboQuant(.tqB3))
+        XCTAssertEqual(KVCacheKind(kvQuant: "tqB2"), .turboQuant(.tqB2))
+        XCTAssertEqual(KVCacheKind(kvQuant: "tqB3"), .turboQuant(.tqB3))
+        XCTAssertNil(KVCacheKind(kvQuant: "8"), "unknown tiers must NOT silently fall back to fp16")
+        XCTAssertTrue(KVCacheKind.fp16.makeCache(capacity: 4) is CompiledKVCache)
+        XCTAssertTrue(KVCacheKind.turboQuant(.tqB3).makeCache(capacity: 4) is TurboQuantKVCache)
+    }
+
+    /// The decoder can't know head_dim before the model's first K/V arrives, so the tier init
+    /// resolves `TurboQuantParams` lazily on first update — and must derive exactly the params
+    /// an explicit `TurboQuantParams(headDim:baseBits:seed:)` gives (same seed, same Π/S/codebook).
+    func testTierInitResolvesParamsLazilyFromFirstUpdate() {
+        let d = 64
+        let k = randomKV(batch: 1, heads: 2, n: 2, d: d, seed: 31)
+        let v = randomKV(batch: 1, heads: 2, n: 2, d: d, seed: 32)
+        let lazyCache = TurboQuantKVCache(capacity: 4, tier: .tqB3, seed: 0)
+        let fixedCache = TurboQuantKVCache(
+            capacity: 4, params: TurboQuantParams(headDim: d, baseBits: 3, seed: 0))
+        let (lk, lv) = lazyCache.update(keys: k, values: v)
+        let (fk, fv) = fixedCache.update(keys: k, values: v)
+        XCTAssertEqual((lk - fk).abs().max().item(Float.self), 0)
+        XCTAssertEqual((lv - fv).abs().max().item(Float.self), 0)
+    }
+
     func testGrowExtendsAndResetInPlacePreservesIdentity() {
         let d = 64
         let p = TurboQuantParams(headDim: d, baseBits: 2, seed: 0)

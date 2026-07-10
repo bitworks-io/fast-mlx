@@ -53,6 +53,12 @@ struct VerifyPayload: Codable, Sendable {
     let equivalencePassed: Bool
     let engaged: Bool
     let triadPassed: Bool
+    /// tqB3 near-lossless check: identical-prefix length vs the same engine at fp16 KV
+    /// (nil for exact-mode and canary-only tiers).
+    let fp16PrefixMatch: Int?
+    /// In-graph cached-token count from the TurboQuant cache after the candidate run —
+    /// the lossy triad's engagement marker (nil on fp16 runs).
+    let turboquantTokens: Int?
 }
 
 struct KLPayload: Codable, Sendable {
@@ -131,28 +137,33 @@ func runCorpus() {
 
 func runVerify(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant <TIER>] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant fp16|tq2.5|tq3.5] [--lossy-min-prefix 16] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     let prompt = flags.string("prompt", default: knownGoodPrompt)
     let n = flags.int("n", default: 60)
     let minPrefix = flags.int("min-prefix", default: 30)
-    // Declared KV-quant tier (Task 4): the engine has no quantized-KV kernel yet (only fp16), so
-    // this is NOT passed into the actual RunConfig used for generation — it only selects and
-    // records which triad bar the run is being held to, ahead of the kernel landing.
+    // KV-quant tier (Task 7): passed INTO the RunConfig, so the engine actually runs the
+    // selected cache (TurboQuantKVCache for tq2.5/tq3.5) — no longer a declaration-only flag.
     let kvQuantTier = flags.string("kv-quant")
+    guard let kvKind = KVCacheKind(kvQuant: kvQuantTier) else {
+        print("verify FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+        exit(2)
+    }
     let mode = triadMode(forKVQuantTier: kvQuantTier)
     do {
         let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
         let promptTokens = tokenizer.encode(text: prompt)
-        let config = RunConfig.greedy(maxTokens: n)
+        let config = RunConfig(temperature: 0, maxTokens: n, kvQuant: kvQuantTier)
 
         let candidate = try await driver.generate(prompt: promptTokens, config: config)
         let decodeCount = candidate.engagement.counts["decode"] ?? 0
-        let engaged = EngagementCheck(marker: "decode", floor: 1).passed(before: 0, after: decodeCount)
+        var engaged = EngagementCheck(marker: "decode", floor: 1).passed(before: 0, after: decodeCount)
 
         let verdict: TriadVerdict
         var referenceVersions: ReferenceDriver.ReferenceVersions?
+        var fp16Prefix: Int?  // tqB3 near-lossless check: identical prefix vs fp16 KV
+        var turboquantTokens: Int?  // in-graph engagement marker from the quantized cache
         switch mode {
         case .exact:
             let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
@@ -169,27 +180,88 @@ func runVerify(_ flags: Flags) async {
                 print("reference: \(refRun.tokens)")
             }
         case .lossy:
+            // TurboQuant engagement (Task 7): the quantized cache's IN-GRAPH cached-token
+            // count must have advanced past the prompt — a silent fp16 fallback cannot
+            // fake this marker (fp16 runs don't emit it at all).
+            let tqTokens = candidate.engagement.counts["turboquant_tokens"] ?? 0
+            let tqEngaged = EngagementCheck(marker: "turboquant_tokens", floor: promptTokens.count + 1)
+                .passed(before: 0, after: tqTokens)
+            engaged = engaged && tqEngaged
             // non-crash: candidate already produced >=1 token (checked below via prefix).
-            // non-NaN: scan a full-vocab logprobs pass for any non-finite value.
+            // non-NaN: scan a full-vocab logprobs pass for any non-finite value — this ALSO
+            // exercises the harness scoring forward with the quantized cache (Phase 3's path).
             let rows = try await driver.logprobs(prompt: promptTokens, config: config)
             let allFinite = rows.allSatisfy { row in row.allSatisfy { $0.isFinite } }
-            // coherence canary: a fixed prompt whose greedy answer must contain a known substring.
+            // Integration diagnostic (not a gate): the uncompiled scoring forward free-runs
+            // its own greedy path at the SAME tier, so its argmax stream vs the compiled
+            // decode's tokens separates compile-trace fidelity from codec loss. Near-tie
+            // flips from kernel-fusion reduction order can still differ, so a long-but-not-
+            // full match is float noise; an immediate mismatch would be a trace bug.
+            let scoringGreedy = rows.map(argmaxIndex)
+            let traceAgreement = identicalPrefix(candidate.tokens, scoringGreedy)
+            print("compiled-vs-uncompiled greedy agreement (same tier): identical-prefix \(traceAgreement)/\(min(candidate.tokens.count, scoringGreedy.count))")
+            // Perturbation-scale diagnostic: position 0 scores the SAME context (the bare
+            // prompt) on both tiers, so the row-0 logit delta is the pure KV-quantization
+            // perturbation on real tensors — O(0.1–1) means near-tie argmax flips (expected
+            // lossy behavior), ≫1 means a broken path.
+            let fp16Row0 = try await driver.logprobs(prompt: promptTokens, config: .greedy(maxTokens: 1)).first ?? []
+            if let tqRow0 = rows.first, fp16Row0.count == tqRow0.count {
+                var maxDiff: Float = 0
+                var sumSq: Double = 0
+                for i in fp16Row0.indices {
+                    let d = fp16Row0[i] - tqRow0[i]
+                    maxDiff = max(maxDiff, abs(d))
+                    sumSq += Double(d) * Double(d)
+                }
+                let rms = (sumSq / Double(fp16Row0.count)).squareRoot()
+                var top1 = -Float.infinity, top2 = -Float.infinity
+                for v in fp16Row0 { if v > top1 { top2 = top1; top1 = v } else if v > top2 { top2 = v } }
+                let fpArg = argmaxIndex(fp16Row0)
+                let tqArg = argmaxIndex(tqRow0)
+                print("pos-0 logit perturbation: max|Δ| \(fmt(Double(maxDiff), 3)), rms \(fmt(rms, 4)) (fp16 top-2 gap \(fmt(Double(top1 - top2), 3))); argmax \(fpArg == tqArg ? "MATCH" : "FLIP \(fpArg) -> \(tqArg)")")
+            }
+            // coherence canary: a fixed prompt whose greedy answer must contain a known
+            // substring — run AT THE QUANTIZED TIER (config carries kvQuant).
             let canary = CoherenceCanary.capitalOfFrance
             let canaryTokens = tokenizer.encode(text: canary.prompt)
-            let canaryRun = try await driver.generate(prompt: canaryTokens, config: .greedy(maxTokens: 20))
+            let canaryRun = try await driver.generate(
+                prompt: canaryTokens, config: RunConfig(temperature: 0, maxTokens: 20, kvQuant: kvQuantTier))
             let canaryText = tokenizer.decode(tokenIds: canaryRun.tokens)
             let canaryPassed = canary.passed(canaryText)
             let lossy = LossyEquivalenceCheck(minPrefix: 1)
                 .evaluate(prefix: candidate.tokens.count, allFinite: allFinite, canaryPassed: canaryPassed)
+            // tqB3 is near-lossless (paper's 4-bit-total tier): additionally require a short
+            // identical prefix vs the SAME engine at fp16 KV, temp 0. tqB2's prefix
+            // legitimately diverges early — canary-only there.
+            var prefixOK = true
+            if case .turboQuant(.tqB3) = kvKind {
+                let gate = flags.int("lossy-min-prefix", default: 16)
+                let fp16Run = try await driver.generate(prompt: promptTokens, config: .greedy(maxTokens: n))
+                let eq = EquivalenceCheck(minPrefix: gate)
+                    .evaluate(candidate: candidate.tokens, reference: fp16Run.tokens)
+                fp16Prefix = eq.prefix
+                prefixOK = eq.passed
+                let comparable = min(candidate.tokens.count, fp16Run.tokens.count)
+                print("near-lossless prefix vs fp16 KV (tqB3): identical-prefix \(eq.prefix)/\(comparable) (gate >= \(gate)) -> \(eq.passed ? "PASS" : "FAIL")")
+                if !eq.passed {
+                    print("candidate (tq): \(candidate.tokens)")
+                    print("fp16 KV:        \(fp16Run.tokens)")
+                }
+            }
+            turboquantTokens = tqTokens
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
-            print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
+            print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed && prefixOK ? "PASS" : "FAIL")")
             if !lossy.reasons.isEmpty { print("  reasons: \(lossy.reasons.joined(separator: "; "))") }
-            verdict = TriadVerdict(equivalenceOK: lossy.passed, engaged: engaged, acceptanceOK: nil)
+            verdict = TriadVerdict(equivalenceOK: lossy.passed && prefixOK, engaged: engaged, acceptanceOK: nil)
             if !verdict.passed { print("candidate: \(candidate.tokens)") }
         }
 
         print("kv_quant_tier: \(kvQuantTier ?? "fp16") (mode=\(mode.rawValue))")
-        print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
+        if let tq = turboquantTokens {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); turboquant_tokens 0 -> \(tq) (floor \(promptTokens.count + 1)) -> \(engaged ? "PASS" : "FAIL")")
+        } else {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
+        }
         print("acceptance:  n/a (no spec-decode configured)")
         print("triad: \(verdict.passed ? "PASS" : "FAIL")")
 
@@ -197,7 +269,8 @@ func runVerify(_ flags: Flags) async {
         let payload = VerifyPayload(
             prompt: prompt, promptTokens: promptTokens.count, n: n, mode: mode.rawValue,
             kvQuantTier: kvQuantTier ?? "fp16", equivalencePassed: verdict.equivalenceOK,
-            engaged: verdict.engaged, triadPassed: verdict.passed)
+            engaged: verdict.engaged, triadPassed: verdict.passed,
+            fp16PrefixMatch: fp16Prefix, turboquantTokens: turboquantTokens)
         appendJSONLRecord(ResultRecord(subcommand: "verify", provenance: provenance, payload: payload), to: evidencePath(flags))
 
         if !verdict.passed { exit(1) }
@@ -477,9 +550,12 @@ struct Harness {
         subcommands:
           corpus                              hermetic corpus + universal invariants (no model)
           verify --model <PATH>               triad: equivalence vs mlx-lm + engagement delta
-                 [--kv-quant <TIER>]          declares a KV-quant tier; nil/fp16 = exact triad,
-                                               any other name = lossy triad (non-crash + non-NaN
-                                               + coherence canary; not yet honored by the engine)
+                 [--kv-quant <TIER>]          KV-quant tier, RUN BY THE ENGINE: nil/fp16 = exact
+                                               triad (fp16 cache); tq2.5|tqB2 / tq3.5|tqB3 select
+                                               the TurboQuant KV cache and the lossy triad
+                                               (non-crash + non-NaN + canary + engagement; tqB3
+                                               adds an identical-prefix gate vs fp16 KV,
+                                               [--lossy-min-prefix 16])
           bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

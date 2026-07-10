@@ -29,7 +29,21 @@ import MLXLMCommon
 /// in SpikeCore.
 public final class TurboQuantKVCache: KVCache, Updatable {
     public private(set) var capacity: Int
-    let params: TurboQuantParams
+
+    /// Codec params: set at init (params variant) or resolved on the first update from the
+    /// incoming head_dim (tier variant — the decoder can't know head_dim before the model's
+    /// first K/V arrives). Fixed for the cache's lifetime once resolved.
+    private var resolvedParams: TurboQuantParams?
+    /// Deferred spec for lazy resolution; nil when params were given directly.
+    private let deferredSpec: (baseBits: Int, seed: UInt64)?
+
+    /// The active codec params (valid after init-with-params or the first update).
+    var params: TurboQuantParams {
+        guard let p = resolvedParams else {
+            preconditionFailure("TurboQuantKVCache params unresolved — no update yet")
+        }
+        return p
+    }
 
     // Code buffers, allocated lazily on the first (uncompiled, prefill) update so batch,
     // kv-head count, and dtypes come from the model itself — same lifecycle as
@@ -55,7 +69,17 @@ public final class TurboQuantKVCache: KVCache, Updatable {
     public init(capacity: Int, params: TurboQuantParams) {
         precondition(capacity > 0)
         self.capacity = capacity
-        self.params = params
+        self.resolvedParams = params
+        self.deferredSpec = nil
+    }
+
+    /// Tier variant: params resolve lazily on the first update from the incoming head_dim.
+    /// The fixed seed makes every layer's cache derive the identical global Π/S/codebook.
+    public init(capacity: Int, tier: TurboQuantTier, seed: UInt64 = 0) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        self.resolvedParams = nil
+        self.deferredSpec = (tier.baseBits, seed)
     }
 
     public var maxSize: Int? { nil }
@@ -71,6 +95,10 @@ public final class TurboQuantKVCache: KVCache, Updatable {
     /// Quantize the incoming `[B, H, n, d]` K/V, scatter their code fields at
     /// positions offset..<offset+n, and return the dequantized FULL buffers.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if resolvedParams == nil, let spec = deferredSpec {
+            resolvedParams = TurboQuantParams(
+                headDim: keys.dim(3), baseBits: spec.baseBits, seed: spec.seed)
+        }
         precondition(
             keys.dim(3) == params.headDim && values.dim(3) == params.headDim,
             "TurboQuantKVCache params are per head_dim (\(params.headDim))")
