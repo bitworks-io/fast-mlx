@@ -27,19 +27,30 @@ enum SwiftEngineDriverError: Error, CustomStringConvertible {
 /// (the next step's compiled forward is asyncEval'd before the current token's `.item()`).
 actor HarnessEngineActor {
     private let model: any LanguageModel
-    private var decoder: CompiledMLXDecoder
+    /// One decoder per KV-cache kind, built lazily and kept alive so each kind's compiled
+    /// step function survives across runs (an fp16 baseline and a TurboQuant candidate can
+    /// alternate within one verify invocation without retracing either).
+    private var decoders: [KVCacheKind: CompiledMLXDecoder] = [:]
 
     init(model: sending any LanguageModel) {
         self.model = model
-        self.decoder = CompiledMLXDecoder(model: model)
     }
 
     /// Greedy decode via the compiled core. The returned ids INCLUDE a terminal eos if one is
     /// produced (mirroring scripts/harness_reference.py exactly, so token streams diff cleanly).
-    func generate(prompt: [Int], maxTokens: Int, eos: Int) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double]) {
+    /// `turboQuantTokens` is the in-graph engagement marker from the quantized cache (nil on
+    /// fp16 runs) — proof the quant path ran, read AFTER timing so it cannot skew the numbers.
+    func generate(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind)
+        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], turboQuantTokens: Int?)
+    {
+        if decoders[kind] == nil {
+            decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
+        }
+        var decoder = decoders[kind]!
+        defer { decoders[kind] = decoder }
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, []) }
+        guard maxTokens > 0 else { return ([], submitTime, [], nil) }
         var tokens: [Int] = []
         var tokenTimes: [Double] = []
         var tok = decoder.prefill(prompt)
@@ -50,7 +61,13 @@ actor HarnessEngineActor {
             tokens.append(tok)
             tokenTimes.append(Date().timeIntervalSinceReferenceDate)
         }
-        return (tokens, submitTime, tokenTimes)
+        let turboQuantTokens = decoder.turboQuantCachedTokens()
+        if case .turboQuant = kind {
+            // A TurboQuant run whose decoder somehow holds an fp16 cache is a plumbing bug,
+            // not a measurement — fail loudly (mirrors requireSupported's contract).
+            precondition(turboQuantTokens != nil, "TurboQuant tier requested but the quantized cache did not engage")
+        }
+        return (tokens, submitTime, tokenTimes, turboQuantTokens)
     }
 
     /// Full-vocab RAW LOGITS per generated position at temp=0 — the `EngineDriver.logprobs`
@@ -59,8 +76,8 @@ actor HarnessEngineActor {
     /// and the per-position full-vocab readback is inherently synchronous anyway.
     /// fp16 -> float32 conversion is exact, so argmax over a returned row reproduces the
     /// greedy token chosen at that position.
-    func logprobs(prompt: [Int], maxTokens: Int, eos: Int) -> [[Float]] {
-        let cache = model.newCache(parameters: nil)
+    func logprobs(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind) -> [[Float]] {
+        let cache = makeScoringCache(kind: kind, capacity: prompt.count + max(maxTokens, 0))
         var rows: [[Float]] = []
         var y = MLXArray(prompt).reshaped([1, prompt.count])
         for _ in 0..<max(maxTokens, 0) {
@@ -71,6 +88,7 @@ actor HarnessEngineActor {
             if tok == eos { break }
             y = MLXArray([tok]).reshaped([1, 1])
         }
+        assertTurboQuantEngaged(kind, cache: cache, minTokens: prompt.count)
         return rows
     }
 
@@ -80,8 +98,8 @@ actor HarnessEngineActor {
     /// its producer stopped). Exactly forced.count rows. Same measurement path as the
     /// free-running variant (plain forward, fresh cache) — the perf path's compiled-step +
     /// no-sync-readback design lives untouched in `generate`.
-    func teacherForcedLogprobs(prompt: [Int], forced: [Int]) -> [[Float]] {
-        scoreForced(prompt: prompt, forced: forced, wanted: nil)
+    func teacherForcedLogprobs(prompt: [Int], forced: [Int], kvCache kind: KVCacheKind) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: nil, kind: kind)
     }
 
     /// Sampled variant: same chunked forward over the full forced continuation (causal decoding
@@ -89,8 +107,10 @@ actor HarnessEngineActor {
     /// full-vocab row at `positions` — a long-context entry can be thousands of positions, and
     /// materializing every row would be ~0.6MB/row x thousands x 2 drivers. `positions` must be
     /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
-    func teacherForcedLogprobsAtPositions(prompt: [Int], forced: [Int], positions: [Int]) -> [[Float]] {
-        scoreForced(prompt: prompt, forced: forced, wanted: positions)
+    func teacherForcedLogprobsAtPositions(
+        prompt: [Int], forced: [Int], positions: [Int], kvCache kind: KVCacheKind
+    ) -> [[Float]] {
+        scoreForced(prompt: prompt, forced: forced, wanted: positions, kind: kind)
     }
 
     /// CHUNKED teacher-forced scoring (`forcedScoringPlan` in HarnessCore holds the pure
@@ -111,9 +131,9 @@ actor HarnessEngineActor {
     /// flat memory by evicting those unreusable buffers (32K tokens: 33.8GB peak footprint,
     /// cache pinned at 8GB). The per-chunk `eval` bounds the lazy graph so pending work cannot
     /// pile up across chunks.
-    private func scoreForced(prompt: [Int], forced: [Int], wanted: [Int]?) -> [[Float]] {
-        let cache = model.newCache(parameters: nil)
+    private func scoreForced(prompt: [Int], forced: [Int], wanted: [Int]?, kind: KVCacheKind) -> [[Float]] {
         let input = prompt + forced.dropLast()
+        let cache = makeScoringCache(kind: kind, capacity: input.count)
         let plan = forcedScoringPlan(
             promptCount: prompt.count, forcedCount: forced.count,
             wantedPositions: wanted, chunkSize: Self.scoringChunkSize)
@@ -126,7 +146,33 @@ actor HarnessEngineActor {
                 rows.append(logits[0..., sel.localIndex, 0...].asType(.float32).asArray(Float.self))
             }
         }
+        assertTurboQuantEngaged(kind, cache: cache, minTokens: input.count)
         return rows
+    }
+
+    /// Scoring-path cache selection (Task 7): the MEASUREMENT forwards must run the same KV
+    /// tier the config asked for, not silently fp16 — Phase 3's KL/ppl numbers come through
+    /// here, not through the compiled decode path. fp16 keeps the stock model cache; a
+    /// TurboQuant tier gets one `TurboQuantKVCache` per layer, sized for the whole pass
+    /// up-front (scoring knows its total length; no chunked growth needed).
+    private func makeScoringCache(kind: KVCacheKind, capacity: Int) -> [any KVCache] {
+        switch kind {
+        case .fp16:
+            return model.newCache(parameters: nil)
+        case .turboQuant:
+            let layerCount = model.newCache(parameters: nil).count
+            return (0 ..< layerCount).map { _ in kind.makeCache(capacity: max(capacity, 1)) }
+        }
+    }
+
+    /// Engagement backstop for the scoring paths: when a TurboQuant tier was requested, the
+    /// cache must BE a TurboQuantKVCache and must have cached every scored position — a
+    /// silent fp16 fallback here would let Phase 3 "measure" the wrong thing.
+    private func assertTurboQuantEngaged(_ kind: KVCacheKind, cache: [any KVCache], minTokens: Int) {
+        guard case .turboQuant = kind else { return }
+        guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
+            preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+        }
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -140,41 +186,53 @@ struct SwiftEngineDriver: EngineDriver {
     let eos: Int
 
     func generate(prompt: [Int], config: RunConfig) async throws -> RunResult {
-        try Self.requireSupported(config)
-        let out = await engine.generate(prompt: prompt, maxTokens: config.maxTokens, eos: eos)
+        let kind = try Self.cacheKind(config)
+        let out = await engine.generate(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
+        var counts = ["decode": out.tokens.count]
+        if let tq = out.turboQuantTokens {
+            // In-graph cached-token count from the quantized cache — the lossy triad's
+            // engagement marker (delta-checked by `verify`; absent on fp16 runs).
+            counts["turboquant_tokens"] = tq
+        }
         return RunResult(
             tokens: out.tokens,
-            engagement: .init(["decode": out.tokens.count]),
+            engagement: .init(counts),
             acceptanceRate: nil, // no spec-decode path yet
             submitTime: out.submitTime,
             tokenTimes: out.tokenTimes)
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
-        try Self.requireSupported(config)
-        return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos)
+        let kind = try Self.cacheKind(config)
+        return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
-        try Self.requireSupported(config)
-        return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation)
+        let kind = try Self.cacheKind(config)
+        return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation, kvCache: kind)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
-        try Self.requireSupported(config)
-        return await engine.teacherForcedLogprobsAtPositions(prompt: prompt, forced: forcedContinuation, positions: positions)
+        let kind = try Self.cacheKind(config)
+        return await engine.teacherForcedLogprobsAtPositions(
+            prompt: prompt, forced: forcedContinuation, positions: positions, kvCache: kind)
     }
 
-    private static func requireSupported(_ config: RunConfig) throws {
+    /// Validates the whole config and maps `kvQuant` to a cache kind. nil/"fp16" → fp16;
+    /// "tq2.5"/"tq3.5" (or "tqB2"/"tqB3") → the TurboQuant cache. Anything else throws —
+    /// a "measurement" must never silently measure something other than what was asked for.
+    private static func cacheKind(_ config: RunConfig) throws -> KVCacheKind {
         guard config.temperature == 0 else {
             throw SwiftEngineDriverError.unsupportedConfig("temperature=\(config.temperature) (greedy-only engine)")
         }
         if let spec = config.specDecode {
             throw SwiftEngineDriverError.unsupportedConfig("specDecode=\(spec) (not implemented)")
         }
-        if let kv = config.kvQuant, kv != "fp16" {
-            throw SwiftEngineDriverError.unsupportedConfig("kvQuant=\(kv) (only fp16 KV cache exists)")
+        guard let kind = KVCacheKind(kvQuant: config.kvQuant) else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "kvQuant=\(config.kvQuant ?? "nil") (known tiers: fp16, tq2.5/tqB2, tq3.5/tqB3)")
         }
+        return kind
     }
 }
 

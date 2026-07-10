@@ -35,12 +35,18 @@ Dequant(idx, qjl, γ):
 ## Validation path (through the hardened harness)
 Run `verify` (lossy-tier triad + canary at 2.5/3.5-bit), and `kl`/perplexity/**long-context tail-p95** vs the **bf16** reference on corpus v2 (incl. the 24K entry). **Promote to a dial tier only if it beats the 4-bit affine baseline (tail-p95 1.665 @24K) at equal-or-smaller KV size**; else shelve with a dated negative result. Also record KV bytes/token (the storage win) once the memory-metrics FAST-FOLLOW lands.
 
+## Spike A resolution (2026-07-09, on-box d=128 property tests + arXiv HTML v1 re-check)
+
+- **Dequant scale CONFIRMED verbatim:** `x̃_qjl = (√(π/2)/d)·γ·Sᵀ·qjl`, no shrinkage factor. Our implementation's regression slope of `⟨q, r̂⟩` on `⟨q, r⟩` = **1.0066** (unbiased, correctly scaled), and the flipped matmul convention (`signs·Sᵀ`) measurably degrades (0.038 vs 0.029) — the `sign(r·Sᵀ)`/`signs·S` row-convention pairing is right.
+- **Theorem 2 metric clarified (this was the VERIFY item):** unbiasedness `E[⟨y,x̃⟩] = ⟨y,x⟩` plus a **worst-case-query** distortion bound `D_prod = E[(⟨y,x⟩−⟨y,x̃⟩)²] ≤ (√3·π²·‖y‖²/d)·4^{−b}` (b = total bits; the earlier "3π²" note was the wrong constant — HTML v1 reads √3·π²). Paper's empirical table: `d·D_prod ≈ {1.57, 0.56, 0.18, 0.047}` for b = 1..4. **Our codec reproduces it: 0.175 @ 3 total bits, 0.0514 @ 4 total bits** (d=128, 4096 unit-norm pairs).
+- **Sharp caveat discovered (derived, then measured):** for **independent** random q,k the unbiased QJL correction has variance `≈ (π/2)·‖r‖²/d` — a factor π/2 *worse* than simply dropping the residual (measured 0.0294 vs 0.0240 mean-abs). `_prod`'s advantage is the removal of the `_mse` shrinkage *bias* `⟨q,r⟩ ≈ ‖r‖²·⟨q,x⟩`, which dominates only when q correlates with x: at ⟨q,x⟩=1 the measured errors are 0.0282 (`_prod`) vs 0.1159 (`_mse`) — 4.1× better; crossover ≈ ⟨q,x⟩ ~ 0.2. Attention is the correlated regime (softmax cares about the high scores), which is why the paper's end-to-end results hold. **Any property test for `_prod` must use correlated or worst-case queries, or test unbiasedness/the Theorem-2 table — a mean-abs test on independent random pairs provably favors `_mse`** (0.122/d < 0.18/d from the paper's own numbers).
+
 ## Open gaps to resolve during implementation (paper-unspecified)
 1. Fast rotation alternative (dense is heavy) — could we substitute a randomized-Hadamard rotation and re-fit Lloyd-Max? Empirical question; the paper doesn't, but it's the obvious perf lever.
 2. Lloyd-Max levels for b≥3 (solve numerically; only b=1,2 tabulated).
 3. Rotation/QJL granularity for KV (global vs per-head_dim — INFERRED: per head_dim).
 4. Outlier-channel selection (fixed vs calibrated) + the exact 2.5-bit channel split (VERIFY).
 5. K vs V same/different bit-widths (unstated).
-6. `_prod` distortion constant 3π² and the norm/‖r‖ bookkeeping when input isn't unit-norm (VERIFY vs PDF).
+6. ~~`_prod` distortion constant 3π² and the norm/‖r‖ bookkeeping when input isn't unit-norm (VERIFY vs PDF).~~ **RESOLVED** — see "Spike A resolution" above (constant is √3·π², worst-case-query metric; scale/convention confirmed). Non-unit-norm bookkeeping: γ=‖r‖₂ is stored explicitly so the residual estimate is norm-correct; Theorem 2 is stated for x on the unit sphere — K/V vectors are not unit-norm, so the *base* codebook's 1/√d scaling assumes unit-ish norm and per-vector norm handling for the base quantizer remains an integration-time check (Phase 2).
 
 No official Google impl; ~10 unofficial community repos (unverified — re-derive constants from the paper, don't trust them). QJL sub-component: author repo amirzandieh/QJL.

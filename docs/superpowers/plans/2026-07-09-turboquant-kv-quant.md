@@ -23,7 +23,7 @@
 **Honest naming:** v1 is *uniform* `(b base + 1 QJL)` = `b+1` bits/element (a `b=2` tier is ~3-bit/element, `b=3` is ~4-bit/element). The paper's "2.5-bit / 3.5-bit" labels require the deferred outlier-channel mixing, so internal tiers are named **`tqB2`** (2 base + QJL) and **`tqB3`** (3 base + QJL); they occupy the harness's `tq2.5`/`tq3.5` recording slots with a documented note that the sub-integer labels await outlier channels. **Never report a `tqB3` result under a "2.5-bit" label.**
 
 **Scheduled spikes (decision points inside the phases, not hand-waves):**
-- **Spike A (Phase 1B, Task 8):** confirm the `_prod` dequant scale `√(π/2)/d` and the `‖r‖₂` norm bookkeeping reproduce inner-product preservation on a real head_dim (128) before building the cache on top of it. If the inner-product test can't be made to pass, STOP and re-derive from the PDF (the reference doc flags the `3π²` constant + norm handling as VERIFY items).
+- **Spike A (Phase 1B, Task 4) — ✅ RESOLVED 2026-07-09.** Verified the codec reproduces the paper's Theorem-2 distortion table (`d·D_prod` 0.175/0.0514 vs paper 0.18/0.047) at d=128, with unbiasedness slope 1.0066 — the scale `√(π/2)/d` is confirmed verbatim. The gate *test* was corrected (the naive `prodErr<mseErr` on independent pairs provably favors `_mse`; `_prod` wins in attention's *correlated* regime). Full derivation in the [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution); the distortion-bound constant is `√3·π²`, not the earlier `3π²`.
 - **Spike B (Phase 3):** if `tqB2` (the aggressive tier) fails the quality gate, the decision is *outlier channels vs shelve* — do not silently ship a failing tier.
 
 ---
@@ -241,25 +241,12 @@ private func l2normalizeRows(_ x: MLXArray) -> MLXArray {
 
 **Files:** extend `TurboQuantCodec.swift` + the test.
 
-- [ ] **Step 1: Failing test — the KEY property.** `_prod` must (a) reconstruct better than `_mse` alone, and (b) **preserve inner products**: for query rows `y` and key rows `x`, `⟨y, dequantProd(quantProd(x))⟩ ≈ ⟨y, x⟩` markedly better than the `_mse`-only estimate. This is the property attention depends on.
+- [ ] **Step 1: Failing test — the paper-faithful gate (⚠️ CORRECTED after Spike A, 2026-07-09).** The intuitive `prodErr < mseErr` on *independent* random query/key pairs is the **WRONG** gate and provably fails for a correct implementation: `_prod`'s unbiased QJL correction carries variance `≈ (π/2)·‖r‖²/d` with no `_mse` shrinkage *bias* to remove when `q ⊥ k`, so it loses on independent pairs (crossover ≈ `⟨q,x⟩ ~ 0.2`). Attention is the **correlated** regime (softmax weights the high scores), which is where `_prod` wins — so the gate asserts the three properties the paper actually guarantees (full derivation + numbers: [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution)). All three must pass on-box at d=128, float32:
+  - (a) **Unbiasedness:** regression slope of `⟨q, dequantProd(quantProd(x))⟩` on `⟨q, x⟩` ≈ 1.0 (±0.05) — pins the `√(π/2)/d` scale (measured 1.0066).
+  - (b) **Correlated-regime superiority** (the KV-relevant property): for `⟨q,x⟩ ≥ 0.45`, mean-abs inner-product error of `_prod` < `_mse` by margin ≥ 1.8× (measured 4.1× at `⟨q,x⟩=1`).
+  - (c) **Theorem-2 table anchor** (the falsifiable pin that the codec *is* the paper's quantizer): `d·D_prod` within ~20% of the paper's `{…, 0.18, 0.047}` at total bits 3, 4 (measured 0.175 / 0.0514).
 
-```swift
-func testProdPreservesInnerProductsBetterThanMSE() {
-    let keys = l2normalizeRows(MLXRandom.normal([64, 128], key: MLXRandom.key(1)))
-    let queries = l2normalizeRows(MLXRandom.normal([64, 128], key: MLXRandom.key(2)))
-    let p = TurboQuantParams(headDim: 128, baseBits: 2, seed: 0)
-    let exact = (queries * keys).sum(axis: -1)
-
-    let mseK = TurboQuantCodec.dequantizeMSE(TurboQuantCodec.quantizeMSE(keys, params: p), params: p)
-    let mseErr = ((queries * mseK).sum(axis: -1) - exact).abs().mean().item(Float.self)
-
-    let code = TurboQuantCodec.quantizeProd(keys, params: p)
-    let prodK = TurboQuantCodec.dequantizeProd(code, params: p)
-    let prodErr = ((queries * prodK).sum(axis: -1) - exact).abs().mean().item(Float.self)
-
-    XCTAssertLessThan(prodErr, mseErr, "QJL residual must improve inner-product fidelity over _mse")
-}
-```
+  Do NOT re-introduce the naive independent-pair assertion, and do NOT adopt an MMSE shrinkage factor to force a random-pair win — that breaks the unbiasedness Theorem 2 proves (and which composition across attention relies on).
 
 - [ ] **Step 2: Verify fail. Step 3: Implement** the Algorithm-2 residual: `r = x − dequantMSE(idx)`; `signs = sign(r·Sᵀ)`; `γ = ‖r‖₂` per row; dequant adds `(√(π/2)/d)·γ·(signs·S)`.
 

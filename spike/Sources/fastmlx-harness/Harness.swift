@@ -53,9 +53,18 @@ struct VerifyPayload: Codable, Sendable {
     let equivalencePassed: Bool
     let engaged: Bool
     let triadPassed: Bool
+    /// Lossy-tier quality statistic (adjudicated re-spec): teacher-forced top-1 agreement
+    /// RATE vs the same engine at fp16 KV — context-locked, so one flipped high-entropy
+    /// token cannot cascade the way a free-running prefix does. nil in exact mode.
+    let teacherForcedTop1AgreementRate: Double?
+    /// In-graph cached-token count from the TurboQuant cache after the candidate run —
+    /// the lossy triad's engagement marker (nil on fp16 runs).
+    let turboquantTokens: Int?
 }
 
 struct KLPayload: Codable, Sendable {
+    /// Candidate-side KV-cache tier ("fp16" when unset). The reference side is always fp16 KV.
+    let kvQuantTier: String
     /// Headline for SHORT entries: median of PER-ENTRY medians (equal weight per entry). NOT a
     /// position-weighted pool -- see the pooled diagnostics below, which exist for visibility only.
     let klMedianNats: Double
@@ -81,6 +90,9 @@ struct BenchPayload: Codable, Sendable {
     let decodeTokS: Double
     let ttftMs: Double
     let quant: String
+    /// KV-cache tier the timed decode ran with ("fp16" when unset) — distinct from `quant`,
+    /// which is the model's own weight quantization.
+    let kvQuantTier: String
     let concurrency: Int
 }
 
@@ -131,28 +143,33 @@ func runCorpus() {
 
 func runVerify(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant <TIER>] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant fp16|tq2.5|tq3.5] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     let prompt = flags.string("prompt", default: knownGoodPrompt)
     let n = flags.int("n", default: 60)
     let minPrefix = flags.int("min-prefix", default: 30)
-    // Declared KV-quant tier (Task 4): the engine has no quantized-KV kernel yet (only fp16), so
-    // this is NOT passed into the actual RunConfig used for generation — it only selects and
-    // records which triad bar the run is being held to, ahead of the kernel landing.
+    // KV-quant tier (Task 7): passed INTO the RunConfig, so the engine actually runs the
+    // selected cache (TurboQuantKVCache for tq2.5/tq3.5) — no longer a declaration-only flag.
     let kvQuantTier = flags.string("kv-quant")
+    guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
+        print("verify FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+        exit(2)
+    }
     let mode = triadMode(forKVQuantTier: kvQuantTier)
     do {
         let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
         let promptTokens = tokenizer.encode(text: prompt)
-        let config = RunConfig.greedy(maxTokens: n)
+        let config = RunConfig(temperature: 0, maxTokens: n, kvQuant: kvQuantTier)
 
         let candidate = try await driver.generate(prompt: promptTokens, config: config)
         let decodeCount = candidate.engagement.counts["decode"] ?? 0
-        let engaged = EngagementCheck(marker: "decode", floor: 1).passed(before: 0, after: decodeCount)
+        var engaged = EngagementCheck(marker: "decode", floor: 1).passed(before: 0, after: decodeCount)
 
         let verdict: TriadVerdict
         var referenceVersions: ReferenceDriver.ReferenceVersions?
+        var teacherForcedTop1: Double?  // context-locked top-1 agreement rate vs fp16 KV
+        var turboquantTokens: Int?  // in-graph engagement marker from the quantized cache
         switch mode {
         case .exact:
             let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
@@ -169,18 +186,73 @@ func runVerify(_ flags: Flags) async {
                 print("reference: \(refRun.tokens)")
             }
         case .lossy:
+            // TurboQuant engagement (Task 7): the quantized cache's IN-GRAPH cached-token
+            // count must have advanced past the prompt — a silent fp16 fallback cannot
+            // fake this marker (fp16 runs don't emit it at all).
+            let tqTokens = candidate.engagement.counts["turboquant_tokens"] ?? 0
+            let tqEngaged = EngagementCheck(marker: "turboquant_tokens", floor: promptTokens.count + 1)
+                .passed(before: 0, after: tqTokens)
+            engaged = engaged && tqEngaged
             // non-crash: candidate already produced >=1 token (checked below via prefix).
-            // non-NaN: scan a full-vocab logprobs pass for any non-finite value.
+            // non-NaN: scan a full-vocab logprobs pass for any non-finite value — this ALSO
+            // exercises the harness scoring forward with the quantized cache (Phase 3's path).
             let rows = try await driver.logprobs(prompt: promptTokens, config: config)
             let allFinite = rows.allSatisfy { row in row.allSatisfy { $0.isFinite } }
-            // coherence canary: a fixed prompt whose greedy answer must contain a known substring.
+            // Integration diagnostic (not a gate): the uncompiled scoring forward free-runs
+            // its own greedy path at the SAME tier, so its argmax stream vs the compiled
+            // decode's tokens separates compile-trace fidelity from codec loss. Near-tie
+            // flips from kernel-fusion reduction order can still differ, so a long-but-not-
+            // full match is float noise; an immediate mismatch would be a trace bug.
+            let scoringGreedy = rows.map(argmaxIndex)
+            let traceAgreement = identicalPrefix(candidate.tokens, scoringGreedy)
+            print("compiled-vs-uncompiled greedy agreement (same tier): identical-prefix \(traceAgreement)/\(min(candidate.tokens.count, scoringGreedy.count))")
+            // Perturbation-scale diagnostic: position 0 scores the SAME context (the bare
+            // prompt) on both tiers, so the row-0 logit delta is the pure KV-quantization
+            // perturbation on real tensors — O(0.1–1) means near-tie argmax flips (expected
+            // lossy behavior), ≫1 means a broken path.
+            let fp16Row0 = try await driver.logprobs(prompt: promptTokens, config: .greedy(maxTokens: 1)).first ?? []
+            if let tqRow0 = rows.first, fp16Row0.count == tqRow0.count {
+                var maxDiff: Float = 0
+                var sumSq: Double = 0
+                for i in fp16Row0.indices {
+                    let d = fp16Row0[i] - tqRow0[i]
+                    maxDiff = max(maxDiff, abs(d))
+                    sumSq += Double(d) * Double(d)
+                }
+                let rms = (sumSq / Double(fp16Row0.count)).squareRoot()
+                var top1 = -Float.infinity, top2 = -Float.infinity
+                for v in fp16Row0 { if v > top1 { top2 = top1; top1 = v } else if v > top2 { top2 = v } }
+                let fpArg = argmaxIndex(fp16Row0)
+                let tqArg = argmaxIndex(tqRow0)
+                print("pos-0 logit perturbation: max|Δ| \(fmt(Double(maxDiff), 3)), rms \(fmt(rms, 4)) (fp16 top-2 gap \(fmt(Double(top1 - top2), 3))); argmax \(fpArg == tqArg ? "MATCH" : "FLIP \(fpArg) -> \(tqArg)")")
+            }
+            // coherence canary: a fixed prompt whose greedy answer must contain a known
+            // substring — run AT THE QUANTIZED TIER (config carries kvQuant).
             let canary = CoherenceCanary.capitalOfFrance
             let canaryTokens = tokenizer.encode(text: canary.prompt)
-            let canaryRun = try await driver.generate(prompt: canaryTokens, config: .greedy(maxTokens: 20))
+            let canaryRun = try await driver.generate(
+                prompt: canaryTokens, config: RunConfig(temperature: 0, maxTokens: 20, kvQuant: kvQuantTier))
             let canaryText = tokenizer.decode(tokenIds: canaryRun.tokens)
             let canaryPassed = canary.passed(canaryText)
             let lossy = LossyEquivalenceCheck(minPrefix: 1)
                 .evaluate(prefix: candidate.tokens.count, allFinite: allFinite, canaryPassed: canaryPassed)
+            // Teacher-forced top-1 agreement vs the SAME engine at fp16 KV, BOTH TurboQuant
+            // tiers (adjudicated re-spec): the earlier free-running identical-prefix gate was
+            // chaotic — one flipped high-entropy token diverges everything after it, the same
+            // lesson that made the KL metric teacher-forced. The context-locked per-position
+            // agreement RATE is the stable statistic; it is REPORTED (recorded in evidence),
+            // and the triad gates on the lossy floor above, not on prefix length.
+            let fp16Run = try await driver.generate(prompt: promptTokens, config: .greedy(maxTokens: n))
+            let forced = fp16Run.tokens
+            if !forced.isEmpty {
+                let tfRows = try await driver.logprobs(
+                    prompt: promptTokens, forcedContinuation: forced, config: config)
+                let agree = zip(tfRows.map(argmaxIndex), forced).filter(==).count
+                let rate = Double(agree) / Double(forced.count)
+                teacherForcedTop1 = rate
+                print("teacher-forced top-1 agreement vs fp16 KV: \(agree)/\(forced.count) (\(fmt(rate * 100, 1))%)")
+            }
+            turboquantTokens = tqTokens
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
             print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
             if !lossy.reasons.isEmpty { print("  reasons: \(lossy.reasons.joined(separator: "; "))") }
@@ -189,7 +261,11 @@ func runVerify(_ flags: Flags) async {
         }
 
         print("kv_quant_tier: \(kvQuantTier ?? "fp16") (mode=\(mode.rawValue))")
-        print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
+        if let tq = turboquantTokens {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); turboquant_tokens 0 -> \(tq) (floor \(promptTokens.count + 1)) -> \(engaged ? "PASS" : "FAIL")")
+        } else {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
+        }
         print("acceptance:  n/a (no spec-decode configured)")
         print("triad: \(verdict.passed ? "PASS" : "FAIL")")
 
@@ -197,7 +273,8 @@ func runVerify(_ flags: Flags) async {
         let payload = VerifyPayload(
             prompt: prompt, promptTokens: promptTokens.count, n: n, mode: mode.rawValue,
             kvQuantTier: kvQuantTier ?? "fp16", equivalencePassed: verdict.equivalenceOK,
-            engaged: verdict.engaged, triadPassed: verdict.passed)
+            engaged: verdict.engaged, triadPassed: verdict.passed,
+            teacherForcedTop1AgreementRate: teacherForcedTop1, turboquantTokens: turboquantTokens)
         appendJSONLRecord(ResultRecord(subcommand: "verify", provenance: provenance, payload: payload), to: evidencePath(flags))
 
         if !verdict.passed { exit(1) }
@@ -220,6 +297,12 @@ func runBench(_ flags: Flags) async {
         let maxTokens = flags.int("max-tokens", default: 256)
         let runs = flags.int("runs", default: 3)
         let label = flags.string("label", default: "harness")
+        // KV tier for the timed decode (Task 8: the materialize-then-attend perf cost).
+        let kvQuantTier = flags.string("kv-quant")
+        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
+            print("bench FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+            exit(2)
+        }
         let (driver, tokenizer, _) = try await loadSwiftDriver(modelPath: modelPath)
 
         let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
@@ -233,7 +316,9 @@ func runBench(_ flags: Flags) async {
         var ttfts: [Double] = []
         let agg = try await BenchRunner().run(cell: cell, iterations: runs + 1, nonce: nonce, basePrompt: prompt) { i, salted in
             let promptTokens = tokenizer.encode(text: salted)
-            let result = try await driver.generate(prompt: promptTokens, config: .greedy(maxTokens: maxTokens))
+            let result = try await driver.generate(
+                prompt: promptTokens,
+                config: RunConfig(temperature: 0, maxTokens: maxTokens, kvQuant: kvQuantTier))
             guard !result.tokenTimes.isEmpty else {
                 print("# run \(i): produced zero tokens -> skipped")
                 return nil
@@ -267,7 +352,8 @@ func runBench(_ flags: Flags) async {
         let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: nil, corpus: nil)
         let payload = BenchPayload(
             label: label, workload: Workload.decode.rawValue, mode: Mode.none.rawValue,
-            decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant, concurrency: 1)
+            decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
+            kvQuantTier: kvQuantTier ?? "fp16", concurrency: 1)
         appendJSONLRecord(ResultRecord(subcommand: "bench", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch BenchGuardError.debugBuild {
         print("bench FAILED: Debug build — perf numbers would be meaningless. Build with -configuration Release.")
@@ -288,16 +374,24 @@ func runKL(_ flags: Flags) async {
     do {
         let positions = flags.int("positions", default: 24)
         let longContextSampleSize = flags.int("long-context-sample-positions", default: 128)
+        // Candidate-side KV tier (Task 8): the CANDIDATE scores with the selected cache;
+        // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
+        let kvQuantTier = flags.string("kv-quant")
+        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
+            print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+            exit(2)
+        }
         let corpus = try loadMeasurementCorpus(flags)
         let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
         let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
         let sameWeights = reference.modelPath == modelPath
-        let config = RunConfig.greedy(maxTokens: positions)
+        let config = RunConfig(temperature: 0, maxTokens: positions, kvQuant: kvQuantTier)
+        let referenceConfig = RunConfig.greedy(maxTokens: positions)
         let shortEntries = corpus.entries(tagged: .prose) + corpus.entries(tagged: .code)
         let longEntries = corpus.entries(tagged: .longContext)
 
-        print("candidate: Swift engine on \(modelPath)")
-        print("reference: mlx-lm on \(reference.modelPath)")
+        print("candidate: Swift engine on \(modelPath) (kv_quant_tier=\(kvQuantTier ?? "fp16"))")
+        print("reference: mlx-lm on \(reference.modelPath) (fp16 KV)")
         print("corpus: \(corpus.corpusId) (content hash \(corpus.contentHash), \(corpus.entries.count) entries)")
         print(sameWeights
             ? "# SAME weights both sides -> this is a PIPELINE PROOF (cross-implementation float-reduction noise), not a quantization-loss measurement."
@@ -317,7 +411,9 @@ func runKL(_ flags: Flags) async {
             let prompt = tokenizer.encode(text: entry.text)
             // teacherForcedScores + perPositionKLs + medianOf ARE KLDivergenceMetric's own
             // internals: the headline below equals metric.measure on the same prompts.
-            let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: prompt, config: config)
+            let s = try await teacherForcedScores(
+                driver: driver, reference: reference, prompt: prompt, config: config,
+                referenceConfig: referenceConfig)
             guard let c0 = s.candidateRows.first, let r0 = s.referenceRows.first else {
                 print("kl FAILED: empty logprobs for entry \(entry.id)")
                 exit(1)
@@ -362,7 +458,7 @@ func runKL(_ flags: Flags) async {
             let sampled = evenlySpacedPositions(total: continuation.count, sampleSize: longContextSampleSize)
             let s = try await teacherForcedScoresAtSampledPositions(
                 driver: driver, reference: reference, prompt: prompt, continuation: continuation,
-                positions: sampled, config: config)
+                positions: sampled, config: config, referenceConfig: referenceConfig)
             let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
             allKLs.append(contentsOf: kls)
             longEntryKLs.append(kls)
@@ -400,6 +496,7 @@ func runKL(_ flags: Flags) async {
         let referenceVersions = await reference.versionSink.versions
         let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: corpus)
         let payload = KLPayload(
+            kvQuantTier: kvQuantTier ?? "fp16",
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
             klPooledMedianNats: medianOf(allKLs), klPooledP95Nats: pooledP95,
             pplCandidate: pplPair.candidate, pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
@@ -477,11 +574,15 @@ struct Harness {
         subcommands:
           corpus                              hermetic corpus + universal invariants (no model)
           verify --model <PATH>               triad: equivalence vs mlx-lm + engagement delta
-                 [--kv-quant <TIER>]          declares a KV-quant tier; nil/fp16 = exact triad,
-                                               any other name = lossy triad (non-crash + non-NaN
-                                               + coherence canary; not yet honored by the engine)
+                 [--kv-quant <TIER>]          KV-quant tier, RUN BY THE ENGINE: nil/fp16 = exact
+                                               triad (fp16 cache); tq2.5|tqB2 / tq3.5|tqB3 select
+                                               the TurboQuant KV cache and the lossy triad
+                                               (non-crash + non-NaN + canary + engagement), and
+                                               REPORT teacher-forced top-1 agreement vs fp16 KV
           bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
+                 [--kv-quant <TIER>]          KV tier for the timed decode (fp16|tq2.5|tq3.5)
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
+                 [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
