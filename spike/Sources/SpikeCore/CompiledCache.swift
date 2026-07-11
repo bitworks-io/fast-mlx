@@ -11,6 +11,10 @@ public protocol CompiledCache: AnyObject, KVCache, Updatable {
     var capacity: Int { get }
     func grow(by chunk: Int)
     func resetInPlace()
+    /// Roll the cached-token count back to `newLength` — speculative-decoding rollback of
+    /// rows a rejected verify forward wrote. Identity-preserving (`_updateInternal`), like
+    /// `resetInPlace`, so compiled-step bindings survive.
+    func truncate(to newLength: Int)
 }
 
 extension CompiledKVCache: CompiledCache {}

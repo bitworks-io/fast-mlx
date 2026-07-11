@@ -163,6 +163,17 @@ public final class TurboQuantKVCache: KVCache, Updatable {
         capacity += chunk
     }
 
+    /// Roll the cached-token count BACK to `newLength` (speculative-decoding rollback).
+    /// The offset is the single source of truth — mask and RoPE derive from `offsetArr` —
+    /// so the rejected rows' stale codes are masked out of attention and overwritten by
+    /// the next update. Same `_updateInternal` identity discipline as `resetInPlace`;
+    /// same host-mirror caveat as `CompiledKVCache.truncate(to:)`.
+    public func truncate(to newLength: Int) {
+        precondition(newLength >= 0 && newLength <= capacity, "truncate target outside the buffer")
+        offsetArr._updateInternal(MLXArray([Int32(newLength)]))
+        offset = newLength
+    }
+
     /// Reset to empty IN PLACE (`_updateInternal`), preserving every MLXArray identity a
     /// compiled step function is bound to — zeroed ‖x‖ makes all rows materialize to 0.
     public func resetInPlace() {
