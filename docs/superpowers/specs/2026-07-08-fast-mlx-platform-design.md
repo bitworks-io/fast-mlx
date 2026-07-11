@@ -89,6 +89,12 @@ The dial exposes a small number of orthogonal knobs and, for each combination, *
 
 **Default policy — "fastest with unnoticeable loss":** auto-select the fastest point where KL ≤ ~0.05 median AND ppl delta ≤ 1% AND task deltas within benchmark CI. Tier labels by measured loss: **Lossless / Balanced (≤1%) / Turbo (≤3%) / Max-fit** (biggest model that fits the box, loss stated).
 
+**Informed consent, not a nanny (dial philosophy).** The default is the *safe* setting, not the *only* one. The dial exposes the **full measured frontier**, including points with **noticeable** loss, and lets a user knowingly opt into them **when the payoff justifies it for their context** — a footprint-constrained device where a more-aggressive quant is the difference between *runs at all* and *doesn't*, a latency/throughput-critical path where a large speedup is worth a stated quality cost, or a loss-tolerant workload (drafting, casual chat). The non-negotiable: every such point is **quantified** (the metric stack above, shown at selection time) so the choice is eyes-open, never a hidden downgrade — bounded by two rails:
+- **A hard garbage floor.** Settings that produce incoherent/degenerate output (fail the coherence canary / non-crash / non-NaN lossy-triad floor, §6.1) are **refused outright and never offered** — we don't let a user stretch a model into uselessness, however fast or small.
+- **The capacity advisor** (system-aware operability spec) surfaces *why* an aggressive point is worth it on *this* box ("fits at 2-bit KV; would OOM at fp16"), so the trade is contextual, not abstract.
+
+This is the wedge, productized: not "we hide compression behind one quality bar," but "we measure the whole trade and let you spend it — down to a floor that protects you from garbage." The **device/footprint frontier** — extreme-compression tiers for small Macs, candidates like 1-bit weight schemes (PrismML, tracked in the [technique intake](../../reference/performance-technique-intake.md)) — lives in exactly this informed-but-gated region.
+
 **Engine-agnostic by construction:** the harness drives the OpenAI API plus a debug logprobs endpoint, so the dial's numbers are reproducible against the Swift engine today, the Python plane on NVIDIA, or a customer's proxied runtime — and the same harness doubles as the port-conformance suite that de-risks any future engine change.
 
 ---
