@@ -189,4 +189,56 @@ final class SpecDecodeTests: XCTestCase {
         for _ in 0..<4 { gate.record(accepted: 0) }
         XCTAssertFalse(gate.isEnabled)
     }
+
+    // MARK: - Phase 2 support: SpecEmit.trim — stopping rules for a multi-token emission
+
+    /// A verify step can emit accepted+1 tokens at once; the run's stopping rules (maxTokens
+    /// budget, terminal eos) must apply to that batch EXACTLY as the plain greedy loop
+    /// (`while tokens.count < maxTokens && tok != eos`) would have applied them one at a time —
+    /// this is part of the byte-identical property. Baseline includes the terminal eos.
+
+    /// Batch fits the budget, no eos: everything is emitted, generation continues.
+    func testTrim_batchWithinBudget_emitsAllAndContinues() {
+        let r = SpecEmit.trim(emitted: [1, 2, 3], alreadyEmitted: 10, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 2, 3])
+        XCTAssertFalse(r.done)
+    }
+
+    /// Batch overruns the budget: emit only up to maxTokens, then stop — the plain loop would
+    /// never have produced the overrun tokens.
+    func testTrim_batchOverrunsBudget_cutsAtMaxTokens() {
+        let r = SpecEmit.trim(emitted: [1, 2, 3, 4], alreadyEmitted: 18, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 2])
+        XCTAssertTrue(r.done)
+    }
+
+    /// Exactly filling the budget stops generation.
+    func testTrim_batchExactlyFillsBudget_stops() {
+        let r = SpecEmit.trim(emitted: [1, 2], alreadyEmitted: 18, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 2])
+        XCTAssertTrue(r.done)
+    }
+
+    /// eos inside the batch: emit through the eos (the baseline stream includes the terminal
+    /// eos), drop everything after it, stop.
+    func testTrim_eosInsideBatch_cutsAfterEOSInclusive() {
+        let r = SpecEmit.trim(emitted: [1, 99, 3], alreadyEmitted: 0, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 99])
+        XCTAssertTrue(r.done)
+    }
+
+    /// eos beyond the budget cut is never seen: the budget cut applies first.
+    func testTrim_eosBeyondBudgetCut_budgetWins() {
+        let r = SpecEmit.trim(emitted: [1, 2, 99], alreadyEmitted: 18, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 2])
+        XCTAssertTrue(r.done)
+    }
+
+    /// eos as the final within-budget token: emitted, stop (same as the plain loop appending
+    /// eos then failing `tok != eos`).
+    func testTrim_eosAsLastWithinBudget_emittedAndStops() {
+        let r = SpecEmit.trim(emitted: [1, 99], alreadyEmitted: 0, maxTokens: 20, eos: 99)
+        XCTAssertEqual(r.emit, [1, 99])
+        XCTAssertTrue(r.done)
+    }
 }
