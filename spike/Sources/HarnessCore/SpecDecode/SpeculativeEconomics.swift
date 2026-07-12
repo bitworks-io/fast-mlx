@@ -94,7 +94,7 @@ public struct SpeculativeEconomics: Sendable, Equatable {
     public let acceptedDraftTokensPerRound: Double
     public let timing: SpeculativePhaseTiming
 
-    public init(
+    public init?(
         baselineTokenSeconds: Double,
         acceptedDraftTokensPerRound: Double,
         timing: SpeculativePhaseTiming
@@ -105,6 +105,7 @@ public struct SpeculativeEconomics: Sendable, Equatable {
         precondition(
             acceptedDraftTokensPerRound.isFinite && acceptedDraftTokensPerRound >= 0,
             "acceptedDraftTokensPerRound must be finite and nonnegative")
+        guard timing.totalSeconds > 0 else { return nil }
         self.baselineTokenSeconds = baselineTokenSeconds
         self.acceptedDraftTokensPerRound = acceptedDraftTokensPerRound
         self.timing = timing
