@@ -397,17 +397,20 @@ def classify_cache_drift(
     expected_token: int,
     full_verify_token: int,
     retained_batch_token: int,
-    sequential_token: int,
+    sequential_batched_token: int,
+    sequential_one_token: int,
 ) -> str:
     """Classify a mismatch by replaying increasingly conservative target-cache histories."""
     if full_verify_token == expected_token:
         return "not-reproduced"
-    if retained_batch_token == expected_token and sequential_token == expected_token:
-        return "rejected-future-cache-drift"
-    if retained_batch_token != expected_token and sequential_token == expected_token:
-        return "batched-retained-prefix-drift"
-    if sequential_token != expected_token:
+    if sequential_one_token != expected_token:
         return "sequential-replay-mismatch"
+    if sequential_batched_token != expected_token:
+        return "immediate-batched-probe-drift"
+    if retained_batch_token == expected_token:
+        return "rejected-future-cache-drift"
+    if retained_batch_token != expected_token:
+        return "batched-retained-prefix-drift"
     return "unclassified"
 
 

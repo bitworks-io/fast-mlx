@@ -263,7 +263,8 @@ class AcceptanceTests(unittest.TestCase):
                 expected_token=12,
                 full_verify_token=44364,
                 retained_batch_token=12,
-                sequential_token=12,
+                sequential_batched_token=12,
+                sequential_one_token=12,
             ),
             "rejected-future-cache-drift",
         )
@@ -272,7 +273,8 @@ class AcceptanceTests(unittest.TestCase):
                 expected_token=12,
                 full_verify_token=44364,
                 retained_batch_token=44364,
-                sequential_token=12,
+                sequential_batched_token=12,
+                sequential_one_token=12,
             ),
             "batched-retained-prefix-drift",
         )
@@ -281,9 +283,20 @@ class AcceptanceTests(unittest.TestCase):
                 expected_token=12,
                 full_verify_token=12,
                 retained_batch_token=12,
-                sequential_token=12,
+                sequential_batched_token=12,
+                sequential_one_token=12,
             ),
             "not-reproduced",
+        )
+        self.assertEqual(
+            classify_cache_drift(
+                expected_token=279,
+                full_verify_token=264,
+                retained_batch_token=279,
+                sequential_batched_token=264,
+                sequential_one_token=279,
+            ),
+            "immediate-batched-probe-drift",
         )
 
     def test_greedy_accept_walk_emits_matching_prefix_plus_target_bonus(self):

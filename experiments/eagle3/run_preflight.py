@@ -241,8 +241,15 @@ def diagnose_cache_drift(
 
     full_cache, first = new_cache()
     retained_cache, retained_first = new_cache()
-    sequential_cache, sequential_first = new_cache()
-    if not first == retained_first == sequential_first == base_tokens[0]:
+    sequential_batched_cache, sequential_batched_first = new_cache()
+    sequential_one_cache, sequential_one_first = new_cache()
+    if not (
+        first
+        == retained_first
+        == sequential_batched_first
+        == sequential_one_first
+        == base_tokens[0]
+    ):
         return {
             "status": "inconclusive",
             "reason": "fresh target prefills did not reproduce the base first token",
@@ -272,9 +279,12 @@ def diagnose_cache_drift(
         _eval_cache(retained_cache)
 
         for token in retained_input:
-            logits = model(mx.array([[token]]), cache=sequential_cache)
+            logits = model(mx.array([[token]]), cache=sequential_batched_cache)
             mx.eval(logits)
-            _eval_cache(sequential_cache)
+            _eval_cache(sequential_batched_cache)
+            logits = model(mx.array([[token]]), cache=sequential_one_cache)
+            mx.eval(logits)
+            _eval_cache(sequential_one_cache)
 
         generated.extend(row["emitted_before_stopping_rules"])
         if generated != list(base_tokens[: len(generated)]):
@@ -287,25 +297,32 @@ def diagnose_cache_drift(
     offsets = {
         "full_verify_and_trim": full_cache[0].offset,
         "retained_batches": retained_cache[0].offset,
-        "all_sequential": sequential_cache[0].offset,
+        "all_sequential_batched_probe": sequential_batched_cache[0].offset,
+        "all_sequential_one_token": sequential_one_cache[0].offset,
     }
     argmax = {}
     for name, cache in (
         ("full_verify_and_trim", full_cache),
         ("retained_batches", retained_cache),
-        ("all_sequential", sequential_cache),
+        ("all_sequential_batched_probe", sequential_batched_cache),
     ):
         logits = model(mx.array([probe]), cache=cache)
         mx.eval(logits)
         _eval_cache(cache)
         argmax[name] = [int(token) for token in mx.argmax(logits[0], axis=-1).tolist()]
+    logits = model(mx.array([[generated[-1]]]), cache=sequential_one_cache)
+    mx.eval(logits)
+    _eval_cache(sequential_one_cache)
+    argmax["all_sequential_one_token"] = [
+        int(mx.argmax(logits[0, -1], axis=-1).item())]
 
     expected = int(base_tokens[mismatch_index])
     classification = classify_cache_drift(
         expected_token=expected,
         full_verify_token=argmax["full_verify_and_trim"][0],
         retained_batch_token=argmax["retained_batches"][0],
-        sequential_token=argmax["all_sequential"][0],
+        sequential_batched_token=argmax["all_sequential_batched_probe"][0],
+        sequential_one_token=argmax["all_sequential_one_token"][0],
     )
     return {
         "status": "classified" if classification != "unclassified" else "inconclusive",
