@@ -24,6 +24,7 @@ After each notable spike / investigation / optimization, write one piece here **
 | 2026-07-09 | [The 7K wall that wasn't: jetsam forensics, a quadratic allocator, and the statistic hiding in the tail](2026-07-09-the-wall-that-wasnt.md) | The optimization dial — quantified precision-loss tuning |
 | 2026-07-09 | [One formula, wrong for a third of the catalog: a KV-memory model that refuses to lie](2026-07-09-one-formula-wrong-for-a-third-of-the-catalog.md) | Serving big models on Apple Silicon |
 | 2026-07-09 | [We implemented Google's TurboQuant exactly, matched the paper's error tables — and it still lost to plain 4-bit quantization](2026-07-09-turboquant-exact-math-still-lost.md) | The optimization dial — quantified precision-loss tuning; Building a high-performance MLX engine in Swift |
+| 2026-07-11 | [2× for free, when the model repeats itself: prompt-lookup decoding with a byte-identical proof](2026-07-11-two-x-for-free-when-the-model-repeats-itself.md) | Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel |
 
 ## Candidate whitepaper themes (aggregations)
 

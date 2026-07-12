@@ -30,6 +30,16 @@ struct Flags {
 let knownGoodPrompt = "The capital of France is"
 let benchPrompt = "Explain how continuous batching improves LLM serving throughput."
 
+/// Default prompt for `verify --spec`: a raw-completion repetition shape (the engine feeds
+/// prompts untemplated, so an "instruction" would not reliably be followed — a self-continuing
+/// repeated structure is). Greedy continuation keeps emitting the repeated line, which is
+/// exactly the case PLD drafts from, so the engagement gate (drafting happened) can bind.
+let specVerifyPrompt = """
+Inventory report, line 1: the warehouse stores red apples, green pears, yellow bananas, and blue plums.
+Inventory report, line 2: the warehouse stores red apples, green pears, yellow bananas, and blue plums.
+Inventory report, line 3: the warehouse stores
+"""
+
 /// Loads the checked-in, versioned measurement corpus (Task 3): a stable `corpusId` + content
 /// hash, entries tagged prose/code/long-context, replacing the formerly CLI-hardcoded `kl`
 /// prompts. Never falls back to a hardcoded list on failure — a silently-substituted corpus would
@@ -60,6 +70,33 @@ struct VerifyPayload: Codable, Sendable {
     /// In-graph cached-token count from the TurboQuant cache after the candidate run —
     /// the lossy triad's engagement marker (nil on fp16 runs).
     let turboquantTokens: Int?
+}
+
+/// Evidence record for `verify --spec`: the spec-decode exactness triad — PLD-on vs PLD-off on
+/// the SAME engine (byte-identical token streams at temp 0) + the engagement delta (drafting
+/// actually happened; a zero-draft run would make the equivalence vacuous).
+struct SpecVerifyPayload: Codable, Sendable {
+    let prompt: String
+    let promptTokens: Int
+    let n: Int
+    let spec: String
+    let ngram: Int
+    let maxDraft: Int
+    let compiledVerify: Bool
+    /// PLD-on and PLD-off token streams are fully identical (not just a prefix).
+    let byteIdentical: Bool
+    /// Length of the identical prefix (== token count when byteIdentical).
+    let identicalPrefix: Int
+    let tokensOn: Int
+    let tokensOff: Int
+    let drafted: Int
+    let accepted: Int
+    let acceptanceRate: Double?
+    let verifySteps: Int
+    let normalSteps: Int
+    let gateDisabledSteps: Int
+    let engaged: Bool
+    let triadPassed: Bool
 }
 
 struct KLPayload: Codable, Sendable {
@@ -94,6 +131,19 @@ struct BenchPayload: Codable, Sendable {
     /// which is the model's own weight quantization.
     let kvQuantTier: String
     let concurrency: Int
+    // Spec-decode telemetry (mode == "pld"): totals over the timed (post-warmup) runs.
+    // nil on plain runs so pre-spec evidence records keep decoding.
+    let specNgram: Int?
+    let specMaxDraft: Int?
+    let specCompiledVerify: Bool?
+    let specDrafted: Int?
+    let specAccepted: Int?
+    let specAcceptanceRate: Double?
+    let specVerifySteps: Int?
+    let specNormalSteps: Int?
+    /// Steps taken while the yield-gate had PLD disabled — the "gate kept a low-repetition
+    /// workload flat" evidence the shape-(c) verdict reads.
+    let specGateDisabledSteps: Int?
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -142,6 +192,10 @@ func runCorpus() {
 // MARK: - verify (the triad)
 
 func runVerify(_ flags: Flags) async {
+    if flags.string("spec") != nil {
+        await runVerifySpec(flags)
+        return
+    }
     guard let modelPath = flags.string("model") else {
         print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant fp16|tq2.5|tq3.5] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
@@ -284,6 +338,88 @@ func runVerify(_ flags: Flags) async {
     }
 }
 
+// MARK: - verify --spec (spec-decode exactness triad)
+
+/// The spec-decode equivalence gate: at temp 0, PLD-on must be BYTE-IDENTICAL to PLD-off —
+/// speculation changes how many tokens a forward emits, never which. The reference here is the
+/// SAME Swift engine with speculation off (not the mlx-lm process): the claim under test is
+/// "the spec path is a pure speed transform of this engine's own greedy loop", so the engine
+/// is its own reference and the mlx-lm cross-check stays with the plain `verify`.
+func runVerifySpec(_ flags: Flags) async {
+    guard let modelPath = flags.string("model") else {
+        print("usage: fastmlx-harness verify --model <PATH> --spec pld [--ngram 3] [--max-draft 8] [--compiled-verify false] [--prompt <TEXT>] [--n 60] [--min-prefix <N=--n>] [--evidence <FILE>]")
+        exit(2)
+    }
+    let spec = flags.string("spec", default: "pld")
+    guard spec == "pld" else {
+        print("verify FAILED: unknown --spec drafter \(spec) (known: pld)")
+        exit(2)
+    }
+    let prompt = flags.string("prompt", default: specVerifyPrompt)
+    let n = flags.int("n", default: 60)
+    // Default gate: the WHOLE run must match (byte-identical is the headline), and it must be
+    // at least this long — a 3-token identical run proves nothing about the accept-walk.
+    let minPrefix = flags.int("min-prefix", default: n)
+    let ngram = flags.int("ngram", default: 3)
+    let maxDraft = flags.int("max-draft", default: 8)
+    let compiledVerify = flags.string("compiled-verify", default: "false") == "true"
+    do {
+        let (driver, tokenizer, _) = try await loadSwiftDriver(modelPath: modelPath)
+        let promptTokens = tokenizer.encode(text: prompt)
+        let offConfig = RunConfig(temperature: 0, maxTokens: n)
+        let onConfig = RunConfig(
+            temperature: 0, maxTokens: n, specDecode: spec,
+            specNgram: ngram, specMaxDraft: maxDraft, specCompiledVerify: compiledVerify)
+
+        let off = try await driver.generate(prompt: promptTokens, config: offConfig)
+        let on = try await driver.generate(prompt: promptTokens, config: onConfig)
+
+        let prefix = identicalPrefix(on.tokens, off.tokens)
+        let byteIdentical = on.tokens == off.tokens
+        let equivalenceOK = byteIdentical && on.tokens.count >= minPrefix
+        let drafted = on.engagement.counts["spec_drafted"] ?? 0
+        let accepted = on.engagement.counts["spec_accepted"] ?? 0
+        let verifySteps = on.engagement.counts["spec_verify_steps"] ?? 0
+        let normalSteps = on.engagement.counts["spec_normal_steps"] ?? 0
+        let gateDisabledSteps = on.engagement.counts["spec_gate_disabled_steps"] ?? 0
+        // Engagement DELTA: tokens were actually drafted AND at least one was accepted — an
+        // all-rejected run is still exact but exercises only the bonus-token path.
+        let engaged = EngagementCheck(marker: "spec_drafted", floor: 1).passed(before: 0, after: drafted)
+            && EngagementCheck(marker: "spec_accepted", floor: 1).passed(before: 0, after: accepted)
+        let verdict = TriadVerdict(equivalenceOK: equivalenceOK, engaged: engaged, acceptanceOK: nil)
+
+        print("prompt: \(String(reflecting: prompt.prefix(80))) (\(promptTokens.count) tokens), n=\(n), temp=0")
+        print("spec: \(spec) ngram=\(ngram) max-draft=\(maxDraft) verify-forward=\(compiledVerify ? "compiled(fixed-K)" : "uncompiled")")
+        print("equivalence (spec-exact): PLD-on vs PLD-off byte-identical=\(byteIdentical), identical-prefix \(prefix)/\(min(on.tokens.count, off.tokens.count)), length \(on.tokens.count) (gate: identical AND >= \(minPrefix)) -> \(equivalenceOK ? "PASS" : "FAIL")")
+        if !byteIdentical {
+            let onTok = prefix < on.tokens.count ? String(on.tokens[prefix]) : "<end>"
+            let offTok = prefix < off.tokens.count ? String(off.tokens[prefix]) : "<end>"
+            print("  first divergence at position \(prefix): spec-on=\(onTok) spec-off=\(offTok)")
+            print("  spec-on:  \(on.tokens)")
+            print("  spec-off: \(off.tokens)")
+        }
+        let rate = on.acceptanceRate.map { fmt($0 * 100, 1) + "%" } ?? "n/a"
+        print("engagement:  drafted 0 -> \(drafted), accepted 0 -> \(accepted) (floor 1 each) -> \(engaged ? "PASS" : "FAIL")")
+        print("acceptance:  \(accepted)/\(drafted) drafts accepted (\(rate)); verify-steps=\(verifySteps), normal-steps=\(normalSteps), gate-disabled-steps=\(gateDisabledSteps) [reported, not gated]")
+        print("triad: \(verdict.passed ? "PASS" : "FAIL")")
+
+        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: nil, corpus: nil)
+        let payload = SpecVerifyPayload(
+            prompt: prompt, promptTokens: promptTokens.count, n: n, spec: spec, ngram: ngram,
+            maxDraft: maxDraft, compiledVerify: compiledVerify, byteIdentical: byteIdentical,
+            identicalPrefix: prefix, tokensOn: on.tokens.count, tokensOff: off.tokens.count,
+            drafted: drafted, accepted: accepted, acceptanceRate: on.acceptanceRate,
+            verifySteps: verifySteps, normalSteps: normalSteps, gateDisabledSteps: gateDisabledSteps,
+            engaged: engaged, triadPassed: verdict.passed)
+        appendJSONLRecord(ResultRecord(subcommand: "verify-spec", provenance: provenance, payload: payload), to: evidencePath(flags))
+
+        if !verdict.passed { exit(1) }
+    } catch {
+        print("verify FAILED: \(error)")
+        exit(1)
+    }
+}
+
 // MARK: - bench (cell matrix -> CSV)
 
 func runBench(_ flags: Flags) async {
@@ -303,6 +439,17 @@ func runBench(_ flags: Flags) async {
             print("bench FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
             exit(2)
         }
+        // Spec-decode arm (Task 6): `--spec pld` times the SAME decode workload through the
+        // speculative path; the CSV/evidence `mode` column records which arm produced the number.
+        let spec = flags.string("spec")
+        if let spec, spec != "pld" {
+            print("bench FAILED: unknown --spec drafter \(spec) (known: pld)")
+            exit(2)
+        }
+        let ngram = flags.int("ngram", default: 3)
+        let maxDraft = flags.int("max-draft", default: 8)
+        let compiledVerify = flags.string("compiled-verify", default: "false") == "true"
+        let mode: Mode = spec == nil ? .none : .pld
         let (driver, tokenizer, _) = try await loadSwiftDriver(modelPath: modelPath)
 
         let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
@@ -310,22 +457,41 @@ func runBench(_ flags: Flags) async {
         // guess — a mislabeled checkpoint directory can no longer record the wrong tier.
         let quant = ProvenanceCLI.modelConfig(at: modelPath).quant.label
         let hardware = ProvenanceCLI.chipBrand()
-        let cell = Cell(workload: .decode, mode: .none, model: modelName, quant: quant, concurrency: 1)
+        let cell = Cell(workload: .decode, mode: mode, model: modelName, quant: quant, concurrency: 1)
         let nonce = String(Int.random(in: 0..<1_000_000))
 
         var ttfts: [Double] = []
+        var draftedTotal = 0, acceptedTotal = 0
+        var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
         let agg = try await BenchRunner().run(cell: cell, iterations: runs + 1, nonce: nonce, basePrompt: prompt) { i, salted in
             let promptTokens = tokenizer.encode(text: salted)
             let result = try await driver.generate(
                 prompt: promptTokens,
-                config: RunConfig(temperature: 0, maxTokens: maxTokens, kvQuant: kvQuantTier))
+                config: RunConfig(
+                    temperature: 0, maxTokens: maxTokens, specDecode: spec, specNgram: ngram,
+                    specMaxDraft: maxDraft, specCompiledVerify: compiledVerify, kvQuant: kvQuantTier))
             guard !result.tokenTimes.isEmpty else {
                 print("# run \(i): produced zero tokens -> skipped")
                 return nil
             }
             let metrics = DecodeMetrics(submitTime: result.submitTime, tokenTimes: result.tokenTimes)
             let tag = i == 0 ? "warmup (dropped)" : "run \(i)"
-            print("# \(tag): \(metrics.generatedTokenCount) tokens, ttft=\(fmt(metrics.ttftSeconds))s, decode_tok_s=\(fmt(metrics.decodeTokensPerSecond ?? .nan, 2))")
+            var specNote = ""
+            if spec != nil {
+                let drafted = result.engagement.counts["spec_drafted"] ?? 0
+                let accepted = result.engagement.counts["spec_accepted"] ?? 0
+                let gateDisabled = result.engagement.counts["spec_gate_disabled_steps"] ?? 0
+                let rate = result.acceptanceRate.map { fmt($0 * 100, 1) + "%" } ?? "n/a"
+                specNote = ", drafted=\(drafted), accepted=\(accepted) (\(rate)), gate-disabled-steps=\(gateDisabled)"
+                if i > 0 {
+                    draftedTotal += drafted
+                    acceptedTotal += accepted
+                    verifyStepsTotal += result.engagement.counts["spec_verify_steps"] ?? 0
+                    normalStepsTotal += result.engagement.counts["spec_normal_steps"] ?? 0
+                    gateDisabledTotal += gateDisabled
+                }
+            }
+            print("# \(tag): \(metrics.generatedTokenCount) tokens, ttft=\(fmt(metrics.ttftSeconds))s, decode_tok_s=\(fmt(metrics.decodeTokensPerSecond ?? .nan, 2))\(specNote)")
             if i > 0 { ttfts.append(metrics.ttftSeconds) }
             return metrics.decodeTokensPerSecond
         }
@@ -335,7 +501,7 @@ func runBench(_ flags: Flags) async {
         }
         let avgTtftMs = ttfts.isEmpty ? 0 : ttfts.reduce(0, +) / Double(ttfts.count) * 1000
         let row = BenchRow(
-            label: label, workload: .decode, mode: .none, model: modelName,
+            label: label, workload: .decode, mode: mode, model: modelName,
             decodeTokS: (agg.mean * 100).rounded() / 100, ttftMs: (avgTtftMs * 10).rounded() / 10,
             quant: quant, concurrency: 1, hardware: hardware)
         print(BenchRow.csvHeader)
@@ -351,9 +517,18 @@ func runBench(_ flags: Flags) async {
 
         let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: nil, corpus: nil)
         let payload = BenchPayload(
-            label: label, workload: Workload.decode.rawValue, mode: Mode.none.rawValue,
+            label: label, workload: Workload.decode.rawValue, mode: mode.rawValue,
             decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
-            kvQuantTier: kvQuantTier ?? "fp16", concurrency: 1)
+            kvQuantTier: kvQuantTier ?? "fp16", concurrency: 1,
+            specNgram: spec == nil ? nil : ngram,
+            specMaxDraft: spec == nil ? nil : maxDraft,
+            specCompiledVerify: spec == nil ? nil : compiledVerify,
+            specDrafted: spec == nil ? nil : draftedTotal,
+            specAccepted: spec == nil ? nil : acceptedTotal,
+            specAcceptanceRate: spec == nil || draftedTotal == 0 ? nil : Double(acceptedTotal) / Double(draftedTotal),
+            specVerifySteps: spec == nil ? nil : verifyStepsTotal,
+            specNormalSteps: spec == nil ? nil : normalStepsTotal,
+            specGateDisabledSteps: spec == nil ? nil : gateDisabledTotal)
         appendJSONLRecord(ResultRecord(subcommand: "bench", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch BenchGuardError.debugBuild {
         print("bench FAILED: Debug build — perf numbers would be meaningless. Build with -configuration Release.")
@@ -579,8 +754,15 @@ struct Harness {
                                                the TurboQuant KV cache and the lossy triad
                                                (non-crash + non-NaN + canary + engagement), and
                                                REPORT teacher-forced top-1 agreement vs fp16 KV
+                 [--spec pld]                 spec-decode exactness triad instead: PLD-on vs
+                 [--ngram 3] [--max-draft 8]   PLD-off on the SAME engine must be byte-identical
+                 [--compiled-verify false]     at temp 0, with an engagement delta (drafting
+                                               happened); acceptance rate is reported
           bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
                  [--kv-quant <TIER>]          KV tier for the timed decode (fp16|tq2.5|tq3.5)
+                 [--spec pld]                 time the speculative decode path (CSV mode=pld)
+                 [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
+                 [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

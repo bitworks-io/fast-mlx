@@ -1,4 +1,5 @@
 import Foundation
+import HarnessCore
 import MLX
 import MLXLMCommon
 
@@ -34,6 +35,9 @@ public struct CompiledMLXDecoder: Decoder {
     // subtype, assigns fine), while the uncompiled fallback closure captures the
     // non-Sendable model/caches and stays confined to this decoder like all MLX state.
     private var compiledStep: (([MLXArray]) -> [MLXArray])?
+    /// Separate fixed-K compiled verify forward for the spec-decode path (lazy; survives
+    /// resets like `compiledStep` so bench runs don't retrace).
+    private var compiledVerifyStep: (([MLXArray]) -> [MLXArray])?
     private var pendingNext: MLXArray? // [1] token id for the current position (lazy)
     private var cachedTokens = 0 // host-side position; caches' host mirror goes stale
 
@@ -48,6 +52,23 @@ public struct CompiledMLXDecoder: Decoder {
     }
 
     public mutating func prefill(_ promptTokens: [Int]) -> Int {
+        let first = prefillCore(promptTokens)
+        // submit-first: the compiled forward for the position after `first` is in
+        // flight before we block reading `first` back to the CPU.
+        let next = compiledStep!([first])[0]
+        asyncEval(next)
+        pendingNext = next
+        cachedTokens += 1
+        return first.item(Int.self)
+    }
+
+    /// Shared prefill: caches allocated/grown, uncompiled prompt forward, compiled step
+    /// created. Afterwards the KV holds exactly the prompt and the returned `[1]` array is
+    /// the first generated token — NOT yet consumed by any forward. `prefill` adds the
+    /// submit-first lookahead on top; the spec-decode loop starts from here directly
+    /// (its next forward depends on a host-side drafting decision, so there is nothing
+    /// to submit ahead of the readback).
+    private mutating func prefillCore(_ promptTokens: [Int]) -> MLXArray {
         let promptLength = promptTokens.count
         if caches.isEmpty {
             let layerCount = model.newCache(parameters: nil).count
@@ -75,14 +96,7 @@ public struct CompiledMLXDecoder: Decoder {
             // Uncompiled variant is the same closure, graph-built fresh every call.
             compiledStep = compileStepEnabled ? compile(inputs: caches, outputs: caches, step) : step
         }
-
-        // submit-first: the compiled forward for the position after `first` is in
-        // flight before we block reading `first` back to the CPU.
-        let next = compiledStep!([first])[0]
-        asyncEval(next)
-        pendingNext = next
-        cachedTokens += 1
-        return first.item(Int.self)
+        return first
     }
 
     public mutating func step(last: Int) -> Int {
@@ -97,6 +111,119 @@ public struct CompiledMLXDecoder: Decoder {
         pendingNext = following
         cachedTokens += 1
         return next.item(Int.self)
+    }
+
+    /// The speculative-decoding loop (PLD first). Per step, when the gate allows: draft up
+    /// to K continuation tokens from the context, run ONE verify forward over
+    /// `[last] + draft` (K+1 positions), accept the longest prefix the target's own argmax
+    /// agrees with plus the bonus token, roll the KV back by the rejected count, feed the
+    /// gate. Empty draft or a disabled gate falls back to the plain compiled single-token
+    /// step (and still feeds the gate, so its cooldown clock advances).
+    ///
+    /// THE HEADLINE PROPERTY: at temp 0 the emitted stream is byte-identical to the plain
+    /// greedy loop — a drafted token is emitted only when it EQUALS the model's own argmax
+    /// at its position, the bonus token IS the model's argmax, and `SpecEmit.trim` replays
+    /// the plain loop's budget/eos stopping rules over each batch. Speculation changes how
+    /// many tokens one forward emits, never which tokens.
+    ///
+    /// No submit-first lookahead here: the next forward's INPUT depends on a host-side
+    /// decision (draft or not, which tokens) that needs the current batch read back first,
+    /// so there is nothing to overlap. The plain path (`prefill`/`step`) keeps its
+    /// pipelining untouched when spec decoding is off.
+    public mutating func generateSpec(
+        prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
+    ) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats) {
+        var stats = SpecDecodeStats()
+        let submitTime = Date().timeIntervalSinceReferenceDate
+        guard maxTokens > 0 else { return ([], submitTime, [], stats) }
+
+        var lastArr = prefillCore(prompt) // KV holds exactly the prompt; `last` unconsumed
+        var last = lastArr.item(Int.self)
+        var tokens = [last]
+        var times = [Date().timeIntervalSinceReferenceDate]
+        var context = prompt + [last]
+        var gate = spec.gate
+        var done = tokens.count >= maxTokens || last == eos
+
+        while !done {
+            // Bounded backward scan (Phase-1 flag #3): PLD is O(scanned) per call.
+            let draft = gate.isEnabled
+                ? spec.drafter.propose(
+                    context: Array(context.suffix(spec.lookback)), maxDraft: spec.maxDraft)
+                : []
+
+            let emitted: [Int]
+            if draft.isEmpty {
+                if !gate.isEnabled { stats.gateDisabledSteps += 1 }
+                stats.normalSteps += 1
+                if cachedTokens + 1 > caches[0].capacity {
+                    for cache in caches { cache.grow(by: chunk) }
+                }
+                let nextArr = compiledStep!([lastArr])[0]
+                last = nextArr.item(Int.self)
+                lastArr = nextArr
+                cachedTokens += 1
+                // Phase-1 flag #2: the gate is fed on EVERY step (cooldown clock).
+                gate.record(accepted: 0)
+                emitted = [last]
+            } else {
+                var verifyDraft = draft
+                if spec.compiledVerify && verifyDraft.count < spec.maxDraft {
+                    // Fixed-K pad so the compiled verify replays without retracing.
+                    // Exact-safe: a padded token is emitted only if it EQUALS the model's
+                    // own argmax at its position (the accept-walk's only criterion).
+                    verifyDraft += Array(
+                        repeating: verifyDraft.last!, count: spec.maxDraft - verifyDraft.count)
+                }
+                let n = verifyDraft.count + 1
+                while cachedTokens + n > caches[0].capacity {
+                    for cache in caches { cache.grow(by: chunk) }
+                }
+                let ids = MLXArray(([last] + verifyDraft).map(Int32.init)).reshaped([1, n])
+                let verifyArgmax: MLXArray // [n]: the target's pick AFTER each position
+                if spec.compiledVerify {
+                    if compiledVerifyStep == nil {
+                        let model = self.model
+                        let caches = self.caches
+                        let verify: ([MLXArray]) -> [MLXArray] = { args in
+                            let logits = model(args[0], cache: caches)
+                            return [argMax(logits[0], axis: -1)]
+                        }
+                        compiledVerifyStep = compile(inputs: caches, outputs: caches, verify)
+                    }
+                    verifyArgmax = compiledVerifyStep!([ids])[0]
+                } else {
+                    let logits = model(ids, cache: caches)
+                    verifyArgmax = argMax(logits[0], axis: -1)
+                }
+                let picks = verifyArgmax.asType(.int32).asArray(Int32.self).map(Int.init)
+                cachedTokens += n // the verify forward appended n rows
+                let (accepted, bonus) = SpecAccept.walk(draft: verifyDraft, verifyArgmax: picks)
+                // Rollback: keep `last` + the accepted drafts; the rejected rows the verify
+                // forward wrote become unreachable and are overwritten by the next update.
+                let keep = cachedTokens - n + 1 + accepted
+                if keep < cachedTokens {
+                    for cache in caches { cache.truncate(to: keep) }
+                    cachedTokens = keep
+                }
+                stats.verifySteps += 1
+                stats.drafted += verifyDraft.count
+                stats.accepted += accepted
+                gate.record(accepted: accepted)
+                last = bonus
+                lastArr = verifyArgmax[accepted].reshaped([1])
+                emitted = Array(verifyDraft.prefix(accepted)) + [bonus]
+            }
+
+            let (emit, stop) = SpecEmit.trim(
+                emitted: emitted, alreadyEmitted: tokens.count, maxTokens: maxTokens, eos: eos)
+            tokens += emit
+            context += emit
+            let t = Date().timeIntervalSinceReferenceDate
+            for _ in emit { times.append(t) }
+            done = stop
+        }
+        return (tokens, submitTime, times, stats)
     }
 
     /// Reset caches IN PLACE (same MLXArray identities) so the compiled step function

@@ -92,6 +92,24 @@ public final class CompiledKVCache: KVCache, Updatable {
         capacity += chunk
     }
 
+    /// Roll the cached-token count BACK to `newLength` (speculative-decoding rollback:
+    /// a verify forward wrote K+1 rows, the accept-walk rejected a suffix). The offset is
+    /// the cache's single source of truth — the attention mask and RoPE offset both derive
+    /// from `offsetArr` — so rolling it back makes the rejected rows unreachable (masked
+    /// out) and the next `update` overwrites them in place. IN PLACE (`_updateInternal`),
+    /// mirroring `resetInPlace`: the MLXArray identities a compiled step is bound to are
+    /// preserved, and no buffer is reallocated.
+    ///
+    /// NOTE: not validated against the host `offset` mirror — compiled-step replays
+    /// advance `offsetArr` in-graph without touching the mirror, so the mirror may be
+    /// smaller than the true in-graph position (see `offset`'s doc). Callers (the spec-
+    /// decode driver) track the true position themselves.
+    public func truncate(to newLength: Int) {
+        precondition(newLength >= 0 && newLength <= capacity, "truncate target outside the buffer")
+        offsetArr._updateInternal(MLXArray([Int32(newLength)]))
+        offset = newLength
+    }
+
     /// Reset to empty IN PLACE: writes fresh contents into the *same* MLXArray objects
     /// via `_updateInternal`, preserving the identity that an already-compiled step
     /// function is bound to (so a reset does not force a rebuild or retrace).
