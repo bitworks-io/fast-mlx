@@ -75,6 +75,8 @@ final class SpecDecodeTests: XCTestCase {
         let result = SpecAccept.walk(draft: draft, verifyArgmax: verifyArgmax)
         XCTAssertEqual(result.accepted, 3)
         XCTAssertEqual(result.bonus, 99)
+        assertExactness(
+            draft: draft, verifyArgmax: [10, 11, 12, 99], result: result)
         assertExactness(draft: draft, verifyArgmax: verifyArgmax, result: result)
     }
 
@@ -86,6 +88,8 @@ final class SpecDecodeTests: XCTestCase {
         let result = SpecAccept.walk(draft: draft, verifyArgmax: verifyArgmax)
         XCTAssertEqual(result.accepted, 0)
         XCTAssertEqual(result.bonus, 7)
+        assertExactness(
+            draft: [10, 11, 12], verifyArgmax: [7, 11, 12, 99], result: result)
         assertExactness(draft: draft, verifyArgmax: verifyArgmax, result: result)
     }
 
@@ -130,6 +134,42 @@ final class SpecDecodeTests: XCTestCase {
         }
     }
 
+    /// The pipelined spec loop already has the target's first pick in flight and forwards only
+    /// the draft tokens. Combining that prefetched pick with the picks produced after each draft
+    /// must preserve the same full-accept + trailing-bonus semantics as the original walk.
+    func testAcceptWalk_prefetchedFirstPick_fullAccept() {
+        let draft = [10, 11, 12]
+        let result = SpecAccept.walk(
+            draft: draft,
+            prefetched: 10,
+            verifyArgmaxAfterDraft: [11, 12, 99])
+        XCTAssertEqual(result.accepted, 3)
+        XCTAssertEqual(result.bonus, 99)
+    }
+
+    /// A mismatch against the prefetched first pick emits that target pick and accepts no draft.
+    func testAcceptWalk_prefetchedFirstPick_zeroAccept() {
+        let result = SpecAccept.walk(
+            draft: [10, 11, 12],
+            prefetched: 7,
+            verifyArgmaxAfterDraft: [11, 12, 99])
+        XCTAssertEqual(result.accepted, 0)
+        XCTAssertEqual(result.bonus, 7)
+    }
+
+    /// After one accepted prefetched pick, the first verify result is the correction token at
+    /// the next position. This pins the one-position shift in the pipelined cache invariant.
+    func testAcceptWalk_prefetchedFirstPick_partialAccept() {
+        let result = SpecAccept.walk(
+            draft: [10, 11, 12],
+            prefetched: 10,
+            verifyArgmaxAfterDraft: [8, 12, 99])
+        XCTAssertEqual(result.accepted, 1)
+        XCTAssertEqual(result.bonus, 8)
+        assertExactness(
+            draft: [10, 11, 12], verifyArgmax: [10, 8, 12, 99], result: result)
+    }
+
     /// Helper: the load-bearing exactness assertion — compares the FULL emitted token sequence,
     /// not just accepted/bonus counts, against the plain-greedy prefix derived independently
     /// from `verifyArgmax` by walking to the first draft/argmax divergence.
@@ -148,9 +188,33 @@ final class SpecDecodeTests: XCTestCase {
 
     /// A sustained low-acceptance sequence (well below minAcceptPerStep) disables the gate.
     func testGate_sustainedLowAcceptance_disables() {
-        var gate = PLDGate(window: 8, minAcceptPerStep: 0.25, cooldown: 4)
+        var gate = PLDGate(
+            window: 8, minimumSamples: 8, minAcceptPerStep: 0.25, cooldown: 4)
         XCTAssertTrue(gate.isEnabled)
         for _ in 0..<8 { gate.record(accepted: 0) }
+        XCTAssertFalse(gate.isEnabled)
+    }
+
+    /// Gate tuning must judge a clearly bad partial window instead of paying for a complete
+    /// long window. Three samples are insufficient evidence; the fourth low-yield sample trips.
+    func testGate_partialLowYield_disablesAtMinimumSamples() {
+        var gate = PLDGate(
+            window: 8, minimumSamples: 4, minAcceptPerStep: 0.5, cooldown: 8)
+        for _ in 0..<3 {
+            gate.record(accepted: 0)
+            XCTAssertTrue(gate.isEnabled)
+        }
+        gate.record(accepted: 0)
+        XCTAssertFalse(gate.isEnabled)
+    }
+
+    /// The production defaults are the global-default-on safety policy: react after four bad
+    /// enabled steps instead of the first-run gate's 32-step warmup.
+    func testGate_defaultLowYield_disablesAfterFourSamples() {
+        var gate = PLDGate()
+        for _ in 0..<3 { gate.record(accepted: 0) }
+        XCTAssertTrue(gate.isEnabled)
+        gate.record(accepted: 0)
         XCTAssertFalse(gate.isEnabled)
     }
 

@@ -29,4 +29,19 @@ public enum SpecAccept {
         }
         return (accepted, verifyArgmax[accepted])
     }
+
+    /// Pipelined variant: the plain submit-first step has already produced the target's pick
+    /// immediately after the committed context, so the verify forward only consumes `draft`.
+    /// Its row `i` therefore predicts the token AFTER `draft[i]`; prepending the prefetched pick
+    /// restores the same K+1 target sequence consumed by the canonical accept walk above.
+    public static func walk(
+        draft: [Int],
+        prefetched: Int,
+        verifyArgmaxAfterDraft: [Int]
+    ) -> (accepted: Int, bonus: Int) {
+        precondition(
+            verifyArgmaxAfterDraft.count == draft.count,
+            "verifyArgmaxAfterDraft must have one entry per forwarded draft token")
+        return walk(draft: draft, verifyArgmax: [prefetched] + verifyArgmaxAfterDraft)
+    }
 }
