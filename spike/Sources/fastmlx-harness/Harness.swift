@@ -139,6 +139,11 @@ struct BenchPayload: Codable, Sendable {
     let specDrafted: Int?
     let specAccepted: Int?
     let specAcceptanceRate: Double?
+    let specVerifySteps: Int?
+    let specNormalSteps: Int?
+    /// Steps taken while the yield-gate had PLD disabled — the "gate kept a low-repetition
+    /// workload flat" evidence the shape-(c) verdict reads.
+    let specGateDisabledSteps: Int?
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -457,6 +462,7 @@ func runBench(_ flags: Flags) async {
 
         var ttfts: [Double] = []
         var draftedTotal = 0, acceptedTotal = 0
+        var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
         let agg = try await BenchRunner().run(cell: cell, iterations: runs + 1, nonce: nonce, basePrompt: prompt) { i, salted in
             let promptTokens = tokenizer.encode(text: salted)
             let result = try await driver.generate(
@@ -474,11 +480,15 @@ func runBench(_ flags: Flags) async {
             if spec != nil {
                 let drafted = result.engagement.counts["spec_drafted"] ?? 0
                 let accepted = result.engagement.counts["spec_accepted"] ?? 0
+                let gateDisabled = result.engagement.counts["spec_gate_disabled_steps"] ?? 0
                 let rate = result.acceptanceRate.map { fmt($0 * 100, 1) + "%" } ?? "n/a"
-                specNote = ", drafted=\(drafted), accepted=\(accepted) (\(rate))"
+                specNote = ", drafted=\(drafted), accepted=\(accepted) (\(rate)), gate-disabled-steps=\(gateDisabled)"
                 if i > 0 {
                     draftedTotal += drafted
                     acceptedTotal += accepted
+                    verifyStepsTotal += result.engagement.counts["spec_verify_steps"] ?? 0
+                    normalStepsTotal += result.engagement.counts["spec_normal_steps"] ?? 0
+                    gateDisabledTotal += gateDisabled
                 }
             }
             print("# \(tag): \(metrics.generatedTokenCount) tokens, ttft=\(fmt(metrics.ttftSeconds))s, decode_tok_s=\(fmt(metrics.decodeTokensPerSecond ?? .nan, 2))\(specNote)")
@@ -515,7 +525,10 @@ func runBench(_ flags: Flags) async {
             specCompiledVerify: spec == nil ? nil : compiledVerify,
             specDrafted: spec == nil ? nil : draftedTotal,
             specAccepted: spec == nil ? nil : acceptedTotal,
-            specAcceptanceRate: spec == nil || draftedTotal == 0 ? nil : Double(acceptedTotal) / Double(draftedTotal))
+            specAcceptanceRate: spec == nil || draftedTotal == 0 ? nil : Double(acceptedTotal) / Double(draftedTotal),
+            specVerifySteps: spec == nil ? nil : verifyStepsTotal,
+            specNormalSteps: spec == nil ? nil : normalStepsTotal,
+            specGateDisabledSteps: spec == nil ? nil : gateDisabledTotal)
         appendJSONLRecord(ResultRecord(subcommand: "bench", provenance: provenance, payload: payload), to: evidencePath(flags))
     } catch BenchGuardError.debugBuild {
         print("bench FAILED: Debug build — perf numbers would be meaningless. Build with -configuration Release.")
