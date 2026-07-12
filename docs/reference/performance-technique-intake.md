@@ -78,6 +78,12 @@ SDPA; multi-accelerator disaggregation belongs to the future scale-out plane.
   unverified token. fast-mlx therefore keeps EAGLE-3/DSpark first for its target-compatible
   Qwen3-32B checkpoint and uses DFlash as a measured control; our byte-identical gate is
   stricter than the port's “lossless” label.
+- **GATE RESULT 2026-07-12 — EAGLE-3 SHELVED:** the authenticated Qwen3-32B head passed
+  PyTorch→MLX parity, but target verification changed the greedy stream on both 4-bit and
+  8-bit pairings. No compatible Qwen3-32B DFlash checkpoint was found in the audited public and
+  bench inventory for the same-target control. DFlash remains conditional on a product-size
+  pairing and must pass the same one-token versus batched-target byte-identity gate before any
+  throughput claim.
 
 **2. omlx oQ4e — importance-calibrated (imatrix) weight quantization — PRIORITY: MEDIUM**
 - *What:* activation-importance / imatrix-calibrated **weight** quant (incl. fractional bit levels), vs uniform affine. From omlx v0.5.x release notes.
@@ -122,8 +128,9 @@ SDPA; multi-accelerator disaggregation belongs to the future scale-out plane.
 - **MTPLX** ([youssofal/MTPLX](https://github.com/youssofal/MTPLX)) — native MTP is
   **not implemented in fast-mlx**. The pinned Swift dependency and external engines provide
   reference machinery, but the actor/compiler/harness path exposes PLD only. Fold native MTP
-  into the trained-speculator gate as a lower-port-cost control; do not treat MTPLX marketing
-  or a single condition as a comparison pair.
+  into a future compatible trained-speculator gate as a lower-port-cost control; the 2026-07-12
+  Qwen3-32B gate closed RED without a matching MTP checkpoint. Do not treat MTPLX marketing or
+  a single condition as a comparison pair.
 - **omlx "Lightning MTP"** — not a separate task. Native MTP is absent from fast-mlx and is
   now a control inside the trained-speculator gate; “verify-shape kernels” alone do not prove
   a net Apple win.

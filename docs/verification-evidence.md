@@ -12,6 +12,7 @@ SHA without copying machine-local paths or transient output.
 | As an operator, I retain PLD's target-workload multiplier. | Echo gain is at least +80%. | Exactness tests protect the accept/bonus and rollback contract used by the fast path. | 28.28 → 56.70 tok/s, **+100.50%**, 684/696 accepted; compiled verify also +86.10%. | 2026-07-11 | Qwen3-32B-4bit on one reference hardware tier. |
 | As an operator, leaving PLD available does not tax cold or low-yield requests. | No non-target regression beyond −1%; empty-draft fallback uses the base pipeline; low yield disables quickly and recovers. | `testGate_defaultLowYield_disablesAfterFourSamples`, partial-window and cooldown tests; 26/26 `SpecDecodeTests`. | Code 28.39 → 29.31 (**+3.24%**); zero-draft prose 28.62 → 28.66 (**+0.14%**). | 2026-07-11 | PLD remains disabled under continuous batching. |
 | As a maintainer, the change preserves MLX build and concurrency invariants. | Pure suite and MLX-coupled suite pass; no banned concurrency escape in changed files. | 113 XCTest + 17 Swift Testing tests off-box; 20/20 `SpikeCoreTests` through Xcode on-box. | Clean feature SHA stamped into all seven bench and two exactness records; focused reviews found no issues. | 2026-07-11 | Full serving/API default wiring is not implemented by this kernel change. |
+| As the owner, I can reject a trained speculator before paying for a Swift port. | Checkpoint/head fidelity is proven first; every implemented temperature-0 verify shape is byte-identical and engaged, otherwise the arm fails closed without a speed claim. | 119 HarnessCore XCTest + 17 Swift Testing tests; 21 MLX-free EAGLE preflight tests; authenticated file-manifest and cache-drift classifier regressions. | Clean `1a70c4d`: checkpoint + parity PASS; 4-bit exactness FAIL at generated index 17; 8-bit FAIL at index 7; both output hashes differ and return exit 1. | 2026-07-12 | EAGLE is shelved. `k=3`, long-output throughput, BF16, and the Swift port intentionally did not run after the earlier hard failure. |
 
 ## Current Verification Commands
 
@@ -72,7 +73,7 @@ upstream-only capabilities.
 | Acceptance criterion | Verdict | Fresh evidence |
 |---|---|---|
 | Reconcile all durable local portfolio inputs | **PASS** | Enumerated 5 plans, 5 Markdown verdicts, 11 task items (excluding the inbox README), the intake, carry-forward backlog, competitive landscape, operability specs, and current Swift cache/spec/scheduler surfaces. The dated audit has explicit completed, shelved, active, and do-not-reopen sections. |
-| Give every new recommendation a disposition and bounded owner | **PASS** | Handoff ranks 11 performance cycles; seven new inbox seeds own trained speculation, batching, KV storage quality, fused attention, prefix/session caching, sampling, and learned weight quantization. Research-later/rejected candidates remain in the intake/audit rather than becoming duplicate tasks. |
+| Give every new recommendation a disposition and bounded owner | **PASS** | At audit time the handoff ranked 11 performance cycles; after the EAGLE result, the current handoff advances the 10 remaining cycles. Seven new inbox seeds own trained speculation, batching, KV storage quality, fused attention, prefix/session caching, sampling, and learned weight quantization. Research-later/rejected candidates remain in the intake/audit rather than becoming duplicate tasks. |
 | Rank by impact, evidence, cost, and Apple fit without promoting research | **PASS** | The audit's scored matrix labels every external number unverified until a clean-SHA fast-mlx run. KVarN storage quality precedes its fused Metal phase; TurboQuant owns its own closure ablations. |
 | Primary sources support material claims | **PASS** | Independent source review caught and corrected the EAGLE `acceptance_length` denominator and the post-paper KVarN attribution. Final source re-review: **No issues found**. All 35 public external URLs introduced/touched by this change returned HTTP 200; the pre-existing authenticated Claude Artifact returned 403 as expected. |
 | Durable docs are internally navigable and review-clean | **PASS** | Repository-wide relative-link check passed across 56 Markdown files; `git diff --check` passed. Final focused review found no High/Medium correctness or priority issues. |
@@ -84,3 +85,38 @@ local historical result or a source-labeled external claim.
 
 **Overall verdict:** ALL PASS for the Sol portfolio-audit acceptance criteria. Engine
 promotion gates remain intentionally open in their individual task seeds.
+
+## Qwen3-32B EAGLE-3 Phase 0 closure — 2026-07-12
+
+**Story:** the owner can decide whether the public Qwen3-32B EAGLE-3 checkpoint merits a
+production Swift port using authenticated, same-target Apple-Silicon evidence.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Accounting is unambiguous | **PASS** | 119 HarnessCore XCTest + 17 Swift Testing tests pass. `SpeculativeAcceptanceSummary` separates proposal acceptance, accepted drafts/round, and inclusive length; zero measured round time now returns no economics projection. `SpeculativeEconomics.swift`: 129 lines, 89.92% line coverage. |
+| Checkpoint and MLX head are faithful | **PASS** | Full checkpoint/config hashes and 16 tensor payload ranges match. Pinned PyTorch→MLX fixture: cosine `0.9999815822`, argmax match `1.0`, max absolute error `0.0625`. |
+| 4-bit output is exact and engaged | **FAIL (candidate RED)** | Clean SHA `1a70c4d`: first mismatch index 17, bytes/token IDs differ, 23/39 accepted across 39 rounds. Replay classifies `rejected-future-cache-drift` at equal offset 59. |
+| 8-bit output is exact and engaged | **FAIL (candidate RED)** | Same clean SHA: first mismatch index 7, bytes/token IDs differ, 25/38 accepted across 38 rounds. Same sequential prefix: one-token argmax `279`, batched-probe argmax `264`, equal offset 49. |
+| Losing arm fails closed | **PASS** | Both verify commands exited 1 and wrote failed evidence. No authoritative throughput table, `k=3`, BF16 download, or production Swift implementation followed. |
+
+**Overall verdict:** the **preflight workflow passes** its fail-closed acceptance story; the
+**EAGLE candidate is RED / SHELVED**. Apparent failed-run rates are explicitly non-authoritative
+because outputs differ.
+
+**Evidence:** [`2026-07-12-qwen3-32b-eagle3-preflight.md`](superpowers/verdicts/2026-07-12-qwen3-32b-eagle3-preflight.md)
+and [`eagle3-evidence-2026-07-12.jsonl`](superpowers/verdicts/eagle3-evidence-2026-07-12.jsonl).
+Raw bench artifact SHA-256 values: checkpoint `a87be2…e34c`, parity `68c6c9…f1b3`, 4-bit
+verify `e9edd3…23d4`, 8-bit verify `e4191c…4686`; every record carries full clean SHA
+`1a70c4d6b3dce20f3254226123dd588a3c80f052`.
+
+**Commands:** off-box `swift test --package-path spike --filter HarnessCoreTests`; on-box
+`python -m unittest discover`, `inspect_checkpoint.py`, `dump_reference_fixture.py`,
+`check_head_parity.py`, and `run_preflight.py verify` for each authenticated target. The
+runner sets an explicit 8 GiB MLX cache limit under the raised wired-memory ceiling.
+
+**Docs source review:** CONFIRMED that pinned Speculators uses one target pass plus
+longest-prefix acceptance, that mlx-lm's standard trim decrements the logical offset, and that
+MLX states equality only up to numerical precision while shapes can trigger compilation work.
+UNVERIFIED—and deliberately not claimed—as an upstream fact: that any one MLX 0.32 kernel is
+the cause of these observations. The verdict labels that mechanism as inference and relies on
+the clean four-history replay for the local result.

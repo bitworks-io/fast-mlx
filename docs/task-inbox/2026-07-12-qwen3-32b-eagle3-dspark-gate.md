@@ -1,10 +1,10 @@
 ---
-status: captured
+status: partial-eagle-red-controls-blocked
 type: performance-spike
 priority: highest
 created: 2026-07-12
 source: sol-audit
-planning_ready: true
+planning_ready: false
 implementation_ready: false
 ---
 
@@ -52,5 +52,15 @@ capacity policy; long-output acceptance collapse.
 
 ## Next Step
 
-Write the architecture/measurement plan, inventory staged target/draft checkpoints on the
-bench Mac, and run the external Python preflight before touching the Swift compiled path.
+**Resolved 2026-07-12:** the authenticated EAGLE-3 Phase 0 passed checkpoint and head parity,
+then failed byte identity on both Qwen3-32B-4bit (first mismatch index 17) and 8-bit (index 7).
+The 8-bit target selects different greedy tokens for one-token and multi-token probes from the
+same sequential prefix; the 4-bit replay isolates drift to full verify+rollback histories.
+Verdict: [`2026-07-12-qwen3-32b-eagle3-preflight.md`](../superpowers/verdicts/2026-07-12-qwen3-32b-eagle3-preflight.md).
+
+EAGLE-3 is shelved and no Swift port begins. DSpark, DFlash, and native MTP were not executable
+same-target Qwen3-32B controls: no compatible product-size checkpoint is staged or available
+in the pinned paths. This records **no negative verdict** for those untested methods. Reopen
+trained speculation only for a deterministic target-verify repair that still pays, or a
+compatible product-size checkpoint. The next actionable flywheel item is continuous batching
+plus decode-first chunked prefill.

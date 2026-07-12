@@ -1,6 +1,6 @@
 # Qwen3-32B EAGLE-3 trained-speculator gate
 
-- **Status:** ACTIVE — Phase 0 implementation-ready; compiled Swift work remains gated
+- **Status:** COMPLETE — Phase 0 RED; compiled Swift work shelved
 - **Date:** 2026-07-12
 - **Owner:** Codex
 - **Queue seed:** [`docs/task-inbox/2026-07-12-qwen3-32b-eagle3-dspark-gate.md`](../../task-inbox/2026-07-12-qwen3-32b-eagle3-dspark-gate.md)
@@ -160,3 +160,18 @@ every compiled/uncompiled verify variant before benchmarking.
 - compact evidence in `docs/superpowers/verdicts/` and the durable verification index;
 - a `docs/content/` piece explaining the inclusive-acceptance trap and Apple round economics;
 - updated task inbox and handoff with the next safe action, whether promoted or shelved.
+
+## Execution outcome — 2026-07-12
+
+Phase 0A and 0B completed. The authenticated checkpoint passed, and the MLX head matched the
+pinned PyTorch/speculators fixture at cosine `0.9999815822` with 100% argmax agreement. Phase
+0C stopped at its first hard gate: Qwen3-32B-4bit changed the greedy stream at generated index
+17 and Qwen3-32B-8bit changed it at index 7, both at `k=1` with non-vacuous engagement. The 8-bit
+diagnostic shows the same sequential prefix selecting token `279` with a one-token target
+probe and `264` with a multi-token probe. The 4-bit diagnostic isolates drift to histories
+that processed and rolled back rejected future tokens.
+
+Per the planned RED rule, the multi-shape throughput table, `k=3`, BF16 download, and Phase 1
+Swift port were not run. Apparent rates from the failing verifies are explicitly
+non-authoritative because the outputs differ. Final verdict:
+[`2026-07-12-qwen3-32b-eagle3-preflight.md`](../verdicts/2026-07-12-qwen3-32b-eagle3-preflight.md).
