@@ -110,3 +110,75 @@ bash scripts/bench_pld_shapes.sh ~/perf-work/models/Qwen3-32B-4bit 3 256        
 
 On-box tests: `xcodebuild test … -only-testing:SpikeCoreTests` — 20/20. Off-box:
 `swift test --filter HarnessCoreTests` — 108 XCTest + 17 swift-testing, 0 failures.
+
+## RESOLVED 2026-07-11: performance gate cleared for a default-on product policy
+
+**Feature SHA:** `bb5b06f22dc62e258c5ee1bdaadd6e53e1f8019d` · **Box:** M5 Max,
+128GB · **Model:** Qwen3-32B-4bit (fp16 KV) · **Runs:** 3 post-warmup, 256 tokens
+
+The first-run verdict named two reasons PLD could not yet be left on indiscriminately: the
+spec loop abandoned the base decoder's submit-first pipeline whenever it had no useful draft,
+and a low-yield request could spend 32 enabled steps proving it was cold. Both causes are now
+fixed and re-measured. This addendum preserves the original result above as the historical
+first run; it records the follow-up decision.
+
+### What changed
+
+- `generateSpec` now starts in the base loop's pipelined state. Empty-draft and gate-disabled
+  rounds use the same `prefill` / `step` lookahead as PLD-off. A one-time two-deep transition
+  restores that pipeline after a speculative round.
+- The accept walk can combine an already-prefetched target pick with the verify rows produced
+  after the draft. This retains the exact K+1 target sequence while avoiding a redundant
+  synchronous forward when entering speculation from the base pipeline.
+- The gate moved from `window=32, threshold=0.25, cooldown=16` to `window=8,
+  minimumSamples=4, threshold=0.5, cooldown=32`. It can step aside after four clearly cold
+  enabled steps, then waits longer before probing again.
+
+The cache-state split is explicit: either the committed context is in KV with a target pick
+pending, or the last emitted token is not yet in KV and no pick is pending. Rejected verify
+rows are still rolled back in place. No unsafe concurrency escape was introduced; MLX state
+remains actor-confined.
+
+### Clean-SHA result
+
+| shape | PLD off | PLD on | delta | acceptance | gate behavior |
+|---|---:|---:|---:|---:|---|
+| preamble-then-echo | 28.28 | **56.70** | **+100.50%** | 684/696 (98.3%) | never disabled |
+| code / repeated structure | 28.39 | **29.31** | **+3.24%** | 92/151 (60.9%) | disabled 543 steps |
+| low-repetition prose | 28.62 | **28.66** | **+0.14%** | 0/0 | disabled 205 steps |
+| echo, compiled fixed-K verify | 28.28 | 52.63 | +86.10% | 684/696 (98.3%) | never disabled |
+
+The task's ±1% neutrality band represented a no-regression safety bar. Prose is inside it at
++0.14%. Code finished outside it in the useful direction: accepted drafts produced a measured
++3.24% gain rather than overhead. The original target win is preserved and slightly improved,
+from +97.5% to +100.5%. Compiled fixed-K verification remains slower than the uncompiled
+default (52.63 versus 56.70 tok/s), despite still beating PLD-off by 86.1%, so the default
+verify strategy does not change.
+
+### Exactness and verification
+
+Both verify strategies emitted **byte-identical 120/120-token streams** against PLD-off at
+temperature 0. Each run drafted 72 tokens, accepted 53, engaged the speculative path, and
+passed the exact triad. The nine evidence records (seven shape rows plus two exactness rows) all
+carry the full feature SHA above. The external evidence bundle is
+`final-bb5b06f.csv`, `final-bb5b06f.jsonl`, and `final-bb5b06f-verify.jsonl`; its hashes and
+criterion mapping are recorded in [`docs/verification-evidence.md`](../../verification-evidence.md).
+
+- Pure harness: `swift test --filter HarnessCoreTests` — 113 XCTest + 17 Swift Testing tests,
+  0 failures.
+- PLD unit coverage: `PLDGate.swift` 90.6%; `SpecAccept.swift` 90.5%.
+- MLX-coupled suite: `xcodebuild test … -only-testing:SpikeCoreTests` — 20/20,
+  `TEST SUCCEEDED` on the bench Mac.
+- Focused cache-state and gate reviews: no correctness, security, or logic findings.
+
+### Final verdict — PROMOTE / default-on performance gate cleared
+
+PLD remains exact and now costs effectively nothing when it finds no work. It is **cleared for
+a default-on product policy with an opt-out**. This patch deliberately does not claim that a
+runtime default was flipped: the measurement harness still selects PLD explicitly with
+`--spec pld`, and the current `RunConfig` default remains `nil`. That product/API wiring is a
+separate surface decision, not an inference-kernel risk.
+
+The named residual constraint is unchanged: PLD assumes one in-flight KV and must remain off
+under continuous batching until that interaction is separately designed and measured.
+Temperature greater than zero was not part of this exact-greedy acceptance gate.

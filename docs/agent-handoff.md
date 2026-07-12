@@ -20,8 +20,7 @@ For the next Codex/Claude Code/human agent. Decision-focused; links to the durab
 ### ▶ Gated next step — TurboQuant Spike B (outlier channels)
 The paper's near-losslessness depends on outlier channels (32ch@3b+96@2b) that uniform-v1 deferred — the one lever that could move tqB3 under the baseline. Extend `TurboQuantCodec`'s bit allocation, re-measure through the same harness, then promote or fully shelve. The codec + cache + tier plumbing are already in place behind the flag. Task-inbox: [`2026-07-09-turboquant-spike-b-outlier-channels.md`](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md). Route engine/MLX work to deep-reasoner (fable).
 
-**Speculative decoding (PLD) — PROMOTED + MERGED** (`main`, `5deb1d0`; plan [`2026-07-09-speculative-decoding-pld.md`](superpowers/plans/2026-07-09-speculative-decoding-pld.md), verdict [`2026-07-09-pld-firstrun.md`](superpowers/verdicts/2026-07-09-pld-firstrun.md)). The **first decode-speed multiplier** beyond the GPU-bound base loop (we're at Zig parity on the base loop; PLD is the first of mlx-serve's multipliers to land). Prompt-lookup decoding: **exact (byte-identical at temp 0, proven 80/80 + 120/120)**, no draft model. Measured on Qwen3-32B-4bit: **echo/agent +97.5% (28.25 → 55.80 tok/s, 98% accept)**; code −3.7%, prose −2.1% (non-target overhead honestly characterized). Ships as a per-request `--spec pld` toggle (opt-in; default path unchanged). The framework (`HarnessCore/SpecDecode/` — `SpecDrafter`/`SpecAccept`/`SpecEmit`/`PLDGate`) is what **DSpark/DFlash will reuse**.
-- **▶ Gated follow-up — PLD gate-tuning** before global default-on: keep non-target shapes ≈ neutral (preserve submit-first pipelining on fallback steps; make the gate disable faster on low yield). Task-inbox: [`2026-07-11-pld-gate-tuning.md`](task-inbox/2026-07-11-pld-gate-tuning.md).
+**Speculative decoding (PLD) — PROMOTED + GATE-TUNED** (`main`, framework merge `5deb1d0`, gate-tuning feature `bb5b06f`, merge `29cc453`; plan [`2026-07-09-speculative-decoding-pld.md`](superpowers/plans/2026-07-09-speculative-decoding-pld.md), [verdict + 2026-07-11 resolution](superpowers/verdicts/2026-07-09-pld-firstrun.md)). The **first decode-speed multiplier** beyond the GPU-bound base loop (we're at Zig parity on the base loop; PLD is the first of mlx-serve's multipliers to land). Prompt-lookup decoding is **exact** with no draft model: byte-identical 120/120 at temp 0 in both verify modes. Clean-SHA Qwen3-32B-4bit result: **echo/agent +100.5% (28.28 → 56.70 tok/s, 98.3% accept)**, code **+3.2%**, zero-draft prose **+0.1%**. Fallback rounds now preserve the base submit-first pipeline; the gate judges a cold partial window after four samples and waits 32 steps before probing. This **clears the performance gate for a default-on product policy**, but does not itself flip a runtime default: the harness still selects `--spec pld` explicitly and `RunConfig` still defaults to no spec decoder. The framework (`HarnessCore/SpecDecode/` — `SpecDrafter`/`SpecAccept`/`SpecEmit`/`PLDGate`) is what **DSpark/DFlash will reuse**.
 
 **Also shipped since:** the [quality-metrics explainer](reference/quality-metrics-explained.md) + a **published Artifact** (`https://claude.ai/code/artifact/168d9b15-96e7-4f30-babf-b7ea64441438` — a user-facing "how we measure quality" page), and the **dial-as-informed-consent** refinement (platform spec §4: noticeable-but-valuable tiers with quantified loss + a hard garbage floor; PrismML 1-bit captured as a device-tier research candidate in the intake).
 
@@ -29,13 +28,13 @@ The paper's near-losslessness depends on outlier channels (32ch@3b+96@2b) that u
 
 Prioritized; each is a self-contained next step. Owner's north star: **match then beat the optimized mlx-serve** — the base loop is at Zig parity and PLD is the first multiplier landed; the rest are the multipliers still to test.
 
-1. **PLD gate-tuning** — immediate, small ([`task-inbox/2026-07-11-pld-gate-tuning.md`](task-inbox/2026-07-11-pld-gate-tuning.md)). Make non-target shapes ≈ neutral (preserve submit-first pipelining on fallback steps; gate disables faster on low yield) so PLD can be default-on.
-2. **DSpark** — EAGLE-3-style spec-decode (a trained drafter), the next decode multiplier; **reuses `HarnessCore/SpecDecode/`** (SpecDrafter/SpecAccept/SpecEmit/PLDGate). Design in [`reference/mlx-serve-archive/`](reference/mlx-serve-archive/) + the [carry-forward backlog](reference/2026-07-08-carry-forward-performance-backlog.md).
-3. **Continuous batching + sampler fusion** — the remaining mlx-serve throughput multipliers (carry-forward backlog). NB: PLD is single-in-flight-KV only → it disables under batching (a named invariant in the spec-decode plan).
-4. **TurboQuant Spike B** — outlier channels ([task-inbox](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md)); the one lever that could un-shelve TurboQuant.
-5. **Absorbed-MLA KV cache** — 71× DeepSeek-R1 KV reduction ([task-inbox](task-inbox/2026-07-09-absorbed-mla-kv-cache.md)); makes R1 viable at long context.
-6. **Operability backlog** — chunked-prefill capacity measurement + runtime admission control (system-aware spec §7).
-7. **PrismML 1-bit** — device-tier extreme-compression research (the informed-consent frontier); intake candidate.
+1. **DSpark** — EAGLE-3-style spec-decode (a trained drafter), the next decode multiplier; **reuses `HarnessCore/SpecDecode/`** (SpecDrafter/SpecAccept/SpecEmit/PLDGate). Design in [`reference/mlx-serve-archive/`](reference/mlx-serve-archive/) + the [carry-forward backlog](reference/2026-07-08-carry-forward-performance-backlog.md).
+2. **Continuous batching + sampler fusion** — the remaining mlx-serve throughput multipliers (carry-forward backlog). NB: PLD is single-in-flight-KV only → it disables under batching (a named invariant in the spec-decode plan).
+3. **TurboQuant Spike B** — outlier channels ([task-inbox](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md)); the one lever that could un-shelve TurboQuant.
+4. **Absorbed-MLA KV cache** — 71× DeepSeek-R1 KV reduction ([task-inbox](task-inbox/2026-07-09-absorbed-mla-kv-cache.md)); makes R1 viable at long context.
+5. **Operability backlog** — chunked-prefill capacity measurement + runtime admission control (system-aware spec §7).
+6. **PrismML 1-bit** — device-tier extreme-compression research (the informed-consent frontier); intake candidate.
+7. **Sol optimization-landscape audit** — reconcile the full queue, then deep-research new engine optimizations and unusual quantizer combinations without duplicating active or shelved work ([task-inbox](task-inbox/2026-07-11-sol-optimization-landscape-audit.md)).
 
 Every one runs the same loop: implement behind a flag → triad + precision-loss harness → **promote to a dial tier or shelve with a dated verdict** (`docs/superpowers/verdicts/`) → write a `docs/content/` piece.
 
@@ -69,11 +68,11 @@ Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit + bf16 reference stage
 
 ## Known Risks / Open Items
 
-- **Long on-box measurement runs** (long-context KL, multi-shape bench) stall the driving agent in monitor-waits and don't reliably auto-resume — check `~/fast-mlx-spike/harness-evidence.jsonl` + `pld-shapes.csv` on the box for partial results, then resume the finalization (verdict + commit) explicitly.
+- **Long on-box measurement runs** (long-context KL, multi-shape bench) can stall the driving agent in monitor-waits and do not reliably auto-resume. Inspect the SHA-stamped evidence bundle for partial rows before restarting; record the final artifact names, hashes, and harness SHA in `docs/verification-evidence.md`.
 - **Model routing:** haiku=scout, sonnet=builder, opus=main/judgment, fable=deep-reasoner; always pass `model` explicitly; re-route UP one tier on failure. Engine/MLX-coupled work → deep-reasoner (builders have escalated on it).
 - **cacheLimit invariant:** whenever `iogpu.wired_limit_mb` is raised, set an explicit `Memory.cacheLimit` (never the 1.5× default — the "7K wall" mechanism). Policy: `CapacityModel.recommendedCacheLimitBytes`.
-- **Backlog** (`docs/task-inbox/`): absorbed-MLA KV cache (71× DeepSeek-R1 lever, unbuilt); chunked-prefill capacity measurement gate; runtime admission control.
-- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 6 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
+- **Backlog** (`docs/task-inbox/`): DSpark; absorbed-MLA KV cache (71× DeepSeek-R1 lever, unbuilt); chunked-prefill capacity measurement gate; runtime admission control; Sol's optimization-landscape audit.
+- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 7 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
 
 ## Commit / Checkin
 

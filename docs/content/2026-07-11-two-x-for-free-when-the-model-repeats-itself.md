@@ -2,6 +2,11 @@
 
 **Whitepaper themes:** Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel
 
+> **Follow-up, 2026-07-11:** The two non-target regressions described below were subsequently
+> removed: final code measured +3.2%, zero-draft prose +0.1%, and echo +100.5%, while exactness
+> remained 120/120 in both verify modes. See the [gate-tuning resolution](../superpowers/verdicts/2026-07-09-pld-firstrun.md#resolved-2026-07-11-performance-gate-cleared-for-a-default-on-product-policy)
+> and [the follow-up investigation](2026-07-11-when-zero-speculation-costs-two-percent.md).
+
 Every LLM speedup we had shipped so far traded something. Quantize the weights, pay in
 perplexity. Quantize the KV cache, pay in long-context tail divergence — we measured that one
 to death and shelved it. So the pitch for speculative decoding sounds like it belongs in the
