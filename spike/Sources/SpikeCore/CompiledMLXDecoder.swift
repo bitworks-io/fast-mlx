@@ -113,12 +113,19 @@ public struct CompiledMLXDecoder: Decoder {
         return next.item(Int.self)
     }
 
-    /// The speculative-decoding loop (PLD first). Per step, when the gate allows: draft up
-    /// to K continuation tokens from the context, run ONE verify forward over
-    /// `[last] + draft` (K+1 positions), accept the longest prefix the target's own argmax
-    /// agrees with plus the bonus token, roll the KV back by the rejected count, feed the
-    /// gate. Empty draft or a disabled gate falls back to the plain compiled single-token
-    /// step (and still feeds the gate, so its cooldown clock advances).
+    /// The speculative-decoding loop (PLD first). High-yield rounds run one verify forward
+    /// over `[last] + draft`, accept the longest target-confirmed prefix plus the bonus token,
+    /// and roll KV back by the rejected count. Empty-draft and gate-disabled rounds retain the
+    /// plain loop's submit-first `pendingNext` pipeline instead of synchronously forwarding and
+    /// reading back one token at a time.
+    ///
+    /// There are two explicit cache invariants:
+    /// - pipelined: committed context is in KV and `pendingNext` is the target's next pick;
+    /// - speculative: the last emitted token is `lastArr`, not yet in KV, and no pick is pending.
+    /// Re-entering speculation verifies `draft` against the prefetched pick plus the draft
+    /// forward's rows, then exits in the efficient speculative invariant. Falling back from a
+    /// speculative round seeds the two-deep plain pipeline once; later fallback steps call the
+    /// exact same `step(last:)` implementation as PLD-off.
     ///
     /// THE HEADLINE PROPERTY: at temp 0 the emitted stream is byte-identical to the plain
     /// greedy loop — a drafted token is emitted only when it EQUALS the model's own argmax
@@ -126,10 +133,6 @@ public struct CompiledMLXDecoder: Decoder {
     /// the plain loop's budget/eos stopping rules over each batch. Speculation changes how
     /// many tokens one forward emits, never which tokens.
     ///
-    /// No submit-first lookahead here: the next forward's INPUT depends on a host-side
-    /// decision (draft or not, which tokens) that needs the current batch read back first,
-    /// so there is nothing to overlap. The plain path (`prefill`/`step`) keeps its
-    /// pipelining untouched when spec decoding is off.
     public mutating func generateSpec(
         prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
     ) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats) {
@@ -137,8 +140,11 @@ public struct CompiledMLXDecoder: Decoder {
         let submitTime = Date().timeIntervalSinceReferenceDate
         guard maxTokens > 0 else { return ([], submitTime, [], stats) }
 
-        var lastArr = prefillCore(prompt) // KV holds exactly the prompt; `last` unconsumed
-        var last = lastArr.item(Int.self)
+        // Start in the same submit-first state as the plain loop. A cold request can therefore
+        // stay on the base pipeline from token one; a hot request pays one transition verify,
+        // then remains in the one-forward-per-round speculative invariant.
+        var last = prefill(prompt)
+        var lastArr: MLXArray? = nil
         var tokens = [last]
         var times = [Date().timeIntervalSinceReferenceDate]
         var context = prompt + [last]
@@ -156,13 +162,28 @@ public struct CompiledMLXDecoder: Decoder {
             if draft.isEmpty {
                 if !gate.isEnabled { stats.gateDisabledSteps += 1 }
                 stats.normalSteps += 1
-                if cachedTokens + 1 > caches[0].capacity {
-                    for cache in caches { cache.grow(by: chunk) }
+                if pendingNext != nil {
+                    // Already on the base loop's pipeline: submit the following forward before
+                    // reading this token, exactly as PLD-off does.
+                    last = step(last: last)
+                } else {
+                    // One-time speculative -> pipelined transition. The current `lastArr` is
+                    // not in KV, so consume it, submit the following token too, and only then
+                    // read back the next emitted token. Subsequent cold steps use `step` above.
+                    guard let current = lastArr, let compiledStep else {
+                        fatalError("speculative fallback missing current token or compiled step")
+                    }
+                    while cachedTokens + 2 > caches[0].capacity {
+                        for cache in caches { cache.grow(by: chunk) }
+                    }
+                    let next = compiledStep([current])[0]
+                    let following = compiledStep([next])[0]
+                    asyncEval(following)
+                    pendingNext = following
+                    cachedTokens += 2
+                    last = next.item(Int.self)
+                    lastArr = nil
                 }
-                let nextArr = compiledStep!([lastArr])[0]
-                last = nextArr.item(Int.self)
-                lastArr = nextArr
-                cachedTokens += 1
                 // Phase-1 flag #2: the gate is fed on EVERY step (cooldown clock).
                 gate.record(accepted: 0)
                 emitted = [last]
@@ -175,12 +196,14 @@ public struct CompiledMLXDecoder: Decoder {
                     verifyDraft += Array(
                         repeating: verifyDraft.last!, count: spec.maxDraft - verifyDraft.count)
                 }
-                let n = verifyDraft.count + 1
+                let wasPipelined = pendingNext != nil
+                let verifyInput = wasPipelined ? verifyDraft : [last] + verifyDraft
+                let n = verifyInput.count
                 while cachedTokens + n > caches[0].capacity {
                     for cache in caches { cache.grow(by: chunk) }
                 }
-                let ids = MLXArray(([last] + verifyDraft).map(Int32.init)).reshaped([1, n])
-                let verifyArgmax: MLXArray // [n]: the target's pick AFTER each position
+                let ids = MLXArray(verifyInput.map(Int32.init)).reshaped([1, n])
+                let verifyArgmax: MLXArray // target pick AFTER each forwarded position
                 if spec.compiledVerify {
                     if compiledVerifyStep == nil {
                         let model = self.model
@@ -196,12 +219,37 @@ public struct CompiledMLXDecoder: Decoder {
                     let logits = model(ids, cache: caches)
                     verifyArgmax = argMax(logits[0], axis: -1)
                 }
-                let picks = verifyArgmax.asType(.int32).asArray(Int32.self).map(Int.init)
+                let picksAfterInput = verifyArgmax.asType(.int32).asArray(Int32.self).map(Int.init)
+                let prefetched = pendingNext
+                let prefetchedPick = prefetched?.item(Int.self)
                 cachedTokens += n // the verify forward appended n rows
-                let (accepted, bonus) = SpecAccept.walk(draft: verifyDraft, verifyArgmax: picks)
-                // Rollback: keep `last` + the accepted drafts; the rejected rows the verify
-                // forward wrote become unreachable and are overwritten by the next update.
-                let keep = cachedTokens - n + 1 + accepted
+
+                let accepted: Int
+                let bonus: Int
+                let bonusArr: MLXArray
+                let keep: Int
+                if let prefetched, let prefetchedPick {
+                    // Pipelined entry: KV already contains `last`; the verify forwarded only
+                    // draft rows. Keep exactly the accepted draft prefix. The target's first
+                    // pick came from the in-flight base step, shifting later picks by one.
+                    (accepted, bonus) = SpecAccept.walk(
+                        draft: verifyDraft,
+                        prefetched: prefetchedPick,
+                        verifyArgmaxAfterDraft: picksAfterInput)
+                    keep = cachedTokens - n + accepted
+                    bonusArr = accepted == 0
+                        ? prefetched
+                        : verifyArgmax[accepted - 1].reshaped([1])
+                } else {
+                    // Speculative entry: KV lacks `last`; `[last] + draft` produced the canonical
+                    // K+1 picks. Keep `last` plus the accepted draft prefix.
+                    (accepted, bonus) = SpecAccept.walk(
+                        draft: verifyDraft, verifyArgmax: picksAfterInput)
+                    keep = cachedTokens - n + 1 + accepted
+                    bonusArr = verifyArgmax[accepted].reshaped([1])
+                }
+
+                // Rejected rows become unreachable and are overwritten by the next update.
                 if keep < cachedTokens {
                     for cache in caches { cache.truncate(to: keep) }
                     cachedTokens = keep
@@ -211,7 +259,8 @@ public struct CompiledMLXDecoder: Decoder {
                 stats.accepted += accepted
                 gate.record(accepted: accepted)
                 last = bonus
-                lastArr = verifyArgmax[accepted].reshaped([1])
+                lastArr = bonusArr
+                pendingNext = nil
                 emitted = Array(verifyDraft.prefix(accepted)) + [bonus]
             }
 
