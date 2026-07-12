@@ -70,6 +70,22 @@ actor HarnessEngineActor {
         return (tokens, submitTime, tokenTimes, turboQuantTokens)
     }
 
+    /// Speculative-decoding generate (PLD first): routes to `CompiledMLXDecoder.generateSpec`,
+    /// which drafts from the context, batch-verifies, accept-walks, and rolls the KV back —
+    /// byte-identical to the plain greedy loop at temp 0 by construction. Same decoder-per-kind
+    /// reuse as `generate` (compiled step + compiled verify survive across runs; in-place reset).
+    func generateSpec(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind, spec: SpecDecodeConfig)
+        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats)
+    {
+        if decoders[kind] == nil {
+            decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
+        }
+        var decoder = decoders[kind]!
+        defer { decoders[kind] = decoder }
+        decoder.reset() // in-place KV reset: compiled graph stays valid across runs
+        return decoder.generateSpec(prompt: prompt, maxTokens: maxTokens, eos: eos, spec: spec)
+    }
+
     /// Full-vocab RAW LOGITS per generated position at temp=0 — the `EngineDriver.logprobs`
     /// contract: index == token id, length == vocab, NOT top-k, NOT softmaxed. Runs the plain
     /// (uncompiled) forward on a fresh cache: this is the measurement path, not the perf path,
@@ -187,6 +203,27 @@ struct SwiftEngineDriver: EngineDriver {
 
     func generate(prompt: [Int], config: RunConfig) async throws -> RunResult {
         let kind = try Self.cacheKind(config)
+        if let spec = try Self.specConfig(config) {
+            let out = await engine.generateSpec(
+                prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind, spec: spec)
+            // Engagement telemetry for the spec triad: `spec_drafted` is the marker proving
+            // drafting actually happened (byte-identical output with zero drafts would be a
+            // vacuous equivalence "pass"); accepted/steps feed the measurement verdict.
+            let counts = [
+                "decode": out.tokens.count,
+                "spec_drafted": out.stats.drafted,
+                "spec_accepted": out.stats.accepted,
+                "spec_verify_steps": out.stats.verifySteps,
+                "spec_normal_steps": out.stats.normalSteps,
+                "spec_gate_disabled_steps": out.stats.gateDisabledSteps,
+            ]
+            return RunResult(
+                tokens: out.tokens,
+                engagement: .init(counts),
+                acceptanceRate: out.stats.acceptanceRate,
+                submitTime: out.submitTime,
+                tokenTimes: out.tokenTimes)
+        }
         let out = await engine.generate(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
         var counts = ["decode": out.tokens.count]
         if let tq = out.turboQuantTokens {
@@ -197,23 +234,23 @@ struct SwiftEngineDriver: EngineDriver {
         return RunResult(
             tokens: out.tokens,
             engagement: .init(counts),
-            acceptanceRate: nil, // no spec-decode path yet
+            acceptanceRate: nil, // plain (non-speculative) decode
             submitTime: out.submitTime,
             tokenTimes: out.tokenTimes)
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
-        let kind = try Self.cacheKind(config)
+        let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
-        let kind = try Self.cacheKind(config)
+        let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation, kvCache: kind)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
-        let kind = try Self.cacheKind(config)
+        let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.teacherForcedLogprobsAtPositions(
             prompt: prompt, forced: forcedContinuation, positions: positions, kvCache: kind)
     }
@@ -221,18 +258,39 @@ struct SwiftEngineDriver: EngineDriver {
     /// Validates the whole config and maps `kvQuant` to a cache kind. nil/"fp16" → fp16;
     /// "tq2.5"/"tq3.5" (or "tqB2"/"tqB3") → the TurboQuant cache. Anything else throws —
     /// a "measurement" must never silently measure something other than what was asked for.
-    private static func cacheKind(_ config: RunConfig) throws -> KVCacheKind {
+    /// The scoring paths pass `allowSpec: false`: speculation changes how a decode loop steps,
+    /// not what a teacher-forced forward scores, so a spec config there is a caller bug.
+    private static func cacheKind(_ config: RunConfig, allowSpec: Bool = true) throws -> KVCacheKind {
         guard config.temperature == 0 else {
             throw SwiftEngineDriverError.unsupportedConfig("temperature=\(config.temperature) (greedy-only engine)")
         }
-        if let spec = config.specDecode {
-            throw SwiftEngineDriverError.unsupportedConfig("specDecode=\(spec) (not implemented)")
+        if !allowSpec, let spec = config.specDecode {
+            throw SwiftEngineDriverError.unsupportedConfig("specDecode=\(spec) on a scoring path (decode-only feature)")
         }
         guard let kind = KVCacheKind(kvQuant: config.kvQuant) else {
             throw SwiftEngineDriverError.unsupportedConfig(
                 "kvQuant=\(config.kvQuant ?? "nil") (known tiers: fp16, tq2.5/tqB2, tq3.5/tqB3)")
         }
         return kind
+    }
+
+    /// Maps `RunConfig.specDecode` to the engine's spec-decode configuration. nil → plain decode;
+    /// "pld" → prompt-lookup drafter with the config's ngram/K/compile-strategy knobs. Unknown
+    /// drafters and unmeasured tier combinations (spec + TurboQuant KV) fail loudly.
+    private static func specConfig(_ config: RunConfig) throws -> SpecDecodeConfig? {
+        guard let spec = config.specDecode else { return nil }
+        guard spec == "pld" else {
+            throw SwiftEngineDriverError.unsupportedConfig("specDecode=\(spec) (known drafters: pld)")
+        }
+        if let kv = config.kvQuant, kv != "fp16" {
+            // Structurally supported (truncate is on the CompiledCache protocol) but never
+            // measured together — reject rather than silently "measure" an untested combo.
+            throw SwiftEngineDriverError.unsupportedConfig("specDecode=pld with kvQuant=\(kv) (unmeasured combination; use fp16)")
+        }
+        return SpecDecodeConfig(
+            drafter: PromptLookupDrafter(ngram: config.specNgram ?? 3),
+            maxDraft: config.specMaxDraft ?? 8,
+            compiledVerify: config.specCompiledVerify ?? false)
     }
 }
 

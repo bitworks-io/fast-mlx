@@ -3,9 +3,21 @@ import Foundation
 public struct RunConfig: Sendable, Hashable {
     public var temperature: Float; public var maxTokens: Int
     public var specDecode: String?   // "pld" | "dspark" | nil
+    /// PLD match n-gram length (nil = the engine drafter's default).
+    public var specNgram: Int?
+    /// Max drafted tokens per verify forward, K (nil = the engine's default).
+    public var specMaxDraft: Int?
+    /// Verify-forward compile strategy: true = separate fixed-K compiled verify step (drafts
+    /// padded to K so the trace replays), false/nil = uncompiled verify forward. The locked
+    /// decision is "choose on-box — measure both", so the harness can select either.
+    public var specCompiledVerify: Bool?
     public var kvQuant: String?      // "fp16" | "8" | "turbo4" | nil
-    public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil, kvQuant: String? = nil) {
-        self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode; self.kvQuant = kvQuant
+    public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
+                specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
+                kvQuant: String? = nil) {
+        self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode
+        self.specNgram = specNgram; self.specMaxDraft = specMaxDraft
+        self.specCompiledVerify = specCompiledVerify; self.kvQuant = kvQuant
     }
     public static func greedy(maxTokens: Int) -> RunConfig { .init(temperature: 0, maxTokens: maxTokens) }
 }
