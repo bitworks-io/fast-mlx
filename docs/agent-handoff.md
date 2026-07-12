@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-11
+Last reviewed: 2026-07-12
 
 For the next Codex/Claude Code/human agent. Decision-focused; links to the durable specs rather than duplicating them.
 
@@ -8,7 +8,7 @@ For the next Codex/Claude Code/human agent. Decision-focused; links to the durab
 
 **fast-mlx** — the fastest, most-optimized MLX inference platform for Apple Silicon, superseding the incumbent Zig `mlx-serve`. A Swift engine + macOS app + Python train/research plane + an engine-agnostic conformance/precision-loss harness. The product wedge is the **optimization dial with quantified precision loss** ("dial in speed, see exactly what accuracy you trade"); the moat is the **technique-integration flywheel** (absorb a new inference technique → measure its speed↔quality frontier → promote to a dial tier or shelve with a dated negative result). First production deployment: **Concierge** (bitworks' shopping assistant). Dev/bench box: **M5 Max 128GB** (`llmbench@192.168.1.252`); production target up to M3 Ultra 512GB. Full design: [`docs/superpowers/specs/2026-07-08-fast-mlx-platform-design.md`](superpowers/specs/2026-07-08-fast-mlx-platform-design.md).
 
-## Current state (2026-07-11)
+## Current state (2026-07-12)
 
 **Shipped to `main`:**
 - **Engine seed** (`spike/`): compiled decode core (`CompiledMLXDecoder` + `CompiledKVCache`) at 155.4 tok/s (≥ Zig), single-owner `InferenceActor`, Swift 6 strict-concurrency clean.
@@ -17,24 +17,62 @@ For the next Codex/Claude Code/human agent. Decision-focused; links to the durab
 
 **TurboQuant KV-quant — COMPLETE + SHELVED** (merged to `main`, `6e82e2b`; plan [`2026-07-09-turboquant-kv-quant.md`](superpowers/plans/2026-07-09-turboquant-kv-quant.md)). The flywheel's first novel technique ran the full loop: Google TurboQuant (arXiv:2504.19874) built exactly (`LloydMaxCodebook` + `TurboQuantCodec` Haar/LUT/QJL — Spike A verified against the paper's Theorem-2 distortion table), integrated as `TurboQuantKVCache` (materialize-then-attend, behind the `tq2.5`/`tq3.5` flag), measured, and **SHELVED as a dated negative result** — uniform-v1 loses to 4-bit affine on Qwen3-32B (tqB3 tail-p95 1.797/ppl +32.6% vs 1.665/+21.4%; tqB2 catastrophic). Verdict: [`verdicts/2026-07-09-turboquant-firstrun.md`](superpowers/verdicts/2026-07-09-turboquant-firstrun.md). The fp16 default path is unchanged (60/60 regression, tests green).
 
-### ▶ Gated next step — TurboQuant Spike B (outlier channels)
-The paper's near-losslessness depends on outlier channels (32ch@3b+96@2b) that uniform-v1 deferred — the one lever that could move tqB3 under the baseline. Extend `TurboQuantCodec`'s bit allocation, re-measure through the same harness, then promote or fully shelve. The codec + cache + tier plumbing are already in place behind the flag. Task-inbox: [`2026-07-09-turboquant-spike-b-outlier-channels.md`](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md). Route engine/MLX work to deep-reasoner (fable).
+### Gated closure — TurboQuant Spike B
+The paper's outlier allocation remains a finite second test, now broadened by the 2026-07-12
+audit to include K-high/V-low, boundary-layer, and QJL ablations. It no longer leads the KV
+queue: fused compressed-domain attention and KVarN/asymmetric affine controls must establish
+the speed/quality baseline first. If no bounded recipe beats them at equal effective bytes,
+fully shelve TurboQuant. Task: [`2026-07-09-turboquant-spike-b-outlier-channels.md`](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 
 **Speculative decoding (PLD) — PROMOTED + GATE-TUNED** (`main`, framework merge `5deb1d0`, gate-tuning feature `bb5b06f`, merge `29cc453`; plan [`2026-07-09-speculative-decoding-pld.md`](superpowers/plans/2026-07-09-speculative-decoding-pld.md), [verdict + 2026-07-11 resolution](superpowers/verdicts/2026-07-09-pld-firstrun.md)). The **first decode-speed multiplier** beyond the GPU-bound base loop (we're at Zig parity on the base loop; PLD is the first of mlx-serve's multipliers to land). Prompt-lookup decoding is **exact** with no draft model: byte-identical 120/120 at temp 0 in both verify modes. Clean-SHA Qwen3-32B-4bit result: **echo/agent +100.5% (28.28 → 56.70 tok/s, 98.3% accept)**, code **+3.2%**, zero-draft prose **+0.1%**. Fallback rounds now preserve the base submit-first pipeline; the gate judges a cold partial window after four samples and waits 32 steps before probing. This **clears the performance gate for a default-on product policy**, but does not itself flip a runtime default: the harness still selects `--spec pld` explicitly and `RunConfig` still defaults to no spec decoder. The framework (`HarnessCore/SpecDecode/` — `SpecDrafter`/`SpecAccept`/`SpecEmit`/`PLDGate`) is what **DSpark/DFlash will reuse**.
 
 **Also shipped since:** the [quality-metrics explainer](reference/quality-metrics-explained.md) + a **published Artifact** (`https://claude.ai/code/artifact/168d9b15-96e7-4f30-babf-b7ea64441438` — a user-facing "how we measure quality" page), and the **dial-as-informed-consent** refinement (platform spec §4: noticeable-but-valuable tiers with quantified loss + a hard garbage floor; PrismML 1-bit captured as a device-tier research candidate in the intake).
 
+**Sol optimization-landscape audit — COMPLETE (2026-07-12).** The full plans/verdicts/
+inbox/intake/carry-forward portfolio was reconciled against the current Swift code and
+current primary sources. It corrected four status errors (native MTP and prefix/SSD cache are
+not implemented here; Python MLX has shipped absorbed MLA; PrismML artifacts are real), kept
+Qwen3-32B EAGLE-3/DSpark first, and ranked the KVarN/asymmetric storage-quality gate plus
+fused compressed-domain KV attention ahead of TurboQuant B. Dated brief:
+[`2026-07-12-sol-optimization-landscape.md`](reference/2026-07-12-sol-optimization-landscape.md).
+
 ## ▶ Open work queue — pick the next flywheel cycle
 
-Prioritized; each is a self-contained next step. Owner's north star: **match then beat the optimized mlx-serve** — the base loop is at Zig parity and PLD is the first multiplier landed; the rest are the multipliers still to test.
+Prioritized by the 2026-07-12 Sol audit. The north star remains **match then beat optimized
+mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the first multiplier.
 
-1. **DSpark** — EAGLE-3-style spec-decode (a trained drafter), the next decode multiplier; **reuses `HarnessCore/SpecDecode/`** (SpecDrafter/SpecAccept/SpecEmit/PLDGate). Design in [`reference/mlx-serve-archive/`](reference/mlx-serve-archive/) + the [carry-forward backlog](reference/2026-07-08-carry-forward-performance-backlog.md).
-2. **Continuous batching + sampler fusion** — the remaining mlx-serve throughput multipliers (carry-forward backlog). NB: PLD is single-in-flight-KV only → it disables under batching (a named invariant in the spec-decode plan).
-3. **TurboQuant Spike B** — outlier channels ([task-inbox](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md)); the one lever that could un-shelve TurboQuant.
-4. **Absorbed-MLA KV cache** — 71× DeepSeek-R1 KV reduction ([task-inbox](task-inbox/2026-07-09-absorbed-mla-kv-cache.md)); makes R1 viable at long context.
-5. **Operability backlog** — chunked-prefill capacity measurement + runtime admission control (system-aware spec §7).
-6. **PrismML 1-bit** — device-tier extreme-compression research (the informed-consent frontier); intake candidate.
-7. **Sol optimization-landscape audit** — reconcile the full queue, then deep-research new engine optimizations and unusual quantizer combinations without duplicating active or shelved work ([task-inbox](task-inbox/2026-07-11-sol-optimization-landscape-audit.md)).
+1. **Qwen3-32B EAGLE-3/DSpark gate** — execute the committed trained-drafter preflight. The
+   model card's 2.15–2.49 `acceptance_length` includes one non-draft token, and the old ~2.3
+   break-even was pairing-specific to Qwen3-8B/DSpark, so 32B Apple economics are unknown.
+   Add DFlash and pinned native-MTP machinery as measured controls, not blind replacements.
+   Reuses `HarnessCore/SpecDecode/`. [Task](task-inbox/2026-07-12-qwen3-32b-eagle3-dspark-gate.md).
+2. **Continuous batching + decode-first chunked prefill** — the largest remaining service
+   throughput multiplier (Zig prior ~2.8× aggregate 1→8). Preserve drain-before-batch-join;
+   speculation stays off in the batched arm. [Task](task-inbox/2026-07-12-continuous-batching-chunked-prefill.md).
+3. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
+   candidate; compare actual packed bytes and teacher-forced quality before Metal investment.
+   [Task](task-inbox/2026-07-12-kvarn-kv-frontier.md).
+4. **Fused compressed-domain KV attention for the selected format** — stop materializing the
+   full cache before attention; prove an end-to-end 32K/128K win, not just a Metal
+   microbenchmark. [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
+5. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
+   TTFT path (hot cache, positive commit, eager warmup, template/tokenize cache; SSD later).
+   Design over batching/cache ownership. [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
+6. **Absorbed MLA** — exact 71× reduction versus the current expanded DeepSeek-V3 cache;
+   Python MLX now ships it and pinned Swift GLM code is a second oracle.
+   [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
+7. **Sampled-generation foundation → sampler fusion** — separate from batching; define RNG
+   and distribution contracts before porting the Zig L1/L3/L1b/L3b stack.
+   [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
+8. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ and oQ4e,
+   producing ordinary MLX checkpoints for the existing Swift loop.
+   [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
+9. **Operability** — measured large-prefill capacity + runtime admission control (system-aware
+   spec §7); reliability/capacity, not a decode-speed claim.
+10. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
+    shelve on a second loss. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
+11. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
+    XGrammar after their exact-cache/sampler prerequisites. [Intake](reference/performance-technique-intake.md).
 
 Every one runs the same loop: implement behind a flag → triad + precision-loss harness → **promote to a dial tier or shelve with a dated verdict** (`docs/superpowers/verdicts/`) → write a `docs/content/` piece.
 
@@ -71,8 +109,13 @@ Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit + bf16 reference stage
 - **Long on-box measurement runs** (long-context KL, multi-shape bench) can stall the driving agent in monitor-waits and do not reliably auto-resume. Inspect the SHA-stamped evidence bundle for partial rows before restarting; record the final artifact names, hashes, and harness SHA in `docs/verification-evidence.md`.
 - **Model routing:** haiku=scout, sonnet=builder, opus=main/judgment, fable=deep-reasoner; always pass `model` explicitly; re-route UP one tier on failure. Engine/MLX-coupled work → deep-reasoner (builders have escalated on it).
 - **cacheLimit invariant:** whenever `iogpu.wired_limit_mb` is raised, set an explicit `Memory.cacheLimit` (never the 1.5× default — the "7K wall" mechanism). Policy: `CapacityModel.recommendedCacheLimitBytes`.
-- **Backlog** (`docs/task-inbox/`): DSpark; absorbed-MLA KV cache (71× DeepSeek-R1 lever, unbuilt); chunked-prefill capacity measurement gate; runtime admission control; Sol's optimization-landscape audit.
-- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 7 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
+- **Performance/flywheel backlog:** the ranked queue above is authoritative for optimization
+  cycles; the dated Sol brief contains the complete active/deferred/rejected performance
+  disposition. The broader platform work remains required by the platform spec: serving/API
+  driver, conformance, task-benchmark layer, soak/recovery, and remaining memory controls.
+  Do not infer implementation from an upstream dependency: native MTP and prompt caching
+  remain unwired in fast-mlx.
+- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 8 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
 
 ## Commit / Checkin
 

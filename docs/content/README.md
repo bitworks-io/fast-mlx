@@ -26,6 +26,7 @@ After each notable spike / investigation / optimization, write one piece here **
 | 2026-07-09 | [We implemented Google's TurboQuant exactly, matched the paper's error tables — and it still lost to plain 4-bit quantization](2026-07-09-turboquant-exact-math-still-lost.md) | The optimization dial — quantified precision-loss tuning; Building a high-performance MLX engine in Swift |
 | 2026-07-11 | [2× for free, when the model repeats itself: prompt-lookup decoding with a byte-identical proof](2026-07-11-two-x-for-free-when-the-model-repeats-itself.md) | Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel |
 | 2026-07-11 | [When zero speculation costs 2%: making a 2× decoder safe to leave on](2026-07-11-when-zero-speculation-costs-two-percent.md) | Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel |
+| 2026-07-12 | [The backlog was lying: when “already have” meant “the old engine had it”](2026-07-12-the-backlog-was-lying.md) | Rapid research integration — the flywheel; Building a high-performance MLX engine in Swift; The optimization dial — quantified precision-loss tuning |
 
 ## Candidate whitepaper themes (aggregations)
 

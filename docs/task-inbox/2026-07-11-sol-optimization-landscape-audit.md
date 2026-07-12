@@ -1,7 +1,7 @@
 # Sol optimization-landscape audit — find the next fast-mlx multipliers
 
 - **Captured:** 2026-07-11
-- **Status:** backlog
+- **Status:** completed 2026-07-12
 - **Task type:** portfolio audit + deep research
 - **Priority:** ongoing discovery; do not displace the committed DSpark queue without evidence
 - **Owner:** Sol / fast-mlx
@@ -21,9 +21,25 @@ active task. Then use current primary sources—papers, official implementations
 engine documentation—to surface evidence-backed candidates across decode, prefill, batching,
 memory/KV, kernels, scheduling, and unusual weight/KV quantizer combinations.
 
-**Open questions:** desired research cadence; whether candidates should be ranked only for
-Apple Silicon today or also for the planned NVIDIA/cloud research plane.
+**Resolved assumptions:** rank for Apple Silicon and the current Swift/MLX product first;
+retain CUDA/NVIDIA evidence only as an algorithm or reference-kernel lead. Run a monthly
+light scan, a quarterly full reconciliation, and an event-driven review when a candidate
+gains an Apple implementation or product-model checkpoint.
 
-**Next planning step:** produce a deduplicated candidate brief that links every recommendation
-to the existing task it strengthens or to a new technique-intake entry; do not implement or
-reprioritize the queue until the owner reviews it.
+## Outcome
+
+The full portfolio was reconciled and the ranked queue was updated. The audit preserves the
+committed Qwen3-32B EAGLE-3/DSpark preflight because a target-compatible checkpoint exists
+and its 32B Apple economics are unknown; source review rejected a first-pass attempt to
+compare its inclusive `acceptance_length` directly with the old 8B DSpark break-even. DFlash
+and native MTP are explicit controls. The audit also restores missing incumbent work
+(continuous batching, exact prefix/session reuse, request warmup, sampler fusion), ranks the
+KVarN/asymmetric storage-quality gate and fused compressed-domain attention ahead of a second
+TurboQuant cycle, and resolves the absorbed-MLA and PrismML status drift.
+
+- [Dated audit and complete disposition](../reference/2026-07-12-sol-optimization-landscape.md)
+- [Updated technique intake](../reference/performance-technique-intake.md)
+- [Content piece](../content/2026-07-12-the-backlog-was-lying.md)
+
+No engine technique was promoted by research. Each external result remains unverified until
+its task runs on the clean-SHA bench harness.

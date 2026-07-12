@@ -3,7 +3,7 @@
 - **Captured:** 2026-07-09
 - **Status:** backlog (gated next step from a dated negative result)
 - **Task type:** quantization / flywheel follow-up
-- **Priority:** medium — the one lever between uniform-v1 (shelved) and the paper's near-lossless result
+- **Priority:** bounded closure — below fused compressed-domain attention and KVarN
 - **Owner project:** fast-mlx engine (`feat/turboquant` foundation, merged behind the `tq2.5`/`tq3.5` flag)
 
 ## Why (the negative result this follows)
@@ -14,9 +14,21 @@ Uniform-v1 TurboQuant was built, verified paper-faithful (reproduces the Theorem
 
 Add outlier-channel bit allocation to the codec: identify the high-variance channels (post-rotation, or per the paper's borrowed recipe) and quantize them at higher precision, the rest lower. Open questions the paper leaves (see `docs/reference/turboquant-algorithm.md` gaps #4): fixed vs calibration-derived channel selection; the exact split; whether it reconciles the "2.5-bit" label. Re-measure tqB2/tqB3-with-outliers through the **same** hardened harness (teacher-forced KL/ppl/tail-p95 vs bf16 on corpus-v2) against the 1.665@24K baseline.
 
+**Audit update, 2026-07-12:** keep the paper-faithful outlier arm, but make this a small
+closure matrix rather than betting the whole second cycle on one recipe. Current community
+implementations provide three cheap, explicitly unverified ablations: spend more bits on K
+than V (`K4/V2`, `K8/V2`, `K8/V4`), protect the first/last attention layers, and compare
+QJL against a no-QJL/MSE control. [MLX-VLM](https://github.com/Blaizzy/mlx-vlm) and
+[TurboQuant+](https://github.com/TheTom/turboquant_plus) are implementation leads; their
+numbers do not replace fast-mlx evidence. Compare actual packed bytes, not nominal tier names.
+
 ## Gate
 
-Promote to a dial tier only if outlier-channel TurboQuant **beats** the 4-bit-affine baseline on the quality/size frontier. If it still doesn't, shelve TurboQuant fully (a second dated negative result) — the technique doesn't pay off for this engine's models. Also address the decode-perf cost (materialize-then-attend is slow; fused quantized-attention is a separate, larger kernel effort) before any promote.
+Promote to a dial tier only if one bounded recipe **beats** both the 4-bit-affine baseline and
+the new KVarN/asymmetric frontier at equal effective bytes. If none does, shelve TurboQuant
+fully (a second dated negative result). No decode-speed promotion is possible while the path
+materializes the full cache before attention; the fused compressed-domain kernel is a
+separate, higher-priority prerequisite.
 
 ## Foundation (already built, do not redo)
 

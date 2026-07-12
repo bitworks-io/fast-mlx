@@ -54,6 +54,22 @@ fast-mlx's dial should therefore select *different* optimization stacks per mode
 |---|---|---|
 | **GPU wired-memory ceiling raise** | `sysctl iogpu.wired_limit_mb` (e.g. ~96GB→115GB on 128GB) via persistent boot LaunchDaemon | Doesn't change decode speed (bandwidth-bound) but is the **prerequisite** to load 70B / DeepSeek-V4-Flash (284B@2-bit, ~81GB) with headroom. Critical for the 256/512GB big-memory targeting. |
 
+### Request-start / cross-request reuse (omitted from the first distillation; restored 2026-07-12)
+
+These were shipped and measured in the optimized Zig incumbent but were accidentally absent
+from the initial carry-forward table. They are **not implemented in fast-mlx** today.
+
+| Technique | What it does | Measured incumbent evidence | Swift-port guardrails |
+|---|---|---|---|
+| **Exact prefix/session cache** | Snapshot actor-owned KV plus recurrent/model state, find the longest reusable token prefix, and continue from it across agent turns | Reusing the prior assistant turn raised the second-turn hit from about **15% to 97%**; interleaved conversation roots were retained under entry/byte budgets | Composite semantic key + positive success-only commit; true retained-byte accounting; explicit hybrid/SSM checkpoints; A/B/A poison test |
+| **Template/tokenize cache** | Reuse rendered chat-template/tokenization work on repeated long conversations | A measured 1,813-token warm request dropped **271→35 ms (7.7×)** before the first token | Record template/tool/tokenizer/revision in the key; report separately from model-prefix reuse |
+| **Eager model warmup** | Page-fault weights and compile decode/prefill shapes immediately after load | First-request wall on Gemma 4 E4B 4-bit dropped **1097→307 ms (3.57×)** in the incumbent release measurement | Gated for tight-memory systems; cold and warm benchmarks must be separate; set explicit MLX cache policy |
+| **Cold SSD prefix tier** | Spill exact completed prefix snapshots below the hot RAM LRU | Operationally shipped as a revisited-prompt latency tier; not a mid-generation context extender | Phase 2 only, after hot-cache correctness; encrypt/protect prompt-bearing state and bound disk bytes |
+
+Source: preserved [`mlx-serve-CHANGELOG.md`](mlx-serve-archive/mlx-serve-CHANGELOG.md) and
+[`mlx-serve-CLAUDE.md`](mlx-serve-archive/mlx-serve-CLAUDE.md). As with every carry-forward
+number, these are priors to reproduce—not results inherited by the Swift engine.
+
 ---
 
 ## Big investigations (deep, honest, carry the lessons)

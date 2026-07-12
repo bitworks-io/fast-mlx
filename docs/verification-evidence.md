@@ -62,3 +62,25 @@ bash scripts/bench_pld_shapes.sh <model> 3 256
 - Do not paste full logs, secrets, tokens, customer data, private host details, transient cache paths, or noisy command output.
 - Store large artifacts in a project-appropriate artifact location and record a hash plus a short interpretation here.
 - Prefer one concise acceptance pass per meaningful change over repeating raw output.
+
+## Portfolio Research Acceptance Pass — 2026-07-12
+
+**Story:** the owner can see one complete, source-qualified optimization backlog and select
+the next flywheel cycle without confusing fast-mlx features, retired-Zig evidence, or
+upstream-only capabilities.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+|---|---|---|
+| Reconcile all durable local portfolio inputs | **PASS** | Enumerated 5 plans, 5 Markdown verdicts, 11 task items (excluding the inbox README), the intake, carry-forward backlog, competitive landscape, operability specs, and current Swift cache/spec/scheduler surfaces. The dated audit has explicit completed, shelved, active, and do-not-reopen sections. |
+| Give every new recommendation a disposition and bounded owner | **PASS** | Handoff ranks 11 performance cycles; seven new inbox seeds own trained speculation, batching, KV storage quality, fused attention, prefix/session caching, sampling, and learned weight quantization. Research-later/rejected candidates remain in the intake/audit rather than becoming duplicate tasks. |
+| Rank by impact, evidence, cost, and Apple fit without promoting research | **PASS** | The audit's scored matrix labels every external number unverified until a clean-SHA fast-mlx run. KVarN storage quality precedes its fused Metal phase; TurboQuant owns its own closure ablations. |
+| Primary sources support material claims | **PASS** | Independent source review caught and corrected the EAGLE `acceptance_length` denominator and the post-paper KVarN attribution. Final source re-review: **No issues found**. All 35 public external URLs introduced/touched by this change returned HTTP 200; the pre-existing authenticated Claude Artifact returned 403 as expected. |
+| Durable docs are internally navigable and review-clean | **PASS** | Repository-wide relative-link check passed across 56 Markdown files; `git diff --check` passed. Final focused review found no High/Medium correctness or priority issues. |
+
+**Not run:** Swift/Xcode tests and the Apple-Silicon bench. This is a documentation/research
+cycle with no engine change; running a technique benchmark would falsely imply that an
+external candidate had entered the flywheel. Every performance result in the audit remains a
+local historical result or a source-labeled external claim.
+
+**Overall verdict:** ALL PASS for the Sol portfolio-audit acceptance criteria. Engine
+promotion gates remain intentionally open in their individual task seeds.
