@@ -31,48 +31,62 @@ fully shelve TurboQuant. Task: [`2026-07-09-turboquant-spike-b-outlier-channels.
 **Sol optimization-landscape audit — COMPLETE (2026-07-12).** The full plans/verdicts/
 inbox/intake/carry-forward portfolio was reconciled against the current Swift code and
 current primary sources. It corrected four status errors (native MTP and prefix/SSD cache are
-not implemented here; Python MLX has shipped absorbed MLA; PrismML artifacts are real), kept
-Qwen3-32B EAGLE-3/DSpark first, and ranked the KVarN/asymmetric storage-quality gate plus
-fused compressed-domain KV attention ahead of TurboQuant B. Dated brief:
+not implemented here; Python MLX has shipped absorbed MLA; PrismML artifacts are real), put
+Qwen3-32B EAGLE-3/DSpark first for execution, and ranked the KVarN/asymmetric storage-quality
+gate plus fused compressed-domain KV attention ahead of TurboQuant B. The EAGLE gate has now
+executed RED as recorded below. Dated brief:
 [`2026-07-12-sol-optimization-landscape.md`](reference/2026-07-12-sol-optimization-landscape.md).
+
+**Qwen3-32B EAGLE-3 Phase 0 — COMPLETE + SHELVED** (clean feature SHA `1a70c4d`; plan
+[`2026-07-12-qwen3-32b-eagle3-preflight.md`](superpowers/plans/2026-07-12-qwen3-32b-eagle3-preflight.md),
+[verdict](superpowers/verdicts/2026-07-12-qwen3-32b-eagle3-preflight.md)). The full draft
+checkpoint and both target shard sets were authenticated. The MLX head passed the pinned
+PyTorch/speculators parity gate (cosine `0.9999816`, argmax 100%), but greedy output changed on
+both pairings: 4-bit first mismatch index 17; 8-bit index 7. The 8-bit replay proves an
+immediate shape boundary: the same sequential prefix predicts `279` with a one-token target
+probe and `264` with `[current,draft]`. 4-bit drift appears only after histories that processed
+and rolled back rejected future tokens. Apparent rates are invalid because outputs differ.
+No `k=3`/multi-shape bench or Swift port ran. Reopen only for deterministic target verification
+or a compatible product-size DSpark/DFlash/MTP checkpoint.
 
 ## ▶ Open work queue — pick the next flywheel cycle
 
 Prioritized by the 2026-07-12 Sol audit. The north star remains **match then beat optimized
 mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the first multiplier.
 
-1. **Qwen3-32B EAGLE-3/DSpark gate** — execute the committed trained-drafter preflight. The
-   model card's 2.15–2.49 `acceptance_length` includes one non-draft token, and the old ~2.3
-   break-even was pairing-specific to Qwen3-8B/DSpark, so 32B Apple economics are unknown.
-   Add DFlash and pinned native-MTP machinery as measured controls, not blind replacements.
-   Reuses `HarnessCore/SpecDecode/`. [Task](task-inbox/2026-07-12-qwen3-32b-eagle3-dspark-gate.md).
-2. **Continuous batching + decode-first chunked prefill** — the largest remaining service
+1. **Continuous batching + decode-first chunked prefill** — the largest remaining service
    throughput multiplier (Zig prior ~2.8× aggregate 1→8). Preserve drain-before-batch-join;
    speculation stays off in the batched arm. [Task](task-inbox/2026-07-12-continuous-batching-chunked-prefill.md).
-3. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
+2. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
    candidate; compare actual packed bytes and teacher-forced quality before Metal investment.
    [Task](task-inbox/2026-07-12-kvarn-kv-frontier.md).
-4. **Fused compressed-domain KV attention for the selected format** — stop materializing the
+3. **Fused compressed-domain KV attention for the selected format** — stop materializing the
    full cache before attention; prove an end-to-end 32K/128K win, not just a Metal
    microbenchmark. [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
-5. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
+4. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
    TTFT path (hot cache, positive commit, eager warmup, template/tokenize cache; SSD later).
    Design over batching/cache ownership. [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
-6. **Absorbed MLA** — exact 71× reduction versus the current expanded DeepSeek-V3 cache;
+5. **Absorbed MLA** — exact 71× reduction versus the current expanded DeepSeek-V3 cache;
    Python MLX now ships it and pinned Swift GLM code is a second oracle.
    [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-7. **Sampled-generation foundation → sampler fusion** — separate from batching; define RNG
+6. **Sampled-generation foundation → sampler fusion** — separate from batching; define RNG
    and distribution contracts before porting the Zig L1/L3/L1b/L3b stack.
    [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-8. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ and oQ4e,
+7. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ and oQ4e,
    producing ordinary MLX checkpoints for the existing Swift loop.
    [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-9. **Operability** — measured large-prefill capacity + runtime admission control (system-aware
+8. **Operability** — measured large-prefill capacity + runtime admission control (system-aware
    spec §7); reliability/capacity, not a decode-speed claim.
-10. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
+9. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
     shelve on a second loss. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
-11. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
+10. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
     XGrammar after their exact-cache/sampler prerequisites. [Intake](reference/performance-technique-intake.md).
+
+**Blocked/deferred trained speculation:** EAGLE-3 is shelved by the dated exactness verdict;
+no compatible Qwen3-32B DSpark, DFlash, or native-MTP checkpoint was runnable. Do not compare
+raw Qwen3-8B control tok/s with the product target. Reopen only under the recovery gate in the
+verdict. The bounded recovery seed is
+[`2026-07-12-shape-stable-spec-verify.md`](task-inbox/2026-07-12-shape-stable-spec-verify.md).
 
 Every one runs the same loop: implement behind a flag → triad + precision-loss harness → **promote to a dial tier or shelve with a dated verdict** (`docs/superpowers/verdicts/`) → write a `docs/content/` piece.
 
@@ -102,7 +116,8 @@ swift run fastmlx-capacity --box m3Ultra512
 bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
 ```
-Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit + bf16 reference staged). Python: `~/harness-venv` (transformers<5).
+Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit and Qwen3-32B-8bit staged; no
+Qwen3-32B BF16 target). Python: `~/harness-venv` (transformers<5).
 
 ## Known Risks / Open Items
 
@@ -115,7 +130,7 @@ Models on llmbench: `~/perf-work/models/` (Qwen3-32B-4bit + bf16 reference stage
   driver, conformance, task-benchmark layer, soak/recovery, and remaining memory controls.
   Do not infer implementation from an upstream dependency: native MTP and prompt caching
   remain unwired in fast-mlx.
-- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 8 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
+- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 9 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
 
 ## Commit / Checkin
 

@@ -4,8 +4,15 @@
 - **Owner:** Sol / fast-mlx
 - **Scope:** existing plans, verdicts, task inbox, performance intake, preserved Zig evidence,
   current Swift implementation, pinned MLX dependencies, and current primary research
-- **Decision:** keep the Qwen3-32B EAGLE-3/DSpark gate first; reorganize everything after it
-  into exact decode, concurrent serving, fused long-context memory, and model/quant lanes
+- **Audit-time decision:** run the Qwen3-32B EAGLE-3/DSpark gate first; reorganize everything
+  after it into exact decode, concurrent serving, fused long-context memory, and model/quant
+  lanes
+
+> **Post-audit execution update (2026-07-12):** the first gate ran. The authenticated
+> Qwen3-32B EAGLE-3 head passed parity but failed greedy byte identity on both 4-bit and 8-bit
+> targets, so it is [shelved RED](../superpowers/verdicts/2026-07-12-qwen3-32b-eagle3-preflight.md).
+> No compatible 32B DSpark/DFlash/MTP control was runnable. The actionable queue now advances
+> to continuous batching plus decode-first chunked prefill.
 
 ## Bottom line
 
@@ -15,7 +22,8 @@ upstream dependency. That made several "already-have" labels false for the Swift
 hid two of the incumbent's largest agent-facing wins: exact prefix/session reuse and eager
 request-start warmup.
 
-The audit does **not** displace the committed Qwen3-32B EAGLE-3/DSpark cycle, but source
+At audit time, the audit did **not** displace the committed Qwen3-32B EAGLE-3/DSpark cycle,
+but source
 review changed the reason. Its model card reports `acceptance_length` 2.15 on summarization,
 2.29 on code, and 2.49 on math at `k=3`. The official evaluation code defines that metric as
 `1 + accepted draft tokens per round`, so the comparable draft counts are about 1.15, 1.29,
@@ -62,7 +70,7 @@ lossy cache work cannot substitute free-running drift for teacher-forced KL/perp
 |---|---|---|---|
 | Compiled base decode | **Shipped**, at Zig parity | Upstream model loading retained | Closed; optimize above the base loop |
 | PLD | **Promoted**, byte-identical at temperature 0 | Zig precedent | Closed except serving-policy wiring |
-| Trained speculation | Not implemented; `dspark` is a harness placeholder | EAGLE-3/DSpark evidence, DFlash MLX ports, pinned Swift speculative machinery | Keep EAGLE-3/DSpark first; measure alternatives inside the gate |
+| Trained speculation | Not implemented; `dspark` is a harness placeholder | EAGLE-3/DSpark evidence, DFlash MLX ports, pinned Swift speculative machinery | EAGLE-3 is RED; DSpark/DFlash/native-MTP controls are blocked until a compatible product-size checkpoint exists |
 | Continuous batching | Not implemented; one actor owns one decoder | Zig measured about 2.8× aggregate from 1→8 streams; current MLX-LM has `BatchGenerator` | Next service-throughput cycle |
 | Sampled generation/fusion | Engine is greedy-only | Zig L1/L3/L1b/L3b reached +27.2% on stochastic PLD for a small/fast model | Separate from batching; sampler/RNG contract first |
 | Prefix/session reuse | Not implemented; `resetForNewRun()` discards cache state and compiled caches cannot copy/restore | Zig measured a 15%→97% second-turn cache hit and 7.7× warm request-start improvement; MLX-LM has trie/LRU prompt caching | Restore as an explicit exact-cache cycle after scheduler ownership is designed |
@@ -85,7 +93,7 @@ fast-mlx results.
 
 | Rank | Cycle | Impact | Evidence | Cost | Apple fit | Decision and hard gate |
 |---:|---|---:|---:|---:|---:|---|
-| 1 | **Qwen3-32B EAGLE-3/DSpark, with DFlash + native-MTP controls** | 5 | 4 | 2 | 5 | Execute next. Byte-identical at temp 0; report accepted tokens/round, draft cost, target verify cost, and net speed. DFlash cannot inherit “lossless” if its stream differs from base AR. |
+| 1 | **Qwen3-32B EAGLE-3/DSpark, with DFlash + native-MTP controls** | 5 | 4 | 2 | 5 | **Executed 2026-07-12:** EAGLE RED on byte identity; controls blocked by missing compatible product-size checkpoints. See the post-audit banner and dated verdict. |
 | 2 | **Continuous batching + decode-first chunked prefill** | 5 | 5 | 2 | 5 | Port the scheduler design. Preserve drain-before-batch-join, cancellation, fairness, and architecture batchability. Measure aggregate throughput plus p95 TTFT/TPOT. |
 | 3 | **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** | 5 | 4 | 2 | 3 | New top KV-quality gate. First prove the tile transform and packed bytes/token; compare K4V2/K8V2 and per-layer schedules at equal effective bits. |
 | 4 | **Fused compressed-domain KV attention for the winner** | 4 | 4 | 1 | 4 | Phase B of the same lane. Equal-output fp16 oracle first; require an end-to-end 32K/128K win, not a kernel-only headline. No codec earns a speed tier while materializing the full cache. |
@@ -106,9 +114,10 @@ technique has passed fast-mlx's promote gate.
 ### 1. Exact decode multipliers
 
 - **PLD — PROMOTED.** Exact and gate-tuned; only serving default wiring remains.
-- **Qwen3-32B EAGLE-3/DSpark — EXECUTE.** A compatible checkpoint exists, but its reported
-  `acceptance_length` includes one non-draft token and its 32B Apple cost ratio is unknown.
-  Measure a pairing-specific break-even; do not reuse the 8B DSpark threshold.
+- **Qwen3-32B EAGLE-3/DSpark — EXECUTED / EAGLE RED, CONTROLS BLOCKED.** The compatible EAGLE
+  checkpoint passed head parity and failed byte identity on 4-bit and 8-bit targets. DSpark,
+  DFlash, and native MTP produced no product-size same-target verdict because no compatible
+  checkpoint was runnable. Do not infer a negative result for those untested methods.
 - **DFlash — CONTROL / CONDITIONAL PORT.** The paper and current Apple port are real. The
   port reports 2.78–3.06× on Qwen3.6-27B-4bit from 1K–16K output on an M5 Max, but those are
   maintainer results from one prompt. Qwen3.5-27B falls from 2.37× at 1K to 1.34× at 8K,
@@ -205,14 +214,15 @@ technique has passed fast-mlx's promote gate.
 
 Unchecked boxes in completed historical plans are stale execution markup, not new work.
 
-### Completed / shelved
+### Completed / shelved / blocked
 
 - Uniform TurboQuant v1: `tqB3` lost to affine 4-bit; `tqB2` was catastrophic.
 - Free-running precision-loss comparisons from the pre-hardening harness: historical only.
+- Qwen3-32B EAGLE-3: shelved on byte identity; DSpark/DFlash/native-MTP controls blocked by
+  missing compatible product-size checkpoints and not planning-ready.
 
 ### Active or planning-ready
 
-- Qwen3-32B EAGLE-3/DSpark; DFlash/native-MTP controls.
 - Continuous batching, chunked prefill, and runtime admission.
 - Sampled-generation foundation and sampler fusion.
 - KVarN/asymmetric affine/KVTuner storage-quality gate.

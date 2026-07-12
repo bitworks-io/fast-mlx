@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy the spike to the bench host, carrying git provenance with it.
+# Deploy the spike and reproducible experiments to the bench host, carrying git provenance.
 #
 # An rsync'd tree has no .git, so the harness binary cannot resolve its own SHA there —
 # every evidence record used to say harnessGitSHA="unknown". This script captures
@@ -13,16 +13,39 @@ set -euo pipefail
 HOST="${1:-llmbench@192.168.1.252}"
 REMOTE_DIR="${2:-fast-mlx-spike}"
 SPIKE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(git -C "$SPIKE_DIR" rev-parse --show-toplevel)"
 
-SHA="$(git -C "$SPIKE_DIR" rev-parse HEAD)"
-if ! git -C "$SPIKE_DIR" diff --quiet HEAD -- .; then
+SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+if ! git -C "$REPO_ROOT" diff --quiet HEAD -- spike experiments \
+    || [[ -n "$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- spike experiments)" ]]; then
     SHA="${SHA}-dirty"
 fi
 echo "$SHA" > "$SPIKE_DIR/.harness-sha"
 
-rsync -a --delete \
-    --exclude '.build' --exclude '.swiftpm' --exclude 'default.profraw' \
-    --exclude 'harness-evidence.jsonl' \
-    "$SPIKE_DIR/" "$HOST:~/$REMOTE_DIR/"
+STAGING_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fast-mlx-sync.XXXXXX")"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+mkdir -p "$STAGING_DIR/source" "$STAGING_DIR/deploy"
 
-echo "synced $SPIKE_DIR -> $HOST:~/$REMOTE_DIR (harness SHA $SHA)"
+# Stage only tracked files plus non-ignored development files. This keeps global or project
+# gitignored machine artifacts from crossing the provenance boundary under a clean SHA.
+git -C "$REPO_ROOT" ls-files -z --cached --others --exclude-standard -- spike experiments \
+    | rsync -a --from0 --files-from=- "$REPO_ROOT/" "$STAGING_DIR/source/"
+rsync -a "$STAGING_DIR/source/spike/" "$STAGING_DIR/deploy/"
+if [[ -d "$STAGING_DIR/source/experiments" ]]; then
+    mkdir -p "$STAGING_DIR/deploy/experiments"
+    rsync -a "$STAGING_DIR/source/experiments/" "$STAGING_DIR/deploy/experiments/"
+fi
+cp "$SPIKE_DIR/.harness-sha" "$STAGING_DIR/deploy/.harness-sha"
+
+# Preserve bench-only build caches and generated evidence; delete every other file that is not
+# in the staged source manifest so an ignored local artifact cannot influence execution.
+rsync -a --delete \
+    --filter='protect .build/' \
+    --filter='protect .swiftpm/' \
+    --filter='protect Package.resolved' \
+    --filter='protect default.profraw' \
+    --filter='protect harness-evidence.jsonl' \
+    --filter='protect experiments/eagle3/artifacts/' \
+    "$STAGING_DIR/deploy/" "$HOST:~/$REMOTE_DIR/"
+
+echo "synced $SPIKE_DIR + experiments -> $HOST:~/$REMOTE_DIR (harness SHA $SHA)"

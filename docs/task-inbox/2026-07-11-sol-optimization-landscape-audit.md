@@ -43,3 +43,6 @@ TurboQuant cycle, and resolves the absorbed-MLA and PrismML status drift.
 
 No engine technique was promoted by research. Each external result remains unverified until
 its task runs on the clean-SHA bench harness.
+
+**Execution update:** the first ranked task has now run. Qwen3-32B EAGLE-3 is shelved after
+clean-SHA 4-bit and 8-bit byte-identity failures; the queue advances to continuous batching.
