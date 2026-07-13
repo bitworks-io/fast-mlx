@@ -13,6 +13,7 @@ SHA without copying machine-local paths or transient output.
 | As an operator, leaving PLD available does not tax cold or low-yield requests. | No non-target regression beyond −1%; empty-draft fallback uses the base pipeline; low yield disables quickly and recovers. | `testGate_defaultLowYield_disablesAfterFourSamples`, partial-window and cooldown tests; 26/26 `SpecDecodeTests`. | Code 28.39 → 29.31 (**+3.24%**); zero-draft prose 28.62 → 28.66 (**+0.14%**). | 2026-07-11 | PLD remains disabled under continuous batching. |
 | As a maintainer, the change preserves MLX build and concurrency invariants. | Pure suite and MLX-coupled suite pass; no banned concurrency escape in changed files. | 113 XCTest + 17 Swift Testing tests off-box; 20/20 `SpikeCoreTests` through Xcode on-box. | Clean feature SHA stamped into all seven bench and two exactness records; focused reviews found no issues. | 2026-07-11 | Full serving/API default wiring is not implemented by this kernel change. |
 | As the owner, I can reject a trained speculator before paying for a Swift port. | Checkpoint/head fidelity is proven first; every implemented temperature-0 verify shape is byte-identical and engaged, otherwise the arm fails closed without a speed claim. | 119 HarnessCore XCTest + 17 Swift Testing tests; 21 MLX-free EAGLE preflight tests; authenticated file-manifest and cache-drift classifier regressions. | Clean `1a70c4d`: checkpoint + parity PASS; 4-bit exactness FAIL at generated index 17; 8-bit FAIL at index 7; both output hashes differ and return exit 1. | 2026-07-12 | EAGLE is shelved. `k=3`, long-output throughput, BF16, and the Swift port intentionally did not run after the earlier hard failure. |
+| As a maintainer, I can enter continuous-batching actor integration only after dense cache shapes are exact and compile-stable. | Scalar-aligned merge/append/filter/extract preserves logits, greedy tokens, row identity, and one trace per stable shape; unsupported state layouts fail closed. | 9 focused `BatchedCompiledKVCacheTests`; 29/29 total `SpikeCoreTests` through Xcode; 134 HarnessCore XCTest + 17 Swift Testing tests off-box. | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed+shapeless PASS with zero initial max-logit delta; 64-step B=4/B=8 fixed PASS; `qwen3_moe` rejected before load. | 2026-07-12 | Phase 2 actor/stream integration, concurrent service metrics, cancellation latency, and throughput frontier remain open. |
 
 ## Current Verification Commands
 
@@ -125,3 +126,30 @@ MLX states equality only up to numerical precision while shapes can trigger comp
 UNVERIFIED—and deliberately not claimed—as an upstream fact: that any one MLX 0.32 kernel is
 the cause of these observations. The verdict labels that mechanism as inference and relies on
 the clean four-history replay for the local result.
+
+## Continuous batching Phase 1 acceptance pass — 2026-07-12
+
+**Story:** a maintainer can proceed from pure scheduling into actor integration only after the
+pinned Swift/MLX stack proves exact dense cache membership and stable compiled shapes.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Scalar cache geometry survives batching | **PASS** | 9 focused Xcode tests cover per-row offsets, scalar-aligned right padding, prefix masks, one- and multi-token scatter, merge, ordered filter, extraction, growth, capacity, and invalid state. |
+| Real dense model matches scalar decode | **PASS** | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed and shapeless runs all report exact greedy tokens and `0.000000` initial max-logit delta. |
+| Stable shapes do not retrace per token | **PASS** | Every 8-step shape records `main_trace_count=1`; B>1 middle-row removal records exactly one new membership trace. Fixed B=4/B=8 also pass 64-step replay with one main trace. |
+| Membership preserves request identity | **PASS** | Each run extracts all rows, compares scalar continuation, removes the middle row, and requires rebuilt and in-place-filtered batches to match the independent scalar references in stable order. B=7 explicitly covers B=8 middle removal. |
+| Unsupported layouts fail closed | **PASS** | `model_type=qwen3_moe` exits before model load; only dense `qwen3` enters this probe. Authoritative capacity and explicit-length assertions fail before cache mutation. |
+
+**Design finding:** copying upstream left-padding into an already fixed-capacity cache caused an
+avoidable exactness failure at close argmax boundaries. Keeping every row at scalar physical
+positions removed the delta. This was treated as a correctness bug, not a lossy performance
+tier. Intentional future lossy batching variants remain eligible only through the normal
+teacher-forced speed↔quality frontier and coherence floor.
+
+**Commands:** off-box `swift test --package-path spike --filter HarnessCoreTests`; on-box Xcode
+`SpikeCoreTests`; stamped `spike-cli batch-probe` sweeps for B=1/2/4/7/8 and 64-step B=4/B=8.
+The probe sets an explicit 8 GiB MLX cache limit and prints the full clean harness SHA.
+
+**Gap:** this closes only cache/shape feasibility. It is not the continuous-batching promotion
+verdict: actor integration, streaming cancellation, chunked prefill, aggregate throughput,
+per-request TTFT/TPOT/fairness, and soak evidence remain Phase 2–3 work.

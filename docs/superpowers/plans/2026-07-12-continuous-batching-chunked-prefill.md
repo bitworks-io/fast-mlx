@@ -1,6 +1,6 @@
 # Continuous batching with decode-first chunked prefill
 
-- **Status:** ACTIVE — architecture locked; Phase 0 pure scheduler ready for TDD
+- **Status:** ACTIVE — Phases 0–1 verified; Phase 2 actor integration next
 - **Date:** 2026-07-12
 - **Owner:** Codex
 - **Evaluation lane:** `EXACT`
@@ -145,6 +145,38 @@ The executor remains a separate actor-isolated layer. The first probe must prove
 
 No MLX array, cache object, or compiled function crosses the actor boundary. No
 `@unchecked Sendable` or `nonisolated(unsafe)` escape hatch is permitted.
+
+### Phase 1 result — 2026-07-12
+
+The pinned Swift API can support exact dense batching, but the cache layout must exploit
+fast-mlx's fixed-capacity buffers rather than copy Python MLX-LM's dynamically sized
+left-padding design.
+
+- The first left-padded prototype was mechanically correct—merge, mask, append, filter, and
+  extract unit tests passed—but the real-model probe exposed numerical drift at close argmax
+  boundaries. On Qwen3-32B-4bit at B=8 it diverged from scalar decode by compiled step 1 even
+  though cache row identity was intact. This was an avoidable layout-induced loss, not a useful
+  speed↔quality dial tier, so Phase 1 stopped and redesigned rather than relabeling the bug.
+- The accepted cache keeps each row in the scalar layout: valid K/V at
+  `0..<logicalLength`, zero right-padding to fixed capacity, per-row scatter positions, per-row
+  RoPE offsets, and per-row prefix masks. Extracting a row is then a direct scalar prefix rather
+  than a physical-layout conversion.
+- Clean SHA `7b9d7090da29a7babc0c6c73e299e8948dbcef39` passed Qwen3-32B-4bit B=1/2/4/7/8 with both
+  fixed and shapeless compilation: exact greedy tokens, `0.000000` initial max logit delta,
+  one main trace per stable shape, and one intentional trace after middle-row removal. B=7 is
+  the ragged shape produced by removing a middle member from B=8.
+- The extended fixed-shape run passed 64 compiled steps at B=4 and B=8 with the same exactness
+  and trace counts. Shapeless compilation showed no steady-state advantage in this probe;
+  fixed-shape remains selected because membership changes intentionally create a new compiled
+  function. Probe step timings are shape diagnostics, not the Phase 3 throughput frontier.
+- The probe reads `config.json` before model load and currently admits only dense `model_type =
+  "qwen3"`; `qwen3_moe` fails closed. Capacity is proven from authoritative array offsets
+  outside compiled replay, and any driver-supplied lengths must equal those offsets.
+
+Verification: 9 focused batch-cache tests and 29 total `SpikeCoreTests` passed through Xcode on
+the bench Mac; 134 HarnessCore XCTest tests plus 17 Swift Testing tests passed off-box. A focused
+review's capacity, length-validation, transition-proof, and architecture-gate findings were
+fixed; re-review found no High or Medium issues.
 
 ## TDD and implementation sequence
 
