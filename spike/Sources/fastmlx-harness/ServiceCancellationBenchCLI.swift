@@ -35,6 +35,8 @@ private struct ServiceCancellationRunEvidence: Codable, Sendable {
     let slotRemoved: Bool
     let cancellationEventObserved: Bool
     let repeatedCancellationNotFound: Bool
+    let initialActiveRequestCount: Int
+    let replacementWasQueued: Bool
     let replacementSlotReused: Bool
     let sharedBatchObserved: Bool
     let decodeFirstInterleaveObserved: Bool
@@ -44,6 +46,7 @@ private struct ServiceCancellationRunEvidence: Codable, Sendable {
     let operations: ServiceOperationSummary
     let memory: ServiceMemorySummary
     let resourcesAtAdmission: ContinuousBatchRuntimeResourceSnapshot
+    let resourcesBeforeCancellation: ContinuousBatchRuntimeResourceSnapshot
     let resourcesAfterCancellation: ContinuousBatchRuntimeResourceSnapshot
     let resourcesAfterReplacement: ContinuousBatchRuntimeResourceSnapshot
     let resourcesAtEnd: ContinuousBatchRuntimeResourceSnapshot
@@ -149,6 +152,8 @@ func runServiceCancellationBench(_ flags: Flags) async {
                 && observation.slotRemoved
                 && observation.cancellationEventObserved
                 && observation.repeatedCancellationNotFound
+                && observation.initialActiveRequestCount == 2
+                && observation.replacementWasQueued
                 && observation.replacementSlotReused
                 && observation.sharedBatchObserved
                 && observation.decodeFirstInterleaveObserved
@@ -156,7 +161,7 @@ func runServiceCancellationBench(_ flags: Flags) async {
                 throw ServiceCancellationBenchError.structuralGateFailed(run)
             }
             guard observation.resourcesAfterCancellation.reservedKVBytes
-                == observation.resourcesAtAdmission.reservedKVBytes
+                == observation.resourcesBeforeCancellation.reservedKVBytes
             else {
                 throw ServiceCancellationBenchError.reservationDroppedBeforeRebuild(run)
             }
@@ -177,6 +182,8 @@ func runServiceCancellationBench(_ flags: Flags) async {
                 slotRemoved: observation.slotRemoved,
                 cancellationEventObserved: observation.cancellationEventObserved,
                 repeatedCancellationNotFound: observation.repeatedCancellationNotFound,
+                initialActiveRequestCount: observation.initialActiveRequestCount,
+                replacementWasQueued: observation.replacementWasQueued,
                 replacementSlotReused: observation.replacementSlotReused,
                 sharedBatchObserved: observation.sharedBatchObserved,
                 decodeFirstInterleaveObserved: observation.decodeFirstInterleaveObserved,
@@ -186,6 +193,7 @@ func runServiceCancellationBench(_ flags: Flags) async {
                 operations: observation.operations,
                 memory: observation.memory,
                 resourcesAtAdmission: observation.resourcesAtAdmission,
+                resourcesBeforeCancellation: observation.resourcesBeforeCancellation,
                 resourcesAfterCancellation: observation.resourcesAfterCancellation,
                 resourcesAfterReplacement: observation.resourcesAfterReplacement,
                 resourcesAtEnd: observation.resourcesAtEnd)
@@ -194,7 +202,7 @@ func runServiceCancellationBench(_ flags: Flags) async {
             print(
                 "# \(run == 0 ? "warmup (dropped)" : "run \(run)"): cancel=\(fmt(evidence.latencySeconds * 1_000, 3))ms, "
                     + "batch-sizes=\(observation.operations.decodeBatchSizeHistogram), "
-                    + "kv=\(observation.resourcesAtAdmission.reservedKVBytes)→\(observation.resourcesAfterReplacement.reservedKVBytes)→0")
+                    + "kv=\(observation.resourcesAtAdmission.reservedKVBytes)→\(observation.resourcesBeforeCancellation.reservedKVBytes)→\(observation.resourcesAfterReplacement.reservedKVBytes)→0")
         }
 
         let gate = try evaluateCancellationGate(

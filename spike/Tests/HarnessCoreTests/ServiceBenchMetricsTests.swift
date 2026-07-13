@@ -196,6 +196,37 @@ final class ServiceBenchMetricsTests: XCTestCase {
         }
     }
 
+    func testStatePoisonGateRequiresNonEmptyByteIdenticalRecoveryOutputs() {
+        let before = [Array("alpha".utf8), Array("beta".utf8)]
+        let passing = evaluateServiceStatePoisonRecovery(before: before, after: before)
+        XCTAssertTrue(passing.requestCountsMatch)
+        XCTAssertTrue(passing.outputsNonEmpty)
+        XCTAssertEqual(passing.perRequestByteMatch, [true, true])
+        XCTAssertTrue(passing.byteIdentical)
+        XCTAssertTrue(passing.passed)
+        XCTAssertEqual(passing.beforeOutputHashes, passing.afterOutputHashes)
+
+        let drifted = evaluateServiceStatePoisonRecovery(
+            before: before,
+            after: [Array("alpha".utf8), Array("changed".utf8)])
+        XCTAssertEqual(drifted.perRequestByteMatch, [true, false])
+        XCTAssertFalse(drifted.byteIdentical)
+        XCTAssertFalse(drifted.passed)
+
+        let missing = evaluateServiceStatePoisonRecovery(
+            before: before,
+            after: [Array("alpha".utf8)])
+        XCTAssertFalse(missing.requestCountsMatch)
+        XCTAssertEqual(missing.perRequestByteMatch, [true, false])
+        XCTAssertFalse(missing.passed)
+
+        let empty = evaluateServiceStatePoisonRecovery(
+            before: [Array("alpha".utf8), []],
+            after: [Array("alpha".utf8), []])
+        XCTAssertFalse(empty.outputsNonEmpty)
+        XCTAssertFalse(empty.passed)
+    }
+
     func testNormalizesTerminalEOSWithoutCountingItAsVisibleServiceOutput() throws {
         let normalized = try normalizeVisibleServiceTokens(
             tokens: [10, 11, 2],

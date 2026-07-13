@@ -768,6 +768,7 @@ struct Harness {
         case "bench": await runBench(flags)
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
+        case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
         case "kl": await runKL(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
@@ -805,6 +806,9 @@ struct Harness {
           service-cancel-bench --model <PATH> disconnect SLA + slot-reuse gate (Release only)
                  [--runs 5] [--max-tokens 64] [--prefill-chunk 16]
                  [--keepalive-ms 1000] [--long-repeat 18]
+          service-state-poison-bench --model <PATH> exact A/B/A recovery gate (Release only)
+                 [--runs 3] [--concurrency 4] [--max-tokens 64]
+                 [--prefill-chunk 16] [--keepalive-ms 1000]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

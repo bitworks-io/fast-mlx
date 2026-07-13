@@ -412,6 +412,43 @@ public func evaluateCancellationGate(
         withinKeepalive: summary.maxSeconds <= keepaliveSeconds)
 }
 
+/// A known-good workload run before and after a hostile request must remain byte-identical.
+/// Hashes make the persisted gate auditable, while `perRequestByteMatch` is computed from the
+/// complete byte arrays rather than trusting the fingerprints.
+public struct ServiceStatePoisonGate: Sendable, Codable, Equatable {
+    public let requestCountsMatch: Bool
+    public let outputsNonEmpty: Bool
+    public let perRequestByteMatch: [Bool]
+    public let byteIdentical: Bool
+    public let beforeOutputHashes: [String]
+    public let afterOutputHashes: [String]
+    public let passed: Bool
+}
+
+public func evaluateServiceStatePoisonRecovery(
+    before: [[UInt8]],
+    after: [[UInt8]]
+) -> ServiceStatePoisonGate {
+    let requestCountsMatch = before.count == after.count
+    let outputsNonEmpty = !before.isEmpty
+        && before.allSatisfy { !$0.isEmpty }
+        && after.allSatisfy { !$0.isEmpty }
+    let comparisonCount = max(before.count, after.count)
+    let perRequestByteMatch = (0 ..< comparisonCount).map { index in
+        guard index < before.count, index < after.count else { return false }
+        return before[index] == after[index]
+    }
+    let byteIdentical = requestCountsMatch && perRequestByteMatch.allSatisfy { $0 }
+    return ServiceStatePoisonGate(
+        requestCountsMatch: requestCountsMatch,
+        outputsNonEmpty: outputsNonEmpty,
+        perRequestByteMatch: perRequestByteMatch,
+        byteIdentical: byteIdentical,
+        beforeOutputHashes: before.map(fnv1a64),
+        afterOutputHashes: after.map(fnv1a64),
+        passed: outputsNonEmpty && byteIdentical)
+}
+
 public struct ServiceMemorySample: Sendable, Codable, Equatable {
     public let timestamp: Double
     public let physicalFootprintBytes: UInt64

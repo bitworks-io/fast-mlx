@@ -392,6 +392,11 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         await Task.yield()
         _ = try await coordinator.runOneTick() // both prefills
         _ = try await coordinator.runOneTick() // first B=2 token
+        let replacement = try await coordinator.submit(submission([30]))
+        guard let queuedReplacement = await coordinator.snapshot(for: replacement.id) else {
+            return XCTFail("replacement disappeared before cancellation")
+        }
+        XCTAssertEqual(queuedReplacement.phase, .queued)
 
         disconnectedConsumer.cancel()
         do {
@@ -415,7 +420,6 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                 previousPhase: .decoding(
                     emittedTokens: 1,
                     hasPendingSoloLookahead: false)))
-        let replacement = try await coordinator.submit(submission([30]))
         try await drain(coordinator)
 
         let survivorTokens = try await collect(initial[0].tokens)
