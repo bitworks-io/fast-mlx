@@ -58,7 +58,9 @@ token- and byte-identical streams; a chunk-size-1 Qwen3-4B run proves decode int
 11 joiner chunks. Queue capacity, config/vocabulary/context validation, and aggregate logical
 context reservations fail atomically; continuous-runtime speculation is rejected at admission
 rather than silently ignored or allowed to poison the service. Current proof: 145 HarnessCore
-XCTest + 17 Swift Testing off-box; 41/41 `SpikeCoreTests` via Xcode. **Do not promote yet:**
+XCTest + 17 Swift Testing off-box; 41/41 `SpikeCoreTests` via Xcode; three clean-SHA probe rows
+in the [Phase 2 evidence artifact](superpowers/verdicts/continuous-batching-phase2-evidence-2026-07-12.jsonl).
+**Do not promote yet:**
 concurrency 1/2/4/8 throughput, TTFT/TPOT/fairness, cancellation latency, byte-accurate memory
 admission, PLD-vs-batch policy, A/B/A, and soak are Phase 3.
 

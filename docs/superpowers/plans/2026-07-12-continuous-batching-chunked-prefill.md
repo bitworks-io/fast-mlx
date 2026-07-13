@@ -205,6 +205,9 @@ graph.
   scalar baselines. The same SHA passes B3→B2 middle cancellation: both survivors are exact,
   and the cancelled stream equals its two-token scalar prefix. A Qwen3-4B-4bit chunk-size-1
   run also passes after 17 single-token first-prompt chunks and 11 interleaved joiner chunks.
+  Those three probes were replayed from clean docs/code SHA `3cc5f63` into the compact
+  [Phase 2 evidence artifact](../verdicts/continuous-batching-phase2-evidence-2026-07-12.jsonl)
+  (SHA-256 `96f403e04abf9cf6c4a80963892a9247f0a65df8e930a7a7c7667599fc6d0c93`).
 - 12 cache-history-sensitive runtime/Xcode tests pass inside 41/41 total `SpikeCoreTests`;
   145 HarnessCore XCTest tests plus 17 Swift Testing tests pass off-box. Final focused review
   found no High or Medium issues and no unsafe Sendable escape.

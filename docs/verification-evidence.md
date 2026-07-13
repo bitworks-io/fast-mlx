@@ -175,7 +175,10 @@ malformed/unsupported admission to poison the service.
 | Queue and resource admission are bounded | **PASS (Phase-2 proxy)** | Pure scheduler caps queued requests (default 256) with atomic burst rejection. Dense runtime validates config/vocabulary/context, reserves a full burst's logical context atomically, and releases on every removal path. |
 | Pure policy remains green | **PASS** | 145 HarnessCore XCTest tests plus 17 Swift Testing tests, 0 failures. Final focused review: no High/Medium issue; no banned concurrency escape. |
 
-**Provenance:** every clean probe row records full harness SHA, model config hash, checkpoint
+**Provenance:** the three clean replay rows are committed in the
+[Phase 2 evidence artifact](superpowers/verdicts/continuous-batching-phase2-evidence-2026-07-12.jsonl)
+(artifact SHA-256 `96f403e04abf9cf6c4a80963892a9247f0a65df8e930a7a7c7667599fc6d0c93`;
+harness SHA `3cc5f6321afaea80d62b6f894c35d50ece8ad0a5`). Every row records full harness SHA, model config hash, checkpoint
 manifest hash (config/index plus shard names/sizes), declared quantization, MLX Swift `0.31.6`,
 pinned MLX Swift LM revision, fixed-membership compile policy, and the operation trace. The
 Qwen3-32B-4bit config hash is `b3f033c21f563996`; manifest hash `33827ddf1b497615`;
