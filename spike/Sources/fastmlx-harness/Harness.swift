@@ -32,15 +32,26 @@ struct Flags {
         guard let value = Int(raw) else { throw FlagValueError.invalidInteger(key: key, value: raw) }
         return value
     }
+    func strictBool(_ key: String, default def: Bool) throws -> Bool {
+        guard let raw = values[key] else { return def }
+        switch raw {
+        case "true": return true
+        case "false": return false
+        default: throw FlagValueError.invalidBoolean(key: key, value: raw)
+        }
+    }
 }
 
 enum FlagValueError: Error, CustomStringConvertible {
     case invalidInteger(key: String, value: String)
+    case invalidBoolean(key: String, value: String)
 
     var description: String {
         switch self {
         case .invalidInteger(let key, let value):
             return "--\(key) requires an integer; actual=\(value)"
+        case .invalidBoolean(let key, let value):
+            return "--\(key) requires true or false; actual=\(value)"
         }
     }
 }
@@ -786,7 +797,7 @@ struct Harness {
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
           service-bench --model <PATH>        aggregate service frontier (Release builds only)
-                 --policy batch-no-spec       exact continuous-batch arm
+                 --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy
                  --scenario burst             simultaneous admission (initial measured scenario)
                  --concurrency 1|2|4|8         aggregate + per-request TTFT/TPOT/fairness
                  [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N]

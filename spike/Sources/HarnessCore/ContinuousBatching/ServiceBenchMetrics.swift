@@ -119,11 +119,39 @@ public enum ServiceBenchMetricsError: Error, Sendable, Equatable {
     case nonMonotonicTokenTimes(BatchRequestID)
     case completionBeforeLastToken(BatchRequestID)
     case nonPositiveCompletionSpan(BatchRequestID)
+    case tokenTimestampCountMismatch(tokens: Int, timestamps: Int)
     case emptyCancellationSamples
     case invalidCancellationTimeline(Int)
     case insufficientMemorySamples
     case invalidMemorySample(Int)
     case zeroMemoryBaseline
+}
+
+public struct VisibleServiceTokenStream: Sendable, Equatable {
+    public let tokens: [Int]
+    public let tokenTimes: [Double]
+
+    public init(tokens: [Int], tokenTimes: [Double]) {
+        self.tokens = tokens
+        self.tokenTimes = tokenTimes
+    }
+}
+
+/// The scalar/PLD driver includes terminal EOS while the continuous coordinator consumes it.
+/// Normalize both policies to user-visible output before any throughput or latency statistic.
+public func normalizeVisibleServiceTokens(
+    tokens: [Int],
+    tokenTimes: [Double],
+    eosToken: Int
+) throws -> VisibleServiceTokenStream {
+    guard tokens.count == tokenTimes.count else {
+        throw ServiceBenchMetricsError.tokenTimestampCountMismatch(
+            tokens: tokens.count, timestamps: tokenTimes.count)
+    }
+    let end = tokens.firstIndex(of: eosToken) ?? tokens.endIndex
+    return VisibleServiceTokenStream(
+        tokens: Array(tokens[..<end]),
+        tokenTimes: Array(tokenTimes[..<end]))
 }
 
 /// Aggregate throughput uses the whole client-observed burst makespan, including queueing and

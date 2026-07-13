@@ -171,4 +171,22 @@ final class ServiceBenchMetricsTests: XCTestCase {
         XCTAssertEqual(memory.maxFootprintDriftPercent, 60, accuracy: 1e-12)
         XCTAssertEqual(memory.maxMLXPeakBytes, 120)
     }
+
+    func testNormalizesTerminalEOSWithoutCountingItAsVisibleServiceOutput() throws {
+        let normalized = try normalizeVisibleServiceTokens(
+            tokens: [10, 11, 2],
+            tokenTimes: [1, 2, 3],
+            eosToken: 2)
+        XCTAssertEqual(normalized.tokens, [10, 11])
+        XCTAssertEqual(normalized.tokenTimes, [1, 2])
+
+        XCTAssertThrowsError(
+            try normalizeVisibleServiceTokens(
+                tokens: [10, 11], tokenTimes: [1], eosToken: 2)
+        ) {
+            XCTAssertEqual(
+                $0 as? ServiceBenchMetricsError,
+                .tokenTimestampCountMismatch(tokens: 2, timestamps: 1))
+        }
+    }
 }

@@ -1,5 +1,7 @@
 import Foundation
 import HarnessCore
+import MLX
+import MLXLMCommon
 
 private enum ServiceBenchCLIError: Error, CustomStringConvertible {
     case invalidArguments(String)
@@ -32,6 +34,32 @@ private struct ServiceBenchRunEvidence: Codable, Sendable {
     let metrics: ServiceRunMetrics
     let operations: ServiceOperationSummary
     let memory: ServiceMemorySummary
+    let speculative: ServiceSpecTelemetry?
+}
+
+private struct ServiceSpecTelemetry: Codable, Sendable {
+    let ngram: Int
+    let maxDraft: Int
+    let compiledVerify: Bool
+    let drafted: Int
+    let accepted: Int
+    let acceptanceRate: Double?
+    let verifySteps: Int
+    let normalSteps: Int
+    let gateDisabledSteps: Int
+}
+
+private struct ServicePolicyRunObservation: Sendable {
+    let metrics: ServiceRunMetrics
+    let operations: ServiceOperationSummary
+    let memory: ServiceMemorySummary
+    let speculative: ServiceSpecTelemetry?
+}
+
+private struct SoloPLDCollectedRequest: Sendable {
+    let index: Int
+    let timeline: ServiceRequestTimeline
+    let engagement: EngagementCounters
 }
 
 private struct ServiceBenchPayload: Codable, Sendable {
@@ -45,9 +73,9 @@ private struct ServiceBenchPayload: Codable, Sendable {
     let mlxSwiftLMRevision: String
     let compilePolicy: String
     let concurrency: Int
-    let maxActiveSlots: Int
-    let maxPrefillSlots: Int
-    let prefillChunkSize: Int
+    let maxActiveSlots: Int?
+    let maxPrefillSlots: Int?
+    let prefillChunkSize: Int?
     let maxOutputTokens: Int
     let memoryCacheLimitBytes: Int
     let aggregate: ServiceRunAggregate
@@ -69,14 +97,14 @@ private struct ServiceBenchCSVRow {
 func runServiceBench(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
         print(
-            "usage: fastmlx-harness service-bench --model <PATH> --policy batch-no-spec --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--evidence FILE]")
+            "usage: fastmlx-harness service-bench --model <PATH> --policy <batch-no-spec|solo-pld> --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--evidence FILE]")
         exit(2)
     }
 
     do {
         try assertReleaseBuild()
         let policy = flags.string("policy", default: "batch-no-spec")
-        guard policy == "batch-no-spec" else {
+        guard policy == "batch-no-spec" || policy == "solo-pld" else {
             throw ServiceBenchCLIError.unsupportedPolicy(policy)
         }
         let scenario = flags.string("scenario", default: "burst")
@@ -100,14 +128,52 @@ func runServiceBench(_ flags: Flags) async {
         }
         let maxReserved = try flags.optionalStrictInt("max-reserved-context-tokens")
         let traceLimit = max(1_024, concurrency * (maxTokens + 64) * 2)
-        let loaded = try await loadContinuousSwiftServiceDriver(
-            modelPath: modelPath,
-            configuration: ContinuousServiceLoadConfiguration(
-                maxActiveSlots: concurrency,
-                maxPrefillSlots: maxPrefill,
-                prefillChunkSize: prefillChunk,
-                maxReservedContextTokens: maxReserved,
-                traceLimit: traceLimit))
+        let ngram = try flags.strictInt("ngram", default: 3)
+        let maxDraft = try flags.strictInt("max-draft", default: 8)
+        let compiledVerify = try flags.strictBool("compiled-verify", default: false)
+        guard ngram > 0, maxDraft > 0 else {
+            throw ServiceBenchCLIError.invalidArguments(
+                "--ngram and --max-draft must be positive")
+        }
+
+        let tokenizer: MLXLMCommon.Tokenizer
+        let runPolicy: @Sendable ([[Int]]) async throws -> ServicePolicyRunObservation
+        if policy == "batch-no-spec" {
+            let loaded = try await loadContinuousSwiftServiceDriver(
+                modelPath: modelPath,
+                configuration: ContinuousServiceLoadConfiguration(
+                    maxActiveSlots: concurrency,
+                    maxPrefillSlots: maxPrefill,
+                    prefillChunkSize: prefillChunk,
+                    maxReservedContextTokens: maxReserved,
+                    traceLimit: traceLimit))
+            tokenizer = loaded.tokenizer
+            let driver = loaded.driver
+            runPolicy = { prompts in
+                let observation = try await driver.runBurst(
+                    prompts: prompts, maxOutputTokens: maxTokens)
+                return ServicePolicyRunObservation(
+                    metrics: observation.metrics,
+                    operations: observation.operations,
+                    memory: observation.memory,
+                    speculative: nil)
+            }
+        } else {
+            let loaded = try await loadSwiftDriver(modelPath: modelPath)
+            tokenizer = loaded.tokenizer
+            let driver = loaded.driver
+            let eos = loaded.eos
+            runPolicy = { prompts in
+                try await runSoloPLDBurst(
+                    driver: driver,
+                    eos: eos,
+                    prompts: prompts,
+                    maxOutputTokens: maxTokens,
+                    ngram: ngram,
+                    maxDraft: maxDraft,
+                    compiledVerify: compiledVerify)
+            }
+        }
 
         let prompt = flags.string("prompt", default: benchPrompt)
         let label = flags.string("label", default: "continuous-service")
@@ -117,37 +183,37 @@ func runServiceBench(_ flags: Flags) async {
 
         for run in 0 ... runs {
             let prompts = (0 ..< concurrency).map { request in
-                loaded.tokenizer.encode(
+                tokenizer.encode(
                     text: "\(saltPrompt(run: run, nonce: nonce, prompt)) [request=\(request)]")
             }
-            let observation = try await loaded.driver.runBurst(
-                prompts: prompts,
-                maxOutputTokens: maxTokens)
+            let observation = try await runPolicy(prompts)
             let expectedChunks = prompts.reduce(0) {
                 $0 + (($1.count + prefillChunk - 1) / prefillChunk)
             }
             let expectedPromptTokens = prompts.map(\.count).reduce(0, +)
-            guard observation.operations.promptChunkCount == expectedChunks,
-                observation.operations.promptTokensProcessed == expectedPromptTokens
-            else {
-                throw ServiceBenchCLIError.promptAccounting(
-                    expectedChunks: expectedChunks,
-                    actualChunks: observation.operations.promptChunkCount,
-                    expectedTokens: expectedPromptTokens,
-                    actualTokens: observation.operations.promptTokensProcessed)
-            }
-            guard observation.operations.maxActiveSlots == concurrency else {
-                throw ServiceBenchCLIError.activeSlotHighWatermark(
-                    expected: concurrency,
-                    actual: observation.operations.maxActiveSlots)
-            }
-            if concurrency > 1,
-                !observation.operations.decodeBatchSizeHistogram.keys.contains(where: { $0 > 1 })
-            {
-                throw ServiceBenchCLIError.missingSharedBatch
-            }
-            guard !observation.operations.speculationEngaged else {
-                throw ServiceBenchCLIError.batchedSpeculationEngaged
+            if policy == "batch-no-spec" {
+                guard observation.operations.promptChunkCount == expectedChunks,
+                    observation.operations.promptTokensProcessed == expectedPromptTokens
+                else {
+                    throw ServiceBenchCLIError.promptAccounting(
+                        expectedChunks: expectedChunks,
+                        actualChunks: observation.operations.promptChunkCount,
+                        expectedTokens: expectedPromptTokens,
+                        actualTokens: observation.operations.promptTokensProcessed)
+                }
+                guard observation.operations.maxActiveSlots == concurrency else {
+                    throw ServiceBenchCLIError.activeSlotHighWatermark(
+                        expected: concurrency,
+                        actual: observation.operations.maxActiveSlots)
+                }
+                if concurrency > 1,
+                    !observation.operations.decodeBatchSizeHistogram.keys.contains(where: { $0 > 1 })
+                {
+                    throw ServiceBenchCLIError.missingSharedBatch
+                }
+                guard !observation.operations.speculationEngaged else {
+                    throw ServiceBenchCLIError.batchedSpeculationEngaged
+                }
             }
             let tag = run == 0 ? "warmup (dropped)" : "run \(run)"
             print(
@@ -162,7 +228,8 @@ func runServiceBench(_ flags: Flags) async {
                     droppedWarmup: run == 0,
                     metrics: observation.metrics,
                     operations: observation.operations,
-                    memory: observation.memory))
+                    memory: observation.memory,
+                    speculative: observation.speculative))
         }
 
         let measured = Array(evidenceRuns.dropFirst())
@@ -204,11 +271,13 @@ func runServiceBench(_ flags: Flags) async {
             checkpointManifestHash: try ProvenanceCLI.checkpointManifestHash(at: modelPath),
             checkpointIdentityKind: "config-index-shard-name-size-manifest",
             mlxSwiftLMRevision: ProvenanceCLI.mlxSwiftLMRevision,
-            compilePolicy: "fixed-membership-fresh-burst-retrace",
+            compilePolicy: policy == "batch-no-spec"
+                ? "fixed-membership-fresh-burst-retrace"
+                : "compiled-scalar-actor-serialized",
             concurrency: concurrency,
-            maxActiveSlots: concurrency,
-            maxPrefillSlots: maxPrefill,
-            prefillChunkSize: prefillChunk,
+            maxActiveSlots: policy == "batch-no-spec" ? concurrency : 1,
+            maxPrefillSlots: policy == "batch-no-spec" ? maxPrefill : nil,
+            prefillChunkSize: policy == "batch-no-spec" ? prefillChunk : nil,
             maxOutputTokens: maxTokens,
             memoryCacheLimitBytes: 8 << 30,
             aggregate: aggregate,
@@ -232,4 +301,85 @@ func runServiceBench(_ flags: Flags) async {
         print("service-bench FAILED: \(error)")
         exit(1)
     }
+}
+
+private func runSoloPLDBurst(
+    driver: SwiftEngineDriver,
+    eos: Int,
+    prompts: [[Int]],
+    maxOutputTokens: Int,
+    ngram: Int,
+    maxDraft: Int,
+    compiledVerify: Bool
+) async throws -> ServicePolicyRunObservation {
+    Memory.peakMemory = 0
+    var memory = [serviceMemorySample()]
+    let submittedAt = Date().timeIntervalSinceReferenceDate
+    let collected = try await withThrowingTaskGroup(
+        of: SoloPLDCollectedRequest.self,
+        returning: [SoloPLDCollectedRequest].self
+    ) { group in
+        for (index, prompt) in prompts.enumerated() {
+            group.addTask {
+                let result = try await driver.generate(
+                    prompt: prompt,
+                    config: RunConfig(
+                        temperature: 0,
+                        maxTokens: maxOutputTokens,
+                        specDecode: "pld",
+                        specNgram: ngram,
+                        specMaxDraft: maxDraft,
+                        specCompiledVerify: compiledVerify,
+                        kvQuant: "fp16"))
+                let visible = try normalizeVisibleServiceTokens(
+                    tokens: result.tokens,
+                    tokenTimes: result.tokenTimes,
+                    eosToken: eos)
+                return SoloPLDCollectedRequest(
+                    index: index,
+                    timeline: ServiceRequestTimeline(
+                        requestID: BatchRequestID(UInt64(index + 1)),
+                        promptTokenCount: prompt.count,
+                        submittedAt: submittedAt,
+                        tokenTimes: visible.tokenTimes,
+                        completedAt: Date().timeIntervalSinceReferenceDate),
+                    engagement: result.engagement)
+            }
+        }
+        var result: [SoloPLDCollectedRequest] = []
+        for try await request in group {
+            result.append(request)
+            memory.append(serviceMemorySample())
+        }
+        return result.sorted { $0.index < $1.index }
+    }
+    let metrics = try measureServiceRun(collected.map(\.timeline))
+    func total(_ key: String) -> Int {
+        collected.reduce(0) { $0 + ($1.engagement.counts[key] ?? 0) }
+    }
+    let drafted = total("spec_drafted")
+    let accepted = total("spec_accepted")
+    return ServicePolicyRunObservation(
+        metrics: metrics,
+        operations: ServiceOperationSummary(
+            tickCount: 0,
+            maxActiveSlots: 1,
+            meanActiveSlots: 1,
+            maxQueuedSlots: max(0, prompts.count - 1),
+            decodeBatchSizeHistogram: [:],
+            promptChunkCount: 0,
+            promptTokensProcessed: 0,
+            drainCount: 0,
+            speculationEngaged: drafted > 0),
+        memory: try summarizeServiceMemory(memory),
+        speculative: ServiceSpecTelemetry(
+            ngram: ngram,
+            maxDraft: maxDraft,
+            compiledVerify: compiledVerify,
+            drafted: drafted,
+            accepted: accepted,
+            acceptanceRate: drafted == 0 ? nil : Double(accepted) / Double(drafted),
+            verifySteps: total("spec_verify_steps"),
+            normalSteps: total("spec_normal_steps"),
+            gateDisabledSteps: total("spec_gate_disabled_steps")))
 }

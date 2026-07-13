@@ -225,7 +225,7 @@ private func serviceClockSeconds() -> Double {
     ProcessInfo.processInfo.systemUptime
 }
 
-private func serviceMemorySample() -> ServiceMemorySample {
+func serviceMemorySample() -> ServiceMemorySample {
     let snapshot = Memory.snapshot()
     return ServiceMemorySample(
         timestamp: serviceClockSeconds(),
