@@ -1,6 +1,6 @@
 # Continuous batching with decode-first chunked prefill
 
-- **Status:** ACTIVE — Phases 0–1 verified; Phase 2 actor integration next
+- **Status:** ACTIVE — Phases 0–2 verified; Phase 3 service-frontier measurement next
 - **Date:** 2026-07-12
 - **Owner:** Codex
 - **Evaluation lane:** `EXACT`
@@ -137,7 +137,8 @@ can contain a shared decode before the drain has committed.
 The executor remains a separate actor-isolated layer. The first probe must prove:
 
 1. `[B, 1]` dense model forward matches B independent `[1, 1]` forwards at temperature zero;
-2. per-sequence RoPE offsets and left-padded causal masks match scalar-cache results;
+2. per-sequence RoPE offsets and scalar-aligned right-padded causal masks match scalar-cache
+   results;
 3. cache merge → batched append → filter/extract preserves each slot's next-token result;
 4. batch sizes 1/2/4/8 do not retrace every token after warmup;
 5. removing the middle slot preserves row-to-request identity;
@@ -178,6 +179,36 @@ the bench Mac; 134 HarnessCore XCTest tests plus 17 Swift Testing tests passed o
 review's capacity, length-validation, transition-proof, and architecture-gate findings were
 fixed; re-review found no High or Medium issues.
 
+### Phase 2 result — 2026-07-12
+
+The MLX-free coordinator and actor-confined dense runtime now execute the scheduler contract
+end to end. The runtime keeps one staged greedy token outside committed KV state, performs a
+blocking drain before solo→batch membership, reuses fixed-shape compiled functions for stable
+membership, and extracts/remerges only at membership boundaries. Chunked prefill evaluates
+each boundary so decode and cancellation can interleave without retaining an unbounded lazy
+graph.
+
+- Admission is bounded three ways: an explicit 256-request queue default, a config-derived
+  per-request context ceiling, and an atomic aggregate logical-token reservation. The runtime
+  initially reserves only a bounded decode window and grows in chunks. Phase 3 must still
+  replace the logical-token proxy with measured host-byte admission that includes rounding
+  and temporary merge/rebuild double-buffer peaks.
+- Runtime construction requires a dense Qwen3 `config.json` proof (`model_type`, context cap,
+  vocabulary); unsupported architecture and invalid token IDs fail before MLX indexing. The
+  initializer is package-scoped so external callers cannot forge the pairing. A stronger
+  loader-bound model identity remains a low-risk hardening item.
+- Solo speculation is rejected atomically at admission for this continuous runtime. It cannot
+  become a terminal executor failure or silently lose PLD. The service-policy comparison
+  remains separate: shared batch without speculation versus the existing solo PLD lane.
+- Clean SHA `2a5a5f4df1659ecd14adfbbf9fa1a111698c6acb` passes the Qwen3-32B-4bit
+  B1→drain→B2→B1 probe with both streams token- and byte-identical to independent compiled
+  scalar baselines. The same SHA passes B3→B2 middle cancellation: both survivors are exact,
+  and the cancelled stream equals its two-token scalar prefix. A Qwen3-4B-4bit chunk-size-1
+  run also passes after 17 single-token first-prompt chunks and 11 interleaved joiner chunks.
+- 12 cache-history-sensitive runtime/Xcode tests pass inside 41/41 total `SpikeCoreTests`;
+  145 HarnessCore XCTest tests plus 17 Swift Testing tests pass off-box. Final focused review
+  found no High or Medium issues and no unsafe Sendable escape.
+
 ## TDD and implementation sequence
 
 ### Phase 0 — pure scheduler
@@ -202,7 +233,9 @@ fixed; re-review found no High or Medium issues.
 ### Phase 2 — actor integration
 
 1. Add a streaming request API whose continuation termination enqueues actor cancellation.
-2. Keep the existing compiled solo decoder for one active slot.
+2. Keep concurrency-one product behavior on the existing compiled solo decoder; inside the
+   probe-only continuous runtime, use its actor-confined scalar compiled step until membership
+   becomes a shared batch.
 3. Execute pure tick plans inside the actor; drain before mode transition; demultiplex tokens
    by stable request ID.
 4. Fail closed on unsupported architecture or batched speculation.
@@ -233,7 +266,10 @@ fixed; re-review found no High or Medium issues.
 
 ## Rollback and blast radius
 
-All new behavior stays behind a concurrency flag. Concurrency one continues to use the
-existing compiled decoder until the transition gate passes. The pure scheduler is additive;
-the batch executor is dense/fp16-only initially. Rollback is disabling batching or reverting
-the feature branch—no model conversion, persisted schema, or user data migration is involved.
+The continuous coordinator/runtime is currently reachable only through explicit probe CLI
+subcommands; no production service route or concurrency flag has been wired. Concurrency one
+therefore continues to use the existing compiled decoder. Until the transition gate passes,
+rollback is simply not invoking the probes or reverting the feature branch. The scheduler is
+additive and the executor is dense-Qwen3-only initially; model weight quantization is allowed,
+but the continuous KV path remains the exact fp16-cache design. No model conversion, persisted
+schema, or user data migration is involved.

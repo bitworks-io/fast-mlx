@@ -1,5 +1,6 @@
 ---
 status: active
+phase: service-frontier-measurement
 type: engine-feature
 priority: high
 created: 2026-07-12
@@ -49,7 +50,9 @@ thrash. A small `shapeless` compile probe belongs inside this plan, not as an as
 
 ## Next Step
 
-Execute the architecture and measurement
-[plan](../superpowers/plans/2026-07-12-continuous-batching-chunked-prefill.md): TDD the pure
-scheduler state machine first, then pass the dense batch-cache/shape probe before connecting
-the actor-confined MLX executor.
+Execute Phase 3 of the architecture and measurement
+[plan](../superpowers/plans/2026-07-12-continuous-batching-chunked-prefill.md): the scheduler,
+dense cache, coordinator, and actor-confined MLX runtime have passed clean-SHA exactness gates.
+Next add concurrency 1/2/4/8 service metrics and byte-accurate memory admission, compare batch
+policy with solo PLD, run A/B/A plus cancellation-latency checks, then complete the required
+soak before the dated promote/shelve verdict and `docs/content/` piece.

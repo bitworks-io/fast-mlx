@@ -49,14 +49,29 @@ and rolled back rejected future tokens. Apparent rates are invalid because outpu
 No `k=3`/multi-shape bench or Swift port ran. Reopen only for deterministic target verification
 or a compatible product-size DSpark/DFlash/MTP checkpoint.
 
+**Continuous batching — PHASES 0–2 COMPLETE; MEASUREMENT ACTIVE** (feature branch
+`codex/continuous-batching-chunked-prefill`, engine SHA `2a5a5f4`; [plan](superpowers/plans/2026-07-12-continuous-batching-chunked-prefill.md)). The pure scheduler, MLX-free streaming coordinator,
+scalar-aligned dense batch cache, and actor-confined Qwen3 runtime are integrated in explicit
+CLI probe paths; no production service route is wired yet. Clean-SHA
+Qwen3-32B-4bit probes pass B1→drain→B2→B1 staggered join and B3→B2 middle cancellation with
+token- and byte-identical streams; a chunk-size-1 Qwen3-4B run proves decode interleaves across
+11 joiner chunks. Queue capacity, config/vocabulary/context validation, and aggregate logical
+context reservations fail atomically; continuous-runtime speculation is rejected at admission
+rather than silently ignored or allowed to poison the service. Current proof: 145 HarnessCore
+XCTest + 17 Swift Testing off-box; 41/41 `SpikeCoreTests` via Xcode. **Do not promote yet:**
+concurrency 1/2/4/8 throughput, TTFT/TPOT/fairness, cancellation latency, byte-accurate memory
+admission, PLD-vs-batch policy, A/B/A, and soak are Phase 3.
+
 ## ▶ Open work queue — pick the next flywheel cycle
 
 Prioritized by the 2026-07-12 Sol audit. The north star remains **match then beat optimized
 mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the first multiplier.
 
 1. **Continuous batching + decode-first chunked prefill** — the largest remaining service
-   throughput multiplier (Zig prior ~2.8× aggregate 1→8). Preserve drain-before-batch-join;
-   speculation stays off in the batched arm. [Task](task-inbox/2026-07-12-continuous-batching-chunked-prefill.md).
+   throughput multiplier (Zig prior ~2.8× aggregate 1→8). Phases 0–2 are exact in the
+   explicit probe path;
+   execute the Phase 3 service frontier and soak before promotion. Speculation stays off in
+   the batched arm. [Task](task-inbox/2026-07-12-continuous-batching-chunked-prefill.md).
 2. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
    candidate; compare actual packed bytes and teacher-forced quality before Metal investment.
    [Task](task-inbox/2026-07-12-kvarn-kv-frontier.md).
@@ -136,6 +151,9 @@ Qwen3-32B BF16 target). Python: `~/harness-venv` (transformers<5).
   driver, conformance, task-benchmark layer, soak/recovery, and remaining memory controls.
   Do not infer implementation from an upstream dependency: native MTP and prompt caching
   remain unwired in fast-mlx.
+- **Continuous-batching resource proxy:** current admission bounds queue length and aggregate
+  logical context tokens, but not rounded per-layer KV bytes or temporary merge/rebuild
+  double-buffer peaks. Phase 3 must measure and bind the host-byte limit before default-on.
 - **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 9 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
 
 ## Commit / Checkin
