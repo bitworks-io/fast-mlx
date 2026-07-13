@@ -767,6 +767,7 @@ struct Harness {
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
         case "service-bench": await runServiceBench(flags)
+        case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "kl": await runKL(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
@@ -801,6 +802,9 @@ struct Harness {
                  --scenario burst             simultaneous admission (initial measured scenario)
                  --concurrency 1|2|4|8         aggregate + per-request TTFT/TPOT/fairness
                  [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N]
+          service-cancel-bench --model <PATH> disconnect SLA + slot-reuse gate (Release only)
+                 [--runs 5] [--max-tokens 64] [--prefill-chunk 16]
+                 [--keepalive-ms 1000] [--long-repeat 18]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

@@ -372,6 +372,69 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                     emittedTokens: 1, hasPendingSoloLookahead: true)))
     }
 
+    func testDecodingCancellationReusesSlotAndReformsSharedBatch() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 2, prefill: 2, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [
+                    10: [101, 102, 103, 104, 2],
+                    20: [201, 202, 2],
+                    30: [301, 302, 2],
+                ]),
+            automaticDrive: false,
+            traceLimit: 32)
+        let initial = try await coordinator.submitBatch([
+            submission([10]), submission([20]),
+        ])
+        let disconnectedConsumer = Task {
+            for try await _ in initial[1].tokens {}
+        }
+        await Task.yield()
+        _ = try await coordinator.runOneTick() // both prefills
+        _ = try await coordinator.runOneTick() // first B=2 token
+
+        disconnectedConsumer.cancel()
+        do {
+            try await disconnectedConsumer.value
+        } catch is CancellationError {
+            // Expected for the disconnect path under test.
+        }
+        for _ in 0 ..< 100 {
+            if await coordinator.snapshot(for: initial[1].id) == nil { break }
+            await Task.yield()
+        }
+        let cancellationTrace = await coordinator.executionTrace()
+        let cancellation = cancellationTrace.compactMap {
+            if case .cancelled(let result) = $0, result.id == initial[1].id { return result }
+            return nil
+        }.first
+        XCTAssertEqual(
+            cancellation,
+            .cancelled(
+                id: initial[1].id,
+                previousPhase: .decoding(
+                    emittedTokens: 1,
+                    hasPendingSoloLookahead: false)))
+        let replacement = try await coordinator.submit(submission([30]))
+        try await drain(coordinator)
+
+        let survivorTokens = try await collect(initial[0].tokens)
+        let replacementTokens = try await collect(replacement.tokens)
+        XCTAssertEqual(survivorTokens, [101, 102, 103, 104])
+        XCTAssertEqual(replacementTokens, [301, 302])
+        let trace = await coordinator.executionTrace()
+        let operations = trace.compactMap {
+            if case .operation(let operation) = $0 { return operation }
+            return nil
+        }
+        XCTAssertTrue(
+            operations.contains(
+                .decode(.batch([initial[0].id, initial[1].id], speculationAllowed: false))))
+        XCTAssertTrue(
+            operations.contains(
+                .decode(.batch([initial[0].id, replacement.id], speculationAllowed: false))))
+    }
+
     func testConsumerTaskCancellationEnqueuesQueuedSlotRemoval() async throws {
         let coordinator = ContinuousBatchCoordinator(
             configuration: configuration(active: 1, prefill: 1, chunk: 1),

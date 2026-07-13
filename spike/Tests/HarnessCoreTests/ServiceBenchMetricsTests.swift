@@ -172,6 +172,30 @@ final class ServiceBenchMetricsTests: XCTestCase {
         XCTAssertEqual(memory.maxMLXPeakBytes, 120)
     }
 
+    func testCancellationGateUsesWorstRemovalLatencyAgainstKeepalive() throws {
+        let passing = try evaluateCancellationGate(
+            [
+                ServiceCancellationTimeline(requestedAt: 1, removedAt: 1.05),
+                ServiceCancellationTimeline(requestedAt: 2, removedAt: 2.2),
+            ],
+            keepaliveSeconds: 0.21)
+        XCTAssertTrue(passing.withinKeepalive)
+        XCTAssertEqual(passing.summary.maxSeconds, 0.2, accuracy: 1e-12)
+
+        let failing = try evaluateCancellationGate(
+            [ServiceCancellationTimeline(requestedAt: 4, removedAt: 4.21)],
+            keepaliveSeconds: 0.2)
+        XCTAssertFalse(failing.withinKeepalive)
+
+        XCTAssertThrowsError(
+            try evaluateCancellationGate(
+                [ServiceCancellationTimeline(requestedAt: 1, removedAt: 1.1)],
+                keepaliveSeconds: 0)
+        ) {
+            XCTAssertEqual($0 as? ServiceBenchMetricsError, .invalidKeepaliveSeconds(0))
+        }
+    }
+
     func testNormalizesTerminalEOSWithoutCountingItAsVisibleServiceOutput() throws {
         let normalized = try normalizeVisibleServiceTokens(
             tokens: [10, 11, 2],

@@ -11,7 +11,17 @@ enum ContinuousServiceDriverError: Error, CustomStringConvertible {
     case emptyBurst
     case emptyPrompt(Int)
     case invalidOutputBudget(Int)
+    case invalidCancellationPromptCount(Int)
+    case invalidCancellationWaitLimit(Double)
     case missingRuntimeResources
+    case cancellationTargetNeverDecoded(BatchRequestID)
+    case cancellationSharedBatchMissing
+    case decodeFirstInterleaveMissing
+    case unexpectedCancellationResult(BatchCancellationResult)
+    case cancellationSlotRetained(BatchRequestID)
+    case cancellationEventMissing(BatchRequestID)
+    case replacementSlotMissing(BatchRequestID)
+    case emptyRecoveryOutput(String)
     case missingCompletionTiming(BatchRequestID)
     case tokenTimingCountMismatch(BatchRequestID, expected: Int, actual: Int)
 
@@ -23,8 +33,28 @@ enum ContinuousServiceDriverError: Error, CustomStringConvertible {
             return "continuous service prompt \(index) is empty"
         case .invalidOutputBudget(let budget):
             return "continuous service output budget must be positive; actual=\(budget)"
+        case .invalidCancellationPromptCount(let count):
+            return "continuous cancellation recovery requires three prompts; actual=\(count)"
+        case .invalidCancellationWaitLimit(let seconds):
+            return "continuous cancellation wait limit must be finite and positive; actual=\(seconds)"
         case .missingRuntimeResources:
             return "continuous service runtime did not expose byte-admission resources"
+        case .cancellationTargetNeverDecoded(let id):
+            return "cancellation target \(id.rawValue) never reached decoding"
+        case .cancellationSharedBatchMissing:
+            return "cancellation scenario never formed the required shared batch"
+        case .decodeFirstInterleaveMissing:
+            return "short request never decoded beside long-request prefill"
+        case .unexpectedCancellationResult(let result):
+            return "unexpected cancellation result: \(result)"
+        case .cancellationSlotRetained(let id):
+            return "cancelled request \(id.rawValue) remained in the scheduler"
+        case .cancellationEventMissing(let id):
+            return "cancelled request \(id.rawValue) emitted no cancellation event"
+        case .replacementSlotMissing(let id):
+            return "replacement request \(id.rawValue) did not reuse the released slot"
+        case .emptyRecoveryOutput(let request):
+            return "\(request) emitted no visible recovery tokens"
         case .missingCompletionTiming(let id):
             return "continuous service request \(id.rawValue) has no actor completion timestamp"
         case .tokenTimingCountMismatch(let id, let expected, let actual):
@@ -68,6 +98,26 @@ struct ContinuousServiceRunObservation: Sendable {
     let memorySamples: [ServiceMemorySample]
     let resources: ContinuousBatchRuntimeResourceSnapshot
     let outputTokens: [[Int]]
+}
+
+struct ContinuousServiceCancellationObservation: Sendable {
+    let timeline: ServiceCancellationTimeline
+    let previousPhase: String
+    let slotRemoved: Bool
+    let cancellationEventObserved: Bool
+    let repeatedCancellationNotFound: Bool
+    let replacementSlotReused: Bool
+    let sharedBatchObserved: Bool
+    let decodeFirstInterleaveObserved: Bool
+    let cancelledPrefixTokens: Int
+    let survivorOutputTokens: Int
+    let replacementOutputTokens: Int
+    let operations: ServiceOperationSummary
+    let memory: ServiceMemorySummary
+    let resourcesAtAdmission: ContinuousBatchRuntimeResourceSnapshot
+    let resourcesAfterCancellation: ContinuousBatchRuntimeResourceSnapshot
+    let resourcesAfterReplacement: ContinuousBatchRuntimeResourceSnapshot
+    let resourcesAtEnd: ContinuousBatchRuntimeResourceSnapshot
 }
 
 private struct CollectedServiceRequest: Sendable {
@@ -194,6 +244,201 @@ struct ContinuousSwiftServiceDriver: Sendable {
             resources: resources,
             outputTokens: collected.map(\.tokens))
     }
+
+    /// Cancels one live B=2 row, immediately reuses its slot, then drains both survivors.
+    /// The cancellation timestamp ends only after the coordinator has removed scheduler and
+    /// runtime state, so it measures disconnect-to-removal rather than stream-consumer delay.
+    func runCancellationRecovery(
+        prompts: [[Int]],
+        maxOutputTokens: Int,
+        cancellationWaitLimitSeconds: Double
+    ) async throws -> ContinuousServiceCancellationObservation {
+        guard prompts.count == 3 else {
+            throw ContinuousServiceDriverError.invalidCancellationPromptCount(prompts.count)
+        }
+        guard maxOutputTokens > 1 else {
+            throw ContinuousServiceDriverError.invalidOutputBudget(maxOutputTokens)
+        }
+        guard cancellationWaitLimitSeconds.isFinite, cancellationWaitLimitSeconds > 0 else {
+            throw ContinuousServiceDriverError.invalidCancellationWaitLimit(
+                cancellationWaitLimitSeconds)
+        }
+        for (index, prompt) in prompts.enumerated() where prompt.isEmpty {
+            throw ContinuousServiceDriverError.emptyPrompt(index)
+        }
+
+        _ = await coordinator.takeExecutionTrace()
+        _ = await coordinator.takeTimingTrace()
+        Memory.peakMemory = 0
+        var memory = [serviceMemorySample()]
+        var ticks: [ServiceTickObservation] = []
+        let initial = try await coordinator.submitBatch(
+            prompts.prefix(2).map {
+                ContinuousBatchSubmission(
+                    promptTokens: $0,
+                    maxOutputTokens: maxOutputTokens,
+                    eosToken: eos,
+                    architecture: .denseAttention)
+            })
+        let survivor = initial[0]
+        let target = initial[1]
+        let targetConsumer = Task {
+            for try await _ in target.tokens {}
+        }
+        await Task.yield()
+        guard let resourcesAtAdmission = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
+
+        var sharedBatchObserved = false
+        var decodeFirstInterleaveObserved = false
+        while true {
+            let observed = try await observedServiceTick(coordinator)
+            ticks.append(observed.tick)
+            memory.append(observed.memory)
+            let hasPrefill = observed.tick.operations.contains {
+                if case .prefill = $0 { return true }
+                return false
+            }
+            let hasTargetDecode = observed.tick.operations.contains {
+                switch $0 {
+                case .decode(.solo(let id, _)), .decode(.drainSoloPipeline(let id)):
+                    return id == target.id
+                case .decode(.batch(let ids, _)):
+                    return ids.contains(target.id)
+                default:
+                    return false
+                }
+            }
+            decodeFirstInterleaveObserved = decodeFirstInterleaveObserved
+                || (hasPrefill && hasTargetDecode)
+            sharedBatchObserved = sharedBatchObserved || observed.tick.operations.contains {
+                if case .decode(.batch(let ids, speculationAllowed: false)) = $0 {
+                    return ids.contains(survivor.id) && ids.contains(target.id)
+                }
+                return false
+            }
+            if case .decoding(let emitted, _) = await coordinator.snapshot(for: target.id)?.phase,
+                emitted >= 1,
+                sharedBatchObserved
+            {
+                break
+            }
+            guard observed.remains else {
+                throw ContinuousServiceDriverError.cancellationTargetNeverDecoded(target.id)
+            }
+        }
+        guard sharedBatchObserved else {
+            throw ContinuousServiceDriverError.cancellationSharedBatchMissing
+        }
+        guard decodeFirstInterleaveObserved else {
+            throw ContinuousServiceDriverError.decodeFirstInterleaveMissing
+        }
+
+        let requestedAt = serviceClockSeconds()
+        targetConsumer.cancel()
+        do {
+            try await targetConsumer.value
+        } catch is CancellationError {
+            // Expected for a consumer-side disconnect.
+        }
+        while await coordinator.snapshot(for: target.id) != nil {
+            guard serviceClockSeconds() - requestedAt <= cancellationWaitLimitSeconds else {
+                throw ContinuousServiceDriverError.cancellationSlotRetained(target.id)
+            }
+            await Task.yield()
+        }
+        let removedAt = serviceClockSeconds()
+        let cancellationEvents = await coordinator.takeExecutionTrace()
+        guard let result = cancellationEvents.compactMap({ event -> BatchCancellationResult? in
+            if case .cancelled(let result) = event, result.id == target.id { return result }
+            return nil
+        }).first else {
+            throw ContinuousServiceDriverError.cancellationEventMissing(target.id)
+        }
+        let previousPhase: BatchSlotPhase
+        guard case .cancelled(_, let phase) = result else {
+            throw ContinuousServiceDriverError.unexpectedCancellationResult(result)
+        }
+        previousPhase = phase
+        let slotRemoved = await coordinator.snapshot(for: target.id) == nil
+        guard slotRemoved else {
+            throw ContinuousServiceDriverError.cancellationSlotRetained(target.id)
+        }
+        guard let resourcesAfterCancellation = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
+        let cancellationEventObserved = cancellationEvents.contains(.cancelled(result))
+        guard cancellationEventObserved else {
+            throw ContinuousServiceDriverError.cancellationEventMissing(target.id)
+        }
+        let repeatedCancellationNotFound = await coordinator.cancel(target.id) == .notFound(target.id)
+        memory.append(serviceMemorySample())
+
+        let replacement = try await coordinator.submit(
+            ContinuousBatchSubmission(
+                promptTokens: prompts[2],
+                maxOutputTokens: maxOutputTokens,
+                eosToken: eos,
+                architecture: .denseAttention))
+        guard await coordinator.snapshot(for: replacement.id) != nil else {
+            throw ContinuousServiceDriverError.replacementSlotMissing(replacement.id)
+        }
+        guard let resourcesAfterReplacement = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
+
+        var replacementSlotReused = false
+        while true {
+            let observed = try await observedServiceTick(coordinator)
+            ticks.append(observed.tick)
+            memory.append(observed.memory)
+            replacementSlotReused = replacementSlotReused || observed.tick.operations.contains {
+                if case .decode(.batch(let ids, speculationAllowed: false)) = $0 {
+                    return ids.contains(survivor.id) && ids.contains(replacement.id)
+                }
+                return false
+            }
+            if !observed.remains { break }
+        }
+        guard replacementSlotReused else {
+            throw ContinuousServiceDriverError.replacementSlotMissing(replacement.id)
+        }
+
+        let survivorTokens = try await collectServiceTokens(survivor.tokens)
+        let replacementTokens = try await collectServiceTokens(replacement.tokens)
+        guard !survivorTokens.isEmpty else {
+            throw ContinuousServiceDriverError.emptyRecoveryOutput("survivor")
+        }
+        guard !replacementTokens.isEmpty else {
+            throw ContinuousServiceDriverError.emptyRecoveryOutput("replacement")
+        }
+        guard let resourcesAtEnd = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
+        memory.append(serviceMemorySample())
+
+        return ContinuousServiceCancellationObservation(
+            timeline: ServiceCancellationTimeline(
+                requestedAt: requestedAt,
+                removedAt: removedAt),
+            previousPhase: servicePhaseDescription(previousPhase),
+            slotRemoved: slotRemoved,
+            cancellationEventObserved: cancellationEventObserved,
+            repeatedCancellationNotFound: repeatedCancellationNotFound,
+            replacementSlotReused: replacementSlotReused,
+            sharedBatchObserved: sharedBatchObserved,
+            decodeFirstInterleaveObserved: decodeFirstInterleaveObserved,
+            cancelledPrefixTokens: emittedTokenCount(previousPhase),
+            survivorOutputTokens: survivorTokens.count,
+            replacementOutputTokens: replacementTokens.count,
+            operations: summarizeServiceOperations(ticks),
+            memory: try summarizeServiceMemory(memory),
+            resourcesAtAdmission: resourcesAtAdmission,
+            resourcesAfterCancellation: resourcesAfterCancellation,
+            resourcesAfterReplacement: resourcesAfterReplacement,
+            resourcesAtEnd: resourcesAtEnd)
+    }
 }
 
 func loadContinuousSwiftServiceDriver(
@@ -235,6 +480,55 @@ func loadContinuousSwiftServiceDriver(
 
 private func serviceClockSeconds() -> Double {
     ProcessInfo.processInfo.systemUptime
+}
+
+private func observedServiceTick(
+    _ coordinator: ContinuousBatchCoordinator
+) async throws -> (
+    remains: Bool,
+    tick: ServiceTickObservation,
+    memory: ServiceMemorySample
+) {
+    let remains = try await coordinator.runOneTick()
+    let events = await coordinator.takeExecutionTrace()
+    _ = await coordinator.takeTimingTrace()
+    let snapshots = await coordinator.snapshots()
+    let queued = snapshots.filter {
+        if case .queued = $0.phase { return true }
+        return false
+    }.count
+    return (
+        remains,
+        ServiceTickObservation(
+            activeSlots: snapshots.count - queued,
+            queuedSlots: queued,
+            operations: events.compactMap {
+                if case .operation(let operation) = $0 { return operation }
+                return nil
+            }),
+        serviceMemorySample())
+}
+
+private func collectServiceTokens(
+    _ stream: AsyncThrowingStream<Int, Error>
+) async throws -> [Int] {
+    var tokens: [Int] = []
+    for try await token in stream { tokens.append(token) }
+    return tokens
+}
+
+private func servicePhaseDescription(_ phase: BatchSlotPhase) -> String {
+    switch phase {
+    case .queued: "queued"
+    case .prefilling: "prefilling"
+    case .ready: "ready"
+    case .decoding: "decoding"
+    }
+}
+
+private func emittedTokenCount(_ phase: BatchSlotPhase) -> Int {
+    if case .decoding(let emittedTokens, _) = phase { return emittedTokens }
+    return 0
 }
 
 func serviceMemorySample() -> ServiceMemorySample {

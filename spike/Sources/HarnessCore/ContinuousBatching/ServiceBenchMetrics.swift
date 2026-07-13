@@ -122,6 +122,7 @@ public enum ServiceBenchMetricsError: Error, Sendable, Equatable {
     case tokenTimestampCountMismatch(tokens: Int, timestamps: Int)
     case emptyCancellationSamples
     case invalidCancellationTimeline(Int)
+    case invalidKeepaliveSeconds(Double)
     case insufficientMemorySamples
     case invalidMemorySample(Int)
     case zeroMemoryBaseline
@@ -370,6 +371,12 @@ public struct ServiceCancellationSummary: Sendable, Codable, Equatable {
     public let maxSeconds: Double
 }
 
+public struct ServiceCancellationGate: Sendable, Codable, Equatable {
+    public let keepaliveSeconds: Double
+    public let summary: ServiceCancellationSummary
+    public let withinKeepalive: Bool
+}
+
 public func summarizeCancellationLatencies(
     _ timelines: [ServiceCancellationTimeline]
 ) throws -> ServiceCancellationSummary {
@@ -389,6 +396,20 @@ public func summarizeCancellationLatencies(
         p50Seconds: quantile(values, 0.5),
         p95Seconds: quantile(values, 0.95),
         maxSeconds: values.max()!)
+}
+
+public func evaluateCancellationGate(
+    _ timelines: [ServiceCancellationTimeline],
+    keepaliveSeconds: Double
+) throws -> ServiceCancellationGate {
+    guard keepaliveSeconds.isFinite, keepaliveSeconds > 0 else {
+        throw ServiceBenchMetricsError.invalidKeepaliveSeconds(keepaliveSeconds)
+    }
+    let summary = try summarizeCancellationLatencies(timelines)
+    return ServiceCancellationGate(
+        keepaliveSeconds: keepaliveSeconds,
+        summary: summary,
+        withinKeepalive: summary.maxSeconds <= keepaliveSeconds)
 }
 
 public struct ServiceMemorySample: Sendable, Codable, Equatable {
