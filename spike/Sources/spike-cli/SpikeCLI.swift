@@ -237,6 +237,32 @@ struct SpikeCLI {
                 modelPath: modelPath, compiledSteps: steps, compileMode: compileMode,
                 batchSizes: batchSizes)
 
+        case "batch-stream-probe":
+            guard let modelPath = flags.string("model") else {
+                print(
+                    "usage: spike-cli batch-stream-probe --model <PATH> --max-tokens <N> --join-after <N> --prefill-chunk <N>"
+                )
+                exit(1)
+            }
+            await batchStreamProbe(
+                modelPath: modelPath,
+                maxTokens: flags.int("max-tokens", default: 16),
+                joinAfter: flags.int("join-after", default: 2),
+                prefillChunkSize: flags.int("prefill-chunk", default: 16))
+
+        case "batch-membership-probe":
+            guard let modelPath = flags.string("model") else {
+                print(
+                    "usage: spike-cli batch-membership-probe --model <PATH> --max-tokens <N> --cancel-after <N> --prefill-chunk <N>"
+                )
+                exit(1)
+            }
+            await batchMembershipProbe(
+                modelPath: modelPath,
+                maxTokens: flags.int("max-tokens", default: 8),
+                cancelAfter: flags.int("cancel-after", default: 2),
+                prefillChunkSize: flags.int("prefill-chunk", default: 16))
+
         default:
             print("spike ok: \(Spike.ok)")
         }

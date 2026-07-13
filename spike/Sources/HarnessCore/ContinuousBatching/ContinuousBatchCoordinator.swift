@@ -6,12 +6,23 @@ public struct ContinuousBatchRuntimePrefill: Sendable, Equatable {
     public let startToken: Int
     public let tokens: [Int]
     public let isFinal: Bool
+    public let totalPromptTokens: Int
+    public let maxOutputTokens: Int
 
-    public init(id: BatchRequestID, startToken: Int, tokens: [Int], isFinal: Bool) {
+    public init(
+        id: BatchRequestID,
+        startToken: Int,
+        tokens: [Int],
+        isFinal: Bool,
+        totalPromptTokens: Int,
+        maxOutputTokens: Int
+    ) {
         self.id = id
         self.startToken = startToken
         self.tokens = tokens
         self.isFinal = isFinal
+        self.totalPromptTokens = totalPromptTokens
+        self.maxOutputTokens = maxOutputTokens
     }
 }
 
@@ -35,15 +46,31 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
     }
 }
 
+public struct ContinuousBatchRuntimeAdmission: Sendable, Equatable {
+    public let id: BatchRequestID
+    public let submission: ContinuousBatchSubmission
+
+    public init(id: BatchRequestID, submission: ContinuousBatchSubmission) {
+        self.id = id
+        self.submission = submission
+    }
+}
+
 /// Synchronous runtime seam owned by `ContinuousBatchCoordinator`.
 ///
 /// The protocol deliberately is not `Sendable`: a production implementation owns MLX
 /// arrays, caches, and compiled functions. A `sending` initializer transfers that whole
 /// isolation region into the coordinator actor, and no runtime value crosses back out.
 public protocol ContinuousBatchRuntime: AnyObject {
+    func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws
     func decode(_ action: BatchDecodeAction) throws -> [ContinuousBatchRuntimeDecodeResult]
     func remove(_ id: BatchRequestID)
+}
+
+extension ContinuousBatchRuntime {
+    /// Runtimes with no additional capability or resource gate can accept scheduler-valid work.
+    public func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {}
 }
 
 public struct ContinuousBatchSubmission: Sendable, Equatable {
@@ -172,6 +199,10 @@ public actor ContinuousBatchCoordinator {
             ids.append(id)
             candidateNextID = rawID == UInt64.max ? nil : rawID + 1
         }
+        try runtime.admit(
+            zip(ids, submissions).map {
+                ContinuousBatchRuntimeAdmission(id: $0.0, submission: $0.1)
+            })
 
         var handles: [ContinuousBatchRequestHandle] = []
         handles.reserveCapacity(submissions.count)
@@ -304,7 +335,9 @@ public actor ContinuousBatchCoordinator {
                         id: slice.id,
                         startToken: slice.startToken,
                         tokens: Array(prompt[range]),
-                        isFinal: slice.endToken == prompt.count))
+                        isFinal: slice.endToken == prompt.count,
+                        totalPromptTokens: prompt.count,
+                        maxOutputTokens: state.submission.maxOutputTokens))
             }
         }
 

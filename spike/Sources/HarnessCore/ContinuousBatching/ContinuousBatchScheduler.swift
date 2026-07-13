@@ -51,11 +51,13 @@ public struct ContinuousBatchConfiguration: Sendable, Equatable {
     public let maxActiveSlots: Int
     public let maxPrefillSlots: Int
     public let prefillChunkSize: Int
+    public let maxQueuedRequests: Int
 
     public init(
         maxActiveSlots: Int,
         maxPrefillSlots: Int,
-        prefillChunkSize: Int
+        prefillChunkSize: Int,
+        maxQueuedRequests: Int = 256
     ) throws {
         guard maxActiveSlots > 0 else {
             throw ContinuousBatchSchedulerError.invalidMaxActiveSlots(maxActiveSlots)
@@ -72,9 +74,13 @@ public struct ContinuousBatchConfiguration: Sendable, Equatable {
         guard prefillChunkSize > 0 else {
             throw ContinuousBatchSchedulerError.invalidPrefillChunkSize(prefillChunkSize)
         }
+        guard maxQueuedRequests > 0 else {
+            throw ContinuousBatchSchedulerError.invalidMaxQueuedRequests(maxQueuedRequests)
+        }
         self.maxActiveSlots = maxActiveSlots
         self.maxPrefillSlots = maxPrefillSlots
         self.prefillChunkSize = prefillChunkSize
+        self.maxQueuedRequests = maxQueuedRequests
     }
 }
 
@@ -83,6 +89,8 @@ public enum ContinuousBatchSchedulerError: Error, Sendable, Equatable {
     case invalidMaxPrefillSlots(Int)
     case prefillSlotsExceedActive(prefill: Int, active: Int)
     case invalidPrefillChunkSize(Int)
+    case invalidMaxQueuedRequests(Int)
+    case queueCapacityExceeded(limit: Int)
     case duplicateRequest(BatchRequestID)
     case emptyPrompt(BatchRequestID)
     case invalidOutputBudget(BatchRequestID, Int)
@@ -276,6 +284,10 @@ public struct ContinuousBatchScheduler: Sendable {
                 request.id,
                 request.architecture
             )
+        }
+        guard queue.count < configuration.maxQueuedRequests else {
+            throw ContinuousBatchSchedulerError.queueCapacityExceeded(
+                limit: configuration.maxQueuedRequests)
         }
 
         slots[request.id] = Slot(

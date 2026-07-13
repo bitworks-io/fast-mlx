@@ -62,7 +62,8 @@ func batchShapeProbe(
             exit(1)
         }
 
-        try requireSupportedDenseModel(modelPath: modelPath)
+        _ = try DenseContinuousBatchModelProof.verifying(
+            modelDirectory: URL(fileURLWithPath: modelPath))
 
         // Keep the allocator cache bounded even when the bench host's wired limit is raised.
         Memory.cacheLimit = 8 << 30
@@ -389,24 +390,7 @@ private func argmaxIndex(_ values: [Float]) -> Int {
     values.indices.max { values[$0] < values[$1] } ?? 0
 }
 
-private struct BatchProbeModelConfiguration: Decodable {
-    let modelType: String
-
-    enum CodingKeys: String, CodingKey {
-        case modelType = "model_type"
-    }
-}
-
-private func requireSupportedDenseModel(modelPath: String) throws {
-    let url = URL(fileURLWithPath: modelPath).appendingPathComponent("config.json")
-    let configuration = try JSONDecoder().decode(
-        BatchProbeModelConfiguration.self, from: Data(contentsOf: url))
-    guard configuration.modelType == "qwen3" else {
-        throw BatchShapeProbeError.unsupportedArchitecture(configuration.modelType)
-    }
-}
-
-private func batchProbeHarnessSHA() throws -> String {
+func batchProbeHarnessSHA() throws -> String {
     if let environment = ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"]?
         .trimmingCharacters(in: .whitespacesAndNewlines),
         !environment.isEmpty, !environment.contains("\n")

@@ -25,12 +25,14 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
     private func configuration(
         active: Int = 4,
         prefill: Int = 2,
-        chunk: Int = 4
+        chunk: Int = 4,
+        queued: Int = 256
     ) -> ContinuousBatchConfiguration {
         try! ContinuousBatchConfiguration(
             maxActiveSlots: active,
             maxPrefillSlots: prefill,
-            prefillChunkSize: chunk
+            prefillChunkSize: chunk,
+            maxQueuedRequests: queued
         )
     }
 
@@ -115,6 +117,33 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
                 .invalidPrefillChunkSize(0)
             )
         }
+
+        XCTAssertThrowsError(
+            try ContinuousBatchConfiguration(
+                maxActiveSlots: 2, maxPrefillSlots: 1, prefillChunkSize: 4,
+                maxQueuedRequests: 0)
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousBatchSchedulerError,
+                .invalidMaxQueuedRequests(0)
+            )
+        }
+    }
+
+    func testQueueCapacityIsExplicitAndRejectsOverflowAtomically() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 1, prefill: 1, chunk: 1, queued: 2))
+        try scheduler.submit(request(1, promptTokens: 1))
+        try scheduler.submit(request(2, promptTokens: 1))
+
+        XCTAssertThrowsError(try scheduler.submit(request(3, promptTokens: 1))) { error in
+            XCTAssertEqual(
+                error as? ContinuousBatchSchedulerError,
+                .queueCapacityExceeded(limit: 2)
+            )
+        }
+        XCTAssertEqual(scheduler.queuedRequestIDs, [id(1), id(2)])
+        XCTAssertNil(scheduler.snapshot(for: id(3)))
     }
 
     func testSubmitFailsClosedForInvalidOrUnsupportedRequests() throws {
