@@ -91,6 +91,11 @@ promotion gates remain intentionally open in their individual task seeds.
 **Story:** the owner can decide whether the public Qwen3-32B EAGLE-3 checkpoint merits a
 production Swift port using authenticated, same-target Apple-Silicon evidence.
 
+**Verdict lane:** [`EXACT`](superpowers/verdicts/README.md). Its byte-identity failure is a
+speculative-decoding correctness failure, not a rejection of intentional `LOSSY_FRONTIER`
+tiers. Lossy techniques remain eligible when teacher-forced measurements quantify a useful
+speed/memory/capacity trade above the coherence/garbage floor.
+
 | Acceptance criterion | Verdict | Fresh evidence |
 | --- | --- | --- |
 | Accounting is unambiguous | **PASS** | 119 HarnessCore XCTest + 17 Swift Testing tests pass. `SpeculativeAcceptanceSummary` separates proposal acceptance, accepted drafts/round, and inclusive length; zero measured round time now returns no economics projection. `SpeculativeEconomics.swift`: 129 lines, 89.92% line coverage. |

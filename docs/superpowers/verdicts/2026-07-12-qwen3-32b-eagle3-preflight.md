@@ -6,12 +6,30 @@
   `dc84fe7ff1db31efa824776f49c141fc8195eb47`
 - **Targets:** authenticated Qwen3-32B 4-bit and 8-bit MLX checkpoints
 - **Hardware/runtime:** Apple M5 Max 128 GB; MLX 0.32.0; mlx-lm 0.29.1
-**Decision:** **SHELVE this production port. Do not start the Swift EAGLE path.**
+- **Evaluation lane:** [`EXACT`](README.md)—speculation may change execution cost, not the
+  greedy target result
+- **Decision:** **SHELVE this production port. Do not start the Swift EAGLE path.**
 
 The EAGLE head port is faithful, engaged, and apparently fast. It is also not exact. Both
 target pairings change the greedy byte stream on a 64-token code prompt. fast-mlx treats a
 lossy speculative path as a correctness bug, so Phase 0 stops before the multi-workload
 throughput bench and no speed number below is promotion evidence.
+
+## How to read this verdict
+
+This is an `EXACT`-lane failure, not a policy against lossy optimization. The fast-mlx dial is
+intended to offer real speed and capacity gains with real, quantified quality loss when an
+intentional approximation clears the coherence/garbage floor and occupies a useful point on
+the measured frontier. Weight/KV quantization, approximate attention, pruning, and selective
+cache policies belong in that `LOSSY_FRONTIER` lane.
+
+EAGLE-3 does not. Greedy speculative decoding claims to reproduce the base target while doing
+less target work; byte identity at temperature zero is therefore its correctness contract.
+The observed mismatch is shape/history-dependent target behavior, not a calibrated loss knob
+with a teacher-forced quality estimate. Relabeling it as lossy would also make the apparent
+rate invalid because the changed continuation can alter later work and stopping. A separately
+designed approximate decoder would be a new technique requiring its own lossy-frontier plan,
+quality measurements, and product guardrails.
 
 ## Gate results
 

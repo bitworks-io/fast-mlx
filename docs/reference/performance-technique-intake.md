@@ -2,7 +2,15 @@
 
 The **monitor-the-field front of the flywheel** (spec §1): candidate *external* techniques to evaluate + quantify through the harness, before deciding to promote or shelve. These are **unproven for fast-mlx** and vendor-numbers unless noted. Complements [`carry-forward-performance-backlog.md`](2026-07-08-carry-forward-performance-backlog.md) (proven Zig techniques already ours).
 
-**Process:** each candidate → implement behind a flag → run the equivalence/engagement/acceptance triad + dial/perf harness → **promote to a dial tier or shelve with a dated negative result.** Judge on *quantized/MoE* numbers (our real workloads), never bf16-small-model or vendor headlines. Do not adopt on an acceptance number without checking its denominator (DSpark lesson).
+**Process:** classify each candidate under the
+[`EXACT`, `LOSSY_FRONTIER`, or `EXPERIMENTAL` verdict contract](../superpowers/verdicts/README.md)
+→ implement behind a flag → run the lane-appropriate triad + quality/performance harness →
+**promote to a dial tier or shelve with a dated negative result.** Exact techniques must
+preserve their declared equivalence contract. Intentional approximations may trade real,
+quantified quality for speed, memory, power, or model fit as long as they remain above the
+garbage floor and are not dominated by a better configuration. Judge on *quantized/MoE*
+numbers (our real workloads), never bf16-small-model or vendor headlines. Do not adopt on an
+acceptance number without checking its denominator (DSpark lesson).
 
 ---
 

@@ -88,7 +88,13 @@ raw Qwen3-8B control tok/s with the product target. Reopen only under the recove
 verdict. The bounded recovery seed is
 [`2026-07-12-shape-stable-spec-verify.md`](task-inbox/2026-07-12-shape-stable-spec-verify.md).
 
-Every one runs the same loop: implement behind a flag → triad + precision-loss harness → **promote to a dial tier or shelve with a dated verdict** (`docs/superpowers/verdicts/`) → write a `docs/content/` piece.
+Every one runs the same loop: classify it as
+[`EXACT`, `LOSSY_FRONTIER`, or `EXPERIMENTAL`](superpowers/verdicts/README.md) → implement
+behind a flag → run the lane-appropriate triad + precision-loss/performance harness →
+**promote to a dial tier or shelve with a dated verdict** → write a `docs/content/` piece.
+`EXACT` failures are correctness failures; `LOSSY_FRONTIER` candidates may be promoted with
+real, quantified loss when they remain useful, non-catastrophic, and non-dominated. This is
+the optimization dial's informed-consent contract, not a zero-loss-only policy.
 
 ## For a Codex (OpenAI) agent picking this up
 

@@ -3,6 +3,9 @@
 **Date:** 2026-07-11 (plan 2026-07-09) · **Branch:** `feat/spec-decode` · **Box:** llmbench (M5 Max, 128GB)
 **Model:** Qwen3-32B-4bit (dense; fp16 KV) · **Params:** ngram=3, K=8, gate window=32 / min-accept=0.25/step / cooldown=16, lookback=4096
 **Evidence:** `harness-evidence.jsonl` (subcommands `verify-spec` + `bench` labels `pld-*`), `pld-shapes.csv`
+**Evaluation lane:** [`EXACT`](README.md)—PLD changes the amount of target work, never the
+temperature-zero greedy result. This byte-identity gate is specific to exact speculation; it
+does not prohibit measured quality loss in `LOSSY_FRONTIER` techniques.
 
 ## What was built (Tasks 1–6, all verified)
 

@@ -84,10 +84,18 @@ every emitted token: accept draft tokens only when the verifier agrees, otherwis
 verifier's token. That proof assumes the verifier used for the batched round represents the
 same target distribution as ordinary autoregressive decoding.
 
-Our product contract is stronger and more concrete: temperature-zero output must be
-byte-identical to the engine's base loop. Different numerical shapes can be mathematically
-close and still cross an argmax boundary. Once that happens, “the target approved every
-token” is not enough—the two target executions disagreed about which token the target wanted.
+Our product contract **for greedy speculative decoding** is stronger and more concrete:
+temperature-zero output must be byte-identical to the engine's base loop. Different numerical
+shapes can be mathematically close and still cross an argmax boundary. Once that happens,
+“the target approved every token” is not enough—the two target executions disagreed about
+which token the target wanted.
+
+That exactness rule is not a ban on lossy optimization. The fast-mlx dial is explicitly meant
+to offer quantization, compressed caches, approximate attention, and other tiers with real,
+teacher-forced quality loss when the speed, memory, or runs-at-all benefit is worth it. Those
+techniques have a measured quality frontier and a hard coherence/garbage floor. EAGLE was
+different: it promised the same target result, and its shape-dependent mismatch provided no
+stable or quantified loss control for a user to choose.
 
 There is also an economics trap. Published `acceptance_length` commonly includes the one
 target correction or bonus that every verify round emits. The quantity that pays for draft

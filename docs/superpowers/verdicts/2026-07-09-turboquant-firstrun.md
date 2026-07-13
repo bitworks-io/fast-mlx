@@ -5,6 +5,14 @@
 **Reference:** Qwen3-32B-bf16 via mlx-lm (fp16 KV), teacher-forced, `measurement-corpus-v2`
 **Baseline row:** same candidate weights with **fp16 KV** vs the same bf16 reference
 (harness-spine firstrun, Run 3): kl_median 1.945e-01, tail-p95 @24K **1.665 nats**, ppl **+21.37%**.
+**Evaluation lane:** [`LOSSY_FRONTIER`](README.md)—real quality loss is allowed when it buys a
+useful, measured speed/memory/capacity point above the garbage floor.
+
+This negative result is not a rejection of lossy tiers. `tqB3` is shelved because 4-bit affine
+provides better quality at nearly the same design size, so TurboQuant is dominated on the
+measured frontier. `tqB2` is shelved because its +488% perplexity and 10.09-nat long-context
+tail cross the catastrophic floor. A materially faster or smaller configuration with bounded,
+clearly reported loss would remain eligible for the user dial.
 
 ## What was built (Phase 1B → Task 7, all verified on-box)
 
