@@ -67,6 +67,8 @@ func batchShapeProbe(
         // Keep the allocator cache bounded even when the bench host's wired limit is raised.
         Memory.cacheLimit = 8 << 30
         let (model, tokenizer, _) = try await loadModelAndTokenizer(modelPath: modelPath)
+        let harnessSHA = try batchProbeHarnessSHA()
+        let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
         let promptText = [
             "Batch probe alpha.",
             "Batch probe beta has a different prompt length.",
@@ -97,12 +99,12 @@ func batchShapeProbe(
         }
 
         print(
-            "compile_mode,batch_size,prompt_lengths,compiled_steps,main_trace_count,membership_trace_count,first_compiled_ms,steady_p50_ms,max_initial_logit_delta,status"
+            "harness_sha,model,compile_mode,batch_size,prompt_lengths,compiled_steps,main_trace_count,membership_trace_count,first_compiled_ms,steady_p50_ms,max_initial_logit_delta,status"
         )
         for result in results {
             let lengths = result.promptLengths.map(String.init).joined(separator: ":")
             print(
-                "\(result.mode),\(result.batchSize),\(lengths),\(result.compiledSteps),\(result.mainTraceCount),\(result.membershipTraceCount),\(String(format: "%.3f", result.firstCompiledMilliseconds)),\(String(format: "%.3f", result.steadyP50Milliseconds)),\(String(format: "%.6f", result.maxInitialLogitDelta)),PASS"
+                "\(harnessSHA),\(modelName),\(result.mode),\(result.batchSize),\(lengths),\(result.compiledSteps),\(result.mainTraceCount),\(result.membershipTraceCount),\(String(format: "%.3f", result.firstCompiledMilliseconds)),\(String(format: "%.3f", result.steadyP50Milliseconds)),\(String(format: "%.6f", result.maxInitialLogitDelta)),PASS"
             )
         }
     } catch {
@@ -402,4 +404,21 @@ private func requireSupportedDenseModel(modelPath: String) throws {
     guard configuration.modelType == "qwen3" else {
         throw BatchShapeProbeError.unsupportedArchitecture(configuration.modelType)
     }
+}
+
+private func batchProbeHarnessSHA() throws -> String {
+    if let environment = ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+        !environment.isEmpty, !environment.contains("\n")
+    {
+        return environment
+    }
+    let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".harness-sha")
+    let stamped = try String(contentsOf: url, encoding: .utf8)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !stamped.isEmpty, !stamped.contains("\n") else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    return stamped
 }
