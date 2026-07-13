@@ -23,6 +23,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     private let reverseBatchResults: Bool
     private let omittedPromptHead: Int?
     private let speculativeSoloWidth: Int
+    private let resources: ContinuousBatchRuntimeResourceSnapshot?
     private var slots: [BatchRequestID: Slot] = [:]
     private var promptHeadByID: [BatchRequestID: Int] = [:]
 
@@ -30,13 +31,17 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         scriptsByPromptHead: [Int: [Int]],
         reverseBatchResults: Bool = false,
         omittedPromptHead: Int? = nil,
-        speculativeSoloWidth: Int = 1
+        speculativeSoloWidth: Int = 1,
+        resources: ContinuousBatchRuntimeResourceSnapshot? = nil
     ) {
         self.scriptsByPromptHead = scriptsByPromptHead
         self.reverseBatchResults = reverseBatchResults
         self.omittedPromptHead = omittedPromptHead
         self.speculativeSoloWidth = speculativeSoloWidth
+        self.resources = resources
     }
+
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { resources }
 
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
         var slot: Slot
@@ -505,5 +510,22 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertTrue(timestamp.isFinite)
         XCTAssertGreaterThan(timestamp, 0)
         XCTAssertTrue(second.isEmpty)
+    }
+
+    func testRuntimeResourceSnapshotCrossesActorBoundaryAsValue() async {
+        let expected = ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 262_144,
+            reservedKVBytes: 2_147_491_968,
+            maxReservedKVBytes: 34_359_738_368)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [:],
+                resources: expected),
+            automaticDrive: false)
+
+        let actual = await coordinator.runtimeResourceSnapshot()
+        XCTAssertEqual(actual, expected)
+        await coordinator.shutdown()
     }
 }

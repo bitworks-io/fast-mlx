@@ -56,6 +56,23 @@ public struct ContinuousBatchRuntimeAdmission: Sendable, Equatable {
     }
 }
 
+/// Value-only resource state exported by an actor-confined runtime for service evidence.
+public struct ContinuousBatchRuntimeResourceSnapshot: Sendable, Equatable, Codable {
+    public let kvBytesPerToken: Int
+    public let reservedKVBytes: Int
+    public let maxReservedKVBytes: Int
+
+    public init(
+        kvBytesPerToken: Int,
+        reservedKVBytes: Int,
+        maxReservedKVBytes: Int
+    ) {
+        self.kvBytesPerToken = kvBytesPerToken
+        self.reservedKVBytes = reservedKVBytes
+        self.maxReservedKVBytes = maxReservedKVBytes
+    }
+}
+
 /// Synchronous runtime seam owned by `ContinuousBatchCoordinator`.
 ///
 /// The protocol deliberately is not `Sendable`: a production implementation owns MLX
@@ -63,6 +80,7 @@ public struct ContinuousBatchRuntimeAdmission: Sendable, Equatable {
 /// isolation region into the coordinator actor, and no runtime value crosses back out.
 public protocol ContinuousBatchRuntime: AnyObject {
     func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot?
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws
     func decode(_ action: BatchDecodeAction) throws -> [ContinuousBatchRuntimeDecodeResult]
     func remove(_ id: BatchRequestID)
@@ -71,6 +89,7 @@ public protocol ContinuousBatchRuntime: AnyObject {
 extension ContinuousBatchRuntime {
     /// Runtimes with no additional capability or resource gate can accept scheduler-valid work.
     public func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {}
+    public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { nil }
 }
 
 public struct ContinuousBatchSubmission: Sendable, Equatable {
@@ -295,6 +314,10 @@ public actor ContinuousBatchCoordinator {
 
     public func snapshots() -> [BatchSlotSnapshot] {
         scheduler.snapshots
+    }
+
+    public func runtimeResourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
+        runtime.resourceSnapshot()
     }
 
     public func executionTrace() -> [ContinuousBatchCoordinatorEvent] {

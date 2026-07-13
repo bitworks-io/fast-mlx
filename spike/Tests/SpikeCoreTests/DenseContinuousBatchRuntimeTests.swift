@@ -37,7 +37,8 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
     private func makeRuntime(
         allocationChunk: Int = 4,
         maxContextTokens: Int = 32_768,
-        initialDecodeReserve: Int = 384
+        initialDecodeReserve: Int = 384,
+        maxReservedKVBytes: Int? = nil
     ) throws
         -> DenseContinuousBatchRuntime
     {
@@ -45,7 +46,8 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
             testing: TinyDenseLanguageModel(),
             allocationChunk: allocationChunk,
             maxContextTokens: maxContextTokens,
-            initialDecodeReserve: initialDecodeReserve)
+            initialDecodeReserve: initialDecodeReserve,
+            maxReservedKVBytes: maxReservedKVBytes)
     }
 
     private func prefill(
@@ -363,6 +365,135 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         let replacement = try await coordinator.submit(nineTokens)
         XCTAssertEqual(replacement.id, BatchRequestID(2))
         await coordinator.shutdown()
+    }
+
+    func testKVByteReservationRejectsAtomicallyAndReleasesOnRemoval() throws {
+        let submission = ContinuousBatchSubmission(
+            promptTokens: [10],
+            maxOutputTokens: 1,
+            eosToken: 2,
+            architecture: .denseAttention)
+        let admission = ContinuousBatchRuntimeAdmission(
+            id: BatchRequestID(1), submission: submission)
+        let rejected = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 199)
+
+        XCTAssertThrowsError(try rejected.admit([admission])) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError,
+                .aggregateKVByteLimitExceeded(requested: 200, limit: 199))
+        }
+        XCTAssertEqual(rejected.diagnostics().reservedKVBytes, 0)
+
+        let accepted = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 200)
+        try accepted.admit([admission])
+        XCTAssertEqual(accepted.diagnostics().reservedKVBytes, 200)
+        XCTAssertEqual(accepted.diagnostics().kvBytesPerToken, 8)
+        accepted.remove(BatchRequestID(1))
+        XCTAssertEqual(accepted.diagnostics().reservedKVBytes, 0)
+    }
+
+    func testKVGeometryCalibrationRejectsBeforeAdmissionReservation() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            model: TinyDenseLanguageModel(),
+            verifiedBy: .testing(
+                maxPositionEmbeddings: 16,
+                vocabularySize: 2_048,
+                keyValueHeadCount: 2),
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 1_000)
+        let admission = ContinuousBatchRuntimeAdmission(
+            id: BatchRequestID(1),
+            submission: ContinuousBatchSubmission(
+                promptTokens: [10],
+                maxOutputTokens: 1,
+                eosToken: 2,
+                architecture: .denseAttention))
+
+        XCTAssertThrowsError(try runtime.admit([admission])) { error in
+            guard let runtimeError = error as? DenseContinuousBatchRuntimeError,
+                case .cacheGeometryMismatch(let expectedHeads, _, _) = runtimeError
+            else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertEqual(expectedHeads, 2)
+        }
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 0)
+    }
+
+    func testRemovedBatchRowRetainsByteReservationUntilMembershipRebuild() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 400)
+        let submission = ContinuousBatchSubmission(
+            promptTokens: [10],
+            maxOutputTokens: 2,
+            eosToken: 2,
+            architecture: .denseAttention)
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(1), submission: submission),
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(2), submission: submission),
+        ])
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 2)
+        try prefill(runtime, id: 2, tokens: [10], chunks: [1], maxOutputTokens: 2)
+        _ = try runtime.decode(
+            .batch([BatchRequestID(1), BatchRequestID(2)], speculationAllowed: false))
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 400)
+
+        runtime.remove(BatchRequestID(2))
+        XCTAssertEqual(
+            runtime.diagnostics().reservedKVBytes,
+            400,
+            "old B=2 arrays remain live until the next membership boundary")
+
+        _ = try runtime.decode(.solo(BatchRequestID(1), speculationAllowed: false))
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 200)
+    }
+
+    func testMixedCapacitySurvivorRetainsPaddedPhysicalReservation() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 720)
+        let short = ContinuousBatchSubmission(
+            promptTokens: [10],
+            maxOutputTokens: 2,
+            eosToken: 2,
+            architecture: .denseAttention)
+        let long = ContinuousBatchSubmission(
+            promptTokens: [20, 21, 22, 23, 24],
+            maxOutputTokens: 2,
+            eosToken: 2,
+            architecture: .denseAttention)
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(1), submission: short),
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(2), submission: long),
+        ])
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 720)
+        try prefill(runtime, id: 1, tokens: short.promptTokens, chunks: [1], maxOutputTokens: 2)
+        try prefill(runtime, id: 2, tokens: long.promptTokens, chunks: [5], maxOutputTokens: 2)
+        _ = try runtime.decode(
+            .batch([BatchRequestID(1), BatchRequestID(2)], speculationAllowed: false))
+
+        runtime.remove(BatchRequestID(2))
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 720)
+        _ = try runtime.decode(.solo(BatchRequestID(1), speculationAllowed: false))
+        XCTAssertEqual(
+            runtime.diagnostics().reservedKVBytes,
+            360,
+            "the short survivor still owns a scalar cache padded to the removed row's capacity")
     }
 
     func testCoordinatorExecutesDecodeFirstDrainAndSharedBatchEndToEnd() async throws {

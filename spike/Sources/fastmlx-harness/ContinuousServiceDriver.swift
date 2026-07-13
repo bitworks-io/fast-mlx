@@ -11,6 +11,7 @@ enum ContinuousServiceDriverError: Error, CustomStringConvertible {
     case emptyBurst
     case emptyPrompt(Int)
     case invalidOutputBudget(Int)
+    case missingRuntimeResources
     case missingCompletionTiming(BatchRequestID)
     case tokenTimingCountMismatch(BatchRequestID, expected: Int, actual: Int)
 
@@ -22,6 +23,8 @@ enum ContinuousServiceDriverError: Error, CustomStringConvertible {
             return "continuous service prompt \(index) is empty"
         case .invalidOutputBudget(let budget):
             return "continuous service output budget must be positive; actual=\(budget)"
+        case .missingRuntimeResources:
+            return "continuous service runtime did not expose byte-admission resources"
         case .missingCompletionTiming(let id):
             return "continuous service request \(id.rawValue) has no actor completion timestamp"
         case .tokenTimingCountMismatch(let id, let expected, let actual):
@@ -36,6 +39,7 @@ struct ContinuousServiceLoadConfiguration: Sendable {
     let prefillChunkSize: Int
     let maxQueuedRequests: Int
     let maxReservedContextTokens: Int?
+    let maxReservedKVBytes: Int
     let traceLimit: Int
 
     init(
@@ -44,6 +48,7 @@ struct ContinuousServiceLoadConfiguration: Sendable {
         prefillChunkSize: Int,
         maxQueuedRequests: Int = 256,
         maxReservedContextTokens: Int? = nil,
+        maxReservedKVBytes: Int,
         traceLimit: Int
     ) {
         self.maxActiveSlots = maxActiveSlots
@@ -51,6 +56,7 @@ struct ContinuousServiceLoadConfiguration: Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.maxQueuedRequests = maxQueuedRequests
         self.maxReservedContextTokens = maxReservedContextTokens
+        self.maxReservedKVBytes = maxReservedKVBytes
         self.traceLimit = traceLimit
     }
 }
@@ -60,6 +66,7 @@ struct ContinuousServiceRunObservation: Sendable {
     let operations: ServiceOperationSummary
     let memory: ServiceMemorySummary
     let memorySamples: [ServiceMemorySample]
+    let resources: ContinuousBatchRuntimeResourceSnapshot
     let outputTokens: [[Int]]
 }
 
@@ -104,6 +111,9 @@ struct ContinuousSwiftServiceDriver: Sendable {
                     eosToken: eos,
                     architecture: .denseAttention)
             })
+        guard let resources = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
 
         var ticks: [ServiceTickObservation] = []
         var memory = [memoryStart]
@@ -181,6 +191,7 @@ struct ContinuousSwiftServiceDriver: Sendable {
             operations: summarizeServiceOperations(ticks),
             memory: try summarizeServiceMemory(memory),
             memorySamples: memory,
+            resources: resources,
             outputTokens: collected.map(\.tokens))
     }
 }
@@ -212,7 +223,8 @@ func loadContinuousSwiftServiceDriver(
     let runtime = try DenseContinuousBatchRuntime(
         model: context.model,
         verifiedBy: proof,
-        maxReservedContextTokens: configuration.maxReservedContextTokens)
+        maxReservedContextTokens: configuration.maxReservedContextTokens,
+        maxReservedKVBytes: configuration.maxReservedKVBytes)
     let coordinator = ContinuousBatchCoordinator(
         configuration: scheduler,
         runtime: runtime,

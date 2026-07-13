@@ -32,8 +32,9 @@ private struct ServiceBenchRunEvidence: Codable, Sendable {
     let run: Int
     let droppedWarmup: Bool
     let metrics: ServiceRunMetrics
-    let operations: ServiceOperationSummary
+    let operations: ServiceOperationSummary?
     let memory: ServiceMemorySummary
+    let resources: ContinuousBatchRuntimeResourceSnapshot?
     let speculative: ServiceSpecTelemetry?
 }
 
@@ -51,8 +52,9 @@ private struct ServiceSpecTelemetry: Codable, Sendable {
 
 private struct ServicePolicyRunObservation: Sendable {
     let metrics: ServiceRunMetrics
-    let operations: ServiceOperationSummary
+    let operations: ServiceOperationSummary?
     let memory: ServiceMemorySummary
+    let resources: ContinuousBatchRuntimeResourceSnapshot?
     let speculative: ServiceSpecTelemetry?
 }
 
@@ -76,6 +78,8 @@ private struct ServiceBenchPayload: Codable, Sendable {
     let maxActiveSlots: Int?
     let maxPrefillSlots: Int?
     let prefillChunkSize: Int?
+    let maxReservedContextTokens: Int?
+    let maxReservedKVBytes: Int?
     let maxOutputTokens: Int
     let memoryCacheLimitBytes: Int
     let aggregate: ServiceRunAggregate
@@ -97,7 +101,7 @@ private struct ServiceBenchCSVRow {
 func runServiceBench(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
         print(
-            "usage: fastmlx-harness service-bench --model <PATH> --policy <batch-no-spec|solo-pld> --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--evidence FILE]")
+            "usage: fastmlx-harness service-bench --model <PATH> --policy <batch-no-spec|solo-pld> --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--max-reserved-kv-bytes N] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--evidence FILE]")
         exit(2)
     }
 
@@ -127,6 +131,14 @@ func runServiceBench(_ flags: Flags) async {
                 "--runs/--max-tokens/--prefill-chunk must be positive and --max-prefill must be in 1...concurrency")
         }
         let maxReserved = try flags.optionalStrictInt("max-reserved-context-tokens")
+        let defaultKVByteLimit = Int(
+            min(ProvenanceCLI.ramBytes() / 4, UInt64(Int.max)))
+        let maxReservedKVBytes = try flags.optionalStrictInt("max-reserved-kv-bytes")
+            ?? defaultKVByteLimit
+        guard maxReservedKVBytes > 0 else {
+            throw ServiceBenchCLIError.invalidArguments(
+                "--max-reserved-kv-bytes must be positive")
+        }
         let traceLimit = max(1_024, concurrency * (maxTokens + 64) * 2)
         let ngram = try flags.strictInt("ngram", default: 3)
         let maxDraft = try flags.strictInt("max-draft", default: 8)
@@ -146,6 +158,7 @@ func runServiceBench(_ flags: Flags) async {
                     maxPrefillSlots: maxPrefill,
                     prefillChunkSize: prefillChunk,
                     maxReservedContextTokens: maxReserved,
+                    maxReservedKVBytes: maxReservedKVBytes,
                     traceLimit: traceLimit))
             tokenizer = loaded.tokenizer
             let driver = loaded.driver
@@ -156,6 +169,7 @@ func runServiceBench(_ flags: Flags) async {
                     metrics: observation.metrics,
                     operations: observation.operations,
                     memory: observation.memory,
+                    resources: observation.resources,
                     speculative: nil)
             }
         } else {
@@ -192,26 +206,29 @@ func runServiceBench(_ flags: Flags) async {
             }
             let expectedPromptTokens = prompts.map(\.count).reduce(0, +)
             if policy == "batch-no-spec" {
-                guard observation.operations.promptChunkCount == expectedChunks,
-                    observation.operations.promptTokensProcessed == expectedPromptTokens
+                guard let operations = observation.operations else {
+                    throw ServiceBenchCLIError.missingSharedBatch
+                }
+                guard operations.promptChunkCount == expectedChunks,
+                    operations.promptTokensProcessed == expectedPromptTokens
                 else {
                     throw ServiceBenchCLIError.promptAccounting(
                         expectedChunks: expectedChunks,
-                        actualChunks: observation.operations.promptChunkCount,
+                        actualChunks: operations.promptChunkCount,
                         expectedTokens: expectedPromptTokens,
-                        actualTokens: observation.operations.promptTokensProcessed)
+                        actualTokens: operations.promptTokensProcessed)
                 }
-                guard observation.operations.maxActiveSlots == concurrency else {
+                guard operations.maxActiveSlots == concurrency else {
                     throw ServiceBenchCLIError.activeSlotHighWatermark(
                         expected: concurrency,
-                        actual: observation.operations.maxActiveSlots)
+                        actual: operations.maxActiveSlots)
                 }
                 if concurrency > 1,
-                    !observation.operations.decodeBatchSizeHistogram.keys.contains(where: { $0 > 1 })
+                    !operations.decodeBatchSizeHistogram.keys.contains(where: { $0 > 1 })
                 {
                     throw ServiceBenchCLIError.missingSharedBatch
                 }
-                guard !observation.operations.speculationEngaged else {
+                guard !operations.speculationEngaged else {
                     throw ServiceBenchCLIError.batchedSpeculationEngaged
                 }
             }
@@ -221,7 +238,7 @@ func runServiceBench(_ flags: Flags) async {
                     + "ttft-p50=\(fmt(observation.metrics.ttft.p50Seconds * 1_000, 1))ms, "
                     + "ttft-p95=\(fmt(observation.metrics.ttft.p95Seconds * 1_000, 1))ms, "
                     + "jain=\(fmt(observation.metrics.jainCompletionRate, 4)), "
-                    + "batch-sizes=\(observation.operations.decodeBatchSizeHistogram)")
+                    + "batch-sizes=\(observation.operations.map { String(describing: $0.decodeBatchSizeHistogram) } ?? "n/a")")
             evidenceRuns.append(
                 ServiceBenchRunEvidence(
                     run: run,
@@ -229,6 +246,7 @@ func runServiceBench(_ flags: Flags) async {
                     metrics: observation.metrics,
                     operations: observation.operations,
                     memory: observation.memory,
+                    resources: observation.resources,
                     speculative: observation.speculative))
         }
 
@@ -278,6 +296,8 @@ func runServiceBench(_ flags: Flags) async {
             maxActiveSlots: policy == "batch-no-spec" ? concurrency : 1,
             maxPrefillSlots: policy == "batch-no-spec" ? maxPrefill : nil,
             prefillChunkSize: policy == "batch-no-spec" ? prefillChunk : nil,
+            maxReservedContextTokens: policy == "batch-no-spec" ? maxReserved : nil,
+            maxReservedKVBytes: policy == "batch-no-spec" ? maxReservedKVBytes : nil,
             maxOutputTokens: maxTokens,
             memoryCacheLimitBytes: 8 << 30,
             aggregate: aggregate,
@@ -361,17 +381,9 @@ private func runSoloPLDBurst(
     let accepted = total("spec_accepted")
     return ServicePolicyRunObservation(
         metrics: metrics,
-        operations: ServiceOperationSummary(
-            tickCount: 0,
-            maxActiveSlots: 1,
-            meanActiveSlots: 1,
-            maxQueuedSlots: max(0, prompts.count - 1),
-            decodeBatchSizeHistogram: [:],
-            promptChunkCount: 0,
-            promptTokensProcessed: 0,
-            drainCount: 0,
-            speculationEngaged: drafted > 0),
+        operations: nil,
         memory: try summarizeServiceMemory(memory),
+        resources: nil,
         speculative: ServiceSpecTelemetry(
             ngram: ngram,
             maxDraft: maxDraft,

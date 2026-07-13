@@ -7,22 +7,47 @@ import MLXLMCommon
 public struct DenseContinuousBatchModelProof: Sendable, Equatable {
     fileprivate let maxPositionEmbeddings: Int
     fileprivate let vocabularySize: Int
+    fileprivate let layerCount: Int
+    fileprivate let keyValueHeadCount: Int
+    fileprivate let headDimension: Int
+    fileprivate let elementBytes: Int
 
     private struct Configuration: Decodable {
         let modelType: String
         let maxPositionEmbeddings: Int
         let vocabularySize: Int
+        let layerCount: Int?
+        let keyValueHeadCount: Int?
+        let headDimension: Int?
+        let torchDtype: String?
+        let dtype: String?
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
             case maxPositionEmbeddings = "max_position_embeddings"
             case vocabularySize = "vocab_size"
+            case layerCount = "num_hidden_layers"
+            case keyValueHeadCount = "num_key_value_heads"
+            case headDimension = "head_dim"
+            case torchDtype = "torch_dtype"
+            case dtype
         }
     }
 
-    private init(maxPositionEmbeddings: Int, vocabularySize: Int) {
+    private init(
+        maxPositionEmbeddings: Int,
+        vocabularySize: Int,
+        layerCount: Int,
+        keyValueHeadCount: Int,
+        headDimension: Int,
+        elementBytes: Int
+    ) {
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.vocabularySize = vocabularySize
+        self.layerCount = layerCount
+        self.keyValueHeadCount = keyValueHeadCount
+        self.headDimension = headDimension
+        self.elementBytes = elementBytes
     }
 
     public static func verifying(modelDirectory: URL) throws -> Self {
@@ -38,20 +63,52 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
             throw DenseContinuousBatchRuntimeError.unsupportedModelFamily(
                 configuration.modelType)
         }
+        guard let layerCount = configuration.layerCount,
+            let keyValueHeadCount = configuration.keyValueHeadCount,
+            let headDimension = configuration.headDimension
+        else {
+            throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
+        let elementBytes: Int
+        switch configuration.torchDtype ?? configuration.dtype {
+        case "float16", "bfloat16": elementBytes = 2
+        case "float32": elementBytes = 4
+        default: throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
         guard configuration.maxPositionEmbeddings > 0,
             configuration.maxPositionEmbeddings <= Int(Int32.max),
             configuration.vocabularySize > 0,
-            configuration.vocabularySize <= Int(Int32.max)
+            configuration.vocabularySize <= Int(Int32.max),
+            layerCount > 0,
+            keyValueHeadCount > 0,
+            headDimension > 0
         else {
             throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
         }
         return Self(
             maxPositionEmbeddings: configuration.maxPositionEmbeddings,
-            vocabularySize: configuration.vocabularySize)
+            vocabularySize: configuration.vocabularySize,
+            layerCount: layerCount,
+            keyValueHeadCount: keyValueHeadCount,
+            headDimension: headDimension,
+            elementBytes: elementBytes)
     }
 
-    static func testing(maxPositionEmbeddings: Int, vocabularySize: Int) -> Self {
-        Self(maxPositionEmbeddings: maxPositionEmbeddings, vocabularySize: vocabularySize)
+    static func testing(
+        maxPositionEmbeddings: Int,
+        vocabularySize: Int,
+        layerCount: Int = 1,
+        keyValueHeadCount: Int = 1,
+        headDimension: Int = 1,
+        elementBytes: Int = 4
+    ) -> Self {
+        Self(
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            vocabularySize: vocabularySize,
+            layerCount: layerCount,
+            keyValueHeadCount: keyValueHeadCount,
+            headDimension: headDimension,
+            elementBytes: elementBytes)
     }
 }
 
@@ -61,6 +118,7 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     case invalidAllocationChunk(Int)
     case invalidContextLimit(Int)
     case invalidAggregateContextLimit(Int)
+    case invalidAggregateKVByteLimit(Int)
     case invalidInitialDecodeReserve(Int)
     case noCacheLayers
     case unknownRequest(BatchRequestID)
@@ -76,6 +134,11 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     case cacheLengthMismatch(BatchRequestID, expected: Int, actual: Int)
     case contextLimitExceeded(BatchRequestID, requested: Int, limit: Int)
     case aggregateContextLimitExceeded(requested: Int, limit: Int)
+    case aggregateKVByteLimitExceeded(requested: Int, limit: Int)
+    case kvByteAccountingOverflow
+    case modelLayerCountMismatch(expected: Int, actual: Int)
+    case cacheGeometryMismatch(expectedHeads: Int, expectedDimension: Int, actual: [Int])
+    case cacheElementSizeMismatch(expected: Int, actual: Int)
     case invalidTokenID(BatchRequestID, Int)
     case positionOverflow(BatchRequestID)
 }
@@ -84,6 +147,9 @@ struct DenseContinuousBatchRuntimeDiagnostics: Equatable {
     let batchTraceCount: Int
     let batchMembership: [BatchRequestID]
     let batchCapacity: Int?
+    let kvBytesPerToken: Int
+    let reservedKVBytes: Int
+    let maxReservedKVBytes: Int
 }
 
 /// Actor-confined dense MLX executor for `ContinuousBatchCoordinator`.
@@ -131,8 +197,16 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     private let initialDecodeReserve: Int
     private let vocabularySize: Int
     private let layerCount: Int
+    private let kvBytePlan: DenseKVByteAdmissionPlan
+    private let expectedKVHeads: Int
+    private let expectedKVHeadDimension: Int
+    private let expectedKVElementBytes: Int
+    private let maxReservedKVBytes: Int
     private var slots: [BatchRequestID: Slot] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
+    private var kvCapacityReservations: [BatchRequestID: Int] = [:]
+    private var reservedKVBytes = 0
+    private var cacheGeometryCalibrated = false
     private var batch: BatchState?
 
     package init(
@@ -141,7 +215,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         allocationChunk: Int = 256,
         maxContextTokens: Int? = nil,
         maxReservedContextTokens: Int? = nil,
-        initialDecodeReserve: Int = 384
+        initialDecodeReserve: Int = 384,
+        maxReservedKVBytes: Int? = nil
     ) throws {
         guard allocationChunk > 0 else {
             throw DenseContinuousBatchRuntimeError.invalidAllocationChunk(allocationChunk)
@@ -169,6 +244,27 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard layerCount > 0 else {
             throw DenseContinuousBatchRuntimeError.noCacheLayers
         }
+        guard layerCount == proof.layerCount else {
+            throw DenseContinuousBatchRuntimeError.modelLayerCountMismatch(
+                expected: proof.layerCount, actual: layerCount)
+        }
+        let kvBytePlan: DenseKVByteAdmissionPlan
+        do {
+            kvBytePlan = try DenseKVByteAdmissionPlan(
+                layerCount: proof.layerCount,
+                keyValueHeadCount: proof.keyValueHeadCount,
+                headDimension: proof.headDimension,
+                elementBytes: proof.elementBytes,
+                allocationChunk: allocationChunk,
+                maxContextTokens: resolvedContextLimit)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+        }
+        let resolvedKVByteLimit = maxReservedKVBytes ?? Int.max
+        guard resolvedKVByteLimit > 0 else {
+            throw DenseContinuousBatchRuntimeError.invalidAggregateKVByteLimit(
+                resolvedKVByteLimit)
+        }
         self.model = model
         self.allocationChunk = allocationChunk
         self.maxContextTokens = resolvedContextLimit
@@ -176,6 +272,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         self.initialDecodeReserve = initialDecodeReserve
         self.vocabularySize = proof.vocabularySize
         self.layerCount = layerCount
+        self.kvBytePlan = kvBytePlan
+        self.expectedKVHeads = proof.keyValueHeadCount
+        self.expectedKVHeadDimension = proof.headDimension
+        self.expectedKVElementBytes = proof.elementBytes
+        self.maxReservedKVBytes = resolvedKVByteLimit
     }
 
     convenience init(
@@ -183,7 +284,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         allocationChunk: Int = 256,
         maxContextTokens: Int = 32_768,
         maxReservedContextTokens: Int? = nil,
-        initialDecodeReserve: Int = 384
+        initialDecodeReserve: Int = 384,
+        maxReservedKVBytes: Int? = nil
     ) throws {
         try self.init(
             model: model,
@@ -193,11 +295,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             allocationChunk: allocationChunk,
             maxContextTokens: maxContextTokens,
             maxReservedContextTokens: maxReservedContextTokens,
-            initialDecodeReserve: initialDecodeReserve)
+            initialDecodeReserve: initialDecodeReserve,
+            maxReservedKVBytes: maxReservedKVBytes)
     }
 
     public func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
-        var additions: [(BatchRequestID, Int)] = []
+        var additions: [(BatchRequestID, tokens: Int, capacity: Int)] = []
         additions.reserveCapacity(admissions.count)
         for admission in admissions {
             let submission = admission.submission
@@ -209,12 +312,24 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 promptTokens: submission.promptTokens,
                 totalPromptTokens: submission.promptTokens.count,
                 maxOutputTokens: submission.maxOutputTokens)
+            let capacity: Int
+            do {
+                capacity = try kvBytePlan.reservedCapacity(
+                    promptTokens: submission.promptTokens.count,
+                    outputTokens: submission.maxOutputTokens)
+            } catch {
+                throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+            }
             additions.append(
-                (admission.id, submission.promptTokens.count + submission.maxOutputTokens))
+                (admission.id, submission.promptTokens.count + submission.maxOutputTokens, capacity))
+        }
+
+        if !additions.isEmpty {
+            try calibrateCacheGeometryIfNeeded()
         }
 
         var requested = contextReservations.values.reduce(0, +)
-        for (_, tokens) in additions {
+        for (_, tokens, _) in additions {
             let (next, overflow) = requested.addingReportingOverflow(tokens)
             guard !overflow, next <= maxReservedContextTokens else {
                 throw DenseContinuousBatchRuntimeError.aggregateContextLimitExceeded(
@@ -223,7 +338,24 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             requested = next
         }
-        for (id, tokens) in additions { contextReservations[id] = tokens }
+        var candidateCapacities = kvCapacityReservations
+        for (id, _, capacity) in additions { candidateCapacities[id] = capacity }
+        let requestedKVBytes: Int
+        do {
+            requestedKVBytes = try kvBytePlan.transitionEnvelopeBytes(
+                capacities: Array(candidateCapacities.values))
+        } catch {
+            throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+        }
+        guard requestedKVBytes <= maxReservedKVBytes else {
+            throw DenseContinuousBatchRuntimeError.aggregateKVByteLimitExceeded(
+                requested: requestedKVBytes, limit: maxReservedKVBytes)
+        }
+        for (id, tokens, capacity) in additions {
+            contextReservations[id] = tokens
+            kvCapacityReservations[id] = capacity
+        }
+        reservedKVBytes = requestedKVBytes
     }
 
     public func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
@@ -299,6 +431,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         let staged = argMax(logits[0..., -1, 0...], axis: -1)
         eval([staged] + caches.flatMap { $0.innerState() })
 
+        try validatePhysicalCacheGeometry(caches)
+
         for cache in caches {
             let actual = Int(cache.offsetArr.item(Int32.self))
             guard actual == endToken else {
@@ -345,17 +479,41 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     public func remove(_ id: BatchRequestID) {
         contextReservations[id] = nil
         slots[id] = nil
-        guard let batch else { return }
-        if !batch.ids.contains(where: { slots[$0] != nil }) {
-            self.batch = nil
+
+        guard let batch else {
+            kvCapacityReservations[id] = nil
+            recomputeReservedKVBytes()
+            return
         }
+        let removedBatchedRow = batch.ids.contains(id)
+        let hasLiveBatchedRow = batch.ids.contains(where: { slots[$0] != nil })
+        if !hasLiveBatchedRow {
+            self.batch = nil
+            pruneKVReservationsToLiveSlots()
+        } else if !removedBatchedRow {
+            kvCapacityReservations[id] = nil
+            recomputeReservedKVBytes()
+        }
+        // A removed row of a still-live batch remains physically allocated until the next
+        // membership rebuild. Keep its KV byte reservation until ensureBatch/ensureScalar
+        // releases the old batch arrays.
     }
 
     func diagnostics() -> DenseContinuousBatchRuntimeDiagnostics {
         DenseContinuousBatchRuntimeDiagnostics(
             batchTraceCount: batch?.traceCounter.count ?? 0,
             batchMembership: batch?.ids ?? [],
-            batchCapacity: batch?.caches.first?.capacity)
+            batchCapacity: batch?.caches.first?.capacity,
+            kvBytesPerToken: kvBytePlan.bytesPerToken,
+            reservedKVBytes: reservedKVBytes,
+            maxReservedKVBytes: maxReservedKVBytes)
+    }
+
+    public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
+        ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: kvBytePlan.bytesPerToken,
+            reservedKVBytes: reservedKVBytes,
+            maxReservedKVBytes: maxReservedKVBytes)
     }
 
     private func decodeScalar(
@@ -484,6 +642,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.scalarTraceCounter = nil
         slots[id] = slot
         self.batch = nil
+        recordPhysicalKVCapacity(caches[0].capacity, for: [id])
+        pruneKVReservationsToLiveSlots()
     }
 
     private func ensureBatch(_ ids: [BatchRequestID]) throws {
@@ -551,6 +711,76 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.hasPendingSoloLookahead = false
             slots[id] = slot
         }
+        recordPhysicalKVCapacity(caches[0].capacity, for: ids)
+        pruneKVReservationsToLiveSlots()
+    }
+
+    private func calibrateCacheGeometryIfNeeded() throws {
+        guard !cacheGeometryCalibrated else { return }
+
+        let caches = (0 ..< layerCount).map { _ in CompiledKVCache(capacity: 1) }
+        let modelCaches: [any KVCache] = caches.map { $0 }
+        let token = MLXArray([Int32(0)]).reshaped([1, 1])
+        let logits = model(token, cache: modelCaches)
+        eval([logits] + caches.flatMap { $0.innerState() })
+        try validatePhysicalCacheGeometry(caches)
+        cacheGeometryCalibrated = true
+    }
+
+    private func validatePhysicalCacheGeometry(_ caches: [CompiledKVCache]) throws {
+        guard caches.count == layerCount else {
+            throw DenseContinuousBatchRuntimeError.modelLayerCountMismatch(
+                expected: layerCount, actual: caches.count)
+        }
+        for cache in caches {
+            guard let keys = cache.keysBuf, let values = cache.valuesBuf else {
+                throw DenseContinuousBatchRuntimeError.cacheGeometryMismatch(
+                    expectedHeads: expectedKVHeads,
+                    expectedDimension: expectedKVHeadDimension,
+                    actual: [])
+            }
+            guard keys.shape.count == 4,
+                values.shape == keys.shape,
+                keys.dim(1) == expectedKVHeads,
+                keys.dim(3) == expectedKVHeadDimension
+            else {
+                throw DenseContinuousBatchRuntimeError.cacheGeometryMismatch(
+                    expectedHeads: expectedKVHeads,
+                    expectedDimension: expectedKVHeadDimension,
+                    actual: keys.shape + [-1] + values.shape)
+            }
+            guard keys.itemSize == expectedKVElementBytes,
+                values.itemSize == expectedKVElementBytes
+            else {
+                throw DenseContinuousBatchRuntimeError.cacheElementSizeMismatch(
+                    expected: expectedKVElementBytes,
+                    actual: keys.itemSize == expectedKVElementBytes
+                        ? values.itemSize : keys.itemSize)
+            }
+        }
+    }
+
+    private func pruneKVReservationsToLiveSlots() {
+        kvCapacityReservations = kvCapacityReservations.filter { slots[$0.key] != nil }
+        recomputeReservedKVBytes()
+    }
+
+    private func recomputeReservedKVBytes() {
+        reservedKVBytes = (try? kvBytePlan.transitionEnvelopeBytes(
+            capacities: Array(kvCapacityReservations.values))) ?? maxReservedKVBytes
+    }
+
+    private func recordPhysicalKVCapacity(
+        _ capacity: Int,
+        for ids: [BatchRequestID]
+    ) {
+        var changed = false
+        for id in ids {
+            guard let reserved = kvCapacityReservations[id], capacity > reserved else { continue }
+            kvCapacityReservations[id] = capacity
+            changed = true
+        }
+        if changed { recomputeReservedKVBytes() }
     }
 
     private func makeScalarStep(
@@ -604,6 +834,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         let growth = roundedGrowth(required: required, capacity: capacity)
         for cache in caches { cache.grow(by: growth) }
+        recordPhysicalKVCapacity(caches[0].capacity, for: [id])
         slot.scalarStep = nil
         slot.scalarTraceCounter = nil
     }
@@ -632,6 +863,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         eval([batch.stagedTokens] + batch.caches.flatMap { $0.innerState() })
         let growth = roundedGrowth(required: required, capacity: capacity)
         for cache in batch.caches { cache.grow(by: growth) }
+        recordPhysicalKVCapacity(batch.caches[0].capacity, for: batch.ids)
         batch.step = nil
     }
 
