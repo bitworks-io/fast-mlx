@@ -1,11 +1,11 @@
 ---
-status: captured
+status: active
 type: engine-feature
 priority: high
 created: 2026-07-12
 source: carry-forward-plus-sol-audit
 planning_ready: true
-implementation_ready: false
+implementation_ready: true
 ---
 
 # Continuous batching with decode-first chunked prefill
@@ -49,5 +49,7 @@ thrash. A small `shapeless` compile probe belongs inside this plan, not as an as
 
 ## Next Step
 
-Design slot/cache ownership and the pure scheduler state machine first; TDD the transition,
-cancellation, admission, and fairness rules before connecting MLX batch caches.
+Execute the architecture and measurement
+[plan](../superpowers/plans/2026-07-12-continuous-batching-chunked-prefill.md): TDD the pure
+scheduler state machine first, then pass the dense batch-cache/shape probe before connecting
+the actor-confined MLX executor.
