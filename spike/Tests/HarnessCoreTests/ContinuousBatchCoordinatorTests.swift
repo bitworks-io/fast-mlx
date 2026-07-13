@@ -463,4 +463,47 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         let remaining = await coordinator.snapshots()
         XCTAssertTrue(remaining.isEmpty)
     }
+
+    func testTakeExecutionTraceReturnsCommittedEventsOnce() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(scriptsByPromptHead: [10: [101, 2]]),
+            automaticDrive: false,
+            traceLimit: 16)
+        _ = try await coordinator.submit(submission([10]))
+        _ = try await coordinator.runOneTick()
+
+        let first = await coordinator.takeExecutionTrace()
+        let second = await coordinator.takeExecutionTrace()
+
+        XCTAssertEqual(
+            first,
+            [.operation(.prefill(BatchPrefillSlice(id: BatchRequestID(1), startToken: 0, count: 1)))])
+        XCTAssertTrue(second.isEmpty)
+    }
+
+    func testTakeTimingTraceStampsActorYieldBoundaryAndClearsInterval() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(scriptsByPromptHead: [10: [101, 2]]),
+            automaticDrive: false,
+            traceLimit: 16)
+        let handle = try await coordinator.submit(submission([10]))
+        _ = try await coordinator.runOneTick() // prefill only
+        let prefillTiming = await coordinator.takeTimingTrace()
+        XCTAssertTrue(prefillTiming.isEmpty)
+
+        _ = try await coordinator.runOneTick() // one visible token
+        let first = await coordinator.takeTimingTrace()
+        let second = await coordinator.takeTimingTrace()
+
+        XCTAssertEqual(first.count, 1)
+        guard case .emitted(let id, let timestamp) = first[0] else {
+            return XCTFail("expected emitted timing event, got \(first[0])")
+        }
+        XCTAssertEqual(id, handle.id)
+        XCTAssertTrue(timestamp.isFinite)
+        XCTAssertGreaterThan(timestamp, 0)
+        XCTAssertTrue(second.isEmpty)
+    }
 }

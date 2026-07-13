@@ -22,6 +22,27 @@ struct Flags {
     func string(_ key: String, default def: String) -> String { values[key] ?? def }
     func string(_ key: String) -> String? { values[key] }
     func int(_ key: String, default def: Int) -> Int { values[key].flatMap(Int.init) ?? def }
+    func strictInt(_ key: String, default def: Int) throws -> Int {
+        guard let raw = values[key] else { return def }
+        guard let value = Int(raw) else { throw FlagValueError.invalidInteger(key: key, value: raw) }
+        return value
+    }
+    func optionalStrictInt(_ key: String) throws -> Int? {
+        guard let raw = values[key] else { return nil }
+        guard let value = Int(raw) else { throw FlagValueError.invalidInteger(key: key, value: raw) }
+        return value
+    }
+}
+
+enum FlagValueError: Error, CustomStringConvertible {
+    case invalidInteger(key: String, value: String)
+
+    var description: String {
+        switch self {
+        case .invalidInteger(let key, let value):
+            return "--\(key) requires an integer; actual=\(value)"
+        }
+    }
 }
 
 /// Known-good prompts from the spike's equivalence work (see 2026-07-08-swift-spike-verdict.md):
@@ -734,6 +755,7 @@ struct Harness {
         case "corpus": runCorpus()
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
+        case "service-bench": await runServiceBench(flags)
         case "kl": await runKL(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
@@ -763,6 +785,11 @@ struct Harness {
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
+          service-bench --model <PATH>        aggregate service frontier (Release builds only)
+                 --policy batch-no-spec       exact continuous-batch arm
+                 --scenario burst             simultaneous admission (initial measured scenario)
+                 --concurrency 1|2|4|8         aggregate + per-request TTFT/TPOT/fairness
+                 [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

@@ -119,6 +119,13 @@ public enum ContinuousBatchCoordinatorEvent: Sendable, Equatable {
     case failed(String)
 }
 
+/// Monotonic service-availability timestamps captured immediately before stream publication.
+/// Kept separate from the operation trace so measurement events cannot evict exactness events.
+public enum ContinuousBatchTimingEvent: Sendable, Equatable {
+    case emitted(BatchRequestID, timestamp: Double)
+    case finished(BatchRequestID, timestamp: Double)
+}
+
 /// MLX-free orchestration actor around the pure scheduler.
 ///
 /// One tick is one transaction with no suspension point: execute decode first, execute bounded
@@ -144,6 +151,7 @@ public actor ContinuousBatchCoordinator {
     private let automaticDrive: Bool
     private let traceLimit: Int
     private var trace: [ContinuousBatchCoordinatorEvent] = []
+    private var timingTrace: [ContinuousBatchTimingEvent] = []
     private var requests: [BatchRequestID: RequestState] = [:]
     private var nextRequestID: UInt64? = 1
     private var driveTask: Task<Void, Never>?
@@ -293,6 +301,20 @@ public actor ContinuousBatchCoordinator {
         trace
     }
 
+    /// Returns only this measurement interval's committed trace. Clearing is actor-isolated,
+    /// so a later run cannot accidentally report operations from an earlier warmup/burst.
+    public func takeExecutionTrace() -> [ContinuousBatchCoordinatorEvent] {
+        let result = trace
+        trace.removeAll(keepingCapacity: true)
+        return result
+    }
+
+    public func takeTimingTrace() -> [ContinuousBatchTimingEvent] {
+        let result = timingTrace
+        timingTrace.removeAll(keepingCapacity: true)
+        return result
+    }
+
     public func isShutDown() -> Bool { shuttingDown }
 
     private func ensureAutomaticDrive() {
@@ -393,10 +415,18 @@ public actor ContinuousBatchCoordinator {
         for result in prepared {
             guard var state = requests[result.id] else { continue }
             for token in result.visibleTokens {
+                recordTiming(
+                    .emitted(
+                        result.id,
+                        timestamp: ProcessInfo.processInfo.systemUptime))
                 state.continuation.yield(token)
             }
             state.emittedTokens += result.visibleTokens.count
             if result.finished {
+                recordTiming(
+                    .finished(
+                        result.id,
+                        timestamp: ProcessInfo.processInfo.systemUptime))
                 state.continuation.finish()
                 runtime.remove(result.id)
                 requests[result.id] = nil
@@ -423,6 +453,15 @@ public actor ContinuousBatchCoordinator {
         trace.append(event)
         if trace.count > traceLimit {
             trace.removeFirst(trace.count - traceLimit)
+        }
+    }
+
+
+    private func recordTiming(_ event: ContinuousBatchTimingEvent) {
+        guard traceLimit > 0 else { return }
+        timingTrace.append(event)
+        if timingTrace.count > traceLimit {
+            timingTrace.removeFirst(timingTrace.count - traceLimit)
         }
     }
 }
