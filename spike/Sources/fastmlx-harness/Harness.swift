@@ -769,6 +769,7 @@ struct Harness {
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
+        case "service-soak": await runServiceSoakBench(flags)
         case "kl": await runKL(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
@@ -809,6 +810,9 @@ struct Harness {
           service-state-poison-bench --model <PATH> exact A/B/A recovery gate (Release only)
                  [--runs 3] [--concurrency 4] [--max-tokens 64]
                  [--prefill-chunk 16] [--keepalive-ms 1000]
+          service-soak --model <PATH> --progress <FILE> resident mixed-workload soak
+                 [--duration-seconds 86400] [--concurrency 4] [--max-tokens 64]
+                 [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

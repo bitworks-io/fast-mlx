@@ -126,6 +126,10 @@ public enum ServiceBenchMetricsError: Error, Sendable, Equatable {
     case insufficientMemorySamples
     case invalidMemorySample(Int)
     case zeroMemoryBaseline
+    case insufficientSoakCycles
+    case soakSampleCountMismatch(memory: Int, cycles: Int, responsiveness: Int)
+    case invalidSoakLimit
+    case invalidResponsivenessSample(Int)
 }
 
 public struct VisibleServiceTokenStream: Sendable, Equatable {
@@ -514,4 +518,121 @@ public func summarizeServiceMemory(
         maxMLXActiveBytes: samples.map(\.mlxActiveBytes).max()!,
         maxMLXCacheBytes: samples.map(\.mlxCacheBytes).max()!,
         maxMLXPeakBytes: samples.map(\.mlxPeakBytes).max()!)
+}
+
+/// Stability gate for a resident-process soak. Sample 0 is cold/model-load state; sample 1 is
+/// the completed warmup cycle and is the RSS baseline. Correctness and responsiveness still
+/// include the warmup cycle—only the memory-growth baseline drops cold-start effects.
+public struct ServiceSoakGate: Sendable, Codable, Equatable {
+    public let baselineSampleIndex: Int
+    public let cycleCount: Int
+    public let measuredCycleCount: Int
+    public let baselineRSSBytes: UInt64
+    public let endRSSBytes: UInt64
+    public let maxRSSBytes: UInt64
+    public let endRSSDriftPercent: Double
+    public let maxRSSDriftPercent: Double
+    public let rssDriftLimitPercent: Double
+    public let maxResponsivenessSeconds: Double
+    public let responsivenessLimitSeconds: Double
+    public let allCyclesPassed: Bool
+    public let rssWithinLimit: Bool
+    public let responsive: Bool
+    public let passed: Bool
+}
+
+public func evaluateServiceSoakGate(
+    memorySamples: [ServiceMemorySample],
+    cyclePassed: [Bool],
+    responsivenessSeconds: [Double],
+    maxRSSDriftPercent: Double,
+    responsivenessLimitSeconds: Double
+) throws -> ServiceSoakGate {
+    guard cyclePassed.count >= 2 else {
+        throw ServiceBenchMetricsError.insufficientSoakCycles
+    }
+    guard memorySamples.count == cyclePassed.count + 1,
+        responsivenessSeconds.count == cyclePassed.count
+    else {
+        throw ServiceBenchMetricsError.soakSampleCountMismatch(
+            memory: memorySamples.count,
+            cycles: cyclePassed.count,
+            responsiveness: responsivenessSeconds.count)
+    }
+    guard maxRSSDriftPercent.isFinite, maxRSSDriftPercent >= 0,
+        responsivenessLimitSeconds.isFinite, responsivenessLimitSeconds > 0
+    else {
+        throw ServiceBenchMetricsError.invalidSoakLimit
+    }
+    _ = try summarizeServiceMemory(memorySamples)
+    for (index, seconds) in responsivenessSeconds.enumerated()
+    where !seconds.isFinite || seconds < 0 {
+        throw ServiceBenchMetricsError.invalidResponsivenessSample(index)
+    }
+
+    let baselineIndex = 1
+    let baseline = memorySamples[baselineIndex].physicalFootprintBytes
+    guard baseline > 0 else { throw ServiceBenchMetricsError.zeroMemoryBaseline }
+    let postWarmup = memorySamples[baselineIndex...]
+    let end = memorySamples.last!.physicalFootprintBytes
+    let peak = postWarmup.map(\.physicalFootprintBytes).max()!
+    return try evaluateServiceSoakSummary(
+        cycleCount: cyclePassed.count,
+        allCyclesPassed: cyclePassed.allSatisfy { $0 },
+        baselineRSSBytes: baseline,
+        endRSSBytes: end,
+        maxRSSBytes: peak,
+        maxResponsivenessSeconds: responsivenessSeconds.max()!,
+        maxRSSDriftPercent: maxRSSDriftPercent,
+        responsivenessLimitSeconds: responsivenessLimitSeconds)
+}
+
+/// Bounded-memory form used by long resident soaks. The caller retains running maxima and
+/// correctness instead of every detailed cycle, preventing the harness from becoming the leak.
+public func evaluateServiceSoakSummary(
+    cycleCount: Int,
+    allCyclesPassed: Bool,
+    baselineRSSBytes: UInt64,
+    endRSSBytes: UInt64,
+    maxRSSBytes: UInt64,
+    maxResponsivenessSeconds: Double,
+    maxRSSDriftPercent: Double,
+    responsivenessLimitSeconds: Double
+) throws -> ServiceSoakGate {
+    guard cycleCount >= 2 else { throw ServiceBenchMetricsError.insufficientSoakCycles }
+    guard baselineRSSBytes > 0 else { throw ServiceBenchMetricsError.zeroMemoryBaseline }
+    guard maxResponsivenessSeconds.isFinite, maxResponsivenessSeconds >= 0 else {
+        throw ServiceBenchMetricsError.invalidResponsivenessSample(0)
+    }
+    guard maxRSSDriftPercent.isFinite, maxRSSDriftPercent >= 0,
+        responsivenessLimitSeconds.isFinite, responsivenessLimitSeconds > 0
+    else {
+        throw ServiceBenchMetricsError.invalidSoakLimit
+    }
+    // Fail closed if a caller's running maximum is stale: the terminal sample is itself a
+    // sampled footprint and therefore must participate in the gated peak.
+    let peak = max(baselineRSSBytes, max(maxRSSBytes, endRSSBytes))
+    func drift(_ value: UInt64) -> Double {
+        (Double(value) - Double(baselineRSSBytes)) / Double(baselineRSSBytes) * 100
+    }
+    let endDrift = drift(endRSSBytes)
+    let peakDrift = drift(peak)
+    let rssWithinLimit = peakDrift <= maxRSSDriftPercent
+    let responsive = maxResponsivenessSeconds <= responsivenessLimitSeconds
+    return ServiceSoakGate(
+        baselineSampleIndex: 1,
+        cycleCount: cycleCount,
+        measuredCycleCount: cycleCount - 1,
+        baselineRSSBytes: baselineRSSBytes,
+        endRSSBytes: endRSSBytes,
+        maxRSSBytes: peak,
+        endRSSDriftPercent: endDrift,
+        maxRSSDriftPercent: peakDrift,
+        rssDriftLimitPercent: maxRSSDriftPercent,
+        maxResponsivenessSeconds: maxResponsivenessSeconds,
+        responsivenessLimitSeconds: responsivenessLimitSeconds,
+        allCyclesPassed: allCyclesPassed,
+        rssWithinLimit: rssWithinLimit,
+        responsive: responsive,
+        passed: allCyclesPassed && rssWithinLimit && responsive)
 }

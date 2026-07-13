@@ -14,14 +14,14 @@ private enum ServiceStatePoisonBenchError: Error, CustomStringConvertible {
     }
 }
 
-private struct ServiceStatePoisonArmEvidence: Codable, Sendable {
+struct ServiceStatePoisonArmEvidence: Codable, Sendable {
     let metrics: ServiceRunMetrics
     let operations: ServiceOperationSummary
     let memory: ServiceMemorySummary
     let resourcesAtAdmission: ContinuousBatchRuntimeResourceSnapshot
 }
 
-private struct ServiceStatePoisonHostileEvidence: Codable, Sendable {
+struct ServiceStatePoisonHostileEvidence: Codable, Sendable {
     let cancellationLatencySeconds: Double
     let previousPhase: String
     let slotRemoved: Bool
@@ -36,6 +36,7 @@ private struct ServiceStatePoisonHostileEvidence: Codable, Sendable {
     let survivorOutputTokens: Int
     let replacementOutputTokens: Int
     let operations: ServiceOperationSummary
+    let memory: ServiceMemorySummary
     let resourcesAtAdmission: ContinuousBatchRuntimeResourceSnapshot
     let resourcesBeforeCancellation: ContinuousBatchRuntimeResourceSnapshot
     let resourcesAfterCancellation: ContinuousBatchRuntimeResourceSnapshot
@@ -43,7 +44,7 @@ private struct ServiceStatePoisonHostileEvidence: Codable, Sendable {
     let resourcesAtEnd: ContinuousBatchRuntimeResourceSnapshot
 }
 
-private struct ServiceStatePoisonRunEvidence: Codable, Sendable {
+struct ServiceStatePoisonRunEvidence: Codable, Sendable {
     let run: Int
     let droppedWarmup: Bool
     let goodPromptTokenCounts: [Int]
@@ -143,110 +144,25 @@ func runServiceStatePoisonBench(_ flags: Flags) async {
         var cancellationTimelines: [ServiceCancellationTimeline] = []
 
         for run in 0 ... runs {
-            let goodPrompts = serviceStatePoisonGoodPrompts(
-                tokenizer: tokenizer,
-                concurrency: concurrency,
-                run: run,
-                nonce: workloadNonce)
-            let hostilePrompts = serviceStatePoisonHostilePrompts(
+            let cycle = try await runServiceStatePoisonCycle(
+                driver: driver,
                 tokenizer: tokenizer,
                 concurrency: concurrency,
                 run: run,
                 nonce: workloadNonce,
-                longRepeat: hostileLongRepeat)
-            var sequenceSamples = [serviceMemorySample()]
-            let before = try await driver.runBurst(
-                prompts: goodPrompts,
-                maxOutputTokens: maxTokens)
-            sequenceSamples.append(serviceMemorySample())
-            guard let resourcesAfterBefore = await driver.coordinator.runtimeResourceSnapshot()
-            else {
-                throw ServiceStatePoisonBenchError.gateFailed
-            }
-            let hostile = try await driver.runCancellationRecovery(
-                prompts: hostilePrompts,
                 maxOutputTokens: maxTokens,
-                cancellationWaitLimitSeconds: max(1, Double(keepaliveMS) / 500))
-            sequenceSamples.append(serviceMemorySample())
-            let after = try await driver.runBurst(
-                prompts: goodPrompts,
-                maxOutputTokens: maxTokens)
-            sequenceSamples.append(serviceMemorySample())
-            guard let resourcesAtEnd = await driver.coordinator.runtimeResourceSnapshot() else {
-                throw ServiceStatePoisonBenchError.gateFailed
-            }
-
-            let outputGate = evaluateServiceStatePoisonRecovery(
-                before: decodedServiceOutputBytes(before.outputTokens, tokenizer: tokenizer),
-                after: decodedServiceOutputBytes(after.outputTokens, tokenizer: tokenizer))
-            let beforeStructural = serviceStatePoisonArmPassed(
-                before,
-                prompts: goodPrompts,
-                concurrency: concurrency,
-                prefillChunk: prefillChunk)
-            let afterStructural = serviceStatePoisonArmPassed(
-                after,
-                prompts: goodPrompts,
-                concurrency: concurrency,
-                prefillChunk: prefillChunk)
-            let hostileStructural = hostile.previousPhase == "decoding"
-                && hostile.slotRemoved
-                && hostile.cancellationEventObserved
-                && hostile.repeatedCancellationNotFound
-                && hostile.initialActiveRequestCount == concurrency
-                && hostile.replacementWasQueued
-                && hostile.replacementSlotReused
-                && hostile.sharedBatchObserved
-                && hostile.decodeFirstInterleaveObserved
-                && hostile.resourcesAfterCancellation.reservedKVBytes
-                    == hostile.resourcesBeforeCancellation.reservedKVBytes
-                && hostile.resourcesAtEnd.reservedKVBytes == 0
-            let structuralPassed = beforeStructural && hostileStructural && afterStructural
-                && resourcesAfterBefore.reservedKVBytes == 0
-                && resourcesAtEnd.reservedKVBytes == 0
-            let evidence = ServiceStatePoisonRunEvidence(
-                run: run,
-                droppedWarmup: run == 0,
-                goodPromptTokenCounts: goodPrompts.map(\.count),
-                hostilePromptTokenCounts: hostilePrompts.map(\.count),
-                before: statePoisonArmEvidence(before),
-                resourcesAfterBefore: resourcesAfterBefore,
-                hostile: ServiceStatePoisonHostileEvidence(
-                    cancellationLatencySeconds: hostile.timeline.removedAt
-                        - hostile.timeline.requestedAt,
-                    previousPhase: hostile.previousPhase,
-                    slotRemoved: hostile.slotRemoved,
-                    cancellationEventObserved: hostile.cancellationEventObserved,
-                    repeatedCancellationNotFound: hostile.repeatedCancellationNotFound,
-                    initialActiveRequestCount: hostile.initialActiveRequestCount,
-                    replacementWasQueued: hostile.replacementWasQueued,
-                    replacementSlotReused: hostile.replacementSlotReused,
-                    sharedBatchObserved: hostile.sharedBatchObserved,
-                    decodeFirstInterleaveObserved: hostile.decodeFirstInterleaveObserved,
-                    cancelledPrefixTokens: hostile.cancelledPrefixTokens,
-                    survivorOutputTokens: hostile.survivorOutputTokens,
-                    replacementOutputTokens: hostile.replacementOutputTokens,
-                    operations: hostile.operations,
-                    resourcesAtAdmission: hostile.resourcesAtAdmission,
-                    resourcesBeforeCancellation: hostile.resourcesBeforeCancellation,
-                    resourcesAfterCancellation: hostile.resourcesAfterCancellation,
-                    resourcesAfterReplacement: hostile.resourcesAfterReplacement,
-                    resourcesAtEnd: hostile.resourcesAtEnd),
-                after: statePoisonArmEvidence(after),
-                sequenceMemory: try summarizeServiceMemory(sequenceSamples),
-                resourcesAtEnd: resourcesAtEnd,
-                outputGate: outputGate,
-                structuralPassed: structuralPassed,
-                passed: structuralPassed && outputGate.passed)
-            evidenceRuns.append(evidence)
-            cancellationTimelines.append(hostile.timeline)
+                prefillChunk: prefillChunk,
+                keepaliveMS: keepaliveMS,
+                hostileLongRepeat: hostileLongRepeat)
+            evidenceRuns.append(cycle.evidence)
+            cancellationTimelines.append(cycle.cancellationTimeline)
             print(
                 "# \(run == 0 ? "warmup (dropped)" : "run \(run)"): "
-                    + "A=\(fmt(before.metrics.aggregateTokensPerSecond, 2)) tok/s, "
-                    + "B-cancel=\(fmt(evidence.hostile.cancellationLatencySeconds * 1_000, 3))ms, "
-                    + "A'=\(fmt(after.metrics.aggregateTokensPerSecond, 2)) tok/s, "
-                    + "bytes=\(outputGate.byteIdentical ? "MATCH" : "MISMATCH"), "
-                    + "kv-end=\(resourcesAtEnd.reservedKVBytes)")
+                    + "A=\(fmt(cycle.evidence.before.metrics.aggregateTokensPerSecond, 2)) tok/s, "
+                    + "B-cancel=\(fmt(cycle.evidence.hostile.cancellationLatencySeconds * 1_000, 3))ms, "
+                    + "A'=\(fmt(cycle.evidence.after.metrics.aggregateTokensPerSecond, 2)) tok/s, "
+                    + "bytes=\(cycle.evidence.outputGate.byteIdentical ? "MATCH" : "MISMATCH"), "
+                    + "kv-end=\(cycle.evidence.resourcesAtEnd.reservedKVBytes)")
         }
 
         let cancellationGate = try evaluateCancellationGate(
@@ -306,6 +222,128 @@ func runServiceStatePoisonBench(_ flags: Flags) async {
     }
 }
 
+struct ServiceStatePoisonCycleResult: Sendable {
+    let evidence: ServiceStatePoisonRunEvidence
+    let cancellationTimeline: ServiceCancellationTimeline
+}
+
+func runServiceStatePoisonCycle(
+    driver: ContinuousSwiftServiceDriver,
+    tokenizer: MLXLMCommon.Tokenizer,
+    concurrency: Int,
+    run: Int,
+    nonce: String,
+    maxOutputTokens: Int,
+    prefillChunk: Int,
+    keepaliveMS: Int,
+    hostileLongRepeat: Int,
+    stageHeartbeat: ((String, ServiceMemorySample) throws -> Void)? = nil
+) async throws -> ServiceStatePoisonCycleResult {
+    let goodPrompts = serviceStatePoisonGoodPrompts(
+        tokenizer: tokenizer,
+        concurrency: concurrency,
+        run: run,
+        nonce: nonce)
+    let hostilePrompts = serviceStatePoisonHostilePrompts(
+        tokenizer: tokenizer,
+        concurrency: concurrency,
+        run: run,
+        nonce: nonce,
+        longRepeat: hostileLongRepeat)
+    var sequenceSamples = [serviceMemorySample()]
+    let before = try await driver.runBurst(
+        prompts: goodPrompts,
+        maxOutputTokens: maxOutputTokens)
+    let afterBeforeSample = serviceMemorySample()
+    sequenceSamples.append(afterBeforeSample)
+    try stageHeartbeat?("after-a", afterBeforeSample)
+    guard let resourcesAfterBefore = await driver.coordinator.runtimeResourceSnapshot() else {
+        throw ServiceStatePoisonBenchError.gateFailed
+    }
+    let hostile = try await driver.runCancellationRecovery(
+        prompts: hostilePrompts,
+        maxOutputTokens: maxOutputTokens,
+        cancellationWaitLimitSeconds: max(1, Double(keepaliveMS) / 500))
+    let afterHostileSample = serviceMemorySample()
+    sequenceSamples.append(afterHostileSample)
+    try stageHeartbeat?("after-hostile", afterHostileSample)
+    let after = try await driver.runBurst(
+        prompts: goodPrompts,
+        maxOutputTokens: maxOutputTokens)
+    let afterRecoverySample = serviceMemorySample()
+    sequenceSamples.append(afterRecoverySample)
+    try stageHeartbeat?("after-a-prime", afterRecoverySample)
+    guard let resourcesAtEnd = await driver.coordinator.runtimeResourceSnapshot() else {
+        throw ServiceStatePoisonBenchError.gateFailed
+    }
+
+    let outputGate = evaluateServiceStatePoisonRecovery(
+        before: decodedServiceOutputBytes(before.outputTokens, tokenizer: tokenizer),
+        after: decodedServiceOutputBytes(after.outputTokens, tokenizer: tokenizer))
+    let beforeStructural = serviceStatePoisonArmPassed(
+        before,
+        prompts: goodPrompts,
+        concurrency: concurrency,
+        prefillChunk: prefillChunk)
+    let afterStructural = serviceStatePoisonArmPassed(
+        after,
+        prompts: goodPrompts,
+        concurrency: concurrency,
+        prefillChunk: prefillChunk)
+    let hostileStructural = hostile.previousPhase == "decoding"
+        && hostile.slotRemoved
+        && hostile.cancellationEventObserved
+        && hostile.repeatedCancellationNotFound
+        && hostile.initialActiveRequestCount == concurrency
+        && hostile.replacementWasQueued
+        && hostile.replacementSlotReused
+        && hostile.sharedBatchObserved
+        && hostile.decodeFirstInterleaveObserved
+        && hostile.resourcesAfterCancellation.reservedKVBytes
+            == hostile.resourcesBeforeCancellation.reservedKVBytes
+        && hostile.resourcesAtEnd.reservedKVBytes == 0
+    let structuralPassed = beforeStructural && hostileStructural && afterStructural
+        && resourcesAfterBefore.reservedKVBytes == 0
+        && resourcesAtEnd.reservedKVBytes == 0
+    return ServiceStatePoisonCycleResult(
+        evidence: ServiceStatePoisonRunEvidence(
+            run: run,
+            droppedWarmup: run == 0,
+            goodPromptTokenCounts: goodPrompts.map(\.count),
+            hostilePromptTokenCounts: hostilePrompts.map(\.count),
+            before: statePoisonArmEvidence(before),
+            resourcesAfterBefore: resourcesAfterBefore,
+            hostile: ServiceStatePoisonHostileEvidence(
+                cancellationLatencySeconds: hostile.timeline.removedAt
+                    - hostile.timeline.requestedAt,
+                previousPhase: hostile.previousPhase,
+                slotRemoved: hostile.slotRemoved,
+                cancellationEventObserved: hostile.cancellationEventObserved,
+                repeatedCancellationNotFound: hostile.repeatedCancellationNotFound,
+                initialActiveRequestCount: hostile.initialActiveRequestCount,
+                replacementWasQueued: hostile.replacementWasQueued,
+                replacementSlotReused: hostile.replacementSlotReused,
+                sharedBatchObserved: hostile.sharedBatchObserved,
+                decodeFirstInterleaveObserved: hostile.decodeFirstInterleaveObserved,
+                cancelledPrefixTokens: hostile.cancelledPrefixTokens,
+                survivorOutputTokens: hostile.survivorOutputTokens,
+                replacementOutputTokens: hostile.replacementOutputTokens,
+                operations: hostile.operations,
+                memory: hostile.memory,
+                resourcesAtAdmission: hostile.resourcesAtAdmission,
+                resourcesBeforeCancellation: hostile.resourcesBeforeCancellation,
+                resourcesAfterCancellation: hostile.resourcesAfterCancellation,
+                resourcesAfterReplacement: hostile.resourcesAfterReplacement,
+                resourcesAtEnd: hostile.resourcesAtEnd),
+            after: statePoisonArmEvidence(after),
+            sequenceMemory: try summarizeServiceMemory(sequenceSamples),
+            resourcesAtEnd: resourcesAtEnd,
+            outputGate: outputGate,
+            structuralPassed: structuralPassed,
+            passed: structuralPassed && outputGate.passed),
+        cancellationTimeline: hostile.timeline)
+}
+
 private func serviceStatePoisonGoodPrompts(
     tokenizer: MLXLMCommon.Tokenizer,
     concurrency: Int,
@@ -316,7 +354,7 @@ private func serviceStatePoisonGoodPrompts(
         "Chat: explain why bounded admission matters for an on-device language model.",
         "Agent recall: remember marker ORCHID-17, then state the marker and its number.",
         "Tool request: return one JSON object with keys action and safety_check.",
-        "Swift completion: func clamp(_ value: Int, lower: Int, upper: Int) -> Int {",
+        "Anthropic messages style: provide a concise assistant response with no tool call.",
     ]
     return (0 ..< concurrency).map { request in
         tokenizer.encode(
@@ -357,7 +395,7 @@ private func serviceStatePoisonHostilePrompts(
     return prompts
 }
 
-private func serviceStatePoisonModelContextLimit(_ modelPath: String) throws -> Int {
+func serviceStatePoisonModelContextLimit(_ modelPath: String) throws -> Int {
     struct ModelLimits: Decodable {
         let maxPositionEmbeddings: Int
 

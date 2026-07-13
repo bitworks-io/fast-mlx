@@ -227,6 +227,77 @@ final class ServiceBenchMetricsTests: XCTestCase {
         XCTAssertFalse(empty.passed)
     }
 
+    func testSoakGateUsesPostWarmupRSSAndSeparateResponsiveness() throws {
+        func sample(_ timestamp: Double, _ rss: UInt64) -> ServiceMemorySample {
+            ServiceMemorySample(
+                timestamp: timestamp,
+                physicalFootprintBytes: rss,
+                mlxActiveBytes: 10,
+                mlxCacheBytes: 5,
+                mlxPeakBytes: 15)
+        }
+        let passing = try evaluateServiceSoakGate(
+            memorySamples: [sample(0, 100), sample(1, 120), sample(2, 124), sample(3, 123)],
+            cyclePassed: [true, true, true],
+            responsivenessSeconds: [0.5, 0.7, 0.6],
+            maxRSSDriftPercent: 5,
+            responsivenessLimitSeconds: 1)
+        XCTAssertEqual(passing.baselineSampleIndex, 1)
+        XCTAssertEqual(passing.measuredCycleCount, 2)
+        XCTAssertEqual(passing.maxRSSDriftPercent, 100.0 / 30.0, accuracy: 1e-12)
+        XCTAssertTrue(passing.rssWithinLimit)
+        XCTAssertTrue(passing.responsive)
+        XCTAssertTrue(passing.allCyclesPassed)
+        XCTAssertTrue(passing.passed)
+
+        let bounded = try evaluateServiceSoakSummary(
+            cycleCount: 4,
+            allCyclesPassed: true,
+            baselineRSSBytes: 120,
+            endRSSBytes: 123,
+            maxRSSBytes: 130,
+            maxResponsivenessSeconds: 0.7,
+            maxRSSDriftPercent: 5,
+            responsivenessLimitSeconds: 1)
+        XCTAssertEqual(bounded.measuredCycleCount, 3)
+        XCTAssertEqual(bounded.maxRSSBytes, 130)
+        XCTAssertFalse(bounded.rssWithinLimit)
+        XCTAssertFalse(bounded.passed)
+
+        let stalePeak = try evaluateServiceSoakSummary(
+            cycleCount: 3,
+            allCyclesPassed: true,
+            baselineRSSBytes: 100,
+            endRSSBytes: 120,
+            maxRSSBytes: 102,
+            maxResponsivenessSeconds: 0.5,
+            maxRSSDriftPercent: 5,
+            responsivenessLimitSeconds: 1)
+        XCTAssertEqual(stalePeak.maxRSSBytes, 120)
+        XCTAssertEqual(stalePeak.maxRSSDriftPercent, 20, accuracy: 1e-12)
+        XCTAssertFalse(stalePeak.rssWithinLimit)
+        XCTAssertFalse(stalePeak.passed)
+
+        let failing = try evaluateServiceSoakGate(
+            memorySamples: [sample(0, 100), sample(1, 120), sample(2, 130)],
+            cyclePassed: [true, false],
+            responsivenessSeconds: [0.5, 1.1],
+            maxRSSDriftPercent: 5,
+            responsivenessLimitSeconds: 1)
+        XCTAssertFalse(failing.rssWithinLimit)
+        XCTAssertFalse(failing.responsive)
+        XCTAssertFalse(failing.allCyclesPassed)
+        XCTAssertFalse(failing.passed)
+
+        XCTAssertThrowsError(
+            try evaluateServiceSoakGate(
+                memorySamples: [sample(0, 100), sample(1, 120)],
+                cyclePassed: [true],
+                responsivenessSeconds: [],
+                maxRSSDriftPercent: 5,
+                responsivenessLimitSeconds: 1))
+    }
+
     func testNormalizesTerminalEOSWithoutCountingItAsVisibleServiceOutput() throws {
         let normalized = try normalizeVisibleServiceTokens(
             tokens: [10, 11, 2],
