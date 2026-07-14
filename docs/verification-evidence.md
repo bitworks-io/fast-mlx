@@ -236,3 +236,34 @@ scanning pass.
 full weight contents. The canonical frontier is one simultaneous-burst prompt shape on one
 Apple box. Production routing, real network disconnect propagation, sampled generation,
 additional dense families, and MoE/hybrid/recurrent/vision layouts remain separate work.
+
+## KVarN Phase 0 evidence-contract acceptance pass — 2026-07-14
+
+**Story:** a bench operator can record exploratory KV-quality rows, but cannot promote a dial cell
+unless the row proves same weights, context-locked 24K quality, canonical format geometry, honest
+actual storage, clean provenance, and durable append-only persistence.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Typed identity and comparison contract | **PASS** | `KLPayload` and `KVFrontierEvidence` bind matrix/cell identity, candidate/reference config and checkpoint-manifest hashes, same-weights fp16-KV baseline, canonical tier geometry, corpus identity, and the outer result provenance. Historical optional fields still decode. |
+| Teacher-forced quality cannot be mislabeled | **PASS** | New rows require finite context-locked top-1 evidence plus short and long cohorts. Promotion requires a distribution actually scored at context depth >=24,000; a shallow custom `long-context` tag fails closed. The available perplexity, long-tail, and top-1 garbage-floor predicates are enforced before persistence. |
+| Storage claims fail closed | **PASS** | The validator reconstructs the predicted allocation from `KVStorageFormat`, rejects fabricated or mismatched breakdowns, and requires predicted bytes to equal actual bytes for promotion. Until Phase 2 supplies real arrays, promotion exits 1 with `missingFormat` and writes no artifact. |
+| Evidence persistence is durable under contention | **PASS** | The writer rejects corrupt/partial prior rows, opens without following symlinks, holds an exclusive file lock across validation and `O_APPEND`, and synchronizes before success. A 128-writer regression preserves 128 unique, decodable rows. |
+| Clean-SHA Apple proof | **PASS** | Commit `e1a3cff6cc95ffcd980cc8e05709fdb0ab7edc39` was stamped by the sync script. Xcode passes 48/48 `SpikeCoreTests`; the Release harness builds. Qwen3-4B same-weights fp16-KV scores the five-entry v2 corpus through a 24,150-token context and writes one schema-valid exploratory row; the corresponding promotion run refuses to write. |
+
+**Pure verification:** focused evidence/provenance/quality tests 28/28; full HarnessCore run 211
+XCTest + 17 Swift Testing, zero failures. Line coverage: `KVFrontierEvidence.swift` 93.63%,
+`Provenance.swift` 85.12%, `QualityMetric.swift` 87.50%. Final focused re-review: no issues.
+Diff check, banned-concurrency scan, and staged gitleaks scan pass.
+
+**Bench artifact hashes:** Xcode test log
+`e1fb2f34004490f76d3e973b443e6ef1a79db08250b970ccfdbcb1f3c01a96e9`; Release build log
+`34a9ec8a7f0a51edb548d43c993a99e3edb4d7cbe7d4b100ab26945d5471634c`; provenance
+`7f726e19b5262e105033ff765886095b0c8fc78f08832edc5eda6bdfa90e0396`; exploratory JSONL
+`edbce7dfc17a3b7d14f0049a29daa6dd41d80067c83e4b988ca63dbabd481716`; exploratory log
+`11744e02b897fd92d66c36b8a9035c6d775ef0ddb8e9f5982a8dea60bcd31435`; promotion-refusal log
+`bcf8c4290d2df7f9ea9b3d749c4421e0b56c7956f0f21a853cc320e9516672d4`.
+
+**Boundary:** this closes only the Phase 0 evidence gate. It is not an affine/KVarN performance
+or capacity result. Phase 2 must reconcile native MLX array bytes—including compile-control state
+and materialization workspace—before any dial cell can become promotion-eligible.

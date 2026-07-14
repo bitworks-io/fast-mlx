@@ -90,9 +90,26 @@ or if all KVarN cells fail the floor.
 - [x] Generate a deterministic reference fixture with the pinned KVarN pure PyTorch functions.
   Record source commit, script hash, explicit iteration count, input, packed bytes, fp16 metadata,
   and reconstruction values. Do not import the upstream vLLM fork as a runtime dependency.
-- [ ] Move the KL evidence payload into testable pure code and add `sameWeights`, reference model
+- [x] Move the KL evidence payload into testable pure code and add `sameWeights`, reference model
   config/checkpoint hash, matrix ID, cell ID, format geometry, actual storage bytes, and comparison
   baseline. Switch the promotion path to fail-closed evidence writing.
+
+Phase 0 evidence proof (2026-07-14): commit `e1a3cff6cc95ffcd980cc8e05709fdb0ab7edc39`
+makes candidate/reference identity, same-weights baseline, matrix/cell identity, canonical format
+geometry, predicted-versus-actual storage, short/long cohort counts, deepest actually scored context,
+teacher-forced top-1, quality floors, clean SHA, and runtime/corpus provenance one typed validation
+boundary. It also serializes appenders while validating and synchronizing JSONL, so concurrent
+promotion jobs cannot silently lose rows. The final pure run passes 211 XCTest + 17 Swift Testing
+tests; the focused evidence slice passes 28/28. Final line coverage is 93.63% for
+`KVFrontierEvidence`, 85.12% for `Provenance`, and 87.50% for `QualityMetric`. Independent focused
+review found no remaining issue.
+
+The clean-SHA bench pass builds Release and passes 48/48 `SpikeCoreTests` through Xcode. A
+same-checkpoint Qwen3-4B fp16-KV smoke records all five corpus entries, including distributions
+actually scored at a 24,150-token context; its exploratory JSONL validates. The identical
+`--promotion-evidence true` run exits 1 with `missingFormat` and creates no JSONL because Phase 2
+has not yet connected real cache-array geometry/bytes. This is the intended boundary: Phase 0
+proves that incomplete evidence cannot be promoted; it does not manufacture an affine result.
 
 ### Phase 1 — pure format/reference layer, test first
 
