@@ -217,6 +217,52 @@ struct SpikeCLI {
             let runs = flags.int("runs", default: 3)
             await bench(modelPath: modelPath, prompt: prompt, maxTokens: maxTokens, runs: runs, engine: engine)
 
+        case "batch-probe":
+            guard let modelPath = flags.string("model") else {
+                print(
+                    "usage: spike-cli batch-probe --model <PATH> --steps <N> --compile-mode <fixed|shapeless|both> --batch-sizes <1,2,4,7,8>"
+                )
+                exit(1)
+            }
+            let steps = flags.int("steps", default: 8)
+            let compileMode = flags.string("compile-mode", default: "both")
+            let batchSizeFields = flags.string("batch-sizes", default: "1,2,4,7,8")
+                .split(separator: ",")
+            guard batchSizeFields.allSatisfy({ Int($0) != nil }) else {
+                print("batch-probe FAILED: --batch-sizes must contain only integers")
+                exit(1)
+            }
+            let batchSizes = batchSizeFields.map { Int($0)! }
+            await batchShapeProbe(
+                modelPath: modelPath, compiledSteps: steps, compileMode: compileMode,
+                batchSizes: batchSizes)
+
+        case "batch-stream-probe":
+            guard let modelPath = flags.string("model") else {
+                print(
+                    "usage: spike-cli batch-stream-probe --model <PATH> --max-tokens <N> --join-after <N> --prefill-chunk <N>"
+                )
+                exit(1)
+            }
+            await batchStreamProbe(
+                modelPath: modelPath,
+                maxTokens: flags.int("max-tokens", default: 16),
+                joinAfter: flags.int("join-after", default: 2),
+                prefillChunkSize: flags.int("prefill-chunk", default: 16))
+
+        case "batch-membership-probe":
+            guard let modelPath = flags.string("model") else {
+                print(
+                    "usage: spike-cli batch-membership-probe --model <PATH> --max-tokens <N> --cancel-after <N> --prefill-chunk <N>"
+                )
+                exit(1)
+            }
+            await batchMembershipProbe(
+                modelPath: modelPath,
+                maxTokens: flags.int("max-tokens", default: 8),
+                cancelAfter: flags.int("cancel-after", default: 2),
+                prefillChunkSize: flags.int("prefill-chunk", default: 16))
+
         default:
             print("spike ok: \(Spike.ok)")
         }

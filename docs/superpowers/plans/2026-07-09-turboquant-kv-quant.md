@@ -2,7 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. **Route engine/MLX tasks (Phase 1B onward) to `deep-reasoner` (fable), not `builder`** — prior MLX-coupled engine work (compiled decode, teacher-forcing) exceeded the builder tier and had to be re-routed up. Pure off-box tasks (Phase 1A) are `builder`-appropriate.
 
-**Goal:** Implement Google TurboQuant (arXiv:2504.19874) as a custom KV-cache quantizer in the fast-mlx Swift engine, and measure its precision-loss/size frontier against the established 4-bit-affine-vs-bf16 baseline — the flywheel's first genuinely novel technique.
+**Goal:** Implement Google TurboQuant (arXiv:2504.19874) as a custom KV-cache quantizer in the fast-mlx Swift engine, and measure its precision-loss/size frontier against the established 4-bit-weights/fp16-KV-vs-bf16 reference row — the flywheel's first genuinely novel technique.
+
+> **Evidence clarification — 2026-07-14:** the completed run never measured an ordinary
+> affine-KV quality row. The 1.665-nat / +21.4% row is 4-bit weights with fp16 KV versus bf16.
+> Affine appeared only as theoretical packed-byte accounting. The KVarN/asymmetric cycle owns
+> the missing same-weights affine-KV comparator; historical gates below should be read with
+> that correction.
 
 **Architecture:** TurboQuant_prod = a dense-Haar rotation + a non-uniform Lloyd-Max LUT quantizer (`b` base bits) + a 1-bit QJL sign-residual that makes the inner-product estimator unbiased-in-expectation. MLX's native `quantize` is affine-only and cannot represent this, so it's a fully custom build. v1 uses **materialize-then-attend** (dequant stored K/V to full precision, then the existing fused SDPA) — this keeps the KV-cache *storage* win; the attention-bandwidth win via a fused dequant-in-SDPA kernel is explicit backlog. Correctness is proven in a pure/off-box codebook layer + on-box mathematical-property tests, then integrated into `CompiledKVCache`, then run through the hardened harness.
 
@@ -23,7 +29,7 @@
 **Honest naming:** v1 is *uniform* `(b base + 1 QJL)` = `b+1` bits/element (a `b=2` tier is ~3-bit/element, `b=3` is ~4-bit/element). The paper's "2.5-bit / 3.5-bit" labels require the deferred outlier-channel mixing, so internal tiers are named **`tqB2`** (2 base + QJL) and **`tqB3`** (3 base + QJL); they occupy the harness's `tq2.5`/`tq3.5` recording slots with a documented note that the sub-integer labels await outlier channels. **Never report a `tqB3` result under a "2.5-bit" label.**
 
 **Scheduled spikes (decision points inside the phases, not hand-waves):**
-- **Spike A (Phase 1B, Task 4) — ✅ RESOLVED 2026-07-09.** Verified the codec reproduces the paper's Theorem-2 distortion table (`d·D_prod` 0.175/0.0514 vs paper 0.18/0.047) at d=128, with unbiasedness slope 1.0066 — the scale `√(π/2)/d` is confirmed verbatim. The gate *test* was corrected (the naive `prodErr<mseErr` on independent pairs provably favors `_mse`; `_prod` wins in attention's *correlated* regime). Full derivation in the [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution); the distortion-bound constant is `√3·π²`, not the earlier `3π²`.
+- **Spike A (Phase 1B, Task 4) — ✅ RESOLVED 2026-07-09.** Verified the codec reproduces the paper's Theorem-2 distortion table (`d·D_prod` 0.175/0.0514 vs paper 0.18/0.047) at d=128, with unbiasedness slope 1.0066 — the scale `√(π/2)/d` is confirmed verbatim. The gate *test* was corrected (the naive `prodErr<mseErr` on independent pairs provably favors `_mse`; `_prod` wins in attention's *correlated* regime). Full derivation in the [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution-2026-07-09-on-box-d128-property-tests--arxiv-html-v1-re-check); the distortion-bound constant is `√3·π²`, not the earlier `3π²`.
 - **Spike B (Phase 3):** if `tqB2` (the aggressive tier) fails the quality gate, the decision is *outlier channels vs shelve* — do not silently ship a failing tier.
 
 ---
@@ -241,7 +247,7 @@ private func l2normalizeRows(_ x: MLXArray) -> MLXArray {
 
 **Files:** extend `TurboQuantCodec.swift` + the test.
 
-- [ ] **Step 1: Failing test — the paper-faithful gate (⚠️ CORRECTED after Spike A, 2026-07-09).** The intuitive `prodErr < mseErr` on *independent* random query/key pairs is the **WRONG** gate and provably fails for a correct implementation: `_prod`'s unbiased QJL correction carries variance `≈ (π/2)·‖r‖²/d` with no `_mse` shrinkage *bias* to remove when `q ⊥ k`, so it loses on independent pairs (crossover ≈ `⟨q,x⟩ ~ 0.2`). Attention is the **correlated** regime (softmax weights the high scores), which is where `_prod` wins — so the gate asserts the three properties the paper actually guarantees (full derivation + numbers: [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution)). All three must pass on-box at d=128, float32:
+- [ ] **Step 1: Failing test — the paper-faithful gate (⚠️ CORRECTED after Spike A, 2026-07-09).** The intuitive `prodErr < mseErr` on *independent* random query/key pairs is the **WRONG** gate and provably fails for a correct implementation: `_prod`'s unbiased QJL correction carries variance `≈ (π/2)·‖r‖²/d` with no `_mse` shrinkage *bias* to remove when `q ⊥ k`, so it loses on independent pairs (crossover ≈ `⟨q,x⟩ ~ 0.2`). Attention is the **correlated** regime (softmax weights the high scores), which is where `_prod` wins — so the gate asserts the three properties the paper actually guarantees (full derivation + numbers: [Spike A resolution](../../reference/turboquant-algorithm.md#spike-a-resolution-2026-07-09-on-box-d128-property-tests--arxiv-html-v1-re-check)). All three must pass on-box at d=128, float32:
   - (a) **Unbiasedness:** regression slope of `⟨q, dequantProd(quantProd(x))⟩` on `⟨q, x⟩` ≈ 1.0 (±0.05) — pins the `√(π/2)/d` scale (measured 1.0066).
   - (b) **Correlated-regime superiority** (the KV-relevant property): for `⟨q,x⟩ ≥ 0.45`, mean-abs inner-product error of `_prod` < `_mse` by margin ≥ 1.8× (measured 4.1× at `⟨q,x⟩=1`).
   - (c) **Theorem-2 table anchor** (the falsifiable pin that the codec *is* the paper's quantizer): `d·D_prod` within ~20% of the paper's `{…, 0.18, 0.047}` at total bits 3, 4 (measured 0.175 / 0.0514).
@@ -322,9 +328,9 @@ fastmlx-harness kl   --model <qwen3-32b-4bit> --reference <qwen3-32b-bf16> --kv-
 fastmlx-harness bench --model <qwen3-32b-4bit> --kv-quant tqB3   # decode tok/s + KV bytes/token
 ```
 
-- [ ] **Step 2: Compare to the baseline** ([content piece](../../content/2026-07-09-the-wall-that-wasnt.md): 4-bit-affine KV vs bf16 = **tail-p95 1.665 nats @24K, ppl +21.4%**). Record `tqB3`/`tqB2` tail-p95 @24K, ppl-delta, decode tok/s, and **KV bytes/token** (the storage win) in `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`.
+- [ ] **Step 2: Compare to the measured reference row** ([content piece](../../content/2026-07-09-the-wall-that-wasnt.md): 4-bit weights with fp16 KV vs bf16 = **tail-p95 1.665 nats @24K, ppl +21.4%**). Record `tqB3`/`tqB2` tail-p95 @24K, ppl-delta, decode tok/s, and **KV bytes/token** (the storage win) in `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`.
 - [ ] **Step 3: Promote or shelve (explicit).**
-  - **Promote** a tier to a dial `kvQuant` tier iff it **beats the 4-bit-affine baseline on the quality/size frontier** — i.e., lower-or-equal tail-p95 @24K at **strictly smaller** KV bytes/token, or materially smaller KV at equal quality. Update the platform spec §4 dial axes.
+  - **Promote** a tier to a dial `kvQuant` tier iff it establishes a useful measured quality/size frontier against the same-weights fp16-KV row; an ordinary affine-KV claim additionally requires its own teacher-forced row. Update the platform spec §4 dial axes.
   - **Shelve** with a **dated negative result** (the flywheel's discipline) if it doesn't — and if only `tqB2` fails, that triggers **Spike B** (outlier channels vs shelve `tqB2`, keep `tqB3`).
 - [ ] **Step 4:** write the content-library piece (standing practice) — the honest arc: "we built the paper's exact quantizer; here's where it beat/didn't beat 4-bit affine, measured." **Step 5: Commit** the verdict + content.
 

@@ -8,7 +8,7 @@
 
 ## Why (the negative result this follows)
 
-Uniform-v1 TurboQuant was built, verified paper-faithful (reproduces the Theorem-2 distortion table, unbiased), and **measured — it loses to 4-bit affine on Qwen3-32B**: tqB3 tail-p95 1.797 / ppl +32.6% and tqB2 10.09 / +488%, vs the baseline 1.665 / +21.4%. Verdict: `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`. Root cause: ~2% per-vector KV error compounds across 64 layers; the paper's near-lossless 3.5-bit used **outlier channels** (allocate higher precision to high-variance channels — e.g. 32ch@3b + 96@2b for its 2.5-bit) that v1 deliberately deferred. Uniform bit allocation is the gap.
+Uniform-v1 TurboQuant was built, verified paper-faithful (reproduces the Theorem-2 distortion table, unbiased), and measured. tqB3 adds loss over the same 4-bit-weight/fp16-KV row: tail-p95 1.797 / ppl +32.6% versus 1.665 / +21.4%; its actual unpacked cache is also larger. tqB2 reaches 10.09 / +488% and crosses the garbage floor. **Clarification (2026-07-14): no ordinary affine-KV quality row was measured in that run.** Verdict: `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`. Root cause: ~2% per-vector KV error compounds across 64 layers; the paper's near-lossless 3.5-bit used **outlier channels** (allocate higher precision to high-variance channels — e.g. 32ch@3b + 96@2b for its 2.5-bit) that v1 deliberately deferred. Uniform bit allocation is the gap.
 
 ## The spike
 
@@ -24,8 +24,8 @@ numbers do not replace fast-mlx evidence. Compare actual packed bytes, not nomin
 
 ## Gate
 
-Promote to a dial tier only if one bounded recipe **beats** both the 4-bit-affine baseline and
-the new KVarN/asymmetric frontier at equal effective bytes. If none does, shelve TurboQuant
+Promote to a dial tier only if one bounded recipe beats the newly measured same-weights
+affine/KVarN frontier at equal actual bytes and remains useful above the garbage floor. If none does, shelve TurboQuant
 fully (a second dated negative result). No decode-speed promotion is possible while the path
 materializes the full cache before attention; the fused compressed-domain kernel is a
 separate, higher-priority prerequisite.

@@ -162,12 +162,18 @@ Discriminator: does the lever cut **steady-state KV/token** (extends what fits),
 **In scope now — LANDED on `main` 2026-07-09:**
 1. ✅ The **§2 per-arch KV memory model** — pure `HarnessCore` `CapacityModel`/`ModelArchProfile`/`SystemProfile`, 98 tests, verified vs confirmed numbers (merge `7f9c088`).
 2. ✅ The **§3 system-introspection profiler** — `SystemProfiler.probe()` (chip/cores/RAM/wired-limit/GPU-alloc/disk via Metal+sysctl, MLX-free), on-host verified (merge `2cdef35`). *Remaining increments:* NVMe/interconnect (IOKit) + `os_proc_available_memory` shim — left as marked TODOs.
-3. ✅ The **§3.1 cacheLimit invariant** — pure `recommendedCacheLimitBytes` policy (merge `2cdef35`). *Remaining:* the one-line MLX application (`Memory.cacheLimit = …`) wired into the actual engine startup on any wired-limit raise — **engine work, deferred** with the engine.
+3. ✅ The **§3.1 cacheLimit invariant** — pure `recommendedCacheLimitBytes` policy (merge `2cdef35`). Continuous-service loaders and benches now set and record an explicit 8 GiB MLX cache limit; *remaining:* apply the advisor-selected value at the production engine startup on every wired-limit raise.
 4. ✅ The **§4 context tunable** + **§5 capacity-advisor** logic — `effectiveDefaultContext`/`contextCeiling`/`classify` (green/yellow/red + binding constraint) exposed via the **`fastmlx-capacity` CLI** (live host + `--box` planning). *Remaining:* the admin API / tooltips / macOS-app surfaces that consume this — deferred with those components.
 5. ✅ The **catalog update** (§2.2/§2.3 → parent §9, merge `520ff99`).
 
 **Named backlog (with gates):**
-- **Runtime admission control** — `WiredMemoryManager` ticket/admission + hysteresis. *Gate:* confirm `mlx_set_wired_limit` ↔ sysctl relationship from MLX core source first (§3.1).
+- **Runtime admission control** — the dense-Qwen3 continuous runtime now atomically reserves
+  measured KV geometry in bytes, including allocation rounding, per-row metadata, and a
+  conservative five-copy membership-transition envelope; it releases the reservation on every
+  removal path. This closes admission for that explicit runtime, not for the whole engine.
+  General architecture-aware host admission, `WiredMemoryManager` tickets/hysteresis, and the
+  production API remain backlog. *Gate:* confirm `mlx_set_wired_limit` ↔ sysctl relationship
+  from MLX core source first (§3.1), then define non-dense state envelopes independently.
 - **Absorbed-MLA caching** — the 71× DeepSeek-R1 lever. *Gate:* its own design/plan; measure against the as-implemented baseline through the harness.
 - **Chunked-prefill capacity value** — *Gate:* extend `CtxProbe` `generate` to one-shot 64K/128K/262K prefill and **measure the transient peak** before any chunked-prefill capacity claim (parent §5).
 - **SSD/NVMe KV paging** — cross-request prefix cache for the agentic profile; separate design.

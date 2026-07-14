@@ -8,11 +8,20 @@
 **Evaluation lane:** [`LOSSY_FRONTIER`](README.md)—real quality loss is allowed when it buys a
 useful, measured speed/memory/capacity point above the garbage floor.
 
-This negative result is not a rejection of lossy tiers. `tqB3` is shelved because 4-bit affine
-provides better quality at nearly the same design size, so TurboQuant is dominated on the
-measured frontier. `tqB2` is shelved because its +488% perplexity and 10.09-nat long-context
-tail cross the catastrophic floor. A materially faster or smaller configuration with bounded,
-clearly reported loss would remain eligible for the user dial.
+> **Evidence clarification — 2026-07-14:** this run did not measure an ordinary affine-KV
+> quality row. The 1.665-nat / +21.37% comparator above is 4-bit **weights with fp16 KV**; the
+> affine row below is design-byte accounting only. Earlier “lost to 4-bit affine” wording was
+> too broad. The SHELVE decision still stands because uniform-v1 `tqB3` added quality loss,
+> realized no packed-memory win in its actual byte-aligned cache, and produced no measured
+> speed case. The next KVarN/asymmetric gate must create the missing same-weights affine-KV
+> quality comparator.
+
+This negative result is not a rejection of lossy tiers. `tqB3` is shelved because its actual
+v1 implementation is dominated by the same-weights fp16-KV path: it is larger in memory,
+adds measured loss, and has no demonstrated speed win. `tqB2` is shelved because its +488%
+perplexity and 10.09-nat long-context tail cross the catastrophic floor. A materially faster
+or smaller configuration with bounded, clearly reported loss would remain eligible for the
+user dial.
 
 ## What was built (Phase 1B → Task 7, all verified on-box)
 
@@ -62,14 +71,15 @@ pooled perplexity are the load-bearing statistics, and both are decisively worse
 | tier | bits/element (format design) | KV bytes/token (design) | vs fp16 | v1 in-memory today |
 |---|---|---|---|---|
 | fp16 | 16 | 262,144 (256 KiB) | 1.0× | 256 KiB |
-| 4-bit affine (mlx-lm, group 64) | 4.5 | 73,728 (72 KiB) | 3.6× | 72 KiB (packed) |
+| 4-bit affine design comparator (mlx-lm, group 64; quality not measured here) | 4.5 | 73,728 (72 KiB) | 3.6× | 72 KiB (packed) |
 | tqB3 | 3+1+32/128 = 4.25 | 69,632 (68 KiB) | 3.8× | ~264 KiB (byte-aligned, unpacked) |
 | tqB2 | 2+1+32/128 = 3.25 | 53,248 (52 KiB) | 4.9× | ~264 KiB (byte-aligned, unpacked) |
 
 Bits/element includes BOTH per-row fp16 scalars (γ and ‖x‖) amortized over head_dim
 (`TurboQuantTier.bitsPerElement`, honest-accounting test updated). The v1 cache stores
 uint8 idx + int8 sign + fp32 norms — the design footprint requires bit-packing (deferred
-engineering, mechanical).
+engineering, mechanical). The affine row supplies only a format-size comparator; it does not
+supply the missing teacher-forced quality result.
 
 ## Perf — decode tok/s (bench, 256 tokens, 3 runs post-warmup)
 
@@ -78,18 +88,19 @@ fail decisively), so the bench is moot for the shelve decision. Qualitatively co
 materialize-then-attend dequantizes the full capacity buffer per layer per step (the codec's
 two matmuls Π/S per read), a large per-step cost that grows with context. Fused
 quantized-attention is the paper's Metal-kernel work, out of scope for v1. **Net: TurboQuant
-v1 is both slower AND lower-quality than the fp16-KV path it would replace** — a second,
-independent reason to shelve.
+v1 has no measured speed claim and is lower-quality plus slightly larger in actual memory
+than the fp16-KV path it would replace.**
 
 ## Verdict — per tier
 
-**SHELVE both tiers** — dated negative result (2026-07-09). Uniform-v1 TurboQuant does **not** beat
-the 4-bit-affine baseline on Qwen3-32B:
+**SHELVE both tiers** — dated negative result (2026-07-09). Uniform-v1 TurboQuant does **not**
+establish a useful measured quality/size/speed point on Qwen3-32B:
 
 - **tqB3** (`tq3.5` slot; 3 base + 1 QJL, ~4.25 bits/elem design): tail-p95 **1.797 vs 1.665**
-  (+8%) and ppl **+32.6% vs +21.4%** — worse quality at a KV *design* size (68 KiB) only
-  marginally under 4-bit affine (72 KiB), and the v1 in-memory footprint is larger (unpacked).
-  Dominated on the quality/size frontier.
+  (+8%) and ppl **+32.6% vs +21.4%** against the same 4-bit weights with fp16 KV. Its KV
+  *design* size (68 KiB) is only marginally under the unmeasured 4-bit-affine design comparator
+  (72 KiB), while the v1 in-memory footprint is ~264 KiB—larger than fp16 KV. Dominated as
+  implemented; no affine-KV quality conclusion is drawn.
 - **tqB2** (`tq2.5` slot; 2 base + 1 QJL): tail-p95 **10.09**, ppl **+488%** — catastrophic,
   unusable as-is.
 

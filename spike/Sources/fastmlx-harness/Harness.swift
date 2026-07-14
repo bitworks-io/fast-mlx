@@ -3,26 +3,9 @@ import HarnessCore
 import MLXLMCommon
 import SpikeCore
 
-/// Minimal `--flag value` parser (same shape as the spike's; no ArgumentParser dependency).
-struct Flags {
-    private var values: [String: String] = [:]
-
-    init(_ arguments: [String]) {
-        var i = 0
-        while i < arguments.count {
-            if arguments[i].hasPrefix("--"), i + 1 < arguments.count {
-                values[String(arguments[i].dropFirst(2))] = arguments[i + 1]
-                i += 2
-            } else {
-                i += 1
-            }
-        }
-    }
-
-    func string(_ key: String, default def: String) -> String { values[key] ?? def }
-    func string(_ key: String) -> String? { values[key] }
-    func int(_ key: String, default def: Int) -> Int { values[key].flatMap(Int.init) ?? def }
-}
+/// Minimal `--flag value` parser (no ArgumentParser dependency), kept pure in HarnessCore so
+/// malformed promotion-gate commands are regression-tested off-box.
+typealias Flags = CLIFlags
 
 /// Known-good prompts from the spike's equivalence work (see 2026-07-08-swift-spike-verdict.md):
 /// "The capital of France is" matched 60/60 on the MoE target model. Still used as the `verify`
@@ -734,6 +717,10 @@ struct Harness {
         case "corpus": runCorpus()
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
+        case "service-bench": await runServiceBench(flags)
+        case "service-cancel-bench": await runServiceCancellationBench(flags)
+        case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
+        case "service-soak": await runServiceSoakBench(flags)
         case "kl": await runKL(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
@@ -763,6 +750,20 @@ struct Harness {
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
+          service-bench --model <PATH>        aggregate service frontier (Release builds only)
+                 --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy
+                 --scenario burst             simultaneous admission (initial measured scenario)
+                 --concurrency 1|2|4|8         aggregate + per-request TTFT/TPOT/fairness
+                 [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N]
+          service-cancel-bench --model <PATH> disconnect SLA + slot-reuse gate (Release only)
+                 [--runs 5] [--max-tokens 64] [--prefill-chunk 16]
+                 [--keepalive-ms 1000] [--long-repeat 18]
+          service-state-poison-bench --model <PATH> exact A/B/A recovery gate (Release only)
+                 [--runs 3] [--concurrency 4] [--max-tokens 64]
+                 [--prefill-chunk 16] [--keepalive-ms 1000]
+          service-soak --model <PATH> --progress <FILE> resident mixed-workload soak
+                 [--duration-seconds 86400] [--concurrency 4] [--max-tokens 64]
+                 [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)

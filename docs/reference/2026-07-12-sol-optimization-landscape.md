@@ -14,6 +14,10 @@
 > No compatible 32B DSpark/DFlash/MTP control was runnable. The actionable queue now advances
 > to continuous batching plus decode-first chunked prefill.
 
+> **Subsequent status (2026-07-14):** continuous batching passed its corrected same-workload
+> frontier and required 24-hour soak and is promoted as an exact dense-Qwen3 service building
+> block. The live queue in `docs/agent-handoff.md` now advances to KVarN/asymmetric affine.
+
 ## Bottom line
 
 The queue was directionally right, but it mixed three different states: features already in
@@ -71,13 +75,13 @@ lossy cache work cannot substitute free-running drift for teacher-forced KL/perp
 | Compiled base decode | **Shipped**, at Zig parity | Upstream model loading retained | Closed; optimize above the base loop |
 | PLD | **Promoted**, byte-identical at temperature 0 | Zig precedent | Closed except serving-policy wiring |
 | Trained speculation | Not implemented; `dspark` is a harness placeholder | EAGLE-3/DSpark evidence, DFlash MLX ports, pinned Swift speculative machinery | EAGLE-3 is RED; DSpark/DFlash/native-MTP controls are blocked until a compatible product-size checkpoint exists |
-| Continuous batching | Not implemented; one actor owns one decoder | Zig measured about 2.8× aggregate from 1→8 streams; current MLX-LM has `BatchGenerator` | Next service-throughput cycle |
+| Continuous batching | **Promoted 2026-07-14** as an exact dense-Qwen3 probe-path building block; production routing remains open | Zig measured about 2.8× aggregate from 1→8 streams; current MLX-LM has `BatchGenerator` | Engine/policy gate closed; serving-route and network-disconnect propagation tracked separately |
 | Sampled generation/fusion | Engine is greedy-only | Zig L1/L3/L1b/L3b reached +27.2% on stochastic PLD for a small/fast model | Separate from batching; sampler/RNG contract first |
 | Prefix/session reuse | Not implemented; `resetForNewRun()` discards cache state and compiled caches cannot copy/restore | Zig measured a 15%→97% second-turn cache hit and 7.7× warm request-start improvement; MLX-LM has trie/LRU prompt caching | Restore as an explicit exact-cache cycle after scheduler ownership is designed |
 | KV quantization | fp16 and shelved TurboQuant only | Zig affine 4/8-bit and fused quant-KV; current research includes KVarN/KVTuner | Build the ordinary/asymmetric baseline and fused read path before exotic promotion |
 | Absorbed MLA | Not implemented for DeepSeek V3 | Current Python MLX ships it; pinned Swift has an analogous GLM latent-cache path | Existing task is planning-ready with two code oracles, not greenfield research |
 | Request-start warmup | Not implemented as a product policy | Zig measured 1097→307 ms on Gemma 4 E4B; upstream caches/templates exist | Fold eager warmup + tokenize caching into exact request-start work |
-| Runtime capacity control | Static capacity model/CLI shipped; no serving admission loop | Platform spec defines the gate | Retain as reliability-critical work |
+| Runtime capacity control | Static capacity model/CLI shipped; dense-Qwen continuous admission now reserves conservative KV bytes; no general serving loop | Platform spec defines the gate | Retain general architecture-aware admission as reliability-critical work |
 
 The code facts behind the table are local and inspectable: `InferenceActor` is single-owner;
 `KVCacheKind` has only fp16 and TurboQuant; `CompiledKVCache.copy()` and state restore trap;
@@ -94,7 +98,7 @@ fast-mlx results.
 | Rank | Cycle | Impact | Evidence | Cost | Apple fit | Decision and hard gate |
 |---:|---|---:|---:|---:|---:|---|
 | 1 | **Qwen3-32B EAGLE-3/DSpark, with DFlash + native-MTP controls** | 5 | 4 | 2 | 5 | **Executed 2026-07-12:** EAGLE RED on byte identity; controls blocked by missing compatible product-size checkpoints. See the post-audit banner and dated verdict. |
-| 2 | **Continuous batching + decode-first chunked prefill** | 5 | 5 | 2 | 5 | Port the scheduler design. Preserve drain-before-batch-join, cancellation, fairness, and architecture batchability. Measure aggregate throughput plus p95 TTFT/TPOT. |
+| 2 | **Continuous batching + decode-first chunked prefill** | 5 | 5 | 2 | 5 | **Executed 2026-07-14:** exact dense-Qwen3 building block promoted after the corrected frontier and 24-hour soak; production serving-route gate remains separate. |
 | 3 | **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** | 5 | 4 | 2 | 3 | New top KV-quality gate. First prove the tile transform and packed bytes/token; compare K4V2/K8V2 and per-layer schedules at equal effective bits. |
 | 4 | **Fused compressed-domain KV attention for the winner** | 4 | 4 | 1 | 4 | Phase B of the same lane. Equal-output fp16 oracle first; require an end-to-end 32K/128K win, not a kernel-only headline. No codec earns a speed tier while materializing the full cache. |
 | 5 | **Exact hot prefix/session cache + request-start latency stack** | 5 | 5 | 2 | 5 | Design over scheduler/cache ownership. Composite key, positive commit, byte/entry budget, hybrid checkpoints, eager warmup, template/tokenize cache. SSD is phase 2. |
@@ -138,9 +142,9 @@ technique has passed fast-mlx's promote gate.
 
 ### 2. Concurrent serving and request-start latency
 
-- **Continuous batching — EXECUTE.** Preserve the named solo→batch transition invariant.
-  MLX-LM's current decode-first prompt/completion separation and Sarathi's token-budgeted
-  chunking are references, while the 2.8× Zig result is the Apple prior.
+- **Continuous batching — EXECUTED 2026-07-14.** The exact dense-Qwen3 engine/policy building
+  block passed the common-workload service frontier and 24-hour soak. Production routing and
+  real client-disconnect propagation remain a separately captured gate.
 - **Chunked prefill — FOLD INTO BATCHING.** It is a fairness, cancellation, and TTFT tool,
   not a claim that full-context KV allocation disappears.
 - **Exact prefix/session cache — EXECUTE AFTER CACHE OWNERSHIP.** Trie/LRU nearest-prefix
@@ -216,14 +220,17 @@ Unchecked boxes in completed historical plans are stale execution markup, not ne
 
 ### Completed / shelved / blocked
 
-- Uniform TurboQuant v1: `tqB3` lost to affine 4-bit; `tqB2` was catastrophic.
+- Uniform TurboQuant v1: `tqB3` adds loss over the same-weights fp16-KV row without a realized
+  memory/speed win; `tqB2` was catastrophic. No ordinary affine-KV quality row was measured.
 - Free-running precision-loss comparisons from the pre-hardening harness: historical only.
 - Qwen3-32B EAGLE-3: shelved on byte identity; DSpark/DFlash/native-MTP controls blocked by
   missing compatible product-size checkpoints and not planning-ready.
+- Continuous batching/chunked prefill: exact dense-Qwen3 engine/policy building block promoted;
+  the production serving route is separate.
 
 ### Active or planning-ready
 
-- Continuous batching, chunked prefill, and runtime admission.
+- General architecture-aware runtime admission and measured large-prefill capacity.
 - Sampled-generation foundation and sampler fusion.
 - KVarN/asymmetric affine/KVTuner storage-quality gate.
 - Fused compressed-domain KV attention for the selected format.

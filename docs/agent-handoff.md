@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-12
+Last reviewed: 2026-07-14
 
 For the next Codex/Claude Code/human agent. Decision-focused; links to the durable specs rather than duplicating them.
 
@@ -8,14 +8,14 @@ For the next Codex/Claude Code/human agent. Decision-focused; links to the durab
 
 **fast-mlx** — the fastest, most-optimized MLX inference platform for Apple Silicon, superseding the incumbent Zig `mlx-serve`. A Swift engine + macOS app + Python train/research plane + an engine-agnostic conformance/precision-loss harness. The product wedge is the **optimization dial with quantified precision loss** ("dial in speed, see exactly what accuracy you trade"); the moat is the **technique-integration flywheel** (absorb a new inference technique → measure its speed↔quality frontier → promote to a dial tier or shelve with a dated negative result). First production deployment: **Concierge** (bitworks' shopping assistant). Dev/bench box: **M5 Max 128GB** (`llmbench@192.168.1.252`); production target up to M3 Ultra 512GB. Full design: [`docs/superpowers/specs/2026-07-08-fast-mlx-platform-design.md`](superpowers/specs/2026-07-08-fast-mlx-platform-design.md).
 
-## Current state (2026-07-12)
+## Current state (2026-07-14)
 
 **Shipped to `main`:**
 - **Engine seed** (`spike/`): compiled decode core (`CompiledMLXDecoder` + `CompiledKVCache`) at 155.4 tok/s (≥ Zig), single-owner `InferenceActor`, Swift 6 strict-concurrency clean.
-- **The harness spine** (`HarnessCore`, pure/Foundation): equivalence+engagement+acceptance triad, teacher-forced KL + perplexity + long-context tail-p95, versioned corpus (incl. a 24,151-token entry), provenance/JSONL. Established baseline: **4-bit affine KV vs bf16 = tail-p95 1.665 nats @24K, ppl +21.4%**.
+- **The harness spine** (`HarnessCore`, pure/Foundation): equivalence+engagement+acceptance triad, teacher-forced KL + perplexity + long-context tail-p95, versioned corpus (incl. a 24,151-token entry), provenance/JSONL. Established reference row: **Qwen3-32B 4-bit weights with fp16 KV vs bf16 weights with fp16 KV = tail-p95 1.665 nats @24K, ppl +21.4%**. This is a weight-quantization baseline, not a measured 4-bit affine-KV row; the KVarN/asymmetric frontier must build the missing same-weights affine-KV comparator before using that label.
 - **System-aware context operability**: the per-arch KV **capacity memory model** (`HarnessCore/CapacityModel.swift` — dispatches KV/token by `model_type`; naive formula is wrong 4×–71× for hybrid-linear/SWA/MLA/Mamba2), the `SystemProfiler` (real host introspection, MLX-free), and the **`fastmlx-capacity` CLI** (`swift run fastmlx-capacity [--box …]`). Spec: [`2026-07-09-system-aware-context-operability.md`](superpowers/specs/2026-07-09-system-aware-context-operability.md). Catalog (context caps + memory + Nemotron-3-Ultra/Ornith resolved) in platform spec §9.
 
-**TurboQuant KV-quant — COMPLETE + SHELVED** (merged to `main`, `6e82e2b`; plan [`2026-07-09-turboquant-kv-quant.md`](superpowers/plans/2026-07-09-turboquant-kv-quant.md)). The flywheel's first novel technique ran the full loop: Google TurboQuant (arXiv:2504.19874) built exactly (`LloydMaxCodebook` + `TurboQuantCodec` Haar/LUT/QJL — Spike A verified against the paper's Theorem-2 distortion table), integrated as `TurboQuantKVCache` (materialize-then-attend, behind the `tq2.5`/`tq3.5` flag), measured, and **SHELVED as a dated negative result** — uniform-v1 loses to 4-bit affine on Qwen3-32B (tqB3 tail-p95 1.797/ppl +32.6% vs 1.665/+21.4%; tqB2 catastrophic). Verdict: [`verdicts/2026-07-09-turboquant-firstrun.md`](superpowers/verdicts/2026-07-09-turboquant-firstrun.md). The fp16 default path is unchanged (60/60 regression, tests green).
+**TurboQuant KV-quant — COMPLETE + SHELVED** (merged to `main`, `6e82e2b`; plan [`2026-07-09-turboquant-kv-quant.md`](superpowers/plans/2026-07-09-turboquant-kv-quant.md)). The flywheel's first novel technique ran the full loop: Google TurboQuant (arXiv:2504.19874) built exactly (`LloydMaxCodebook` + `TurboQuantCodec` Haar/LUT/QJL — Spike A verified against the paper's Theorem-2 distortion table), integrated as `TurboQuantKVCache` (materialize-then-attend, behind the `tq2.5`/`tq3.5` flag), measured, and **SHELVED as a dated negative result** — uniform-v1 tqB3 adds loss over the same 4-bit-weight/fp16-KV reference row (tail-p95 1.797/ppl +32.6% vs 1.665/+21.4%) without realizing its packed design footprint; tqB2 is catastrophic. An ordinary asymmetric affine-KV quality row was not measured in that run and must not be reconstructed from the reference values. Verdict: [`verdicts/2026-07-09-turboquant-firstrun.md`](superpowers/verdicts/2026-07-09-turboquant-firstrun.md). The fp16 default path is unchanged (60/60 regression, tests green).
 
 ### Gated closure — TurboQuant Spike B
 The paper's outlier allocation remains a finite second test, now broadened by the 2026-07-12
@@ -49,37 +49,51 @@ and rolled back rejected future tokens. Apparent rates are invalid because outpu
 No `k=3`/multi-shape bench or Swift port ran. Reopen only for deterministic target verification
 or a compatible product-size DSpark/DFlash/MTP checkpoint.
 
+**Continuous batching — PROMOTED as an exact measured service building block** (feature branch
+`codex/continuous-batching-chunked-prefill`, final evidence harness `7a775f6`; [plan](superpowers/plans/2026-07-12-continuous-batching-chunked-prefill.md),
+[verdict](superpowers/verdicts/2026-07-14-continuous-batching-chunked-prefill.md)). The pure
+scheduler, MLX-free coordinator, scalar-aligned dense cache, and actor-confined `qwen3` runtime
+pass final-SHA B1→drain→B2→B1, B3→B2 cancellation, and chunk-size-1 byte exactness. Dense KV
+admission charges allocation rounding plus a conservative five-copy transition envelope in
+bytes and releases atomically. A corrected common-workload Qwen3-32B frontier selects solo PLD
+at C=1 (28.30 vs 26.72 service tok/s) and batch-no-spec at C=2/4/8 (+45.8%/+58.6%/+74.7%);
+shared batches never speculate. The 24-hour post-warmup run measured 86,412.85 seconds, passed
+all 33 predicates 3,519/3,519, and held peak RSS drift to 2.2444% (<5%). Compact evidence:
+[`continuous-batching-phase3-evidence-2026-07-14.jsonl`](superpowers/verdicts/continuous-batching-phase3-evidence-2026-07-14.jsonl).
+**Boundary:** this clears the engine/policy gate only. No production service/API route or
+dynamic PLD↔batch default is wired; sampled generation and non-dense state remain rejected.
+Production routing and real client-disconnect propagation are captured in the
+[serving-route task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
+
 ## ▶ Open work queue — pick the next flywheel cycle
 
 Prioritized by the 2026-07-12 Sol audit. The north star remains **match then beat optimized
 mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the first multiplier.
 
-1. **Continuous batching + decode-first chunked prefill** — the largest remaining service
-   throughput multiplier (Zig prior ~2.8× aggregate 1→8). Preserve drain-before-batch-join;
-   speculation stays off in the batched arm. [Task](task-inbox/2026-07-12-continuous-batching-chunked-prefill.md).
-2. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
-   candidate; compare actual packed bytes and teacher-forced quality before Metal investment.
+1. **KVarN K4V2 + asymmetric affine/KVTuner storage-quality gate** — the strongest new KV
+   candidate; first build the missing same-weights affine-KV reference row, then compare actual
+   packed bytes and teacher-forced quality before Metal investment.
    [Task](task-inbox/2026-07-12-kvarn-kv-frontier.md).
-3. **Fused compressed-domain KV attention for the selected format** — stop materializing the
+2. **Fused compressed-domain KV attention for the selected format** — stop materializing the
    full cache before attention; prove an end-to-end 32K/128K win, not just a Metal
    microbenchmark. [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
-4. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
+3. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
    TTFT path (hot cache, positive commit, eager warmup, template/tokenize cache; SSD later).
    Design over batching/cache ownership. [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
-5. **Absorbed MLA** — exact 71× reduction versus the current expanded DeepSeek-V3 cache;
+4. **Absorbed MLA** — exact 71× reduction versus the current expanded DeepSeek-V3 cache;
    Python MLX now ships it and pinned Swift GLM code is a second oracle.
    [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-6. **Sampled-generation foundation → sampler fusion** — separate from batching; define RNG
+5. **Sampled-generation foundation → sampler fusion** — separate from batching; define RNG
    and distribution contracts before porting the Zig L1/L3/L1b/L3b stack.
    [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-7. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ and oQ4e,
+6. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ and oQ4e,
    producing ordinary MLX checkpoints for the existing Swift loop.
    [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-8. **Operability** — measured large-prefill capacity + runtime admission control (system-aware
+7. **Operability** — measured large-prefill capacity + general runtime admission control (system-aware
    spec §7); reliability/capacity, not a decode-speed claim.
-9. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
+8. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
     shelve on a second loss. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
-10. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
+9. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
     XGrammar after their exact-cache/sampler prerequisites. [Intake](reference/performance-technique-intake.md).
 
 **Blocked/deferred trained speculation:** EAGLE-3 is shelved by the dated exactness verdict;
@@ -136,7 +150,12 @@ Qwen3-32B BF16 target). Python: `~/harness-venv` (transformers<5).
   driver, conformance, task-benchmark layer, soak/recovery, and remaining memory controls.
   Do not infer implementation from an upstream dependency: native MTP and prompt caching
   remain unwired in fast-mlx.
-- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 9 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
+- **Continuous-batching scope:** dense-Qwen admission now uses rounded per-layer KV bytes and a
+  conservative five-copy transition envelope, but it is not whole-process RSS accounting or a
+  general architecture memory model. The probe-only promotion still needs production routing,
+  network cancellation propagation ([task](task-inbox/2026-07-14-continuous-batching-serving-route.md)),
+  and separate gates for sampling and non-dense state.
+- **Content-library practice:** after each notable spike/optimization, write a `docs/content/` piece (blog/whitepaper source). 10 pieces so far ([`docs/content/README.md`](content/README.md) indexes them).
 
 ## Commit / Checkin
 

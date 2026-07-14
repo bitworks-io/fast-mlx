@@ -13,6 +13,9 @@ SHA without copying machine-local paths or transient output.
 | As an operator, leaving PLD available does not tax cold or low-yield requests. | No non-target regression beyond −1%; empty-draft fallback uses the base pipeline; low yield disables quickly and recovers. | `testGate_defaultLowYield_disablesAfterFourSamples`, partial-window and cooldown tests; 26/26 `SpecDecodeTests`. | Code 28.39 → 29.31 (**+3.24%**); zero-draft prose 28.62 → 28.66 (**+0.14%**). | 2026-07-11 | PLD remains disabled under continuous batching. |
 | As a maintainer, the change preserves MLX build and concurrency invariants. | Pure suite and MLX-coupled suite pass; no banned concurrency escape in changed files. | 113 XCTest + 17 Swift Testing tests off-box; 20/20 `SpikeCoreTests` through Xcode on-box. | Clean feature SHA stamped into all seven bench and two exactness records; focused reviews found no issues. | 2026-07-11 | Full serving/API default wiring is not implemented by this kernel change. |
 | As the owner, I can reject a trained speculator before paying for a Swift port. | Checkpoint/head fidelity is proven first; every implemented temperature-0 verify shape is byte-identical and engaged, otherwise the arm fails closed without a speed claim. | 119 HarnessCore XCTest + 17 Swift Testing tests; 21 MLX-free EAGLE preflight tests; authenticated file-manifest and cache-drift classifier regressions. | Clean `1a70c4d`: checkpoint + parity PASS; 4-bit exactness FAIL at generated index 17; 8-bit FAIL at index 7; both output hashes differ and return exit 1. | 2026-07-12 | EAGLE is shelved. `k=3`, long-output throughput, BF16, and the Swift port intentionally did not run after the earlier hard failure. |
+| As a maintainer, I can enter continuous-batching actor integration only after dense cache shapes are exact and compile-stable. | Scalar-aligned merge/append/filter/extract preserves logits, greedy tokens, row identity, and one trace per stable shape; unsupported state layouts fail closed. | 9 focused `BatchedCompiledKVCacheTests`; 29/29 total `SpikeCoreTests` through Xcode; 134 HarnessCore XCTest + 17 Swift Testing tests off-box. | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed+shapeless PASS with zero initial max-logit delta; 64-step B=4/B=8 fixed PASS; `qwen3_moe` rejected before load. | 2026-07-12 | Historical Phase-1 gate; Phase 2 and Phase 3 are closed below. |
+| As an operator, concurrent dense streams can join, leave, and prefill in chunks without changing greedy output or exhausting an unbounded queue. | B1→drain→B2→B1 and B3→B2 remain token/byte exact; decode precedes bounded prefill; queue, per-request context, and aggregate logical context are capped; speculation is rejected locally for this runtime. | 16 scheduler + 10 coordinator pure tests within 145 HarnessCore XCTest + 17 Swift Testing; 12 cache-history-sensitive runtime tests within 41/41 Xcode `SpikeCoreTests`. | Clean `2a5a5f4`: Qwen3-32B-4bit staggered join and middle-cancel probes PASS; Qwen3-4B-4bit chunk-size-1 interleave PASS; zero batched speculation. | 2026-07-12 | Historical Phase-2 gate; byte admission, service frontier, cancellation latency, and soak are closed by Phase 3 below. |
+| As a dense-Qwen service operator, I can select the measured exact policy for an isolated request or a simultaneous burst without hidden queueing, state-poison, cancellation, or resident-memory failure. | Same-workload C=1/2/4/8 frontier selects solo PLD at C=1 and batch-no-spec at C≥2; exact transition/cancellation, conservative byte admission, A/B/A, responsiveness, and the full 24-hour RSS gate pass. | 166 HarnessCore XCTest + 17 Swift Testing tests off-box; 48/48 `SpikeCoreTests` through Xcode; final-SHA real-model probes and fail-closed `qwen3_moe` smoke. | Clean `7a775f6` frontier: batch +45.8%/+58.6%/+74.7% at C=2/4/8; clean `0aed280` soak: 86,412.85 measured seconds, all 33 predicates 3,519/3,519, peak RSS drift 2.2444%. | 2026-07-14 | Explicit probe path only; production routing/API, network disconnect propagation, sampling, non-dense state, other models and hardware remain open. |
 
 ## Current Verification Commands
 
@@ -32,9 +35,21 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 <fastmlx-harness> verify --model <model> --spec pld --n 120
 <fastmlx-harness> verify --model <model> --spec pld --n 120 --compiled-verify true
 bash scripts/bench_pld_shapes.sh <model> 3 256
+
+<spike-cli> batch-stream-probe --model <dense-qwen3> --max-tokens 16 \
+  --join-after 2 --prefill-chunk 16
+<spike-cli> batch-membership-probe --model <dense-qwen3> --max-tokens 8 \
+  --cancel-after 2 --prefill-chunk 16
+
+<fastmlx-harness> service-bench --model <dense-qwen3> --policy <batch-no-spec|solo-pld> \
+  --scenario burst --concurrency <1|2|4|8> --runs 3 --workload-nonce <shared-id>
+bash scripts/bench_continuous_service.sh <dense-qwen3> 3 128 16
+<fastmlx-harness> service-cancel-bench --model <dense-qwen3> --runs 5
+<fastmlx-harness> service-state-poison-bench --model <dense-qwen3> --runs 3
+bash scripts/soak_continuous_service.sh <dense-qwen3> 86400 4 64 16
 ```
 
-## Latest Acceptance Pass
+## PLD Acceptance Pass — 2026-07-11
 
 - **Date:** 2026-07-11
 - **Change:** PLD gate tuning, feature `bb5b06f22dc62e258c5ee1bdaadd6e53e1f8019d`,
@@ -125,3 +140,99 @@ MLX states equality only up to numerical precision while shapes can trigger comp
 UNVERIFIED—and deliberately not claimed—as an upstream fact: that any one MLX 0.32 kernel is
 the cause of these observations. The verdict labels that mechanism as inference and relies on
 the clean four-history replay for the local result.
+
+## Continuous batching Phase 1 acceptance pass — 2026-07-12
+
+**Story:** a maintainer can proceed from pure scheduling into actor integration only after the
+pinned Swift/MLX stack proves exact dense cache membership and stable compiled shapes.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Scalar cache geometry survives batching | **PASS** | 9 focused Xcode tests cover per-row offsets, scalar-aligned right padding, prefix masks, one- and multi-token scatter, merge, ordered filter, extraction, growth, capacity, and invalid state. |
+| Real dense model matches scalar decode | **PASS** | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed and shapeless runs all report exact greedy tokens and `0.000000` initial max-logit delta. |
+| Stable shapes do not retrace per token | **PASS** | Every 8-step shape records `main_trace_count=1`; B>1 middle-row removal records exactly one new membership trace. Fixed B=4/B=8 also pass 64-step replay with one main trace. |
+| Membership preserves request identity | **PASS** | Each run extracts all rows, compares scalar continuation, removes the middle row, and requires rebuilt and in-place-filtered batches to match the independent scalar references in stable order. B=7 explicitly covers B=8 middle removal. |
+| Unsupported layouts fail closed | **PASS** | `model_type=qwen3_moe` exits before model load; only dense `qwen3` enters this probe. Authoritative capacity and explicit-length assertions fail before cache mutation. |
+
+**Design finding:** copying upstream left-padding into an already fixed-capacity cache caused an
+avoidable exactness failure at close argmax boundaries. Keeping every row at scalar physical
+positions removed the delta. This was treated as a correctness bug, not a lossy performance
+tier. Intentional future lossy batching variants remain eligible only through the normal
+teacher-forced speed↔quality frontier and coherence floor.
+
+**Commands:** off-box `swift test --package-path spike --filter HarnessCoreTests`; on-box Xcode
+`SpikeCoreTests`; stamped `spike-cli batch-probe` sweeps for B=1/2/4/7/8 and 64-step B=4/B=8.
+The probe sets an explicit 8 GiB MLX cache limit and prints the full clean harness SHA.
+
+**Historical Phase-1 boundary:** this row closed only cache/shape feasibility. Actor integration
+and chunked-prefill exactness are covered by the Phase 2 pass below; the service frontier and
+soak are subsequently closed by Phase 3.
+
+## Continuous batching Phase 2 acceptance pass — 2026-07-12
+
+**Story:** a dense Qwen3 serving actor can execute decode-first chunked prefill and dynamic
+batch membership without changing any request's temperature-zero stream or allowing one
+malformed/unsupported admission to poison the service.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Staggered join preserves exact output | **PASS** | Clean `2a5a5f4`: Qwen3-32B-4bit first and second streams are token- and byte-identical to independent compiled scalar baselines across B1→drain→B2→B1. Required transitions are present; batched speculation is false. |
+| Chunk boundaries do not change output | **PASS** | Same clean SHA on Qwen3-4B-4bit with `prefillChunkSize=1`: 17 first-prompt chunks and 11 interleaved joiner chunks remain exact through drain, four shared steps, and return to solo. |
+| Middle cancellation preserves survivors | **PASS** | Qwen3-32B-4bit B3→B2: both survivors are token/byte exact; the cancelled middle stream is the exact two-token scalar prefix; cancellation reports decoding at emitted count 2. |
+| Actor/runtime state transitions are regression-protected | **PASS** | 12 cache-history-sensitive `DenseContinuousBatchRuntimeTests` cover chunking, solo/drain, reorder/removal, B2→B1, compile reuse, admission limits, invalid state, and coordinator integration. Full on-box suite: 41/41. |
+| Queue and resource admission are bounded | **PASS (Phase-2 proxy)** | Pure scheduler caps queued requests (default 256) with atomic burst rejection. Dense runtime validates config/vocabulary/context, reserves a full burst's logical context atomically, and releases on every removal path. |
+| Pure policy remains green | **PASS** | 145 HarnessCore XCTest tests plus 17 Swift Testing tests, 0 failures. Final focused review: no High/Medium issue; no banned concurrency escape. |
+
+**Provenance:** the three clean replay rows are committed in the
+[Phase 2 evidence artifact](superpowers/verdicts/continuous-batching-phase2-evidence-2026-07-12.jsonl)
+(artifact SHA-256 `96f403e04abf9cf6c4a80963892a9247f0a65df8e930a7a7c7667599fc6d0c93`;
+harness SHA `3cc5f6321afaea80d62b6f894c35d50ece8ad0a5`). Every row records full harness SHA, model config hash, checkpoint
+manifest hash (config/index plus shard names/sizes), declared quantization, MLX Swift `0.31.6`,
+pinned MLX Swift LM revision, fixed-membership compile policy, and the operation trace. The
+Qwen3-32B-4bit config hash is `b3f033c21f563996`; manifest hash `33827ddf1b497615`;
+quantization `int4:group=64`.
+
+**Historical Phase-2 boundary:** this was an exactness and lifecycle pass, not the promotion
+verdict. Phase 3 below subsequently closes the 1/2/4/8 frontier, cancellation, conservative
+byte admission, A/B/A, and required soak. The checkpoint manifest remains a config/index plus
+shard-name/size identity rather than a full weight-content digest.
+
+## Latest Acceptance Pass — Continuous batching Phase 3 — 2026-07-14
+
+**Story:** a dense-Qwen service operator can choose the measured exact policy for isolated and
+simultaneous work, knowing the comparison uses identical prompts and that transition,
+cancellation, state recovery, memory admission, responsiveness, and resident stability have
+all passed their gates.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Exact and engaged | **PASS** | Clean `7a775f6f1db9495d60eecdf030bf63d752f936e0`: Qwen3-32B B1→drain→B2→B1 and B3→B2, plus Qwen3-4B chunk-size-1, are token/byte exact; expected shared batches engage; speculation is absent; `qwen3_moe` exits 1 before load. Exact artifact SHA-256 `5db4bb5fecc853f04fd5869326c730b702b19511b3d28a271063a9c336b9d0de`. |
+| Same-workload service frontier | **PASS** | All eight rows carry the same clean SHA and `workloadNonce=frontier-20260714-final`; every paired run has identical prompt/output counts; one warmup is dropped and three runs measured. Solo PLD wins C=1 (28.30 vs 26.72 tok/s). Batch wins C=2/4/8 by 45.8%/58.6%/74.7%, with Jain mean 1.0000. JSONL SHA-256 `9404c0aa699ecc37a5575ceb5e13dd2ec75908cc47e06d7b1ee0cf7251c1f70c`; CSV `122d5638ee687873941c1fbe98ce8136b707f86423293ee9715fad3321861d68`. |
+| Byte-bounded admission | **PASS** | Dense geometry tests charge rounded capacity, per-row metadata, and the conservative five-copy transition envelope; over-budget bursts reject atomically and every cancellation/completion path releases reservations. This is not claimed as exact whole-process RSS. |
+| Cancellation and recovery | **PASS** | Five Qwen3-4B measured runs: p50 19.542 µs, p95/max 21.042 µs <1 s, removal/reuse/survivor/cleanup all pass; raw SHA-256 `963feb1a1ebebf13f35c19a3246fbfa4f09b23adc5d5648a587dca5cdd9367df`. Three A/B/A runs: per-request output byte-identical before/after hostile cancellation, p95/max 12.583 µs, reservations zero; raw `b9f21fd01a315a1a2b0430392493e77b0ae5f1c61df1c1a72842aa0e7ef420dc`. |
+| Required resident soak | **PASS** | Clean `0aed28087a3f495e1582977e263bc30e0986703d`: 86,412.8508 post-warmup seconds ≥86,400; 3,518 measured +1 warmup; all 33 aggregate predicates pass 3,519/3,519 and all 3,519 cycle-log lines report A/B/A PASS; max cancellation 28.833 µs <1 s; max responsiveness 344.469 ms <30 s; peak RSS drift 2.2444% <5%; watchdog absent and wrapper cleaned. The JSONL retains full fields for warmup +288 measured checkpoint cycles, all independently rederived. Raw SHA-256 `dcc7e446234cf6defc8746964bdefe3eb80fabe543e93078a096eeb3b9452b22`. |
+| Provenance and claim boundary | **PASS** | Qwen3-32B-4bit `int4:group=64`, fp16 KV, M5 Max 128 GB, MLX Swift 0.31.6, pinned mlx-swift-lm revision, explicit 8 GiB cache limit, config/manifest identities. PROMOTE is limited to an exact dense-Qwen probe-path service building block; it does not claim a wired API/default or generalize to sampling/non-dense state. |
+
+**Tests:** `swift test --package-path spike --enable-code-coverage --filter HarnessCoreTests`
+passes 166 XCTest + 17 Swift Testing tests. Continuous policy line coverage: coordinator
+95.09%, scheduler 91.31%, service metrics 94.76%; the new full shared CLI parser reports
+38.75% because this change regression-tests its workload-identity value path rather than every
+pre-existing accessor. On the bench Mac, Xcode `SpikeCoreTests` passes 48/48 and the Release
+build succeeds. No MLX-coupled suite was run with `swift test`.
+
+**Review:** independent evidence audit caught one warmup-inclusive A/B/A p50 in the compact
+extract; it was recomputed from the three post-warmup runs, labeled
+`measured-post-warmup`, and re-audited with no remaining discrepancy. Focused review's scope
+split, stale-queue, and missing-affine-comparator findings were corrected; re-review found no
+High or Medium issues. Repository-wide Markdown path/fragment validation and diff-aware secret
+scanning pass.
+
+**Committed compact evidence:**
+[`continuous-batching-phase3-evidence-2026-07-14.jsonl`](superpowers/verdicts/continuous-batching-phase3-evidence-2026-07-14.jsonl),
+15 valid JSONL records, SHA-256
+`6c188275f2cad49010e0473356dacf3629d066b75b9670f3270a4771fcb97167`.
+
+**Residual risk:** the checkpoint manifest identifies config/index plus shard names/sizes, not
+full weight contents. The canonical frontier is one simultaneous-burst prompt shape on one
+Apple box. Production routing, real network disconnect propagation, sampled generation,
+additional dense families, and MoE/hybrid/recurrent/vision layouts remain separate work.

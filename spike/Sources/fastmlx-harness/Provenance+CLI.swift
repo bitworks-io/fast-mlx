@@ -35,6 +35,7 @@ enum ProvenanceCLI {
     /// is a build-time constant that must be kept in sync with `Package.swift` by hand — cheaper
     /// and more honest than a fragile `Package.resolved` file-read that assumes a specific CWD.
     static let mlxSwiftVersion = "0.31.6"
+    static let mlxSwiftLMRevision = "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"
 
     /// Gathers the three SHA sources and applies the pure precedence (`resolveHarnessGitSHA`,
     /// TDD'd in HarnessCore): explicit `HARNESS_GIT_SHA` env override -> the deploy-written
@@ -78,6 +79,31 @@ enum ProvenanceCLI {
         return (fnv1a64(data), ModelQuantInfoLoader.load(from: data))
     }
 
+    /// Config/index bytes plus sorted shard names and sizes. This detects the common wrong-
+    /// checkpoint/wrong-shard manifest case without reading tens of GiB of weights into the
+    /// benchmark's timed process. It is explicitly a manifest fingerprint, not a content hash.
+    static func checkpointManifestHash(at modelPath: String) throws -> String {
+        let directory = URL(fileURLWithPath: modelPath)
+        let fileManager = FileManager.default
+        var bytes = Array(
+            try Data(contentsOf: directory.appendingPathComponent("config.json")))
+        let index = directory.appendingPathComponent("model.safetensors.index.json")
+        if fileManager.fileExists(atPath: index.path) {
+            bytes.append(contentsOf: try Data(contentsOf: index))
+        }
+        let weights = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles])
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for weight in weights {
+            let size = try weight.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
+            bytes.append(contentsOf: "\(weight.lastPathComponent):\(size)\n".utf8)
+        }
+        return fnv1a64(bytes)
+    }
+
     static func nonce() -> String { String(Int.random(in: 0..<1_000_000_000)) }
 
     static func nowISO8601() -> String {
@@ -117,17 +143,26 @@ enum ProvenanceCLI {
 /// subcommand it's recording — it prints a warning and continues.
 func appendJSONLRecord<Payload: Codable & Sendable>(_ record: ResultRecord<Payload>, to path: String) {
     do {
-        let line = try record.jsonLine() + "\n"
-        let url = URL(fileURLWithPath: path)
-        if let handle = FileHandle(forWritingAtPath: path) {
-            defer { try? handle.close() }
-            handle.seekToEndOfFile()
-            handle.write(Data(line.utf8))
-        } else {
-            try line.write(to: url, atomically: true, encoding: .utf8)
-        }
+        try appendRequiredJSONLRecord(record, to: path)
         print("# provenance: appended to \(path)")
     } catch {
         print("# provenance: WARNING failed to append JSONL record: \(error)")
+    }
+}
+
+/// Promotion-gate measurements use a required writer: a result that cannot preserve its
+/// provenance is a failed run, not a successful benchmark followed by a warning.
+func appendRequiredJSONLRecord<Payload: Codable & Sendable>(
+    _ record: ResultRecord<Payload>,
+    to path: String
+) throws {
+    let line = try record.jsonLine() + "\n"
+    let url = URL(fileURLWithPath: path)
+    if let handle = FileHandle(forWritingAtPath: path) {
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(line.utf8))
+    } else {
+        try line.write(to: url, atomically: true, encoding: .utf8)
     }
 }

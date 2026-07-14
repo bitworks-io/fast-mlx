@@ -109,6 +109,9 @@ The next actionable flywheel cycle is continuous batching plus decode-first chun
 The Qwen3-32B DSpark and DFlash controls remain blocked by missing compatible checkpoints;
 cross-model raw tok/s is not a substitute.
 
+**Subsequent status (2026-07-14):** continuous batching completed its exact engine/policy gate;
+the live queue in `docs/agent-handoff.md` now advances to KVarN/asymmetric affine.
+
 ## Evidence artifacts
 
 | Bench artifact | SHA-256 / content ID |

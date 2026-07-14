@@ -28,6 +28,7 @@ After each notable spike / investigation / optimization, write one piece here **
 | 2026-07-11 | [When zero speculation costs 2%: making a 2× decoder safe to leave on](2026-07-11-when-zero-speculation-costs-two-percent.md) | Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel |
 | 2026-07-12 | [The backlog was lying: when “already have” meant “the old engine had it”](2026-07-12-the-backlog-was-lying.md) | Rapid research integration — the flywheel; Building a high-performance MLX engine in Swift; The optimization dial — quantified precision-loss tuning |
 | 2026-07-12 | [“Lossless” wasn't byte-identical: the speculative decoder that failed at generated index seven](2026-07-12-lossless-wasnt-byte-identical.md) | Rapid research integration — the flywheel; Building a high-performance MLX engine in Swift |
+| 2026-07-14 | [The fastest request wasn't the fastest service](2026-07-14-the-fastest-request-wasnt-the-fastest-service.md) | Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel |
 
 ## Candidate whitepaper themes (aggregations)
 

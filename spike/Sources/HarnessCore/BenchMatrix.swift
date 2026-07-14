@@ -33,6 +33,37 @@ public func saltPrompt(run: Int, nonce: String, _ basePrompt: String) -> String 
     "\(basePrompt) [run=\(run) nonce=\(nonce)]"
 }
 
+public enum ServiceWorkloadIdentityError: Error, Sendable, Equatable {
+    case invalidNonce
+}
+
+/// Stable identity shared by every process in a service-policy frontier. Keeping the nonce
+/// explicit prevents separate policy/concurrency invocations from benchmarking different
+/// salted prompts while claiming a direct comparison.
+public struct ServiceWorkloadIdentity: Sendable, Equatable {
+    public let nonce: String
+
+    public init(nonce: String) throws {
+        let alphanumericByte: (UInt8) -> Bool = {
+            (48 ... 57).contains($0) || (65 ... 90).contains($0)
+                || (97 ... 122).contains($0)
+        }
+        let validByte: (UInt8) -> Bool = {
+            alphanumericByte($0) || $0 == 45 || $0 == 46 || $0 == 95
+        }
+        guard let first = nonce.utf8.first, alphanumericByte(first),
+            nonce.utf8.count <= 64, nonce.utf8.allSatisfy(validByte)
+        else {
+            throw ServiceWorkloadIdentityError.invalidNonce
+        }
+        self.nonce = nonce
+    }
+
+    public func prompt(basePrompt: String, run: Int, request: Int) -> String {
+        "\(saltPrompt(run: run, nonce: nonce, basePrompt)) [request=\(request)]"
+    }
+}
+
 public enum BenchGuardError: Error, Sendable { case debugBuild }
 
 /// Fails fast if this is a Debug/unoptimized build — perf numbers from a Debug build are

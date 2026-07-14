@@ -1,6 +1,6 @@
 # Google TurboQuant — implementable algorithm reference
 
-Design input for the TurboQuant KV-quant implementation (the first flywheel customer). Primary source: **arXiv:2504.19874** (Zandieh/Daliri/Hadian/Mirrokni; QJL companion arXiv:2406.03482). **CONFIRMED** = from the paper; **INFERRED** = standard fill-in where the paper omits a formula; **VERIFY** = flagged for PDF re-check before hard-coding. Baseline it must beat (from our hardened harness): 4-bit affine KV vs bf16 = tail-p95 **1.665 nats @ 24K**, ppl **+21.4%**.
+Design input for the TurboQuant KV-quant implementation (the first flywheel customer). Primary source: **arXiv:2504.19874** (Zandieh/Daliri/Hadian/Mirrokni; QJL companion arXiv:2406.03482). **CONFIRMED** = from the paper; **INFERRED** = standard fill-in where the paper omits a formula; **VERIFY** = flagged for PDF re-check before hard-coding. Measured reference row from the hardened harness: Qwen3-32B 4-bit weights with fp16 KV vs bf16 weights with fp16 KV = tail-p95 **1.665 nats @ 24K**, ppl **+21.4%**. No ordinary affine-KV quality row was measured in this cycle; the KVarN/asymmetric gate owns that comparator.
 
 ## The algorithm (CONFIRMED unless noted)
 
@@ -33,7 +33,7 @@ Dequant(idx, qjl, γ):
 - **Integrate with `CompiledKVCache`:** it stores fp16 K/V today; add a TurboQuant-quantized cache variant storing (codes, qjl signs, per-token ‖r‖₂ + rotation state as globals), dequant-on-read. Mind the compiled-step retrace + the 8GB allocator-cache bound from the long-context work. Ships behind the `kvQuant` tier the harness already records ("tq2.5"/"tq3.5").
 
 ## Validation path (through the hardened harness)
-Run `verify` (lossy-tier triad + canary at 2.5/3.5-bit), and `kl`/perplexity/**long-context tail-p95** vs the **bf16** reference on corpus v2 (incl. the 24K entry). **Promote to a dial tier only if it beats the 4-bit affine baseline (tail-p95 1.665 @24K) at equal-or-smaller KV size**; else shelve with a dated negative result. Also record KV bytes/token (the storage win) once the memory-metrics FAST-FOLLOW lands.
+Run `verify` (lossy-tier triad + canary at 2.5/3.5-bit), and `kl`/perplexity/**long-context tail-p95** vs the **bf16** reference on corpus v2 (incl. the 24K entry). **Promote to a dial tier only if it establishes a useful measured quality/size point against the same-weights fp16-KV row; do not claim an affine-KV comparison without a separately measured teacher-forced affine row.** Also record actual KV bytes/token once the memory-metrics FAST-FOLLOW lands.
 
 ## Spike A resolution (2026-07-09, on-box d=128 property tests + arXiv HTML v1 re-check)
 

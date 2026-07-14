@@ -76,9 +76,10 @@ byte-identical or it is a bug.
 
 The first novel fast-mlx quantizer taught us this lesson painfully. We implemented
 TurboQuant faithfully enough to reproduce its mathematical distortion table, then measured
-it losing to plain 4-bit affine KV on Qwen3-32B. Worse, the cache materialized full-precision
-K/V before attention. Even a future codec winner could not claim the intended bandwidth win
-through that path.
+it adding loss over the same 4-bit-weight/fp16-KV row while its unpacked cache failed to
+realize the design-size win. We had not measured an ordinary affine-KV quality row. Worse,
+the cache materialized full-precision K/V before attention. Even a future codec winner could
+not claim the intended bandwidth win through that path.
 
 The audit therefore split format from execution. Phase A selects a storage/quality winner;
 phase B makes compressed-domain attention mandatory before that winner can claim decode
