@@ -87,7 +87,7 @@ or if all KVarN cells fail the floor.
 
 - [x] Pin KVarN and KVTuner primary sources and separate paper evidence from post-paper repository
   claims in `docs/reference/kvarn-kv-algorithm.md`.
-- [ ] Generate a deterministic reference fixture with the pinned KVarN pure PyTorch functions.
+- [x] Generate a deterministic reference fixture with the pinned KVarN pure PyTorch functions.
   Record source commit, script hash, explicit iteration count, input, packed bytes, fp16 metadata,
   and reconstruction values. Do not import the upstream vLLM fork as a runtime dependency.
 - [ ] Move the KL evidence payload into testable pure code and add `sameWeights`, reference model
@@ -103,16 +103,25 @@ Files planned:
 - `spike/Sources/HarnessCore/KVQuant/KVTunerSchedule.swift`
 - matching `spike/Tests/HarnessCoreTests/` files and a compact checked-in fixture
 
-- [ ] Write failing layout tests for K4V2-g128 (13,824 bytes/tile/head; 108 bytes/token/head;
+- [x] Write failing layout tests for K4V2-g128 (13,824 bytes/tile/head; 108 bytes/token/head;
   3.375 effective bits/element), g64 metadata, affine cells, fp16 sink/tail, alignment, concurrency,
   workspace, overflow, and partial-tile accounting.
-- [ ] Implement the smallest format-aware integer accountant; keep the old approximate
+- [x] Implement the smallest format-aware integer accountant; keep the old approximate
   `KVQuantTier.bytesPerElement` from being used as evidence for new formats.
-- [ ] Write the failing pinned-fixture test, then implement normalized Hadamard rotation, log-domain
+- [x] Write the failing pinned-fixture test, then implement normalized Hadamard rotation, log-domain
   variance balancing, asymmetric RTN, low-bit pack/unpack, absorbed scales, and dequantization.
-- [ ] Write schedule-validation failures first, then implement a versioned JSON artifact with model
+- [x] Write schedule-validation failures first, then implement a versioned JSON artifact with model
   hash, calibration provenance, objective/budget, and complete per-layer K/V widths.
-- [ ] Run focused tests, the full pure suite, and coverage. Commit this phase independently.
+- [x] Run focused tests, the full pure suite, and coverage. Commit this phase independently.
+
+Phase 1 proof (2026-07-14): the intended red tests failed on aggregate overflow, invalid
+Hadamard allocation, axis packing, unrunnable preset geometry, and missing fixture provenance.
+The green run passes 21/21 focused tests and the full 187 XCTest + 17 Swift Testing pure suite.
+Final line coverage is 98.95% for `KVStorageFormat`, 97.22% for `KVTunerSchedule`, and 99.14% for
+`KVarNReference`, with 100% function coverage for all three. Focused review found no remaining
+correctness issue.
+The accountant is explicitly the planned tight fast-mlx layout, not the pinned vLLM block
+allocator; Phase 2 must reconcile it to real MLX array bytes before any capacity claim.
 
 ### Phase 2 — MLX affine controls and actual-byte telemetry
 

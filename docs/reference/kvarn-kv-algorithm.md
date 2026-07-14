@@ -25,7 +25,8 @@ and is never copied into a dial tier without a clean-SHA Apple-Silicon measureme
 | `kvarn_k4v2_g128` is the paper's evaluated 2.3-bit configuration. | **CONTRADICTED.** The pinned repository's later preset is 4-bit K, 2-bit V, 128-token tiles. Its dense D=128 layout is 3.375 effective bits per K/V element before fixed sink/tail/workspace costs. | Never label K4V2 as the paper's 2.3-bit row. Record raw K/V bits, effective packed bits, and fixed overhead separately. |
 | KVarN K4V2 gives Qwen3-32B fp16-level AIME25 quality, about 4x capacity, and fp16-or-better throughput. | **UNVERIFIED as a reproducible result.** This is a post-paper official-repository claim. It is not in arXiv v1, and the repository presentation does not provide the raw logs, full command/provenance packet, seeds, or an Apple result needed by this project. | It justifies running the gate. It cannot appear as fast-mlx evidence or a promotion premise. |
 | Eight variance-normalization iterations are equivalent to sixteen for fast-mlx's target. | **UNVERIFIED for fast-mlx.** The pinned repository defaults its runnable preset to 8 and describes it as converged, while the paper/reference default is 16. | The pure fixture pins explicit iteration counts. The first matrix measures 8 and retains a 16-iteration audit cell; no silent default. |
-| A 128-token fp16 sink and one incomplete fp16 tail are free or negligible. | **CONTRADICTED as an accounting assumption.** The pinned backend keeps the first sink tokens unquantized and maintains a fixed tail pool/workspace for partial tiles and serving concurrency. | Capacity includes sink, tail, alignment, and measured workspace. Nominal payload bits alone may not be reported as capacity. |
+| A 128-token fp16 sink and one incomplete fp16 tail are free or negligible. | **CONTRADICTED as an accounting assumption.** The pinned backend keeps scheduler block zero unquantized and maintains a fixed tail pool/workspace for partial tiles and serving concurrency. At the pinned revision, `KVARN_SINK_TOKENS` is parsed but the backend always identifies the first block as the sink. | The fast-mlx gate pins one full-group sink. Capacity includes sink, tail, alignment, and measured workspace; an apparently configurable upstream token count is not copied into the product contract. |
+| The upstream vLLM allocation formula is the KVarN format's portable byte cost. | **CONTRADICTED.** The pinned CUDA backend reserves a compressed record for every scheduler block (including blocks currently resident in its fp16 pool), sizes that pool with request, prefill, and headroom slots, and uses extra per-token power-of-two padding at `D>=256`. Those are backend allocator choices, not algorithm payload. | The pure accountant models fast-mlx's explicitly documented tight sequential arrays. It reports upstream-layout comparisons separately, accepts caller-supplied local workspace/alignment, and must reconcile every prediction with actual MLX-array `nbytes` before measurement. |
 | KVTuner is a runtime quantizer. | **CONTRADICTED.** Its core contribution is an offline sensitivity search that selects per-layer K/V bit widths; the runtime consumes the frozen schedule using an underlying quantizer. | KVTuner belongs in the control plane. A schedule artifact must pin model/config, calibration corpus, seed, objective, and every layer's K/V bits. |
 | KVTuner supports asymmetric per-token and KIVI-oriented controls with independent K/V widths. | **CONFIRMED** by the paper and pinned repository configuration surface (`nbits_key`, `nbits_value`, `axis_key`, `axis_value`, `asym`, `group_size`, and residual length). | The first matrix includes a simple per-token affine control; KIVI orientation is separately named when used. |
 
@@ -52,10 +53,15 @@ For each full token tile and KV head:
    `K=(q*absorbedChannelScale+absorbedChannelBias)*tokenScale` and
    `V=(q*absorbedTokenScale+absorbedTokenBias)*channelScale`, then apply the inverse Hadamard.
 
-The reference fixture is generated from the pinned Apache-2.0 PyTorch implementation using a
-deterministic finite input. The Swift gate requires byte-identical packed codes and fp16 metadata,
-not merely similar reconstruction error. Non-finite inputs, unsupported bits, non-power-of-two
-head dimensions, and incomplete tiles fail closed.
+The compact scalar reference fixture is generated from a clean checkout of the pinned Apache-2.0
+PyTorch implementation using a deterministic finite input, Torch `2.11.0`, one CPU thread,
+deterministic algorithms, 16 balancing iterations, and the optional RTN-quantile ablation pinned
+off. It records and tests the upstream file hashes plus the generator hash. The Swift gate requires
+byte-identical packed codes and fp16 metadata, not merely similar reconstruction error. Non-finite
+inputs, intermediate overflow, unsupported bits, non-power-of-two head dimensions, impossible
+Hadamard allocations, and incomplete tiles fail closed. This small `D=G=4` fixture locks scalar
+semantics; Phase 3 separately owns `D=G=128`, 8-versus-16 iterations, fp16 MLX rotation, and
+runtime-array conformance.
 
 ## Dense D=128, G=128 K4V2 layout
 
@@ -73,8 +79,10 @@ The pinned repository defines one record per full tile and KV head:
 
 The payload-only average is 3 bits/element; metadata raises it to 3.375. Fully quantized fp16 K/V
 would be 512 bytes per head/token, so the ideal full-tile ratio is 4.741x. That is not the
-end-to-end capacity ratio: the first sink tile, the incomplete tail, allocation alignment,
-allocator residency, and decode workspace remain separate measured terms.
+end-to-end capacity ratio: the first sink tile, the incomplete tail, local allocation alignment,
+allocator residency, and decode workspace remain separate measured terms. The pinned CUDA
+backend's additional block records, pool headroom, and `D>=256` padding are not silently attributed
+to the tight Apple layout; each backend reports its own actual bytes.
 
 ## Controls and evidence boundary
 

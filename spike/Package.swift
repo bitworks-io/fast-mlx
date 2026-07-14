@@ -72,6 +72,7 @@ let package = Package(
         .testTarget(
             name: "HarnessCoreTests",
             dependencies: ["HarnessCore"],
+            resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // MLX-free by design: real host introspection (sysctlbyname, Metal) so the capacity
