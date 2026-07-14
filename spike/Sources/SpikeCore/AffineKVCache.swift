@@ -29,6 +29,15 @@ public struct AffineKVCacheConfiguration: Equatable, Hashable, Sendable {
         where !Self.supportedGroupSizes.contains(groupSize) {
             throw AffineKVCacheConfigurationError.unsupportedGroupSize(groupSize)
         }
+        self.init(
+            validatedKeyBits: keyBits, valueBits: valueBits,
+            keyGroupSize: keyGroupSize, valueGroupSize: valueGroupSize)
+    }
+
+    fileprivate init(
+        validatedKeyBits keyBits: Int, valueBits: Int,
+        keyGroupSize: Int, valueGroupSize: Int
+    ) {
         self.keyBits = keyBits
         self.valueBits = valueBits
         self.keyGroupSize = keyGroupSize
@@ -39,18 +48,149 @@ public struct AffineKVCacheConfiguration: Equatable, Hashable, Sendable {
     private static let supportedGroupSizes: Set<Int> = [32, 64, 128]
 }
 
-/// Actual persistent MLX-array bytes owned by an affine cache after allocation.
+/// Named affine cells admitted to the storage-quality matrix.
+///
+/// The raw value is the only accepted CLI/evidence spelling. Keeping this set closed makes a
+/// typo or an unmeasured geometry fail instead of being coerced to a nearby tier or fp16.
+public enum AffineKVTier: String, CaseIterable, Sendable, Hashable {
+    case k4v2G64 = "affine-k4v2-g64"
+    case k4v2G128 = "affine-k4v2-g128"
+    case k8v2G64 = "affine-k8v2-g64"
+    case k8v2G128 = "affine-k8v2-g128"
+    case k4v4G128 = "affine-k4v4-g128"
+
+    public var keyBits: Int {
+        switch self {
+        case .k8v2G64, .k8v2G128: 8
+        case .k4v2G64, .k4v2G128, .k4v4G128: 4
+        }
+    }
+
+    public var valueBits: Int {
+        switch self {
+        case .k4v4G128: 4
+        case .k4v2G64, .k4v2G128, .k8v2G64, .k8v2G128: 2
+        }
+    }
+
+    public var groupSize: Int {
+        switch self {
+        case .k4v2G64, .k8v2G64: 64
+        case .k4v2G128, .k8v2G128, .k4v4G128: 128
+        }
+    }
+
+    public var configuration: AffineKVCacheConfiguration {
+        AffineKVCacheConfiguration(
+            validatedKeyBits: keyBits, valueBits: valueBits,
+            keyGroupSize: groupSize, valueGroupSize: groupSize)
+    }
+}
+
+/// Actual MLX-array geometry, persistent bytes, and logical materialization workspace owned or
+/// produced by an affine cache after allocation.
 ///
 /// `dataArrayBytes` reconciles directly with `KVStorageFormat.affine`; the in-graph offset
 /// is reported separately as control state so capacity claims never hide implementation
 /// bytes that are not part of the packed data layout.
 public struct AffineKVCacheStorageSnapshot: Equatable, Sendable {
+    public let capacityTokens: Int
+    public let sequences: Int
+    public let kvHeadCount: Int
+    public let keyHeadDimension: Int
+    public let valueHeadDimension: Int
+    public let metadataScalarBytes: Int
     public let payloadBytes: Int
     public let metadataBytes: Int
     public let controlBytes: Int
+    /// Exact logical bytes of the full-precision K/V pair returned to attention by the most
+    /// recent update. Transformer layers consume these sequentially, so this is one layer's
+    /// pair rather than the sum across every persistent layer cache.
+    public let materializationWorkspaceBytes: Int
 
     public var dataArrayBytes: Int { payloadBytes + metadataBytes }
     public var totalPersistentBytes: Int { dataArrayBytes + controlBytes }
+}
+
+/// Actor-safe scalar telemetry aggregated from every affine layer cache after a run.
+/// MLX arrays never leave their owner; only their evaluated geometry and byte counts do.
+public struct AffineKVCacheTelemetry: Equatable, Sendable {
+    public let tier: AffineKVTier
+    public let cachedTokens: Int
+    public let layerCount: Int
+    public let capacityTokens: Int
+    public let sequences: Int
+    public let kvHeadCount: Int
+    public let headDimension: Int
+    public let metadataScalarBytes: Int
+    public let payloadBytes: Int
+    public let metadataBytes: Int
+    public let controlBytes: Int
+    public let materializationWorkspaceBytes: Int
+
+    public var dataArrayBytes: Int { payloadBytes + metadataBytes }
+    public var totalPersistentBytes: Int { dataArrayBytes + controlBytes }
+
+    /// Capture must run inside the cache owner's inference actor. It synchronizes only the
+    /// in-graph offsets and is therefore intended for post-run evidence, never the hot loop.
+    public static func capture(
+        tier: AffineKVTier, caches: [AffineKVCache]
+    ) -> AffineKVCacheTelemetry {
+        precondition(!caches.isEmpty, "affine telemetry requires at least one layer cache")
+        let snapshots = caches.map { cache -> AffineKVCacheStorageSnapshot in
+            precondition(
+                cache.configuration == tier.configuration,
+                "affine cache configuration does not match the requested tier")
+            guard let snapshot = cache.storageSnapshot() else {
+                preconditionFailure("affine cache did not allocate before telemetry capture")
+            }
+            return snapshot
+        }
+        let first = snapshots[0]
+        precondition(
+            first.keyHeadDimension == first.valueHeadDimension,
+            "K/V head dimensions differ")
+        precondition(
+            snapshots.dropFirst().allSatisfy {
+                $0.capacityTokens == first.capacityTokens
+                    && $0.sequences == first.sequences
+                    && $0.kvHeadCount == first.kvHeadCount
+                    && $0.keyHeadDimension == first.keyHeadDimension
+                    && $0.valueHeadDimension == first.valueHeadDimension
+                    && $0.metadataScalarBytes == first.metadataScalarBytes
+                    && $0.materializationWorkspaceBytes
+                        == first.materializationWorkspaceBytes
+            },
+            "affine layer-cache geometry is inconsistent")
+
+        let cachedTokens = Int(caches[0].offsetArr.item(Int32.self))
+        precondition(
+            caches.dropFirst().allSatisfy {
+                Int($0.offsetArr.item(Int32.self)) == cachedTokens
+            },
+            "affine layer-cache offsets are inconsistent")
+
+        func sum(_ values: [Int]) -> Int {
+            values.reduce(into: 0) { result, value in
+                let (next, overflow) = result.addingReportingOverflow(value)
+                precondition(!overflow, "affine telemetry byte count overflow")
+                result = next
+            }
+        }
+        return AffineKVCacheTelemetry(
+            tier: tier,
+            cachedTokens: cachedTokens,
+            layerCount: caches.count,
+            capacityTokens: first.capacityTokens,
+            sequences: first.sequences,
+            kvHeadCount: first.kvHeadCount,
+            headDimension: first.keyHeadDimension,
+            metadataScalarBytes: first.metadataScalarBytes,
+            payloadBytes: sum(snapshots.map(\.payloadBytes)),
+            metadataBytes: sum(snapshots.map(\.metadataBytes)),
+            controlBytes: sum(snapshots.map(\.controlBytes)),
+            materializationWorkspaceBytes: first.materializationWorkspaceBytes)
+    }
 }
 
 /// Fixed-capacity, compile-capturable KV cache backed by MLX's native affine packing.
@@ -82,6 +222,7 @@ public final class AffineKVCache: KVCache, Updatable {
     private var valueDimension: Int?
     private var keyOutputDType: DType?
     private var valueOutputDType: DType?
+    private var materializationWorkspaceBytes: Int?
 
     /// Host-side mirror used only by uncompiled prefill/control code. Compiled replays update
     /// `offsetArr` in graph, matching `CompiledKVCache`'s documented contract.
@@ -129,16 +270,19 @@ public final class AffineKVCache: KVCache, Updatable {
         offsetArr = offsetArr + MLXArray([Int32(tokenCount)])
         offset += tokenCount
 
-        return (
-            materialize(
-                payload: kPayload!, scales: kScales!, biases: kBiases!,
-                dimension: keyDimension!, bits: configuration.keyBits,
-                groupSize: configuration.keyGroupSize, dtype: keyOutputDType!),
-            materialize(
-                payload: vPayload!, scales: vScales!, biases: vBiases!,
-                dimension: valueDimension!, bits: configuration.valueBits,
-                groupSize: configuration.valueGroupSize, dtype: valueOutputDType!)
-        )
+        let materializedKeys = materialize(
+            payload: kPayload!, scales: kScales!, biases: kBiases!,
+            dimension: keyDimension!, bits: configuration.keyBits,
+            groupSize: configuration.keyGroupSize, dtype: keyOutputDType!)
+        let materializedValues = materialize(
+            payload: vPayload!, scales: vScales!, biases: vBiases!,
+            dimension: valueDimension!, bits: configuration.valueBits,
+            groupSize: configuration.valueGroupSize, dtype: valueOutputDType!)
+        let (workspaceBytes, overflow) = materializedKeys.nbytes.addingReportingOverflow(
+            materializedValues.nbytes)
+        precondition(!overflow, "affine materialization workspace byte count overflow")
+        materializationWorkspaceBytes = workspaceBytes
+        return (materializedKeys, materializedValues)
     }
 
     public func makeMask(
@@ -192,12 +336,25 @@ public final class AffineKVCache: KVCache, Updatable {
 
     public func storageSnapshot() -> AffineKVCacheStorageSnapshot? {
         guard let kPayload, let kScales, let kBiases,
-            let vPayload, let vScales, let vBiases
+            let vPayload, let vScales, let vBiases,
+            let materializationWorkspaceBytes
         else { return nil }
+        precondition(
+            [kScales, kBiases, vScales, vBiases].allSatisfy {
+                $0.itemSize == kScales.itemSize
+            },
+            "affine metadata scalar dtypes differ")
         return AffineKVCacheStorageSnapshot(
+            capacityTokens: capacity,
+            sequences: kPayload.dim(0),
+            kvHeadCount: kPayload.dim(1),
+            keyHeadDimension: keyDimension!,
+            valueHeadDimension: valueDimension!,
+            metadataScalarBytes: kScales.itemSize,
             payloadBytes: kPayload.nbytes + vPayload.nbytes,
             metadataBytes: kScales.nbytes + kBiases.nbytes + vScales.nbytes + vBiases.nbytes,
-            controlBytes: offsetArr.nbytes)
+            controlBytes: offsetArr.nbytes,
+            materializationWorkspaceBytes: materializationWorkspaceBytes)
     }
 
     private struct StoredCode {

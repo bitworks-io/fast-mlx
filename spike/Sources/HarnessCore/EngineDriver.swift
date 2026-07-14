@@ -11,7 +11,9 @@ public struct RunConfig: Sendable, Hashable {
     /// padded to K so the trace replays), false/nil = uncompiled verify forward. The locked
     /// decision is "choose on-box — measure both", so the harness can select either.
     public var specCompiledVerify: Bool?
-    public var kvQuant: String?      // "fp16" | "8" | "turbo4" | nil
+    /// Canonical engine KV-cache tier (`nil`/`fp16`, named affine cell, or TurboQuant tier).
+    /// The engine parser owns the closed allowlist and rejects unknown spellings.
+    public var kvQuant: String?
     public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
                 specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
                 kvQuant: String? = nil) {

@@ -12,6 +12,21 @@ typealias Flags = CLIFlags
 /// / `bench` default `--prompt` — the versioned corpus below is `kl`'s measurement input.
 let knownGoodPrompt = "The capital of France is"
 let benchPrompt = "Explain how continuous batching improves LLM serving throughput."
+let knownKVQuantTiers = (
+    ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
+        + TurboQuantTier.allCases.flatMap { [$0.harnessSlot, $0.rawValue] }
+).joined(separator: ", ")
+let kvQuantUsageTiers = (
+    ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
+        + TurboQuantTier.allCases.map(\.harnessSlot)
+).joined(separator: "|")
+
+/// Strictly parse the CLI tier and normalize explicit fp16 to the engine's nil baseline.
+/// A present flag without a value throws instead of silently selecting fp16.
+func requestedKVQuantTier(_ flags: Flags) throws -> String? {
+    let raw = try flags.strictString("kv-quant", default: "fp16")
+    return raw == "fp16" ? nil : raw
+}
 
 /// Default prompt for `verify --spec`: a raw-completion repetition shape (the engine feeds
 /// prompts untemplated, so an "instruction" would not reliably be followed — a self-continuing
@@ -50,9 +65,15 @@ struct VerifyPayload: Codable, Sendable {
     /// RATE vs the same engine at fp16 KV — context-locked, so one flipped high-entropy
     /// token cannot cascade the way a free-running prefix does. nil in exact mode.
     let teacherForcedTop1AgreementRate: Double?
-    /// In-graph cached-token count from the TurboQuant cache after the candidate run —
-    /// the lossy triad's engagement marker (nil on fp16 runs).
+    /// Legacy TurboQuant engagement marker (nil for fp16/affine).
     let turboquantTokens: Int?
+    /// Native-affine engagement, exact persistent arrays/control, and logical materialization
+    /// workspace (nil for fp16/TurboQuant).
+    let affineTokens: Int?
+    let affinePayloadBytes: Int?
+    let affineMetadataBytes: Int?
+    let affineControlBytes: Int?
+    let affineWorkspaceBytes: Int?
 }
 
 /// Evidence record for `verify --spec`: the spec-decode exactness triad — PLD-on vs PLD-off on
@@ -154,22 +175,32 @@ func runCorpus() {
 // MARK: - verify (the triad)
 
 func runVerify(_ flags: Flags) async {
-    if flags.string("spec") != nil {
-        await runVerifySpec(flags)
-        return
+    do {
+        let requestedSpec = try flags.strictString("spec", default: "")
+        if !requestedSpec.isEmpty {
+            await runVerifySpec(flags)
+            return
+        }
+    } catch {
+        print("verify FAILED: \(error)")
+        exit(2)
     }
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant fp16|tq2.5|tq3.5] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness verify --model <PATH> [--prompt <TEXT>] [--n 60] [--min-prefix 30] [--kv-quant <\(kvQuantUsageTiers)>] [--python <PY>] [--script <REF.py>] [--reference-model <PATH>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     let prompt = flags.string("prompt", default: knownGoodPrompt)
     let n = flags.int("n", default: 60)
     let minPrefix = flags.int("min-prefix", default: 30)
-    // KV-quant tier (Task 7): passed INTO the RunConfig, so the engine actually runs the
-    // selected cache (TurboQuantKVCache for tq2.5/tq3.5) — no longer a declaration-only flag.
-    let kvQuantTier = flags.string("kv-quant")
-    guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
-        print("verify FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+    let kvQuantTier: String?
+    do {
+        kvQuantTier = try requestedKVQuantTier(flags)
+    } catch {
+        print("verify FAILED: \(error)")
+        exit(2)
+    }
+    guard let cacheKind = KVCacheKind(kvQuant: kvQuantTier) else {
+        print("verify FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
         exit(2)
     }
     let mode = triadMode(forKVQuantTier: kvQuantTier)
@@ -185,7 +216,14 @@ func runVerify(_ flags: Flags) async {
         let verdict: TriadVerdict
         var referenceVersions: ReferenceDriver.ReferenceVersions?
         var teacherForcedTop1: Double?  // context-locked top-1 agreement rate vs fp16 KV
-        var turboquantTokens: Int?  // in-graph engagement marker from the quantized cache
+        var quantizedMarker: String?
+        var quantizedTokens: Int?
+        var turboquantTokens: Int?
+        var affineTokens: Int?
+        var affinePayloadBytes: Int?
+        var affineMetadataBytes: Int?
+        var affineControlBytes: Int?
+        var affineWorkspaceBytes: Int?
         switch mode {
         case .exact:
             let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
@@ -202,13 +240,21 @@ func runVerify(_ flags: Flags) async {
                 print("reference: \(refRun.tokens)")
             }
         case .lossy:
-            // TurboQuant engagement (Task 7): the quantized cache's IN-GRAPH cached-token
-            // count must have advanced past the prompt — a silent fp16 fallback cannot
-            // fake this marker (fp16 runs don't emit it at all).
-            let tqTokens = candidate.engagement.counts["turboquant_tokens"] ?? 0
-            let tqEngaged = EngagementCheck(marker: "turboquant_tokens", floor: promptTokens.count + 1)
-                .passed(before: 0, after: tqTokens)
-            engaged = engaged && tqEngaged
+            let marker: String
+            switch cacheKind {
+            case .fp16:
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "lossy triad selected for fp16 KV")
+            case .affine:
+                marker = "affine_tokens"
+            case .turboQuant:
+                marker = "turboquant_tokens"
+            }
+            let cachedTokens = candidate.engagement.counts[marker] ?? 0
+            let cacheEngaged = EngagementCheck(
+                marker: marker, floor: promptTokens.count + 1
+            ).passed(before: 0, after: cachedTokens)
+            engaged = engaged && cacheEngaged
             // non-crash: candidate already produced >=1 token (checked below via prefix).
             // non-NaN: scan a full-vocab logprobs pass for any non-finite value — this ALSO
             // exercises the harness scoring forward with the quantized cache (Phase 3's path).
@@ -227,11 +273,11 @@ func runVerify(_ flags: Flags) async {
             // perturbation on real tensors — O(0.1–1) means near-tie argmax flips (expected
             // lossy behavior), ≫1 means a broken path.
             let fp16Row0 = try await driver.logprobs(prompt: promptTokens, config: .greedy(maxTokens: 1)).first ?? []
-            if let tqRow0 = rows.first, fp16Row0.count == tqRow0.count {
+            if let quantizedRow0 = rows.first, fp16Row0.count == quantizedRow0.count {
                 var maxDiff: Float = 0
                 var sumSq: Double = 0
                 for i in fp16Row0.indices {
-                    let d = fp16Row0[i] - tqRow0[i]
+                    let d = fp16Row0[i] - quantizedRow0[i]
                     maxDiff = max(maxDiff, abs(d))
                     sumSq += Double(d) * Double(d)
                 }
@@ -239,8 +285,8 @@ func runVerify(_ flags: Flags) async {
                 var top1 = -Float.infinity, top2 = -Float.infinity
                 for v in fp16Row0 { if v > top1 { top2 = top1; top1 = v } else if v > top2 { top2 = v } }
                 let fpArg = argmaxIndex(fp16Row0)
-                let tqArg = argmaxIndex(tqRow0)
-                print("pos-0 logit perturbation: max|Δ| \(fmt(Double(maxDiff), 3)), rms \(fmt(rms, 4)) (fp16 top-2 gap \(fmt(Double(top1 - top2), 3))); argmax \(fpArg == tqArg ? "MATCH" : "FLIP \(fpArg) -> \(tqArg)")")
+                let quantizedArg = argmaxIndex(quantizedRow0)
+                print("pos-0 logit perturbation: max|Δ| \(fmt(Double(maxDiff), 3)), rms \(fmt(rms, 4)) (fp16 top-2 gap \(fmt(Double(top1 - top2), 3))); argmax \(fpArg == quantizedArg ? "MATCH" : "FLIP \(fpArg) -> \(quantizedArg)")")
             }
             // coherence canary: a fixed prompt whose greedy answer must contain a known
             // substring — run AT THE QUANTIZED TIER (config carries kvQuant).
@@ -252,8 +298,8 @@ func runVerify(_ flags: Flags) async {
             let canaryPassed = canary.passed(canaryText)
             let lossy = LossyEquivalenceCheck(minPrefix: 1)
                 .evaluate(prefix: candidate.tokens.count, allFinite: allFinite, canaryPassed: canaryPassed)
-            // Teacher-forced top-1 agreement vs the SAME engine at fp16 KV, BOTH TurboQuant
-            // tiers (adjudicated re-spec): the earlier free-running identical-prefix gate was
+            // Teacher-forced top-1 agreement vs the SAME engine at fp16 KV (adjudicated
+            // re-spec): the earlier free-running identical-prefix gate was
             // chaotic — one flipped high-entropy token diverges everything after it, the same
             // lesson that made the KL metric teacher-forced. The context-locked per-position
             // agreement RATE is the stable statistic; it is REPORTED (recorded in evidence),
@@ -268,7 +314,20 @@ func runVerify(_ flags: Flags) async {
                 teacherForcedTop1 = rate
                 print("teacher-forced top-1 agreement vs fp16 KV: \(agree)/\(forced.count) (\(fmt(rate * 100, 1))%)")
             }
-            turboquantTokens = tqTokens
+            quantizedMarker = marker
+            quantizedTokens = cachedTokens
+            switch cacheKind {
+            case .fp16:
+                break
+            case .affine:
+                affineTokens = cachedTokens
+                affinePayloadBytes = candidate.engagement.counts["affine_payload_bytes"]
+                affineMetadataBytes = candidate.engagement.counts["affine_metadata_bytes"]
+                affineControlBytes = candidate.engagement.counts["affine_control_bytes"]
+                affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
+            case .turboQuant:
+                turboquantTokens = cachedTokens
+            }
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
             print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
             if !lossy.reasons.isEmpty { print("  reasons: \(lossy.reasons.joined(separator: "; "))") }
@@ -277,8 +336,8 @@ func runVerify(_ flags: Flags) async {
         }
 
         print("kv_quant_tier: \(kvQuantTier ?? "fp16") (mode=\(mode.rawValue))")
-        if let tq = turboquantTokens {
-            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); turboquant_tokens 0 -> \(tq) (floor \(promptTokens.count + 1)) -> \(engaged ? "PASS" : "FAIL")")
+        if let marker = quantizedMarker, let cachedTokens = quantizedTokens {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); \(marker) 0 -> \(cachedTokens) (floor \(promptTokens.count + 1)) -> \(engaged ? "PASS" : "FAIL")")
         } else {
             print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
         }
@@ -290,7 +349,13 @@ func runVerify(_ flags: Flags) async {
             prompt: prompt, promptTokens: promptTokens.count, n: n, mode: mode.rawValue,
             kvQuantTier: kvQuantTier ?? "fp16", equivalencePassed: verdict.equivalenceOK,
             engaged: verdict.engaged, triadPassed: verdict.passed,
-            teacherForcedTop1AgreementRate: teacherForcedTop1, turboquantTokens: turboquantTokens)
+            teacherForcedTop1AgreementRate: teacherForcedTop1,
+            turboquantTokens: turboquantTokens,
+            affineTokens: affineTokens,
+            affinePayloadBytes: affinePayloadBytes,
+            affineMetadataBytes: affineMetadataBytes,
+            affineControlBytes: affineControlBytes,
+            affineWorkspaceBytes: affineWorkspaceBytes)
         appendJSONLRecord(ResultRecord(subcommand: "verify", provenance: provenance, payload: payload), to: evidencePath(flags))
 
         if !verdict.passed { exit(1) }
@@ -309,12 +374,26 @@ func runVerify(_ flags: Flags) async {
 /// is its own reference and the mlx-lm cross-check stays with the plain `verify`.
 func runVerifySpec(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness verify --model <PATH> --spec pld [--ngram 3] [--max-draft 8] [--compiled-verify false] [--prompt <TEXT>] [--n 60] [--min-prefix <N=--n>] [--evidence <FILE>]")
+        print("usage: fastmlx-harness verify --model <PATH> --spec pld [--kv-quant fp16] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--prompt <TEXT>] [--n 60] [--min-prefix <N=--n>] [--evidence <FILE>]")
         exit(2)
     }
-    let spec = flags.string("spec", default: "pld")
+    let spec: String
+    let kvQuantTier: String?
+    do {
+        spec = try flags.strictString("spec", default: "pld")
+        kvQuantTier = try requestedKVQuantTier(flags)
+    } catch {
+        print("verify FAILED: \(error)")
+        exit(2)
+    }
     guard spec == "pld" else {
         print("verify FAILED: unknown --spec drafter \(spec) (known: pld)")
+        exit(2)
+    }
+    if let rejectedTier = kvQuantTier {
+        print(
+            "verify FAILED: specDecode=pld with kvQuant=\(rejectedTier) "
+                + "(unmeasured combination; use fp16)")
         exit(2)
     }
     let prompt = flags.string("prompt", default: specVerifyPrompt)
@@ -390,24 +469,32 @@ func runBench(_ flags: Flags) async {
         exit(2)
     }
     do {
+        // Validate the requested measurement before the build-mode or model-load gates so a
+        // misspelled/missing flag cannot be reported as an unrelated environment failure.
+        let kvQuantTier = try requestedKVQuantTier(flags)
+        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
+            print("bench FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
+            exit(2)
+        }
+        let requestedSpec = try flags.strictString("spec", default: "")
+        let spec: String? = requestedSpec.isEmpty ? nil : requestedSpec
+        if let spec, spec != "pld" {
+            print("bench FAILED: unknown --spec drafter \(spec) (known: pld)")
+            exit(2)
+        }
+        if spec != nil, let rejectedTier = kvQuantTier {
+            print(
+                "bench FAILED: specDecode=pld with kvQuant=\(rejectedTier) "
+                    + "(unmeasured combination; use fp16)")
+            exit(2)
+        }
         try assertReleaseBuild()
         let prompt = flags.string("prompt", default: benchPrompt)
         let maxTokens = flags.int("max-tokens", default: 256)
         let runs = flags.int("runs", default: 3)
         let label = flags.string("label", default: "harness")
-        // KV tier for the timed decode (Task 8: the materialize-then-attend perf cost).
-        let kvQuantTier = flags.string("kv-quant")
-        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
-            print("bench FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
-            exit(2)
-        }
         // Spec-decode arm (Task 6): `--spec pld` times the SAME decode workload through the
         // speculative path; the CSV/evidence `mode` column records which arm produced the number.
-        let spec = flags.string("spec")
-        if let spec, spec != "pld" {
-            print("bench FAILED: unknown --spec drafter \(spec) (known: pld)")
-            exit(2)
-        }
         let ngram = flags.int("ngram", default: 3)
         let maxDraft = flags.int("max-draft", default: 8)
         let compiledVerify = flags.string("compiled-verify", default: "false") == "true"
@@ -526,11 +613,10 @@ func runKL(_ flags: Flags) async {
             "reference-model", default: modelPath)
         // Candidate-side KV tier (Task 8): the CANDIDATE scores with the selected cache;
         // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
-        let requestedKVQuantTier = try flags.strictString("kv-quant", default: "fp16")
-        let kvQuantTier: String? = requestedKVQuantTier == "fp16"
-            ? nil : requestedKVQuantTier
-        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
-            print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+        let kvQuantTier = try requestedKVQuantTier(flags)
+        let requestedKVQuantTier = kvQuantTier ?? "fp16"
+        guard let requestedCacheKind = KVCacheKind(kvQuant: kvQuantTier) else {
+            print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
             exit(2)
         }
         let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
@@ -688,6 +774,62 @@ func runKL(_ flags: Flags) async {
             modelPath: modelPath, referenceVersions: referenceVersions,
             corpus: corpus,
             modelCheckpointManifestHash: candidateIdentity.checkpointManifestHash)
+        let candidateFormat: KVFormatGeometryEvidence?
+        let storage: KVStorageEvidence?
+        let actualControlBytes: Int?
+        switch requestedCacheKind {
+        case .affine(let tier):
+            guard let telemetry = await driver.affineScoringTelemetry() else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "affine KL run completed without affine allocation telemetry")
+            }
+            guard telemetry.tier == tier else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "affine telemetry tier \(telemetry.tier.rawValue) != requested \(tier.rawValue)")
+            }
+            let format = KVFormatGeometryEvidence(
+                kind: .affine, tier: tier.rawValue,
+                keyBits: tier.keyBits, valueBits: tier.valueBits,
+                groupSize: tier.groupSize, sinkTokens: 0,
+                layerCount: telemetry.layerCount,
+                kvHeadCount: telemetry.kvHeadCount,
+                headDimension: telemetry.headDimension,
+                capacityTokens: telemetry.capacityTokens,
+                sequences: telemetry.sequences,
+                metadataScalarBytes: telemetry.metadataScalarBytes,
+                recordAlignment: 1)
+            let (evidenceTotalBytes, overflow) = telemetry.dataArrayBytes
+                .addingReportingOverflow(telemetry.materializationWorkspaceBytes)
+            guard !overflow else {
+                throw KVFrontierEvidenceError.storageArithmeticOverflow
+            }
+            let actual = KVStorageBreakdownEvidence(
+                payloadBytes: telemetry.payloadBytes,
+                metadataBytes: telemetry.metadataBytes,
+                alignmentPaddingBytes: 0,
+                fp16SinkBytes: 0,
+                fp16TailBytes: 0,
+                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                totalBytes: evidenceTotalBytes)
+            candidateFormat = format
+            storage = try format.storageEvidence(actual: actual)
+            actualControlBytes = telemetry.controlBytes
+            print(
+                "# affine storage: payload=\(telemetry.payloadBytes), "
+                    + "metadata=\(telemetry.metadataBytes), control=\(telemetry.controlBytes), "
+                    + "persistent_total=\(telemetry.totalPersistentBytes), "
+                    + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "evidence_total=\(evidenceTotalBytes), "
+                    + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
+                    + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
+        case .fp16, .turboQuant:
+            // These rows remain exploratory until their formats expose the same complete
+            // runtime allocation contract. Promotion continues to fail closed below.
+            candidateFormat = nil
+            storage = nil
+            actualControlBytes = nil
+        }
+
         let frontier = KVFrontierEvidence(
             schemaVersion: 1, matrixID: matrixID, cellID: cellID,
             sameWeights: sameWeights,
@@ -696,9 +838,8 @@ func runKL(_ flags: Flags) async {
             referenceKVQuantTier: "fp16",
             candidateModel: candidateIdentity,
             referenceModel: referenceIdentity,
-            // Phase 2 supplies these from the real MLX allocation. A missing pair keeps this
-            // row useful for exploration but makes `--promotion-evidence true` fail closed.
-            candidateFormat: nil, storage: nil)
+            candidateFormat: candidateFormat, storage: storage,
+            actualControlBytes: actualControlBytes)
         let payload = KLPayload(
             kvQuantTier: requestedKVQuantTier,
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
@@ -799,16 +940,16 @@ struct Harness {
           corpus                              hermetic corpus + universal invariants (no model)
           verify --model <PATH>               triad: equivalence vs mlx-lm + engagement delta
                  [--kv-quant <TIER>]          KV-quant tier, RUN BY THE ENGINE: nil/fp16 = exact
-                                               triad (fp16 cache); tq2.5|tqB2 / tq3.5|tqB3 select
-                                               the TurboQuant KV cache and the lossy triad
+                                               triad; affine-k4v2-g64/g128, affine-k8v2-g64/g128,
+                                               affine-k4v4-g128, and tq2.5/tq3.5 select a lossy triad
                                                (non-crash + non-NaN + canary + engagement), and
                                                REPORT teacher-forced top-1 agreement vs fp16 KV
                  [--spec pld]                 spec-decode exactness triad instead: PLD-on vs
                  [--ngram 3] [--max-draft 8]   PLD-off on the SAME engine must be byte-identical
                  [--compiled-verify false]     at temp 0, with an engagement delta (drafting
-                                               happened); acceptance rate is reported
+                                               happened); acceptance rate is reported; fp16 KV only
           bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
-                 [--kv-quant <TIER>]          KV tier for the timed decode (fp16|tq2.5|tq3.5)
+                 [--kv-quant <TIER>]          KV tier for timed decode (\(kvQuantUsageTiers))
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
@@ -828,7 +969,8 @@ struct Harness {
                  [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  --matrix-id <ID> --cell-id <ID> pin the frontier matrix/cell identity
-                 [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
+                 [--kv-quant <TIER>]          CANDIDATE KV tier (\(kvQuantUsageTiers));
+                                               reference always stays fp16 KV
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]

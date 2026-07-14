@@ -101,7 +101,9 @@ public struct KVStorageEvidence: Codable, Equatable, Sendable {
 
 /// Context that turns a general teacher-forced KL row into a matrix cell eligible for a verdict.
 /// Geometry/storage remain optional for backward-compatible exploratory rows, but the promotion
-/// validator requires both and refuses any predicted-vs-actual mismatch.
+/// validator requires both and refuses any predicted-vs-actual mismatch. `storage` describes the
+/// format data arrays that reconcile with `KVStorageFormat`; engine bookkeeping arrays are kept
+/// visible in `actualControlBytes` instead of being hidden inside a nominal bit rate.
 public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     public let schemaVersion: Int
     public let matrixID: String
@@ -113,6 +115,7 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     public let referenceModel: KVModelEvidenceIdentity
     public let candidateFormat: KVFormatGeometryEvidence?
     public let storage: KVStorageEvidence?
+    public let actualControlBytes: Int?
 
     public init(
         schemaVersion: Int, matrixID: String, cellID: String,
@@ -121,7 +124,8 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         candidateModel: KVModelEvidenceIdentity,
         referenceModel: KVModelEvidenceIdentity,
         candidateFormat: KVFormatGeometryEvidence?,
-        storage: KVStorageEvidence?
+        storage: KVStorageEvidence?,
+        actualControlBytes: Int? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.matrixID = matrixID
@@ -133,6 +137,7 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         self.referenceModel = referenceModel
         self.candidateFormat = candidateFormat
         self.storage = storage
+        self.actualControlBytes = actualControlBytes
     }
 }
 
@@ -216,6 +221,8 @@ public enum KVFrontierEvidenceError: Error, Equatable, Sendable {
     case storageArithmeticOverflow
     case missingFormat
     case missingStorage
+    case missingControlStorage
+    case invalidControlStorage
     case storageMismatch
     case storagePredictionMismatch
     case invalidMetric(String)
@@ -352,6 +359,9 @@ private extension KVFrontierEvidence {
                 throw KVFrontierEvidenceError.inconsistentBaseline
             }
         }
+        if let actualControlBytes, actualControlBytes < 0 {
+            throw KVFrontierEvidenceError.invalidControlStorage
+        }
 
         switch (candidateFormat, storage) {
         case (.none, .none):
@@ -381,6 +391,9 @@ private extension KVFrontierEvidence {
         }
         guard candidateFormat != nil else { throw KVFrontierEvidenceError.missingFormat }
         guard let storage else { throw KVFrontierEvidenceError.missingStorage }
+        guard actualControlBytes != nil else {
+            throw KVFrontierEvidenceError.missingControlStorage
+        }
         try storage.validate(requireExactMatch: true)
     }
 
@@ -390,6 +403,21 @@ private extension KVFrontierEvidence {
                 && $0 == $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 && !$0.contains("\n") && !$0.contains("\r")
         }
+    }
+}
+
+public extension KVFormatGeometryEvidence {
+    /// Pair real runtime array bytes with the accountant's prediction for this exact geometry.
+    /// The caller supplies measured terms only; the prediction is always recomputed here so an
+    /// evidence writer cannot accidentally bless a fabricated predicted breakdown.
+    func storageEvidence(
+        actual: KVStorageBreakdownEvidence
+    ) throws -> KVStorageEvidence {
+        try actual.validate()
+        return KVStorageEvidence(
+            predicted: try predictedStorage(
+                workspaceBytes: actual.workspaceBytes),
+            actual: actual)
     }
 }
 

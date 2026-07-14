@@ -14,9 +14,9 @@ import MLXLMCommon
 ///
 /// The KV-cache position is carried by the caches as in-graph state (array offset +
 /// fixed-size buffers), which is what makes the trace valid for every step. The cache
-/// implementation is selected by `KVCacheKind` — fp16 `CompiledKVCache` or a TurboQuant
-/// tier's `TurboQuantKVCache`; both satisfy `CompiledCache`, the contract this decoder
-/// needs (Updatable state, chunked grow, identity-preserving reset).
+/// implementation is selected by `KVCacheKind` — fp16, native affine, or TurboQuant;
+/// each satisfies `CompiledCache`, the contract this decoder needs (Updatable state,
+/// chunked grow, identity-preserving reset).
 /// Keeps MLXDecoder's submit-first lookahead: the next step's compiled call is
 /// submitted (asyncEval) BEFORE the current token's blocking `.item()` readback.
 public struct CompiledMLXDecoder: Decoder {
@@ -290,5 +290,17 @@ public struct CompiledMLXDecoder: Decoder {
     public func turboQuantCachedTokens() -> Int? {
         guard let cache = caches.first as? TurboQuantKVCache else { return nil }
         return Int(cache.offsetArr.item(Int32.self))
+    }
+
+    /// Post-run affine engagement, geometry, and exact storage bytes. The capture happens
+    /// while this decoder and its MLX arrays remain in the inference actor; only a Sendable
+    /// scalar snapshot crosses back to the harness.
+    public func affineKVTelemetry() -> AffineKVCacheTelemetry? {
+        guard case .affine(let tier) = kvCacheKind else { return nil }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "affine tier requested but the decoder contains a different cache type")
+        return AffineKVCacheTelemetry.capture(tier: tier, caches: affineCaches)
     }
 }

@@ -32,7 +32,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
         matrixID: String = "kvarn-qwen3-32b-v1",
         cellID: String = "affine-k4v2-g128",
         format: KVFormatGeometryEvidence? = nil,
-        storage: KVStorageEvidence? = nil
+        storage: KVStorageEvidence? = nil,
+        controlBytes: Int? = 256
     ) -> KVFrontierEvidence {
         let same = identity()
         let bytes = breakdown()
@@ -43,7 +44,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
             candidateModel: candidate ?? same,
             referenceModel: reference ?? same,
             candidateFormat: format ?? geometry(),
-            storage: storage ?? KVStorageEvidence(predicted: bytes, actual: bytes))
+            storage: storage ?? KVStorageEvidence(predicted: bytes, actual: bytes),
+            actualControlBytes: controlBytes)
     }
 
     private func payload(frontier: KVFrontierEvidence? = nil) -> KLPayload {
@@ -71,6 +73,34 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertEqual(decoded, validated)
         XCTAssertEqual(decoded.frontier?.matrixID, "kvarn-qwen3-32b-v1")
         XCTAssertEqual(decoded.frontier?.storage?.actual.totalBytes, 218_103_808)
+    }
+
+    func testHistoricalFrontierWithoutControlBytesStillDecodesButCannotPromote() throws {
+        let encoded = try JSONEncoder().encode(payload())
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        var frontier = try XCTUnwrap(object["frontier"] as? [String: Any])
+        frontier.removeValue(forKey: "actualControlBytes")
+        object["frontier"] = frontier
+
+        let historical = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(KLPayload.self, from: historical)
+
+        XCTAssertNil(decoded.frontier?.actualControlBytes)
+        XCTAssertNoThrow(try decoded.validatedForRecord())
+        XCTAssertThrowsError(try decoded.validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingControlStorage)
+        }
+    }
+
+    func testFormatBuildsPredictionAroundMeasuredRuntimeArrays() throws {
+        let actual = breakdown()
+        let evidence = try geometry().storageEvidence(actual: actual)
+
+        XCTAssertEqual(evidence.actual, actual)
+        XCTAssertEqual(evidence.predicted, actual)
     }
 
     func testPromotionRejectsMissingFrontierAndLongContextTail() {
@@ -142,6 +172,23 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertThrowsError(try payload(frontier: frontier(
             storage: KVStorageEvidence(predicted: invalid, actual: invalid)
         )).validatedForRecord())
+    }
+
+    func testPromotionRequiresExplicitImplementationControlBytes() {
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            controlBytes: nil
+        )).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingControlStorage)
+        }
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            controlBytes: -1
+        )).validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidControlStorage)
+        }
     }
 
     func testPromotionRejectsEqualButFabricatedStorageAndTierGeometryMismatch() {

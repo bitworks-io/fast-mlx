@@ -5,8 +5,8 @@ import MLXLMCommon
 /// The cache contract `CompiledMLXDecoder` actually depends on, beyond MLXLMCommon's
 /// `KVCache`: compile-capturable state (`Updatable`), chunked growth between steps (one
 /// retrace per chunk), and identity-preserving in-place reset. `CompiledKVCache` (fp16)
-/// and `TurboQuantKVCache` (quantized codes, materialize-then-attend) both conform, so
-/// the decoder is selected per KV tier instead of hardcoding the fp16 type.
+/// `AffineKVCache`, and `TurboQuantKVCache` all conform, so the decoder is selected per KV
+/// tier instead of hardcoding the fp16 type.
 public protocol CompiledCache: AnyObject, KVCache, Updatable {
     var capacity: Int { get }
     func grow(by chunk: Int)
@@ -25,17 +25,22 @@ extension AffineKVCache: CompiledCache {}
 /// harness's `RunConfig.kvQuant` tier string.
 public enum KVCacheKind: Sendable, Hashable {
     case fp16
+    case affine(AffineKVTier)
     case turboQuant(TurboQuantTier)
 
-    /// Maps a `RunConfig.kvQuant` string. `nil`/`"fp16"` → `.fp16`; TurboQuant tiers accept
-    /// both the harness recording slot ("tq2.5"/"tq3.5") and the honest tier name
-    /// ("tqB2"/"tqB3"). Unknown strings return nil — callers must fail loudly, never
-    /// silently fall back to fp16 (a "measurement" must measure what was asked for).
+    /// Maps a `RunConfig.kvQuant` string. `nil`/`"fp16"` → `.fp16`; affine cells accept
+    /// only `AffineKVTier`'s canonical raw values, while TurboQuant accepts both the harness
+    /// recording slot ("tq2.5"/"tq3.5") and honest tier name ("tqB2"/"tqB3"). Unknown
+    /// strings return nil — callers must fail loudly, never silently fall back to fp16.
     public init?(kvQuant: String?) {
         switch kvQuant {
         case nil, "fp16":
             self = .fp16
         case let s?:
+            if let tier = AffineKVTier(rawValue: s) {
+                self = .affine(tier)
+                return
+            }
             guard
                 let tier = TurboQuantTier.allCases.first(where: {
                     $0.harnessSlot == s || $0.rawValue == s
@@ -45,13 +50,15 @@ public enum KVCacheKind: Sendable, Hashable {
         }
     }
 
-    /// Build one layer's cache. TurboQuant params resolve lazily from the first update's
-    /// head_dim; the fixed seed means every layer derives the identical global Π/S/codebook
-    /// (the paper's "global parameters").
+    /// Build one layer's cache. Native affine geometry is fixed by its named tier. TurboQuant
+    /// params resolve lazily from the first update's head_dim; the fixed seed means every layer
+    /// derives the identical global Π/S/codebook (the paper's "global parameters").
     public func makeCache(capacity: Int) -> any CompiledCache {
         switch self {
         case .fp16:
             CompiledKVCache(capacity: capacity)
+        case .affine(let tier):
+            AffineKVCache(capacity: capacity, configuration: tier.configuration)
         case .turboQuant(let tier):
             TurboQuantKVCache(capacity: capacity, tier: tier)
         }

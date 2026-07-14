@@ -31,6 +31,9 @@ actor HarnessEngineActor {
     /// step function survives across runs (an fp16 baseline and a TurboQuant candidate can
     /// alternate within one verify invocation without retracing either).
     private var decoders: [KVCacheKind: CompiledMLXDecoder] = [:]
+    /// Largest affine scoring allocation observed in this actor. Scoring caches are ephemeral,
+    /// so their scalar geometry/byte evidence must be retained before the arrays are released.
+    private var maximumAffineScoringTelemetry: AffineKVCacheTelemetry?
 
     init(model: sending any LanguageModel) {
         self.model = model
@@ -38,10 +41,14 @@ actor HarnessEngineActor {
 
     /// Greedy decode via the compiled core. The returned ids INCLUDE a terminal eos if one is
     /// produced (mirroring scripts/harness_reference.py exactly, so token streams diff cleanly).
-    /// `turboQuantTokens` is the in-graph engagement marker from the quantized cache (nil on
-    /// fp16 runs) — proof the quant path ran, read AFTER timing so it cannot skew the numbers.
+    /// Quantized-cache engagement is read AFTER timing so its synchronization cannot skew the
+    /// benchmark. Affine returns a Sendable scalar snapshot; TurboQuant retains its legacy token
+    /// marker until that format's evidence schema is generalized.
     func generate(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind)
-        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], turboQuantTokens: Int?)
+        -> (
+            tokens: [Int], submitTime: Double, tokenTimes: [Double],
+            turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?
+        )
     {
         if decoders[kind] == nil {
             decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
@@ -50,7 +57,7 @@ actor HarnessEngineActor {
         defer { decoders[kind] = decoder }
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, [], nil) }
+        guard maxTokens > 0 else { return ([], submitTime, [], nil, nil) }
         var tokens: [Int] = []
         var tokenTimes: [Double] = []
         var tok = decoder.prefill(prompt)
@@ -62,12 +69,18 @@ actor HarnessEngineActor {
             tokenTimes.append(Date().timeIntervalSinceReferenceDate)
         }
         let turboQuantTokens = decoder.turboQuantCachedTokens()
+        let affineTelemetry = decoder.affineKVTelemetry()
         if case .turboQuant = kind {
             // A TurboQuant run whose decoder somehow holds an fp16 cache is a plumbing bug,
             // not a measurement — fail loudly (mirrors requireSupported's contract).
             precondition(turboQuantTokens != nil, "TurboQuant tier requested but the quantized cache did not engage")
         }
-        return (tokens, submitTime, tokenTimes, turboQuantTokens)
+        if case .affine = kind {
+            precondition(
+                affineTelemetry != nil,
+                "affine tier requested but the affine cache did not engage")
+        }
+        return (tokens, submitTime, tokenTimes, turboQuantTokens, affineTelemetry)
     }
 
     /// Speculative-decoding generate (PLD first): routes to `CompiledMLXDecoder.generateSpec`,
@@ -104,7 +117,7 @@ actor HarnessEngineActor {
             if tok == eos { break }
             y = MLXArray([tok]).reshaped([1, 1])
         }
-        assertTurboQuantEngaged(kind, cache: cache, minTokens: prompt.count)
+        captureQuantizedScoringTelemetry(kind, cache: cache, minTokens: prompt.count)
         return rows
     }
 
@@ -162,33 +175,58 @@ actor HarnessEngineActor {
                 rows.append(logits[0..., sel.localIndex, 0...].asType(.float32).asArray(Float.self))
             }
         }
-        assertTurboQuantEngaged(kind, cache: cache, minTokens: input.count)
+        captureQuantizedScoringTelemetry(kind, cache: cache, minTokens: input.count)
         return rows
     }
 
     /// Scoring-path cache selection (Task 7): the MEASUREMENT forwards must run the same KV
     /// tier the config asked for, not silently fp16 — Phase 3's KL/ppl numbers come through
-    /// here, not through the compiled decode path. fp16 keeps the stock model cache; a
-    /// TurboQuant tier gets one `TurboQuantKVCache` per layer, sized for the whole pass
-    /// up-front (scoring knows its total length; no chunked growth needed).
+    /// here, not through the compiled decode path. fp16 keeps the stock model cache; affine
+    /// and TurboQuant tiers get their requested concrete cache per layer, sized for the whole
+    /// pass up front (scoring knows its total length; no chunked growth needed).
     private func makeScoringCache(kind: KVCacheKind, capacity: Int) -> [any KVCache] {
         switch kind {
         case .fp16:
             return model.newCache(parameters: nil)
-        case .turboQuant:
+        case .affine, .turboQuant:
             let layerCount = model.newCache(parameters: nil).count
             return (0 ..< layerCount).map { _ in kind.makeCache(capacity: max(capacity, 1)) }
         }
     }
 
-    /// Engagement backstop for the scoring paths: when a TurboQuant tier was requested, the
-    /// cache must BE a TurboQuantKVCache and must have cached every scored position — a
-    /// silent fp16 fallback here would let Phase 3 "measure" the wrong thing.
-    private func assertTurboQuantEngaged(_ kind: KVCacheKind, cache: [any KVCache], minTokens: Int) {
-        guard case .turboQuant = kind else { return }
-        guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
-            preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+    /// Engagement backstop for the scoring paths: a requested lossy cache must have the
+    /// matching concrete type and must have cached every scored position. A silent fp16
+    /// fallback here would make the quality evidence measure the wrong thing.
+    private func captureQuantizedScoringTelemetry(
+        _ kind: KVCacheKind, cache: [any KVCache], minTokens: Int
+    ) {
+        switch kind {
+        case .fp16:
+            return
+        case .affine(let tier):
+            guard let affine = cache.first as? AffineKVCache, affine.offset >= minTokens else {
+                preconditionFailure("affine tier requested but the affine scoring cache did not engage")
+            }
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "affine scoring cache contains a different cache type")
+            let telemetry = AffineKVCacheTelemetry.capture(
+                tier: tier, caches: affineCaches)
+            if maximumAffineScoringTelemetry.map({
+                telemetry.capacityTokens > $0.capacityTokens
+            }) ?? true {
+                maximumAffineScoringTelemetry = telemetry
+            }
+        case .turboQuant:
+            guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
+                preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+            }
         }
+    }
+
+    func affineScoringTelemetry() -> AffineKVCacheTelemetry? {
+        maximumAffineScoringTelemetry
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -231,6 +269,13 @@ struct SwiftEngineDriver: EngineDriver {
             // engagement marker (delta-checked by `verify`; absent on fp16 runs).
             counts["turboquant_tokens"] = tq
         }
+        if let affine = out.affineTelemetry {
+            counts["affine_tokens"] = affine.cachedTokens
+            counts["affine_payload_bytes"] = affine.payloadBytes
+            counts["affine_metadata_bytes"] = affine.metadataBytes
+            counts["affine_control_bytes"] = affine.controlBytes
+            counts["affine_workspace_bytes"] = affine.materializationWorkspaceBytes
+        }
         return RunResult(
             tokens: out.tokens,
             engagement: .init(counts),
@@ -255,9 +300,13 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, forced: forcedContinuation, positions: positions, kvCache: kind)
     }
 
-    /// Validates the whole config and maps `kvQuant` to a cache kind. nil/"fp16" → fp16;
-    /// "tq2.5"/"tq3.5" (or "tqB2"/"tqB3") → the TurboQuant cache. Anything else throws —
-    /// a "measurement" must never silently measure something other than what was asked for.
+    func affineScoringTelemetry() async -> AffineKVCacheTelemetry? {
+        await engine.affineScoringTelemetry()
+    }
+
+    /// Validates the whole config and maps `kvQuant` through `KVCacheKind`'s closed affine /
+    /// TurboQuant allowlist. Anything else throws — a measurement must never silently run a
+    /// different cache from the one requested.
     /// The scoring paths pass `allowSpec: false`: speculation changes how a decode loop steps,
     /// not what a teacher-forced forward scores, so a spec config there is a caller bug.
     private static func cacheKind(_ config: RunConfig, allowSpec: Bool = true) throws -> KVCacheKind {
@@ -269,14 +318,14 @@ struct SwiftEngineDriver: EngineDriver {
         }
         guard let kind = KVCacheKind(kvQuant: config.kvQuant) else {
             throw SwiftEngineDriverError.unsupportedConfig(
-                "kvQuant=\(config.kvQuant ?? "nil") (known tiers: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+                "kvQuant=\(config.kvQuant ?? "fp16") (unknown tier)")
         }
         return kind
     }
 
     /// Maps `RunConfig.specDecode` to the engine's spec-decode configuration. nil → plain decode;
     /// "pld" → prompt-lookup drafter with the config's ngram/K/compile-strategy knobs. Unknown
-    /// drafters and unmeasured tier combinations (spec + TurboQuant KV) fail loudly.
+    /// drafters and every unmeasured spec + lossy-KV combination fail loudly.
     private static func specConfig(_ config: RunConfig) throws -> SpecDecodeConfig? {
         guard let spec = config.specDecode else { return nil }
         guard spec == "pld" else {

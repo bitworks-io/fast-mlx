@@ -99,6 +99,7 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(storage.payloadBytes, 1_536)
         XCTAssertEqual(storage.metadataBytes, 128)
         XCTAssertEqual(storage.controlBytes, 4)
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 8_192)
         XCTAssertEqual(storage.dataArrayBytes, 1_664)
         XCTAssertEqual(storage.totalPersistentBytes, 1_668)
         XCTAssertEqual(cache.innerState().count, 7)
@@ -127,6 +128,32 @@ final class AffineKVCacheTests: XCTestCase {
         }
     }
 
+    func testAffineTierNamesMapFailClosedAndBuildTheRequestedCache() {
+        let expected: [(String, AffineKVTier)] = [
+            ("affine-k4v2-g64", .k4v2G64),
+            ("affine-k4v2-g128", .k4v2G128),
+            ("affine-k8v2-g64", .k8v2G64),
+            ("affine-k8v2-g128", .k8v2G128),
+            ("affine-k4v4-g128", .k4v4G128),
+        ]
+
+        for (name, tier) in expected {
+            XCTAssertEqual(KVCacheKind(kvQuant: name), .affine(tier))
+            guard let cache = KVCacheKind.affine(tier).makeCache(capacity: 7)
+                as? AffineKVCache
+            else { return XCTFail("expected AffineKVCache for \(name)") }
+            XCTAssertEqual(cache.capacity, 7)
+            XCTAssertEqual(cache.configuration.keyBits, tier.keyBits)
+            XCTAssertEqual(cache.configuration.valueBits, tier.valueBits)
+            XCTAssertEqual(cache.configuration.keyGroupSize, tier.groupSize)
+            XCTAssertEqual(cache.configuration.valueGroupSize, tier.groupSize)
+        }
+
+        XCTAssertNil(KVCacheKind(kvQuant: "affine-k4v2-g96"))
+        XCTAssertNil(KVCacheKind(kvQuant: "k4v2-g128"))
+        XCTAssertNil(KVCacheKind(kvQuant: "affine-k3v2-g128"))
+    }
+
     func testDeclaredAffineCellsReportTheirActualPackedShapesAndBytes() throws {
         struct Cell {
             let keyBits: Int
@@ -143,6 +170,10 @@ final class AffineKVCacheTests: XCTestCase {
                 keyBits: 4, valueBits: 2, groupSize: 64,
                 keyPayloadWidth: 16, valuePayloadWidth: 8, metadataWidth: 2,
                 payloadBytes: 480, metadataBytes: 80),
+            Cell(
+                keyBits: 8, valueBits: 2, groupSize: 64,
+                keyPayloadWidth: 32, valuePayloadWidth: 8, metadataWidth: 2,
+                payloadBytes: 800, metadataBytes: 80),
             Cell(
                 keyBits: 8, valueBits: 2, groupSize: 128,
                 keyPayloadWidth: 32, valuePayloadWidth: 8, metadataWidth: 1,
@@ -198,6 +229,40 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(storage.payloadBytes, 288)
         XCTAssertEqual(storage.metadataBytes, 36)
         XCTAssertEqual(storage.totalPersistentBytes, 328)
+    }
+
+    func testTelemetryAggregatesAllLayersAndKeepsControlBytesExplicit() throws {
+        let caches: [AffineKVCache] = (0 ..< 3).map { _ in
+            AffineKVCache(
+                capacity: 8,
+                configuration: AffineKVTier.k4v2G128.configuration)
+        }
+        let keys = randomKV(
+            batch: 1, heads: 2, tokens: 2, dimension: 128, seed: 27)
+        let values = randomKV(
+            batch: 1, heads: 2, tokens: 2, dimension: 128, seed: 28)
+        for cache in caches { _ = cache.update(keys: keys, values: values) }
+
+        let telemetry = AffineKVCacheTelemetry.capture(
+            tier: .k4v2G128,
+            caches: caches)
+
+        XCTAssertEqual(telemetry.tier, .k4v2G128)
+        XCTAssertEqual(telemetry.cachedTokens, 2)
+        XCTAssertEqual(telemetry.layerCount, 3)
+        XCTAssertEqual(telemetry.capacityTokens, 8)
+        XCTAssertEqual(telemetry.sequences, 1)
+        XCTAssertEqual(telemetry.kvHeadCount, 2)
+        XCTAssertEqual(telemetry.headDimension, 128)
+        XCTAssertEqual(telemetry.metadataScalarBytes, 2)
+        XCTAssertEqual(telemetry.payloadBytes, 4_608)
+        XCTAssertEqual(telemetry.metadataBytes, 384)
+        XCTAssertEqual(telemetry.controlBytes, 12)
+        // Layers execute sequentially, so the logical materialization workspace is one
+        // full K/V pair, not the sum of all three layer-local pairs.
+        XCTAssertEqual(telemetry.materializationWorkspaceBytes, 8_192)
+        XCTAssertEqual(telemetry.dataArrayBytes, 4_992)
+        XCTAssertEqual(telemetry.totalPersistentBytes, 5_004)
     }
 
     func testGrowTruncateAndResetPreserveTheCompiledStateContract() throws {
