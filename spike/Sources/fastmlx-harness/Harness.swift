@@ -82,27 +82,6 @@ struct SpecVerifyPayload: Codable, Sendable {
     let triadPassed: Bool
 }
 
-struct KLPayload: Codable, Sendable {
-    /// Candidate-side KV-cache tier ("fp16" when unset). The reference side is always fp16 KV.
-    let kvQuantTier: String
-    /// Headline for SHORT entries: median of PER-ENTRY medians (equal weight per entry). NOT a
-    /// position-weighted pool -- see the pooled diagnostics below, which exist for visibility only.
-    let klMedianNats: Double
-    /// Headline for LONG-CONTEXT entries: median across long entries of the per-entry p95
-    /// (`longContextTailKL`). Over natural long text the per-position median sits BELOW the
-    /// same-weights noise floor (easy tokens dominate); KV-quant divergence is a TAIL
-    /// phenomenon, so the tail statistic is the honest long-context headline. nil when the
-    /// corpus has no long-context entries.
-    let klLongContextTailP95Nats: Double?
-    let klPooledMedianNats: Double
-    let klPooledP95Nats: Double
-    let pplCandidate: Double
-    let pplReference: Double
-    let pplDeltaPct: Double
-    let totalPositions: Int
-    let entryCount: Int
-}
-
 struct BenchPayload: Codable, Sendable {
     let label: String
     let workload: String
@@ -526,34 +505,63 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
-        let positions = flags.int("positions", default: 24)
-        let longContextSampleSize = flags.int("long-context-sample-positions", default: 128)
+        let matrixID = try flags.strictString("matrix-id", default: "")
+        let cellID = try flags.strictString("cell-id", default: "")
+        guard !matrixID.isEmpty, !cellID.isEmpty else {
+            throw KVFrontierEvidenceError.invalidIdentifier("matrix-id/cell-id")
+        }
+        let promotionEvidence = try flags.strictBool(
+            "promotion-evidence", default: false)
+        let positions = try flags.strictInt("positions", default: 24)
+        let longContextSampleSize = try flags.strictInt(
+            "long-context-sample-positions", default: 128)
+        guard positions > 0, longContextSampleSize > 0 else {
+            throw KVFrontierEvidenceError.invalidMetric("positions")
+        }
+        let referenceModelPath = try flags.strictString(
+            "reference-model", default: modelPath)
         // Candidate-side KV tier (Task 8): the CANDIDATE scores with the selected cache;
         // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
-        let kvQuantTier = flags.string("kv-quant")
+        let requestedKVQuantTier = try flags.strictString("kv-quant", default: "fp16")
+        let kvQuantTier: String? = requestedKVQuantTier == "fp16"
+            ? nil : requestedKVQuantTier
         guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
             print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "nil") (known: fp16, tq2.5/tqB2, tq3.5/tqB3)")
             exit(2)
         }
+        let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
+        let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+            at: referenceModelPath)
+        let sameWeights = ProvenanceCLI.sameResolvedModelPath(
+            modelPath, referenceModelPath) && candidateIdentity == referenceIdentity
         let corpus = try loadMeasurementCorpus(flags)
-        let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
-        let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
-        let sameWeights = reference.modelPath == modelPath
-        let config = RunConfig(temperature: 0, maxTokens: positions, kvQuant: kvQuantTier)
-        let referenceConfig = RunConfig.greedy(maxTokens: positions)
         let shortEntries = corpus.entries(tagged: .prose) + corpus.entries(tagged: .code)
         let longEntries = corpus.entries(tagged: .longContext)
+        guard !shortEntries.isEmpty, !longEntries.isEmpty,
+            shortEntries.count + longEntries.count == corpus.entries.count
+        else { throw KVFrontierEvidenceError.missingCohortEvidence }
+        let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
+        let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
+        guard reference.modelPath == referenceModelPath else {
+            throw KVFrontierEvidenceError.invalidPromotionProvenance("referenceModelPath")
+        }
+        let config = RunConfig(temperature: 0, maxTokens: positions, kvQuant: kvQuantTier)
+        let referenceConfig = RunConfig.greedy(maxTokens: positions)
 
         print("candidate: Swift engine on \(modelPath) (kv_quant_tier=\(kvQuantTier ?? "fp16"))")
         print("reference: mlx-lm on \(reference.modelPath) (fp16 KV)")
         print("corpus: \(corpus.corpusId) (content hash \(corpus.contentHash), \(corpus.entries.count) entries)")
-        print(sameWeights
-            ? "# SAME weights both sides -> this is a PIPELINE PROOF (cross-implementation float-reduction noise), not a quantization-loss measurement."
-            : "# DIFFERENT weights -> candidate-vs-reference quantization/behavior divergence measurement.")
+        if sameWeights, requestedKVQuantTier == "fp16" {
+            print("# SAME weights + fp16 KV both sides -> pipeline/noise-floor proof.")
+        } else if sameWeights {
+            print("# SAME weights; candidate \(requestedKVQuantTier) KV vs fp16 KV reference -> marginal KV-cache loss measurement.")
+        } else {
+            print("# DIFFERENT weights -> confounded comparison evidence; never promotion-eligible as marginal KV-cache loss.")
+        }
         print("# TEACHER-FORCED: both sides score the reference's greedy continuation, so every position is context-locked.")
 
         var allKLs: [Double] = []
@@ -564,6 +572,10 @@ func runKL(_ flags: Flags) async {
         // give every entry equal weight regardless of how many positions it was scored at.
         var entryMedians: [Double] = []
         var candNLLTotal = 0.0, refNLLTotal = 0.0, totalPositions = 0
+        var top1Matches = 0, top1ScoredPositions = 0
+        var shortScoredPositionCount = 0, longContextScoredPositionCount = 0
+        var longContextMaxDocumentTokens = 0
+        var longContextMaxScoredContextTokens = 0
         var spotChecked = false
         for entry in shortEntries {
             let prompt = tokenizer.encode(text: entry.text)
@@ -586,18 +598,20 @@ func runKL(_ flags: Flags) async {
                 spotChecked = true
             }
             let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
-            // Diagnostic: at how many positions would the candidate have picked the same token
-            // the reference did, given the reference's context? (Top-1 agreement, not a gate.)
-            let agree = zip(s.candidateRows.map(argmaxIndex), s.continuation).filter(==).count
+            let top1 = try teacherForcedTop1Agreement(
+                candidate: s.candidateRows, reference: s.referenceRows)
             allKLs.append(contentsOf: kls)
             entryMedians.append(medianOf(kls))
+            top1Matches += top1.matches
+            top1ScoredPositions += top1.scoredPositions
             // Perplexity pools NLL over positions from the SAME rows (identical math to
             // teacherForcedPerplexities — one forward pass serves both metrics).
             let n = Double(s.continuation.count)
             candNLLTotal += meanNLL(rows: s.candidateRows, tokens: s.continuation) * n
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.continuation) * n
             totalPositions += s.continuation.count
-            print("entry \(entry.id) (\(entry.tag.rawValue)): forced-positions=\(kls.count), top1-agreement=\(agree)/\(s.continuation.count), median KL=\(sci(medianOf(kls)))")
+            shortScoredPositionCount += s.continuation.count
+            print("entry \(entry.id) (\(entry.tag.rawValue)): forced-positions=\(kls.count), teacher-forced-top1-vs-reference=\(top1.matches)/\(top1.scoredPositions), median KL=\(sci(medianOf(kls)))")
         }
 
         // Long-context entries (Task 3): teacher-forced AGAINST THEMSELVES (wikitext-perplexity
@@ -617,17 +631,30 @@ func runKL(_ flags: Flags) async {
             let s = try await teacherForcedScoresAtSampledPositions(
                 driver: driver, reference: reference, prompt: prompt, continuation: continuation,
                 positions: sampled, config: config, referenceConfig: referenceConfig)
+            guard let deepestPosition = s.positions.last else {
+                throw KVFrontierEvidenceError.missingLongContextDepthEvidence
+            }
+            longContextMaxDocumentTokens = max(
+                longContextMaxDocumentTokens, docTokens.count)
+            longContextMaxScoredContextTokens = max(
+                longContextMaxScoredContextTokens,
+                prompt.count + deepestPosition)
             let kls = perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows)
+            let top1 = try teacherForcedTop1Agreement(
+                candidate: s.candidateRows, reference: s.referenceRows)
             allKLs.append(contentsOf: kls)
             longEntryKLs.append(kls)
+            top1Matches += top1.matches
+            top1ScoredPositions += top1.scoredPositions
             let n = Double(s.forcedTokens.count)
             candNLLTotal += meanNLL(rows: s.candidateRows, tokens: s.forcedTokens) * n
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.forcedTokens) * n
             totalPositions += s.forcedTokens.count
+            longContextScoredPositionCount += s.forcedTokens.count
             // The long-context ENTRY headline is the TAIL (p95), not the median: over natural
             // long text the median sits below the same-weights noise floor (easy tokens both
             // quants agree on dominate it), while KV-quant loss accrues in the tail.
-            print("entry \(entry.id) (long-context, \(docTokens.count) doc tokens): sampled-positions=\(kls.count)/\(continuation.count), p95 KL=\(sci(quantile(kls, 0.95))), median KL=\(sci(medianOf(kls)))")
+            print("entry \(entry.id) (long-context, \(docTokens.count) doc tokens): sampled-positions=\(kls.count)/\(continuation.count), teacher-forced-top1-vs-reference=\(top1.matches)/\(top1.scoredPositions), p95 KL=\(sci(quantile(kls, 0.95))), median KL=\(sci(medianOf(kls)))")
         }
 
         let pooledP95 = quantile(allKLs, 0.95)
@@ -650,16 +677,51 @@ func runKL(_ flags: Flags) async {
         print("ppl_candidate (teacher-forced, pooled \(totalPositions) positions): \(fmt(pplPair.candidate, 4))")
         print("ppl_reference (its own greedy continuation): \(fmt(pplPair.reference, 4))")
         print("ppl_delta (PerplexityMetric): \(String(format: "%+.2f%%", pplPair.relativeDelta * 100)) (dial gate: <= 1%)")
+        guard top1ScoredPositions == totalPositions, top1ScoredPositions > 0 else {
+            throw KVFrontierEvidenceError.invalidMetric("teacherForcedTop1Positions")
+        }
+        let top1Rate = Double(top1Matches) / Double(top1ScoredPositions)
+        print("teacher_forced_top1_vs_reference: \(top1Matches)/\(top1ScoredPositions) (\(fmt(top1Rate * 100, 2))%)")
 
         let referenceVersions = await reference.versionSink.versions
-        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: referenceVersions, corpus: corpus)
+        let (provenance, _) = ProvenanceCLI.build(
+            modelPath: modelPath, referenceVersions: referenceVersions,
+            corpus: corpus,
+            modelCheckpointManifestHash: candidateIdentity.checkpointManifestHash)
+        let frontier = KVFrontierEvidence(
+            schemaVersion: 1, matrixID: matrixID, cellID: cellID,
+            sameWeights: sameWeights,
+            comparisonBaseline: sameWeights
+                ? .sameWeightsFP16KV : .differentWeightsFP16KV,
+            referenceKVQuantTier: "fp16",
+            candidateModel: candidateIdentity,
+            referenceModel: referenceIdentity,
+            // Phase 2 supplies these from the real MLX allocation. A missing pair keeps this
+            // row useful for exploration but makes `--promotion-evidence true` fail closed.
+            candidateFormat: nil, storage: nil)
         let payload = KLPayload(
-            kvQuantTier: kvQuantTier ?? "fp16",
+            kvQuantTier: requestedKVQuantTier,
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
             klPooledMedianNats: medianOf(allKLs), klPooledP95Nats: pooledP95,
             pplCandidate: pplPair.candidate, pplReference: pplPair.reference, pplDeltaPct: pplPair.relativeDelta * 100,
-            totalPositions: totalPositions, entryCount: corpus.entries.count)
-        appendJSONLRecord(ResultRecord(subcommand: "kl", provenance: provenance, payload: payload), to: evidencePath(flags))
+            totalPositions: totalPositions, entryCount: corpus.entries.count,
+            teacherForcedTop1AgreementCount: top1Matches,
+            teacherForcedTop1ScoredPositions: top1ScoredPositions,
+            teacherForcedTop1AgreementRate: top1Rate,
+            frontier: frontier,
+            shortEntryCount: shortEntries.count,
+            shortScoredPositions: shortScoredPositionCount,
+            longContextEntryCount: longEntries.count,
+            longContextScoredPositions: longContextScoredPositionCount,
+            longContextMaxDocumentTokens: longContextMaxDocumentTokens,
+            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
+        let record = ResultRecord(
+            subcommand: "kl", provenance: provenance, payload: payload)
+        let outputPath = evidencePath(flags)
+        try RequiredKLEvidenceWriter.append(
+            record, to: URL(fileURLWithPath: outputPath),
+            promotion: promotionEvidence)
+        print("# provenance: appended validated KL evidence to \(outputPath)")
     } catch {
         print("kl FAILED: \(error)")
         exit(1)
@@ -765,10 +827,12 @@ struct Harness {
                  [--duration-seconds 86400] [--concurrency 4] [--max-tokens 64]
                  [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
+                 --matrix-id <ID> --cell-id <ID> pin the frontier matrix/cell identity
                  [--kv-quant <TIER>]          CANDIDATE-side KV tier (reference stays fp16 KV)
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
+                 [--promotion-evidence false] require full storage + clean-SHA coherence gate
 
         common flags: --python <PY=~/harness-venv/bin/python> --script <scripts/harness_reference.py>
         """)

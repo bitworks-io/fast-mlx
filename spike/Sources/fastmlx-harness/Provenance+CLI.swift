@@ -10,6 +10,20 @@ import Darwin
 /// Provenance`/`ResultRecord` — the typed struct and its JSONL encoding — stay pure and TDD'd;
 /// this file only GATHERS the values that get poured into them.
 enum ProvenanceCLI {
+    enum EvidenceIdentityError: Error, CustomStringConvertible {
+        case unreadableModelConfig(String)
+        case missingCheckpointWeights(String)
+
+        var description: String {
+            switch self {
+            case .unreadableModelConfig(let path):
+                return "cannot fingerprint model config at \(path)"
+            case .missingCheckpointWeights(let path):
+                return "checkpoint manifest at \(path) contains no safetensors files"
+            }
+        }
+    }
+
     /// `machdep.cpu.brand_string` via sysctlbyname — the standard way to name the chip on Apple
     /// Silicon; there is no public Swift/Foundation API for it.
     static func chipBrand() -> String {
@@ -38,22 +52,36 @@ enum ProvenanceCLI {
     static let mlxSwiftLMRevision = "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"
 
     /// Gathers the three SHA sources and applies the pure precedence (`resolveHarnessGitSHA`,
-    /// TDD'd in HarnessCore): explicit `HARNESS_GIT_SHA` env override -> the deploy-written
-    /// `.harness-sha` file (`scripts/sync_llmbench.sh` captures `git rev-parse HEAD` at sync
-    /// time, because an rsync'd bench host has no `.git` for the fallback below to read) ->
-    /// `git rev-parse HEAD` in the current directory -> "unknown". A record with an honest
-    /// "unknown" is better than a hard failure blocking every subcommand.
+    /// TDD'd in HarnessCore): explicit `HARNESS_GIT_SHA` env override -> dirty-aware live Git ->
+    /// the deploy-written `.harness-sha` file (`sync_llmbench.sh` writes it because the rsync'd
+    /// bench tree has no `.git`) -> "unknown". Live Git must outrank a stale local stamp.
     static func harnessGitSHA() -> String {
         resolveHarnessGitSHA(
             env: ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"],
             shaFile: try? String(contentsOfFile: ".harness-sha", encoding: .utf8),
-            gitOutput: gitRevParseHEAD())
+            gitOutput: liveGitSHA())
     }
 
-    private static func gitRevParseHEAD() -> String? {
+    private static func liveGitSHA() -> String? {
+        guard let root = runGit(["rev-parse", "--show-toplevel"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !root.isEmpty,
+            let sha = runGit(["-C", root, "rev-parse", "HEAD"])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !sha.isEmpty,
+            let status = runGit([
+                "-C", root, "status", "--porcelain", "--untracked-files=normal",
+                "--", "spike", "experiments",
+            ])
+        else { return nil }
+        return status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? sha : "\(sha)-dirty"
+    }
+
+    private static func runGit(_ arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["git", "rev-parse", "HEAD"]
+        process.arguments = ["git"] + arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
@@ -97,11 +125,39 @@ enum ProvenanceCLI {
             options: [.skipsHiddenFiles])
             .filter { $0.pathExtension == "safetensors" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !weights.isEmpty else {
+            throw EvidenceIdentityError.missingCheckpointWeights(modelPath)
+        }
         for weight in weights {
             let size = try weight.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
             bytes.append(contentsOf: "\(weight.lastPathComponent):\(size)\n".utf8)
         }
         return fnv1a64(bytes)
+    }
+
+    /// Promotion evidence uses both config bytes and a checkpoint manifest fingerprint. The
+    /// latter is deliberately not described as a tensor-content hash: it covers config/index
+    /// bytes plus sorted shard names and sizes so identity remains cheap enough to gather before
+    /// a timed run.
+    static func modelEvidenceIdentity(at modelPath: String) throws -> KVModelEvidenceIdentity {
+        let configHash = modelConfig(at: modelPath).hash
+        guard configHash != "unknown" else {
+            throw EvidenceIdentityError.unreadableModelConfig(modelPath)
+        }
+        return KVModelEvidenceIdentity(
+            configHash: configHash,
+            checkpointManifestHash: try checkpointManifestHash(at: modelPath))
+    }
+
+    /// Manifest equality alone cannot prove tensor equality, so `sameWeights` also requires both
+    /// CLI paths to resolve to the same filesystem location. Symlink aliases remain valid; copied
+    /// lookalike checkpoints remain conservatively classified as different weights.
+    static func sameResolvedModelPath(_ lhs: String, _ rhs: String) -> Bool {
+        func resolved(_ path: String) -> String {
+            URL(fileURLWithPath: path).standardizedFileURL
+                .resolvingSymlinksInPath().path
+        }
+        return resolved(lhs) == resolved(rhs)
     }
 
     static func nonce() -> String { String(Int.random(in: 0..<1_000_000_000)) }
@@ -116,7 +172,7 @@ enum ProvenanceCLI {
     /// runs that never invoke the Python reference, e.g. a same-weights-only bench).
     static func build(
         modelPath: String, referenceVersions: ReferenceDriver.ReferenceVersions?,
-        corpus: MeasurementCorpus?
+        corpus: MeasurementCorpus?, modelCheckpointManifestHash: String? = nil
     ) -> (provenance: Provenance, quant: ModelQuantInfo) {
         let (configHash, quant) = modelConfig(at: modelPath)
         let provenance = Provenance(
@@ -130,6 +186,7 @@ enum ProvenanceCLI {
             referenceMLXLMVersion: referenceVersions?.mlxLM,
             modelPath: modelPath,
             modelConfigHash: configHash,
+            modelCheckpointManifestHash: modelCheckpointManifestHash,
             modelQuant: quant,
             corpusId: corpus?.corpusId,
             corpusContentHash: corpus?.contentHash,
@@ -156,13 +213,5 @@ func appendRequiredJSONLRecord<Payload: Codable & Sendable>(
     _ record: ResultRecord<Payload>,
     to path: String
 ) throws {
-    let line = try record.jsonLine() + "\n"
-    let url = URL(fileURLWithPath: path)
-    if let handle = FileHandle(forWritingAtPath: path) {
-        defer { try? handle.close() }
-        try handle.seekToEnd()
-        try handle.write(contentsOf: Data(line.utf8))
-    } else {
-        try line.write(to: url, atomically: true, encoding: .utf8)
-    }
+    try RequiredJSONLWriter.append(record, to: URL(fileURLWithPath: path))
 }
