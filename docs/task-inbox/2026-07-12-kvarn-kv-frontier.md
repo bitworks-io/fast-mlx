@@ -1,11 +1,11 @@
 ---
-status: captured
+status: active
 type: quantization-spike
 priority: high
 created: 2026-07-12
 source: sol-audit
 planning_ready: true
-implementation_ready: false
+implementation_ready: true
 ---
 
 # KVarN K4V2 and asymmetric mixed-precision KV frontier
@@ -48,5 +48,8 @@ bit label hides metadata; task gains fail to generalize beyond calibration promp
 
 ## Next Step
 
-Implement the pure/reference tile transform and offline per-layer configuration artifact;
-do not begin Metal work until the quality/size matrix selects a winner.
+Execute the dated implementation plan in
+[`docs/superpowers/plans/2026-07-14-kvarn-kv-frontier.md`](../superpowers/plans/2026-07-14-kvarn-kv-frontier.md):
+start with the pinned pure/reference tile transform, exact storage accountant, and offline
+per-layer configuration artifact. Do not begin Metal work until the quality/size matrix selects
+a winner.
