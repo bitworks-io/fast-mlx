@@ -22,4 +22,55 @@ final class BenchMatrixTests: XCTestCase {
     XCTAssertTrue(row.csvLine.hasSuffix(",Apple M3 Ultra"))
     XCTAssertEqual(row.csvLine, "harness,decode,none,Qwen3-32B-4bit,42.5,120.3,int4,1,Apple M3 Ultra")
   }
+
+  func testServiceWorkloadIdentityPinsTheSamePromptAcrossPolicyProcesses() throws {
+    let batchIdentity = try ServiceWorkloadIdentity(nonce: "frontier-20260714")
+    let soloIdentity = try ServiceWorkloadIdentity(nonce: "frontier-20260714")
+
+    XCTAssertEqual(
+      batchIdentity.prompt(basePrompt: "serve", run: 2, request: 3),
+      soloIdentity.prompt(basePrompt: "serve", run: 2, request: 3))
+    XCTAssertEqual(
+      batchIdentity.prompt(basePrompt: "serve", run: 2, request: 3),
+      "serve [run=2 nonce=frontier-20260714] [request=3]")
+    XCTAssertNotEqual(
+      batchIdentity.prompt(basePrompt: "serve", run: 1, request: 3),
+      batchIdentity.prompt(basePrompt: "serve", run: 2, request: 3))
+    XCTAssertNotEqual(
+      batchIdentity.prompt(basePrompt: "serve", run: 2, request: 2),
+      batchIdentity.prompt(basePrompt: "serve", run: 2, request: 3))
+  }
+
+  func testServiceWorkloadIdentityRejectsUnstableOrPromptChangingNonceValues() {
+    for nonce in [
+      "", "   ", "contains space", "contains,comma", "-looks-like-a-flag",
+      String(repeating: "x", count: 65),
+    ] {
+      XCTAssertThrowsError(try ServiceWorkloadIdentity(nonce: nonce)) {
+        XCTAssertEqual($0 as? ServiceWorkloadIdentityError, .invalidNonce)
+      }
+    }
+  }
+
+  func testCLIFlagsFailClosedWhenAValueIsMissingOrFollowedByAnotherFlag() throws {
+    let trailing = CLIFlags(["--workload-nonce"])
+    XCTAssertThrowsError(
+      try trailing.strictString("workload-nonce", default: "generated")) {
+        XCTAssertEqual($0 as? FlagValueError, .missingValue(key: "workload-nonce"))
+      }
+
+    let followedByFlag = CLIFlags([
+      "--workload-nonce", "--csv", "frontier.csv",
+    ])
+    XCTAssertThrowsError(
+      try followedByFlag.strictString("workload-nonce", default: "generated")) {
+        XCTAssertEqual($0 as? FlagValueError, .missingValue(key: "workload-nonce"))
+      }
+    XCTAssertEqual(followedByFlag.string("csv"), "frontier.csv")
+
+    let explicit = CLIFlags(["--workload-nonce", "shared-identity"])
+    XCTAssertEqual(
+      try explicit.strictString("workload-nonce", default: "generated"),
+      "shared-identity")
+  }
 }

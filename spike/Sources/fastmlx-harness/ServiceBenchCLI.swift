@@ -82,6 +82,7 @@ private struct ServiceBenchPayload: Codable, Sendable {
     let maxReservedKVBytes: Int?
     let maxOutputTokens: Int
     let memoryCacheLimitBytes: Int
+    let workloadNonce: String
     let aggregate: ServiceRunAggregate
     let warmup: ServiceBenchRunEvidence
     let measuredRuns: [ServiceBenchRunEvidence]
@@ -101,7 +102,7 @@ private struct ServiceBenchCSVRow {
 func runServiceBench(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
         print(
-            "usage: fastmlx-harness service-bench --model <PATH> --policy <batch-no-spec|solo-pld> --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--max-reserved-kv-bytes N] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--evidence FILE]")
+            "usage: fastmlx-harness service-bench --model <PATH> --policy <batch-no-spec|solo-pld> --scenario burst --concurrency <1|2|4|8> [--max-tokens 128] [--runs 3] [--prefill-chunk 16] [--max-prefill N] [--max-reserved-kv-bytes N] [--ngram 3] [--max-draft 8] [--compiled-verify false] [--workload-nonce ID] [--evidence FILE]")
         exit(2)
     }
 
@@ -147,6 +148,10 @@ func runServiceBench(_ flags: Flags) async {
             throw ServiceBenchCLIError.invalidArguments(
                 "--ngram and --max-draft must be positive")
         }
+        let prompt = flags.string("prompt", default: benchPrompt)
+        let label = flags.string("label", default: "continuous-service")
+        let workloadIdentity = try ServiceWorkloadIdentity(
+            nonce: flags.strictString("workload-nonce", default: ProvenanceCLI.nonce()))
 
         let tokenizer: MLXLMCommon.Tokenizer
         let runPolicy: @Sendable ([[Int]]) async throws -> ServicePolicyRunObservation
@@ -189,16 +194,14 @@ func runServiceBench(_ flags: Flags) async {
             }
         }
 
-        let prompt = flags.string("prompt", default: benchPrompt)
-        let label = flags.string("label", default: "continuous-service")
-        let nonce = ProvenanceCLI.nonce()
         var evidenceRuns: [ServiceBenchRunEvidence] = []
         evidenceRuns.reserveCapacity(runs + 1)
 
         for run in 0 ... runs {
             let prompts = (0 ..< concurrency).map { request in
                 tokenizer.encode(
-                    text: "\(saltPrompt(run: run, nonce: nonce, prompt)) [request=\(request)]")
+                    text: workloadIdentity.prompt(
+                        basePrompt: prompt, run: run, request: request))
             }
             let observation = try await runPolicy(prompts)
             let expectedChunks = prompts.reduce(0) {
@@ -300,6 +303,7 @@ func runServiceBench(_ flags: Flags) async {
             maxReservedKVBytes: policy == "batch-no-spec" ? maxReservedKVBytes : nil,
             maxOutputTokens: maxTokens,
             memoryCacheLimitBytes: 8 << 30,
+            workloadNonce: workloadIdentity.nonce,
             aggregate: aggregate,
             warmup: evidenceRuns[0],
             measuredRuns: measured)

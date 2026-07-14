@@ -13,6 +13,7 @@ PREFILL_CHUNK="${4:-16}"
 CSV="${CSV:-continuous-service-frontier.csv}"
 EVIDENCE="${EVIDENCE:-harness-evidence.jsonl}"
 BIN="${BIN:-$(ls ~/Library/Developer/Xcode/DerivedData/fast-mlx-spike-*/Build/Products/Release/fastmlx-harness)}"
+WORKLOAD_NONCE="${WORKLOAD_NONCE-frontier-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 
 for value in "$RUNS" "$MAX_TOKENS" "$PREFILL_CHUNK"; do
     [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
@@ -20,6 +21,13 @@ for value in "$RUNS" "$MAX_TOKENS" "$PREFILL_CHUNK"; do
         exit 2
     }
 done
+
+[[ "$WORKLOAD_NONCE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+    echo "WORKLOAD_NONCE must start with an ASCII letter or digit and contain at most 64 letters, digits, dots, underscores, or hyphens" >&2
+    exit 2
+}
+
+echo "=== workload nonce: $WORKLOAD_NONCE ==="
 
 for policy in batch-no-spec solo-pld; do
     for concurrency in 1 2 4 8; do
@@ -34,6 +42,7 @@ for policy in batch-no-spec solo-pld; do
             --max-tokens "$MAX_TOKENS"
             --runs "$RUNS"
             --label "$label"
+            --workload-nonce "$WORKLOAD_NONCE"
             --csv "$CSV"
             --evidence "$EVIDENCE"
         )

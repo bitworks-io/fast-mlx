@@ -3,58 +3,9 @@ import HarnessCore
 import MLXLMCommon
 import SpikeCore
 
-/// Minimal `--flag value` parser (same shape as the spike's; no ArgumentParser dependency).
-struct Flags {
-    private var values: [String: String] = [:]
-
-    init(_ arguments: [String]) {
-        var i = 0
-        while i < arguments.count {
-            if arguments[i].hasPrefix("--"), i + 1 < arguments.count {
-                values[String(arguments[i].dropFirst(2))] = arguments[i + 1]
-                i += 2
-            } else {
-                i += 1
-            }
-        }
-    }
-
-    func string(_ key: String, default def: String) -> String { values[key] ?? def }
-    func string(_ key: String) -> String? { values[key] }
-    func int(_ key: String, default def: Int) -> Int { values[key].flatMap(Int.init) ?? def }
-    func strictInt(_ key: String, default def: Int) throws -> Int {
-        guard let raw = values[key] else { return def }
-        guard let value = Int(raw) else { throw FlagValueError.invalidInteger(key: key, value: raw) }
-        return value
-    }
-    func optionalStrictInt(_ key: String) throws -> Int? {
-        guard let raw = values[key] else { return nil }
-        guard let value = Int(raw) else { throw FlagValueError.invalidInteger(key: key, value: raw) }
-        return value
-    }
-    func strictBool(_ key: String, default def: Bool) throws -> Bool {
-        guard let raw = values[key] else { return def }
-        switch raw {
-        case "true": return true
-        case "false": return false
-        default: throw FlagValueError.invalidBoolean(key: key, value: raw)
-        }
-    }
-}
-
-enum FlagValueError: Error, CustomStringConvertible {
-    case invalidInteger(key: String, value: String)
-    case invalidBoolean(key: String, value: String)
-
-    var description: String {
-        switch self {
-        case .invalidInteger(let key, let value):
-            return "--\(key) requires an integer; actual=\(value)"
-        case .invalidBoolean(let key, let value):
-            return "--\(key) requires true or false; actual=\(value)"
-        }
-    }
-}
+/// Minimal `--flag value` parser (no ArgumentParser dependency), kept pure in HarnessCore so
+/// malformed promotion-gate commands are regression-tested off-box.
+typealias Flags = CLIFlags
 
 /// Known-good prompts from the spike's equivalence work (see 2026-07-08-swift-spike-verdict.md):
 /// "The capital of France is" matched 60/60 on the MoE target model. Still used as the `verify`
