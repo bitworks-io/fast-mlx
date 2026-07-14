@@ -19,6 +19,7 @@ public protocol CompiledCache: AnyObject, KVCache, Updatable {
 
 extension CompiledKVCache: CompiledCache {}
 extension TurboQuantKVCache: CompiledCache {}
+extension AffineKVCache: CompiledCache {}
 
 /// Which KV-cache implementation a decode/scoring path runs with — selected from the
 /// harness's `RunConfig.kvQuant` tier string.
