@@ -64,3 +64,6 @@ in the pinned paths. This records **no negative verdict** for those untested met
 trained speculation only for a deterministic target-verify repair that still pays, or a
 compatible product-size checkpoint. The next actionable flywheel item is continuous batching
 plus decode-first chunked prefill.
+
+**Subsequent status (2026-07-14):** continuous batching completed its exact engine/policy gate;
+the live queue in `docs/agent-handoff.md` now advances to KVarN/asymmetric affine.

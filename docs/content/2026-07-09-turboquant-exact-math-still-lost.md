@@ -64,7 +64,8 @@ TurboQuant tqB3 (3 base bits + 1 QJL bit ≈ 4.25 bits/element with the per-row 
 tail-p95 **1.797 nats**, ppl **+32.6%**. The KV quantization added half again the entire
 weight-quantization loss — at a size (68 KiB/token) that plain 4-bit affine KV
 quantization (72 KiB/token, group-wise scale+zero, boring since forever) roughly matches
-while behaving near-losslessly in the literature. The 3-bit tier is smaller (52 KiB/token)
+in design accounting. We did not measure a local affine-KV quality row; that comparator is
+part of the later KVarN/asymmetric gate. The 3-bit tier is smaller (52 KiB/token)
 and, as expected, worse. And the v1 decode path pays a real speed tax on top: it
 dequantizes the whole cache every step because the fused quantized-attention kernel is
 precisely the engineering the paper's system section is about.

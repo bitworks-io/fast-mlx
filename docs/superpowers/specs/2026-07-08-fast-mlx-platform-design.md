@@ -77,7 +77,26 @@ Four components + the harness spine. Each communicates through a **well-defined,
 
 The dial exposes a small number of orthogonal knobs and, for each combination, **ships a measured speed↔quality point** rather than an unquantified promise.
 
-**Dial axes (v1):** weight-quant preset × KV-quant tier (`fp16` / `8-bit` / `turbo4` Hadamard-rotated) × spec-decode toggle (PLD + DSpark) × chunked-prefill size. (**Measured through the flywheel:** PLD spec-decode → **PROMOTED** (`--spec pld`) — distribution-preserving / byte-identical, **2× decode (+100.5%) on high-repetition/agentic workloads**, with gate-tuned non-target results of code +3.2% and zero-draft prose +0.1% ([verdict + resolution](../verdicts/2026-07-09-pld-firstrun.md)). This clears the performance gate for a default-on product policy; the current harness remains explicitly opt-in until the serving/API surface chooses and wires that policy. TurboQuant KV → **SHELVED** — lost to 4-bit affine, pending outlier channels. 2-bit KV / DSpark / MTP remain experimental flags until measured.) The **KV-quant tier is also the primary large-context memory lever** — the same knob that trades quality for speed extends how much context fits per GB, so the dial and the context tunable share it (governed by the capacity advisor in the [system-aware operability spec](2026-07-09-system-aware-context-operability.md)).
+**Dial axes (v1):** weight-quant preset × KV-quant tier (`fp16` / `8-bit` / selected
+compressed formats), plus exact execution controls such as spec-decode and service policy.
+Weight/KV compression occupies the measured quality-loss frontier; an exact control has no
+quality-loss coordinate and instead reports its speed/TTFT/TPOT/fairness frontier. Prefill chunk
+size is an exact scheduling/cancellation control, not permission to change model quality.
+(**Measured through the flywheel:** PLD spec-decode → **PROMOTED** (`--spec pld`) —
+distribution-preserving / byte-identical, **2× decode (+100.5%) on high-repetition/agentic
+workloads**, with gate-tuned non-target results of code +3.2% and zero-draft prose +0.1%
+([verdict + resolution](../verdicts/2026-07-09-pld-firstrun.md)). Exact dense-Qwen3 continuous
+batching → **PROMOTED as a measured service-policy building block**: on the canonical
+same-workload burst, solo PLD wins C=1 while batch-no-spec wins C=2/4/8 by
+45.8%/58.6%/74.7%, with a clean 24-hour stability gate
+([verdict](../verdicts/2026-07-14-continuous-batching-chunked-prefill.md)). Neither product
+default is wired yet. Uniform-v1 TurboQuant KV → **SHELVED** after adding more measured loss
+than the same-weights fp16-KV baseline without a realized packed-memory win; outlier allocation
+is separately gated. KVarN/asymmetric affine, 2-bit KV, DSpark, and MTP remain unpromoted until
+their lane-specific gates run.) The **KV-quant tier is also the primary large-context memory
+lever** — the same knob that trades quality for speed extends how much context fits per GB, so
+the dial and the context tunable share it (governed by the capacity advisor in the
+[system-aware operability spec](2026-07-09-system-aware-context-operability.md)).
 
 **Three-layer precision-loss metric stack, computed per dial point:**
 1. **KL divergence vs fp16 logits** (median + p95) on a fixed mixed corpus (prose / code / long-context) — cheap, most sensitive, the primary signal.
@@ -104,9 +123,29 @@ This is the wedge, productized: not "we hide compression behind one quality bar,
 The Zig engine already proved a correct, high-overlap serving loop; we **port the design, not the syntax**, and let Swift 6 strict concurrency enforce the invariants the Zig code hand-rolled. (Source: mlx-serve `scheduler.zig`, `generate.zig`.)
 
 - **Single-owner inference actor.** A dedicated actor owns the mlx-swift model, weights, and *all* array lifetimes; **every** MLX call — forward, sample, eval, even array deallocation — is actor-isolated. Request-handling code is `Sendable`, never imports mlx-swift types, and consumes tokens as an `AsyncThrowingStream`. (Swift actors are built for exactly the "one owner, everyone else asks nicely" invariant the Zig thread+condvar code hand-rolls — and the "MLX-from-two-threads crash class" disappears structurally.)
-- **Continuous-batching slots.** Per-request state (KV cache, MoE offset, SSM state, vision embeddings) lives *off* the shared weights, in a per-slot state machine (`pendingPrefill / decoding / finished / errored`). Tick rule: 1 active → single-stream fast path (bit-identical to non-batched); ≥2 active → one batched forward, sampled per slot, **speculative paths disabled in the batched arm** (they assume a single in-flight KV cache). Output channel = `AsyncStream.Continuation` (replaces the Zig ring-buffer + condvar; Swift owns backpressure + cancellation).
-- **NAMED INVARIANT — drain-pipeline-before-batch-join.** The pipelined decode keeps a one-step lookahead (a token already forwarded into the KV cache + its pending logits, resolved lazily for GPU overlap). When a solo slot joins a batched tick mid-generation, that pending state **must be drained first** — dropping it and re-forwarding appends a duplicate KV position and re-emits a token, *corrupting every stream that joins a batch mid-generation*. This is a concurrency-only bug that won't appear in single-request tests → it is a **named invariant with a dedicated equivalence test from day one** (§6), before the batching code exists.
-- **Chunked prefill.** Prefill large prompts in bounded chunks (default 8192, configurable) for **TTFT/scheduling fairness under continuous batching**, a natural `Task.checkCancellation()` point between chunks, and cache-alignment awareness (chunk stride must stay aligned with SSM-checkpoint stride on hybrid models — misalignment silently kills prefix-cache hits). **It is NOT a large-context capacity enabler** — per vLLM's own docs, chunking bounds *transient* prefill compute, not the KV allocation for the full sequence. Our own evidence agrees: the serving path (`CtxProbe generate`) prefilled 32K **unchunked** without OOM, and every attention site routes through fused SDPA (no O(L²) score-matrix materialization). **Gate:** before relying on chunking for capacity at 64K+, extend `CtxProbe generate` to one-shot 64K/128K/262K prefill and *measure* the transient peak (the "measure, don't assume" pattern; see [system-aware operability spec §6/§7](2026-07-09-system-aware-context-operability.md)).
+- **Continuous-batching slots — dense-Qwen3 probe path proven 2026-07-14.** Per-request state
+  lives off the shared weights in a pure scheduler plus actor-confined MLX runtime. Decode runs
+  before bounded prefill; a stable shared membership executes one batched greedy forward and
+  demultiplexes by request ID. Qwen3-32B B1→B2→B1 and B3→B2 are byte-identical, and the
+  same-workload C=1/2/4/8 frontier plus 24-hour soak passes. The current executor admits only
+  dense `qwen3`; MoE/hybrid/recurrent/vision layouts fail closed. Speculation stays disabled in
+  shared batches. The runtime is still explicit-probe-only—production request routing and the
+  API surface remain open and are tracked by the
+  [serving-route gate](../../task-inbox/2026-07-14-continuous-batching-serving-route.md).
+- **NAMED INVARIANT — drain-pipeline-before-batch-join — PROVEN.** The pipelined decode keeps a
+  one-step lookahead (a token already forwarded into the KV cache + its pending logits,
+  resolved lazily for GPU overlap). When a solo slot joins a batched tick mid-generation, that
+  pending state **must be drained first**—dropping it and re-forwarding appends a duplicate KV
+  position and re-emits a token. The pure red-on-revert order test and final-SHA real-model
+  transition probe both pass; the invariant remains mandatory for every future executor.
+- **Chunked prefill — exact fairness/cancellation control, dense-Qwen3 probe path proven.** Prefill
+  large prompts in bounded chunks for TTFT/scheduling fairness and a cancellation point between
+  chunks. A chunk-size-1 real-model run proves decode interleaves without changing either byte
+  stream. **It is NOT a large-context capacity enabler**: chunking bounds transient prefill work,
+  not the KV allocation for the full sequence. Hybrid/SSM alignment has not been proven and those
+  architectures remain rejected. Before relying on chunking for capacity at 64K+, extend
+  `CtxProbe generate` to one-shot 64K/128K/262K prefill and measure the transient peak (see the
+  [system-aware operability spec §6/§7](2026-07-09-system-aware-context-operability.md)).
 - **Eager warmup.** Immediately after weight load, on the model actor, run one dummy decode-shaped `[1,1]` and one prefill-shaped `[1,8]` forward + `eval` to pre-fault weight pages and force Metal kernel JIT — so cold-start cost is paid at boot, not on the first user token (and doesn't masquerade as "experiment N is slower"). Gated for minimal-footprint deployments.
 - **KV / prefix cache — composite key + positive commit gate (NOT reactive invalidation).** Lookup key is an `Equatable` struct encoding every axis that changes buffer semantics: `(token-prefix, hasTools, exact KVQuantConfig)`. Commit is *positively gated* — an entry is written only when generation **cleanly succeeded** (skip pad-only, errored, vision-bearing, zero-token). A degenerate generation's state is never eligible for reuse *by construction*, which structurally avoids the "did we remember every invalidation call site?" bug class.
 - **Structured-concurrency shutdown.** Hold request tasks in a `TaskGroup` / tracked `Set<Task>` so teardown `await`s their completion/cancellation before freeing actor state (the Zig SIGSEGV bug class — detached handle-dropped workers touching freed shared state — is what structured concurrency exists to prevent). Cancellation must be observed at every `await` in the generation loop (`withTaskCancellationHandler`), or a "cancelled" stream spins on uncancelled.

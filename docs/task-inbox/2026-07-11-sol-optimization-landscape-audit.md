@@ -46,3 +46,7 @@ its task runs on the clean-SHA bench harness.
 
 **Execution update:** the first ranked task has now run. Qwen3-32B EAGLE-3 is shelved after
 clean-SHA 4-bit and 8-bit byte-identity failures; the queue advances to continuous batching.
+
+**Subsequent status (2026-07-14):** continuous batching completed its corrected service
+frontier and 24-hour soak and was promoted as an exact dense-Qwen3 service building block. The
+authoritative handoff queue now advances to the KVarN/asymmetric affine storage-quality gate.

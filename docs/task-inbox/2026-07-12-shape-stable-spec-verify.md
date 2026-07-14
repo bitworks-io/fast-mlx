@@ -37,6 +37,7 @@ documentation is explanatory context, not proof of a fix.
 
 ## Next Step
 
-Keep deferred behind continuous batching and the current ranked queue. Re-plan only when a
-bounded shape-stable kernel hypothesis or a new compatible product-size trained-drafter pairing
-exists. Use the 2026-07-12 EAGLE verdict's four-history replay as the regression oracle.
+Continuous batching is complete; keep this deferred behind the current ranked queue. Re-plan
+only when a bounded shape-stable kernel hypothesis or a new compatible product-size
+trained-drafter pairing exists. Use the 2026-07-12 EAGLE verdict's four-history replay as the
+regression oracle.

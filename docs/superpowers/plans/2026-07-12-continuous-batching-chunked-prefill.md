@@ -1,6 +1,6 @@
 # Continuous batching with decode-first chunked prefill
 
-- **Status:** ACTIVE — Phases 0–2 verified; Phase 3 service-frontier measurement next
+- **Status:** COMPLETE — exact dense-Qwen3 service building block PROMOTED 2026-07-14
 - **Date:** 2026-07-12
 - **Owner:** Codex
 - **Evaluation lane:** `EXACT`
@@ -23,9 +23,11 @@ bounded and observable service quality.
    from advancing.
 3. **Fair bounded admission.** Requests enter active slots FIFO. Short prompts admitted beside
    a long prompt can become decodable independently; queue and active limits are explicit.
-4. **Cancellation and recovery.** Cancellation removes queued, prefilling, ready, or decoding
-   work idempotently and releases its slot by the next scheduling boundary. The serving path
-   must demonstrate disconnect-to-removal within one configured keepalive interval.
+4. **Cancellation and runtime recovery.** Cancellation removes queued, prefilling, ready, or
+   decoding work idempotently and releases its slot by the next scheduling boundary. This
+   engine-building-block cycle measures runtime cancellation inside one configured keepalive
+   interval. Real transport disconnect-to-runtime propagation belongs to the separately
+   tracked [production serving-route gate](../../task-inbox/2026-07-14-continuous-batching-serving-route.md).
 5. **Fail-closed scope.** Dense attention is the only initially batchable architecture.
    MoE, hybrid/recurrent, vision, diffusion, and unknown state layouts are refused until their
    cache merge/extract and numerical contracts are proven.
@@ -190,9 +192,9 @@ graph.
 
 - Admission is bounded three ways: an explicit 256-request queue default, a config-derived
   per-request context ceiling, and an atomic aggregate logical-token reservation. The runtime
-  initially reserves only a bounded decode window and grows in chunks. Phase 3 must still
-  replace the logical-token proxy with measured host-byte admission that includes rounding
-  and temporary merge/rebuild double-buffer peaks.
+  initially reserved only a bounded decode window and grew in chunks. This was the Phase-2
+  proxy; Phase 3 below replaces it with dense KV byte admission that includes rounding and a
+  conservative five-copy merge/rebuild transition envelope.
 - Runtime construction requires a dense Qwen3 `config.json` proof (`model_type`, context cap,
   vocabulary); unsupported architecture and invalid token IDs fail before MLX indexing. The
   initializer is package-scoped so external callers cannot forge the pairing. A stronger
@@ -211,6 +213,38 @@ graph.
 - 12 cache-history-sensitive runtime/Xcode tests pass inside 41/41 total `SpikeCoreTests`;
   145 HarnessCore XCTest tests plus 17 Swift Testing tests pass off-box. Final focused review
   found no High or Medium issues and no unsafe Sendable escape.
+
+### Phase 3 result — 2026-07-14
+
+The measured gate passes. A corrected Qwen3-32B-4bit frontier pins one workload nonce across
+all eight policy/concurrency processes, drops one warmup, and aggregates three measured runs
+per cell. Preliminary rows made with per-process random nonces are disqualified. On the common
+workload, solo PLD wins C=1 (28.30 versus 26.72 aggregate service tok/s); batch-no-spec wins
+C=2/4/8 by 45.8%/58.6%/74.7% and reaches 56.56 tok/s at C=8 with Jain fairness 1.0000.
+These are complete-burst service rates, not decode-only rates.
+
+Final clean harness `7a775f6f1db9495d60eecdf030bf63d752f936e0` replays the real-model
+B1→drain→B2→B1, B3→B2 middle-cancel, and chunk-size-1 probes byte-identically; dense batching
+engages and speculation remains absent. Dense KV admission now charges allocation rounding,
+per-row metadata, and a conservative five-copy membership-transition envelope atomically,
+then releases reservations on removal.
+
+The required Qwen3-32B resident run measured 86,412.8508 seconds after warmup, completed 3,518
+measured cycles, passed all 33 predicates 3,519/3,519 including warmup, held peak RSS drift to
+2.2444% (<5%), cancellation to 28.833 microseconds max (<1 second), and responsiveness to
+344.469 milliseconds max (<30 seconds). The [dated verdict](../verdicts/2026-07-14-continuous-batching-chunked-prefill.md)
+and [compact Phase 3 evidence](../verdicts/continuous-batching-phase3-evidence-2026-07-14.jsonl)
+record the full frontier, raw artifact hashes, provenance, cancellation, A/B/A, and soak.
+
+Disposition: **PROMOTE the exact dense-Qwen3 runtime as a measured service-policy building
+block.** Isolated requests prefer solo PLD; the tested simultaneous C≥2 bursts prefer
+batch-no-spec. No production serving/API route, runtime default, or dynamic PLD↔batch handoff
+is wired by this plan.
+
+**Deliberate scope split:** the original acceptance wording joined runtime removal to a real
+client disconnect. The former is proven here; the latter cannot be exercised before a serving
+route exists and is now an explicit acceptance gate in the linked production-route task. This
+plan is complete only at the named engine-building-block boundary, not at product default-on.
 
 ## TDD and implementation sequence
 
@@ -247,13 +281,13 @@ graph.
 
 ### Phase 3 — measurement and promotion gate
 
-1. Extend evidence schemas for aggregate/per-request rate, TTFT, TPOT, Jain fairness index,
+1. [x] Extend evidence schemas for aggregate/per-request rate, TTFT, TPOT, Jain fairness index,
    cancellation latency, active slots, prompt chunks, batch-size distribution, and memory.
-2. Verify solo, simultaneous burst, staggered mid-join, short+long prompt, cancellation, and
+2. [x] Verify solo, simultaneous burst, staggered mid-join, short+long prompt, cancellation, and
    A/B/A recovery.
-3. Benchmark 1/2/4/8 on the product dense model and compare batch-no-spec with solo PLD policy.
-4. Run a short soak as a harness check, then the required 24-hour mixed-workload soak.
-5. Publish a dated promote/shelve verdict, compact evidence, handoff update, and content piece.
+3. [x] Benchmark 1/2/4/8 on the product dense model and compare batch-no-spec with solo PLD policy.
+4. [x] Run a short soak as a harness check, then the required 24-hour mixed-workload soak.
+5. [x] Publish a dated promote/shelve verdict, compact evidence, handoff update, and content piece.
 
 ## Verification mapping
 
@@ -269,10 +303,10 @@ graph.
 
 ## Rollback and blast radius
 
-The continuous coordinator/runtime is currently reachable only through explicit probe CLI
+The continuous coordinator/runtime remains reachable only through explicit probe CLI
 subcommands; no production service route or concurrency flag has been wired. Concurrency one
-therefore continues to use the existing compiled decoder. Until the transition gate passes,
-rollback is simply not invoking the probes or reverting the feature branch. The scheduler is
-additive and the executor is dense-Qwen3-only initially; model weight quantization is allowed,
+therefore continues to use the existing compiled decoder. The transition gate now passes;
+rollback is still simply not invoking the probes or reverting the feature branch. The scheduler
+is additive and the executor remains dense-Qwen3-only; model weight quantization is allowed,
 but the continuous KV path remains the exact fp16-cache design. No model conversion, persisted
 schema, or user data migration is involved.

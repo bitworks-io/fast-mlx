@@ -106,9 +106,9 @@ SDPA; multi-accelerator disaggregation belongs to the future scale-out plane.
 - *What:* Google Research's TurboQuant ([arXiv:2504.19874](https://arxiv.org/abs/2504.19874); [blog](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/)) — an **online, data-free vector quantizer**: random-rotate → coordinates become ~Beta-distributed → apply a closed-form per-coordinate **optimal** scalar quantizer (within ~2.7× of the information-theoretic distortion bound). A `_prod` variant adds a 1-bit QJL residual for unbiased Q·K inner products. Evaluated on **KV cache**: quality-neutral at **3.5 bits/channel**, marginal at **2.5-bit**.
 - *Why (owner-requested — corrects the earlier mix-up):* this is the **actual** Google TurboQuant the owner meant — **not** mlx-serve's `turbo2/4`, which was our own Hadamard-rotation-then-affine (QuaRot-family) scheme mislabeled "turboquant." The real distinction that could matter: TurboQuant's distribution-optimal non-uniform quantizer **+ zero stored per-group scale/zero metadata**, vs our affine scheme's ~25%-of-bit-budget metadata tax at group-64/2-bit, plus the inner-product debiasing.
 - *Where it was expected to win:* the **2-bit / max-context tier**. The retired Zig engine
-  had rotation+affine `turbo4` and 2-bit controls, and the hardened harness has an external
-  4-bit-affine evidence row, but the current Swift runtime does **not** implement those
-  ordinary affine cache tiers. The new KVarN/asymmetric task owns creation of the Swift
+  had rotation+affine `turbo4` and 2-bit controls, while the hardened harness has a
+  4-bit-weight/fp16-KV reference row but no same-weights affine-KV quality row. The current
+  Swift runtime does **not** implement ordinary affine cache tiers. The new KVarN/asymmetric task owns creation of the Swift
   baseline; TurboQuant B may promote only if its clean-SHA row beats the available
   affine/KVarN frontier at equal actual packed bytes.
 - *Effort:* port/adapt the Beta-optimal quantizer (+ optional QJL residual) — materially more
@@ -119,7 +119,7 @@ SDPA; multi-accelerator disaggregation belongs to the future scale-out plane.
   [TurboQuant+](https://github.com/TheTom/turboquant_plus), and other community ports now
   provide packed/Metal implementation leads. Upstream support and their quality/performance
   claims remain unverified for fast-mlx.
-- **UPDATE 2026-07-09 — DONE + SHELVED.** Built exactly (Spike A verified vs the paper's distortion table), integrated, measured — **uniform-v1 loses to 4-bit affine on Qwen3-32B** (tqB3 tail-p95 1.797/ppl +32.6% vs 1.665/+21.4%). Shelved as a dated negative result; gated next step is **Spike B (outlier channels)**, the recipe the paper's near-losslessness actually depends on. Verdict: `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`.
+- **UPDATE 2026-07-09; clarified 2026-07-14 — DONE + SHELVED.** Built exactly (Spike A verified vs the paper's distortion table), integrated, and measured. Uniform-v1 tqB3 adds loss over the same 4-bit-weight/fp16-KV row (tail-p95 1.797/ppl +32.6% vs 1.665/+21.4%) while its actual unpacked cache is larger; tqB2 is catastrophic. No ordinary affine-KV quality row was measured. Shelved as a dated negative result; gated next step is **Spike B (outlier channels)**. Verdict: `docs/superpowers/verdicts/2026-07-09-turboquant-firstrun.md`.
 
 **4. PrismML — 1-bit weight quantization — PRIORITY: RESEARCH-LATER (owner-flagged)**
 - *What:* official Bonsai binary (1-bit) and Ternary-Bonsai (1.58-bit information stored in a
