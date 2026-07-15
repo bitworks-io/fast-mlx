@@ -3,26 +3,49 @@ import XCTest
 @testable import HarnessCore
 
 final class KVTunerScheduleTests: XCTestCase {
+    private let matrixID = "kvarn-qwen3-32b-v1"
+    private let cellID = "kvtuner-g128-b4.5"
+    private let configHash = "0123456789abcdef"
+    private let checkpointHash = "fedcba9876543210"
+
     private func validSchedule() -> KVTunerSchedule {
         KVTunerSchedule(
-            schemaVersion: 1,
-            modelConfigHash: "model-config-abc",
+            schemaVersion: 2,
+            matrixID: matrixID,
+            cellID: cellID,
+            modelConfigHash: configHash,
+            checkpointManifestHash: checkpointHash,
+            groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
-            calibrationCorpusHash: "calibration-hash-123",
+            calibrationCorpusHash: "1111111111111111",
+            calibrationEntryHashes: [
+                "2222222222222222",
+                "3333333333333333",
+            ],
             seed: 7,
             objective: "minimize-attention-error-at-4.5-average-bits",
             nominalAverageBits: 4.5,
+            sourceSensitivityArtifactSHA256: String(repeating: "a", count: 64),
             layers: [
                 KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
                 KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
             ])
     }
 
-    func testCompletePinnedScheduleValidatesAndRoundTripsJSON() throws {
-        let schedule = validSchedule()
+    private func validate(
+        _ schedule: KVTunerSchedule,
+        expectedCellID: String? = nil
+    ) throws -> KVTunerSchedule {
+        try schedule.validated(
+            expectedLayerCount: 2,
+            expectedMatrixID: matrixID,
+            expectedCellID: expectedCellID ?? cellID,
+            expectedModelConfigHash: configHash,
+            expectedCheckpointManifestHash: checkpointHash)
+    }
 
-        let validated = try schedule.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc")
+    func testCompletePinnedV2ScheduleValidatesAndRoundTripsJSON() throws {
+        let validated = try validate(validSchedule())
         let encoded = try JSONEncoder().encode(validated)
         let decoded = try JSONDecoder().decode(KVTunerSchedule.self, from: encoded)
 
@@ -30,61 +53,318 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertEqual(decoded, validated)
     }
 
-    func testMissingDuplicateOrOutOfRangeLayerFailsClosed() {
+    func testSchemaOneCannotQualifyEvenWhenAllV2FieldsArePresent() {
+        var legacy = validSchedule()
+        legacy.schemaVersion = 1
+
+        XCTAssertThrowsError(try validate(legacy)) { error in
+            XCTAssertEqual(error as? KVTunerScheduleError, .unsupportedSchema(1))
+        }
+    }
+
+    func testMissingV2FieldCannotDecodeAsAQualifyingSchedule() throws {
+        let encoded = try JSONEncoder().encode(validSchedule())
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "sourceSensitivityArtifactSHA256")
+
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            KVTunerSchedule.self,
+            from: JSONSerialization.data(withJSONObject: object)))
+    }
+
+    func testModelConfigAndCheckpointMustMatchExpectedRuntime() {
+        XCTAssertThrowsError(try validSchedule().validated(
+            expectedLayerCount: 2,
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: "aaaaaaaaaaaaaaaa",
+            expectedCheckpointManifestHash: checkpointHash)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .modelConfigHashMismatch)
+            }
+        XCTAssertThrowsError(try validSchedule().validated(
+            expectedLayerCount: 2,
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: configHash,
+            expectedCheckpointManifestHash: "bbbbbbbbbbbbbbbb")) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .checkpointManifestHashMismatch)
+            }
+    }
+
+    func testMatrixIDMustMatchRequestedMatrix() {
+        var mismatched = validSchedule()
+        mismatched.matrixID = "another-declared-matrix"
+
+        XCTAssertThrowsError(try validate(mismatched)) { error in
+            XCTAssertEqual(error as? KVTunerScheduleError, .matrixIDMismatch)
+        }
+    }
+
+    func testCellIDMustMatchRequestedCell() {
+        var mismatched = validSchedule()
+        mismatched.cellID = "another-declared-cell"
+
+        XCTAssertThrowsError(try validate(mismatched)) { error in
+            XCTAssertEqual(error as? KVTunerScheduleError, .cellIDMismatch)
+        }
+    }
+
+    func testCellGroupMustMatchScheduleGeometry() {
+        var mismatched = validSchedule()
+        mismatched.groupSize = 64
+
+        XCTAssertThrowsError(try validate(mismatched)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .cellGroupSizeMismatch(cell: 128, schedule: 64))
+        }
+    }
+
+    func testCellBudgetMustMatchScheduleNominalAverage() {
+        var mismatched = validSchedule()
+        mismatched.layers[1] = KVLayerPrecision(
+            layer: 1, keyBits: 8, valueBits: 2)
+        mismatched.nominalAverageBits = mismatched.computedNominalAverageBits
+
+        XCTAssertEqual(mismatched.nominalAverageBits, 5.5, accuracy: 0)
+        XCTAssertThrowsError(try validate(mismatched)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .cellNominalAverageBitsMismatch(cell: 4.5, schedule: 5.5))
+        }
+    }
+
+    func testCellDescriptorMustUseCanonicalNumericSpellings() {
+        for cellID in [
+            "kvtuner-g0128-b4.5",
+            "kvtuner-g128-b4.50",
+        ] {
+            var invalid = validSchedule()
+            invalid.cellID = cellID
+
+            XCTAssertThrowsError(try validate(
+                invalid, expectedCellID: cellID)) { error in
+                    XCTAssertEqual(
+                        error as? KVTunerScheduleError,
+                        .invalidCellDescriptor(cellID))
+                }
+        }
+    }
+
+    func testIdentifiersAndDigestsFailClosed() {
+        var invalid = validSchedule()
+        invalid.matrixID = " matrix"
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.cellID = "unknown"
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.objective = "has spaces"
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.modelConfigHash = "not-a-digest"
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.checkpointManifestHash = String(repeating: "A", count: 16)
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.calibrationCorpusHash = "1234"
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.sourceSensitivityArtifactSHA256 = String(repeating: "g", count: 64)
+        XCTAssertThrowsError(try validate(invalid))
+    }
+
+    func testCalibrationEntryHashesAreNonemptyUniqueAndCanonical() {
+        var invalid = validSchedule()
+        invalid.calibrationEntryHashes = []
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.calibrationEntryHashes = [
+            "2222222222222222", "2222222222222222",
+        ]
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.calibrationEntryHashes.reverse()
+        XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.calibrationEntryHashes[0] = "not-a-digest"
+        XCTAssertThrowsError(try validate(invalid))
+    }
+
+    func testGroupSizeMustBeOneOfTheDeclaredScheduleGeometries() {
+        for groupSize in [0, 32, 256] {
+            var invalid = validSchedule()
+            invalid.groupSize = groupSize
+            XCTAssertThrowsError(try validate(invalid)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .unsupportedGroupSize(groupSize))
+            }
+        }
+
+        var g64 = validSchedule()
+        g64.groupSize = 64
+        g64.cellID = "kvtuner-g64-b4.5"
+        XCTAssertNoThrow(try validate(
+            g64, expectedCellID: g64.cellID))
+    }
+
+    func testLayersMustBeCanonicalExactZeroThroughLayerCountMinusOne() {
         var missing = validSchedule()
-        missing.layers = [KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4)]
-        XCTAssertThrowsError(try missing.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc"))
+        missing.layers.removeLast()
+        XCTAssertThrowsError(try validate(missing))
 
         var duplicate = validSchedule()
-        duplicate.layers = [
-            KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
-            KVLayerPrecision(layer: 0, keyBits: 4, valueBits: 2),
-        ]
-        XCTAssertThrowsError(try duplicate.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc"))
+        duplicate.layers[1].layer = 0
+        XCTAssertThrowsError(try validate(duplicate))
+
+        var reversed = validSchedule()
+        reversed.layers.reverse()
+        XCTAssertThrowsError(try validate(reversed))
 
         var outOfRange = validSchedule()
-        outOfRange.layers[1] = KVLayerPrecision(layer: 2, keyBits: 4, valueBits: 2)
-        XCTAssertThrowsError(try outOfRange.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc"))
+        outOfRange.layers[1].layer = 2
+        XCTAssertThrowsError(try validate(outOfRange))
     }
 
-    func testModelHashUnsupportedBitsAndAverageMismatchFailClosed() {
-        XCTAssertThrowsError(try validSchedule().validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "different-model"))
+    func testOnlyDeclaredAsymmetricPerLayerPairsQualify() {
+        for (keyBits, valueBits) in [
+            (16, 2), (8, 8), (4, 4), (2, 2), (2, 4), (3, 2),
+        ] {
+            var invalid = validSchedule()
+            invalid.layers[1].keyBits = keyBits
+            invalid.layers[1].valueBits = valueBits
+            XCTAssertThrowsError(try validate(invalid)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .unsupportedPrecision(
+                        layer: 1, keyBits: keyBits, valueBits: valueBits))
+            }
+        }
 
-        var unsupported = validSchedule()
-        unsupported.layers[1] = KVLayerPrecision(layer: 1, keyBits: 3, valueBits: 2)
-        XCTAssertThrowsError(try unsupported.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc"))
+        for (keyBits, valueBits, cellID) in [
+            (8, 4, "kvtuner-g128-b6.0"),
+            (8, 2, "kvtuner-g128-b5.5"),
+            (4, 2, "kvtuner-g128-b4.5"),
+        ] {
+            var runnable = validSchedule()
+            runnable.layers[1].keyBits = keyBits
+            runnable.layers[1].valueBits = valueBits
+            runnable.nominalAverageBits =
+                runnable.computedNominalAverageBits
+            runnable.cellID = cellID
+            XCTAssertNoThrow(try validate(
+                runnable, expectedCellID: cellID))
+        }
+    }
+
+    func testNominalAverageMustBeFinitePositiveAndExact() {
+        for value in [Double.nan, .infinity, -.infinity, 0, -1] {
+            var invalid = validSchedule()
+            invalid.nominalAverageBits = value
+            XCTAssertThrowsError(try validate(invalid))
+        }
 
         var wrongAverage = validSchedule()
-        wrongAverage.nominalAverageBits = 4.0
-        XCTAssertThrowsError(try wrongAverage.validated(
-            expectedLayerCount: 2, expectedModelConfigHash: "model-config-abc"))
-    }
-
-    func testCalibrationAndEvaluationCorpusMustBeDistinct() {
-        XCTAssertNoThrow(try validSchedule().validateEvaluationCorpus(
-            id: "measurement-corpus-v2", hash: "different-hash"))
-        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
-            id: "kvtuner-calibration-v1", hash: "calibration-hash-123"))
-        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
-            id: "renamed-corpus", hash: "calibration-hash-123"))
+        wrongAverage.nominalAverageBits = 4.500_000_000_01
+        XCTAssertThrowsError(try validate(wrongAverage))
     }
 
     func testNominalAverageComputationDoesNotTrapOnUntrustedIntegers() {
-        let schedule = KVTunerSchedule(
-            schemaVersion: 1,
-            modelConfigHash: "model-config-abc",
-            calibrationCorpusID: "calibration",
-            calibrationCorpusHash: "calibration-hash",
-            seed: 7,
-            objective: "test",
-            nominalAverageBits: 0,
-            layers: [KVLayerPrecision(layer: 0, keyBits: Int.max, valueBits: Int.max)])
+        var schedule = validSchedule()
+        schedule.layers = [
+            KVLayerPrecision(
+                layer: 0, keyBits: Int.max, valueBits: Int.max),
+        ]
 
-        XCTAssertEqual(schedule.computedNominalAverageBits, Double(Int.max), accuracy: 0)
+        XCTAssertTrue(schedule.computedNominalAverageBits.isFinite)
+        XCTAssertEqual(
+            schedule.computedNominalAverageBits,
+            Double(Int.max),
+            accuracy: 0)
+        XCTAssertThrowsError(try schedule.validated(
+            expectedLayerCount: 1,
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: configHash,
+            expectedCheckpointManifestHash: checkpointHash))
+    }
+
+    func testEvaluationCorpusRejectsAggregateOrEntryLevelCalibrationLeakage() {
+        let schedule = validSchedule()
+        XCTAssertNoThrow(try schedule.validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555", "6666666666666666"]))
+
+        XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
+            id: schedule.calibrationCorpusID,
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"]))
+        XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
+            id: "renamed-corpus",
+            hash: schedule.calibrationCorpusHash,
+            entryHashes: ["5555555555555555"]))
+        XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["2222222222222222", "5555555555555555"]))
+    }
+
+    func testMalformedEvaluationIdentityFailsBeforeLeakageComparison() {
+        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
+            id: "evaluation corpus",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"]))
+        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "not-a-digest",
+            entryHashes: ["5555555555555555"]))
+        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: []))
+        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["not-a-digest"]))
+    }
+
+    func testEvaluationLeakageCheckAlsoRejectsMalformedStoredCalibrationIdentity() {
+        var invalid = validSchedule()
+        invalid.calibrationCorpusID = "calibration corpus"
+        XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"]))
+
+        invalid = validSchedule()
+        invalid.calibrationCorpusHash = "not-a-digest"
+        XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"]))
+
+        invalid = validSchedule()
+        invalid.calibrationEntryHashes = []
+        XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
+            id: "measurement-corpus-v2",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"]))
     }
 }
