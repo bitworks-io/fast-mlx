@@ -81,6 +81,24 @@ runtime and passes the hard floor. “Transparent” is required only for defaul
 exposure. KVarN is shelved if affine/KVTuner dominates every KVarN cell at equal-or-lower actual bytes,
 or if all KVarN cells fail the floor.
 
+### 2026-07-15 pre-evaluation KVTuner search-budget lock
+
+The first clean Qwen3-32B g128 sensitivity artifact was captured at harness SHA `e044ae9` before
+any candidate output was generated or inspected. Its 3,840 canonical samples produce 64 singleton
+DBSCAN groups: 63 layers retain K8V4/K8V2/K4V2 and layer 47 retains K8V4/K4V2. Exact dynamic
+programming over those groups gives 718,704 schedules at the nominal equal-byte target of 400
+pair-bits, so the authenticated runner correctly exceeds its 10,000-candidate safety cap. The
+nearby counts are 3,969 at 394, 1,953 at 392, 64 at 390, 63 at 388, and one at 384.
+
+Candidate scoring is the pinned 200-prompt, up-to-256-token GSM8K evaluation for every schedule;
+3,969 candidates would permit more than 203 million generated tokens. Before observing quality,
+the exhaustive qualification cell is therefore locked to **390 pair-bits**, the highest nearby
+budget with at most 100 candidates. It evaluates all 64 possible placements of one K8V4 layer over
+an otherwise K4V2 policy. At g128 this is 105.5 persistent bytes/token/head averaged across layers,
+below KVarN K4V2-g128's 108 bytes/token/head, so it is a valid stricter size control rather than an
+inflated quality comparator. The 400-bit topology remains recorded as a search-complexity finding
+and may be revisited only with a separately qualified search reduction or batched evaluator.
+
 ## Architecture and work order
 
 ### Phase 0 — source, fixture, and evidence contract
