@@ -149,6 +149,8 @@ public struct TaskCoherenceCacheEngagementEvidence:
     /// a quantized engagement marker and must not manufacture one from prompt length.
     public let cachedTokens: Int?
     public let affineTokens: Int?
+    public let kvtunerTokens: Int?
+    public let kvtunerLayerCount: Int?
     public let kvarnCompletedTileCount: Int?
     public let kvarnCompressedTokens: Int?
     public let kvarnCodecIterations: Int?
@@ -156,27 +158,34 @@ public struct TaskCoherenceCacheEngagementEvidence:
     /// Native engagement captured from the fresh, full-prompt cache used to score a restricted
     /// choice. Structured-tool rows do not run this second scoring pass and leave these nil.
     public let scoringCachedTokens: Int?
+    public let scoringKVTunerLayerCount: Int?
     public let scoringKVarNCompletedTileCount: Int?
     public let scoringKVarNCompressedTokens: Int?
 
     public init(
         cachedTokens: Int?,
         affineTokens: Int?,
+        kvtunerTokens: Int? = nil,
+        kvtunerLayerCount: Int? = nil,
         kvarnCompletedTileCount: Int?,
         kvarnCompressedTokens: Int?,
         kvarnCodecIterations: Int?,
         kvarnExecutionMode: String?,
         scoringCachedTokens: Int? = nil,
+        scoringKVTunerLayerCount: Int? = nil,
         scoringKVarNCompletedTileCount: Int? = nil,
         scoringKVarNCompressedTokens: Int? = nil
     ) {
         self.cachedTokens = cachedTokens
         self.affineTokens = affineTokens
+        self.kvtunerTokens = kvtunerTokens
+        self.kvtunerLayerCount = kvtunerLayerCount
         self.kvarnCompletedTileCount = kvarnCompletedTileCount
         self.kvarnCompressedTokens = kvarnCompressedTokens
         self.kvarnCodecIterations = kvarnCodecIterations
         self.kvarnExecutionMode = kvarnExecutionMode
         self.scoringCachedTokens = scoringCachedTokens
+        self.scoringKVTunerLayerCount = scoringKVTunerLayerCount
         self.scoringKVarNCompletedTileCount =
             scoringKVarNCompletedTileCount
         self.scoringKVarNCompressedTokens = scoringKVarNCompressedTokens
@@ -391,10 +400,11 @@ public enum TaskCoherenceArtifact {
     ]
 
     /// Closed runnable mapping shared by preflight CLI validation and artifact adjudication.
-    /// KVTuner schedules remain excluded until their external schedule digest is bound into
-    /// both runtime construction and task evidence.
+    /// Uniform tiers use the fixed table; canonical KVTuner cells use their authenticated
+    /// schedule-bound cell spelling as both tier and cell identity.
     public static func expectedCellID(forTier tier: String) -> String? {
-        tierCellIDs[tier]
+        if let cellID = tierCellIDs[tier] { return cellID }
+        return isCanonicalKVTunerCellID(tier) ? tier : nil
     }
 
     /// Strict JSON Lines decoding: exactly one optional trailing newline is accepted. Blank rows,
@@ -543,7 +553,8 @@ public enum TaskCoherenceArtifact {
             isIdentifier(payload.identity.modelConfigHash),
             isIdentifier(payload.identity.modelCheckpointManifestHash),
             isIdentifier(payload.identity.kvQuantTier),
-            tierCellIDs[payload.identity.kvQuantTier] == payload.cellID,
+            expectedCellID(forTier: payload.identity.kvQuantTier)
+                == payload.cellID,
             payload.generatedTokenCount > 0,
             isHex(payload.outputSHA256, length: 64),
             payload.outputSHA256
@@ -571,6 +582,34 @@ public enum TaskCoherenceArtifact {
             throw TaskCoherenceEvidenceError.mismatchedArtifact("prompt")
         }
         try payload.runConfiguration.validated()
+        let isKVTuner = isCanonicalKVTunerCellID(
+            payload.identity.kvQuantTier)
+        if isKVTuner {
+            guard let schedule = payload.identity.kvtunerSchedule,
+                let layerCount = payload.engagement.kvtunerLayerCount
+            else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "kvtuner-schedule")
+            }
+            do {
+                try schedule.validated(
+                    expectedMatrixID: payload.matrixID,
+                    expectedCellID: payload.cellID,
+                    expectedModelConfigHash:
+                        payload.identity.modelConfigHash,
+                    expectedCheckpointManifestHash:
+                        payload.identity.modelCheckpointManifestHash,
+                    expectedLayerCount: layerCount,
+                    requiredEvaluationCorpus:
+                        corpus.kvtunerEvaluationCorpusIdentity)
+            } catch {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "kvtuner-schedule")
+            }
+        } else if payload.identity.kvtunerSchedule != nil {
+            throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                "kvtuner-schedule")
+        }
         guard isHex(
             payload.tokenization.tokenizerManifestSHA256, length: 64),
             isHex(payload.tokenization.promptTokenIDsSHA256, length: 64)
@@ -625,6 +664,7 @@ public enum TaskCoherenceArtifact {
         try payload.layout.validated()
         try validateEngagement(
             payload.engagement, tier: payload.identity.kvQuantTier,
+            kvtunerSchedule: payload.identity.kvtunerSchedule,
             layout: payload.layout,
             generatedTokenCount: payload.generatedTokenCount,
             scoringMode: item.scoringMode)
@@ -646,6 +686,7 @@ public enum TaskCoherenceArtifact {
     private static func validateEngagement(
         _ engagement: TaskCoherenceCacheEngagementEvidence,
         tier: String,
+        kvtunerSchedule: KVTunerScheduleBinding?,
         layout: TaskCoherencePromptLayoutEvidence,
         generatedTokenCount: Int,
         scoringMode: TaskCoherenceScoringMode
@@ -668,12 +709,18 @@ public enum TaskCoherenceArtifact {
             engagement.scoringKVarNCompletedTileCount,
             engagement.scoringKVarNCompressedTokens,
         ]
+        let kvtunerValues = [
+            engagement.kvtunerTokens,
+            engagement.kvtunerLayerCount,
+        ]
         if tier == "fp16" {
             guard engagement.cachedTokens == nil,
                 engagement.affineTokens == nil,
+                kvtunerValues.allSatisfy({ $0 == nil }),
                 kvarnValues.allSatisfy({ $0 == nil }),
                 engagement.kvarnExecutionMode == nil,
                 engagement.scoringCachedTokens == nil,
+                engagement.scoringKVTunerLayerCount == nil,
                 scoringKVarNValues.allSatisfy({ $0 == nil })
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence("fp16")
@@ -686,22 +733,61 @@ public enum TaskCoherenceArtifact {
             case .restrictedChoice:
                 validScoringEngagement =
                     engagement.scoringCachedTokens == layout.promptTokens
+                    && engagement.scoringKVTunerLayerCount == nil
                     && scoringKVarNValues.allSatisfy({ $0 == nil })
             case .structuredTool:
                 validScoringEngagement =
                     engagement.scoringCachedTokens == nil
+                    && engagement.scoringKVTunerLayerCount == nil
                     && scoringKVarNValues.allSatisfy({ $0 == nil })
             }
             guard let cachedTokens = engagement.cachedTokens,
                 let affineTokens = engagement.affineTokens,
                 cachedTokens == expectedCachedTokens,
                 cachedTokens == affineTokens,
+                kvtunerValues.allSatisfy({ $0 == nil }),
                 kvarnValues.allSatisfy({ $0 == nil }),
                 engagement.kvarnExecutionMode == nil,
                 validScoringEngagement
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "affine")
+            }
+            return
+        }
+        if isCanonicalKVTunerCellID(tier) {
+            guard let schedule = kvtunerSchedule else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "kvtuner")
+            }
+            let validScoringEngagement: Bool
+            switch scoringMode {
+            case .restrictedChoice:
+                validScoringEngagement =
+                    engagement.scoringCachedTokens == layout.promptTokens
+                    && engagement.scoringKVTunerLayerCount
+                        == schedule.layers.count
+                    && scoringKVarNValues.allSatisfy({ $0 == nil })
+            case .structuredTool:
+                validScoringEngagement =
+                    engagement.scoringCachedTokens == nil
+                    && engagement.scoringKVTunerLayerCount == nil
+                    && scoringKVarNValues.allSatisfy({ $0 == nil })
+            }
+            guard let cachedTokens = engagement.cachedTokens,
+                let kvtunerTokens = engagement.kvtunerTokens,
+                let layerCount = engagement.kvtunerLayerCount,
+                cachedTokens == expectedCachedTokens,
+                kvtunerTokens == cachedTokens,
+                layerCount == schedule.layers.count,
+                layerCount > 0,
+                engagement.affineTokens == nil,
+                kvarnValues.allSatisfy({ $0 == nil }),
+                engagement.kvarnExecutionMode == nil,
+                validScoringEngagement
+            else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "kvtuner")
             }
             return
         }
@@ -717,6 +803,7 @@ public enum TaskCoherenceArtifact {
                 {
                     validScoringEngagement =
                         scoringCachedTokens == layout.promptTokens
+                        && engagement.scoringKVTunerLayerCount == nil
                         && checkedKVarNGeometry(
                             cachedTokens: scoringCachedTokens,
                             completedTiles: scoringCompleted,
@@ -728,10 +815,12 @@ public enum TaskCoherenceArtifact {
             case .structuredTool:
                 validScoringEngagement =
                     engagement.scoringCachedTokens == nil
+                    && engagement.scoringKVTunerLayerCount == nil
                     && scoringKVarNValues.allSatisfy({ $0 == nil })
             }
             guard let cachedTokens = engagement.cachedTokens,
                 engagement.affineTokens == nil,
+                kvtunerValues.allSatisfy({ $0 == nil }),
                 let completed = engagement.kvarnCompletedTileCount,
                 let compressed = engagement.kvarnCompressedTokens,
                 let iterations = engagement.kvarnCodecIterations,
@@ -824,8 +913,30 @@ public enum TaskCoherenceArtifact {
         for tier: String
     ) -> KVStorageFormatKind? {
         if affineTiers.contains(tier) { return .affine }
+        if isCanonicalKVTunerCellID(tier) { return .kvtuner }
         if kvarnIterations[tier] != nil { return .kvarn }
         return tier == "fp16" ? .fp16 : nil
+    }
+
+    private static func isCanonicalKVTunerCellID(_ value: String) -> Bool {
+        let prefix = "kvtuner-g"
+        guard value.hasPrefix(prefix) else { return false }
+        let fields = value.dropFirst(prefix.count).split(
+            separator: "-", omittingEmptySubsequences: false)
+        guard fields.count == 2, fields[1].first == "b" else {
+            return false
+        }
+        let groupText = String(fields[0])
+        let bitsText = String(fields[1].dropFirst())
+        guard let groupSize = Int(groupText),
+            [64, 128].contains(groupSize),
+            String(groupSize) == groupText,
+            let nominalAverageBits = Double(bitsText),
+            nominalAverageBits.isFinite,
+            nominalAverageBits > 0,
+            String(nominalAverageBits) == bitsText
+        else { return false }
+        return true
     }
 
     fileprivate static func isCleanGitSHA(_ value: String) -> Bool {
@@ -954,6 +1065,22 @@ public struct TaskCoherencePromotionEvidence:
         else {
             throw TaskCoherenceEvidenceError.invalidPromotionProvenance(
                 "runtime")
+        }
+        let schedulePairMatches: Bool
+        switch (
+            candidate.identity.kvtunerSchedule,
+            frontier.candidateKVTunerSchedule
+        ) {
+        case (.none, .none):
+            schedulePairMatches = true
+        case (.some(let taskSchedule), .some(let klSchedule)):
+            schedulePairMatches = taskSchedule.sameSchedule(as: klSchedule)
+        default:
+            schedulePairMatches = false
+        }
+        guard schedulePairMatches else {
+            throw TaskCoherenceEvidenceError.klEvidenceMismatch(
+                "kvtuner-schedule")
         }
         guard candidate.matrixID == frontier.matrixID,
             candidate.cellID == frontier.cellID,

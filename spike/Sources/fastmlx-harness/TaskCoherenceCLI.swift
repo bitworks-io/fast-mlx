@@ -49,6 +49,7 @@ private struct TaskCoherenceRunPlan {
     let evidencePath: String
     let summaryEvidencePath: String?
     let referenceEvidencePath: String?
+    let kvtunerSchedulePath: String?
     let maxToolTokens: Int
 }
 
@@ -122,6 +123,8 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
         "summary-evidence", default: "")
     let reference = try flags.strictString(
         "reference-task-evidence", default: "")
+    let kvtunerSchedule = try flags.strictString(
+        "kvtuner-schedule", default: "")
     let maxToolTokens = try flags.strictInt("max-tool-tokens", default: 96)
 
     guard !modelPath.isEmpty else {
@@ -138,11 +141,15 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
     }
     try requireTaskIdentifier(matrixID, flag: "matrix-id")
     try requireTaskIdentifier(cellID, flag: "cell-id")
-    guard TaskCoherenceArtifact.expectedCellID(forTier: tier) == cellID,
-        KVCacheKind(kvQuant: tier) != nil
-    else {
-        throw TaskCoherenceCLIError.unsupportedTierCell(
-            tier: tier, cell: cellID)
+    try validateKVTunerScheduleFlag(
+        tier: tier, cellID: cellID, schedulePath: kvtunerSchedule)
+    if !isKVTunerTier(tier) {
+        guard TaskCoherenceArtifact.expectedCellID(forTier: tier) == cellID,
+            KVCacheKind(kvQuant: tier) != nil
+        else {
+            throw TaskCoherenceCLIError.unsupportedTierCell(
+                tier: tier, cell: cellID)
+        }
     }
     guard (1 ... 512).contains(maxToolTokens) else {
         throw TaskCoherenceCLIError.invalidToolTokenBudget(maxToolTokens)
@@ -156,7 +163,9 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
         throw TaskCoherenceCLIError.missingFlag("reference-task-evidence")
     }
 
-    try requireDistinctTaskPaths([output, summaryOutput, reference])
+    try requireDistinctTaskPaths([
+        output, summaryOutput, reference, kvtunerSchedule,
+    ])
 
     try freshTaskOutput(output)
     if !summaryOutput.isEmpty { try freshTaskOutput(summaryOutput) }
@@ -165,6 +174,8 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
         tier: tier, evidencePath: output,
         summaryEvidencePath: summaryOutput.isEmpty ? nil : summaryOutput,
         referenceEvidencePath: reference.isEmpty ? nil : reference,
+        kvtunerSchedulePath:
+            kvtunerSchedule.isEmpty ? nil : kvtunerSchedule,
         maxToolTokens: maxToolTokens)
 }
 
@@ -310,6 +321,7 @@ private func prepareTaskCoherenceCases(
 
 private func taskEngagement(
     tier: String,
+    kvtunerSchedule: KVTunerScheduleBinding?,
     generated: EngagementCounters,
     scoring: EngagementCounters?
 ) throws -> TaskCoherenceCacheEngagementEvidence {
@@ -339,6 +351,34 @@ private func taskEngagement(
             kvarnExecutionMode: nil,
             scoringCachedTokens:
                 scoring?.counts["scoring_cached_tokens"])
+    }
+    if let kvtunerSchedule {
+        guard let cached = generated.counts["kvtuner_tokens"],
+            let layers = generated.counts["kvtuner_layers"],
+            layers == kvtunerSchedule.layers.count
+        else {
+            throw TaskCoherenceCLIError.missingEngagement(
+                "kvtuner generation")
+        }
+        if scoring != nil {
+            for marker in [
+                "scoring_cached_tokens", "scoring_kvtuner_layers",
+            ] where scoring?.counts[marker] == nil {
+                throw TaskCoherenceCLIError.missingEngagement(marker)
+            }
+        }
+        return TaskCoherenceCacheEngagementEvidence(
+            cachedTokens: cached, affineTokens: nil,
+            kvtunerTokens: cached,
+            kvtunerLayerCount: layers,
+            kvarnCompletedTileCount: nil,
+            kvarnCompressedTokens: nil,
+            kvarnCodecIterations: nil,
+            kvarnExecutionMode: nil,
+            scoringCachedTokens:
+                scoring?.counts["scoring_cached_tokens"],
+            scoringKVTunerLayerCount:
+                scoring?.counts["scoring_kvtuner_layers"])
     }
     guard let cached = generated.counts["kvarn_tokens"],
         let completed = generated.counts["kvarn_completed_tiles"],
@@ -439,6 +479,21 @@ func runTaskCoherence(_ flags: Flags) async {
             reference = nil
         }
 
+        let preparedKVTuner: PreparedKVTunerRun?
+        if let schedulePath = plan.kvtunerSchedulePath {
+            preparedKVTuner = try prepareKVTunerRun(
+                schedulePath: schedulePath,
+                modelPath: plan.modelPath,
+                matrixID: plan.matrixID,
+                cellID: plan.cellID,
+                modelIdentity: modelIdentity,
+                evaluationCorpus:
+                    KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(
+                        corpus))
+        } else {
+            preparedKVTuner = nil
+        }
+
         print("# task-coherence loading model after all artifact preflight gates passed")
         let (driver, tokenizer, _) = try await loadSwiftDriver(
             modelPath: plan.modelPath)
@@ -466,13 +521,21 @@ func runTaskCoherence(_ flags: Flags) async {
             }
         }
         let configTier = plan.tier == "fp16" ? nil : plan.tier
+        func runConfig(maxTokens: Int) -> RunConfig {
+            RunConfig(
+                temperature: 0,
+                maxTokens: maxTokens,
+                kvQuant: configTier,
+                kvtunerSelection: preparedKVTuner?.selection)
+        }
         let identity = TaskCoherenceRunIdentity(
             corpusID: corpus.id,
             corpusContentHash: corpus.contentHash,
             modelConfigHash: modelIdentity.configHash,
             modelCheckpointManifestHash:
                 modelIdentity.checkpointManifestHash,
-            kvQuantTier: plan.tier)
+            kvQuantTier: plan.tier,
+            kvtunerSchedule: preparedKVTuner?.binding)
 
         for (index, prepared) in preparedCases.enumerated() {
             let item = prepared.item
@@ -487,17 +550,13 @@ func runTaskCoherence(_ flags: Flags) async {
             case .restrictedChoice:
                 let scoring = try await driver.taskChoiceLogits(
                     prompt: promptTokens,
-                    config: RunConfig(
-                        temperature: 0, maxTokens: 1,
-                        kvQuant: configTier))
+                    config: runConfig(maxTokens: 1))
                 scoredOutput = try TaskRestrictedChoiceScorer.predict(
                     logits: scoring.logits,
                     labelTokenIDs: labelTokenIDs)
                 generation = try await driver.generate(
                     prompt: promptTokens,
-                    config: RunConfig(
-                        temperature: 0, maxTokens: 1,
-                        kvQuant: configTier))
+                    config: runConfig(maxTokens: 1))
                 scoringEngagement = scoring.engagement
                 guard let expected = item.expectedChoice else {
                     throw TaskCoherenceCLIError.invalidReference(
@@ -510,10 +569,7 @@ func runTaskCoherence(_ flags: Flags) async {
             case .structuredTool:
                 generation = try await driver.generate(
                     prompt: promptTokens,
-                    config: RunConfig(
-                        temperature: 0,
-                        maxTokens: plan.maxToolTokens,
-                        kvQuant: configTier))
+                    config: runConfig(maxTokens: plan.maxToolTokens))
                 scoredOutput = tokenizer.decode(
                     tokenIds: generation.tokens,
                     skipSpecialTokens: true)
@@ -534,7 +590,9 @@ func runTaskCoherence(_ flags: Flags) async {
                     "generated token")
             }
             let engagement = try taskEngagement(
-                tier: plan.tier, generated: generation.engagement,
+                tier: plan.tier,
+                kvtunerSchedule: preparedKVTuner?.binding,
+                generated: generation.engagement,
                 scoring: scoringEngagement)
             let payload = TaskCoherenceCasePayload(
                 schemaVersion: TaskCoherenceArtifact.schemaVersion,
@@ -551,6 +609,12 @@ func runTaskCoherence(_ flags: Flags) async {
                 outputSHA256: sha256Hex(Data(scoredOutput.utf8)),
                 score: score,
                 engagement: engagement)
+            try requireDistinctTaskPaths([
+                plan.evidencePath,
+                plan.summaryEvidencePath ?? "",
+                plan.referenceEvidencePath ?? "",
+                plan.kvtunerSchedulePath ?? "",
+            ])
             try appendRequiredJSONLRecord(
                 ResultRecord(
                     subcommand: "task-coherence",
@@ -576,6 +640,7 @@ func runTaskCoherence(_ flags: Flags) async {
                 plan.evidencePath,
                 output,
                 plan.referenceEvidencePath ?? "",
+                plan.kvtunerSchedulePath ?? "",
             ])
             try appendRequiredJSONLRecord(
                 ResultRecord(
@@ -594,6 +659,7 @@ func runTaskCoherence(_ flags: Flags) async {
                     plan.evidencePath,
                     output,
                     plan.referenceEvidencePath ?? "",
+                    plan.kvtunerSchedulePath ?? "",
                 ])
                 try appendRequiredJSONLRecord(
                     ResultRecord(

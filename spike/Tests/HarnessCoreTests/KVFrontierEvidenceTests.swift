@@ -46,7 +46,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
         controlBytes: Int? = 256,
         executionMode: String? = nil,
         codecIterations: Int? = nil,
-        memoryGate: KVarNMemoryGateEvidence? = nil
+        memoryGate: KVarNMemoryGateEvidence? = nil,
+        kvtunerSchedule: KVTunerScheduleBinding? = nil
     ) -> KVFrontierEvidence {
         let same = identity()
         let bytes = breakdown()
@@ -61,7 +62,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
             actualControlBytes: controlBytes,
             candidateExecutionMode: executionMode,
             candidateCodecIterations: codecIterations,
-            candidateMemoryGate: memoryGate)
+            candidateMemoryGate: memoryGate,
+            candidateKVTunerSchedule: kvtunerSchedule)
     }
 
     private func kvarnMemoryGate(
@@ -321,6 +323,106 @@ final class KVFrontierEvidenceTests: XCTestCase {
         return (format, try format.storageEvidence(actual: actual))
     }
 
+    private func kvtunerEvaluation(
+        id: String = "measurement-corpus-v2",
+        aggregateDigest: String = "4444444444444444"
+    ) -> KVTunerEvaluationCorpusIdentity {
+        KVTunerEvaluationCorpusIdentity(
+            id: id,
+            aggregateDigest: aggregateDigest,
+            canonicalEntryDigests: [
+                "5555555555555555",
+                "6666666666666666",
+            ])
+    }
+
+    private func kvtunerBinding(
+        evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
+    ) throws -> KVTunerScheduleBinding {
+        let matrixID = "kvarn-qwen3-32b-v1"
+        let cellID = "kvtuner-g128-b4.5"
+        let configHash = "0123456789abcdef"
+        let checkpointHash = "fedcba9876543210"
+        let schedule = KVTunerSchedule(
+            schemaVersion: 2,
+            matrixID: matrixID,
+            cellID: cellID,
+            modelConfigHash: configHash,
+            checkpointManifestHash: checkpointHash,
+            groupSize: 128,
+            calibrationCorpusID: "calibration-v1",
+            calibrationCorpusHash: "1111111111111111",
+            calibrationEntryHashes: [
+                "2222222222222222",
+                "3333333333333333",
+            ],
+            seed: 7,
+            objective: "minimum-error",
+            nominalAverageBits: 4.5,
+            sourceSensitivityArtifactSHA256: String(
+                repeating: "a", count: 64),
+            layers: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+                KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
+            ])
+        let selection = try KVTunerRuntimeSelection.load(
+            artifactData: JSONEncoder().encode(schedule),
+            expectedLayerCount: 2,
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: configHash,
+            expectedCheckpointManifestHash: checkpointHash,
+            evaluationCorpora: evaluationCorpora ?? [kvtunerEvaluation()])
+        return KVTunerScheduleBinding(selection: selection)
+    }
+
+    private func kvtunerFormatAndStorage(
+        binding: KVTunerScheduleBinding,
+        capacityTokens: Int = 24_192
+    ) throws -> (
+        format: KVFormatGeometryEvidence,
+        storage: KVStorageEvidence,
+        allocation: KVTunerStorageAllocation
+    ) {
+        let format = KVFormatGeometryEvidence(
+            kind: .kvtuner, tier: binding.cellID,
+            keyBits: 0, valueBits: 0, groupSize: binding.groupSize,
+            sinkTokens: 0, layerCount: binding.layers.count,
+            kvHeadCount: 8, headDimension: 128,
+            capacityTokens: capacityTokens, sequences: 1,
+            metadataScalarBytes: 4, recordAlignment: 1)
+        let workspaceBytes = capacityTokens * 8 * 128 * 4
+        let allocation = try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: binding.layers.map {
+                KVLayerPrecision(
+                    layer: $0.layer,
+                    keyBits: $0.keyBits,
+                    valueBits: $0.valueBits)
+            },
+            groupSize: binding.groupSize,
+            geometry: KVStorageGeometry(
+                layerCount: binding.layers.count,
+                kvHeadCount: 8,
+                headDimension: 128),
+            capacityTokens: capacityTokens,
+            sequences: 1,
+            metadataScalarBytes: 4,
+            maximumLayerWorkspaceBytes: workspaceBytes)
+        let actual = KVStorageBreakdownEvidence(
+            payloadBytes: allocation.payloadBytes,
+            metadataBytes: allocation.metadataBytes,
+            alignmentPaddingBytes: 0,
+            fp16SinkBytes: 0,
+            fp16TailBytes: 0,
+            workspaceBytes: allocation.workspaceBytes,
+            totalBytes: allocation.totalBytes - allocation.controlBytes)
+        return (
+            format,
+            try format.storageEvidence(
+                actual: actual, kvtunerSchedule: binding),
+            allocation)
+    }
+
     private func payload(
         kvQuantTier: String = "affine-k4v2-g128",
         frontier: KVFrontierEvidence? = nil
@@ -373,6 +475,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
         let decoded = try JSONDecoder().decode(KLPayload.self, from: historical)
 
         XCTAssertNil(decoded.frontier?.actualControlBytes)
+        XCTAssertNil(decoded.frontier?.candidateKVTunerSchedule)
         XCTAssertNoThrow(try decoded.validatedForRecord())
         XCTAssertThrowsError(try decoded.validatedForPromotion()) {
             XCTAssertEqual(
@@ -387,6 +490,297 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
         XCTAssertEqual(evidence.actual, actual)
         XCTAssertEqual(evidence.predicted, actual)
+    }
+
+    func testKVTunerFrontierRoundTripsAndReconcilesHeterogeneousStorage() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+        let evidence = frontier(
+            candidate: model,
+            reference: model,
+            matrixID: binding.matrixID,
+            cellID: binding.cellID,
+            format: measured.format,
+            storage: measured.storage,
+            controlBytes: measured.allocation.controlBytes,
+            kvtunerSchedule: binding)
+        let candidate = payload(
+            kvQuantTier: binding.cellID,
+            frontier: evidence)
+
+        XCTAssertNoThrow(try candidate.validatedForPromotion())
+        XCTAssertEqual(
+            measured.storage.predicted.payloadBytes,
+            measured.allocation.payloadBytes)
+        XCTAssertEqual(
+            measured.storage.predicted.metadataBytes,
+            measured.allocation.metadataBytes)
+        XCTAssertEqual(
+            measured.storage.predicted.totalBytes,
+            measured.allocation.totalBytes
+                - measured.allocation.controlBytes)
+
+        let decoded = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONEncoder().encode(candidate))
+        XCTAssertEqual(decoded, candidate)
+        XCTAssertEqual(
+            decoded.frontier?.candidateKVTunerSchedule,
+            binding)
+
+        let record = ResultRecord(
+            subcommand: "kl",
+            provenance: provenance(
+                configHash: binding.modelConfigHash,
+                manifestHash: binding.checkpointManifestHash,
+                corpusHash: kvtunerEvaluation().aggregateDigest),
+            payload: candidate)
+        XCTAssertNoThrow(try record.validatedForPromotionEvidence())
+    }
+
+    func testKVTunerRequiresScheduleExclusivelyAndExactControlStorage() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+
+        let missingSchedule = frontier(
+            candidate: model,
+            reference: model,
+            matrixID: binding.matrixID,
+            cellID: binding.cellID,
+            format: measured.format,
+            storage: measured.storage,
+            controlBytes: measured.allocation.controlBytes)
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: binding.cellID,
+            frontier: missingSchedule).validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidKVTunerSchedule)
+        }
+
+        let unexpectedSchedule = frontier(
+            kvtunerSchedule: binding)
+        XCTAssertThrowsError(try payload(
+            frontier: unexpectedSchedule).validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidKVTunerSchedule)
+        }
+
+        let wrongControl = frontier(
+            candidate: model,
+            reference: model,
+            matrixID: binding.matrixID,
+            cellID: binding.cellID,
+            format: measured.format,
+            storage: measured.storage,
+            controlBytes: measured.allocation.controlBytes - 1,
+            kvtunerSchedule: binding)
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: binding.cellID,
+            frontier: wrongControl).validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidControlStorage)
+        }
+    }
+
+    func testKVTunerForbidsKVarNOnlyRuntimeEvidence() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+
+        let invalidRows = [
+            frontier(
+                candidate: model,
+                reference: model,
+                matrixID: binding.matrixID,
+                cellID: binding.cellID,
+                format: measured.format,
+                storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                executionMode: "uncompiled-correctness",
+                codecIterations: 8,
+                kvtunerSchedule: binding),
+            frontier(
+                candidate: model,
+                reference: model,
+                matrixID: binding.matrixID,
+                cellID: binding.cellID,
+                format: measured.format,
+                storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                memoryGate: kvarnMemoryGate(),
+                kvtunerSchedule: binding),
+        ]
+        for invalid in invalidRows {
+            XCTAssertThrowsError(try payload(
+                kvQuantTier: binding.cellID,
+                frontier: invalid).validatedForRecord()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+        }
+    }
+
+    func testKVTunerScheduleBindsMatrixCellModelLayerAndGroupIdentity() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+        let invalidFormats = [
+            KVFormatGeometryEvidence(
+                kind: .kvtuner, tier: binding.cellID,
+                keyBits: 0, valueBits: 0, groupSize: binding.groupSize,
+                sinkTokens: 0, layerCount: binding.layers.count + 1,
+                kvHeadCount: 8, headDimension: 128,
+                capacityTokens: 24_192, sequences: 1,
+                metadataScalarBytes: 4, recordAlignment: 1),
+            KVFormatGeometryEvidence(
+                kind: .kvtuner, tier: binding.cellID,
+                keyBits: 0, valueBits: 0, groupSize: 64,
+                sinkTokens: 0, layerCount: binding.layers.count,
+                kvHeadCount: 8, headDimension: 128,
+                capacityTokens: 24_192, sequences: 1,
+                metadataScalarBytes: 4, recordAlignment: 1),
+        ]
+        let invalidRows = [
+            frontier(
+                candidate: model, reference: model,
+                matrixID: "other-matrix", cellID: binding.cellID,
+                format: measured.format, storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding),
+            frontier(
+                candidate: model, reference: model,
+                matrixID: binding.matrixID, cellID: "other-cell",
+                format: measured.format, storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding),
+            frontier(
+                candidate: identity("different"),
+                reference: identity("different"),
+                matrixID: binding.matrixID, cellID: binding.cellID,
+                format: measured.format, storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding),
+        ] + invalidFormats.map { format in
+            frontier(
+                candidate: model, reference: model,
+                matrixID: binding.matrixID, cellID: binding.cellID,
+                format: format, storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding)
+        }
+        for invalid in invalidRows {
+            XCTAssertThrowsError(try payload(
+                kvQuantTier: binding.cellID,
+                frontier: invalid).validatedForRecord()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidKVTunerSchedule)
+            }
+        }
+    }
+
+    func testKVTunerEvaluationCorpusMustMatchKLProvenance() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+        let candidate = payload(
+            kvQuantTier: binding.cellID,
+            frontier: frontier(
+                candidate: model,
+                reference: model,
+                matrixID: binding.matrixID,
+                cellID: binding.cellID,
+                format: measured.format,
+                storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding))
+
+        for invalidProvenance in [
+            provenance(
+                configHash: binding.modelConfigHash,
+                manifestHash: binding.checkpointManifestHash,
+                corpusHash: "7777777777777777"),
+            provenance(
+                configHash: binding.modelConfigHash,
+                manifestHash: binding.checkpointManifestHash,
+                corpusHash: kvtunerEvaluation().aggregateDigest,
+                corpusID: "other-evaluation"),
+        ] {
+            XCTAssertThrowsError(try ResultRecord(
+                subcommand: "kl",
+                provenance: invalidProvenance,
+                payload: candidate
+            ).validatedForRecordEvidence()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .kvtunerEvaluationProvenanceMismatch)
+            }
+        }
+    }
+
+    func testKVTunerKLRejectsMutatedScheduleEntryDigests() throws {
+        let binding = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+        let candidate = payload(
+            kvQuantTier: binding.cellID,
+            frontier: frontier(
+                candidate: model,
+                reference: model,
+                matrixID: binding.matrixID,
+                cellID: binding.cellID,
+                format: measured.format,
+                storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: binding))
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(candidate)) as? [String: Any])
+        var frontierObject = try XCTUnwrap(
+            object["frontier"] as? [String: Any])
+        var scheduleObject = try XCTUnwrap(
+            frontierObject["candidateKVTunerSchedule"] as? [String: Any])
+        var corpora = try XCTUnwrap(
+            scheduleObject["evaluationCorpora"] as? [[String: Any]])
+        corpora[0]["canonicalEntryDigests"] = [
+            "5555555555555555",
+            "7777777777777777",
+        ]
+        scheduleObject["evaluationCorpora"] = corpora
+        frontierObject["candidateKVTunerSchedule"] = scheduleObject
+        frontierObject["candidateKVTunerEvaluationCorpus"] =
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(
+                    with: JSONEncoder().encode(kvtunerEvaluation()))
+                    as? [String: Any])
+        object["frontier"] = frontierObject
+        let mutated = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONSerialization.data(withJSONObject: object))
+
+        XCTAssertThrowsError(try mutated.validatedForPromotion()) { error in
+            XCTAssertEqual(
+                error as? KVFrontierEvidenceError,
+                .invalidKVTunerSchedule)
+        }
     }
 
     func testKVarNPromotionRequiresMeasuredExecutionModeAndIterationCell() throws {
@@ -1205,7 +1599,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
         gitSHA: String = String(repeating: "a", count: 40),
         configHash: String = "config-same",
         manifestHash: String? = "checkpoint-same",
-        corpusHash: String? = "corpus-hash"
+        corpusHash: String? = "corpus-hash",
+        corpusID: String? = "measurement-corpus-v2"
     ) -> Provenance {
         Provenance(
             date: "2026-07-14T00:00:00Z", hardwareChip: "Apple M3 Ultra",
@@ -1216,7 +1611,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             modelConfigHash: configHash,
             modelCheckpointManifestHash: manifestHash,
             modelQuant: ModelQuantInfo(bits: 4, groupSize: 64),
-            corpusId: corpusHash == nil ? nil : "measurement-corpus-v2",
+            corpusId: corpusHash == nil ? nil : corpusID,
             corpusContentHash: corpusHash, nonce: "evidence-nonce")
     }
 }

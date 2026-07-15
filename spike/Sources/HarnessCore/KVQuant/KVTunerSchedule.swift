@@ -227,7 +227,7 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
             throw KVTunerScheduleError.invalidProvenance
         }
         for digest in entryHashes {
-            guard Self.isIdentityDigest(digest) else {
+            guard KVTunerPromptDigest.isCanonical(digest) else {
                 throw KVTunerScheduleError.invalidDigest(digest)
             }
         }
@@ -256,7 +256,7 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
             throw KVTunerScheduleError.invalidProvenance
         }
         for digest in calibrationEntryHashes {
-            guard Self.isIdentityDigest(digest) else {
+            guard KVTunerPromptDigest.isCanonical(digest) else {
                 throw KVTunerScheduleError.invalidDigest(digest)
             }
         }

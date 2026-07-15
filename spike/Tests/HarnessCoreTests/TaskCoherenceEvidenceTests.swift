@@ -5,6 +5,9 @@ import XCTest
 final class TaskCoherenceEvidenceTests: XCTestCase {
     private let matrixID = "kvarn-qwen3-32b-v1"
     private let candidateCellID = "affine-k4v2-g128"
+    private let kvtunerCellID = "kvtuner-g128-b4.5"
+    private let modelConfigHash = "0123456789abcdef"
+    private let checkpointManifestHash = "fedcba9876543210"
     private let cleanSHA = String(repeating: "a", count: 40)
 
     func testRunnableTaskTierCellMappingIsClosed() {
@@ -18,9 +21,20 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             TaskCoherenceArtifact.expectedCellID(
                 forTier: "kvarn-k4v2-g128"),
             "kvarn-k4v2-g128-i8")
+        XCTAssertEqual(
+            TaskCoherenceArtifact.expectedCellID(
+                forTier: kvtunerCellID),
+            kvtunerCellID)
         XCTAssertNil(TaskCoherenceArtifact.expectedCellID(forTier: "tq2.5"))
-        XCTAssertNil(TaskCoherenceArtifact.expectedCellID(
-            forTier: "kvtuner-unbound"))
+        for invalid in [
+            "kvtuner-unbound",
+            "kvtuner-g0128-b4.5",
+            "kvtuner-g128-b4.50",
+            "kvtuner-g32-b4.5",
+        ] {
+            XCTAssertNil(TaskCoherenceArtifact.expectedCellID(
+                forTier: invalid))
+        }
     }
 
     func testPromptLayoutRequiresMaterialInsideCompletedCompressedTiles() {
@@ -241,6 +255,122 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             artifactData(rows), corpus: corpus))
     }
 
+    func testKVTunerSummaryBindsScheduleAndExactGenerationAndScoringEngagement()
+        throws
+    {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        let binding = try kvtunerBinding(corpus: corpus)
+        let rows = try makeRows(
+            corpus: corpus, tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceArtifactSHA256: reference.artifactSHA256,
+            kvtunerSchedule: binding)
+
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+        XCTAssertTrue(try XCTUnwrap(
+            candidate.identity.kvtunerSchedule).sameSchedule(as: binding))
+        XCTAssertTrue(candidate.cases.allSatisfy {
+            $0.engagement.kvtunerTokens == $0.engagement.cachedTokens
+                && $0.engagement.kvtunerLayerCount == binding.layers.count
+        })
+        XCTAssertTrue(candidate.cases.allSatisfy { payload in
+            if payload.score.domain == .structuredTool {
+                return payload.engagement.scoringCachedTokens == nil
+                    && payload.engagement.scoringKVTunerLayerCount == nil
+            }
+            return payload.engagement.scoringCachedTokens
+                    == payload.layout.promptTokens
+                && payload.engagement.scoringKVTunerLayerCount
+                    == binding.layers.count
+        })
+
+        let missingBinding = try makeRows(
+            corpus: corpus, tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceArtifactSHA256: reference.artifactSHA256,
+            kvtunerSchedule: nil)
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(missingBinding), corpus: corpus))
+
+        var wrongLayers = rows
+        let first = wrongLayers[0]
+        wrongLayers[0] = replacing(
+            first,
+            engagement: TaskCoherenceCacheEngagementEvidence(
+                cachedTokens: first.payload.engagement.cachedTokens,
+                affineTokens: nil,
+                kvtunerTokens: first.payload.engagement.kvtunerTokens,
+                kvtunerLayerCount: binding.layers.count + 1,
+                kvarnCompletedTileCount: nil,
+                kvarnCompressedTokens: nil,
+                kvarnCodecIterations: nil,
+                kvarnExecutionMode: nil,
+                scoringCachedTokens:
+                    first.payload.engagement.scoringCachedTokens,
+                scoringKVTunerLayerCount:
+                    first.payload.engagement.scoringKVTunerLayerCount))
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(wrongLayers), corpus: corpus))
+
+        var wrongScoringLayers = rows
+        wrongScoringLayers[0] = replacing(
+            first,
+            engagement: TaskCoherenceCacheEngagementEvidence(
+                cachedTokens: first.payload.engagement.cachedTokens,
+                affineTokens: nil,
+                kvtunerTokens: first.payload.engagement.kvtunerTokens,
+                kvtunerLayerCount: binding.layers.count,
+                kvarnCompletedTileCount: nil,
+                kvarnCompressedTokens: nil,
+                kvarnCodecIterations: nil,
+                kvarnExecutionMode: nil,
+                scoringCachedTokens:
+                    first.payload.engagement.scoringCachedTokens,
+                scoringKVTunerLayerCount: binding.layers.count + 1))
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(wrongScoringLayers), corpus: corpus))
+
+        var wrongTokens = rows
+        wrongTokens[0] = replacing(
+            first,
+            engagement: TaskCoherenceCacheEngagementEvidence(
+                cachedTokens: first.payload.engagement.cachedTokens,
+                affineTokens: nil,
+                kvtunerTokens:
+                    (first.payload.engagement.kvtunerTokens ?? 0) - 1,
+                kvtunerLayerCount: binding.layers.count,
+                kvarnCompletedTileCount: nil,
+                kvarnCompressedTokens: nil,
+                kvarnCodecIterations: nil,
+                kvarnExecutionMode: nil,
+                scoringCachedTokens:
+                    first.payload.engagement.scoringCachedTokens,
+                scoringKVTunerLayerCount:
+                    first.payload.engagement.scoringKVTunerLayerCount))
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(wrongTokens), corpus: corpus))
+    }
+
+    func testNonKVTunerTaskRowsRejectAnExtraScheduleBinding() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        let binding = try kvtunerBinding(corpus: corpus)
+        let rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256,
+            kvtunerSchedule: binding)
+
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus))
+    }
+
     func testCandidateAssessmentBindsExactFP16Artifact() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
         let reference = try summary(
@@ -285,6 +415,43 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         let wrongCell = try validKLRecord(cellID: "affine-k4v2-g64")
         XCTAssertThrowsError(try evidence.validated(
             with: wrongCell, corpus: corpus))
+    }
+
+    func testKVTunerPromotionPairsTheExactTaskAndKLSchedule() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        let taskBinding = try kvtunerBinding(corpus: corpus)
+        let candidate = try summary(
+            corpus: corpus, tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceDigest: reference.artifactSHA256,
+            kvtunerSchedule: taskBinding)
+        let promotion = try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus)
+
+        let measurement = kvtunerKLEvaluationCorpus()
+        let matchingKLBinding = try kvtunerBinding(
+            corpus: corpus,
+            evaluationCorpora: [measurement])
+        XCTAssertTrue(taskBinding.sameSchedule(as: matchingKLBinding))
+        XCTAssertNoThrow(try promotion.validated(
+            with: validKVTunerKLRecord(binding: matchingKLBinding),
+            corpus: corpus))
+
+        let differentKLBinding = try kvtunerBinding(
+            corpus: corpus,
+            seed: 8,
+            evaluationCorpora: [measurement])
+        XCTAssertFalse(taskBinding.sameSchedule(as: differentKLBinding))
+        XCTAssertThrowsError(try promotion.validated(
+            with: validKVTunerKLRecord(binding: differentKLBinding),
+            corpus: corpus)) {
+            XCTAssertEqual(
+                $0 as? TaskCoherenceEvidenceError,
+                .klEvidenceMismatch("kvtuner-schedule"))
+        }
     }
 
     func testSummaryAuthenticatesCanonicalBytesAndEmbeddedCases() throws {
@@ -742,13 +909,15 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         tier: String,
         cellID: String,
         referenceDigest: String?,
-        nonce: String? = nil
+        nonce: String? = nil,
+        kvtunerSchedule: KVTunerScheduleBinding? = nil
     ) throws -> TaskCoherenceArtifactSummary {
         try TaskCoherenceArtifact.summarize(
             artifactData(try makeRows(
                 corpus: corpus, tier: tier, cellID: cellID,
                 referenceArtifactSHA256: referenceDigest,
-                nonce: nonce)),
+                nonce: nonce,
+                kvtunerSchedule: kvtunerSchedule)),
             corpus: corpus)
     }
 
@@ -764,14 +933,16 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         tier: String,
         cellID: String,
         referenceArtifactSHA256: String?,
-        nonce: String? = nil
+        nonce: String? = nil,
+        kvtunerSchedule: KVTunerScheduleBinding? = nil
     ) throws -> [ResultRecord<TaskCoherenceCasePayload>] {
         let identity = TaskCoherenceRunIdentity(
             corpusID: corpus.id,
             corpusContentHash: corpus.contentHash,
-            modelConfigHash: "config-same",
-            modelCheckpointManifestHash: "checkpoint-same",
-            kvQuantTier: tier)
+            modelConfigHash: modelConfigHash,
+            modelCheckpointManifestHash: checkpointManifestHash,
+            kvQuantTier: tier,
+            kvtunerSchedule: kvtunerSchedule)
         let runProvenance = provenance(
             corpus: corpus, tier: tier,
             nonce: nonce ?? "task-run-(cellID)")
@@ -812,6 +983,22 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     scoringCachedTokens: restricted ? 512 : nil,
                     scoringKVarNCompletedTileCount: restricted ? 3 : nil,
                     scoringKVarNCompressedTokens: restricted ? 384 : nil)
+            } else if tier.hasPrefix("kvtuner-") {
+                let layerCount = kvtunerSchedule?.layers.count ?? 2
+                engagement = TaskCoherenceCacheEngagementEvidence(
+                    cachedTokens: expectedCachedTokens,
+                    affineTokens: nil,
+                    kvtunerTokens: expectedCachedTokens,
+                    kvtunerLayerCount: layerCount,
+                    kvarnCompletedTileCount: nil,
+                    kvarnCompressedTokens: nil,
+                    kvarnCodecIterations: nil,
+                    kvarnExecutionMode: nil,
+                    scoringCachedTokens: restricted ? 512 : nil,
+                    scoringKVTunerLayerCount:
+                        restricted ? layerCount : nil,
+                    scoringKVarNCompletedTileCount: nil,
+                    scoringKVarNCompressedTokens: nil)
             } else {
                 engagement = TaskCoherenceCacheEngagementEvidence(
                     cachedTokens: expectedCachedTokens,
@@ -862,6 +1049,92 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         }
     }
 
+    private func replacing(
+        _ record: ResultRecord<TaskCoherenceCasePayload>,
+        identity: TaskCoherenceRunIdentity? = nil,
+        engagement: TaskCoherenceCacheEngagementEvidence? = nil
+    ) -> ResultRecord<TaskCoherenceCasePayload> {
+        let payload = record.payload
+        return ResultRecord(
+            subcommand: record.subcommand,
+            provenance: record.provenance,
+            payload: TaskCoherenceCasePayload(
+                schemaVersion: payload.schemaVersion,
+                matrixID: payload.matrixID,
+                cellID: payload.cellID,
+                identity: identity ?? payload.identity,
+                referenceArtifactSHA256:
+                    payload.referenceArtifactSHA256,
+                promptContentHash: payload.promptContentHash,
+                runConfiguration: payload.runConfiguration,
+                tokenization: payload.tokenization,
+                layout: payload.layout,
+                generatedTokenCount: payload.generatedTokenCount,
+                scoredOutput: payload.scoredOutput,
+                outputSHA256: payload.outputSHA256,
+                score: payload.score,
+                engagement: engagement ?? payload.engagement))
+    }
+
+    private func kvtunerEvaluationCorpus(
+        _ corpus: TaskCoherenceCorpus
+    ) -> KVTunerEvaluationCorpusIdentity {
+        KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(corpus)
+    }
+
+    private func kvtunerBinding(
+        corpus: TaskCoherenceCorpus,
+        seed: UInt64 = 7,
+        evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
+    ) throws -> KVTunerScheduleBinding {
+        let evaluation = kvtunerEvaluationCorpus(corpus)
+        let schedule = KVTunerSchedule(
+            schemaVersion: 2,
+            matrixID: matrixID,
+            cellID: kvtunerCellID,
+            modelConfigHash: modelConfigHash,
+            checkpointManifestHash: checkpointManifestHash,
+            groupSize: 128,
+            calibrationCorpusID: "calibration-v1",
+            calibrationCorpusHash: "1111111111111111",
+            calibrationEntryHashes: [
+                "2222222222222222",
+                "3333333333333333",
+            ],
+            seed: seed,
+            objective: "minimum-error",
+            nominalAverageBits: 4.5,
+            sourceSensitivityArtifactSHA256: String(
+                repeating: "c", count: 64),
+            layers: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+                KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
+            ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let selection = try KVTunerRuntimeSelection.load(
+            artifactData: encoder.encode(schedule),
+            expectedLayerCount: 2,
+            expectedMatrixID: matrixID,
+            expectedCellID: kvtunerCellID,
+            expectedModelConfigHash: modelConfigHash,
+            expectedCheckpointManifestHash: checkpointManifestHash,
+            evaluationCorpora: evaluationCorpora ?? [evaluation])
+        return KVTunerScheduleBinding(selection: selection)
+    }
+
+    private func kvtunerKLEvaluationCorpus()
+        -> KVTunerEvaluationCorpusIdentity
+    {
+        KVTunerEvaluationCorpusIdentity(
+            id: "measurement-corpus-v2",
+            aggregateDigest: "4444444444444444",
+            canonicalEntryDigests: [
+                "5555555555555555",
+                "6666666666666666",
+            ])
+    }
+
     private func provenance(
         corpus: TaskCoherenceCorpus,
         tier: String,
@@ -878,8 +1151,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             referenceMLXVersion: "0.32.0",
             referenceMLXLMVersion: "0.29.0",
             modelPath: "/models/qwen3-32b",
-            modelConfigHash: "config-same",
-            modelCheckpointManifestHash: "checkpoint-same",
+            modelConfigHash: modelConfigHash,
+            modelCheckpointManifestHash: checkpointManifestHash,
             modelQuant: ModelQuantInfo(bits: 4, groupSize: 64),
             corpusId: corpus.id,
             corpusContentHash: corpus.contentHash,
@@ -910,11 +1183,11 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             comparisonBaseline: .sameWeightsFP16KV,
             referenceKVQuantTier: "fp16",
             candidateModel: KVModelEvidenceIdentity(
-                configHash: "config-same",
-                checkpointManifestHash: "checkpoint-same"),
+                configHash: modelConfigHash,
+                checkpointManifestHash: checkpointManifestHash),
             referenceModel: KVModelEvidenceIdentity(
-                configHash: "config-same",
-                checkpointManifestHash: "checkpoint-same"),
+                configHash: modelConfigHash,
+                checkpointManifestHash: checkpointManifestHash),
             candidateFormat: format,
             storage: KVStorageEvidence(predicted: actual, actual: actual),
             actualControlBytes: 256,
@@ -960,14 +1233,137 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             referenceMLXVersion: "0.32.0",
             referenceMLXLMVersion: "0.29.0",
             modelPath: "/models/qwen3-32b",
-            modelConfigHash: "config-same",
-            modelCheckpointManifestHash: "checkpoint-same",
+            modelConfigHash: modelConfigHash,
+            modelCheckpointManifestHash: checkpointManifestHash,
             modelQuant: ModelQuantInfo(bits: 4, groupSize: 64),
             corpusId: "measurement-corpus-v2",
             corpusContentHash: "measurement-corpus-hash",
             nonce: "kl-run")
         return ResultRecord(
             subcommand: "kl", provenance: measurementProvenance,
+            payload: payload)
+    }
+
+    private func validKVTunerKLRecord(
+        binding: KVTunerScheduleBinding
+    ) throws -> ResultRecord<KLPayload> {
+        let capacityTokens = 24_192
+        let kvHeadCount = 8
+        let headDimension = 128
+        let metadataScalarBytes = 4
+        let workspaceBytes = capacityTokens * kvHeadCount
+            * headDimension * metadataScalarBytes
+        let format = KVFormatGeometryEvidence(
+            kind: .kvtuner,
+            tier: binding.cellID,
+            keyBits: 0,
+            valueBits: 0,
+            groupSize: binding.groupSize,
+            sinkTokens: 0,
+            layerCount: binding.layers.count,
+            kvHeadCount: kvHeadCount,
+            headDimension: headDimension,
+            capacityTokens: capacityTokens,
+            sequences: 1,
+            metadataScalarBytes: metadataScalarBytes,
+            recordAlignment: 1)
+        let allocation = try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: binding.layers.map {
+                KVLayerPrecision(
+                    layer: $0.layer,
+                    keyBits: $0.keyBits,
+                    valueBits: $0.valueBits)
+            },
+            groupSize: binding.groupSize,
+            geometry: KVStorageGeometry(
+                layerCount: binding.layers.count,
+                kvHeadCount: kvHeadCount,
+                headDimension: headDimension),
+            capacityTokens: capacityTokens,
+            sequences: 1,
+            metadataScalarBytes: metadataScalarBytes,
+            maximumLayerWorkspaceBytes: workspaceBytes)
+        let actual = KVStorageBreakdownEvidence(
+            payloadBytes: allocation.payloadBytes,
+            metadataBytes: allocation.metadataBytes,
+            alignmentPaddingBytes: 0,
+            fp16SinkBytes: 0,
+            fp16TailBytes: 0,
+            workspaceBytes: allocation.workspaceBytes,
+            totalBytes: allocation.totalBytes - allocation.controlBytes)
+        let storage = try format.storageEvidence(
+            actual: actual,
+            kvtunerSchedule: binding)
+        let model = KVModelEvidenceIdentity(
+            configHash: binding.modelConfigHash,
+            checkpointManifestHash: binding.checkpointManifestHash)
+        let frontier = KVFrontierEvidence(
+            schemaVersion: 1,
+            matrixID: binding.matrixID,
+            cellID: binding.cellID,
+            sameWeights: true,
+            comparisonBaseline: .sameWeightsFP16KV,
+            referenceKVQuantTier: "fp16",
+            candidateModel: model,
+            referenceModel: model,
+            candidateFormat: format,
+            storage: storage,
+            actualControlBytes: allocation.controlBytes,
+            candidateExecutionMode: nil,
+            candidateCodecIterations: nil,
+            candidateMemoryGate: nil,
+            candidateKVTunerSchedule: binding)
+        let template = try validKLRecord().payload
+        let payload = KLPayload(
+            kvQuantTier: binding.cellID,
+            klMedianNats: template.klMedianNats,
+            klLongContextTailP95Nats:
+                template.klLongContextTailP95Nats,
+            klPooledMedianNats: template.klPooledMedianNats,
+            klPooledP95Nats: template.klPooledP95Nats,
+            pplCandidate: template.pplCandidate,
+            pplReference: template.pplReference,
+            pplDeltaPct: template.pplDeltaPct,
+            totalPositions: template.totalPositions,
+            entryCount: template.entryCount,
+            teacherForcedTop1AgreementCount:
+                template.teacherForcedTop1AgreementCount,
+            teacherForcedTop1ScoredPositions:
+                template.teacherForcedTop1ScoredPositions,
+            teacherForcedTop1AgreementRate:
+                template.teacherForcedTop1AgreementRate,
+            frontier: frontier,
+            shortEntryCount: template.shortEntryCount,
+            shortScoredPositions: template.shortScoredPositions,
+            longContextEntryCount: template.longContextEntryCount,
+            longContextScoredPositions:
+                template.longContextScoredPositions,
+            shortEntryScoring: template.shortEntryScoring,
+            longContextEntryScoring: template.longContextEntryScoring,
+            longContextMaxDocumentTokens:
+                template.longContextMaxDocumentTokens,
+            longContextMaxScoredContextTokens:
+                template.longContextMaxScoredContextTokens)
+        let evaluation = kvtunerKLEvaluationCorpus()
+        let provenance = Provenance(
+            date: "2026-07-15T00:10:00Z",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareRAMBytes: 256 * 1_024 * 1_024 * 1_024,
+            hardwareOS: "macOS 15.5",
+            harnessGitSHA: cleanSHA,
+            mlxSwiftVersion: "0.31.6",
+            referenceMLXVersion: "0.32.0",
+            referenceMLXLMVersion: "0.29.0",
+            modelPath: "/models/qwen3-32b",
+            modelConfigHash: binding.modelConfigHash,
+            modelCheckpointManifestHash:
+                binding.checkpointManifestHash,
+            modelQuant: ModelQuantInfo(bits: 4, groupSize: 64),
+            corpusId: evaluation.id,
+            corpusContentHash: evaluation.aggregateDigest,
+            nonce: "kvtuner-kl-run")
+        return ResultRecord(
+            subcommand: "kl", provenance: provenance,
             payload: payload)
     }
 }

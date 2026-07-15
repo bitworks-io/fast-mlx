@@ -8,6 +8,7 @@ public enum KVComparisonBaseline: String, Codable, Equatable, Sendable {
 public enum KVStorageFormatKind: String, Codable, Equatable, Sendable {
     case fp16
     case affine
+    case kvtuner
     case kvarn
 }
 
@@ -759,6 +760,15 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     public let candidateExecutionMode: String?
     public let candidateCodecIterations: Int?
     public let candidateMemoryGate: KVarNMemoryGateEvidence?
+    /// Exact authenticated heterogeneous policy used by a KVTuner candidate. Optional decoding
+    /// preserves schema-1 fp16/affine/KVarN rows; validation requires it iff the candidate tier
+    /// is KVTuner and binds every schedule identity before the row can be accepted.
+    public let candidateKVTunerSchedule: KVTunerScheduleBinding?
+    /// Independent copy of the exact KL corpus identity. Keeping it outside the schedule binding
+    /// lets decoded evidence detect a changed per-prompt digest list instead of trusting the
+    /// schedule's own claim as both value and expected value.
+    public let candidateKVTunerEvaluationCorpus:
+        KVTunerEvaluationCorpusIdentity?
 
     public init(
         schemaVersion: Int, matrixID: String, cellID: String,
@@ -771,7 +781,10 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         actualControlBytes: Int? = nil,
         candidateExecutionMode: String? = nil,
         candidateCodecIterations: Int? = nil,
-        candidateMemoryGate: KVarNMemoryGateEvidence? = nil
+        candidateMemoryGate: KVarNMemoryGateEvidence? = nil,
+        candidateKVTunerSchedule: KVTunerScheduleBinding? = nil,
+        candidateKVTunerEvaluationCorpus:
+            KVTunerEvaluationCorpusIdentity? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.matrixID = matrixID
@@ -787,6 +800,16 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         self.candidateExecutionMode = candidateExecutionMode
         self.candidateCodecIterations = candidateCodecIterations
         self.candidateMemoryGate = candidateMemoryGate
+        self.candidateKVTunerSchedule = candidateKVTunerSchedule
+        if let candidateKVTunerEvaluationCorpus {
+            self.candidateKVTunerEvaluationCorpus =
+                candidateKVTunerEvaluationCorpus
+        } else if candidateKVTunerSchedule?.evaluationCorpora.count == 1 {
+            self.candidateKVTunerEvaluationCorpus =
+                candidateKVTunerSchedule?.evaluationCorpora[0]
+        } else {
+            self.candidateKVTunerEvaluationCorpus = nil
+        }
     }
 }
 
@@ -893,6 +916,8 @@ public enum KVFrontierEvidenceError: Error, Equatable, Sendable {
     case missingControlStorage
     case invalidControlStorage
     case invalidRuntimeEvidence
+    case invalidKVTunerSchedule
+    case kvtunerEvaluationProvenanceMismatch
     case missingMemoryGateEvidence
     case invalidMemoryGateEvidence
     case memoryGateProvenanceMismatch
@@ -1279,6 +1304,36 @@ private extension KVFrontierEvidence {
         guard referenceKVQuantTier == "fp16" else {
             throw KVFrontierEvidenceError.inconsistentBaseline
         }
+        let requestsKVTuner = candidateTier.hasPrefix("kvtuner-")
+        guard requestsKVTuner == (candidateKVTunerSchedule != nil),
+            requestsKVTuner
+                == (candidateKVTunerEvaluationCorpus != nil)
+        else {
+            throw KVFrontierEvidenceError.invalidKVTunerSchedule
+        }
+        if let schedule = candidateKVTunerSchedule {
+            guard let evaluation = candidateKVTunerEvaluationCorpus,
+                schedule.evaluationCorpora == [evaluation]
+            else {
+                throw KVFrontierEvidenceError.invalidKVTunerSchedule
+            }
+            do {
+                try schedule.validated(
+                    expectedMatrixID: matrixID,
+                    expectedCellID: cellID,
+                    expectedModelConfigHash: candidateModel.configHash,
+                    expectedCheckpointManifestHash:
+                        candidateModel.checkpointManifestHash,
+                    expectedLayerCount:
+                        candidateFormat?.layerCount ?? schedule.layers.count,
+                    requiredEvaluationCorpus: evaluation)
+            } catch {
+                throw KVFrontierEvidenceError.invalidKVTunerSchedule
+            }
+            guard schedule.cellID == candidateTier else {
+                throw KVFrontierEvidenceError.invalidKVTunerSchedule
+            }
+        }
         if sameWeights {
             guard comparisonBaseline == .sameWeightsFP16KV,
                 candidateModel == referenceModel
@@ -1301,17 +1356,57 @@ private extension KVFrontierEvidence {
             }
             break
         case (.some(let format), .some(let storage)):
-            try format.validate()
+            guard (format.kind == .kvtuner)
+                == (candidateKVTunerSchedule != nil)
+            else {
+                throw KVFrontierEvidenceError.invalidKVTunerSchedule
+            }
+            if let schedule = candidateKVTunerSchedule {
+                guard format.tier == schedule.cellID,
+                    format.groupSize == schedule.groupSize,
+                    format.layerCount == schedule.layers.count
+                else {
+                    throw KVFrontierEvidenceError.invalidKVTunerSchedule
+                }
+            }
+            try format.validate(
+                kvtunerSchedule: candidateKVTunerSchedule)
             guard format.tier == candidateTier else {
                 throw KVFrontierEvidenceError.tierMismatch
             }
             try storage.validate(requireExactMatch: false)
             let expected = try format.predictedStorage(
-                workspaceBytes: storage.predicted.workspaceBytes)
+                workspaceBytes: storage.predicted.workspaceBytes,
+                kvtunerSchedule: candidateKVTunerSchedule)
             guard expected == storage.predicted else {
                 throw KVFrontierEvidenceError.storagePredictionMismatch
             }
             switch format.kind {
+            case .kvtuner:
+                guard let schedule = candidateKVTunerSchedule,
+                    schedule.groupSize == format.groupSize,
+                    schedule.layers.count == format.layerCount
+                else {
+                    throw KVFrontierEvidenceError.invalidKVTunerSchedule
+                }
+                guard candidateExecutionMode == nil,
+                    candidateCodecIterations == nil,
+                    candidateMemoryGate == nil
+                else {
+                    throw KVFrontierEvidenceError.invalidRuntimeEvidence
+                }
+                guard let actualControlBytes else {
+                    throw KVFrontierEvidenceError.missingControlStorage
+                }
+                let (expectedControlBytes, controlOverflow) = schedule.layers
+                    .count.multipliedReportingOverflow(
+                        by: MemoryLayout<Int32>.size)
+                guard !controlOverflow else {
+                    throw KVFrontierEvidenceError.storageArithmeticOverflow
+                }
+                guard actualControlBytes == expectedControlBytes else {
+                    throw KVFrontierEvidenceError.invalidControlStorage
+                }
             case .kvarn:
                 let expectedIterations = format.tier.hasSuffix("-i16") ? 16 : 8
                 let expectedCellID = format.tier.hasSuffix("-i16")
@@ -1349,7 +1444,9 @@ private extension KVFrontierEvidence {
                 }
             case .fp16, .affine:
                 guard candidateExecutionMode == nil, candidateCodecIterations == nil,
-                    candidateMemoryGate == nil
+                    candidateMemoryGate == nil,
+                    candidateKVTunerSchedule == nil,
+                    candidateKVTunerEvaluationCorpus == nil
                 else {
                     throw KVFrontierEvidenceError.invalidRuntimeEvidence
                 }
@@ -1396,17 +1493,39 @@ public extension KVFormatGeometryEvidence {
         try actual.validate()
         return KVStorageEvidence(
             predicted: try predictedStorage(
-                workspaceBytes: actual.workspaceBytes),
+                workspaceBytes: actual.workspaceBytes,
+                kvtunerSchedule: nil),
+            actual: actual)
+    }
+
+    /// KVTuner prediction consumes the exact ordered policy copied from the authenticated
+    /// selection. A scalar tier label cannot stand in for heterogeneous per-layer K/V widths.
+    func storageEvidence(
+        actual: KVStorageBreakdownEvidence,
+        kvtunerSchedule: KVTunerScheduleBinding
+    ) throws -> KVStorageEvidence {
+        try actual.validate()
+        return KVStorageEvidence(
+            predicted: try predictedStorage(
+                workspaceBytes: actual.workspaceBytes,
+                kvtunerSchedule: kvtunerSchedule),
             actual: actual)
     }
 }
 
 private extension KVFormatGeometryEvidence {
-    func validate() throws {
-        _ = try predictedStorage(workspaceBytes: 0)
+    func validate(
+        kvtunerSchedule: KVTunerScheduleBinding?
+    ) throws {
+        _ = try predictedStorage(
+            workspaceBytes: 0,
+            kvtunerSchedule: kvtunerSchedule)
     }
 
-    func predictedStorage(workspaceBytes: Int) throws -> KVStorageBreakdownEvidence {
+    func predictedStorage(
+        workspaceBytes: Int,
+        kvtunerSchedule: KVTunerScheduleBinding?
+    ) throws -> KVStorageBreakdownEvidence {
         guard KLPayload.isIdentifier(tier), workspaceBytes >= 0,
             layerCount > 0, kvHeadCount > 0, headDimension > 0,
             capacityTokens > 0, sinkTokens >= 0, sinkTokens <= capacityTokens,
@@ -1418,12 +1537,18 @@ private extension KVFormatGeometryEvidence {
         let format: KVStorageFormat
         switch kind {
         case .fp16:
+            guard kvtunerSchedule == nil else {
+                throw KVFrontierEvidenceError.invalidGeometry
+            }
             expectedTier = "fp16"
             guard keyBits == 16, valueBits == 16, groupSize == 1,
                 sinkTokens == 0, metadataScalarBytes == 0, recordAlignment == 1
             else { throw KVFrontierEvidenceError.invalidGeometry }
             format = .fp16
         case .affine:
+            guard kvtunerSchedule == nil else {
+                throw KVFrontierEvidenceError.invalidGeometry
+            }
             expectedTier = "affine-k\(keyBits)v\(valueBits)-g\(groupSize)"
             guard sinkTokens == 0, recordAlignment == 1 else {
                 throw KVFrontierEvidenceError.invalidGeometry
@@ -1431,7 +1556,58 @@ private extension KVFormatGeometryEvidence {
             format = .affine(
                 keyBits: keyBits, valueBits: valueBits, groupSize: groupSize,
                 metadataScalarBytes: metadataScalarBytes)
+        case .kvtuner:
+            guard let schedule = kvtunerSchedule,
+                tier == schedule.cellID,
+                keyBits == 0, valueBits == 0,
+                groupSize == schedule.groupSize,
+                sinkTokens == 0,
+                layerCount == schedule.layers.count,
+                metadataScalarBytes > 0,
+                recordAlignment == 1
+            else { throw KVFrontierEvidenceError.invalidGeometry }
+            do {
+                let allocation = try KVStorageFormat.kvtunerAllocation(
+                    layerPolicy: schedule.layers.map {
+                        KVLayerPrecision(
+                            layer: $0.layer,
+                            keyBits: $0.keyBits,
+                            valueBits: $0.valueBits)
+                    },
+                    groupSize: schedule.groupSize,
+                    geometry: KVStorageGeometry(
+                        layerCount: layerCount,
+                        kvHeadCount: kvHeadCount,
+                        headDimension: headDimension),
+                    capacityTokens: capacityTokens,
+                    sequences: sequences,
+                    metadataScalarBytes: metadataScalarBytes,
+                    maximumLayerWorkspaceBytes: workspaceBytes)
+                let (evidenceTotalBytes, underflow) = allocation.totalBytes
+                    .subtractingReportingOverflow(
+                        allocation.controlBytes)
+                guard !underflow else {
+                    throw KVFrontierEvidenceError.storageArithmeticOverflow
+                }
+                return KVStorageBreakdownEvidence(
+                    payloadBytes: allocation.payloadBytes,
+                    metadataBytes: allocation.metadataBytes,
+                    alignmentPaddingBytes: 0,
+                    fp16SinkBytes: 0,
+                    fp16TailBytes: 0,
+                    workspaceBytes: allocation.workspaceBytes,
+                    totalBytes: evidenceTotalBytes)
+            } catch KVStorageFormatError.arithmeticOverflow {
+                throw KVFrontierEvidenceError.storageArithmeticOverflow
+            } catch let error as KVFrontierEvidenceError {
+                throw error
+            } catch {
+                throw KVFrontierEvidenceError.invalidGeometry
+            }
         case .kvarn:
+            guard kvtunerSchedule == nil else {
+                throw KVFrontierEvidenceError.invalidGeometry
+            }
             expectedTier = "kvarn-k\(keyBits)v\(valueBits)-g\(groupSize)"
             guard keyBits == 4, valueBits == 2, groupSize == 128,
                 sinkTokens == 128, metadataScalarBytes == 2,
@@ -1530,6 +1706,19 @@ public extension ResultRecord where Payload == KLPayload {
         guard Self.isEvidenceValue(provenance.corpusId),
             Self.isEvidenceValue(provenance.corpusContentHash)
         else { throw KVFrontierEvidenceError.invalidPromotionProvenance("corpus") }
+        if let schedule = frontier.candidateKVTunerSchedule {
+            guard let corpusID = provenance.corpusId,
+                let corpusDigest = provenance.corpusContentHash,
+                let evaluation =
+                    frontier.candidateKVTunerEvaluationCorpus,
+                schedule.evaluationCorpora == [evaluation],
+                evaluation.id == corpusID,
+                evaluation.aggregateDigest == corpusDigest
+            else {
+                throw KVFrontierEvidenceError
+                    .kvtunerEvaluationProvenanceMismatch
+            }
+        }
         if let memoryGate = payload.frontier?.candidateMemoryGate {
             guard memoryGate.harnessGitSHA == provenance.harnessGitSHA,
                 memoryGate.mlxSwiftVersion == provenance.mlxSwiftVersion,

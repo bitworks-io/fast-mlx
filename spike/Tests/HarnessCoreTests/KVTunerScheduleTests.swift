@@ -206,6 +206,40 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertThrowsError(try validate(invalid))
     }
 
+    func testCalibrationAndEvaluationEntryDigestsPinFNV1a64TextIdentity() {
+        let reusedPrompt = "the exact prompt must not cross calibration"
+        let evaluationFNV = fnv1a64(reusedPrompt.utf8)
+        let calibrationSHA = sha256Hex(Data(reusedPrompt.utf8))
+
+        var ambiguousCalibration = validSchedule()
+        ambiguousCalibration.calibrationEntryHashes = [calibrationSHA]
+        XCTAssertThrowsError(try validate(ambiguousCalibration)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .invalidDigest(calibrationSHA))
+        }
+
+        XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
+            id: "renamed-evaluation",
+            hash: "4444444444444444",
+            entryHashes: [calibrationSHA])) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .invalidDigest(calibrationSHA))
+            }
+
+        var pinnedCalibration = validSchedule()
+        pinnedCalibration.calibrationEntryHashes = [evaluationFNV]
+        XCTAssertThrowsError(try pinnedCalibration.validateEvaluationCorpus(
+            id: "renamed-evaluation",
+            hash: "4444444444444444",
+            entryHashes: [evaluationFNV])) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .evaluationCorpusLeaksCalibration)
+            }
+    }
+
     func testGroupSizeMustBeOneOfTheDeclaredScheduleGeometries() {
         for groupSize in [0, 32, 256] {
             var invalid = validSchedule()

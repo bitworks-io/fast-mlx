@@ -169,6 +169,14 @@ public struct TaskCoherenceCorpus: Codable, Equatable, Sendable {
         try container.encode(contentHash, forKey: .contentHash)
     }
 
+    /// Exact corpus identity presented to the KVTuner calibration-leakage gate. The shared factory
+    /// canonicalizes prompt digests that match the per-case hashes preserved in task evidence.
+    public var kvtunerEvaluationCorpusIdentity:
+        KVTunerEvaluationCorpusIdentity
+    {
+        KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(self)
+    }
+
     private static func isValid(_ item: TaskCoherenceItem) -> Bool {
         guard !item.id.isEmpty,
             !item.prefix.isEmpty,
@@ -513,19 +521,24 @@ public struct TaskCoherenceRunIdentity: Codable, Equatable, Sendable {
     public let modelConfigHash: String
     public let modelCheckpointManifestHash: String
     public let kvQuantTier: String
+    /// Exact authenticated heterogeneous policy. Uniform fp16/affine/KVarN runs must leave this
+    /// nil; a KVTuner tier is not a runnable identity without it.
+    public let kvtunerSchedule: KVTunerScheduleBinding?
 
     public init(
         corpusID: String,
         corpusContentHash: String,
         modelConfigHash: String,
         modelCheckpointManifestHash: String,
-        kvQuantTier: String
+        kvQuantTier: String,
+        kvtunerSchedule: KVTunerScheduleBinding? = nil
     ) {
         self.corpusID = corpusID
         self.corpusContentHash = corpusContentHash
         self.modelConfigHash = modelConfigHash
         self.modelCheckpointManifestHash = modelCheckpointManifestHash
         self.kvQuantTier = kvQuantTier
+        self.kvtunerSchedule = kvtunerSchedule
     }
 }
 
@@ -578,8 +591,8 @@ public struct TaskCoherenceAssessment: Codable, Equatable, Sendable {
         reference: TaskCoherenceScoredRun,
         corpus: TaskCoherenceCorpus
     ) throws -> TaskCoherenceAssessment {
-        try validateIdentity(candidate.identity)
-        try validateIdentity(reference.identity)
+        try validateIdentity(candidate.identity, corpus: corpus)
+        try validateIdentity(reference.identity, corpus: corpus)
         guard reference.identity.kvQuantTier == "fp16" else {
             throw TaskCoherenceError.referenceMustBeFP16
         }
@@ -678,7 +691,8 @@ public struct TaskCoherenceAssessment: Codable, Equatable, Sendable {
     }
 
     private static func validateIdentity(
-        _ identity: TaskCoherenceRunIdentity
+        _ identity: TaskCoherenceRunIdentity,
+        corpus: TaskCoherenceCorpus
     ) throws {
         guard !identity.corpusID.isEmpty,
             !identity.corpusContentHash.isEmpty,
@@ -686,6 +700,19 @@ public struct TaskCoherenceAssessment: Codable, Equatable, Sendable {
             !identity.modelCheckpointManifestHash.isEmpty,
             !identity.kvQuantTier.isEmpty
         else { throw TaskCoherenceError.invalidRunIdentity }
+
+        if identity.kvQuantTier.hasPrefix("kvtuner-") {
+            guard let schedule = identity.kvtunerSchedule,
+                schedule.cellID == identity.kvQuantTier,
+                schedule.modelConfigHash == identity.modelConfigHash,
+                schedule.checkpointManifestHash
+                    == identity.modelCheckpointManifestHash,
+                schedule.evaluationCorpora.contains(
+                    corpus.kvtunerEvaluationCorpusIdentity)
+            else { throw TaskCoherenceError.invalidRunIdentity }
+        } else if identity.kvtunerSchedule != nil {
+            throw TaskCoherenceError.invalidRunIdentity
+        }
     }
 
     private static func validateScores(

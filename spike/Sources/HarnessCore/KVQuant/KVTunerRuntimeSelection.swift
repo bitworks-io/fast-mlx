@@ -8,9 +8,27 @@ public enum KVTunerRuntimeSelectionError: Error, Equatable, Sendable {
     case unexpectedValidationFailure
 }
 
+/// Schema-2 KVTuner schedules pin prompt fingerprints to FNV-1a-64 over the exact UTF-8 text.
+/// Accepting an unlabelled second digest width would let identical calibration/evaluation text
+/// appear disjoint merely because one side used SHA-256 and the other used FNV.
+public enum KVTunerPromptDigest: Sendable {
+    public static let algorithm = "fnv1a64-utf8-v1"
+
+    public static func exactText(_ value: String) -> String {
+        fnv1a64(value.utf8)
+    }
+
+    public static func isCanonical(_ value: String) -> Bool {
+        guard value.count == 16 else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdef").contains($0)
+        }
+    }
+}
+
 /// Stable evaluation identity supplied at the same trust boundary as the schedule artifact.
 /// Validation remains centralized in `KVTunerSchedule.validateEvaluationCorpus`.
-public struct KVTunerEvaluationCorpusIdentity: Hashable, Sendable {
+public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
     public let id: String
     public let aggregateDigest: String
     public let canonicalEntryDigests: [String]
@@ -24,11 +42,39 @@ public struct KVTunerEvaluationCorpusIdentity: Hashable, Sendable {
         self.aggregateDigest = aggregateDigest
         self.canonicalEntryDigests = canonicalEntryDigests
     }
+
+    /// Stable leakage identity for the exact strings supplied to measurement tokenization.
+    /// Entry IDs are deliberately excluded: renaming a reused prompt cannot hide overlap with
+    /// the schedule's calibration corpus.
+    public static func measurementCorpus(
+        _ corpus: MeasurementCorpus
+    ) -> KVTunerEvaluationCorpusIdentity {
+        KVTunerEvaluationCorpusIdentity(
+            id: corpus.corpusId,
+            aggregateDigest: corpus.contentHash,
+            canonicalEntryDigests: corpus.entries
+                .map { KVTunerPromptDigest.exactText($0.text) }
+                .sorted())
+    }
+
+    /// Stable leakage identity for the fully expanded task prompts actually passed to the model.
+    /// Item and corpus renames may change the aggregate identity, but cannot change these exact
+    /// prompt fingerprints.
+    public static func taskCoherenceCorpus(
+        _ corpus: TaskCoherenceCorpus
+    ) -> KVTunerEvaluationCorpusIdentity {
+        KVTunerEvaluationCorpusIdentity(
+            id: corpus.id,
+            aggregateDigest: corpus.contentHash,
+            canonicalEntryDigests: corpus.items
+                .map { KVTunerPromptDigest.exactText($0.prompt) }
+                .sorted())
+    }
 }
 
 /// Runtime-only copy of one validated layer decision. Unlike `KVLayerPrecision`, these fields
 /// cannot be changed after the authenticated selection is constructed.
-public struct KVTunerRuntimeLayerPolicy: Hashable, Sendable {
+public struct KVTunerRuntimeLayerPolicy: Codable, Hashable, Sendable {
     public let layer: Int
     public let keyBits: Int
     public let valueBits: Int
@@ -52,6 +98,10 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
     public let modelConfigHash: String
     public let checkpointManifestHash: String
     public let groupSize: Int
+    public let promptDigestAlgorithm: String
+    public let calibrationCorpusID: String
+    public let calibrationCorpusHash: String
+    public let calibrationEntryDigests: [String]
     public let evaluationCorpora: [KVTunerEvaluationCorpusIdentity]
     public let layers: [KVTunerRuntimeLayerPolicy]
 
@@ -67,6 +117,10 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
         modelConfigHash = schedule.modelConfigHash
         checkpointManifestHash = schedule.checkpointManifestHash
         groupSize = schedule.groupSize
+        promptDigestAlgorithm = KVTunerPromptDigest.algorithm
+        calibrationCorpusID = schedule.calibrationCorpusID
+        calibrationCorpusHash = schedule.calibrationCorpusHash
+        calibrationEntryDigests = schedule.calibrationEntryHashes
         self.evaluationCorpora = evaluationCorpora
         layers = schedule.layers.map {
             KVTunerRuntimeLayerPolicy(

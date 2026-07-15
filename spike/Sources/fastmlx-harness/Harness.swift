@@ -718,7 +718,7 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <JSON>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -741,9 +741,55 @@ func runKL(_ flags: Flags) async {
         // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
         let kvQuantTier = try requestedKVQuantTier(flags)
         let requestedKVQuantTier = kvQuantTier ?? "fp16"
-        guard let requestedCacheKind = KVCacheKind(kvQuant: kvQuantTier) else {
-            print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
-            exit(2)
+        let kvtunerSchedulePath = try flags.strictString(
+            "kvtuner-schedule", default: "")
+        try validateKVTunerScheduleFlag(
+            tier: requestedKVQuantTier,
+            cellID: cellID,
+            schedulePath: kvtunerSchedulePath)
+        if !kvtunerSchedulePath.isEmpty,
+            outputPathsReferToSameFile(
+                kvtunerSchedulePath, evidencePath(flags))
+        {
+            throw KVTunerCLIError.outputPathCollision(
+                kvtunerSchedulePath)
+        }
+        let staticCacheKind: KVCacheKind?
+        if isKVTunerTier(requestedKVQuantTier) {
+            staticCacheKind = nil
+        } else {
+            guard let parsed = KVCacheKind(kvQuant: kvQuantTier) else {
+                print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
+                exit(2)
+            }
+            staticCacheKind = parsed
+        }
+        let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
+        let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+            at: referenceModelPath)
+        let sameWeights = ProvenanceCLI.sameResolvedModelPath(
+            modelPath, referenceModelPath) && candidateIdentity == referenceIdentity
+        let corpus = try loadMeasurementCorpus(flags)
+        let preparedKVTuner: PreparedKVTunerRun?
+        if isKVTunerTier(requestedKVQuantTier) {
+            preparedKVTuner = try prepareKVTunerRun(
+                schedulePath: kvtunerSchedulePath,
+                modelPath: modelPath,
+                matrixID: matrixID,
+                cellID: cellID,
+                modelIdentity: candidateIdentity,
+                evaluationCorpus:
+                    KVTunerEvaluationCorpusIdentity.measurementCorpus(corpus))
+        } else {
+            preparedKVTuner = nil
+        }
+        let requestedCacheKind: KVCacheKind
+        if let selection = preparedKVTuner?.selection {
+            requestedCacheKind = .kvtuner(selection)
+        } else if let staticCacheKind {
+            requestedCacheKind = staticCacheKind
+        } else {
+            throw KVTunerCLIError.missingSchedule
         }
         let requestedKVarNMemoryGate: KVarNMemoryGateEvidence?
         switch requestedCacheKind {
@@ -766,12 +812,6 @@ func runKL(_ flags: Flags) async {
             }
             requestedKVarNMemoryGate = nil
         }
-        let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
-        let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
-            at: referenceModelPath)
-        let sameWeights = ProvenanceCLI.sameResolvedModelPath(
-            modelPath, referenceModelPath) && candidateIdentity == referenceIdentity
-        let corpus = try loadMeasurementCorpus(flags)
         let shortEntries = corpus.entries(tagged: .prose) + corpus.entries(tagged: .code)
         let longEntries = corpus.entries(tagged: .longContext)
         guard !shortEntries.isEmpty, !longEntries.isEmpty,
@@ -782,7 +822,11 @@ func runKL(_ flags: Flags) async {
         guard reference.modelPath == referenceModelPath else {
             throw KVFrontierEvidenceError.invalidPromotionProvenance("referenceModelPath")
         }
-        let config = RunConfig(temperature: 0, maxTokens: positions, kvQuant: kvQuantTier)
+        let config = RunConfig(
+            temperature: 0,
+            maxTokens: positions,
+            kvQuant: kvQuantTier,
+            kvtunerSelection: preparedKVTuner?.selection)
         let referenceConfig = RunConfig.greedy(maxTokens: positions)
 
         print("candidate: Swift engine on \(modelPath) (kv_quant_tier=\(kvQuantTier ?? "fp16"))")
@@ -933,6 +977,7 @@ func runKL(_ flags: Flags) async {
         let candidateExecutionMode: String?
         let candidateCodecIterations: Int?
         let candidateMemoryGate: KVarNMemoryGateEvidence?
+        let candidateKVTunerSchedule: KVTunerScheduleBinding?
         switch requestedCacheKind {
         case .affine(let tier):
             guard let telemetry = await driver.affineScoringTelemetry() else {
@@ -973,6 +1018,7 @@ func runKL(_ flags: Flags) async {
             candidateExecutionMode = nil
             candidateCodecIterations = nil
             candidateMemoryGate = nil
+            candidateKVTunerSchedule = nil
             print(
                 "# affine storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), control=\(telemetry.controlBytes), "
@@ -981,9 +1027,82 @@ func runKL(_ flags: Flags) async {
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
-        case .kvtuner:
-            throw SwiftEngineDriverError.unsupportedConfig(
-                "KVTuner KL evidence requires a schedule-bound CLI selection")
+        case .kvtuner(let selection):
+            guard let binding = preparedKVTuner?.binding,
+                binding.sameSchedule(
+                    as: KVTunerScheduleBinding(selection: selection)),
+                let telemetry = await driver.kvtunerScoringTelemetry(
+                    for: selection)
+            else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVTuner KL run completed without its authenticated schedule telemetry")
+            }
+            guard telemetry.artifactSHA256 == selection.artifactSHA256,
+                telemetry.matrixID == selection.matrixID,
+                telemetry.cellID == selection.cellID,
+                telemetry.groupSize == selection.groupSize,
+                telemetry.layers == selection.layers,
+                telemetry.layerCount == selection.layers.count
+            else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVTuner telemetry does not match its authenticated schedule")
+            }
+            let format = KVFormatGeometryEvidence(
+                kind: .kvtuner,
+                tier: selection.cellID,
+                keyBits: 0,
+                valueBits: 0,
+                groupSize: selection.groupSize,
+                sinkTokens: 0,
+                layerCount: telemetry.layerCount,
+                kvHeadCount: telemetry.kvHeadCount,
+                headDimension: telemetry.headDimension,
+                capacityTokens: telemetry.capacityTokens,
+                sequences: telemetry.sequences,
+                metadataScalarBytes: telemetry.metadataScalarBytes,
+                recordAlignment: 1)
+            let evidenceTerms = [
+                telemetry.payloadBytes,
+                telemetry.metadataBytes,
+                telemetry.materializationWorkspaceBytes,
+            ]
+            let evidenceTotalBytes = try evidenceTerms.reduce(0) {
+                partial, value in
+                let (sum, overflow) = partial.addingReportingOverflow(value)
+                guard !overflow else {
+                    throw KVFrontierEvidenceError.storageArithmeticOverflow
+                }
+                return sum
+            }
+            let actual = KVStorageBreakdownEvidence(
+                payloadBytes: telemetry.payloadBytes,
+                metadataBytes: telemetry.metadataBytes,
+                alignmentPaddingBytes: 0,
+                fp16SinkBytes: 0,
+                fp16TailBytes: 0,
+                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                totalBytes: evidenceTotalBytes)
+            candidateFormat = format
+            storage = try format.storageEvidence(
+                actual: actual,
+                kvtunerSchedule: binding)
+            actualControlBytes = telemetry.controlBytes
+            candidateExecutionMode = nil
+            candidateCodecIterations = nil
+            candidateMemoryGate = nil
+            candidateKVTunerSchedule = binding
+            print(
+                "# KVTuner storage: schedule_sha256=\(binding.artifactSHA256), "
+                    + "payload=\(telemetry.payloadBytes), "
+                    + "metadata=\(telemetry.metadataBytes), "
+                    + "control=\(telemetry.controlBytes), "
+                    + "persistent_total=\(telemetry.totalPersistentBytes), "
+                    + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "evidence_total=\(evidenceTotalBytes), "
+                    + "capacity=\(telemetry.capacityTokens), "
+                    + "layers=\(telemetry.layerCount), "
+                    + "kv_heads=\(telemetry.kvHeadCount), "
+                    + "head_dim=\(telemetry.headDimension)")
         case .kvarn(let cell):
             guard let telemetry = await driver.kvarnScoringTelemetry(
                 for: cell)
@@ -1044,6 +1163,7 @@ func runKL(_ flags: Flags) async {
             candidateExecutionMode = telemetry.executionMode.rawValue
             candidateCodecIterations = telemetry.iterations
             candidateMemoryGate = requestedKVarNMemoryGate
+            candidateKVTunerSchedule = nil
             print(
                 "# KVarN storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), "
@@ -1070,6 +1190,7 @@ func runKL(_ flags: Flags) async {
             candidateExecutionMode = nil
             candidateCodecIterations = nil
             candidateMemoryGate = nil
+            candidateKVTunerSchedule = nil
         }
 
         let frontier = KVFrontierEvidence(
@@ -1084,7 +1205,8 @@ func runKL(_ flags: Flags) async {
             actualControlBytes: actualControlBytes,
             candidateExecutionMode: candidateExecutionMode,
             candidateCodecIterations: candidateCodecIterations,
-            candidateMemoryGate: candidateMemoryGate)
+            candidateMemoryGate: candidateMemoryGate,
+            candidateKVTunerSchedule: candidateKVTunerSchedule)
         let payload = KLPayload(
             kvQuantTier: requestedKVQuantTier,
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
@@ -1106,6 +1228,12 @@ func runKL(_ flags: Flags) async {
         let record = ResultRecord(
             subcommand: "kl", provenance: provenance, payload: payload)
         let outputPath = evidencePath(flags)
+        if !kvtunerSchedulePath.isEmpty,
+            outputPathsReferToSameFile(kvtunerSchedulePath, outputPath)
+        {
+            throw KVTunerCLIError.outputPathCollision(
+                kvtunerSchedulePath)
+        }
         try RequiredKLEvidenceWriter.append(
             record, to: URL(fileURLWithPath: outputPath),
             promotion: promotionEvidence)
@@ -1222,10 +1350,12 @@ struct Harness {
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
+                 [--kvtuner-schedule <JSON>] required exactly for kvtuner-* cells
                  [--promotion-evidence false] require full storage + clean-SHA coherence gate
           task-coherence --model <PATH>       frozen 80-case secondary coherence/task gate
                  --matrix-id <ID> --cell-id <ID> --evidence <NEW-OR-EMPTY-FILE>
-                 [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN runtime tier
+                 [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN/KVTuner runtime tier
+                 [--kvtuner-schedule <JSON>] required exactly for kvtuner-* cells
                  [--reference-task-evidence <FP16-JSONL>]
                                                required for every lossy candidate; forbidden for fp16
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]
