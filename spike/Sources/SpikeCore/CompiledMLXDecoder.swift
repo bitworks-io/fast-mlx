@@ -26,6 +26,7 @@ public struct CompiledMLXDecoder: Decoder {
     /// `MLX.compile`: `false` runs the same step closure uncompiled (correctness path;
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
     private let compileStepEnabled: Bool
+    public let executionMode: KVCacheExecutionMode
     private let chunk = 256
     /// Decode headroom preallocated beyond the prompt (rounded up to `chunk`).
     private let reserve: Int
@@ -45,10 +46,12 @@ public struct CompiledMLXDecoder: Decoder {
         model: any LanguageModel, reserve: Int = 384,
         kvCache: KVCacheKind = .fp16, compileStep: Bool = true
     ) {
+        let executionMode = kvCache.executionMode(requestingCompilation: compileStep)
         self.model = model
         self.reserve = reserve
         self.kvCacheKind = kvCache
-        self.compileStepEnabled = compileStep
+        self.compileStepEnabled = executionMode == .compiled
+        self.executionMode = executionMode
     }
 
     public mutating func prefill(_ promptTokens: [Int]) -> Int {
@@ -136,6 +139,9 @@ public struct CompiledMLXDecoder: Decoder {
     public mutating func generateSpec(
         prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
     ) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats) {
+        precondition(
+            kvCacheKind.supportsSpecDecode,
+            "speculative decoding is not qualified for the selected KV-cache tier")
         var stats = SpecDecodeStats()
         let submitTime = Date().timeIntervalSinceReferenceDate
         guard maxTokens > 0 else { return ([], submitTime, [], stats) }

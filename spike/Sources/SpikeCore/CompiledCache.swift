@@ -20,6 +20,12 @@ public protocol CompiledCache: AnyObject, KVCache, Updatable {
 extension CompiledKVCache: CompiledCache {}
 extension TurboQuantKVCache: CompiledCache {}
 extension AffineKVCache: CompiledCache {}
+extension KVarNKVCache: CompiledCache {}
+
+public enum KVCacheExecutionMode: String, Equatable, Sendable {
+    case compiled
+    case uncompiledCorrectness = "uncompiled-correctness"
+}
 
 /// Which KV-cache implementation a decode/scoring path runs with — selected from the
 /// harness's `RunConfig.kvQuant` tier string.
@@ -27,6 +33,7 @@ public enum KVCacheKind: Sendable, Hashable {
     case fp16
     case affine(AffineKVTier)
     case turboQuant(TurboQuantTier)
+    case kvarn(KVarNKVTier)
 
     /// Maps a `RunConfig.kvQuant` string. `nil`/`"fp16"` → `.fp16`; affine cells accept
     /// only `AffineKVTier`'s canonical raw values, while TurboQuant accepts both the harness
@@ -39,6 +46,10 @@ public enum KVCacheKind: Sendable, Hashable {
         case let s?:
             if let tier = AffineKVTier(rawValue: s) {
                 self = .affine(tier)
+                return
+            }
+            if let tier = KVarNKVTier(rawValue: s) {
+                self = .kvarn(tier)
                 return
             }
             guard
@@ -61,6 +72,35 @@ public enum KVCacheKind: Sendable, Hashable {
             AffineKVCache(capacity: capacity, configuration: tier.configuration)
         case .turboQuant(let tier):
             TurboQuantKVCache(capacity: capacity, tier: tier)
+        case .kvarn(let tier):
+            KVarNKVCache(
+                capacity: capacity, tier: tier,
+                iterations: tier.matrixIterationCount)
+        }
+    }
+
+    /// Resolve the actual step mode once, before the decoder builds its closure. KVarN's host
+    /// tile-boundary mutation is not compile-capturable, so a caller cannot accidentally turn it
+    /// into a stale compiled trace by requesting compilation.
+    public func executionMode(requestingCompilation: Bool) -> KVCacheExecutionMode {
+        guard requestingCompilation else { return .uncompiledCorrectness }
+        switch self {
+        case .kvarn:
+            return .uncompiledCorrectness
+        case .fp16, .affine, .turboQuant:
+            return .compiled
+        }
+    }
+
+    /// Speculation is qualified independently from a cache's standalone decode path. Until a
+    /// lossy cache proves byte-identical temp-0 A/B behavior (including rollback), the engine
+    /// rejects the combination at its own API boundary instead of relying on CLI validation.
+    public var supportsSpecDecode: Bool {
+        switch self {
+        case .fp16:
+            return true
+        case .affine, .turboQuant, .kvarn:
+            return false
         }
     }
 }

@@ -188,7 +188,7 @@ actor HarnessEngineActor {
         switch kind {
         case .fp16:
             return model.newCache(parameters: nil)
-        case .affine, .turboQuant:
+        case .affine, .turboQuant, .kvarn:
             let layerCount = model.newCache(parameters: nil).count
             return (0 ..< layerCount).map { _ in kind.makeCache(capacity: max(capacity, 1)) }
         }
@@ -221,6 +221,10 @@ actor HarnessEngineActor {
         case .turboQuant:
             guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
                 preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+            }
+        case .kvarn:
+            guard let kvarn = cache.first as? KVarNKVCache, kvarn.offset >= minTokens else {
+                preconditionFailure("KVarN tier requested but the KVarN scoring cache did not engage")
             }
         }
     }

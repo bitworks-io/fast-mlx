@@ -14,10 +14,12 @@ let knownGoodPrompt = "The capital of France is"
 let benchPrompt = "Explain how continuous batching improves LLM serving throughput."
 let knownKVQuantTiers = (
     ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
+        + KVarNKVTier.allCases.map(\.rawValue)
         + TurboQuantTier.allCases.flatMap { [$0.harnessSlot, $0.rawValue] }
 ).joined(separator: ", ")
 let kvQuantUsageTiers = (
     ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
+        + KVarNKVTier.allCases.map(\.rawValue)
         + TurboQuantTier.allCases.map(\.harnessSlot)
 ).joined(separator: "|")
 
@@ -249,6 +251,8 @@ func runVerify(_ flags: Flags) async {
                 marker = "affine_tokens"
             case .turboQuant:
                 marker = "turboquant_tokens"
+            case .kvarn:
+                marker = "kvarn_tokens"
             }
             let cachedTokens = candidate.engagement.counts[marker] ?? 0
             let cacheEngaged = EngagementCheck(
@@ -327,6 +331,8 @@ func runVerify(_ flags: Flags) async {
                 affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
             case .turboQuant:
                 turboquantTokens = cachedTokens
+            case .kvarn:
+                break
             }
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
             print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
@@ -828,7 +834,7 @@ func runKL(_ flags: Flags) async {
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
-        case .fp16, .turboQuant:
+        case .fp16, .turboQuant, .kvarn:
             // These rows remain exploratory until their formats expose the same complete
             // runtime allocation contract. Promotion continues to fail closed below.
             candidateFormat = nil
