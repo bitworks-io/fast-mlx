@@ -663,6 +663,8 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.iterations, 8)
         XCTAssertEqual(telemetry.executionMode, .uncompiledCorrectness)
         XCTAssertEqual(telemetry.cachedTokens, 1)
+        XCTAssertEqual(telemetry.completedTileCount, 0)
+        XCTAssertEqual(telemetry.compressedTokens, 0)
         XCTAssertEqual(telemetry.layerCount, 2)
         XCTAssertEqual(telemetry.capacityTokens, 257)
         XCTAssertEqual(telemetry.packedTileSlots, 2)
@@ -679,6 +681,22 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.formatPersistentBytes, 317_440)
         XCTAssertEqual(telemetry.totalPersistentBytes, 317_448)
         XCTAssertEqual(telemetry.storageAndMaterializationBytes, 449_024)
+
+        for cache in caches {
+            _ = cache.update(
+                keys: MLXArray.zeros([1, 1, 255, 128], dtype: .float16),
+                values: MLXArray.zeros([1, 1, 255, 128], dtype: .float16))
+        }
+        let boundaryTelemetry = KVarNKVCacheTelemetry.capture(caches: caches)
+        XCTAssertEqual(boundaryTelemetry.cachedTokens, 256)
+        XCTAssertEqual(boundaryTelemetry.completedTileCount, 1)
+        XCTAssertEqual(boundaryTelemetry.compressedTokens, 128)
+
+        for cache in caches { cache.resetInPlace() }
+        let resetTelemetry = KVarNKVCacheTelemetry.capture(caches: caches)
+        XCTAssertEqual(resetTelemetry.cachedTokens, 0)
+        XCTAssertEqual(resetTelemetry.completedTileCount, 0)
+        XCTAssertEqual(resetTelemetry.compressedTokens, 0)
     }
 
     func testDecoderExportsOnlyScalarTelemetryForSelectedKVarNRuntimeCell() throws {
@@ -693,6 +711,8 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.iterations, 16)
         XCTAssertEqual(telemetry.executionMode, .uncompiledCorrectness)
         XCTAssertEqual(telemetry.cachedTokens, 3)
+        XCTAssertEqual(telemetry.completedTileCount, 0)
+        XCTAssertEqual(telemetry.compressedTokens, 0)
         XCTAssertEqual(telemetry.layerCount, 1)
         XCTAssertEqual(telemetry.capacityTokens, 256)
         XCTAssertEqual(telemetry.kvHeadCount, 1)

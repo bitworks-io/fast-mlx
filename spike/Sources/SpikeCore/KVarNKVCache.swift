@@ -454,6 +454,10 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
     public let iterations: Int
     public let executionMode: KVCacheExecutionMode
     public let cachedTokens: Int
+    /// Complete post-sink tiles that have actually passed through the KVarN codec. Packed
+    /// capacity is preallocated, so allocation bytes alone are not proof of engagement.
+    public let completedTileCount: Int
+    public let compressedTokens: Int
     public let layerCount: Int
     public let capacityTokens: Int
     public let packedTileSlots: Int
@@ -503,11 +507,18 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
             },
             "KVarN layer-cache geometry is inconsistent")
         let cachedTokens = Int(caches[0].offsetArr.item(Int32.self))
+        let completedTileCount = caches[0].completedTileCount
         precondition(
             caches.dropFirst().allSatisfy {
                 Int($0.offsetArr.item(Int32.self)) == cachedTokens
+                    && $0.completedTileCount == completedTileCount
             },
-            "KVarN layer-cache offsets are inconsistent")
+            "KVarN layer-cache compression state is inconsistent")
+        let (compressedTokens, compressedTokensOverflow) = completedTileCount
+            .multipliedReportingOverflow(by: first.tier.groupSize)
+        precondition(
+            !compressedTokensOverflow,
+            "KVarN compressed-token telemetry overflow")
 
         func sum(_ values: [Int]) -> Int {
             values.reduce(into: 0) { result, value in
@@ -519,7 +530,10 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
         return KVarNKVCacheTelemetry(
             tier: first.tier, iterations: first.iterations,
             executionMode: .uncompiledCorrectness,
-            cachedTokens: cachedTokens, layerCount: caches.count,
+            cachedTokens: cachedTokens,
+            completedTileCount: completedTileCount,
+            compressedTokens: compressedTokens,
+            layerCount: caches.count,
             capacityTokens: first.capacityTokens,
             packedTileSlots: first.packedTileSlots,
             sequences: first.sequences, kvHeadCount: first.kvHeadCount,

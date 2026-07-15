@@ -323,6 +323,8 @@ struct SwiftEngineDriver: EngineDriver {
         }
         if let kvarn = out.kvarnTelemetry {
             counts["kvarn_tokens"] = kvarn.cachedTokens
+            counts["kvarn_completed_tiles"] = kvarn.completedTileCount
+            counts["kvarn_compressed_tokens"] = kvarn.compressedTokens
             counts["kvarn_payload_bytes"] = kvarn.payloadBytes
             counts["kvarn_metadata_bytes"] = kvarn.metadataBytes
             counts["kvarn_alignment_padding_bytes"] = kvarn.alignmentPaddingBytes

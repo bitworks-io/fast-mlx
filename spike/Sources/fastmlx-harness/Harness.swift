@@ -96,6 +96,8 @@ struct VerifyPayload: Codable, Sendable {
     let affineWorkspaceBytes: Int?
     /// KVarN engagement plus the exact allocation/runtime cell used by this decode.
     let kvarnTokens: Int?
+    let kvarnCompletedTileCount: Int?
+    let kvarnCompressedTokens: Int?
     let kvarnPayloadBytes: Int?
     let kvarnMetadataBytes: Int?
     let kvarnAlignmentPaddingBytes: Int?
@@ -248,7 +250,8 @@ func runVerify(_ flags: Flags) async {
         var referenceVersions: ReferenceDriver.ReferenceVersions?
         var teacherForcedTop1: Double?  // context-locked top-1 agreement rate vs fp16 KV
         var quantizedMarker: String?
-        var quantizedTokens: Int?
+        var quantizedMarkerValue: Int?
+        var quantizedMarkerFloor: Int?
         var turboquantTokens: Int?
         var affineTokens: Int?
         var affinePayloadBytes: Int?
@@ -256,6 +259,8 @@ func runVerify(_ flags: Flags) async {
         var affineControlBytes: Int?
         var affineWorkspaceBytes: Int?
         var kvarnTokens: Int?
+        var kvarnCompletedTileCount: Int?
+        var kvarnCompressedTokens: Int?
         var kvarnPayloadBytes: Int?
         var kvarnMetadataBytes: Int?
         var kvarnAlignmentPaddingBytes: Int?
@@ -282,21 +287,27 @@ func runVerify(_ flags: Flags) async {
             }
         case .lossy:
             let marker: String
+            let markerFloor: Int
             switch cacheKind {
             case .fp16:
                 throw SwiftEngineDriverError.unsupportedConfig(
                     "lossy triad selected for fp16 KV")
             case .affine:
                 marker = "affine_tokens"
+                markerFloor = promptTokens.count + 1
             case .turboQuant:
                 marker = "turboquant_tokens"
+                markerFloor = promptTokens.count + 1
             case .kvarn:
-                marker = "kvarn_tokens"
+                // KVarN preallocates packed buffers before it has compressed a tile. Gate on
+                // actual completed codec work, not cached-token count or nonzero capacity.
+                marker = "kvarn_completed_tiles"
+                markerFloor = 1
             }
-            let cachedTokens = candidate.engagement.counts[marker] ?? 0
+            let markerValue = candidate.engagement.counts[marker] ?? 0
             let cacheEngaged = EngagementCheck(
-                marker: marker, floor: promptTokens.count + 1
-            ).passed(before: 0, after: cachedTokens)
+                marker: marker, floor: markerFloor
+            ).passed(before: 0, after: markerValue)
             engaged = engaged && cacheEngaged
             // non-crash: candidate already produced >=1 token (checked below via prefix).
             // non-NaN: scan a full-vocab logprobs pass for any non-finite value — this ALSO
@@ -358,20 +369,33 @@ func runVerify(_ flags: Flags) async {
                 print("teacher-forced top-1 agreement vs fp16 KV: \(agree)/\(forced.count) (\(fmt(rate * 100, 1))%)")
             }
             quantizedMarker = marker
-            quantizedTokens = cachedTokens
+            quantizedMarkerValue = markerValue
+            quantizedMarkerFloor = markerFloor
             switch cacheKind {
             case .fp16:
                 break
             case .affine:
-                affineTokens = cachedTokens
+                affineTokens = markerValue
                 affinePayloadBytes = candidate.engagement.counts["affine_payload_bytes"]
                 affineMetadataBytes = candidate.engagement.counts["affine_metadata_bytes"]
                 affineControlBytes = candidate.engagement.counts["affine_control_bytes"]
                 affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
             case .turboQuant:
-                turboquantTokens = cachedTokens
+                turboquantTokens = markerValue
             case .kvarn(let cell):
                 guard
+                    let cachedTokens = candidate.engagement.counts[
+                        "kvarn_tokens"],
+                    let completedTiles = candidate.engagement.counts[
+                        "kvarn_completed_tiles"],
+                    let compressedTokens = candidate.engagement.counts[
+                        "kvarn_compressed_tokens"],
+                    completedTiles >= 0,
+                    compressedTokens >= 0,
+                    compressedTokens == completedTiles * cell.tier.groupSize,
+                    completedTiles == 0
+                        || cachedTokens
+                            >= cell.tier.sinkTokens + compressedTokens,
                     let payloadBytes = candidate.engagement.counts[
                         "kvarn_payload_bytes"],
                     let metadataBytes = candidate.engagement.counts[
@@ -396,6 +420,8 @@ func runVerify(_ flags: Flags) async {
                         "KVarN verify run completed without matching allocation/runtime telemetry")
                 }
                 kvarnTokens = cachedTokens
+                kvarnCompletedTileCount = completedTiles
+                kvarnCompressedTokens = compressedTokens
                 kvarnPayloadBytes = payloadBytes
                 kvarnMetadataBytes = metadataBytes
                 kvarnAlignmentPaddingBytes = alignmentPaddingBytes
@@ -415,8 +441,11 @@ func runVerify(_ flags: Flags) async {
         }
 
         print("kv_quant_tier: \(kvQuantTier ?? "fp16") (mode=\(mode.rawValue))")
-        if let marker = quantizedMarker, let cachedTokens = quantizedTokens {
-            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); \(marker) 0 -> \(cachedTokens) (floor \(promptTokens.count + 1)) -> \(engaged ? "PASS" : "FAIL")")
+        if let marker = quantizedMarker,
+            let markerValue = quantizedMarkerValue,
+            let markerFloor = quantizedMarkerFloor
+        {
+            print("engagement:  decode counter 0 -> \(decodeCount) (floor 1); \(marker) 0 -> \(markerValue) (floor \(markerFloor)) -> \(engaged ? "PASS" : "FAIL")")
         } else {
             print("engagement:  decode counter 0 -> \(decodeCount) (floor 1) -> \(engaged ? "PASS" : "FAIL")")
         }
@@ -436,6 +465,8 @@ func runVerify(_ flags: Flags) async {
             affineControlBytes: affineControlBytes,
             affineWorkspaceBytes: affineWorkspaceBytes,
             kvarnTokens: kvarnTokens,
+            kvarnCompletedTileCount: kvarnCompletedTileCount,
+            kvarnCompressedTokens: kvarnCompressedTokens,
             kvarnPayloadBytes: kvarnPayloadBytes,
             kvarnMetadataBytes: kvarnMetadataBytes,
             kvarnAlignmentPaddingBytes: kvarnAlignmentPaddingBytes,
@@ -953,10 +984,13 @@ func runKL(_ flags: Flags) async {
             }
             guard telemetry.tier == cell.tier,
                 telemetry.iterations == cell.iterations,
-                telemetry.executionMode == .uncompiledCorrectness
+                telemetry.executionMode == .uncompiledCorrectness,
+                telemetry.completedTileCount > 0,
+                telemetry.compressedTokens
+                    == telemetry.completedTileCount * cell.tier.groupSize
             else {
                 throw SwiftEngineDriverError.unsupportedConfig(
-                    "KVarN scoring telemetry does not match requested cell \(cell.rawValue)")
+                    "KVarN scoring telemetry does not prove completed compression for requested cell \(cell.rawValue)")
             }
             let format = KVFormatGeometryEvidence(
                 kind: .kvarn, tier: cell.rawValue,
@@ -1014,6 +1048,8 @@ func runKL(_ flags: Flags) async {
                     + "layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), "
                     + "head_dim=\(telemetry.headDimension), "
+                    + "completed_tiles=\(telemetry.completedTileCount), "
+                    + "compressed_tokens=\(telemetry.compressedTokens), "
                     + "iterations=\(telemetry.iterations), "
                     + "execution_mode=\(telemetry.executionMode.rawValue)")
         case .fp16, .turboQuant:
