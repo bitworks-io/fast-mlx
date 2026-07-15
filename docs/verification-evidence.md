@@ -267,3 +267,30 @@ Diff check, banned-concurrency scan, and staged gitleaks scan pass.
 **Boundary:** this closes only the Phase 0 evidence gate. It is not an affine/KVarN performance
 or capacity result. Phase 2 must reconcile native MLX array bytes—including compile-control state
 and materialization workspace—before any dial cell can become promotion-eligible.
+
+## KVarN Phase 2 affine-control acceptance pass — 2026-07-14
+
+**Story:** a bench operator can select every declared affine KV control and receive native-array,
+teacher-forced evidence whose storage and per-entry sample claims fail closed, without treating a
+small plumbing smoke as a quality verdict.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Runnable controls fail closed | **PASS** | `fp16`, K4V2/K8V2 at groups 64/128, and K4V4-g128 parse independently and report the selected geometry. Unknown or incompatible tiers fail before scoring; lossy KV plus PLD remains rejected. Qwen3-4B smokes engaged all five affine cells. |
+| Native storage is honest | **PASS** | `AffineKVCache` stores packed K/V plus native scale/bias arrays and reports payload, metadata, workspace, and control bytes from real MLX arrays. Clean `4c1bfe1` K8V2-g128 predicts and observes exactly 1,112,832,000 payload + 55,641,600 metadata + 98,918,400 workspace = 1,267,392,000 bytes, plus 144 control bytes. |
+| Cache lifecycle preserves the MLX contract | **PASS** | Xcode tests cover materialize/read, growth, reset, truncation, mask behavior, two-bit packing, compile integration, and accounting. MLX state remains actor-owned; no banned concurrency escape was introduced. Engine SHA `d4bda35dbfa78c079fa970bbb8aaf1526a0022f7` passes 56/56 `SpikeCoreTests` through Xcode; the extracted result summary records 56 passed, 0 failed, 0 skipped. |
+| Teacher-forced evidence is entry-complete | **PASS** | Each short/long aggregate is now backed by unique real corpus entry IDs and scored-position counts whose overflow-safe sums must match. Promotion requires every short entry >=24 and every long entry >=128. A clean undersampled promotion run exits 1 at the first 2/24 short entry and creates no JSONL. |
+| Current clean-SHA integration is reproducible | **PASS** | Synced clean `4c1bfe1f6947b184a6fc8834e0787bbfd4e3354a` builds Release and produces a schema-valid exploratory K8V2-g128 row across all three short and two long entries. Full pure verification passes 217 XCTest + 17 Swift Testing tests; focused re-review reports no issue. |
+
+**Artifact hashes:** current clean Release log
+`a9c56edf34592939da2f01fd7d5c7670064419f7d1e7b68b6eea9c73b49f1237`; final-engine Xcode
+result summary `ccc7795197c52ce98a035c30326388ebaba6eb363ff2beed695b904b72bc455a`;
+launch/build log `bd36cbcd25d7f67560178b128f4ead7124fea622bbb4f4dbf9444e00353931b2`; exploratory JSONL
+`ecd8760845b9e727df64731f400b04544f4943425efeeae1fd1dae3f5de38a3e`; promotion-refusal log
+`9188293d41b06d39b0a971db7c828d7d726e0d7f14de47ee1af1380bb6fa667b`; refusal status artifact
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+
+**Boundary:** this closes affine runtime/control plumbing and its evidence gate—not the KVarN
+implementation, the Qwen3-32B 24/128-position matrix, monotonicity, capacity benefit, or a dial
+verdict. The exploratory affine predicate counts (4/8, 7/8, 7/8, 7/8, and 3/8 across the five
+cells) are deliberately non-authoritative until the frozen full matrix runs.

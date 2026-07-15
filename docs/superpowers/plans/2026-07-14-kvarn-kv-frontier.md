@@ -1,6 +1,6 @@
 # KVarN / asymmetric KV-cache frontier implementation plan
 
-**Status:** active — pure reference and accounting gate first
+**Status:** active — affine control closed; KVarN MLX cache next
 
 **Technique class:** `LOSSY_FRONTIER`
 
@@ -142,14 +142,31 @@ allocator; Phase 2 must reconcile it to real MLX array bytes before any capacity
 
 ### Phase 2 — MLX affine controls and actual-byte telemetry
 
-- [ ] Add an actor-confined `AffineKVCache` conforming to `CompiledCache`, with independent K/V
+- [x] Add an actor-confined `AffineKVCache` conforming to `CompiledCache`, with independent K/V
   bits and group sizes, native packed MLX arrays, materialize-then-attend reads, chunked growth,
   reset, and truncation. No `Sendable` escape hatches.
-- [ ] Extend `KVCacheKind`, CLI parsing, scoring-cache construction, and engagement telemetry with
+- [x] Extend `KVCacheKind`, CLI parsing, scoring-cache construction, and engagement telemetry with
   fail-closed affine tier names. Keep spec-decode combinations rejected until independently measured.
-- [ ] Add actual array dtype/shape/`nbytes` telemetry and reconcile it exactly with Phase 1.
-- [ ] TDD on-box with `xcodebuild ... -skipPackagePluginValidation`; never use `swift test` for
+- [x] Add actual array dtype/shape/`nbytes` telemetry and reconcile it exactly with Phase 1.
+- [x] TDD on-box with `xcodebuild ... -skipPackagePluginValidation`; never use `swift test` for
   this MLX-importing target.
+
+Phase 2 proof (2026-07-14): commits `4464ac9`, `d4bda35`, and `4c1bfe1` add the native affine
+cache, independently selectable controls, exact array/workspace accounting, and per-corpus-entry
+teacher-forced sample evidence. The MLX-coupled suite passes 56/56 through Xcode at the final
+engine SHA; the current clean evidence SHA builds Release. The full pure suite passes 217 XCTest +
+17 Swift Testing tests. Focused review found and closed an evidence-writer path that had accepted
+detail-less exploratory rows; re-review found no remaining issue.
+
+All five declared affine controls engaged in Qwen3-4B plumbing smokes. The preliminary
+K4V2-g128, K4V2-g64, K8V2-g64, K8V2-g128, and K4V4-g128 triads passed 4/8, 7/8, 7/8, 7/8, and
+3/8 predicates respectively. These deliberately undersampled runs prove selection and evidence
+flow only; they are not monotonicity findings or dial verdicts. On clean `4c1bfe1`, K8V2-g128's
+predicted and actual allocation agree byte-for-byte: 1,112,832,000 payload + 55,641,600 metadata +
+98,918,400 workspace = 1,267,392,000 bytes, with 144 control bytes. Every one of the three short
+and two long entries carries its real ID and scored-position count. Promotion mode rejects the
+2-position-per-entry smoke, exits nonzero, and creates no JSONL; the full Qwen3-32B matrix still
+owes at least 24 positions per short entry and 128 per long entry.
 
 ### Phase 3 — KVarN correctness-first MLX cache
 
@@ -161,6 +178,12 @@ allocator; Phase 2 must reconcile it to real MLX array bytes before any capacity
   If tile-boundary mutation cannot be captured safely, use the explicit uncompiled correctness path
   and record that fact; do not weaken actor confinement or pretend it is a speed path.
 - [ ] Add frozen KVTuner per-layer cache selection only after uniform affine cells pass.
+
+The present storage frontier remains intentionally batch-1. Before any selected quantized format
+is admitted to continuous batching, add the adversarial compaction case: merge unequal rows,
+remove the longest/zero-padding boundary row, append again, then prove physical end, mask width,
+survivor bytes/logits, and dense-control parity. Upstream precedent shows that deriving the write
+end from surviving padded offsets can corrupt the cache; that is a correctness bug, never dial loss.
 
 ### Phase 4 — clean-SHA matrix on the bench Mac
 

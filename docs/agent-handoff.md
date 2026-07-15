@@ -76,7 +76,8 @@ mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the fir
    [Task](task-inbox/2026-07-12-kvarn-kv-frontier.md).
 2. **Fused compressed-domain KV attention for the selected format** — stop materializing the
    full cache before attention; prove an end-to-end 32K/128K win, not just a Metal
-   microbenchmark. [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
+   microbenchmark, and include the adversarial batch-row-removal/append poison case.
+   [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 3. **Exact prefix/session cache + request-start stack** — restore the incumbent's agent-loop
    TTFT path (hot cache, positive commit, eager warmup, template/tokenize cache; SSD later).
    Design over batching/cache ownership. [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
@@ -90,11 +91,25 @@ mlx-serve**: the base loop is at Zig parity and exact, gate-tuned PLD is the fir
    producing ordinary MLX checkpoints for the existing Swift loop.
    [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
 7. **Operability** — measured large-prefill capacity + general runtime admission control (system-aware
-   spec §7); reliability/capacity, not a decode-speed claim.
+   spec §7), plus the M5/pre-NAX [long-context Metal watchdog gate](task-inbox/2026-07-14-long-context-metal-watchdog.md);
+   reliability/capacity, not a decode-speed claim.
 8. **TurboQuant Spike B closure** — bounded outlier/asymmetry/boundary matrix, then fully
     shelve on a second loss. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 9. **Device/workload-specific research** — PrismML Ternary/Bonsai, then EpiCache/KVzip and
     XGrammar after their exact-cache/sampler prerequisites. [Intake](reference/performance-technique-intake.md).
+
+**Dependency watch (does not displace active KVarN):** the
+[MLX-Swift 0.32 kernel-uplift gate](task-inbox/2026-07-14-mlx-swift-032-kernel-uplift.md)
+tracks `qmv_wide` and related Metal changes. fast-mlx remains on official MLX-Swift 0.31.6;
+upstream kernel microbenchmarks are leads, not project speed claims, until an official compatible
+release is pinned and measured here. The often-cited RoPE-without-copy change is CUDA-only.
+
+**oMLX watch disposition (2026-07-14):** the user-supplied Reddit page is an issue digest, not a
+release note; the corresponding current stable release is
+[oMLX v0.5.1](https://github.com/jundot/omlx/releases/tag/v0.5.1). Its useful deltas are now owned
+by the kernel-uplift and long-context-watchdog gates above. It also strengthened the exact
+partial-block restore cases and the quantized batch-compaction poison case in their existing task
+seeds. None provides local evidence that should displace KVarN or promote a fast-mlx dial tier.
 
 **Blocked/deferred trained speculation:** EAGLE-3 is shelved by the dated exactness verdict;
 no compatible Qwen3-32B DSpark, DFlash, or native-MTP checkpoint was runnable. Do not compare

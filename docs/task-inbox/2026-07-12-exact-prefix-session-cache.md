@@ -34,12 +34,15 @@ Acceptance signals:
 - entry and true retained-byte budgets evict LRU state and reserve capacity up front;
 - second-turn cache-read tokens, cold/warm TTFT, template/tokenize time, and apparent/physical
   prefill rates are reported separately;
+- full-block-only SSD snapshots recompute the uncached tail exactly: cover `blockSize-1`,
+  `blockSize+1`, and several-block-plus-tail prompts, put the final system/user instruction wholly
+  in that tail, restore concurrently, and require cache-on/off temperature-zero byte identity;
 - hybrid/SSM checkpoints are explicit boundaries; arbitrary trim is not assumed.
 
 Known failure cases: shared-buffer undercounting, template/tool/config cross-contamination,
 vision embedding reuse, recurrent-state snapshots larger than reported, cache-hit benchmark
-contamination, copy/restore breaking compiled array identity, and SSD snapshots containing
-sensitive prompt state.
+contamination, copy/restore breaking compiled array identity, mistaking an intentionally
+recomputed partial block for dropped context, and SSD snapshots containing sensitive prompt state.
 
 ## Sources / local precedent
 
@@ -47,6 +50,7 @@ sensitive prompt state.
 - [Preserved incumbent changelog](../reference/mlx-serve-archive/mlx-serve-CHANGELOG.md)
 - [MLX-LM v0.31.2 cache changes](https://github.com/ml-explore/mlx-lm/releases/tag/v0.31.2)
 - [SGLang RadixAttention](https://arxiv.org/abs/2312.07104)
+- [oMLX partial-block report and exact-tail resolution](https://github.com/jundot/omlx/issues/2227)
 
 ## Next Step
 

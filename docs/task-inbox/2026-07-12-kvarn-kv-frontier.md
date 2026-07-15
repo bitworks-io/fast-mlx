@@ -38,7 +38,9 @@ Acceptance signals:
 
 Known failure cases: CUDA/Triton wins do not survive Metal; partial tiles or recent tokens
 erase capacity; key precision is too low for Qwen; normalization overhead dominates; a nominal
-bit label hides metadata; task gains fail to generalize beyond calibration prompts.
+bit label hides metadata; task gains fail to generalize beyond calibration prompts; later batch
+compaction overwrites surviving quantized KV state. That last case is a correctness failure, not
+loss that may be exposed through the dial.
 
 ## Sources
 
