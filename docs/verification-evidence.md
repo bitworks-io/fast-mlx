@@ -236,3 +236,26 @@ scanning pass.
 full weight contents. The canonical frontier is one simultaneous-burst prompt shape on one
 Apple box. Production routing, real network disconnect propagation, sampled generation,
 additional dense families, and MoE/hybrid/recurrent/vision layouts remain separate work.
+
+## Public evidence/community platform research acceptance pass — 2026-07-15
+
+**Story:** a prospective user, maintainer, or research agent can use one source-qualified review
+and one agent-ready backlog artifact to understand fast-mlx's relative standing, build a public
+proof/community loop, and avoid unsafe benchmark-publication or update mechanisms.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Review oMLX's website, benchmark, release, updater, and community loop from primary sources | **PASS** | The [dated review](reference/2026-07-15-omlx-public-ecosystem-review.md) labels material claims CONFIRMED, CONTRADICTED, INFERRED, or UNVERIFIED. Source probes confirmed automatic post-benchmark upload, the hardware-derived owner hash, updater's absent EdDSA archive check, current M5 Max/Qwen3-32B rows, and fast-mlx verdict values. All 21 external URLs returned HTTP 200. |
+| State fast-mlx's relative performance without manufacturing a winner | **PASS** | The review places the local ~28 tok/s single-request rows in the same broad band as public oMLX 4K rows at 23.9–26.3 tok/s, explicitly rejects a winner claim, identifies mismatched prompt/runtime/cache/statistical boundaries, and defines a same-machine/common-boundary comparison lane. |
+| Produce an agent-ready roadmap for site, benchmark automation, update, and engagement | **PASS** | The [task artifact](task-inbox/2026-07-15-public-evidence-community-platform.md) records the raw request, user/operator stories, 12 acceptance signals, failure/recovery paths, public evidence schema, four trust levels, P0/P1/P2 spawn packets, dependencies, ownership decisions, and next safe action. Sol review moved fleet/full-matrix automation behind a bounded first proof and added the minimal feedback loop, compatibility manifest, and reproducible agent-workload packs. |
+| Preserve privacy, supply-chain, and performance-evidence boundaries | **PASS** | Community submission is explicit opt-in with payload preview/deletion and no stable hardware ID; updater requires signed/notarized/Team-ID-checked failure-safe delivery; lossy rows retain teacher-forced/task loss plus coherence floor; dirty/incomplete/incomparable evidence fails closed; lab, reproduced competitor, community, and external rows stay visibly separate. |
+| Keep durable docs navigable, review-clean, and secret-free | **PASS** | All relative links in the four touched Markdown files resolve; `git diff --check` passes; all 21 external URLs return 200; working-tree `gitleaks dir --redact .` scans 2.26 MB with no leaks. Focused review's RAM-filter, three-engine counterbalancing, and compatibility-manifest dependency findings were corrected; Sol's five prioritization/engagement findings were incorporated; final re-review found no issues. |
+
+**Not run:** Swift/Xcode tests or a new Apple-Silicon benchmark. This is a documentation/research
+cycle and the current oMLX rows are intentionally EXTERNAL REFERENCE evidence; running unlike
+workloads would not satisfy the same-box comparison gate. The domain, host, public/commercial
+policy, privacy owner, signing authority, application target, and second-node availability remain
+explicit implementation decisions.
+
+**Overall verdict:** ALL PASS for the review and durable-roadmap acceptance criteria. Website,
+ingest, competitor runner, community upload, and updater implementation remain open work.
