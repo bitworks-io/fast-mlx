@@ -132,16 +132,144 @@ public struct KVarNMemoryProbeArtifactConfiguration:
 public struct KVarNMemoryProbeArtifactHighWater:
     Codable, Equatable, Sendable
 {
+    public let start: KVarNMemoryProbeArtifactCounters
+    public let end: KVarNMemoryProbeArtifactCounters
     public let observedPeakActiveBytes: Int
+    public let retainedActiveBytes: Int
     public let transientActiveAboveRetainedBytes: Int
+    public let incrementalPeakActiveBytes: Int
 
     public init(
+        start: KVarNMemoryProbeArtifactCounters,
+        end: KVarNMemoryProbeArtifactCounters,
         observedPeakActiveBytes: Int,
-        transientActiveAboveRetainedBytes: Int
+        retainedActiveBytes: Int,
+        transientActiveAboveRetainedBytes: Int,
+        incrementalPeakActiveBytes: Int
     ) {
+        self.start = start
+        self.end = end
         self.observedPeakActiveBytes = observedPeakActiveBytes
+        self.retainedActiveBytes = retainedActiveBytes
         self.transientActiveAboveRetainedBytes =
             transientActiveAboveRetainedBytes
+        self.incrementalPeakActiveBytes = incrementalPeakActiveBytes
+    }
+}
+
+public struct KVarNMemoryProbeArtifactCounters:
+    Codable, Equatable, Sendable
+{
+    public let activeBytes: Int
+    public let cacheBytes: Int
+    public let peakActiveBytes: Int
+
+    public init(activeBytes: Int, cacheBytes: Int, peakActiveBytes: Int) {
+        self.activeBytes = activeBytes
+        self.cacheBytes = cacheBytes
+        self.peakActiveBytes = peakActiveBytes
+    }
+}
+
+public struct KVarNMemoryProbeArtifactReconciliation:
+    Codable, Equatable, Sendable
+{
+    public let logicalBytes: Int
+    public let expectedAllocatorBytes: Int
+    public let activeBytes: Int
+    public let runtimeBaselineBytes: Int
+    public let arrayCount: Int
+    public let allocatorPageBytes: Int
+    public let maximumActiveBytes: Int
+    public let activeAboveExpectedAllocatorBytes: Int
+
+    public init(
+        logicalBytes: Int, expectedAllocatorBytes: Int,
+        activeBytes: Int, runtimeBaselineBytes: Int,
+        arrayCount: Int, allocatorPageBytes: Int,
+        maximumActiveBytes: Int,
+        activeAboveExpectedAllocatorBytes: Int
+    ) {
+        self.logicalBytes = logicalBytes
+        self.expectedAllocatorBytes = expectedAllocatorBytes
+        self.activeBytes = activeBytes
+        self.runtimeBaselineBytes = runtimeBaselineBytes
+        self.arrayCount = arrayCount
+        self.allocatorPageBytes = allocatorPageBytes
+        self.maximumActiveBytes = maximumActiveBytes
+        self.activeAboveExpectedAllocatorBytes =
+            activeAboveExpectedAllocatorBytes
+    }
+}
+
+public struct KVarNMemoryProbeArtifactRetainedAccounting:
+    Codable, Equatable, Sendable
+{
+    public let minimumLogicalBytes: Int
+    public let activeBytes: Int
+    public let arrayCount: Int
+    public let activeAboveMinimumLogicalBytes: Int
+
+    public init(
+        minimumLogicalBytes: Int, activeBytes: Int,
+        arrayCount: Int, activeAboveMinimumLogicalBytes: Int
+    ) {
+        self.minimumLogicalBytes = minimumLogicalBytes
+        self.activeBytes = activeBytes
+        self.arrayCount = arrayCount
+        self.activeAboveMinimumLogicalBytes = activeAboveMinimumLogicalBytes
+    }
+}
+
+public struct KVarNMemoryProbeArtifactStructuralMemory:
+    Codable, Equatable, Sendable
+{
+    public let completedTileCount: Int
+    public let materializedOutputArrayBytes: Int
+    public let materializedOutputArrayAllocatorBytes: Int
+    public let reconstructedTileArrayBytes: Int
+    public let reconstructedTileArrayAllocatorBytes: Int
+    public let minimumConcatIncrementBytes: Int
+    public let minimumStructuralPeakActiveBytes: Int
+    public let dualConcatReferenceIncrementBytes: Int
+    public let dualConcatReferencePeakActiveBytes: Int
+    public let observedPeakActiveBytes: Int
+    public let observedPeakAboveMinimumStructuralBytes: Int
+    public let observedPeakDeltaFromDualConcatReferenceBytes: Int
+
+    public init(
+        completedTileCount: Int,
+        materializedOutputArrayBytes: Int,
+        materializedOutputArrayAllocatorBytes: Int,
+        reconstructedTileArrayBytes: Int,
+        reconstructedTileArrayAllocatorBytes: Int,
+        minimumConcatIncrementBytes: Int,
+        minimumStructuralPeakActiveBytes: Int,
+        dualConcatReferenceIncrementBytes: Int,
+        dualConcatReferencePeakActiveBytes: Int,
+        observedPeakActiveBytes: Int,
+        observedPeakAboveMinimumStructuralBytes: Int,
+        observedPeakDeltaFromDualConcatReferenceBytes: Int
+    ) {
+        self.completedTileCount = completedTileCount
+        self.materializedOutputArrayBytes = materializedOutputArrayBytes
+        self.materializedOutputArrayAllocatorBytes =
+            materializedOutputArrayAllocatorBytes
+        self.reconstructedTileArrayBytes = reconstructedTileArrayBytes
+        self.reconstructedTileArrayAllocatorBytes =
+            reconstructedTileArrayAllocatorBytes
+        self.minimumConcatIncrementBytes = minimumConcatIncrementBytes
+        self.minimumStructuralPeakActiveBytes =
+            minimumStructuralPeakActiveBytes
+        self.dualConcatReferenceIncrementBytes =
+            dualConcatReferenceIncrementBytes
+        self.dualConcatReferencePeakActiveBytes =
+            dualConcatReferencePeakActiveBytes
+        self.observedPeakActiveBytes = observedPeakActiveBytes
+        self.observedPeakAboveMinimumStructuralBytes =
+            observedPeakAboveMinimumStructuralBytes
+        self.observedPeakDeltaFromDualConcatReferenceBytes =
+            observedPeakDeltaFromDualConcatReferenceBytes
     }
 }
 
@@ -153,9 +281,21 @@ public struct KVarNMemoryProbeArtifactRow: Codable, Equatable, Sendable {
     public let hardwareOS: String
     public let hardwareRAMBytes: UInt64
     public let configuration: KVarNMemoryProbeArtifactConfiguration
+    public let persistentLogicalBytes: Int
+    public let materializationLogicalBytes: Int
+    public let controlLogicalBytes: Int
     public let evaluatedArrayCount: Int
     public let expectedEvaluatedArrayCount: Int
     public let valuesFinite: Bool
+    public let emptyBaseline: KVarNMemoryProbeArtifactCounters
+    public let startReconciliation: KVarNMemoryProbeArtifactReconciliation
+    public let endRetainedAccounting:
+        KVarNMemoryProbeArtifactRetainedAccounting
+    public let postDetachCounters: KVarNMemoryProbeArtifactCounters
+    public let postDetachReconciliation:
+        KVarNMemoryProbeArtifactReconciliation
+    public let cacheBoundaryStructuralMemory:
+        KVarNMemoryProbeArtifactStructuralMemory?
     public let highWater: KVarNMemoryProbeArtifactHighWater
     public let status: String
 
@@ -164,8 +304,20 @@ public struct KVarNMemoryProbeArtifactRow: Codable, Equatable, Sendable {
         hardwareChip: String, hardwareOS: String,
         hardwareRAMBytes: UInt64,
         configuration: KVarNMemoryProbeArtifactConfiguration,
+        persistentLogicalBytes: Int, materializationLogicalBytes: Int,
+        controlLogicalBytes: Int,
         evaluatedArrayCount: Int, expectedEvaluatedArrayCount: Int,
-        valuesFinite: Bool, highWater: KVarNMemoryProbeArtifactHighWater,
+        valuesFinite: Bool,
+        emptyBaseline: KVarNMemoryProbeArtifactCounters,
+        startReconciliation: KVarNMemoryProbeArtifactReconciliation,
+        endRetainedAccounting:
+            KVarNMemoryProbeArtifactRetainedAccounting,
+        postDetachCounters: KVarNMemoryProbeArtifactCounters,
+        postDetachReconciliation:
+            KVarNMemoryProbeArtifactReconciliation,
+        cacheBoundaryStructuralMemory:
+            KVarNMemoryProbeArtifactStructuralMemory?,
+        highWater: KVarNMemoryProbeArtifactHighWater,
         status: String
     ) {
         self.schemaVersion = schemaVersion
@@ -175,9 +327,18 @@ public struct KVarNMemoryProbeArtifactRow: Codable, Equatable, Sendable {
         self.hardwareOS = hardwareOS
         self.hardwareRAMBytes = hardwareRAMBytes
         self.configuration = configuration
+        self.persistentLogicalBytes = persistentLogicalBytes
+        self.materializationLogicalBytes = materializationLogicalBytes
+        self.controlLogicalBytes = controlLogicalBytes
         self.evaluatedArrayCount = evaluatedArrayCount
         self.expectedEvaluatedArrayCount = expectedEvaluatedArrayCount
         self.valuesFinite = valuesFinite
+        self.emptyBaseline = emptyBaseline
+        self.startReconciliation = startReconciliation
+        self.endRetainedAccounting = endRetainedAccounting
+        self.postDetachCounters = postDetachCounters
+        self.postDetachReconciliation = postDetachReconciliation
+        self.cacheBoundaryStructuralMemory = cacheBoundaryStructuralMemory
         self.highWater = highWater
         self.status = status
     }
@@ -223,6 +384,298 @@ private struct KVarNMemoryProbeMatrixKey: Hashable {
     let phase: String
     let capacity: Int
     let run: Int
+}
+
+private extension KVarNMemoryProbeArtifactRow {
+    func hasAuthenticatedMemoryProof() -> Bool {
+        let expectedStartArrayCount: Int
+        let expectedEndArrayCount: Int
+        switch configuration.phase {
+        case "encode":
+            expectedStartArrayCount = 2
+            expectedEndArrayCount = 10
+            guard persistentLogicalBytes > 0,
+                materializationLogicalBytes == 0,
+                controlLogicalBytes == 0,
+                cacheBoundaryStructuralMemory == nil,
+                checkedSum(
+                    startReconciliation.logicalBytes,
+                    persistentLogicalBytes)
+                    == endRetainedAccounting.minimumLogicalBytes
+            else { return false }
+        case "decode":
+            expectedStartArrayCount = 8
+            expectedEndArrayCount = 10
+            guard persistentLogicalBytes > 0,
+                materializationLogicalBytes > 0,
+                controlLogicalBytes == 0,
+                cacheBoundaryStructuralMemory == nil,
+                startReconciliation.logicalBytes == persistentLogicalBytes,
+                checkedSum(
+                    persistentLogicalBytes,
+                    materializationLogicalBytes)
+                    == endRetainedAccounting.minimumLogicalBytes
+            else { return false }
+        case "cache-boundary":
+            expectedStartArrayCount = 15
+            expectedEndArrayCount = 17
+            let expectedPersistent = try? KVStorageFormat.kvarn(
+                keyBits: 4, valueBits: 2,
+                groupSize: configuration.groupSize,
+                sinkTokens: configuration.groupSize,
+                metadataScalarBytes: 2, alignment: 8
+            ).allocation(
+                geometry: KVStorageGeometry(
+                    layerCount: 1,
+                    kvHeadCount: configuration.heads,
+                    headDimension: configuration.headDimension),
+                capacityTokens: configuration.capacity,
+                sequences: 1, workspaceBytes: 0).totalBytes
+            let expectedTriggerBytes = checkedProduct([
+                2, 2, configuration.heads,
+                configuration.headDimension,
+            ])
+            guard persistentLogicalBytes > 0,
+                materializationLogicalBytes > 0,
+                persistentLogicalBytes == expectedPersistent,
+                controlLogicalBytes == MemoryLayout<Int32>.size,
+                let expectedTriggerBytes,
+                checkedSum([
+                    persistentLogicalBytes,
+                    controlLogicalBytes,
+                    expectedTriggerBytes,
+                ]) == startReconciliation.logicalBytes,
+                let structural = cacheBoundaryStructuralMemory,
+                checkedProduct([
+                    2, structural.materializedOutputArrayBytes,
+                ]) == materializationLogicalBytes,
+                checkedSum([
+                    startReconciliation.logicalBytes,
+                    materializationLogicalBytes,
+                ]) == endRetainedAccounting.minimumLogicalBytes,
+                structural.isValid(
+                    configuration: configuration,
+                    allocatorPageBytes:
+                        startReconciliation.allocatorPageBytes,
+                    startActiveBytes: highWater.start.activeBytes,
+                    observedPeakActiveBytes:
+                        highWater.observedPeakActiveBytes)
+            else { return false }
+        default:
+            return false
+        }
+
+        let pageBytes = startReconciliation.allocatorPageBytes
+        guard emptyBaseline.activeBytes >= 0,
+            emptyBaseline.activeBytes < pageBytes,
+            emptyBaseline.cacheBytes == 0,
+            emptyBaseline.peakActiveBytes == 0,
+            startReconciliation.isValid(
+                runtimeBaselineBytes: emptyBaseline.activeBytes,
+                expectedArrayCount: expectedStartArrayCount),
+            postDetachReconciliation.allocatorPageBytes == pageBytes,
+            postDetachReconciliation.isValid(
+                runtimeBaselineBytes: emptyBaseline.activeBytes,
+                expectedArrayCount: expectedEndArrayCount),
+            endRetainedAccounting.isValid(
+                expectedArrayCount: expectedEndArrayCount),
+            postDetachCounters.activeBytes
+                == postDetachReconciliation.activeBytes,
+            postDetachCounters.cacheBytes == 0,
+            postDetachCounters.peakActiveBytes == 0,
+            postDetachReconciliation.logicalBytes
+                == endRetainedAccounting.minimumLogicalBytes,
+            highWater.start.activeBytes == startReconciliation.activeBytes,
+            highWater.start.cacheBytes == 0,
+            highWater.start.peakActiveBytes == 0,
+            highWater.end.activeBytes == endRetainedAccounting.activeBytes,
+            highWater.end.cacheBytes == 0,
+            highWater.end.peakActiveBytes >= 0
+        else { return false }
+
+        let observed = max(
+            highWater.start.activeBytes,
+            highWater.end.activeBytes,
+            highWater.end.peakActiveBytes)
+        let retained = max(
+            highWater.start.activeBytes,
+            highWater.end.activeBytes)
+        guard observed == highWater.observedPeakActiveBytes,
+            retained == highWater.retainedActiveBytes,
+            checkedDifference(observed, retained)
+                == highWater.transientActiveAboveRetainedBytes,
+            checkedDifference(observed, highWater.start.activeBytes)
+                == highWater.incrementalPeakActiveBytes
+        else { return false }
+        return true
+    }
+
+    private func checkedSum(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : sum
+    }
+
+    private func checkedDifference(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (difference, overflow) = lhs.subtractingReportingOverflow(rhs)
+        return overflow ? nil : difference
+    }
+
+    private func checkedProduct(_ values: [Int]) -> Int? {
+        var result = 1
+        for value in values {
+            guard value >= 0 else { return nil }
+            let (next, overflow) = result.multipliedReportingOverflow(
+                by: value)
+            guard !overflow else { return nil }
+            result = next
+        }
+        return result
+    }
+
+    private func checkedSum(_ values: [Int]) -> Int? {
+        var result = 0
+        for value in values {
+            guard value >= 0 else { return nil }
+            let (next, overflow) = result.addingReportingOverflow(value)
+            guard !overflow else { return nil }
+            result = next
+        }
+        return result
+    }
+}
+
+private extension KVarNMemoryProbeArtifactReconciliation {
+    func isValid(
+        runtimeBaselineBytes expectedRuntimeBaseline: Int,
+        expectedArrayCount: Int
+    ) -> Bool {
+        guard logicalBytes >= 0,
+            expectedAllocatorBytes >= logicalBytes,
+            activeBytes >= expectedAllocatorBytes,
+            runtimeBaselineBytes == expectedRuntimeBaseline,
+            runtimeBaselineBytes >= 0,
+            arrayCount == expectedArrayCount,
+            allocatorPageBytes > 0,
+            allocatorPageBytes & (allocatorPageBytes - 1) == 0
+        else { return false }
+        let (maximumRounding, roundingOverflow) = (allocatorPageBytes - 1)
+            .multipliedReportingOverflow(by: arrayCount)
+        let (maximumActive, activeOverflow) = expectedAllocatorBytes
+            .addingReportingOverflow(runtimeBaselineBytes)
+        let (activeAboveAllocator, differenceOverflow) = activeBytes
+            .subtractingReportingOverflow(expectedAllocatorBytes)
+        guard !roundingOverflow, !activeOverflow, !differenceOverflow,
+            expectedAllocatorBytes - logicalBytes <= maximumRounding,
+            maximumActiveBytes == maximumActive,
+            activeBytes <= maximumActive,
+            activeAboveExpectedAllocatorBytes == activeAboveAllocator
+        else { return false }
+        return true
+    }
+}
+
+private extension KVarNMemoryProbeArtifactRetainedAccounting {
+    func isValid(expectedArrayCount: Int) -> Bool {
+        guard minimumLogicalBytes >= 0,
+            activeBytes >= minimumLogicalBytes,
+            arrayCount == expectedArrayCount
+        else { return false }
+        let (above, overflow) = activeBytes.subtractingReportingOverflow(
+            minimumLogicalBytes)
+        return !overflow && activeAboveMinimumLogicalBytes == above
+    }
+}
+
+private extension KVarNMemoryProbeArtifactStructuralMemory {
+    func isValid(
+        configuration: KVarNMemoryProbeArtifactConfiguration,
+        allocatorPageBytes: Int,
+        startActiveBytes: Int,
+        observedPeakActiveBytes expectedObservedPeak: Int
+    ) -> Bool {
+        guard allocatorPageBytes > 0,
+            allocatorPageBytes & (allocatorPageBytes - 1) == 0,
+            startActiveBytes >= 0,
+            expectedObservedPeak >= 0,
+            let materialized = checkedProduct([
+                2, configuration.heads, configuration.capacity,
+                configuration.headDimension,
+            ]),
+            let reconstructed = checkedProduct([
+                2, configuration.heads, configuration.groupSize,
+                configuration.headDimension,
+            ]),
+            let materializedAllocator = allocatorBytes(
+                materialized, pageBytes: allocatorPageBytes),
+            let reconstructedAllocator = allocatorBytes(
+                reconstructed, pageBytes: allocatorPageBytes),
+            configuration.capacity >= configuration.groupSize,
+            (configuration.capacity - configuration.groupSize)
+                % configuration.groupSize == 0
+        else { return false }
+        let tiles = (configuration.capacity - configuration.groupSize)
+            / configuration.groupSize
+        guard let reconstructedPieces = checkedProduct([
+            tiles, reconstructedAllocator,
+        ]),
+            let minimumIncrement = checkedSum([
+                materializedAllocator, reconstructedPieces,
+            ]),
+            let minimumPeak = checkedSum([
+                startActiveBytes, minimumIncrement,
+            ]),
+            let dualIncrement = checkedProduct([2, minimumIncrement]),
+            let dualPeak = checkedSum([startActiveBytes, dualIncrement]),
+            expectedObservedPeak >= minimumPeak
+        else { return false }
+        return completedTileCount == tiles
+            && materializedOutputArrayBytes == materialized
+            && materializedOutputArrayAllocatorBytes == materializedAllocator
+            && reconstructedTileArrayBytes == reconstructed
+            && reconstructedTileArrayAllocatorBytes == reconstructedAllocator
+            && minimumConcatIncrementBytes == minimumIncrement
+            && minimumStructuralPeakActiveBytes == minimumPeak
+            && dualConcatReferenceIncrementBytes == dualIncrement
+            && dualConcatReferencePeakActiveBytes == dualPeak
+            && observedPeakActiveBytes == expectedObservedPeak
+            && observedPeakAboveMinimumStructuralBytes
+                == expectedObservedPeak - minimumPeak
+            && observedPeakDeltaFromDualConcatReferenceBytes
+                == expectedObservedPeak - dualPeak
+    }
+
+    private func allocatorBytes(_ logical: Int, pageBytes: Int) -> Int? {
+        guard logical >= 0 else { return nil }
+        guard logical > pageBytes else { return logical }
+        let (adjusted, overflow) = logical.addingReportingOverflow(
+            pageBytes - 1)
+        guard !overflow else { return nil }
+        let (rounded, multiplyOverflow) = (adjusted / pageBytes)
+            .multipliedReportingOverflow(by: pageBytes)
+        return multiplyOverflow ? nil : rounded
+    }
+
+    private func checkedProduct(_ values: [Int]) -> Int? {
+        var result = 1
+        for value in values {
+            guard value >= 0 else { return nil }
+            let (next, overflow) = result.multipliedReportingOverflow(
+                by: value)
+            guard !overflow else { return nil }
+            result = next
+        }
+        return result
+    }
+
+    private func checkedSum(_ values: [Int]) -> Int? {
+        var result = 0
+        for value in values {
+            let (next, overflow) = result.addingReportingOverflow(value)
+            guard !overflow else { return nil }
+            result = next
+        }
+        return result
+    }
 }
 
 /// Compact, embedded reference to the separately measured KVarN allocator/high-water matrix.
@@ -674,6 +1127,7 @@ public extension KVarNMemoryGateEvidence {
                 row.evaluatedArrayCount == expectedArrayCount,
                 row.expectedEvaluatedArrayCount == expectedArrayCount,
                 row.valuesFinite,
+                row.hasAuthenticatedMemoryProof(),
                 row.highWater.observedPeakActiveBytes > 0,
                 row.highWater.transientActiveAboveRetainedBytes >= 0,
                 row.highWater.transientActiveAboveRetainedBytes

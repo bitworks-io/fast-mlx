@@ -96,11 +96,140 @@ final class KVFrontierEvidenceTests: XCTestCase {
         expectedEvaluatedArrayCount: Int? = nil
     ) -> KVarNMemoryProbeArtifactRow {
         let phaseArrayCount: Int
+        let startArrayCount: Int
+        let endArrayCount: Int
+        let persistentLogicalBytes: Int
+        let materializationLogicalBytes: Int
+        let controlLogicalBytes: Int
+        let startLogicalBytes: Int
+        let endMinimumLogicalBytes: Int
         switch phase {
-        case "encode": phaseArrayCount = 8
-        case "decode": phaseArrayCount = 2
-        case "cache-boundary": phaseArrayCount = 15
-        default: phaseArrayCount = 0
+        case "encode":
+            phaseArrayCount = 8
+            startArrayCount = 2
+            endArrayCount = 10
+            persistentLogicalBytes = 16_384
+            materializationLogicalBytes = 0
+            controlLogicalBytes = 0
+            startLogicalBytes = 8_192
+            endMinimumLogicalBytes = 24_576
+        case "decode":
+            phaseArrayCount = 2
+            startArrayCount = 8
+            endArrayCount = 10
+            persistentLogicalBytes = 32_768
+            materializationLogicalBytes = 32_768
+            controlLogicalBytes = 0
+            startLogicalBytes = persistentLogicalBytes
+            endMinimumLogicalBytes = 65_536
+        case "cache-boundary":
+            phaseArrayCount = 15
+            startArrayCount = 15
+            endArrayCount = 17
+            let slots = (capacity - 128 + 127) / 128
+            persistentLogicalBytes = slots * 8 * 13_824
+                + 2 * 2 * 128 * 8 * 128 * 2
+            materializationLogicalBytes =
+                2 * 2 * 8 * capacity * 128
+            controlLogicalBytes = 4
+            startLogicalBytes = persistentLogicalBytes
+                + controlLogicalBytes + 2 * 2 * 8 * 128
+            endMinimumLogicalBytes = startLogicalBytes
+                + materializationLogicalBytes
+        default:
+            phaseArrayCount = 0
+            startArrayCount = 0
+            endArrayCount = 0
+            persistentLogicalBytes = 0
+            materializationLogicalBytes = 0
+            controlLogicalBytes = 0
+            startLogicalBytes = 0
+            endMinimumLogicalBytes = 0
+        }
+        let pageBytes = 4_096
+        let baselineBytes = 128
+        let allocatorBytes: (Int) -> Int = { logical in
+            logical <= pageBytes
+                ? logical
+                : ((logical + pageBytes - 1) / pageBytes) * pageBytes
+        }
+        let startExpectedAllocatorBytes = allocatorBytes(startLogicalBytes)
+        let startActiveBytes = startExpectedAllocatorBytes + baselineBytes
+        let retainedActiveBytes = max(
+            startActiveBytes, peak - transient)
+        let postDetachExpectedAllocatorBytes = allocatorBytes(
+            endMinimumLogicalBytes)
+        let postDetachActiveBytes =
+            postDetachExpectedAllocatorBytes + baselineBytes
+        let emptyBaseline = KVarNMemoryProbeArtifactCounters(
+            activeBytes: baselineBytes, cacheBytes: 0, peakActiveBytes: 0)
+        let startReconciliation = KVarNMemoryProbeArtifactReconciliation(
+            logicalBytes: startLogicalBytes,
+            expectedAllocatorBytes: startExpectedAllocatorBytes,
+            activeBytes: startActiveBytes,
+            runtimeBaselineBytes: baselineBytes,
+            arrayCount: startArrayCount,
+            allocatorPageBytes: pageBytes,
+            maximumActiveBytes: startExpectedAllocatorBytes + baselineBytes,
+            activeAboveExpectedAllocatorBytes: baselineBytes)
+        let endRetained = KVarNMemoryProbeArtifactRetainedAccounting(
+            minimumLogicalBytes: endMinimumLogicalBytes,
+            activeBytes: retainedActiveBytes,
+            arrayCount: endArrayCount,
+            activeAboveMinimumLogicalBytes:
+                retainedActiveBytes - endMinimumLogicalBytes)
+        let postDetachCounters = KVarNMemoryProbeArtifactCounters(
+            activeBytes: postDetachActiveBytes,
+            cacheBytes: 0, peakActiveBytes: 0)
+        let postDetachReconciliation =
+            KVarNMemoryProbeArtifactReconciliation(
+                logicalBytes: endMinimumLogicalBytes,
+                expectedAllocatorBytes: postDetachExpectedAllocatorBytes,
+                activeBytes: postDetachActiveBytes,
+                runtimeBaselineBytes: baselineBytes,
+                arrayCount: endArrayCount,
+                allocatorPageBytes: pageBytes,
+                maximumActiveBytes:
+                    postDetachExpectedAllocatorBytes + baselineBytes,
+                activeAboveExpectedAllocatorBytes: baselineBytes)
+        let startCounters = KVarNMemoryProbeArtifactCounters(
+            activeBytes: startActiveBytes,
+            cacheBytes: 0, peakActiveBytes: 0)
+        let endCounters = KVarNMemoryProbeArtifactCounters(
+            activeBytes: retainedActiveBytes,
+            cacheBytes: 0, peakActiveBytes: peak)
+
+        let structuralMemory: KVarNMemoryProbeArtifactStructuralMemory?
+        if phase == "cache-boundary" {
+            let materialized = 2 * 8 * capacity * 128
+            let materializedAllocator = allocatorBytes(materialized)
+            let reconstructed = 2 * 8 * 128 * 128
+            let reconstructedAllocator = allocatorBytes(reconstructed)
+            let tiles = (capacity - 128) / 128
+            let minimumIncrement = materializedAllocator
+                + tiles * reconstructedAllocator
+            let minimumPeak = startActiveBytes + minimumIncrement
+            let dualIncrement = 2 * minimumIncrement
+            let dualPeak = startActiveBytes + dualIncrement
+            structuralMemory = KVarNMemoryProbeArtifactStructuralMemory(
+                completedTileCount: tiles,
+                materializedOutputArrayBytes: materialized,
+                materializedOutputArrayAllocatorBytes:
+                    materializedAllocator,
+                reconstructedTileArrayBytes: reconstructed,
+                reconstructedTileArrayAllocatorBytes:
+                    reconstructedAllocator,
+                minimumConcatIncrementBytes: minimumIncrement,
+                minimumStructuralPeakActiveBytes: minimumPeak,
+                dualConcatReferenceIncrementBytes: dualIncrement,
+                dualConcatReferencePeakActiveBytes: dualPeak,
+                observedPeakActiveBytes: peak,
+                observedPeakAboveMinimumStructuralBytes:
+                    peak - minimumPeak,
+                observedPeakDeltaFromDualConcatReferenceBytes:
+                    peak - dualPeak)
+        } else {
+            structuralMemory = nil
         }
         return KVarNMemoryProbeArtifactRow(
             schemaVersion: 3,
@@ -113,13 +242,25 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 phase: phase, heads: 8, headDimension: 128,
                 groupSize: 128, iterations: iterations,
                 capacity: capacity, cacheLimitBytes: 0, run: run),
+            persistentLogicalBytes: persistentLogicalBytes,
+            materializationLogicalBytes: materializationLogicalBytes,
+            controlLogicalBytes: controlLogicalBytes,
             evaluatedArrayCount: evaluatedArrayCount ?? phaseArrayCount,
             expectedEvaluatedArrayCount:
                 expectedEvaluatedArrayCount ?? phaseArrayCount,
             valuesFinite: true,
+            emptyBaseline: emptyBaseline,
+            startReconciliation: startReconciliation,
+            endRetainedAccounting: endRetained,
+            postDetachCounters: postDetachCounters,
+            postDetachReconciliation: postDetachReconciliation,
+            cacheBoundaryStructuralMemory: structuralMemory,
             highWater: KVarNMemoryProbeArtifactHighWater(
+                start: startCounters, end: endCounters,
                 observedPeakActiveBytes: peak,
-                transientActiveAboveRetainedBytes: transient),
+                retainedActiveBytes: retainedActiveBytes,
+                transientActiveAboveRetainedBytes: transient,
+                incrementalPeakActiveBytes: peak - startActiveBytes),
             status: "PASS")
     }
 
@@ -552,6 +693,79 @@ final class KVFrontierEvidenceTests: XCTestCase {
                     $0 as? KVFrontierEvidenceError,
                     .invalidMemoryGateEvidence)
             }
+        }
+    }
+
+    func testKVarNSchema3ArtifactRejectsRowsMissingReconciliationProof() throws {
+        let unauthenticated = Data(
+            """
+            {"configuration":{"capacity":256,"cacheLimitBytes":0,"groupSize":128,"headDimension":128,"heads":8,"iterations":8,"phase":"encode","run":1},"evaluatedArrayCount":8,"expectedEvaluatedArrayCount":8,"hardwareChip":"Apple M3 Ultra","hardwareOS":"macOS 15.5","hardwareRAMBytes":274877906944,"harnessSHA":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","highWater":{"observedPeakActiveBytes":100000000,"transientActiveAboveRetainedBytes":20000001},"mlxSwiftVersion":"0.31.6","schemaVersion":3,"status":"PASS","valuesFinite":true}
+            """.utf8)
+
+        XCTAssertThrowsError(
+            try KVarNMemoryProbeArtifact.decodeJSONL(unauthenticated)
+        ) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
+        }
+    }
+
+    func testKVarNMemoryGateRejectsContradictoryReconciliationProof() throws {
+        let encoder = JSONEncoder()
+        let original = try encoder.encode(memoryProbeRows()[0])
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: original)
+                as? [String: Any])
+        var reconciliation = try XCTUnwrap(
+            object["startReconciliation"] as? [String: Any])
+        reconciliation["activeAboveExpectedAllocatorBytes"] = 999
+        object["startReconciliation"] = reconciliation
+        let tampered = try JSONSerialization.data(withJSONObject: object)
+        let row = try XCTUnwrap(
+            KVarNMemoryProbeArtifact.decodeJSONL(tampered).first)
+        var rows = memoryProbeRows()
+        rows[0] = row
+
+        XCTAssertThrowsError(try KVarNMemoryGateEvidence.derived(
+            from: rows,
+            artifactSHA256: String(repeating: "b", count: 64),
+            runtimeTier: "kvarn-k4v2-g128"
+        )) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
+        }
+    }
+
+    func testKVarNMemoryGateBindsCacheBoundaryLogicalBytesToGeometry() throws {
+        let encoder = JSONEncoder()
+        let source = memoryProbeRow(
+            phase: "cache-boundary", capacity: 256, run: 1)
+        let original = try encoder.encode(source)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: original)
+                as? [String: Any])
+        object["controlLogicalBytes"] = 64
+        let tampered = try JSONSerialization.data(withJSONObject: object)
+        let row = try XCTUnwrap(
+            KVarNMemoryProbeArtifact.decodeJSONL(tampered).first)
+        var rows = memoryProbeRows()
+        let index = try XCTUnwrap(rows.firstIndex(where: {
+            $0.configuration.phase == "cache-boundary"
+                && $0.configuration.capacity == 256
+                && $0.configuration.run == 1
+        }))
+        rows[index] = row
+
+        XCTAssertThrowsError(try KVarNMemoryGateEvidence.derived(
+            from: rows,
+            artifactSHA256: String(repeating: "b", count: 64),
+            runtimeTier: "kvarn-k4v2-g128"
+        )) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
         }
     }
 
