@@ -9,19 +9,29 @@ final class KVFrontierEvidenceTests: XCTestCase {
             checkpointManifestHash: "checkpoint-\(suffix)")
     }
 
-    private func geometry(tier: String = "affine-k4v2-g128") -> KVFormatGeometryEvidence {
+    private func geometry(
+        tier: String = "affine-k4v2-g128",
+        capacityTokens: Int = 24_192
+    ) -> KVFormatGeometryEvidence {
         KVFormatGeometryEvidence(
             kind: .affine, tier: tier, keyBits: 4, valueBits: 2, groupSize: 128,
             sinkTokens: 0, layerCount: 64, kvHeadCount: 8, headDimension: 128,
-            capacityTokens: 4_096, sequences: 1, metadataScalarBytes: 2,
+            capacityTokens: capacityTokens, sequences: 1, metadataScalarBytes: 2,
             recordAlignment: 1)
     }
 
-    private func breakdown(total: Int = 218_103_808) -> KVStorageBreakdownEvidence {
-        KVStorageBreakdownEvidence(
-            payloadBytes: 201_326_592, metadataBytes: 16_777_216,
+    private func breakdown(
+        capacityTokens: Int = 24_192,
+        total: Int? = nil
+    ) -> KVStorageBreakdownEvidence {
+        let tokenHeads = capacityTokens * 64 * 8
+        let payloadBytes = tokenHeads * 96
+        let metadataBytes = tokenHeads * 8
+        return KVStorageBreakdownEvidence(
+            payloadBytes: payloadBytes, metadataBytes: metadataBytes,
             alignmentPaddingBytes: 0, fp16SinkBytes: 0, fp16TailBytes: 0,
-            workspaceBytes: 0, totalBytes: total)
+            workspaceBytes: 0,
+            totalBytes: total ?? payloadBytes + metadataBytes)
     }
 
     private func frontier(
@@ -33,7 +43,10 @@ final class KVFrontierEvidenceTests: XCTestCase {
         cellID: String = "affine-k4v2-g128",
         format: KVFormatGeometryEvidence? = nil,
         storage: KVStorageEvidence? = nil,
-        controlBytes: Int? = 256
+        controlBytes: Int? = 256,
+        executionMode: String? = nil,
+        codecIterations: Int? = nil,
+        memoryGate: KVarNMemoryGateEvidence? = nil
     ) -> KVFrontierEvidence {
         let same = identity()
         let bytes = breakdown()
@@ -45,12 +58,134 @@ final class KVFrontierEvidenceTests: XCTestCase {
             referenceModel: reference ?? same,
             candidateFormat: format ?? geometry(),
             storage: storage ?? KVStorageEvidence(predicted: bytes, actual: bytes),
-            actualControlBytes: controlBytes)
+            actualControlBytes: controlBytes,
+            candidateExecutionMode: executionMode,
+            candidateCodecIterations: codecIterations,
+            candidateMemoryGate: memoryGate)
     }
 
-    private func payload(frontier: KVFrontierEvidence? = nil) -> KLPayload {
+    private func kvarnMemoryGate(
+        tier: String = "kvarn-k4v2-g128",
+        iterations: Int = 8,
+        harnessSHA: String = String(repeating: "a", count: 40),
+        maximumCapacityTokens: Int = 24_192
+    ) -> KVarNMemoryGateEvidence {
+        KVarNMemoryGateEvidence(
+            schemaVersion: 1,
+            artifactSHA256: String(repeating: "b", count: 64),
+            harnessGitSHA: harnessSHA,
+            mlxSwiftVersion: "0.31.6",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareOS: "macOS 15.5",
+            hardwareRAMBytes: 256 * 1_024 * 1_024 * 1_024,
+            runtimeTier: tier, codecIterations: iterations,
+            cacheBoundaryMaximumCapacityTokens: maximumCapacityTokens,
+            encodeSampleCount: 3, decodeSampleCount: 3,
+            cacheBoundarySampleCount: 9,
+            encodeTransientPeakBytes: 28_147_712,
+            decodeTransientPeakBytes: 2_310_144,
+            cacheBoundaryTransientPeakBytes: 48_037_888,
+            maximumPeakActiveBytes: 1_000_000_000)
+    }
+
+    private func memoryProbeRow(
+        phase: String, capacity: Int, run: Int,
+        iterations: Int = 8, peak: Int = 100_000_000,
+        transient: Int = 10_000_000,
+        evaluatedArrayCount: Int? = nil,
+        expectedEvaluatedArrayCount: Int? = nil
+    ) -> KVarNMemoryProbeArtifactRow {
+        let phaseArrayCount: Int
+        switch phase {
+        case "encode": phaseArrayCount = 8
+        case "decode": phaseArrayCount = 2
+        case "cache-boundary": phaseArrayCount = 15
+        default: phaseArrayCount = 0
+        }
+        return KVarNMemoryProbeArtifactRow(
+            schemaVersion: 3,
+            harnessSHA: String(repeating: "a", count: 40),
+            mlxSwiftVersion: "0.31.6",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareOS: "macOS 15.5",
+            hardwareRAMBytes: 256 * 1_024 * 1_024 * 1_024,
+            configuration: KVarNMemoryProbeArtifactConfiguration(
+                phase: phase, heads: 8, headDimension: 128,
+                groupSize: 128, iterations: iterations,
+                capacity: capacity, cacheLimitBytes: 0, run: run),
+            evaluatedArrayCount: evaluatedArrayCount ?? phaseArrayCount,
+            expectedEvaluatedArrayCount:
+                expectedEvaluatedArrayCount ?? phaseArrayCount,
+            valuesFinite: true,
+            highWater: KVarNMemoryProbeArtifactHighWater(
+                observedPeakActiveBytes: peak,
+                transientActiveAboveRetainedBytes: transient),
+            status: "PASS")
+    }
+
+    private func memoryProbeRows(iterations: Int = 8)
+        -> [KVarNMemoryProbeArtifactRow]
+    {
+        var rows: [KVarNMemoryProbeArtifactRow] = []
+        for run in 1 ... 3 {
+            rows.append(memoryProbeRow(
+                phase: "encode", capacity: 256, run: run,
+                iterations: iterations, transient: 20_000_000 + run))
+            rows.append(memoryProbeRow(
+                phase: "decode", capacity: 256, run: run,
+                iterations: iterations, transient: 2_000_000 + run))
+            for capacity in [256, 4_096, 24_192] {
+                rows.append(memoryProbeRow(
+                    phase: "cache-boundary", capacity: capacity,
+                    run: run, iterations: iterations,
+                    peak: capacity * 100_000,
+                    transient: capacity * 1_000 + run))
+            }
+        }
+        return rows
+    }
+
+    private func kvarnFormatAndStorage(
+        tier: String = "kvarn-k4v2-g128",
+        capacityTokens: Int = 24_192,
+        kvHeadCount: Int = 8,
+        headDimension: Int = 128
+    ) throws -> (KVFormatGeometryEvidence, KVStorageEvidence) {
+        let format = KVFormatGeometryEvidence(
+            kind: .kvarn, tier: tier,
+            keyBits: 4, valueBits: 2, groupSize: 128,
+            sinkTokens: 128, layerCount: 2,
+            kvHeadCount: kvHeadCount,
+            headDimension: headDimension,
+            capacityTokens: capacityTokens, sequences: 1,
+            metadataScalarBytes: 2, recordAlignment: 8)
+        let workspaceBytes = capacityTokens * kvHeadCount * headDimension * 4
+        let allocation = try KVStorageFormat.kvarn(
+            keyBits: 4, valueBits: 2, groupSize: 128,
+            sinkTokens: 128, metadataScalarBytes: 2, alignment: 8
+        ).allocation(
+            geometry: KVStorageGeometry(
+                layerCount: 2, kvHeadCount: kvHeadCount,
+                headDimension: headDimension),
+            capacityTokens: capacityTokens, sequences: 1,
+            workspaceBytes: workspaceBytes)
+        let actual = KVStorageBreakdownEvidence(
+            payloadBytes: allocation.payloadBytes,
+            metadataBytes: allocation.metadataBytes,
+            alignmentPaddingBytes: allocation.alignmentPaddingBytes,
+            fp16SinkBytes: allocation.fp16SinkBytes,
+            fp16TailBytes: allocation.fp16TailBytes,
+            workspaceBytes: allocation.workspaceBytes,
+            totalBytes: allocation.totalBytes)
+        return (format, try format.storageEvidence(actual: actual))
+    }
+
+    private func payload(
+        kvQuantTier: String = "affine-k4v2-g128",
+        frontier: KVFrontierEvidence? = nil
+    ) -> KLPayload {
         KLPayload(
-            kvQuantTier: "affine-k4v2-g128",
+            kvQuantTier: kvQuantTier,
             klMedianNats: 0.04, klLongContextTailP95Nats: 0.3,
             klPooledMedianNats: 0.05, klPooledP95Nats: 0.4,
             pplCandidate: 10.2, pplReference: 10.0, pplDeltaPct: 2.0,
@@ -80,7 +215,9 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
         XCTAssertEqual(decoded, validated)
         XCTAssertEqual(decoded.frontier?.matrixID, "kvarn-qwen3-32b-v1")
-        XCTAssertEqual(decoded.frontier?.storage?.actual.totalBytes, 218_103_808)
+        XCTAssertEqual(
+            decoded.frontier?.storage?.actual.totalBytes,
+            breakdown().totalBytes)
     }
 
     func testHistoricalFrontierWithoutControlBytesStillDecodesButCannotPromote() throws {
@@ -109,6 +246,312 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
         XCTAssertEqual(evidence.actual, actual)
         XCTAssertEqual(evidence.predicted, actual)
+    }
+
+    func testKVarNPromotionRequiresMeasuredExecutionModeAndIterationCell() throws {
+        let (format, storage) = try kvarnFormatAndStorage()
+        let complete = frontier(
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format, storage: storage, controlBytes: 8,
+            executionMode: "uncompiled-correctness", codecIterations: 8,
+            memoryGate: kvarnMemoryGate())
+
+        let completePayload = payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: complete)
+        XCTAssertNoThrow(try completePayload.validatedForPromotion())
+        XCTAssertNoThrow(try ResultRecord(
+            subcommand: "kl", provenance: provenance(), payload: completePayload
+        ).validatedForPromotionEvidence())
+
+        let wrongMemorySHA = frontier(
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format, storage: storage, controlBytes: 8,
+            executionMode: "uncompiled-correctness", codecIterations: 8,
+            memoryGate: kvarnMemoryGate(
+                harnessSHA: String(repeating: "c", count: 40)))
+        XCTAssertThrowsError(try ResultRecord(
+            subcommand: "kl", provenance: provenance(),
+            payload: payload(
+                kvQuantTier: "kvarn-k4v2-g128", frontier: wrongMemorySHA)
+        ).validatedForPromotionEvidence()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .memoryGateProvenanceMismatch)
+        }
+
+        let (i16Format, i16Storage) = try kvarnFormatAndStorage(
+            tier: "kvarn-k4v2-g128-i16")
+        XCTAssertNoThrow(try payload(
+            kvQuantTier: "kvarn-k4v2-g128-i16",
+            frontier: frontier(
+                cellID: "kvarn-k4v2-g128-i16",
+                format: i16Format, storage: i16Storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 16,
+                memoryGate: kvarnMemoryGate(
+                    tier: "kvarn-k4v2-g128-i16", iterations: 16))
+        ).validatedForPromotion())
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 8)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingMemoryGateEvidence)
+        }
+
+        for invalid in [
+            frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: nil, codecIterations: 8),
+            frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "compiled", codecIterations: 8),
+            frontier(
+                cellID: "kvarn-k4v2-g128-i4",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 4),
+            frontier(
+                cellID: "kvarn-k4v2-g128-i16",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 8,
+                memoryGate: kvarnMemoryGate()),
+        ] {
+            XCTAssertThrowsError(try payload(
+                kvQuantTier: "kvarn-k4v2-g128",
+                frontier: invalid).validatedForPromotion()
+            ) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+            }
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 0,
+                executionMode: "uncompiled-correctness", codecIterations: 8,
+                memoryGate: kvarnMemoryGate())
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidControlStorage)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 8,
+                memoryGate: kvarnMemoryGate(
+                    tier: "kvarn-k4v2-g128-i16", iterations: 16))
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness", codecIterations: 8,
+                memoryGate: kvarnMemoryGate(
+                    maximumCapacityTokens: 24_193))
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
+        }
+    }
+
+    func testKVarNPromotionRejectsGeometryWithoutAnAdmittedRuntimeCell() throws {
+        let format = KVFormatGeometryEvidence(
+            kind: .kvarn, tier: "kvarn-k4v4-g128",
+            keyBits: 4, valueBits: 4, groupSize: 128,
+            sinkTokens: 128, layerCount: 2, kvHeadCount: 1,
+            headDimension: 128, capacityTokens: 257, sequences: 1,
+            metadataScalarBytes: 2, recordAlignment: 8)
+        let actual = KVStorageBreakdownEvidence(
+            payloadBytes: 65_536, metadataBytes: 6_144,
+            alignmentPaddingBytes: 0,
+            fp16SinkBytes: 131_072, fp16TailBytes: 131_072,
+            workspaceBytes: 131_584, totalBytes: 465_408)
+        XCTAssertThrowsError(try format.storageEvidence(actual: actual)) {
+            XCTAssertEqual($0 as? KVFrontierEvidenceError, .invalidGeometry)
+        }
+
+        for (sequences, capacity) in [(2, 257), (1, Int(Int32.max) + 1)] {
+            let unavailable = KVFormatGeometryEvidence(
+                kind: .kvarn, tier: "kvarn-k4v2-g128",
+                keyBits: 4, valueBits: 2, groupSize: 128,
+                sinkTokens: 128, layerCount: 2, kvHeadCount: 1,
+                headDimension: 128, capacityTokens: capacity,
+                sequences: sequences, metadataScalarBytes: 2,
+                recordAlignment: 8)
+            XCTAssertThrowsError(try unavailable.storageEvidence(actual: actual)) {
+                XCTAssertEqual($0 as? KVFrontierEvidenceError, .invalidGeometry)
+            }
+        }
+    }
+
+    func testKVarNMemoryGateIsDerivedFromTheExactRawProbeMatrix() throws {
+        let rows = memoryProbeRows()
+        let gate = try KVarNMemoryGateEvidence.derived(
+            from: rows,
+            artifactSHA256: String(repeating: "b", count: 64),
+            runtimeTier: "kvarn-k4v2-g128")
+
+        XCTAssertEqual(gate.encodeSampleCount, 3)
+        XCTAssertEqual(gate.decodeSampleCount, 3)
+        XCTAssertEqual(gate.cacheBoundarySampleCount, 9)
+        XCTAssertEqual(gate.cacheBoundaryMaximumCapacityTokens, 24_192)
+        XCTAssertEqual(gate.encodeTransientPeakBytes, 20_000_003)
+        XCTAssertEqual(gate.decodeTransientPeakBytes, 2_000_003)
+        XCTAssertEqual(gate.cacheBoundaryTransientPeakBytes, 24_192_003)
+        XCTAssertEqual(gate.maximumPeakActiveBytes, 2_419_200_000)
+
+        let i16Rows = memoryProbeRows(iterations: 16)
+        for artifactRows in [i16Rows, rows + i16Rows] {
+            let i16Gate = try KVarNMemoryGateEvidence.derived(
+                from: artifactRows,
+                artifactSHA256: String(repeating: "c", count: 64),
+                runtimeTier: "kvarn-k4v2-g128-i16")
+            XCTAssertEqual(i16Gate.runtimeTier, "kvarn-k4v2-g128-i16")
+            XCTAssertEqual(i16Gate.codecIterations, 16)
+            XCTAssertEqual(i16Gate.cacheBoundaryMaximumCapacityTokens, 24_192)
+        }
+
+        let falseCompleteCounts = rows.enumerated().map { index, row in
+            index == 0
+                ? memoryProbeRow(
+                    phase: row.configuration.phase,
+                    capacity: row.configuration.capacity,
+                    run: row.configuration.run,
+                    evaluatedArrayCount: 1,
+                    expectedEvaluatedArrayCount: 1)
+                : row
+        }
+
+        for invalid in [
+            Array(rows.dropLast()),
+            rows + [rows[0]],
+            rows.map { row in
+                row.configuration.capacity == 24_192
+                    ? memoryProbeRow(
+                        phase: row.configuration.phase,
+                        capacity: 4_096, run: row.configuration.run)
+                    : row
+            },
+            falseCompleteCounts,
+            rows + i16Rows.dropLast(),
+        ] {
+            XCTAssertThrowsError(try KVarNMemoryGateEvidence.derived(
+                from: invalid,
+                artifactSHA256: String(repeating: "b", count: 64),
+                runtimeTier: "kvarn-k4v2-g128")) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidMemoryGateEvidence)
+            }
+        }
+    }
+
+    func testKVarNRawMemoryArtifactJSONLRejectsEmptyRows() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let rows = Array(memoryProbeRows().prefix(2))
+        let lines = try rows.map {
+            String(decoding: try encoder.encode($0), as: UTF8.self)
+        }
+        let valid = Data((lines.joined(separator: "\n") + "\n").utf8)
+        XCTAssertEqual(
+            try KVarNMemoryProbeArtifact.decodeJSONL(valid),
+            rows)
+
+        let invalidArtifacts = [
+            Data(),
+            Data("\n".utf8),
+            Data((lines.joined(separator: "\n") + "\n\n").utf8),
+            Data((lines[0] + "\n\n" + lines[1]).utf8),
+        ]
+        for artifact in invalidArtifacts {
+            XCTAssertThrowsError(
+                try KVarNMemoryProbeArtifact.decodeJSONL(artifact)
+            ) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidMemoryGateEvidence)
+            }
+        }
+    }
+
+    func testKVarNPromotionRejectsCapacityBeyondMeasuredBoundary() throws {
+        let (format, storage) = try kvarnFormatAndStorage(
+            capacityTokens: 24_193)
+        let evidence = frontier(
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format,
+            storage: storage,
+            controlBytes: 8,
+            executionMode: "uncompiled-correctness",
+            codecIterations: 8,
+            memoryGate: kvarnMemoryGate())
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: evidence).validatedForPromotion()
+        ) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMemoryGateEvidence)
+        }
+    }
+
+    func testPromotionBindsFormatCapacityToDeepestScoredContext() throws {
+        let format = geometry(capacityTokens: 4_096)
+        let actual = breakdown(capacityTokens: 4_096)
+        let evidence = frontier(
+            format: format,
+            storage: KVStorageEvidence(predicted: actual, actual: actual))
+
+        XCTAssertThrowsError(try payload(
+            frontier: evidence).validatedForPromotion()
+        ) {
+            XCTAssertEqual($0 as? KVFrontierEvidenceError, .invalidGeometry)
+        }
+    }
+
+    func testKVarNMemoryGateRejectsUnmeasuredHeadGeometry() throws {
+        for (heads, dimension) in [(4, 128), (8, 256)] {
+            let (format, storage) = try kvarnFormatAndStorage(
+                kvHeadCount: heads, headDimension: dimension)
+            let evidence = frontier(
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format, storage: storage, controlBytes: 8,
+                executionMode: "uncompiled-correctness",
+                codecIterations: 8,
+                memoryGate: kvarnMemoryGate())
+
+            XCTAssertThrowsError(try payload(
+                kvQuantTier: "kvarn-k4v2-g128",
+                frontier: evidence).validatedForPromotion()
+            ) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidMemoryGateEvidence)
+            }
+        }
     }
 
     func testPromotionRejectsMissingFrontierAndLongContextTail() {

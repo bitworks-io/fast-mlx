@@ -1,9 +1,41 @@
 import Foundation
 import HarnessCore
 import MLX
+import MLXLMCommon
+import MLXNN
 import XCTest
 
 @testable import SpikeCore
+
+private final class TinyKVarNTelemetryModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    let kvHeads = [1]
+    private let vocabularySize = 512
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        guard let cache = cache?.first else {
+            preconditionFailure("tiny KVarN model requires one cache")
+        }
+        let scalar = inputs.asType(.float16).reshaped([
+            inputs.dim(0), 1, inputs.dim(1), 1,
+        ])
+        let kv = broadcast(
+            scalar, to: [inputs.dim(0), 1, inputs.dim(1), 128])
+        let (keys, _) = cache.update(keys: kv, values: kv)
+        let target = keys.sum(axes: [1, 2, 3]).asType(.int32)
+            .reshaped([inputs.dim(0), 1, 1])
+        let vocabulary = MLXArray(Int32(0) ..< Int32(vocabularySize))
+            .reshaped([1, 1, vocabularySize])
+        return (target .== vocabulary).asType(.float32) * 100
+    }
+}
 
 final class KVarNKVCacheTests: XCTestCase {
     func testCacheAcceptsOnlyDTypesItsFP16SinkAndTailPreserveExactly() {
@@ -491,15 +523,28 @@ final class KVarNKVCacheTests: XCTestCase {
 
     func testCanonicalFactoryTelemetryAndExecutionModeFailClosed() throws {
         XCTAssertEqual(KVarNKVTier.k4v2G128.rawValue, "kvarn-k4v2-g128")
-        XCTAssertEqual(KVarNKVTier.k4v2G128.matrixIterationCount, 8)
+        XCTAssertEqual(
+            KVarNKVRuntimeCell.k4v2G128I8.rawValue,
+            "kvarn-k4v2-g128")
+        XCTAssertEqual(
+            KVarNKVRuntimeCell.k4v2G128I16.rawValue,
+            "kvarn-k4v2-g128-i16")
         let kind = try XCTUnwrap(KVCacheKind(kvQuant: "kvarn-k4v2-g128"))
-        XCTAssertEqual(kind, .kvarn(.k4v2G128))
+        XCTAssertEqual(kind, .kvarn(.k4v2G128I8))
         let factoryCache = try XCTUnwrap(
             kind.makeCache(capacity: 257) as? KVarNKVCache)
         XCTAssertEqual(factoryCache.tier, .k4v2G128)
         XCTAssertEqual(factoryCache.iterations, 8)
+        let i16Kind = try XCTUnwrap(
+            KVCacheKind(kvQuant: "kvarn-k4v2-g128-i16"))
+        XCTAssertEqual(i16Kind, .kvarn(.k4v2G128I16))
+        let i16Cache = try XCTUnwrap(
+            i16Kind.makeCache(capacity: 257) as? KVarNKVCache)
+        XCTAssertEqual(i16Cache.tier, .k4v2G128)
+        XCTAssertEqual(i16Cache.iterations, 16)
         for spelling in [
-            "k4v2-g128", "kvarn-k4v2-g64", "kvarn-k4v4-g128", "kvarn-k4v2-g96",
+            "k4v2-g128", "kvarn-k4v2-g128-i8", "kvarn-k4v2-g64",
+            "kvarn-k4v4-g128", "kvarn-k4v2-g96",
         ] {
             XCTAssertNil(KVCacheKind(kvQuant: spelling), "unexpected alias: \(spelling)")
         }
@@ -551,6 +596,25 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.formatPersistentBytes, 317_440)
         XCTAssertEqual(telemetry.totalPersistentBytes, 317_448)
         XCTAssertEqual(telemetry.storageAndMaterializationBytes, 449_024)
+    }
+
+    func testDecoderExportsOnlyScalarTelemetryForSelectedKVarNRuntimeCell() throws {
+        var decoder = CompiledMLXDecoder(
+            model: TinyKVarNTelemetryModel(), reserve: 1,
+            kvCache: .kvarn(.k4v2G128I16), compileStep: true)
+        XCTAssertEqual(decoder.executionMode, .uncompiledCorrectness)
+
+        _ = decoder.prefill([1, 2])
+        let telemetry = try XCTUnwrap(decoder.kvarnKVTelemetry())
+        XCTAssertEqual(telemetry.tier, .k4v2G128)
+        XCTAssertEqual(telemetry.iterations, 16)
+        XCTAssertEqual(telemetry.executionMode, .uncompiledCorrectness)
+        XCTAssertEqual(telemetry.cachedTokens, 3)
+        XCTAssertEqual(telemetry.layerCount, 1)
+        XCTAssertEqual(telemetry.capacityTokens, 256)
+        XCTAssertEqual(telemetry.kvHeadCount, 1)
+        XCTAssertEqual(telemetry.headDimension, 128)
+        XCTAssertGreaterThan(telemetry.storageAndMaterializationBytes, 0)
     }
 
     private func mismatchCount<T: Equatable>(_ lhs: [T], _ rhs: [T]) -> Int {

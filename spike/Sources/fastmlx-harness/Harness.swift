@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import HarnessCore
 import MLXLMCommon
@@ -14,12 +15,12 @@ let knownGoodPrompt = "The capital of France is"
 let benchPrompt = "Explain how continuous batching improves LLM serving throughput."
 let knownKVQuantTiers = (
     ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
-        + KVarNKVTier.allCases.map(\.rawValue)
+        + KVarNKVRuntimeCell.allCases.map(\.rawValue)
         + TurboQuantTier.allCases.flatMap { [$0.harnessSlot, $0.rawValue] }
 ).joined(separator: ", ")
 let kvQuantUsageTiers = (
     ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
-        + KVarNKVTier.allCases.map(\.rawValue)
+        + KVarNKVRuntimeCell.allCases.map(\.rawValue)
         + TurboQuantTier.allCases.map(\.harnessSlot)
 ).joined(separator: "|")
 
@@ -54,6 +55,23 @@ func loadMeasurementCorpus(_ flags: Flags) throws -> MeasurementCorpus {
 
 func evidencePath(_ flags: Flags) -> String { flags.string("evidence", default: "harness-evidence.jsonl") }
 
+func loadKVarNMemoryGate(
+    _ flags: Flags,
+    runtimeCell: KVarNKVRuntimeCell
+) throws -> KVarNMemoryGateEvidence? {
+    let path = try flags.strictString("kvarn-memory-gate", default: "")
+    guard !path.isEmpty else { return nil }
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    let digest = SHA256.hash(data: data).map {
+        String(format: "%02x", $0)
+    }.joined()
+    let rows = try KVarNMemoryProbeArtifact.decodeJSONL(data)
+    return try KVarNMemoryGateEvidence.derived(
+        from: rows,
+        artifactSHA256: digest,
+        runtimeTier: runtimeCell.rawValue)
+}
+
 struct VerifyPayload: Codable, Sendable {
     let prompt: String
     let promptTokens: Int
@@ -76,6 +94,17 @@ struct VerifyPayload: Codable, Sendable {
     let affineMetadataBytes: Int?
     let affineControlBytes: Int?
     let affineWorkspaceBytes: Int?
+    /// KVarN engagement plus the exact allocation/runtime cell used by this decode.
+    let kvarnTokens: Int?
+    let kvarnPayloadBytes: Int?
+    let kvarnMetadataBytes: Int?
+    let kvarnAlignmentPaddingBytes: Int?
+    let kvarnFP16SinkBytes: Int?
+    let kvarnFP16TailBytes: Int?
+    let kvarnControlBytes: Int?
+    let kvarnWorkspaceBytes: Int?
+    let kvarnCodecIterations: Int?
+    let kvarnExecutionMode: String?
 }
 
 /// Evidence record for `verify --spec`: the spec-decode exactness triad — PLD-on vs PLD-off on
@@ -226,6 +255,16 @@ func runVerify(_ flags: Flags) async {
         var affineMetadataBytes: Int?
         var affineControlBytes: Int?
         var affineWorkspaceBytes: Int?
+        var kvarnTokens: Int?
+        var kvarnPayloadBytes: Int?
+        var kvarnMetadataBytes: Int?
+        var kvarnAlignmentPaddingBytes: Int?
+        var kvarnFP16SinkBytes: Int?
+        var kvarnFP16TailBytes: Int?
+        var kvarnControlBytes: Int?
+        var kvarnWorkspaceBytes: Int?
+        var kvarnCodecIterations: Int?
+        var kvarnExecutionMode: String?
         switch mode {
         case .exact:
             let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
@@ -331,8 +370,42 @@ func runVerify(_ flags: Flags) async {
                 affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
             case .turboQuant:
                 turboquantTokens = cachedTokens
-            case .kvarn:
-                break
+            case .kvarn(let cell):
+                guard
+                    let payloadBytes = candidate.engagement.counts[
+                        "kvarn_payload_bytes"],
+                    let metadataBytes = candidate.engagement.counts[
+                        "kvarn_metadata_bytes"],
+                    let alignmentPaddingBytes = candidate.engagement.counts[
+                        "kvarn_alignment_padding_bytes"],
+                    let sinkBytes = candidate.engagement.counts[
+                        "kvarn_fp16_sink_bytes"],
+                    let tailBytes = candidate.engagement.counts[
+                        "kvarn_fp16_tail_bytes"],
+                    let controlBytes = candidate.engagement.counts[
+                        "kvarn_control_bytes"],
+                    let workspaceBytes = candidate.engagement.counts[
+                        "kvarn_workspace_bytes"],
+                    let iterations = candidate.engagement.counts[
+                        "kvarn_codec_iterations"],
+                    iterations == cell.iterations,
+                    candidate.engagement.counts[
+                        "kvarn_uncompiled_correctness"] == 1
+                else {
+                    throw SwiftEngineDriverError.unsupportedConfig(
+                        "KVarN verify run completed without matching allocation/runtime telemetry")
+                }
+                kvarnTokens = cachedTokens
+                kvarnPayloadBytes = payloadBytes
+                kvarnMetadataBytes = metadataBytes
+                kvarnAlignmentPaddingBytes = alignmentPaddingBytes
+                kvarnFP16SinkBytes = sinkBytes
+                kvarnFP16TailBytes = tailBytes
+                kvarnControlBytes = controlBytes
+                kvarnWorkspaceBytes = workspaceBytes
+                kvarnCodecIterations = iterations
+                kvarnExecutionMode = KVCacheExecutionMode
+                    .uncompiledCorrectness.rawValue
             }
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
             print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
@@ -361,7 +434,17 @@ func runVerify(_ flags: Flags) async {
             affinePayloadBytes: affinePayloadBytes,
             affineMetadataBytes: affineMetadataBytes,
             affineControlBytes: affineControlBytes,
-            affineWorkspaceBytes: affineWorkspaceBytes)
+            affineWorkspaceBytes: affineWorkspaceBytes,
+            kvarnTokens: kvarnTokens,
+            kvarnPayloadBytes: kvarnPayloadBytes,
+            kvarnMetadataBytes: kvarnMetadataBytes,
+            kvarnAlignmentPaddingBytes: kvarnAlignmentPaddingBytes,
+            kvarnFP16SinkBytes: kvarnFP16SinkBytes,
+            kvarnFP16TailBytes: kvarnFP16TailBytes,
+            kvarnControlBytes: kvarnControlBytes,
+            kvarnWorkspaceBytes: kvarnWorkspaceBytes,
+            kvarnCodecIterations: kvarnCodecIterations,
+            kvarnExecutionMode: kvarnExecutionMode)
         appendJSONLRecord(ResultRecord(subcommand: "verify", provenance: provenance, payload: payload), to: evidencePath(flags))
 
         if !verdict.passed { exit(1) }
@@ -598,7 +681,7 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -624,6 +707,27 @@ func runKL(_ flags: Flags) async {
         guard let requestedCacheKind = KVCacheKind(kvQuant: kvQuantTier) else {
             print("kl FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
             exit(2)
+        }
+        let requestedKVarNMemoryGate: KVarNMemoryGateEvidence?
+        switch requestedCacheKind {
+        case .kvarn(let cell):
+            requestedKVarNMemoryGate = try loadKVarNMemoryGate(
+                flags, runtimeCell: cell)
+            if promotionEvidence, requestedKVarNMemoryGate == nil {
+                throw KVFrontierEvidenceError.missingMemoryGateEvidence
+            }
+            if let requestedKVarNMemoryGate {
+                try requestedKVarNMemoryGate.validated(
+                    candidateTier: cell.rawValue,
+                    candidateIterations: cell.iterations)
+            }
+        case .fp16, .affine, .turboQuant:
+            guard try flags.strictString(
+                "kvarn-memory-gate", default: "").isEmpty
+            else {
+                throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+            }
+            requestedKVarNMemoryGate = nil
         }
         let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
         let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
@@ -789,6 +893,9 @@ func runKL(_ flags: Flags) async {
         let candidateFormat: KVFormatGeometryEvidence?
         let storage: KVStorageEvidence?
         let actualControlBytes: Int?
+        let candidateExecutionMode: String?
+        let candidateCodecIterations: Int?
+        let candidateMemoryGate: KVarNMemoryGateEvidence?
         switch requestedCacheKind {
         case .affine(let tier):
             guard let telemetry = await driver.affineScoringTelemetry() else {
@@ -826,6 +933,9 @@ func runKL(_ flags: Flags) async {
             candidateFormat = format
             storage = try format.storageEvidence(actual: actual)
             actualControlBytes = telemetry.controlBytes
+            candidateExecutionMode = nil
+            candidateCodecIterations = nil
+            candidateMemoryGate = nil
             print(
                 "# affine storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), control=\(telemetry.controlBytes), "
@@ -834,12 +944,87 @@ func runKL(_ flags: Flags) async {
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
-        case .fp16, .turboQuant, .kvarn:
+        case .kvarn(let cell):
+            guard let telemetry = await driver.kvarnScoringTelemetry(
+                for: cell)
+            else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVarN KL run completed without KVarN allocation telemetry")
+            }
+            guard telemetry.tier == cell.tier,
+                telemetry.iterations == cell.iterations,
+                telemetry.executionMode == .uncompiledCorrectness
+            else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVarN scoring telemetry does not match requested cell \(cell.rawValue)")
+            }
+            let format = KVFormatGeometryEvidence(
+                kind: .kvarn, tier: cell.rawValue,
+                keyBits: cell.tier.keyBits,
+                valueBits: cell.tier.valueBits,
+                groupSize: cell.tier.groupSize,
+                sinkTokens: cell.tier.sinkTokens,
+                layerCount: telemetry.layerCount,
+                kvHeadCount: telemetry.kvHeadCount,
+                headDimension: telemetry.headDimension,
+                capacityTokens: telemetry.capacityTokens,
+                sequences: telemetry.sequences,
+                metadataScalarBytes: telemetry.metadataScalarBytes,
+                recordAlignment: cell.tier.alignment)
+            let evidenceTerms = [
+                telemetry.payloadBytes,
+                telemetry.metadataBytes,
+                telemetry.alignmentPaddingBytes,
+                telemetry.fp16SinkBytes,
+                telemetry.fp16TailBytes,
+                telemetry.materializationWorkspaceBytes,
+            ]
+            let evidenceTotalBytes = try evidenceTerms.reduce(0) {
+                partial, value in
+                let (sum, overflow) = partial.addingReportingOverflow(value)
+                guard !overflow else {
+                    throw KVFrontierEvidenceError.storageArithmeticOverflow
+                }
+                return sum
+            }
+            let actual = KVStorageBreakdownEvidence(
+                payloadBytes: telemetry.payloadBytes,
+                metadataBytes: telemetry.metadataBytes,
+                alignmentPaddingBytes: telemetry.alignmentPaddingBytes,
+                fp16SinkBytes: telemetry.fp16SinkBytes,
+                fp16TailBytes: telemetry.fp16TailBytes,
+                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                totalBytes: evidenceTotalBytes)
+            candidateFormat = format
+            storage = try format.storageEvidence(actual: actual)
+            actualControlBytes = telemetry.controlBytes
+            candidateExecutionMode = telemetry.executionMode.rawValue
+            candidateCodecIterations = telemetry.iterations
+            candidateMemoryGate = requestedKVarNMemoryGate
+            print(
+                "# KVarN storage: payload=\(telemetry.payloadBytes), "
+                    + "metadata=\(telemetry.metadataBytes), "
+                    + "alignment_padding=\(telemetry.alignmentPaddingBytes), "
+                    + "fp16_sink=\(telemetry.fp16SinkBytes), "
+                    + "fp16_tail=\(telemetry.fp16TailBytes), "
+                    + "control=\(telemetry.controlBytes), "
+                    + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "evidence_total=\(evidenceTotalBytes), "
+                    + "capacity=\(telemetry.capacityTokens), "
+                    + "layers=\(telemetry.layerCount), "
+                    + "kv_heads=\(telemetry.kvHeadCount), "
+                    + "head_dim=\(telemetry.headDimension), "
+                    + "iterations=\(telemetry.iterations), "
+                    + "execution_mode=\(telemetry.executionMode.rawValue)")
+        case .fp16, .turboQuant:
             // These rows remain exploratory until their formats expose the same complete
             // runtime allocation contract. Promotion continues to fail closed below.
             candidateFormat = nil
             storage = nil
             actualControlBytes = nil
+            candidateExecutionMode = nil
+            candidateCodecIterations = nil
+            candidateMemoryGate = nil
         }
 
         let frontier = KVFrontierEvidence(
@@ -851,7 +1036,10 @@ func runKL(_ flags: Flags) async {
             candidateModel: candidateIdentity,
             referenceModel: referenceIdentity,
             candidateFormat: candidateFormat, storage: storage,
-            actualControlBytes: actualControlBytes)
+            actualControlBytes: actualControlBytes,
+            candidateExecutionMode: candidateExecutionMode,
+            candidateCodecIterations: candidateCodecIterations,
+            candidateMemoryGate: candidateMemoryGate)
         let payload = KLPayload(
             kvQuantTier: requestedKVQuantTier,
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,

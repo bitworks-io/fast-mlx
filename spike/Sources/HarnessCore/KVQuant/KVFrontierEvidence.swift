@@ -99,6 +99,190 @@ public struct KVStorageEvidence: Codable, Equatable, Sendable {
     }
 }
 
+/// Projection of one raw `spike-cli kvarn-memory-probe` JSONL row. The probe's larger nested
+/// payload remains available in the raw artifact; these are the fields required to authenticate
+/// and derive the promotion gate without trusting a hand-written summary.
+public struct KVarNMemoryProbeArtifactConfiguration:
+    Codable, Equatable, Sendable
+{
+    public let phase: String
+    public let heads: Int
+    public let headDimension: Int
+    public let groupSize: Int
+    public let iterations: Int
+    public let capacity: Int
+    public let cacheLimitBytes: Int
+    public let run: Int
+
+    public init(
+        phase: String, heads: Int, headDimension: Int, groupSize: Int,
+        iterations: Int, capacity: Int, cacheLimitBytes: Int, run: Int
+    ) {
+        self.phase = phase
+        self.heads = heads
+        self.headDimension = headDimension
+        self.groupSize = groupSize
+        self.iterations = iterations
+        self.capacity = capacity
+        self.cacheLimitBytes = cacheLimitBytes
+        self.run = run
+    }
+}
+
+public struct KVarNMemoryProbeArtifactHighWater:
+    Codable, Equatable, Sendable
+{
+    public let observedPeakActiveBytes: Int
+    public let transientActiveAboveRetainedBytes: Int
+
+    public init(
+        observedPeakActiveBytes: Int,
+        transientActiveAboveRetainedBytes: Int
+    ) {
+        self.observedPeakActiveBytes = observedPeakActiveBytes
+        self.transientActiveAboveRetainedBytes =
+            transientActiveAboveRetainedBytes
+    }
+}
+
+public struct KVarNMemoryProbeArtifactRow: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let harnessSHA: String
+    public let mlxSwiftVersion: String
+    public let hardwareChip: String
+    public let hardwareOS: String
+    public let hardwareRAMBytes: UInt64
+    public let configuration: KVarNMemoryProbeArtifactConfiguration
+    public let evaluatedArrayCount: Int
+    public let expectedEvaluatedArrayCount: Int
+    public let valuesFinite: Bool
+    public let highWater: KVarNMemoryProbeArtifactHighWater
+    public let status: String
+
+    public init(
+        schemaVersion: Int, harnessSHA: String, mlxSwiftVersion: String,
+        hardwareChip: String, hardwareOS: String,
+        hardwareRAMBytes: UInt64,
+        configuration: KVarNMemoryProbeArtifactConfiguration,
+        evaluatedArrayCount: Int, expectedEvaluatedArrayCount: Int,
+        valuesFinite: Bool, highWater: KVarNMemoryProbeArtifactHighWater,
+        status: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.harnessSHA = harnessSHA
+        self.mlxSwiftVersion = mlxSwiftVersion
+        self.hardwareChip = hardwareChip
+        self.hardwareOS = hardwareOS
+        self.hardwareRAMBytes = hardwareRAMBytes
+        self.configuration = configuration
+        self.evaluatedArrayCount = evaluatedArrayCount
+        self.expectedEvaluatedArrayCount = expectedEvaluatedArrayCount
+        self.valuesFinite = valuesFinite
+        self.highWater = highWater
+        self.status = status
+    }
+}
+
+public enum KVarNMemoryProbeArtifact {
+    /// Decode strict JSON Lines while preserving the original `Data` for the caller's digest.
+    /// One optional final newline is accepted; empty internal rows and multiple trailing newlines
+    /// are rejected so a matrix cannot silently lose a malformed row during reduction.
+    public static func decodeJSONL(
+        _ data: Data
+    ) throws -> [KVarNMemoryProbeArtifactRow] {
+        guard let contents = String(data: data, encoding: .utf8),
+            !contents.isEmpty
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+        var lines = contents.split(
+            separator: "\n", omittingEmptySubsequences: false)
+        if lines.last?.isEmpty == true {
+            lines.removeLast()
+        }
+        guard !lines.isEmpty,
+            lines.allSatisfy({
+                !String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+            })
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+
+        do {
+            let decoder = JSONDecoder()
+            return try lines.map {
+                try decoder.decode(
+                    KVarNMemoryProbeArtifactRow.self,
+                    from: Data($0.utf8))
+            }
+        } catch {
+            throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+        }
+    }
+}
+
+private struct KVarNMemoryProbeMatrixKey: Hashable {
+    let iterations: Int
+    let phase: String
+    let capacity: Int
+    let run: Int
+}
+
+/// Compact, embedded reference to the separately measured KVarN allocator/high-water matrix.
+/// Storage accounting intentionally describes cache arrays plus logical materialization; this
+/// gate proves the float32 codec scratch and full cache-boundary peak were measured on the same
+/// committed engine/runtime before a KVarN quality row can become promotion evidence.
+public struct KVarNMemoryGateEvidence: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let artifactSHA256: String
+    public let harnessGitSHA: String
+    public let mlxSwiftVersion: String
+    public let hardwareChip: String
+    public let hardwareOS: String
+    public let hardwareRAMBytes: UInt64
+    public let runtimeTier: String
+    public let codecIterations: Int
+    public let cacheBoundaryMaximumCapacityTokens: Int
+    public let encodeSampleCount: Int
+    public let decodeSampleCount: Int
+    public let cacheBoundarySampleCount: Int
+    public let encodeTransientPeakBytes: Int
+    public let decodeTransientPeakBytes: Int
+    public let cacheBoundaryTransientPeakBytes: Int
+    public let maximumPeakActiveBytes: Int
+
+    init(
+        schemaVersion: Int, artifactSHA256: String,
+        harnessGitSHA: String, mlxSwiftVersion: String,
+        hardwareChip: String, hardwareOS: String,
+        hardwareRAMBytes: UInt64,
+        runtimeTier: String, codecIterations: Int,
+        cacheBoundaryMaximumCapacityTokens: Int,
+        encodeSampleCount: Int, decodeSampleCount: Int,
+        cacheBoundarySampleCount: Int,
+        encodeTransientPeakBytes: Int,
+        decodeTransientPeakBytes: Int,
+        cacheBoundaryTransientPeakBytes: Int,
+        maximumPeakActiveBytes: Int
+    ) {
+        self.schemaVersion = schemaVersion
+        self.artifactSHA256 = artifactSHA256
+        self.harnessGitSHA = harnessGitSHA
+        self.mlxSwiftVersion = mlxSwiftVersion
+        self.hardwareChip = hardwareChip
+        self.hardwareOS = hardwareOS
+        self.hardwareRAMBytes = hardwareRAMBytes
+        self.runtimeTier = runtimeTier
+        self.codecIterations = codecIterations
+        self.cacheBoundaryMaximumCapacityTokens =
+            cacheBoundaryMaximumCapacityTokens
+        self.encodeSampleCount = encodeSampleCount
+        self.decodeSampleCount = decodeSampleCount
+        self.cacheBoundarySampleCount = cacheBoundarySampleCount
+        self.encodeTransientPeakBytes = encodeTransientPeakBytes
+        self.decodeTransientPeakBytes = decodeTransientPeakBytes
+        self.cacheBoundaryTransientPeakBytes = cacheBoundaryTransientPeakBytes
+        self.maximumPeakActiveBytes = maximumPeakActiveBytes
+    }
+}
+
 /// Context that turns a general teacher-forced KL row into a matrix cell eligible for a verdict.
 /// Geometry/storage remain optional for backward-compatible exploratory rows, but the promotion
 /// validator requires both and refuses any predicted-vs-actual mismatch. `storage` describes the
@@ -116,6 +300,12 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     public let candidateFormat: KVFormatGeometryEvidence?
     public let storage: KVStorageEvidence?
     public let actualControlBytes: Int?
+    /// Runtime facts that materially affect KVarN cost while leaving its packed layout unchanged.
+    /// They remain optional for historical affine/fp16 records; KVarN format evidence requires
+    /// both and fails closed unless it used the declared correctness path and iteration cell.
+    public let candidateExecutionMode: String?
+    public let candidateCodecIterations: Int?
+    public let candidateMemoryGate: KVarNMemoryGateEvidence?
 
     public init(
         schemaVersion: Int, matrixID: String, cellID: String,
@@ -125,7 +315,10 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         referenceModel: KVModelEvidenceIdentity,
         candidateFormat: KVFormatGeometryEvidence?,
         storage: KVStorageEvidence?,
-        actualControlBytes: Int? = nil
+        actualControlBytes: Int? = nil,
+        candidateExecutionMode: String? = nil,
+        candidateCodecIterations: Int? = nil,
+        candidateMemoryGate: KVarNMemoryGateEvidence? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.matrixID = matrixID
@@ -138,6 +331,9 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         self.candidateFormat = candidateFormat
         self.storage = storage
         self.actualControlBytes = actualControlBytes
+        self.candidateExecutionMode = candidateExecutionMode
+        self.candidateCodecIterations = candidateCodecIterations
+        self.candidateMemoryGate = candidateMemoryGate
     }
 }
 
@@ -243,6 +439,10 @@ public enum KVFrontierEvidenceError: Error, Equatable, Sendable {
     case missingStorage
     case missingControlStorage
     case invalidControlStorage
+    case invalidRuntimeEvidence
+    case missingMemoryGateEvidence
+    case invalidMemoryGateEvidence
+    case memoryGateProvenanceMismatch
     case storageMismatch
     case storagePredictionMismatch
     case invalidMetric(String)
@@ -389,6 +589,9 @@ public extension KLPayload {
         }
         guard let frontier else { throw KVFrontierEvidenceError.missingFrontier }
         try frontier.validateForPromotion(candidateTier: kvQuantTier)
+        guard let candidateFormat = frontier.candidateFormat,
+            candidateFormat.capacityTokens >= maxScoredContextTokens
+        else { throw KVFrontierEvidenceError.invalidGeometry }
         return self
     }
 
@@ -399,6 +602,207 @@ public extension KLPayload {
         let punctuation = CharacterSet(charactersIn: "-._:/@+")
         return value.unicodeScalars.allSatisfy {
             CharacterSet.alphanumerics.contains($0) || punctuation.contains($0)
+        }
+    }
+}
+
+public extension KVarNMemoryGateEvidence {
+    /// Authenticate and reduce the closed raw probe matrix into the compact gate embedded in a
+    /// quality record. The digest is computed by the CLI over the complete JSONL bytes; this
+    /// reducer independently rejects missing, duplicated, substituted, or mixed-provenance rows.
+    static func derived(
+        from rows: [KVarNMemoryProbeArtifactRow],
+        artifactSHA256: String,
+        runtimeTier: String
+    ) throws -> KVarNMemoryGateEvidence {
+        let targetIterations: Int
+        switch runtimeTier {
+        case "kvarn-k4v2-g128":
+            targetIterations = 8
+        case "kvarn-k4v2-g128-i16":
+            targetIterations = 16
+        default:
+            throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+        }
+        guard Self.isHex(artifactSHA256, lengths: [64]),
+            rows.count == 15 || rows.count == 30,
+            let first = rows.first
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+
+        var keys = Set<KVarNMemoryProbeMatrixKey>()
+        var presentIterations = Set<Int>()
+        for row in rows {
+            let configuration = row.configuration
+            let expectedArrayCount: Int
+            switch configuration.phase {
+            case "encode":
+                expectedArrayCount = 8
+                guard configuration.capacity == 256 else {
+                    throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+                }
+            case "decode":
+                expectedArrayCount = 2
+                guard configuration.capacity == 256 else {
+                    throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+                }
+            case "cache-boundary":
+                expectedArrayCount = 15
+                guard [256, 4_096, 24_192].contains(configuration.capacity) else {
+                    throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+                }
+            default:
+                throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+            }
+
+            guard row.schemaVersion == 3,
+                Self.isHex(row.harnessSHA, lengths: [40, 64]),
+                Self.isEvidenceValue(row.mlxSwiftVersion),
+                Self.isEvidenceValue(row.hardwareChip),
+                Self.isEvidenceValue(row.hardwareOS),
+                row.hardwareRAMBytes > 0,
+                row.harnessSHA == first.harnessSHA,
+                row.mlxSwiftVersion == first.mlxSwiftVersion,
+                row.hardwareChip == first.hardwareChip,
+                row.hardwareOS == first.hardwareOS,
+                row.hardwareRAMBytes == first.hardwareRAMBytes,
+                configuration.heads == 8,
+                configuration.headDimension == 128,
+                configuration.groupSize == 128,
+                configuration.iterations == 8 || configuration.iterations == 16,
+                configuration.cacheLimitBytes == 0,
+                (1 ... 3).contains(configuration.run),
+                row.evaluatedArrayCount == expectedArrayCount,
+                row.expectedEvaluatedArrayCount == expectedArrayCount,
+                row.valuesFinite,
+                row.highWater.observedPeakActiveBytes > 0,
+                row.highWater.transientActiveAboveRetainedBytes > 0,
+                row.highWater.transientActiveAboveRetainedBytes
+                    <= row.highWater.observedPeakActiveBytes,
+                row.status == "PASS"
+            else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+
+            let key = KVarNMemoryProbeMatrixKey(
+                iterations: configuration.iterations,
+                phase: configuration.phase,
+                capacity: configuration.capacity,
+                run: configuration.run)
+            guard keys.insert(key).inserted else {
+                throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+            }
+            presentIterations.insert(configuration.iterations)
+        }
+
+        let targetOnly = Set([targetIterations])
+        let bothCells = Set([8, 16])
+        guard presentIterations == targetOnly || presentIterations == bothCells else {
+            throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+        }
+        for iterations in presentIterations {
+            let actualKeys = Set(keys.filter { $0.iterations == iterations })
+            guard actualKeys == Self.expectedMatrixKeys(iterations: iterations) else {
+                throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+            }
+        }
+
+        let targetRows = rows.filter {
+            $0.configuration.iterations == targetIterations
+        }
+        let encodeRows = targetRows.filter { $0.configuration.phase == "encode" }
+        let decodeRows = targetRows.filter { $0.configuration.phase == "decode" }
+        let cacheBoundaryRows = targetRows.filter {
+            $0.configuration.phase == "cache-boundary"
+        }
+        guard let encodePeak = encodeRows.map(
+            \.highWater.transientActiveAboveRetainedBytes).max(),
+            let decodePeak = decodeRows.map(
+                \.highWater.transientActiveAboveRetainedBytes).max(),
+            let cacheBoundaryPeak = cacheBoundaryRows.map(
+                \.highWater.transientActiveAboveRetainedBytes).max(),
+            let maximumPeak = targetRows.map(
+                \.highWater.observedPeakActiveBytes).max(),
+            let maximumCapacity = cacheBoundaryRows.map(
+                \.configuration.capacity).max()
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+
+        return KVarNMemoryGateEvidence(
+            schemaVersion: 1,
+            artifactSHA256: artifactSHA256,
+            harnessGitSHA: first.harnessSHA,
+            mlxSwiftVersion: first.mlxSwiftVersion,
+            hardwareChip: first.hardwareChip,
+            hardwareOS: first.hardwareOS,
+            hardwareRAMBytes: first.hardwareRAMBytes,
+            runtimeTier: runtimeTier,
+            codecIterations: targetIterations,
+            cacheBoundaryMaximumCapacityTokens: maximumCapacity,
+            encodeSampleCount: encodeRows.count,
+            decodeSampleCount: decodeRows.count,
+            cacheBoundarySampleCount: cacheBoundaryRows.count,
+            encodeTransientPeakBytes: encodePeak,
+            decodeTransientPeakBytes: decodePeak,
+            cacheBoundaryTransientPeakBytes: cacheBoundaryPeak,
+            maximumPeakActiveBytes: maximumPeak)
+    }
+
+    @discardableResult
+    func validated(
+        candidateTier: String, candidateIterations: Int
+    ) throws -> KVarNMemoryGateEvidence {
+        let transientPeaks = [
+            encodeTransientPeakBytes,
+            decodeTransientPeakBytes,
+            cacheBoundaryTransientPeakBytes,
+        ]
+        guard schemaVersion == 1,
+            Self.isHex(artifactSHA256, lengths: [64]),
+            Self.isHex(harnessGitSHA, lengths: [40, 64]),
+            Self.isEvidenceValue(mlxSwiftVersion),
+            Self.isEvidenceValue(hardwareChip),
+            Self.isEvidenceValue(hardwareOS),
+            hardwareRAMBytes > 0,
+            runtimeTier == candidateTier,
+            codecIterations == candidateIterations,
+            cacheBoundaryMaximumCapacityTokens == 24_192,
+            encodeSampleCount == 3,
+            decodeSampleCount == 3,
+            cacheBoundarySampleCount == 9,
+            transientPeaks.allSatisfy({ $0 > 0 }),
+            maximumPeakActiveBytes > 0,
+            maximumPeakActiveBytes >= (transientPeaks.max() ?? 0)
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+        return self
+    }
+
+    private static func expectedMatrixKeys(
+        iterations: Int
+    ) -> Set<KVarNMemoryProbeMatrixKey> {
+        var result = Set<KVarNMemoryProbeMatrixKey>()
+        for run in 1 ... 3 {
+            result.insert(KVarNMemoryProbeMatrixKey(
+                iterations: iterations, phase: "encode",
+                capacity: 256, run: run))
+            result.insert(KVarNMemoryProbeMatrixKey(
+                iterations: iterations, phase: "decode",
+                capacity: 256, run: run))
+            for capacity in [256, 4_096, 24_192] {
+                result.insert(KVarNMemoryProbeMatrixKey(
+                    iterations: iterations, phase: "cache-boundary",
+                    capacity: capacity, run: run))
+            }
+        }
+        return result
+    }
+
+    private static func isEvidenceValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !trimmed.isEmpty && trimmed == value
+            && !trimmed.contains("\n") && !trimmed.contains("\r")
+    }
+
+    private static func isHex(_ value: String, lengths: Set<Int>) -> Bool {
+        guard lengths.contains(value.count) else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdefABCDEF").contains($0)
         }
     }
 }
@@ -432,6 +836,11 @@ private extension KVFrontierEvidence {
 
         switch (candidateFormat, storage) {
         case (.none, .none):
+            guard candidateExecutionMode == nil, candidateCodecIterations == nil,
+                candidateMemoryGate == nil
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
             break
         case (.some(let format), .some(let storage)):
             try format.validate()
@@ -443,6 +852,49 @@ private extension KVFrontierEvidence {
                 workspaceBytes: storage.predicted.workspaceBytes)
             guard expected == storage.predicted else {
                 throw KVFrontierEvidenceError.storagePredictionMismatch
+            }
+            switch format.kind {
+            case .kvarn:
+                let expectedIterations = format.tier.hasSuffix("-i16") ? 16 : 8
+                let expectedCellID = format.tier.hasSuffix("-i16")
+                    ? format.tier : "\(format.tier)-i8"
+                guard candidateExecutionMode == "uncompiled-correctness",
+                    let candidateCodecIterations,
+                    candidateCodecIterations == expectedIterations,
+                    cellID == expectedCellID
+                else { throw KVFrontierEvidenceError.invalidRuntimeEvidence }
+                guard let actualControlBytes else {
+                    throw KVFrontierEvidenceError.missingControlStorage
+                }
+                let (expectedControlBytes, controlOverflow) = format.layerCount
+                    .multipliedReportingOverflow(by: MemoryLayout<Int32>.size)
+                guard !controlOverflow else {
+                    throw KVFrontierEvidenceError.storageArithmeticOverflow
+                }
+                guard actualControlBytes == expectedControlBytes else {
+                    throw KVFrontierEvidenceError.invalidControlStorage
+                }
+                if let candidateMemoryGate {
+                    guard format.kvHeadCount == 8,
+                        format.headDimension == 128
+                    else {
+                        throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+                    }
+                    try candidateMemoryGate.validated(
+                        candidateTier: format.tier,
+                        candidateIterations: candidateCodecIterations)
+                    guard format.capacityTokens
+                        <= candidateMemoryGate.cacheBoundaryMaximumCapacityTokens
+                    else {
+                        throw KVFrontierEvidenceError.invalidMemoryGateEvidence
+                    }
+                }
+            case .fp16, .affine:
+                guard candidateExecutionMode == nil, candidateCodecIterations == nil,
+                    candidateMemoryGate == nil
+                else {
+                    throw KVFrontierEvidenceError.invalidRuntimeEvidence
+                }
             }
         case (.none, .some):
             throw KVFrontierEvidenceError.missingFormat
@@ -460,6 +912,9 @@ private extension KVFrontierEvidence {
         guard let storage else { throw KVFrontierEvidenceError.missingStorage }
         guard actualControlBytes != nil else {
             throw KVFrontierEvidenceError.missingControlStorage
+        }
+        if candidateFormat?.kind == .kvarn, candidateMemoryGate == nil {
+            throw KVFrontierEvidenceError.missingMemoryGateEvidence
         }
         try storage.validate(requireExactMatch: true)
     }
@@ -520,12 +975,25 @@ private extension KVFormatGeometryEvidence {
                 metadataScalarBytes: metadataScalarBytes)
         case .kvarn:
             expectedTier = "kvarn-k\(keyBits)v\(valueBits)-g\(groupSize)"
+            guard keyBits == 4, valueBits == 2, groupSize == 128,
+                sinkTokens == 128, metadataScalarBytes == 2,
+                recordAlignment == 8, sequences == 1,
+                capacityTokens <= Int(Int32.max)
+            else { throw KVFrontierEvidenceError.invalidGeometry }
             format = .kvarn(
                 keyBits: keyBits, valueBits: valueBits, groupSize: groupSize,
                 sinkTokens: sinkTokens, metadataScalarBytes: metadataScalarBytes,
                 alignment: recordAlignment)
         }
-        guard tier == expectedTier else { throw KVFrontierEvidenceError.invalidGeometry }
+        let acceptedTiers: Set<String>
+        if kind == .kvarn {
+            acceptedTiers = [expectedTier, "\(expectedTier)-i16"]
+        } else {
+            acceptedTiers = [expectedTier]
+        }
+        guard acceptedTiers.contains(tier) else {
+            throw KVFrontierEvidenceError.invalidGeometry
+        }
 
         do {
             let allocation = try format.allocation(
@@ -604,6 +1072,16 @@ public extension ResultRecord where Payload == KLPayload {
         guard Self.isEvidenceValue(provenance.corpusId),
             Self.isEvidenceValue(provenance.corpusContentHash)
         else { throw KVFrontierEvidenceError.invalidPromotionProvenance("corpus") }
+        if let memoryGate = payload.frontier?.candidateMemoryGate {
+            guard memoryGate.harnessGitSHA == provenance.harnessGitSHA,
+                memoryGate.mlxSwiftVersion == provenance.mlxSwiftVersion,
+                memoryGate.hardwareChip == provenance.hardwareChip,
+                memoryGate.hardwareOS == provenance.hardwareOS,
+                memoryGate.hardwareRAMBytes == provenance.hardwareRAMBytes
+            else {
+                throw KVFrontierEvidenceError.memoryGateProvenanceMismatch
+            }
+        }
         return self
     }
 

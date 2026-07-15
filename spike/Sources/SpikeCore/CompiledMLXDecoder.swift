@@ -309,4 +309,22 @@ public struct CompiledMLXDecoder: Decoder {
             "affine tier requested but the decoder contains a different cache type")
         return AffineKVCacheTelemetry.capture(tier: tier, caches: affineCaches)
     }
+
+    /// Post-run KVarN engagement, runtime cell, geometry, and exact storage bytes. All MLX
+    /// arrays remain inside the decoder's inference actor; only this scalar `Sendable` snapshot
+    /// crosses into harness evidence.
+    public func kvarnKVTelemetry() -> KVarNKVCacheTelemetry? {
+        guard case .kvarn(let cell) = kvCacheKind else { return nil }
+        let kvarnCaches = caches.compactMap { $0 as? KVarNKVCache }
+        precondition(
+            kvarnCaches.count == caches.count,
+            "KVarN tier requested but the decoder contains a different cache type")
+        let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+        precondition(
+            telemetry.tier == cell.tier
+                && telemetry.iterations == cell.iterations
+                && telemetry.executionMode == executionMode,
+            "KVarN decoder telemetry does not match its requested runtime cell")
+        return telemetry
+    }
 }

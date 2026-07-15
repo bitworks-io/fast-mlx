@@ -33,7 +33,7 @@ public enum KVCacheKind: Sendable, Hashable {
     case fp16
     case affine(AffineKVTier)
     case turboQuant(TurboQuantTier)
-    case kvarn(KVarNKVTier)
+    case kvarn(KVarNKVRuntimeCell)
 
     /// Maps a `RunConfig.kvQuant` string. `nil`/`"fp16"` → `.fp16`; affine cells accept
     /// only `AffineKVTier`'s canonical raw values, while TurboQuant accepts both the harness
@@ -48,8 +48,8 @@ public enum KVCacheKind: Sendable, Hashable {
                 self = .affine(tier)
                 return
             }
-            if let tier = KVarNKVTier(rawValue: s) {
-                self = .kvarn(tier)
+            if let cell = KVarNKVRuntimeCell(rawValue: s) {
+                self = .kvarn(cell)
                 return
             }
             guard
@@ -72,10 +72,10 @@ public enum KVCacheKind: Sendable, Hashable {
             AffineKVCache(capacity: capacity, configuration: tier.configuration)
         case .turboQuant(let tier):
             TurboQuantKVCache(capacity: capacity, tier: tier)
-        case .kvarn(let tier):
+        case .kvarn(let cell):
             KVarNKVCache(
-                capacity: capacity, tier: tier,
-                iterations: tier.matrixIterationCount)
+                capacity: capacity, tier: cell.tier,
+                iterations: cell.iterations)
         }
     }
 

@@ -303,6 +303,22 @@ public enum KVarNMemoryEvidence {
         }
     }
 
+    /// Evidence-only finite-value reduction for the closed probe array dtypes. Unknown storage
+    /// types fail closed. Callers take their high-water snapshot before invoking this helper so
+    /// the validation graph cannot inflate the measured operation peak.
+    package static func probeArraysAreFinite(_ arrays: [MLXArray]) -> Bool {
+        arrays.allSatisfy { array in
+            switch array.dtype {
+            case .float16, .bfloat16, .float32:
+                isFinite(array).all().item(Bool.self)
+            case .uint8, .int32:
+                true
+            default:
+                false
+            }
+        }
+    }
+
     /// Mirrors MLX's Metal allocator: requests at or below one VM page retain their logical byte
     /// size; larger requests round up to the next page boundary.
     package static func allocatorBytes(

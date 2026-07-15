@@ -276,4 +276,16 @@ final class KVarNMemoryEvidenceTests: XCTestCase {
         XCTAssertEqual(cache.storageSnapshot(), snapshot)
         XCTAssertEqual(cache.offset, 383)
     }
+
+    func testProbeFinitenessMeasuresFloatingOutputsAndAcceptsStorageScalars() {
+        let finite = MLXArray([Float16(1), Float16(-2)])
+        let payload = MLXArray([UInt8(0), UInt8.max])
+        let control = MLXArray([Int32(0), Int32(4)])
+        XCTAssertTrue(KVarNMemoryEvidence.probeArraysAreFinite([
+            finite, payload, control,
+        ]))
+
+        let nonFinite = MLXArray([Float16.nan])
+        XCTAssertFalse(KVarNMemoryEvidence.probeArraysAreFinite([nonFinite]))
+    }
 }

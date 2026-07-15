@@ -384,9 +384,9 @@ public enum KVarNMLXCodec {
     }
 }
 
-/// The first runtime-admitted KVarN storage cell. The tier name fixes the format geometry;
-/// balancing iterations remain an explicit cache/evidence field because eight and sixteen are
-/// separate audit cells even though they share the same packed layout.
+/// The first runtime-admitted KVarN storage geometry. Runtime balancing work is represented by
+/// `KVarNKVRuntimeCell`: eight and sixteen iterations share these exact persistent arrays but
+/// are separate user-visible speed/quality cells.
 public enum KVarNKVTier: String, CaseIterable, Sendable, Hashable {
     case k4v2G128 = "kvarn-k4v2-g128"
 
@@ -395,7 +395,23 @@ public enum KVarNKVTier: String, CaseIterable, Sendable, Hashable {
     public var groupSize: Int { 128 }
     public var sinkTokens: Int { 128 }
     public var alignment: Int { 8 }
-    public var matrixIterationCount: Int { 8 }
+}
+
+/// Closed runtime cells for the admitted KVarN geometry. The eight-iteration cell keeps the
+/// original canonical spelling; the explicit `-i16` suffix prevents evidence for the slower
+/// balancing pass from being mislabeled as the faster cell.
+public enum KVarNKVRuntimeCell: String, CaseIterable, Sendable, Hashable {
+    case k4v2G128I8 = "kvarn-k4v2-g128"
+    case k4v2G128I16 = "kvarn-k4v2-g128-i16"
+
+    public var tier: KVarNKVTier { .k4v2G128 }
+
+    public var iterations: Int {
+        switch self {
+        case .k4v2G128I8: 8
+        case .k4v2G128I16: 16
+        }
+    }
 }
 
 /// Actual persistent MLX arrays owned by one KVarN layer cache plus the full K/V pair returned

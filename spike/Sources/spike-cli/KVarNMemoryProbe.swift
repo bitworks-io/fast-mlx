@@ -50,6 +50,9 @@ private struct KVarNMemoryProbeResult: Encodable {
     let schemaVersion: Int
     let harnessSHA: String
     let mlxSwiftVersion: String
+    let hardwareChip: String
+    let hardwareOS: String
+    let hardwareRAMBytes: UInt64
     let configuration: KVarNMemoryProbeConfiguration
     let persistentLogicalBytes: Int
     let materializationLogicalBytes: Int
@@ -65,6 +68,24 @@ private struct KVarNMemoryProbeResult: Encodable {
     let cacheBoundaryStructuralMemory: KVarNCacheBoundaryStructuralMemory?
     let highWater: KVarNMemoryHighWater
     let status: String
+}
+
+private func probeHardwareChip() -> String {
+    var size = 0
+    sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+    guard size > 0 else { return "unknown" }
+    var buffer = [CChar](repeating: 0, count: size)
+    let result = sysctlbyname(
+        "machdep.cpu.brand_string", &buffer, &size, nil, 0)
+    guard result == 0 else { return "unknown" }
+    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+    return String(decoding: bytes, as: UTF8.self)
+        .trimmingCharacters(in: .whitespaces)
+}
+
+private func probeHardwareOS() -> String {
+    let version = ProcessInfo.processInfo.operatingSystemVersion
+    return "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
 }
 
 func kvarnMemoryProbe(flags: Flags) {
@@ -154,7 +175,7 @@ private func runKVarNEncodeMemoryProbe(
         materializationLogicalBytes: 0, controlLogicalBytes: 0,
         evaluatedArrayCount: measurement.evaluatedArrayCount,
         expectedEvaluatedArrayCount: 8,
-        valuesFinite: true,
+        valuesFinite: measurement.valuesFinite,
         emptyBaseline: emptyBaseline,
         allocatorPageBytes: allocatorPageBytes,
         startLogicalBytes: inputLogicalBytes,
@@ -196,7 +217,7 @@ private func runKVarNDecodeMemoryProbe(
         controlLogicalBytes: 0,
         evaluatedArrayCount: measurement.evaluatedArrayCount,
         expectedEvaluatedArrayCount: 2,
-        valuesFinite: true,
+        valuesFinite: measurement.valuesFinite,
         emptyBaseline: emptyBaseline,
         allocatorPageBytes: allocatorPageBytes,
         startLogicalBytes: persistentLogicalBytes,
@@ -255,7 +276,7 @@ private func runKVarNCacheBoundaryMemoryProbe(
         controlLogicalBytes: measurement.snapshot.controlBytes,
         evaluatedArrayCount: measurement.evaluatedArrayCount,
         expectedEvaluatedArrayCount: 15,
-        valuesFinite: true,
+        valuesFinite: measurement.valuesFinite,
         emptyBaseline: emptyBaseline,
         allocatorPageBytes: allocatorPageBytes,
         startLogicalBytes: startAccounting.logicalBytes,
@@ -289,7 +310,7 @@ private func measureKVarNEncode(
     configuration: KVarNMemoryProbeConfiguration
 ) throws -> (
     record: KVarNMLXRecord, end: KVarNMemoryCounters,
-    evaluatedArrayCount: Int
+    evaluatedArrayCount: Int, valuesFinite: Bool
 ) {
     let record = try KVarNMLXCodec.quantize(
         keys: inputs.keys, values: inputs.values,
@@ -297,24 +318,26 @@ private func measureKVarNEncode(
     let arrays = recordArrays(record)
     eval(arrays)
     let end = memoryCounters()
+    let valuesFinite = KVarNMemoryEvidence.probeArraysAreFinite(arrays)
     let detached = try KVarNMLXCodec.detachedStorageCopy(of: record)
     eval(recordArrays(detached))
-    return (detached, end, arrays.count)
+    return (detached, end, arrays.count, valuesFinite)
 }
 
 private func measureKVarNDecode(
     _ record: KVarNMLXRecord
 ) throws -> (
     outputs: [MLXArray], end: KVarNMemoryCounters,
-    evaluatedArrayCount: Int
+    evaluatedArrayCount: Int, valuesFinite: Bool
 ) {
     let reconstruction = try KVarNMLXCodec.dequantize(record)
     let outputs = [reconstruction.keys, reconstruction.values]
     eval(outputs)
     let end = memoryCounters()
+    let valuesFinite = KVarNMemoryEvidence.probeArraysAreFinite(outputs)
     let detached = try outputs.map(detachedArray)
     eval(detached)
-    return (detached, end, outputs.count)
+    return (detached, end, outputs.count, valuesFinite)
 }
 
 private func measureKVarNCacheBoundary(
@@ -323,13 +346,15 @@ private func measureKVarNCacheBoundary(
     configuration: KVarNMemoryProbeConfiguration
 ) throws -> (
     outputs: [MLXArray], end: KVarNMemoryCounters,
-    evaluatedArrayCount: Int, snapshot: KVarNKVCacheStorageSnapshot
+    evaluatedArrayCount: Int, valuesFinite: Bool,
+    snapshot: KVarNKVCacheStorageSnapshot
 ) {
     let materialized = cache.update(keys: trigger.keys, values: trigger.values)
     let outputs = [materialized.0, materialized.1]
     let evaluated = outputs + cache.innerState()
     eval(evaluated)
     let end = memoryCounters()
+    let valuesFinite = KVarNMemoryEvidence.probeArraysAreFinite(evaluated)
     guard let snapshot = cache.storageSnapshot(),
         cache.offset == configuration.capacity,
         cache.completedTileCount == configuration.completedTileCapacity
@@ -337,7 +362,7 @@ private func measureKVarNCacheBoundary(
     let detachedOutputs = try outputs.map(detachedArray)
     eval(detachedOutputs)
     try KVarNMemoryEvidence.detachCacheStorage(cache)
-    return (detachedOutputs, end, evaluated.count, snapshot)
+    return (detachedOutputs, end, evaluated.count, valuesFinite, snapshot)
 }
 
 private func makePreparedKVarNCache(
@@ -567,8 +592,12 @@ private func makeProbeResult<T>(
     }
     return withExtendedLifetime(retained) {
         KVarNMemoryProbeResult(
-            schemaVersion: 2, harnessSHA: harnessSHA,
-            mlxSwiftVersion: "0.31.6", configuration: configuration,
+            schemaVersion: 3, harnessSHA: harnessSHA,
+            mlxSwiftVersion: "0.31.6",
+            hardwareChip: probeHardwareChip(),
+            hardwareOS: probeHardwareOS(),
+            hardwareRAMBytes: ProcessInfo.processInfo.physicalMemory,
+            configuration: configuration,
             persistentLogicalBytes: persistentLogicalBytes,
             materializationLogicalBytes: materializationLogicalBytes,
             controlLogicalBytes: controlLogicalBytes,

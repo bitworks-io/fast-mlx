@@ -34,6 +34,11 @@ actor HarnessEngineActor {
     /// Largest affine scoring allocation observed in this actor. Scoring caches are ephemeral,
     /// so their scalar geometry/byte evidence must be retained before the arrays are released.
     private var maximumAffineScoringTelemetry: AffineKVCacheTelemetry?
+    /// KVarN cells share packed geometry but not codec work. Key retained scalar evidence by
+    /// runtime cell so an i8 scoring pass can never be mislabeled as i16 (or vice versa).
+    private var maximumKVarNScoringTelemetry: [
+        KVarNKVRuntimeCell: KVarNKVCacheTelemetry
+    ] = [:]
 
     init(model: sending any LanguageModel) {
         self.model = model
@@ -42,12 +47,13 @@ actor HarnessEngineActor {
     /// Greedy decode via the compiled core. The returned ids INCLUDE a terminal eos if one is
     /// produced (mirroring scripts/harness_reference.py exactly, so token streams diff cleanly).
     /// Quantized-cache engagement is read AFTER timing so its synchronization cannot skew the
-    /// benchmark. Affine returns a Sendable scalar snapshot; TurboQuant retains its legacy token
-    /// marker until that format's evidence schema is generalized.
+    /// benchmark. Affine and KVarN return Sendable scalar snapshots; TurboQuant retains its
+    /// legacy token marker until that format's evidence schema is generalized.
     func generate(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind)
         -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
-            turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?
+            turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?,
+            kvarnTelemetry: KVarNKVCacheTelemetry?
         )
     {
         if decoders[kind] == nil {
@@ -57,7 +63,9 @@ actor HarnessEngineActor {
         defer { decoders[kind] = decoder }
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, [], nil, nil) }
+        guard maxTokens > 0 else {
+            return ([], submitTime, [], nil, nil, nil)
+        }
         var tokens: [Int] = []
         var tokenTimes: [Double] = []
         var tok = decoder.prefill(prompt)
@@ -70,6 +78,7 @@ actor HarnessEngineActor {
         }
         let turboQuantTokens = decoder.turboQuantCachedTokens()
         let affineTelemetry = decoder.affineKVTelemetry()
+        let kvarnTelemetry = decoder.kvarnKVTelemetry()
         if case .turboQuant = kind {
             // A TurboQuant run whose decoder somehow holds an fp16 cache is a plumbing bug,
             // not a measurement — fail loudly (mirrors requireSupported's contract).
@@ -80,7 +89,16 @@ actor HarnessEngineActor {
                 affineTelemetry != nil,
                 "affine tier requested but the affine cache did not engage")
         }
-        return (tokens, submitTime, tokenTimes, turboQuantTokens, affineTelemetry)
+        if case .kvarn(let cell) = kind {
+            precondition(
+                kvarnTelemetry?.tier == cell.tier
+                    && kvarnTelemetry?.iterations == cell.iterations
+                    && kvarnTelemetry?.executionMode == .uncompiledCorrectness,
+                "KVarN tier requested but matching KVarN telemetry did not engage")
+        }
+        return (
+            tokens, submitTime, tokenTimes, turboQuantTokens, affineTelemetry,
+            kvarnTelemetry)
     }
 
     /// Speculative-decoding generate (PLD first): routes to `CompiledMLXDecoder.generateSpec`,
@@ -181,9 +199,9 @@ actor HarnessEngineActor {
 
     /// Scoring-path cache selection (Task 7): the MEASUREMENT forwards must run the same KV
     /// tier the config asked for, not silently fp16 — Phase 3's KL/ppl numbers come through
-    /// here, not through the compiled decode path. fp16 keeps the stock model cache; affine
-    /// and TurboQuant tiers get their requested concrete cache per layer, sized for the whole
-    /// pass up front (scoring knows its total length; no chunked growth needed).
+    /// here, not through the compiled decode path. fp16 keeps the stock model cache; affine,
+    /// KVarN, and TurboQuant tiers get their requested concrete cache per layer, sized for the
+    /// whole pass up front (scoring knows its total length; no chunked growth needed).
     private func makeScoringCache(kind: KVCacheKind, capacity: Int) -> [any KVCache] {
         switch kind {
         case .fp16:
@@ -222,15 +240,38 @@ actor HarnessEngineActor {
             guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
                 preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
             }
-        case .kvarn:
-            guard let kvarn = cache.first as? KVarNKVCache, kvarn.offset >= minTokens else {
+        case .kvarn(let cell):
+            guard let kvarn = cache.first as? KVarNKVCache,
+                kvarn.offset >= minTokens
+            else {
                 preconditionFailure("KVarN tier requested but the KVarN scoring cache did not engage")
+            }
+            let kvarnCaches = cache.compactMap { $0 as? KVarNKVCache }
+            precondition(
+                kvarnCaches.count == cache.count,
+                "KVarN scoring cache contains a different cache type")
+            let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+            precondition(
+                telemetry.tier == cell.tier
+                    && telemetry.iterations == cell.iterations
+                    && telemetry.executionMode == .uncompiledCorrectness,
+                "KVarN scoring telemetry does not match its requested runtime cell")
+            if maximumKVarNScoringTelemetry[cell].map({
+                telemetry.capacityTokens > $0.capacityTokens
+            }) ?? true {
+                maximumKVarNScoringTelemetry[cell] = telemetry
             }
         }
     }
 
     func affineScoringTelemetry() -> AffineKVCacheTelemetry? {
         maximumAffineScoringTelemetry
+    }
+
+    func kvarnScoringTelemetry(
+        for cell: KVarNKVRuntimeCell
+    ) -> KVarNKVCacheTelemetry? {
+        maximumKVarNScoringTelemetry[cell]
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -280,6 +321,19 @@ struct SwiftEngineDriver: EngineDriver {
             counts["affine_control_bytes"] = affine.controlBytes
             counts["affine_workspace_bytes"] = affine.materializationWorkspaceBytes
         }
+        if let kvarn = out.kvarnTelemetry {
+            counts["kvarn_tokens"] = kvarn.cachedTokens
+            counts["kvarn_payload_bytes"] = kvarn.payloadBytes
+            counts["kvarn_metadata_bytes"] = kvarn.metadataBytes
+            counts["kvarn_alignment_padding_bytes"] = kvarn.alignmentPaddingBytes
+            counts["kvarn_fp16_sink_bytes"] = kvarn.fp16SinkBytes
+            counts["kvarn_fp16_tail_bytes"] = kvarn.fp16TailBytes
+            counts["kvarn_control_bytes"] = kvarn.controlBytes
+            counts["kvarn_workspace_bytes"] = kvarn.materializationWorkspaceBytes
+            counts["kvarn_codec_iterations"] = kvarn.iterations
+            counts["kvarn_uncompiled_correctness"] =
+                kvarn.executionMode == .uncompiledCorrectness ? 1 : 0
+        }
         return RunResult(
             tokens: out.tokens,
             engagement: .init(counts),
@@ -308,9 +362,15 @@ struct SwiftEngineDriver: EngineDriver {
         await engine.affineScoringTelemetry()
     }
 
+    func kvarnScoringTelemetry(
+        for cell: KVarNKVRuntimeCell
+    ) async -> KVarNKVCacheTelemetry? {
+        await engine.kvarnScoringTelemetry(for: cell)
+    }
+
     /// Validates the whole config and maps `kvQuant` through `KVCacheKind`'s closed affine /
-    /// TurboQuant allowlist. Anything else throws — a measurement must never silently run a
-    /// different cache from the one requested.
+    /// KVarN / TurboQuant allowlist. Anything else throws — a measurement must never silently
+    /// run a different cache from the one requested.
     /// The scoring paths pass `allowSpec: false`: speculation changes how a decode loop steps,
     /// not what a teacher-forced forward scores, so a spec config there is a caller bug.
     private static func cacheKind(_ config: RunConfig, allowSpec: Bool = true) throws -> KVCacheKind {
