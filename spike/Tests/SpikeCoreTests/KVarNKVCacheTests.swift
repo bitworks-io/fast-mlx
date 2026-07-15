@@ -38,19 +38,102 @@ private final class TinyKVarNTelemetryModel:
 }
 
 final class KVarNKVCacheTests: XCTestCase {
-    func testCacheAcceptsOnlyDTypesItsFP16SinkAndTailPreserveExactly() {
+    func testCacheAcceptsOnlyTwoByteFloatingDTypesForExactSinkAndTail() {
         XCTAssertTrue(
             KVarNKVCache.supportsExactSinkAndTail(
                 keyDType: .float16, valueDType: .float16))
-        XCTAssertFalse(
+        XCTAssertTrue(
             KVarNKVCache.supportsExactSinkAndTail(
                 keyDType: .bfloat16, valueDType: .float16))
-        XCTAssertFalse(
+        XCTAssertTrue(
             KVarNKVCache.supportsExactSinkAndTail(
                 keyDType: .float16, valueDType: .bfloat16))
+        XCTAssertTrue(
+            KVarNKVCache.supportsExactSinkAndTail(
+                keyDType: .bfloat16, valueDType: .bfloat16))
         XCTAssertFalse(
             KVarNKVCache.supportsExactSinkAndTail(
                 keyDType: .float32, valueDType: .float32))
+    }
+
+    func testCacheRequiresStablePerStreamDTypesForExactSinkAndTail() {
+        XCTAssertTrue(
+            KVarNKVCache.matchesEstablishedSinkAndTailDTypes(
+                keyDType: .bfloat16, valueDType: .float16,
+                establishedKeyDType: nil, establishedValueDType: nil))
+        XCTAssertTrue(
+            KVarNKVCache.matchesEstablishedSinkAndTailDTypes(
+                keyDType: .bfloat16, valueDType: .float16,
+                establishedKeyDType: .bfloat16,
+                establishedValueDType: .float16))
+        XCTAssertFalse(
+            KVarNKVCache.matchesEstablishedSinkAndTailDTypes(
+                keyDType: .float16, valueDType: .float16,
+                establishedKeyDType: .bfloat16,
+                establishedValueDType: .float16))
+        XCTAssertFalse(
+            KVarNKVCache.matchesEstablishedSinkAndTailDTypes(
+                keyDType: .bfloat16, valueDType: .bfloat16,
+                establishedKeyDType: .bfloat16,
+                establishedValueDType: .float16))
+    }
+
+    func testCachePreservesBFloat16SinkAndTailWithoutChangingStorageBytes() throws {
+        let cache = KVarNKVCache(
+            capacity: 257, tier: .k4v2G128, iterations: 8)
+        let elementCount = 129 * 128
+        let keys = MLXArray(
+            (0 ..< elementCount).map { Float(($0 % 31) - 15) / 8 }
+        ).reshaped([1, 1, 129, 128]).asType(.bfloat16)
+        let values = MLXArray(
+            (0 ..< elementCount).map { Float(($0 % 29) - 14) / 4 }
+        ).reshaped([1, 1, 129, 128]).asType(.bfloat16)
+
+        let (materializedKeys, materializedValues) = cache.update(
+            keys: keys, values: values)
+        eval([materializedKeys, materializedValues])
+
+        XCTAssertEqual(cache.sinkKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.sinkValues?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailValues?.dtype, .bfloat16)
+        XCTAssertEqual(materializedKeys.dtype, .bfloat16)
+        XCTAssertEqual(materializedValues.dtype, .bfloat16)
+        XCTAssertTrue(
+            (materializedKeys[0..., 0..., 0 ..< 129, 0...] .== keys)
+                .all().item(Bool.self))
+        XCTAssertTrue(
+            (materializedValues[0..., 0..., 0 ..< 129, 0...] .== values)
+                .all().item(Bool.self))
+
+        let continuationKeys = MLXArray(
+            (0 ..< 128 * 128).map { Float(($0 % 23) - 11) / 16 }
+        ).reshaped([1, 1, 128, 128]).asType(.bfloat16)
+        let continuationValues = MLXArray(
+            (0 ..< 128 * 128).map { Float(($0 % 19) - 9) / 8 }
+        ).reshaped([1, 1, 128, 128]).asType(.bfloat16)
+        let (completedKeys, completedValues) = cache.update(
+            keys: continuationKeys, values: continuationValues)
+        eval([completedKeys, completedValues])
+
+        XCTAssertEqual(cache.completedTileCount, 1)
+        XCTAssertEqual(cache.tailKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailValues?.dtype, .bfloat16)
+        XCTAssertEqual(completedKeys.dtype, .bfloat16)
+        XCTAssertEqual(completedValues.dtype, .bfloat16)
+        XCTAssertTrue(
+            (completedKeys[0..., 0..., 256 ..< 257, 0...]
+                .== continuationKeys[0..., 0..., 127 ..< 128, 0...])
+                .all().item(Bool.self))
+        XCTAssertTrue(
+            (completedValues[0..., 0..., 256 ..< 257, 0...]
+                .== continuationValues[0..., 0..., 127 ..< 128, 0...])
+                .all().item(Bool.self))
+
+        let snapshot = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(snapshot.fp16SinkBytes, 65_536)
+        XCTAssertEqual(snapshot.fp16TailBytes, 65_536)
+        XCTAssertEqual(snapshot.materializationWorkspaceBytes, 131_584)
     }
 
     func testMLXCodecMatchesPinnedOfficialFixtureByteForByte() throws {

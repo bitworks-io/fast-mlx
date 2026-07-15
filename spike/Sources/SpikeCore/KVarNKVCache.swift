@@ -537,11 +537,12 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
 
 /// Correctness-first fixed-capacity KVarN cache.
 ///
-/// The first `G` tokens remain in an explicit fp16 sink. Later tokens accumulate in an explicit
-/// fp16 tail and are encoded only when the whole tile is present. Completed records are stored in
-/// native low-bit payload arrays plus fp16 metadata, then materialized before the existing
-/// attention path. Host-side tile branching makes this version intentionally uncompiled; the
-/// decoder integration must preserve that execution-mode boundary.
+/// The first `G` tokens remain in an explicit native 16-bit sink (fp16 or bfloat16). Later tokens
+/// accumulate in an explicit native 16-bit tail and are encoded only when the whole tile is
+/// present. Completed records are stored in native low-bit payload arrays plus fp16 metadata,
+/// then materialized in the model's original dtype before the existing attention path. Host-side
+/// tile branching makes this version intentionally uncompiled; the decoder integration must
+/// preserve that execution-mode boundary.
 ///
 /// This type intentionally does not conform to `Sendable`. Its MLX state must remain confined to
 /// the inference actor.
@@ -579,7 +580,16 @@ public final class KVarNKVCache: KVCache, Updatable {
     static func supportsExactSinkAndTail(
         keyDType: DType, valueDType: DType
     ) -> Bool {
-        keyDType == .float16 && valueDType == .float16
+        (keyDType == .float16 || keyDType == .bfloat16)
+            && (valueDType == .float16 || valueDType == .bfloat16)
+    }
+
+    static func matchesEstablishedSinkAndTailDTypes(
+        keyDType: DType, valueDType: DType,
+        establishedKeyDType: DType?, establishedValueDType: DType?
+    ) -> Bool {
+        (establishedKeyDType == nil || keyDType == establishedKeyDType)
+            && (establishedValueDType == nil || valueDType == establishedValueDType)
     }
 
     public var completedTileCount: Int {
@@ -630,10 +640,10 @@ public final class KVarNKVCache: KVCache, Updatable {
             let sourceRange = sourceStart ..< (sourceStart + count)
             sinkKeys = scatterRows(
                 into: sinkKeys!, start: nextOffset,
-                values: keys[0..., 0..., sourceRange, 0...].asType(.float16))
+                values: keys[0..., 0..., sourceRange, 0...])
             sinkValues = scatterRows(
                 into: sinkValues!, start: nextOffset,
-                values: values[0..., 0..., sourceRange, 0...].asType(.float16))
+                values: values[0..., 0..., sourceRange, 0...])
             sourceStart += count
             nextOffset += count
         }
@@ -647,10 +657,10 @@ public final class KVarNKVCache: KVCache, Updatable {
             let sourceRange = sourceStart ..< (sourceStart + count)
             tailKeys = scatterRows(
                 into: tailKeys!, start: tailStart,
-                values: keys[0..., 0..., sourceRange, 0...].asType(.float16))
+                values: keys[0..., 0..., sourceRange, 0...])
             tailValues = scatterRows(
                 into: tailValues!, start: tailStart,
-                values: values[0..., 0..., sourceRange, 0...].asType(.float16))
+                values: values[0..., 0..., sourceRange, 0...])
             sourceStart += count
             nextOffset += count
 
@@ -664,8 +674,10 @@ public final class KVarNKVCache: KVCache, Updatable {
                     preconditionFailure("KVarN tile encoding failed: \(error)")
                 }
                 store(record: record, at: slot)
-                tailKeys = MLXArray.zeros(tailKeys!.shape, dtype: .float16)
-                tailValues = MLXArray.zeros(tailValues!.shape, dtype: .float16)
+                tailKeys = MLXArray.zeros(
+                    tailKeys!.shape, dtype: keyOutputDType!)
+                tailValues = MLXArray.zeros(
+                    tailValues!.shape, dtype: valueOutputDType!)
             }
         }
 
@@ -817,7 +829,13 @@ public final class KVarNKVCache: KVCache, Updatable {
         precondition(
             Self.supportsExactSinkAndTail(
                 keyDType: keys.dtype, valueDType: values.dtype),
-            "the first KVarN runtime requires fp16 K/V for exact sink and tail storage")
+            "the first KVarN runtime requires fp16 or bfloat16 K/V for exact sink and tail storage")
+        precondition(
+            Self.matchesEstablishedSinkAndTailDTypes(
+                keyDType: keys.dtype, valueDType: values.dtype,
+                establishedKeyDType: keyOutputDType,
+                establishedValueDType: valueOutputDType),
+            "K/V dtypes changed after KVarN sink and tail allocation")
         precondition(
             batchSize == nil || batchSize == keys.dim(0), "K/V batch size changed")
         precondition(headCount == nil || headCount == keys.dim(1), "K/V head count changed")
@@ -850,13 +868,13 @@ public final class KVarNKVCache: KVCache, Updatable {
         vAbsorbedBiases = MLXArray.zeros(
             [batch, heads, slots, tier.groupSize], dtype: .float16)
         sinkKeys = MLXArray.zeros(
-            [batch, heads, tier.sinkTokens, dimension], dtype: .float16)
+            [batch, heads, tier.sinkTokens, dimension], dtype: keys.dtype)
         sinkValues = MLXArray.zeros(
-            [batch, heads, tier.sinkTokens, dimension], dtype: .float16)
+            [batch, heads, tier.sinkTokens, dimension], dtype: values.dtype)
         tailKeys = MLXArray.zeros(
-            [batch, heads, tier.groupSize, dimension], dtype: .float16)
+            [batch, heads, tier.groupSize, dimension], dtype: keys.dtype)
         tailValues = MLXArray.zeros(
-            [batch, heads, tier.groupSize, dimension], dtype: .float16)
+            [batch, heads, tier.groupSize, dimension], dtype: values.dtype)
         batchSize = batch
         headCount = heads
         headDimension = dimension
