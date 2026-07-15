@@ -660,6 +660,8 @@ func runKL(_ flags: Flags) async {
         var candNLLTotal = 0.0, refNLLTotal = 0.0, totalPositions = 0
         var top1Matches = 0, top1ScoredPositions = 0
         var shortScoredPositionCount = 0, longContextScoredPositionCount = 0
+        var shortEntryScoring: [KVEntryScoringEvidence] = []
+        var longContextEntryScoring: [KVEntryScoringEvidence] = []
         var longContextMaxDocumentTokens = 0
         var longContextMaxScoredContextTokens = 0
         var spotChecked = false
@@ -697,6 +699,8 @@ func runKL(_ flags: Flags) async {
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.continuation) * n
             totalPositions += s.continuation.count
             shortScoredPositionCount += s.continuation.count
+            shortEntryScoring.append(KVEntryScoringEvidence(
+                entryID: entry.id, scoredPositions: s.continuation.count))
             print("entry \(entry.id) (\(entry.tag.rawValue)): forced-positions=\(kls.count), teacher-forced-top1-vs-reference=\(top1.matches)/\(top1.scoredPositions), median KL=\(sci(medianOf(kls)))")
         }
 
@@ -737,6 +741,8 @@ func runKL(_ flags: Flags) async {
             refNLLTotal += meanNLL(rows: s.referenceRows, tokens: s.forcedTokens) * n
             totalPositions += s.forcedTokens.count
             longContextScoredPositionCount += s.forcedTokens.count
+            longContextEntryScoring.append(KVEntryScoringEvidence(
+                entryID: entry.id, scoredPositions: s.forcedTokens.count))
             // The long-context ENTRY headline is the TAIL (p95), not the median: over natural
             // long text the median sits below the same-weights noise floor (easy tokens both
             // quants agree on dominate it), while KV-quant loss accrues in the tail.
@@ -854,6 +860,8 @@ func runKL(_ flags: Flags) async {
             shortScoredPositions: shortScoredPositionCount,
             longContextEntryCount: longEntries.count,
             longContextScoredPositions: longContextScoredPositionCount,
+            shortEntryScoring: shortEntryScoring,
+            longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
             longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
         let record = ResultRecord(

@@ -141,11 +141,25 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     }
 }
 
+/// Per-corpus-entry sample count. Aggregate cohort totals alone cannot prove that every document
+/// was actually sampled deeply enough for a stable loss estimate.
+public struct KVEntryScoringEvidence: Codable, Equatable, Sendable {
+    public let entryID: String
+    public let scoredPositions: Int
+
+    public init(entryID: String, scoredPositions: Int) {
+        self.entryID = entryID
+        self.scoredPositions = scoredPositions
+    }
+}
+
 /// Pure form of the `kl` JSONL payload. Optional additions preserve decoding of historical rows;
 /// every newly written row is validated and supplies top-1 plus frontier identity, while promotion
 /// additionally requires the full geometry/storage contract.
 public struct KLPayload: Codable, Equatable, Sendable {
     public static let minimumPromotionLongContextTokens = 24_000
+    public static let minimumPromotionShortPositionsPerEntry = 24
+    public static let minimumPromotionLongContextPositionsPerEntry = 128
 
     public let kvQuantTier: String
     public let klMedianNats: Double
@@ -165,6 +179,8 @@ public struct KLPayload: Codable, Equatable, Sendable {
     public let shortScoredPositions: Int?
     public let longContextEntryCount: Int?
     public let longContextScoredPositions: Int?
+    public let shortEntryScoring: [KVEntryScoringEvidence]?
+    public let longContextEntryScoring: [KVEntryScoringEvidence]?
     /// Deepest tokenized long document and deepest context at which a distribution was actually
     /// scored. These are distinct because bounded sampling can inspect a shallow position in a
     /// long file; promotion is based on measured depth, not the corpus tag or document length.
@@ -185,6 +201,8 @@ public struct KLPayload: Codable, Equatable, Sendable {
         shortScoredPositions: Int? = nil,
         longContextEntryCount: Int? = nil,
         longContextScoredPositions: Int? = nil,
+        shortEntryScoring: [KVEntryScoringEvidence]? = nil,
+        longContextEntryScoring: [KVEntryScoringEvidence]? = nil,
         longContextMaxDocumentTokens: Int? = nil,
         longContextMaxScoredContextTokens: Int? = nil
     ) {
@@ -206,6 +224,8 @@ public struct KLPayload: Codable, Equatable, Sendable {
         self.shortScoredPositions = shortScoredPositions
         self.longContextEntryCount = longContextEntryCount
         self.longContextScoredPositions = longContextScoredPositions
+        self.shortEntryScoring = shortEntryScoring
+        self.longContextEntryScoring = longContextEntryScoring
         self.longContextMaxDocumentTokens = longContextMaxDocumentTokens
         self.longContextMaxScoredContextTokens = longContextMaxScoredContextTokens
     }
@@ -229,6 +249,9 @@ public enum KVFrontierEvidenceError: Error, Equatable, Sendable {
     case missingTop1Evidence
     case missingCohortEvidence
     case missingRequiredCohort(String)
+    case missingCohortEntryEvidence
+    case insufficientEntryPositions(
+        cohort: String, entryID: String, got: Int, required: Int)
     case missingLongContextDepthEvidence
     case insufficientLongContextDepth(got: Int, required: Int)
     case missingLongContextTail
@@ -280,6 +303,36 @@ public extension KLPayload {
             shortPositions <= totalPositions, longPositions <= totalPositions,
             shortPositions == totalPositions - longPositions
         else { throw KVFrontierEvidenceError.invalidMetric("cohorts") }
+        switch (shortEntryScoring, longContextEntryScoring) {
+        case (.none, .none):
+            break
+        case (.some(let shortDetail), .some(let longDetail)):
+            guard shortDetail.count == shortEntries,
+                longDetail.count == longEntries
+            else { throw KVFrontierEvidenceError.invalidMetric("cohortEntryEvidence") }
+            var identifiers = Set<String>()
+            var detailTotals = [0, 0]
+            for (cohortIndex, detail) in [shortDetail, longDetail].enumerated() {
+                for entry in detail {
+                    guard Self.isIdentifier(entry.entryID), entry.scoredPositions >= 0,
+                        identifiers.insert(entry.entryID).inserted
+                    else {
+                        throw KVFrontierEvidenceError.invalidMetric("cohortEntryEvidence")
+                    }
+                    let (total, overflow) = detailTotals[cohortIndex]
+                        .addingReportingOverflow(entry.scoredPositions)
+                    guard !overflow else {
+                        throw KVFrontierEvidenceError.invalidMetric("cohortEntryEvidence")
+                    }
+                    detailTotals[cohortIndex] = total
+                }
+            }
+            guard detailTotals == [shortPositions, longPositions] else {
+                throw KVFrontierEvidenceError.invalidMetric("cohortEntryEvidence")
+            }
+        default:
+            throw KVFrontierEvidenceError.missingCohortEntryEvidence
+        }
         guard let maxDocumentTokens = longContextMaxDocumentTokens,
             let maxScoredContextTokens = longContextMaxScoredContextTokens
         else { throw KVFrontierEvidenceError.missingLongContextDepthEvidence }
@@ -304,6 +357,20 @@ public extension KLPayload {
         guard let longEntries = longContextEntryCount, longEntries > 0,
             let longPositions = longContextScoredPositions, longPositions > 0
         else { throw KVFrontierEvidenceError.missingRequiredCohort("longContext") }
+        guard let shortDetail = shortEntryScoring,
+            let longDetail = longContextEntryScoring
+        else { throw KVFrontierEvidenceError.missingCohortEntryEvidence }
+        for (cohort, detail, required) in [
+            ("short", shortDetail, Self.minimumPromotionShortPositionsPerEntry),
+            ("longContext", longDetail,
+             Self.minimumPromotionLongContextPositionsPerEntry),
+        ] {
+            for entry in detail where entry.scoredPositions < required {
+                throw KVFrontierEvidenceError.insufficientEntryPositions(
+                    cohort: cohort, entryID: entry.entryID,
+                    got: entry.scoredPositions, required: required)
+            }
+        }
         guard let maxScoredContextTokens = longContextMaxScoredContextTokens,
             maxScoredContextTokens >= Self.minimumPromotionLongContextTokens
         else {
@@ -521,6 +588,11 @@ public extension ResultRecord where Payload == KLPayload {
     @discardableResult
     func validatedForRecordEvidence() throws -> Self {
         try payload.validatedForRecord()
+        // Optional decoding keeps historical rows readable, but every newly persisted envelope
+        // must carry the detail needed to audit how deeply each corpus entry was scored.
+        guard payload.shortEntryScoring != nil,
+            payload.longContextEntryScoring != nil
+        else { throw KVFrontierEvidenceError.missingCohortEntryEvidence }
         guard subcommand == "kl" else {
             throw KVFrontierEvidenceError.invalidPromotionProvenance("subcommand")
         }

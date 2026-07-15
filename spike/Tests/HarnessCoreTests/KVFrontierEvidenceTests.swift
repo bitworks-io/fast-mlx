@@ -54,13 +54,21 @@ final class KVFrontierEvidenceTests: XCTestCase {
             klMedianNats: 0.04, klLongContextTailP95Nats: 0.3,
             klPooledMedianNats: 0.05, klPooledP95Nats: 0.4,
             pplCandidate: 10.2, pplReference: 10.0, pplDeltaPct: 2.0,
-            totalPositions: 100, entryCount: 4,
-            teacherForcedTop1AgreementCount: 83,
-            teacherForcedTop1ScoredPositions: 100,
-            teacherForcedTop1AgreementRate: 0.83,
+            totalPositions: 200, entryCount: 4,
+            teacherForcedTop1AgreementCount: 160,
+            teacherForcedTop1ScoredPositions: 200,
+            teacherForcedTop1AgreementRate: 0.8,
             frontier: frontier ?? self.frontier(),
             shortEntryCount: 3, shortScoredPositions: 72,
-            longContextEntryCount: 1, longContextScoredPositions: 28,
+            longContextEntryCount: 1, longContextScoredPositions: 128,
+            shortEntryScoring: [
+                KVEntryScoringEvidence(entryID: "short-0", scoredPositions: 24),
+                KVEntryScoringEvidence(entryID: "short-1", scoredPositions: 24),
+                KVEntryScoringEvidence(entryID: "short-2", scoredPositions: 24),
+            ],
+            longContextEntryScoring: [
+                KVEntryScoringEvidence(entryID: "long-0", scoredPositions: 128),
+            ],
             longContextMaxDocumentTokens: 24_151,
             longContextMaxScoredContextTokens: 24_150)
     }
@@ -253,7 +261,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             XCTAssertEqual($0 as? KVFrontierEvidenceError, .qualityFloorFailed("longContextTailP95"))
         }
         XCTAssertThrowsError(try payload().withQuality(
-            top1Matches: 49, top1Rate: 0.49
+            top1Matches: 98, top1Rate: 0.49
         ).validatedForPromotion()) {
             XCTAssertEqual($0 as? KVFrontierEvidenceError, .qualityFloorFailed("teacherForcedTop1"))
         }
@@ -275,6 +283,75 @@ final class KVFrontierEvidenceTests: XCTestCase {
             XCTAssertEqual(
                 $0 as? KVFrontierEvidenceError,
                 .missingRequiredCohort("longContext"))
+        }
+    }
+
+    func testPromotionRequiresPerEntrySamplingDetail() {
+        XCTAssertThrowsError(try payload().withoutEntryScoring(
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingCohortEntryEvidence)
+        }
+        XCTAssertThrowsError(try payload().withEntryScoring(
+            short: [23, 24, 25], longContext: [128]
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .insufficientEntryPositions(
+                    cohort: "short", entryID: "short-0", got: 23, required: 24))
+        }
+        XCTAssertThrowsError(try payload().withEntryScoring(
+            short: [24, 24, 24], longContext: [127]
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .insufficientEntryPositions(
+                    cohort: "longContext", entryID: "long-0", got: 127, required: 128))
+        }
+    }
+
+    func testRecordRejectsMalformedPerEntrySamplingDetail() throws {
+        let encoded = try JSONEncoder().encode(payload())
+
+        func decoded(after mutate: (inout [String: Any]) -> Void) throws -> KLPayload {
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            mutate(&object)
+            return try JSONDecoder().decode(
+                KLPayload.self,
+                from: JSONSerialization.data(withJSONObject: object))
+        }
+
+        let halfPresent = try decoded {
+            $0.removeValue(forKey: "longContextEntryScoring")
+        }
+        XCTAssertThrowsError(try halfPresent.validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingCohortEntryEvidence)
+        }
+
+        let duplicateID = try decoded {
+            var long = $0["longContextEntryScoring"] as! [[String: Any]]
+            long[0]["entryID"] = "short-0"
+            $0["longContextEntryScoring"] = long
+        }
+        XCTAssertThrowsError(try duplicateID.validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMetric("cohortEntryEvidence"))
+        }
+
+        let mismatchedAggregate = try decoded {
+            var short = $0["shortEntryScoring"] as! [[String: Any]]
+            short[0]["scoredPositions"] = 25
+            $0["shortEntryScoring"] = short
+        }
+        XCTAssertThrowsError(try mismatchedAggregate.validatedForRecord()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidMetric("cohortEntryEvidence"))
         }
     }
 
@@ -339,6 +416,25 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testRequiredKLWriterRejectsNewExploratoryEvidenceWithoutEntryDetail() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("exploratory.jsonl")
+        let incomplete = ResultRecord(
+            subcommand: "kl", provenance: provenance(),
+            payload: payload().withoutEntryScoring())
+
+        XCTAssertThrowsError(try RequiredKLEvidenceWriter.append(
+            incomplete, to: url, promotion: false)) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingCohortEntryEvidence)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testRequiredKLWriterValidatesAndPersistsCompletePromotion() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -383,6 +479,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertNil(decoded.shortScoredPositions)
         XCTAssertNil(decoded.longContextEntryCount)
         XCTAssertNil(decoded.longContextScoredPositions)
+        XCTAssertNil(decoded.shortEntryScoring)
+        XCTAssertNil(decoded.longContextEntryScoring)
         XCTAssertNil(decoded.longContextMaxDocumentTokens)
         XCTAssertNil(decoded.longContextMaxScoredContextTokens)
     }
@@ -409,7 +507,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
 private extension KLPayload {
     func withoutFrontier() -> KLPayload {
-        KLPayload(
+        return KLPayload(
             kvQuantTier: kvQuantTier,
             klMedianNats: klMedianNats,
             klLongContextTailP95Nats: klLongContextTailP95Nats,
@@ -428,6 +526,8 @@ private extension KLPayload {
             shortScoredPositions: shortScoredPositions,
             longContextEntryCount: longContextEntryCount,
             longContextScoredPositions: longContextScoredPositions,
+            shortEntryScoring: shortEntryScoring,
+            longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
             longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
     }
@@ -460,6 +560,8 @@ private extension KLPayload {
             shortScoredPositions: shortScoredPositions,
             longContextEntryCount: longContextEntryCount,
             longContextScoredPositions: longContextScoredPositions,
+            shortEntryScoring: shortEntryScoring,
+            longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
             longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
     }
@@ -468,7 +570,9 @@ private extension KLPayload {
         shortEntries: Int, shortPositions: Int,
         longEntries: Int, longPositions: Int
     ) -> KLPayload {
-        KLPayload(
+        let positions = shortPositions + longPositions
+        let matches = positions * 4 / 5
+        return KLPayload(
             kvQuantTier: kvQuantTier,
             klMedianNats: klMedianNats,
             klLongContextTailP95Nats: klLongContextTailP95Nats,
@@ -477,16 +581,28 @@ private extension KLPayload {
             pplCandidate: pplCandidate,
             pplReference: pplReference,
             pplDeltaPct: pplDeltaPct,
-            totalPositions: totalPositions,
+            totalPositions: positions,
             entryCount: entryCount,
-            teacherForcedTop1AgreementCount: teacherForcedTop1AgreementCount,
-            teacherForcedTop1ScoredPositions: teacherForcedTop1ScoredPositions,
-            teacherForcedTop1AgreementRate: teacherForcedTop1AgreementRate,
+            teacherForcedTop1AgreementCount: matches,
+            teacherForcedTop1ScoredPositions: positions,
+            teacherForcedTop1AgreementRate: Double(matches) / Double(positions),
             frontier: frontier,
             shortEntryCount: shortEntries,
             shortScoredPositions: shortPositions,
             longContextEntryCount: longEntries,
             longContextScoredPositions: longPositions,
+            shortEntryScoring: (0 ..< shortEntries).map {
+                KVEntryScoringEvidence(
+                    entryID: "short-\($0)",
+                    scoredPositions: shortPositions / max(shortEntries, 1)
+                        + ($0 < shortPositions % max(shortEntries, 1) ? 1 : 0))
+            },
+            longContextEntryScoring: (0 ..< longEntries).map {
+                KVEntryScoringEvidence(
+                    entryID: "long-\($0)",
+                    scoredPositions: longPositions / max(longEntries, 1)
+                        + ($0 < longPositions % max(longEntries, 1) ? 1 : 0))
+            },
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
             longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
     }
@@ -513,7 +629,73 @@ private extension KLPayload {
             shortScoredPositions: shortScoredPositions,
             longContextEntryCount: longContextEntryCount,
             longContextScoredPositions: longContextScoredPositions,
+            shortEntryScoring: shortEntryScoring,
+            longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: documentTokens,
             longContextMaxScoredContextTokens: scoredContextTokens)
+    }
+
+    func withoutEntryScoring() -> KLPayload {
+        KLPayload(
+            kvQuantTier: kvQuantTier,
+            klMedianNats: klMedianNats,
+            klLongContextTailP95Nats: klLongContextTailP95Nats,
+            klPooledMedianNats: klPooledMedianNats,
+            klPooledP95Nats: klPooledP95Nats,
+            pplCandidate: pplCandidate,
+            pplReference: pplReference,
+            pplDeltaPct: pplDeltaPct,
+            totalPositions: totalPositions,
+            entryCount: entryCount,
+            teacherForcedTop1AgreementCount: teacherForcedTop1AgreementCount,
+            teacherForcedTop1ScoredPositions: teacherForcedTop1ScoredPositions,
+            teacherForcedTop1AgreementRate: teacherForcedTop1AgreementRate,
+            frontier: frontier,
+            shortEntryCount: shortEntryCount,
+            shortScoredPositions: shortScoredPositions,
+            longContextEntryCount: longContextEntryCount,
+            longContextScoredPositions: longContextScoredPositions,
+            shortEntryScoring: nil,
+            longContextEntryScoring: nil,
+            longContextMaxDocumentTokens: longContextMaxDocumentTokens,
+            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
+    }
+
+    func withEntryScoring(
+        short: [Int], longContext: [Int]
+    ) -> KLPayload {
+        let shortTotal = short.reduce(0, +)
+        let longTotal = longContext.reduce(0, +)
+        let positions = shortTotal + longTotal
+        let matches = positions * 4 / 5
+        return KLPayload(
+            kvQuantTier: kvQuantTier,
+            klMedianNats: klMedianNats,
+            klLongContextTailP95Nats: klLongContextTailP95Nats,
+            klPooledMedianNats: klPooledMedianNats,
+            klPooledP95Nats: klPooledP95Nats,
+            pplCandidate: pplCandidate,
+            pplReference: pplReference,
+            pplDeltaPct: pplDeltaPct,
+            totalPositions: positions,
+            entryCount: short.count + longContext.count,
+            teacherForcedTop1AgreementCount: matches,
+            teacherForcedTop1ScoredPositions: positions,
+            teacherForcedTop1AgreementRate: Double(matches) / Double(positions),
+            frontier: frontier,
+            shortEntryCount: short.count,
+            shortScoredPositions: shortTotal,
+            longContextEntryCount: longContext.count,
+            longContextScoredPositions: longTotal,
+            shortEntryScoring: short.enumerated().map {
+                KVEntryScoringEvidence(
+                    entryID: "short-\($0.offset)", scoredPositions: $0.element)
+            },
+            longContextEntryScoring: longContext.enumerated().map {
+                KVEntryScoringEvidence(
+                    entryID: "long-\($0.offset)", scoredPositions: $0.element)
+            },
+            longContextMaxDocumentTokens: longContextMaxDocumentTokens,
+            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
     }
 }
