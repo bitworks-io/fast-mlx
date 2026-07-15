@@ -39,6 +39,9 @@ public enum KVCacheKind: Sendable, Hashable {
     case fp16
     case affine(AffineKVTier)
     case kvtuner(KVTunerRuntimeSelection)
+    /// Preselection-only heterogeneous policy. There is deliberately no `kvQuant` parser route:
+    /// only the authenticated KVTuner qualification workflow may construct and execute it.
+    case kvtunerCandidate(KVTunerCandidateRuntimePolicy)
     case turboQuant(TurboQuantTier)
     case kvarn(KVarNKVRuntimeCell)
 
@@ -77,7 +80,7 @@ public enum KVCacheKind: Sendable, Hashable {
             CompiledKVCache(capacity: capacity)
         case .affine(let tier):
             AffineKVCache(capacity: capacity, configuration: tier.configuration)
-        case .kvtuner:
+        case .kvtuner, .kvtunerCandidate:
             preconditionFailure(
                 "KVTuner requires the layer-aware makeCaches factory")
         case .turboQuant(let tier):
@@ -97,30 +100,17 @@ public enum KVCacheKind: Sendable, Hashable {
     ) throws -> [any CompiledCache] {
         switch self {
         case .kvtuner(let selection):
-            guard selection.layers.count == layerCount else {
-                throw KVCacheKindError.layerCountMismatch(
-                    expected: selection.layers.count, actual: layerCount)
-            }
-            return try selection.layers.enumerated().map {
-                position, policy in
-                guard policy.layer == position else {
-                    throw KVCacheKindError.invalidKVTunerConfiguration(
-                        layer: position)
-                }
-                let configuration: AffineKVCacheConfiguration
-                do {
-                    configuration = try AffineKVCacheConfiguration(
-                        keyBits: policy.keyBits,
-                        valueBits: policy.valueBits,
-                        keyGroupSize: selection.groupSize,
-                        valueGroupSize: selection.groupSize)
-                } catch {
-                    throw KVCacheKindError.invalidKVTunerConfiguration(
-                        layer: position)
-                }
-                return AffineKVCache(
-                    capacity: capacity, configuration: configuration)
-            }
+            return try Self.makeKVTunerCaches(
+                layers: selection.layers,
+                groupSize: selection.groupSize,
+                layerCount: layerCount,
+                capacity: capacity)
+        case .kvtunerCandidate(let policy):
+            return try Self.makeKVTunerCaches(
+                layers: policy.layers,
+                groupSize: policy.groupSize,
+                layerCount: layerCount,
+                capacity: capacity)
         case .fp16, .affine, .turboQuant, .kvarn:
             return (0 ..< layerCount).map { _ in
                 makeCache(capacity: capacity)
@@ -136,7 +126,7 @@ public enum KVCacheKind: Sendable, Hashable {
         switch self {
         case .kvarn:
             return .uncompiledCorrectness
-        case .fp16, .affine, .kvtuner, .turboQuant:
+        case .fp16, .affine, .kvtuner, .kvtunerCandidate, .turboQuant:
             return .compiled
         }
     }
@@ -148,8 +138,39 @@ public enum KVCacheKind: Sendable, Hashable {
         switch self {
         case .fp16:
             return true
-        case .affine, .kvtuner, .turboQuant, .kvarn:
+        case .affine, .kvtuner, .kvtunerCandidate, .turboQuant, .kvarn:
             return false
+        }
+    }
+
+    private static func makeKVTunerCaches(
+        layers: [KVTunerRuntimeLayerPolicy],
+        groupSize: Int,
+        layerCount: Int,
+        capacity: Int
+    ) throws -> [any CompiledCache] {
+        guard layers.count == layerCount else {
+            throw KVCacheKindError.layerCountMismatch(
+                expected: layers.count, actual: layerCount)
+        }
+        return try layers.enumerated().map { position, policy in
+            guard policy.layer == position else {
+                throw KVCacheKindError.invalidKVTunerConfiguration(
+                    layer: position)
+            }
+            let configuration: AffineKVCacheConfiguration
+            do {
+                configuration = try AffineKVCacheConfiguration(
+                    keyBits: policy.keyBits,
+                    valueBits: policy.valueBits,
+                    keyGroupSize: groupSize,
+                    valueGroupSize: groupSize)
+            } catch {
+                throw KVCacheKindError.invalidKVTunerConfiguration(
+                    layer: position)
+            }
+            return AffineKVCache(
+                capacity: capacity, configuration: configuration)
         }
     }
 }

@@ -586,7 +586,9 @@ public enum TaskCoherenceArtifact {
             payload.identity.kvQuantTier)
         if isKVTuner {
             guard let schedule = payload.identity.kvtunerSchedule,
-                let layerCount = payload.engagement.kvtunerLayerCount
+                let layerCount = payload.engagement.kvtunerLayerCount,
+                schedule.tokenizerSHA256
+                    == payload.tokenization.tokenizerManifestSHA256
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "kvtuner-schedule")
@@ -601,7 +603,7 @@ public enum TaskCoherenceArtifact {
                         payload.identity.modelCheckpointManifestHash,
                     expectedLayerCount: layerCount,
                     requiredEvaluationCorpus:
-                        corpus.kvtunerEvaluationCorpusIdentity)
+                        try corpus.kvtunerEvaluationCorpusIdentity)
             } catch {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "kvtuner-schedule")

@@ -75,6 +75,20 @@ let package = Package(
             resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // MLX-coupled harness orchestration tests. These must run through Xcode on the bench Mac
+        // so the mlx-swift package plugin emits the required Metal library.
+        .testTarget(
+            name: "FastMLXHarnessTests",
+            dependencies: [
+                "fastmlx-harness",
+                "HarnessCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         // MLX-free by design: real host introspection (sysctlbyname, Metal) so the capacity
         // advisor builds and runs on any Mac without the full inference-engine toolchain.
         .target(

@@ -27,7 +27,8 @@ public struct CompiledMLXDecoder: Decoder {
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
     private let compileStepEnabled: Bool
     public let executionMode: KVCacheExecutionMode
-    private let chunk = 256
+    private let chunk =
+        KVTunerCandidateRuntimeContract.cacheGrowthChunkTokens
     /// Decode headroom preallocated beyond the prompt (rounded up to `chunk`).
     private let reserve: Int
 
@@ -43,7 +44,8 @@ public struct CompiledMLXDecoder: Decoder {
     private var cachedTokens = 0 // host-side position; caches' host mirror goes stale
 
     public init(
-        model: any LanguageModel, reserve: Int = 384,
+        model: any LanguageModel,
+        reserve: Int = KVTunerCandidateRuntimeContract.cacheReserveTokens,
         kvCache: KVCacheKind = .fp16, compileStep: Bool = true
     ) {
         let executionMode = kvCache.executionMode(requestingCompilation: compileStep)
@@ -330,6 +332,28 @@ public struct CompiledMLXDecoder: Decoder {
         } catch {
             preconditionFailure(
                 "KVTuner decoder telemetry does not match its schedule: \(error)")
+        }
+    }
+
+    /// Post-run preselection-candidate receipt. The candidate policy is a distinct cache kind
+    /// with no user-facing parser route, so a decoder cannot be reused across candidate digests
+    /// and only authenticated search orchestration can request this evidence.
+    public func kvtunerCandidateKVTelemetry()
+        -> KVTunerCandidateKVCacheTelemetry?
+    {
+        guard case .kvtunerCandidate(let policy) = kvCacheKind else {
+            return nil
+        }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "KVTuner candidate decoder contains a different cache type")
+        do {
+            return try KVTunerCandidateKVCacheTelemetry.capture(
+                policy: policy, caches: affineCaches)
+        } catch {
+            preconditionFailure(
+                "KVTuner candidate telemetry does not match its policy: \(error)")
         }
     }
 

@@ -326,13 +326,16 @@ final class KVFrontierEvidenceTests: XCTestCase {
     private func kvtunerEvaluation(
         id: String = "measurement-corpus-v2",
         aggregateDigest: String = "4444444444444444"
-    ) -> KVTunerEvaluationCorpusIdentity {
-        KVTunerEvaluationCorpusIdentity(
+    ) throws -> KVTunerEvaluationCorpusIdentity {
+        try KVTunerEvaluationCorpusIdentity(
             id: id,
             aggregateDigest: aggregateDigest,
             canonicalEntryDigests: [
                 "5555555555555555",
                 "6666666666666666",
+            ],
+            canonicalSourceItemDigests: [
+                sha256Hex(Data("frontier-evaluation-source".utf8))
             ])
     }
 
@@ -344,11 +347,12 @@ final class KVFrontierEvidenceTests: XCTestCase {
         let configHash = "0123456789abcdef"
         let checkpointHash = "fedcba9876543210"
         let schedule = KVTunerSchedule(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
             checkpointManifestHash: checkpointHash,
+            tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -356,23 +360,29 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 "2222222222222222",
                 "3333333333333333",
             ],
-            seed: 7,
-            objective: "minimum-error",
+            calibrationSourceItemDigests: (0..<200).map {
+                sha256Hex(Data("source-\($0)".utf8))
+            }.sorted(),
+            seed: 1234,
+            objective: "maximize-gsm8k-accuracy-at-b4.5",
             nominalAverageBits: 4.5,
             sourceSensitivityArtifactSHA256: String(
                 repeating: "a", count: 64),
+            sourceSearchArtifactSHA256: String(
+                repeating: "b", count: 64),
             layers: [
                 KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
                 KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
             ])
-        let selection = try KVTunerRuntimeSelection.load(
+        let selection = try KVTunerRuntimeSelection.loadForTesting(
             artifactData: JSONEncoder().encode(schedule),
             expectedLayerCount: 2,
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
             expectedCheckpointManifestHash: checkpointHash,
-            evaluationCorpora: evaluationCorpora ?? [kvtunerEvaluation()])
+            evaluationCorpora:
+                evaluationCorpora ?? [try kvtunerEvaluation()])
         return KVTunerScheduleBinding(selection: selection)
     }
 
@@ -536,7 +546,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             provenance: provenance(
                 configHash: binding.modelConfigHash,
                 manifestHash: binding.checkpointManifestHash,
-                corpusHash: kvtunerEvaluation().aggregateDigest),
+                corpusHash: try kvtunerEvaluation().aggregateDigest),
             payload: candidate)
         XCTAssertNoThrow(try record.validatedForPromotionEvidence())
     }
@@ -719,7 +729,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             provenance(
                 configHash: binding.modelConfigHash,
                 manifestHash: binding.checkpointManifestHash,
-                corpusHash: kvtunerEvaluation().aggregateDigest,
+                corpusHash: try kvtunerEvaluation().aggregateDigest,
                 corpusID: "other-evaluation"),
         ] {
             XCTAssertThrowsError(try ResultRecord(
@@ -764,12 +774,18 @@ final class KVFrontierEvidenceTests: XCTestCase {
             "5555555555555555",
             "7777777777777777",
         ]
+        corpora[0]["canonicalSourceItemDigests"] =
+            KVTunerEvaluationSourceProvenance.auditedSourceItemDigests(
+                entryDigests: [
+                    "5555555555555555",
+                    "7777777777777777",
+                ])
         scheduleObject["evaluationCorpora"] = corpora
         frontierObject["candidateKVTunerSchedule"] = scheduleObject
         frontierObject["candidateKVTunerEvaluationCorpus"] =
             try XCTUnwrap(
                 JSONSerialization.jsonObject(
-                    with: JSONEncoder().encode(kvtunerEvaluation()))
+                    with: JSONEncoder().encode(try kvtunerEvaluation()))
                     as? [String: Any])
         object["frontier"] = frontierObject
         let mutated = try JSONDecoder().decode(

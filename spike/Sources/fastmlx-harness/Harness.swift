@@ -295,7 +295,7 @@ func runVerify(_ flags: Flags) async {
             case .affine:
                 marker = "affine_tokens"
                 markerFloor = promptTokens.count + 1
-            case .kvtuner:
+            case .kvtuner, .kvtunerCandidate:
                 throw SwiftEngineDriverError.unsupportedConfig(
                     "KVTuner verify requires a schedule-bound CLI selection")
             case .turboQuant:
@@ -383,7 +383,7 @@ func runVerify(_ flags: Flags) async {
                 affineMetadataBytes = candidate.engagement.counts["affine_metadata_bytes"]
                 affineControlBytes = candidate.engagement.counts["affine_control_bytes"]
                 affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
-            case .kvtuner:
+            case .kvtuner, .kvtunerCandidate:
                 throw SwiftEngineDriverError.unsupportedConfig(
                     "KVTuner verify requires a schedule-bound CLI selection")
             case .turboQuant:
@@ -718,7 +718,7 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <JSON>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -772,7 +772,7 @@ func runKL(_ flags: Flags) async {
         let corpus = try loadMeasurementCorpus(flags)
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(requestedKVQuantTier) {
-            preparedKVTuner = try prepareKVTunerRun(
+            preparedKVTuner = try await prepareKVTunerRun(
                 schedulePath: kvtunerSchedulePath,
                 modelPath: modelPath,
                 matrixID: matrixID,
@@ -811,6 +811,9 @@ func runKL(_ flags: Flags) async {
                 throw KVFrontierEvidenceError.invalidMemoryGateEvidence
             }
             requestedKVarNMemoryGate = nil
+        case .kvtunerCandidate:
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner candidates are unavailable to the KL tier route")
         }
         let shortEntries = corpus.entries(tagged: .prose) + corpus.entries(tagged: .code)
         let longEntries = corpus.entries(tagged: .longContext)
@@ -1103,6 +1106,9 @@ func runKL(_ flags: Flags) async {
                     + "layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), "
                     + "head_dim=\(telemetry.headDimension)")
+        case .kvtunerCandidate:
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner candidates are unavailable to the KL tier route")
         case .kvarn(let cell):
             guard let telemetry = await driver.kvarnScoringTelemetry(
                 for: cell)
@@ -1350,12 +1356,12 @@ struct Harness {
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
-                 [--kvtuner-schedule <JSON>] required exactly for kvtuner-* cells
+                 [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
                  [--promotion-evidence false] require full storage + clean-SHA coherence gate
           task-coherence --model <PATH>       frozen 80-case secondary coherence/task gate
                  --matrix-id <ID> --cell-id <ID> --evidence <NEW-OR-EMPTY-FILE>
                  [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN/KVTuner runtime tier
-                 [--kvtuner-schedule <JSON>] required exactly for kvtuner-* cells
+                 [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
                  [--reference-task-evidence <FP16-JSONL>]
                                                required for every lossy candidate; forbidden for fp16
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]

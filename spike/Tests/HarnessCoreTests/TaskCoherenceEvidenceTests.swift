@@ -431,7 +431,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         let promotion = try TaskCoherencePromotionEvidence.derive(
             candidate: candidate, reference: reference, corpus: corpus)
 
-        let measurement = kvtunerKLEvaluationCorpus()
+        let measurement = try kvtunerKLEvaluationCorpus()
         let matchingKLBinding = try kvtunerBinding(
             corpus: corpus,
             evaluationCorpora: [measurement])
@@ -442,7 +442,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
 
         let differentKLBinding = try kvtunerBinding(
             corpus: corpus,
-            seed: 8,
+            searchArtifactSHA256: String(repeating: "e", count: 64),
             evaluationCorpora: [measurement])
         XCTAssertFalse(taskBinding.sameSchedule(as: differentKLBinding))
         XCTAssertThrowsError(try promotion.validated(
@@ -1078,22 +1078,23 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
 
     private func kvtunerEvaluationCorpus(
         _ corpus: TaskCoherenceCorpus
-    ) -> KVTunerEvaluationCorpusIdentity {
-        KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(corpus)
+    ) throws -> KVTunerEvaluationCorpusIdentity {
+        try KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(corpus)
     }
 
     private func kvtunerBinding(
         corpus: TaskCoherenceCorpus,
-        seed: UInt64 = 7,
+        searchArtifactSHA256: String = String(repeating: "d", count: 64),
         evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
     ) throws -> KVTunerScheduleBinding {
-        let evaluation = kvtunerEvaluationCorpus(corpus)
+        let evaluation = try kvtunerEvaluationCorpus(corpus)
         let schedule = KVTunerSchedule(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             cellID: kvtunerCellID,
             modelConfigHash: modelConfigHash,
             checkpointManifestHash: checkpointManifestHash,
+            tokenizerSHA256: String(repeating: "b", count: 64),
             groupSize: 128,
             calibrationCorpusID: "calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -1101,18 +1102,22 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 "2222222222222222",
                 "3333333333333333",
             ],
-            seed: seed,
-            objective: "minimum-error",
+            calibrationSourceItemDigests: (0..<200).map {
+                sha256Hex(Data("source-\($0)".utf8))
+            }.sorted(),
+            seed: 1234,
+            objective: "maximize-gsm8k-accuracy-at-b4.5",
             nominalAverageBits: 4.5,
             sourceSensitivityArtifactSHA256: String(
                 repeating: "c", count: 64),
+            sourceSearchArtifactSHA256: searchArtifactSHA256,
             layers: [
                 KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
                 KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
             ])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let selection = try KVTunerRuntimeSelection.load(
+        let selection = try KVTunerRuntimeSelection.loadForTesting(
             artifactData: encoder.encode(schedule),
             expectedLayerCount: 2,
             expectedMatrixID: matrixID,
@@ -1124,14 +1129,17 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
     }
 
     private func kvtunerKLEvaluationCorpus()
-        -> KVTunerEvaluationCorpusIdentity
+        throws -> KVTunerEvaluationCorpusIdentity
     {
-        KVTunerEvaluationCorpusIdentity(
+        try KVTunerEvaluationCorpusIdentity(
             id: "measurement-corpus-v2",
             aggregateDigest: "4444444444444444",
             canonicalEntryDigests: [
                 "5555555555555555",
                 "6666666666666666",
+            ],
+            canonicalSourceItemDigests: [
+                sha256Hex(Data("kl-evaluation-source".utf8))
             ])
     }
 
@@ -1344,7 +1352,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 template.longContextMaxDocumentTokens,
             longContextMaxScoredContextTokens:
                 template.longContextMaxScoredContextTokens)
-        let evaluation = kvtunerKLEvaluationCorpus()
+        let evaluation = try kvtunerKLEvaluationCorpus()
         let provenance = Provenance(
             date: "2026-07-15T00:10:00Z",
             hardwareChip: "Apple M3 Ultra",

@@ -18,6 +18,7 @@ public enum KVTunerScheduleError: Error, Equatable, Sendable {
     case unsupportedPrecision(layer: Int, keyBits: Int, valueBits: Int)
     case nominalAverageMismatch(declared: Double, computed: Double)
     case evaluationCorpusLeaksCalibration
+    case invalidSearchProtocol(String)
 }
 
 public struct KVLayerPrecision: Codable, Equatable, Sendable {
@@ -41,15 +42,38 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
     public var cellID: String
     public var modelConfigHash: String
     public var checkpointManifestHash: String
+    public var tokenizerSHA256: String
     public var groupSize: Int
     public var calibrationCorpusID: String
     public var calibrationCorpusHash: String
     public var calibrationEntryHashes: [String]
+    public var calibrationSourceItemDigests: [String]
     public var seed: UInt64
     public var objective: String
     public var nominalAverageBits: Double
     public var sourceSensitivityArtifactSHA256: String
+    public var sourceSearchArtifactSHA256: String
     public var layers: [KVLayerPrecision]
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case matrixID
+        case cellID
+        case modelConfigHash
+        case checkpointManifestHash
+        case tokenizerSHA256
+        case groupSize
+        case calibrationCorpusID
+        case calibrationCorpusHash
+        case calibrationEntryHashes
+        case calibrationSourceItemDigests
+        case seed
+        case objective
+        case nominalAverageBits
+        case sourceSensitivityArtifactSHA256
+        case sourceSearchArtifactSHA256
+        case layers
+    }
 
     public init(
         schemaVersion: Int,
@@ -57,14 +81,17 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         cellID: String,
         modelConfigHash: String,
         checkpointManifestHash: String,
+        tokenizerSHA256: String,
         groupSize: Int,
         calibrationCorpusID: String,
         calibrationCorpusHash: String,
         calibrationEntryHashes: [String],
+        calibrationSourceItemDigests: [String],
         seed: UInt64,
         objective: String,
         nominalAverageBits: Double,
         sourceSensitivityArtifactSHA256: String,
+        sourceSearchArtifactSHA256: String,
         layers: [KVLayerPrecision]
     ) {
         self.schemaVersion = schemaVersion
@@ -72,15 +99,54 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         self.cellID = cellID
         self.modelConfigHash = modelConfigHash
         self.checkpointManifestHash = checkpointManifestHash
+        self.tokenizerSHA256 = tokenizerSHA256
         self.groupSize = groupSize
         self.calibrationCorpusID = calibrationCorpusID
         self.calibrationCorpusHash = calibrationCorpusHash
         self.calibrationEntryHashes = calibrationEntryHashes
+        self.calibrationSourceItemDigests = calibrationSourceItemDigests
         self.seed = seed
         self.objective = objective
         self.nominalAverageBits = nominalAverageBits
         self.sourceSensitivityArtifactSHA256 = sourceSensitivityArtifactSHA256
+        self.sourceSearchArtifactSHA256 = sourceSearchArtifactSHA256
         self.layers = layers
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(
+            Int.self, forKey: .schemaVersion)
+        guard schemaVersion == 3 else {
+            throw KVTunerScheduleError.unsupportedSchema(schemaVersion)
+        }
+        matrixID = try container.decode(String.self, forKey: .matrixID)
+        cellID = try container.decode(String.self, forKey: .cellID)
+        modelConfigHash = try container.decode(
+            String.self, forKey: .modelConfigHash)
+        checkpointManifestHash = try container.decode(
+            String.self, forKey: .checkpointManifestHash)
+        tokenizerSHA256 = try container.decode(
+            String.self, forKey: .tokenizerSHA256)
+        groupSize = try container.decode(Int.self, forKey: .groupSize)
+        calibrationCorpusID = try container.decode(
+            String.self, forKey: .calibrationCorpusID)
+        calibrationCorpusHash = try container.decode(
+            String.self, forKey: .calibrationCorpusHash)
+        calibrationEntryHashes = try container.decode(
+            [String].self, forKey: .calibrationEntryHashes)
+        calibrationSourceItemDigests = try container.decode(
+            [String].self, forKey: .calibrationSourceItemDigests)
+        seed = try container.decode(UInt64.self, forKey: .seed)
+        objective = try container.decode(String.self, forKey: .objective)
+        nominalAverageBits = try container.decode(
+            Double.self, forKey: .nominalAverageBits)
+        sourceSensitivityArtifactSHA256 = try container.decode(
+            String.self, forKey: .sourceSensitivityArtifactSHA256)
+        sourceSearchArtifactSHA256 = try container.decode(
+            String.self, forKey: .sourceSearchArtifactSHA256)
+        layers = try container.decode(
+            [KVLayerPrecision].self, forKey: .layers)
     }
 
     /// KVTuner's paper/repository budget convention: the nominal mean of K and V bit widths
@@ -112,7 +178,7 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         expectedModelConfigHash: String,
         expectedCheckpointManifestHash: String
     ) throws -> KVTunerSchedule {
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw KVTunerScheduleError.unsupportedSchema(schemaVersion)
         }
         guard expectedLayerCount > 0 else {
@@ -140,11 +206,14 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
                 throw KVTunerScheduleError.invalidDigest(digest)
             }
         }
-        guard Self.isLowercaseHex(
-            sourceSensitivityArtifactSHA256, length: 64)
-        else {
-            throw KVTunerScheduleError.invalidDigest(
-                sourceSensitivityArtifactSHA256)
+        for digest in [
+            sourceSensitivityArtifactSHA256,
+            sourceSearchArtifactSHA256,
+            tokenizerSHA256,
+        ] {
+            guard Self.isLowercaseHex(digest, length: 64) else {
+                throw KVTunerScheduleError.invalidDigest(digest)
+            }
         }
         guard matrixID == expectedMatrixID else {
             throw KVTunerScheduleError.matrixIDMismatch
@@ -203,6 +272,14 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
                 cell: cellDescriptor.nominalAverageBits,
                 schedule: nominalAverageBits)
         }
+        guard seed == KVTunerScheduleSearch.requiredFewShotSeed else {
+            throw KVTunerScheduleError.invalidSearchProtocol("seed")
+        }
+        guard objective
+            == "maximize-gsm8k-accuracy-at-b\(nominalAverageBits)"
+        else {
+            throw KVTunerScheduleError.invalidSearchProtocol("objective")
+        }
         return self
     }
 
@@ -212,7 +289,9 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
     public func validateEvaluationCorpus(
         id: String,
         hash: String,
-        entryHashes: [String]
+        entryHashes: [String],
+        sourceProvenance: KVTunerEvaluationSourceProvenance,
+        sourceItemHashes: [String]? = nil
     ) throws {
         try validateCalibrationIdentity()
         guard Self.isIdentifier(id) else {
@@ -231,11 +310,41 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
                 throw KVTunerScheduleError.invalidDigest(digest)
             }
         }
+        let effectiveSourceItemHashes: [String]
+        if sourceProvenance == .firstPartyAuditedNoGSM8K {
+            let expected = KVTunerEvaluationSourceProvenance
+                .auditedSourceItemDigests(entryDigests: entryHashes)
+            if let sourceItemHashes, sourceItemHashes != expected {
+                throw KVTunerScheduleError.invalidProvenance
+            }
+            effectiveSourceItemHashes = expected
+        } else {
+            guard let sourceItemHashes, !sourceItemHashes.isEmpty else {
+                throw KVTunerScheduleError.invalidProvenance
+            }
+            effectiveSourceItemHashes = sourceItemHashes
+        }
+        guard !effectiveSourceItemHashes.isEmpty,
+            Set(effectiveSourceItemHashes).count
+                == effectiveSourceItemHashes.count,
+            effectiveSourceItemHashes
+                == effectiveSourceItemHashes.sorted()
+        else {
+            throw KVTunerScheduleError.invalidProvenance
+        }
+        for digest in effectiveSourceItemHashes {
+            guard Self.isLowercaseHex(digest, length: 64) else {
+                throw KVTunerScheduleError.invalidDigest(digest)
+            }
+        }
 
         let calibrationHashes = Set(calibrationEntryHashes)
+        let calibrationSourceItems = Set(calibrationSourceItemDigests)
         guard id != calibrationCorpusID,
             hash != calibrationCorpusHash,
-            calibrationHashes.isDisjoint(with: entryHashes)
+            calibrationHashes.isDisjoint(with: entryHashes),
+            calibrationSourceItems.isDisjoint(
+                with: effectiveSourceItemHashes)
         else {
             throw KVTunerScheduleError.evaluationCorpusLeaksCalibration
         }
@@ -257,6 +366,18 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         }
         for digest in calibrationEntryHashes {
             guard KVTunerPromptDigest.isCanonical(digest) else {
+                throw KVTunerScheduleError.invalidDigest(digest)
+            }
+        }
+        guard calibrationSourceItemDigests.count == 200,
+            Set(calibrationSourceItemDigests).count == 200,
+            calibrationSourceItemDigests
+                == calibrationSourceItemDigests.sorted()
+        else {
+            throw KVTunerScheduleError.invalidProvenance
+        }
+        for digest in calibrationSourceItemDigests {
+            guard Self.isLowercaseHex(digest, length: 64) else {
                 throw KVTunerScheduleError.invalidDigest(digest)
             }
         }

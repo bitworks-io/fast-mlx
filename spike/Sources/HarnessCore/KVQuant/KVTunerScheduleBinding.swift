@@ -12,24 +12,34 @@ public enum KVTunerScheduleBindingError: Error, Equatable, Sendable {
 /// Portable evidence identity for one already-authenticated KVTuner runtime selection.
 ///
 /// This is not a second path for constructing a runtime policy. Live inference still obtains its
-/// policy exclusively through `KVTunerRuntimeSelection.load`. The binding copies that immutable
+/// policy exclusively through `KVTunerRuntimeSelection.loadQualified`. The binding copies that immutable
 /// result into task/KL evidence, then revalidates its own decoded structure and all externally
 /// expected identities before the evidence is accepted.
 public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public let schemaVersion: Int
     public let scheduleSchemaVersion: Int
+    /// Exact schedule-byte identity used for runtime policy pairing.
     public let artifactSHA256: String
+    /// Exact outer qualification-bundle identity retained for provenance and auditing.
+    public let qualificationBundleSHA256: String
     public let matrixID: String
     public let cellID: String
     public let modelConfigHash: String
     public let checkpointManifestHash: String
+    public let tokenizerSHA256: String
     public let groupSize: Int
     public let promptDigestAlgorithm: String
     public let calibrationCorpusID: String
     public let calibrationCorpusHash: String
     public let calibrationEntryDigests: [String]
+    public let calibrationSourceItemDigests: [String]
+    public let seed: UInt64
+    public let objective: String
+    public let nominalAverageBits: Double
+    public let sourceSensitivityArtifactSHA256: String
+    public let sourceSearchArtifactSHA256: String
     public let evaluationCorpora: [KVTunerEvaluationCorpusIdentity]
     public let layers: [KVTunerRuntimeLayerPolicy]
 
@@ -37,15 +47,25 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         schemaVersion = Self.currentSchemaVersion
         scheduleSchemaVersion = selection.schemaVersion
         artifactSHA256 = selection.artifactSHA256
+        qualificationBundleSHA256 = selection.qualificationBundleSHA256
         matrixID = selection.matrixID
         cellID = selection.cellID
         modelConfigHash = selection.modelConfigHash
         checkpointManifestHash = selection.checkpointManifestHash
+        tokenizerSHA256 = selection.tokenizerSHA256
         groupSize = selection.groupSize
         promptDigestAlgorithm = selection.promptDigestAlgorithm
         calibrationCorpusID = selection.calibrationCorpusID
         calibrationCorpusHash = selection.calibrationCorpusHash
         calibrationEntryDigests = selection.calibrationEntryDigests
+        calibrationSourceItemDigests =
+            selection.calibrationSourceItemDigests
+        seed = selection.seed
+        objective = selection.objective
+        nominalAverageBits = selection.nominalAverageBits
+        sourceSensitivityArtifactSHA256 =
+            selection.sourceSensitivityArtifactSHA256
+        sourceSearchArtifactSHA256 = selection.sourceSearchArtifactSHA256
         evaluationCorpora = selection.evaluationCorpora
         layers = selection.layers
     }
@@ -54,16 +74,28 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(
             Int.self, forKey: .schemaVersion)
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw KVTunerScheduleBindingError.unsupportedBindingSchema(
+                schemaVersion)
+        }
         scheduleSchemaVersion = try container.decode(
             Int.self, forKey: .scheduleSchemaVersion)
+        guard scheduleSchemaVersion == 3 else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .unsupportedSchema(scheduleSchemaVersion))
+        }
         artifactSHA256 = try container.decode(
             String.self, forKey: .artifactSHA256)
+        qualificationBundleSHA256 = try container.decode(
+            String.self, forKey: .qualificationBundleSHA256)
         matrixID = try container.decode(String.self, forKey: .matrixID)
         cellID = try container.decode(String.self, forKey: .cellID)
         modelConfigHash = try container.decode(
             String.self, forKey: .modelConfigHash)
         checkpointManifestHash = try container.decode(
             String.self, forKey: .checkpointManifestHash)
+        tokenizerSHA256 = try container.decode(
+            String.self, forKey: .tokenizerSHA256)
         groupSize = try container.decode(Int.self, forKey: .groupSize)
         promptDigestAlgorithm = try container.decode(
             String.self, forKey: .promptDigestAlgorithm)
@@ -73,6 +105,16 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             String.self, forKey: .calibrationCorpusHash)
         calibrationEntryDigests = try container.decode(
             [String].self, forKey: .calibrationEntryDigests)
+        calibrationSourceItemDigests = try container.decode(
+            [String].self, forKey: .calibrationSourceItemDigests)
+        seed = try container.decode(UInt64.self, forKey: .seed)
+        objective = try container.decode(String.self, forKey: .objective)
+        nominalAverageBits = try container.decode(
+            Double.self, forKey: .nominalAverageBits)
+        sourceSensitivityArtifactSHA256 = try container.decode(
+            String.self, forKey: .sourceSensitivityArtifactSHA256)
+        sourceSearchArtifactSHA256 = try container.decode(
+            String.self, forKey: .sourceSearchArtifactSHA256)
         evaluationCorpora = try container.decode(
             [KVTunerEvaluationCorpusIdentity].self,
             forKey: .evaluationCorpora)
@@ -181,11 +223,21 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             && cellID == other.cellID
             && modelConfigHash == other.modelConfigHash
             && checkpointManifestHash == other.checkpointManifestHash
+            && tokenizerSHA256 == other.tokenizerSHA256
             && groupSize == other.groupSize
             && promptDigestAlgorithm == other.promptDigestAlgorithm
             && calibrationCorpusID == other.calibrationCorpusID
             && calibrationCorpusHash == other.calibrationCorpusHash
             && calibrationEntryDigests == other.calibrationEntryDigests
+            && calibrationSourceItemDigests
+                == other.calibrationSourceItemDigests
+            && seed == other.seed
+            && objective == other.objective
+            && nominalAverageBits == other.nominalAverageBits
+            && sourceSensitivityArtifactSHA256
+                == other.sourceSensitivityArtifactSHA256
+            && sourceSearchArtifactSHA256
+                == other.sourceSearchArtifactSHA256
             && layers == other.layers
     }
 
@@ -194,14 +246,19 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             throw KVTunerScheduleBindingError.unsupportedBindingSchema(
                 schemaVersion)
         }
-        guard scheduleSchemaVersion == 2 else {
+        guard scheduleSchemaVersion == 3 else {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .unsupportedSchema(scheduleSchemaVersion))
         }
         guard Self.isLowercaseHex(artifactSHA256, length: 64) else {
             throw KVTunerScheduleBindingError.invalidArtifactSHA256
         }
-        for identifier in [matrixID, cellID] {
+        guard Self.isLowercaseHex(
+            qualificationBundleSHA256, length: 64)
+        else {
+            throw KVTunerScheduleBindingError.invalidArtifactSHA256
+        }
+        for identifier in [matrixID, cellID, objective] {
             guard Self.isIdentifier(identifier) else {
                 throw KVTunerScheduleBindingError.invalidSchedule(
                     .invalidIdentifier(identifier))
@@ -209,6 +266,16 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         }
         for digest in [modelConfigHash, checkpointManifestHash] {
             guard Self.isIdentityDigest(digest) else {
+                throw KVTunerScheduleBindingError.invalidSchedule(
+                    .invalidDigest(digest))
+            }
+        }
+        for digest in [
+            sourceSensitivityArtifactSHA256,
+            sourceSearchArtifactSHA256,
+            tokenizerSHA256,
+        ] {
+            guard Self.isLowercaseHex(digest, length: 64) else {
                 throw KVTunerScheduleBindingError.invalidSchedule(
                     .invalidDigest(digest))
             }
@@ -253,6 +320,20 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
                     .invalidDigest(digest))
             }
         }
+        guard calibrationSourceItemDigests.count == 200,
+            Set(calibrationSourceItemDigests).count == 200,
+            calibrationSourceItemDigests
+                == calibrationSourceItemDigests.sorted()
+        else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .invalidProvenance)
+        }
+        for digest in calibrationSourceItemDigests {
+            guard Self.isLowercaseHex(digest, length: 64) else {
+                throw KVTunerScheduleBindingError.invalidSchedule(
+                    .invalidDigest(digest))
+            }
+        }
 
         guard !layers.isEmpty else {
             throw KVTunerScheduleBindingError.invalidSchedule(
@@ -280,12 +361,25 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             totalBits += Double(policy.keyBits) / 2
                 + Double(policy.valueBits) / 2
         }
-        let nominalAverageBits = totalBits / Double(layers.count)
-        guard nominalAverageBits == descriptor.nominalAverageBits else {
+        let computedNominalAverageBits = totalBits / Double(layers.count)
+        guard nominalAverageBits.isFinite, nominalAverageBits > 0,
+            nominalAverageBits == computedNominalAverageBits,
+            nominalAverageBits == descriptor.nominalAverageBits
+        else {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .cellNominalAverageBitsMismatch(
                     cell: descriptor.nominalAverageBits,
                     schedule: nominalAverageBits))
+        }
+        guard seed == KVTunerScheduleSearch.requiredFewShotSeed else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .invalidSearchProtocol("seed"))
+        }
+        guard objective
+            == "maximize-gsm8k-accuracy-at-b\(nominalAverageBits)"
+        else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .invalidSearchProtocol("objective"))
         }
 
         guard !evaluationCorpora.isEmpty else {
@@ -325,10 +419,44 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
                             reason: .invalidDigest(digest))
                 }
             }
+            let expectedSourceItems: [String]
+            if corpus.sourceProvenance == .firstPartyAuditedNoGSM8K {
+                expectedSourceItems = KVTunerEvaluationSourceProvenance
+                    .auditedSourceItemDigests(
+                        entryDigests: corpus.canonicalEntryDigests)
+                guard corpus.canonicalSourceItemDigests
+                    == expectedSourceItems
+                else {
+                    throw KVTunerScheduleBindingError
+                        .invalidEvaluationCorpus(
+                            index: index, reason: .invalidProvenance)
+                }
+            } else {
+                expectedSourceItems = corpus.canonicalSourceItemDigests
+            }
+            guard !expectedSourceItems.isEmpty,
+                Set(expectedSourceItems).count
+                    == corpus.canonicalSourceItemDigests.count,
+                corpus.canonicalSourceItemDigests
+                    == corpus.canonicalSourceItemDigests.sorted()
+            else {
+                throw KVTunerScheduleBindingError.invalidEvaluationCorpus(
+                    index: index, reason: .invalidProvenance)
+            }
+            for digest in corpus.canonicalSourceItemDigests {
+                guard Self.isLowercaseHex(digest, length: 64) else {
+                    throw KVTunerScheduleBindingError
+                        .invalidEvaluationCorpus(
+                            index: index,
+                            reason: .invalidDigest(digest))
+                }
+            }
             guard corpus.id != calibrationCorpusID,
                 corpus.aggregateDigest != calibrationCorpusHash,
                 Set(calibrationEntryDigests).isDisjoint(
-                    with: corpus.canonicalEntryDigests)
+                    with: corpus.canonicalEntryDigests),
+                Set(calibrationSourceItemDigests).isDisjoint(
+                    with: corpus.canonicalSourceItemDigests)
             else {
                 throw KVTunerScheduleBindingError.invalidEvaluationCorpus(
                     index: index,

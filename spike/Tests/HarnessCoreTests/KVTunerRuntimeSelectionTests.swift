@@ -10,11 +10,12 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
 
     private func validSchedule() -> KVTunerSchedule {
         KVTunerSchedule(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
             checkpointManifestHash: checkpointHash,
+            tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -22,10 +23,14 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
                 "2222222222222222",
                 "3333333333333333",
             ],
-            seed: 7,
-            objective: "minimize-attention-error-at-4.5-average-bits",
+            calibrationSourceItemDigests: (0..<200).map {
+                sha256Hex(Data("source-\($0)".utf8))
+            }.sorted(),
+            seed: 1234,
+            objective: "maximize-gsm8k-accuracy-at-b4.5",
             nominalAverageBits: 4.5,
             sourceSensitivityArtifactSHA256: String(repeating: "a", count: 64),
+            sourceSearchArtifactSHA256: String(repeating: "b", count: 64),
             layers: [
                 KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
                 KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
@@ -38,22 +43,30 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         try JSONEncoder().encode(schedule ?? validSchedule())
     }
 
-    private func evaluationCorpora() -> [KVTunerEvaluationCorpusIdentity] {
+    private func sourceRows(_ label: String) -> [String] {
+        [sha256Hex(Data("test-source-\(label)".utf8))]
+    }
+
+    private func evaluationCorpora() throws
+        -> [KVTunerEvaluationCorpusIdentity]
+    {
         [
-            KVTunerEvaluationCorpusIdentity(
+            try KVTunerEvaluationCorpusIdentity(
                 id: "measurement-short-v2",
                 aggregateDigest: "4444444444444444",
                 canonicalEntryDigests: [
                     "5555555555555555",
                     "6666666666666666",
-                ]),
-            KVTunerEvaluationCorpusIdentity(
+                ],
+                canonicalSourceItemDigests: sourceRows("short")),
+            try KVTunerEvaluationCorpusIdentity(
                 id: "measurement-long-v2",
                 aggregateDigest: "7777777777777777",
                 canonicalEntryDigests: [
                     "8888888888888888",
                     "9999999999999999",
-                ]),
+                ],
+                canonicalSourceItemDigests: sourceRows("long")),
         ]
     }
 
@@ -72,7 +85,7 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         } else {
             artifact = try artifactData()
         }
-        return try KVTunerRuntimeSelection.load(
+        return try KVTunerRuntimeSelection.loadForTesting(
             artifactData: artifact,
             expectedLayerCount: expectedLayerCount,
             expectedMatrixID: expectedMatrixID ?? matrixID,
@@ -80,7 +93,8 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
             expectedModelConfigHash: expectedModelConfigHash ?? configHash,
             expectedCheckpointManifestHash:
                 expectedCheckpointManifestHash ?? checkpointHash,
-            evaluationCorpora: evaluationCorpora ?? self.evaluationCorpora())
+            evaluationCorpora:
+                evaluationCorpora ?? (try self.evaluationCorpora()))
     }
 
     private func assertSelectionError(
@@ -104,15 +118,30 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
 
     func testLoadsExactBytesValidatesMultipleCorporaAndFreezesRuntimePolicy() throws {
         let data = try artifactData()
-        let corpora = evaluationCorpora()
+        let corpora = try evaluationCorpora()
         let selection = try load(data, evaluationCorpora: corpora)
 
         XCTAssertEqual(selection.artifactSHA256, sha256Hex(data))
+        XCTAssertEqual(
+            selection.qualificationBundleSHA256,
+            sha256Hex(data))
         XCTAssertEqual(selection.matrixID, matrixID)
         XCTAssertEqual(selection.cellID, cellID)
         XCTAssertEqual(selection.modelConfigHash, configHash)
         XCTAssertEqual(selection.checkpointManifestHash, checkpointHash)
         XCTAssertEqual(selection.groupSize, 128)
+        XCTAssertEqual(selection.schemaVersion, 3)
+        XCTAssertEqual(selection.seed, 1234)
+        XCTAssertEqual(
+            selection.objective,
+            "maximize-gsm8k-accuracy-at-b4.5")
+        XCTAssertEqual(selection.nominalAverageBits, 4.5, accuracy: 0)
+        XCTAssertEqual(
+            selection.sourceSensitivityArtifactSHA256,
+            String(repeating: "a", count: 64))
+        XCTAssertEqual(
+            selection.sourceSearchArtifactSHA256,
+            String(repeating: "b", count: 64))
         XCTAssertEqual(selection.evaluationCorpora, corpora)
         XCTAssertEqual(selection.layers, [
             KVTunerRuntimeLayerPolicy(layer: 0, keyBits: 8, valueBits: 4),
@@ -209,11 +238,12 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         }
     }
 
-    func testEvaluationIdentityAggregateAndEntryLeakageFailClosedAtTheirIndex() {
-        let leakingID = KVTunerEvaluationCorpusIdentity(
+    func testEvaluationIdentityAggregateAndEntryLeakageFailClosedAtTheirIndex() throws {
+        let leakingID = try KVTunerEvaluationCorpusIdentity(
             id: "kvtuner-calibration-v1",
             aggregateDigest: "4444444444444444",
-            canonicalEntryDigests: ["5555555555555555"])
+            canonicalEntryDigests: ["5555555555555555"],
+            canonicalSourceItemDigests: sourceRows("leaking-id"))
         assertSelectionError(
             .invalidEvaluationCorpus(
                 index: 0,
@@ -222,10 +252,11 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
             _ = try load(evaluationCorpora: [leakingID])
         }
 
-        let leakingAggregate = KVTunerEvaluationCorpusIdentity(
+        let leakingAggregate = try KVTunerEvaluationCorpusIdentity(
             id: "measurement-short-v2",
             aggregateDigest: "1111111111111111",
-            canonicalEntryDigests: ["5555555555555555"])
+            canonicalEntryDigests: ["5555555555555555"],
+            canonicalSourceItemDigests: sourceRows("leaking-aggregate"))
         assertSelectionError(
             .invalidEvaluationCorpus(
                 index: 0,
@@ -234,30 +265,32 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
             _ = try load(evaluationCorpora: [leakingAggregate])
         }
 
-        let leakingEntry = KVTunerEvaluationCorpusIdentity(
+        let leakingEntry = try KVTunerEvaluationCorpusIdentity(
             id: "measurement-short-v2",
             aggregateDigest: "4444444444444444",
             canonicalEntryDigests: [
                 "2222222222222222",
                 "5555555555555555",
-            ])
+            ],
+            canonicalSourceItemDigests: sourceRows("leaking-entry"))
         assertSelectionError(
             .invalidEvaluationCorpus(
                 index: 1,
                 reason: .evaluationCorpusLeaksCalibration)
         ) {
             _ = try load(evaluationCorpora: [
-                evaluationCorpora()[0],
+                try evaluationCorpora()[0],
                 leakingEntry,
             ])
         }
     }
 
-    func testMalformedEvaluationIdentityFailsClosedThroughExistingGate() {
-        let malformed = KVTunerEvaluationCorpusIdentity(
+    func testMalformedEvaluationIdentityFailsClosedThroughExistingGate() throws {
+        let malformed = try KVTunerEvaluationCorpusIdentity(
             id: "measurement corpus",
             aggregateDigest: "not-a-digest",
-            canonicalEntryDigests: [])
+            canonicalEntryDigests: [],
+            canonicalSourceItemDigests: sourceRows("malformed"))
 
         assertSelectionError(
             .invalidEvaluationCorpus(

@@ -203,52 +203,45 @@ public enum KVTunerKVCacheTelemetryError: Error, Equatable, Sendable {
     case byteCountOverflow
 }
 
-/// Actor-safe scalar evidence for one authenticated heterogeneous affine policy. The exact
-/// schedule digest and frozen layer decisions travel with the actual MLX-array byte totals;
-/// no MLX array crosses the inference actor boundary.
-public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
-    public let artifactSHA256: String
-    public let matrixID: String
-    public let cellID: String
-    public let groupSize: Int
-    public let layers: [KVTunerRuntimeLayerPolicy]
-    public let cachedTokens: Int
-    public let layerCount: Int
-    public let capacityTokens: Int
-    public let sequences: Int
-    public let kvHeadCount: Int
-    public let headDimension: Int
-    public let metadataScalarBytes: Int
-    public let payloadBytes: Int
-    public let metadataBytes: Int
-    public let controlBytes: Int
-    public let materializationWorkspaceBytes: Int
-    public let totalPersistentBytes: Int
-    public let totalBytes: Int
+/// Shared scalar reconciliation for qualified and preselection KVTuner policies. This helper is
+/// intentionally private: callers receive only the policy-specific authenticated envelope, never
+/// a policy-free byte snapshot that could be detached from the schedule which produced it.
+private struct KVTunerAffineCacheAggregate {
+    let cachedTokens: Int
+    let layerCount: Int
+    let capacityTokens: Int
+    let sequences: Int
+    let kvHeadCount: Int
+    let headDimension: Int
+    let metadataScalarBytes: Int
+    let payloadBytes: Int
+    let metadataBytes: Int
+    let controlBytes: Int
+    let materializationWorkspaceBytes: Int
+    let totalPersistentBytes: Int
+    let totalBytes: Int
 
-    /// Capture must run in the cache owner's inference actor after allocation. Persistent
-    /// bytes sum every layer; workspace is the largest one-layer full-precision K/V pair,
-    /// because transformer layers materialize and consume their caches sequentially.
-    public static func capture(
-        selection: KVTunerRuntimeSelection,
+    static func capture(
+        layers: [KVTunerRuntimeLayerPolicy],
+        groupSize: Int,
         caches: [AffineKVCache]
-    ) throws -> KVTunerKVCacheTelemetry {
-        guard caches.count == selection.layers.count else {
+    ) throws -> KVTunerAffineCacheAggregate {
+        guard caches.count == layers.count else {
             throw KVTunerKVCacheTelemetryError.layerCountMismatch(
-                expected: selection.layers.count, actual: caches.count)
+                expected: layers.count, actual: caches.count)
         }
 
         var snapshots: [AffineKVCacheStorageSnapshot] = []
         snapshots.reserveCapacity(caches.count)
-        for (position, pair) in zip(caches, selection.layers).enumerated() {
+        for (position, pair) in zip(caches, layers).enumerated() {
             let (cache, policy) = pair
             let expected: AffineKVCacheConfiguration
             do {
                 expected = try AffineKVCacheConfiguration(
                     keyBits: policy.keyBits,
                     valueBits: policy.valueBits,
-                    keyGroupSize: selection.groupSize,
-                    valueGroupSize: selection.groupSize)
+                    keyGroupSize: groupSize,
+                    valueGroupSize: groupSize)
             } catch {
                 throw KVTunerKVCacheTelemetryError.configurationMismatch(
                     layer: position)
@@ -264,7 +257,7 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
         }
         guard let first = snapshots.first, let firstCache = caches.first else {
             throw KVTunerKVCacheTelemetryError.layerCountMismatch(
-                expected: selection.layers.count, actual: 0)
+                expected: layers.count, actual: 0)
         }
         guard first.keyHeadDimension == first.valueHeadDimension else {
             throw KVTunerKVCacheTelemetryError.inconsistentGeometry(layer: 0)
@@ -314,13 +307,7 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
         let totalBytes = try checkedSum([
             totalPersistentBytes, workspaceBytes,
         ])
-
-        return KVTunerKVCacheTelemetry(
-            artifactSHA256: selection.artifactSHA256,
-            matrixID: selection.matrixID,
-            cellID: selection.cellID,
-            groupSize: selection.groupSize,
-            layers: selection.layers,
+        return KVTunerAffineCacheAggregate(
             cachedTokens: cachedTokens,
             layerCount: caches.count,
             capacityTokens: first.capacityTokens,
@@ -334,6 +321,163 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
             materializationWorkspaceBytes: workspaceBytes,
             totalPersistentBytes: totalPersistentBytes,
             totalBytes: totalBytes)
+    }
+}
+
+/// Actor-safe scalar evidence for one authenticated heterogeneous affine policy. The exact
+/// schedule digest and frozen layer decisions travel with the actual MLX-array byte totals;
+/// no MLX array crosses the inference actor boundary.
+public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
+    public let artifactSHA256: String
+    public let matrixID: String
+    public let cellID: String
+    public let groupSize: Int
+    public let layers: [KVTunerRuntimeLayerPolicy]
+    public let cachedTokens: Int
+    public let layerCount: Int
+    public let capacityTokens: Int
+    public let sequences: Int
+    public let kvHeadCount: Int
+    public let headDimension: Int
+    public let metadataScalarBytes: Int
+    public let payloadBytes: Int
+    public let metadataBytes: Int
+    public let controlBytes: Int
+    public let materializationWorkspaceBytes: Int
+    public let totalPersistentBytes: Int
+    public let totalBytes: Int
+
+    /// Capture must run in the cache owner's inference actor after allocation. Persistent
+    /// bytes sum every layer; workspace is the largest one-layer full-precision K/V pair,
+    /// because transformer layers materialize and consume their caches sequentially.
+    public static func capture(
+        selection: KVTunerRuntimeSelection,
+        caches: [AffineKVCache]
+    ) throws -> KVTunerKVCacheTelemetry {
+        let aggregate = try KVTunerAffineCacheAggregate.capture(
+            layers: selection.layers,
+            groupSize: selection.groupSize,
+            caches: caches)
+        return KVTunerKVCacheTelemetry(
+            artifactSHA256: selection.artifactSHA256,
+            matrixID: selection.matrixID,
+            cellID: selection.cellID,
+            groupSize: selection.groupSize,
+            layers: selection.layers,
+            cachedTokens: aggregate.cachedTokens,
+            layerCount: aggregate.layerCount,
+            capacityTokens: aggregate.capacityTokens,
+            sequences: aggregate.sequences,
+            kvHeadCount: aggregate.kvHeadCount,
+            headDimension: aggregate.headDimension,
+            metadataScalarBytes: aggregate.metadataScalarBytes,
+            payloadBytes: aggregate.payloadBytes,
+            metadataBytes: aggregate.metadataBytes,
+            controlBytes: aggregate.controlBytes,
+            materializationWorkspaceBytes:
+                aggregate.materializationWorkspaceBytes,
+            totalPersistentBytes: aggregate.totalPersistentBytes,
+            totalBytes: aggregate.totalBytes)
+    }
+}
+
+/// Actor-safe execution receipt for an authenticated preselection candidate. The policy digest,
+/// complete candidate-set identity, exact model identities, frozen layer decisions, and observed
+/// MLX allocation all travel together so a search row cannot self-report cache engagement.
+public struct KVTunerCandidateKVCacheTelemetry: Equatable, Sendable {
+    public let runtimePolicySHA256: String
+    public let calibrationManifestSHA256: String
+    public let sourceSensitivityArtifactSHA256: String
+    public let candidateListSHA256: String
+    public let candidateSHA256: String
+    public let matrixID: String
+    public let modelConfigHash: String
+    public let modelConfigSHA256: String
+    public let checkpointManifestHash: String
+    public let tokenizerSHA256: String
+    public let groupSize: Int
+    public let targetPairBitTotal: Int
+    public let candidateCount: Int
+    public let candidateOrdinal: Int
+    public let layers: [KVTunerRuntimeLayerPolicy]
+    public let cachedTokens: Int
+    public let layerCount: Int
+    public let capacityTokens: Int
+    public let sequences: Int
+    public let kvHeadCount: Int
+    public let headDimension: Int
+    public let metadataScalarBytes: Int
+    public let payloadBytes: Int
+    public let metadataBytes: Int
+    public let controlBytes: Int
+    public let materializationWorkspaceBytes: Int
+    public let totalPersistentBytes: Int
+    public let totalBytes: Int
+
+    /// Schema-2 scalar receipt derived directly from observed cache telemetry. Keeping this
+    /// conversion beside the source values prevents CLI orchestration from transposing geometry
+    /// or omitting a byte class while constructing durable candidate evidence.
+    public var evidenceReceipt: KVTunerCandidateRuntimeReceipt {
+        KVTunerCandidateRuntimeReceipt(
+            runtimePolicySHA256: runtimePolicySHA256,
+            cachedTokens: cachedTokens,
+            capacityTokens: capacityTokens,
+            layers: layers,
+            geometry: KVTunerCandidateRuntimeGeometry(
+                layerCount: layerCount,
+                kvHeadCount: kvHeadCount,
+                headDimension: headDimension),
+            groupSize: groupSize,
+            sequenceCount: sequences,
+            metadataScalarBytes: metadataScalarBytes,
+            actualPayloadBytes: payloadBytes,
+            actualMetadataBytes: metadataBytes,
+            actualControlBytes: controlBytes,
+            actualWorkspaceBytes: materializationWorkspaceBytes,
+            actualTotalPersistentBytes: totalPersistentBytes,
+            actualTotalBytes: totalBytes)
+    }
+
+    public static func capture(
+        policy: KVTunerCandidateRuntimePolicy,
+        caches: [AffineKVCache]
+    ) throws -> KVTunerCandidateKVCacheTelemetry {
+        let aggregate = try KVTunerAffineCacheAggregate.capture(
+            layers: policy.layers,
+            groupSize: policy.groupSize,
+            caches: caches)
+        return KVTunerCandidateKVCacheTelemetry(
+            runtimePolicySHA256: policy.runtimePolicySHA256,
+            calibrationManifestSHA256:
+                policy.calibrationManifestSHA256,
+            sourceSensitivityArtifactSHA256:
+                policy.sourceSensitivityArtifactSHA256,
+            candidateListSHA256: policy.candidateListSHA256,
+            candidateSHA256: policy.candidateSHA256,
+            matrixID: policy.matrixID,
+            modelConfigHash: policy.modelConfigHash,
+            modelConfigSHA256: policy.modelConfigSHA256,
+            checkpointManifestHash: policy.checkpointManifestHash,
+            tokenizerSHA256: policy.tokenizerSHA256,
+            groupSize: policy.groupSize,
+            targetPairBitTotal: policy.targetPairBitTotal,
+            candidateCount: policy.candidateCount,
+            candidateOrdinal: policy.candidateOrdinal,
+            layers: policy.layers,
+            cachedTokens: aggregate.cachedTokens,
+            layerCount: aggregate.layerCount,
+            capacityTokens: aggregate.capacityTokens,
+            sequences: aggregate.sequences,
+            kvHeadCount: aggregate.kvHeadCount,
+            headDimension: aggregate.headDimension,
+            metadataScalarBytes: aggregate.metadataScalarBytes,
+            payloadBytes: aggregate.payloadBytes,
+            metadataBytes: aggregate.metadataBytes,
+            controlBytes: aggregate.controlBytes,
+            materializationWorkspaceBytes:
+                aggregate.materializationWorkspaceBytes,
+            totalPersistentBytes: aggregate.totalPersistentBytes,
+            totalBytes: aggregate.totalBytes)
     }
 }
 

@@ -481,7 +481,7 @@ func runTaskCoherence(_ flags: Flags) async {
 
         let preparedKVTuner: PreparedKVTunerRun?
         if let schedulePath = plan.kvtunerSchedulePath {
-            preparedKVTuner = try prepareKVTunerRun(
+            preparedKVTuner = try await prepareKVTunerRun(
                 schedulePath: schedulePath,
                 modelPath: plan.modelPath,
                 matrixID: plan.matrixID,

@@ -174,7 +174,9 @@ public struct TaskCoherenceCorpus: Codable, Equatable, Sendable {
     public var kvtunerEvaluationCorpusIdentity:
         KVTunerEvaluationCorpusIdentity
     {
-        KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(self)
+        get throws {
+            try KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(self)
+        }
     }
 
     private static func isValid(_ item: TaskCoherenceItem) -> Bool {
@@ -708,7 +710,7 @@ public struct TaskCoherenceAssessment: Codable, Equatable, Sendable {
                 schedule.checkpointManifestHash
                     == identity.modelCheckpointManifestHash,
                 schedule.evaluationCorpora.contains(
-                    corpus.kvtunerEvaluationCorpusIdentity)
+                    try corpus.kvtunerEvaluationCorpusIdentity)
             else { throw TaskCoherenceError.invalidRunIdentity }
         } else if identity.kvtunerSchedule != nil {
             throw TaskCoherenceError.invalidRunIdentity

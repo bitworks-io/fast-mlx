@@ -10,11 +10,12 @@ final class KVTunerScheduleTests: XCTestCase {
 
     private func validSchedule() -> KVTunerSchedule {
         KVTunerSchedule(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
             checkpointManifestHash: checkpointHash,
+            tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -22,10 +23,14 @@ final class KVTunerScheduleTests: XCTestCase {
                 "2222222222222222",
                 "3333333333333333",
             ],
-            seed: 7,
-            objective: "minimize-attention-error-at-4.5-average-bits",
+            calibrationSourceItemDigests: (0..<200).map {
+                sha256Hex(Data("source-\($0)".utf8))
+            }.sorted(),
+            seed: 1234,
+            objective: "maximize-gsm8k-accuracy-at-b4.5",
             nominalAverageBits: 4.5,
             sourceSensitivityArtifactSHA256: String(repeating: "a", count: 64),
+            sourceSearchArtifactSHA256: String(repeating: "b", count: 64),
             layers: [
                 KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
                 KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
@@ -44,7 +49,7 @@ final class KVTunerScheduleTests: XCTestCase {
             expectedCheckpointManifestHash: checkpointHash)
     }
 
-    func testCompletePinnedV2ScheduleValidatesAndRoundTripsJSON() throws {
+    func testCompletePinnedV3ScheduleValidatesAndRoundTripsJSON() throws {
         let validated = try validate(validSchedule())
         let encoded = try JSONEncoder().encode(validated)
         let decoded = try JSONDecoder().decode(KVTunerSchedule.self, from: encoded)
@@ -53,24 +58,50 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertEqual(decoded, validated)
     }
 
-    func testSchemaOneCannotQualifyEvenWhenAllV2FieldsArePresent() {
-        var legacy = validSchedule()
-        legacy.schemaVersion = 1
+    func testPriorSchemasCannotQualifyEvenWhenAllV3FieldsArePresent() {
+        for schema in [1, 2] {
+            var legacy = validSchedule()
+            legacy.schemaVersion = schema
 
-        XCTAssertThrowsError(try validate(legacy)) { error in
-            XCTAssertEqual(error as? KVTunerScheduleError, .unsupportedSchema(1))
+            XCTAssertThrowsError(try validate(legacy)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .unsupportedSchema(schema))
+            }
         }
     }
 
-    func testMissingV2FieldCannotDecodeAsAQualifyingSchedule() throws {
-        let encoded = try JSONEncoder().encode(validSchedule())
-        var object = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: encoded) as? [String: Any])
-        object.removeValue(forKey: "sourceSensitivityArtifactSHA256")
+    func testGenuineV2ShapeIsClassifiedAsUnsupportedBeforeV3FieldsDecode() throws {
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(validSchedule())) as? [String: Any])
+        object["schemaVersion"] = 2
+        object.removeValue(forKey: "tokenizerSHA256")
+        object.removeValue(forKey: "sourceSearchArtifactSHA256")
+        let data = try JSONSerialization.data(withJSONObject: object)
 
         XCTAssertThrowsError(try JSONDecoder().decode(
-            KVTunerSchedule.self,
-            from: JSONSerialization.data(withJSONObject: object)))
+            KVTunerSchedule.self, from: data)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleError,
+                    .unsupportedSchema(2))
+            }
+    }
+
+    func testMissingV3SourceFieldCannotDecodeAsAQualifyingSchedule() throws {
+        for field in [
+            "sourceSensitivityArtifactSHA256",
+            "sourceSearchArtifactSHA256",
+        ] {
+            let encoded = try JSONEncoder().encode(validSchedule())
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoded)
+                    as? [String: Any])
+            object.removeValue(forKey: field)
+
+            XCTAssertThrowsError(try JSONDecoder().decode(
+                KVTunerSchedule.self,
+                from: JSONSerialization.data(withJSONObject: object)))
+        }
     }
 
     func testModelConfigAndCheckpointMustMatchExpectedRuntime() {
@@ -94,6 +125,21 @@ final class KVTunerScheduleTests: XCTestCase {
                     error as? KVTunerScheduleError,
                     .checkpointManifestHashMismatch)
             }
+    }
+
+    func testRewrappedPromptFromSameSourceItemFailsLeakageGate() throws {
+        let schedule = try validate(validSchedule())
+        XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
+            id: "rewrapped-gsm8k-v1",
+            hash: "4444444444444444",
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [schedule.calibrationSourceItemDigests[0]]
+        )) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .evaluationCorpusLeaksCalibration)
+        }
     }
 
     func testMatrixIDMustMatchRequestedMatrix() {
@@ -184,6 +230,28 @@ final class KVTunerScheduleTests: XCTestCase {
         invalid = validSchedule()
         invalid.sourceSensitivityArtifactSHA256 = String(repeating: "g", count: 64)
         XCTAssertThrowsError(try validate(invalid))
+
+        invalid = validSchedule()
+        invalid.sourceSearchArtifactSHA256 = String(repeating: "G", count: 64)
+        XCTAssertThrowsError(try validate(invalid))
+    }
+
+    func testSearchSeedAndObjectiveArePartOfTheRuntimeContract() {
+        var invalid = validSchedule()
+        invalid.seed = 7
+        XCTAssertThrowsError(try validate(invalid)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .invalidSearchProtocol("seed"))
+        }
+
+        invalid = validSchedule()
+        invalid.objective = "minimize-attention-error"
+        XCTAssertThrowsError(try validate(invalid)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleError,
+                .invalidSearchProtocol("objective"))
+        }
     }
 
     func testCalibrationEntryHashesAreNonemptyUniqueAndCanonical() {
@@ -222,7 +290,9 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
             id: "renamed-evaluation",
             hash: "4444444444444444",
-            entryHashes: [calibrationSHA])) { error in
+            entryHashes: [calibrationSHA],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)])) { error in
                 XCTAssertEqual(
                     error as? KVTunerScheduleError,
                     .invalidDigest(calibrationSHA))
@@ -233,7 +303,9 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertThrowsError(try pinnedCalibration.validateEvaluationCorpus(
             id: "renamed-evaluation",
             hash: "4444444444444444",
-            entryHashes: [evaluationFNV])) { error in
+            entryHashes: [evaluationFNV],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)])) { error in
                 XCTAssertEqual(
                     error as? KVTunerScheduleError,
                     .evaluationCorpusLeaksCalibration)
@@ -302,6 +374,8 @@ final class KVTunerScheduleTests: XCTestCase {
             runnable.nominalAverageBits =
                 runnable.computedNominalAverageBits
             runnable.cellID = cellID
+            runnable.objective =
+                "maximize-gsm8k-accuracy-at-b\(runnable.nominalAverageBits)"
             XCTAssertNoThrow(try validate(
                 runnable, expectedCellID: cellID))
         }
@@ -344,39 +418,55 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertNoThrow(try schedule.validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555", "6666666666666666"]))
+            entryHashes: ["5555555555555555", "6666666666666666"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
 
         XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
             id: schedule.calibrationCorpusID,
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
         XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
             id: "renamed-corpus",
             hash: schedule.calibrationCorpusHash,
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
         XCTAssertThrowsError(try schedule.validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["2222222222222222", "5555555555555555"]))
+            entryHashes: ["2222222222222222", "5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
     }
 
     func testMalformedEvaluationIdentityFailsBeforeLeakageComparison() {
         XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
             id: "evaluation corpus",
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
         XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "not-a-digest",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
         XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: []))
+            entryHashes: [],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
         XCTAssertThrowsError(try validSchedule().validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["not-a-digest"]))
+            entryHashes: ["not-a-digest"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
     }
 
     func testEvaluationLeakageCheckAlsoRejectsMalformedStoredCalibrationIdentity() {
@@ -385,20 +475,26 @@ final class KVTunerScheduleTests: XCTestCase {
         XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
 
         invalid = validSchedule()
         invalid.calibrationCorpusHash = "not-a-digest"
         XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
 
         invalid = validSchedule()
         invalid.calibrationEntryHashes = []
         XCTAssertThrowsError(try invalid.validateEvaluationCorpus(
             id: "measurement-corpus-v2",
             hash: "4444444444444444",
-            entryHashes: ["5555555555555555"]))
+            entryHashes: ["5555555555555555"],
+            sourceProvenance: .canonicalSourceItems,
+            sourceItemHashes: [String(repeating: "f", count: 64)]))
     }
 }
