@@ -6,6 +6,19 @@ public func sha256Hex(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
+/// Stable, architecture-independent digest of the exact tokenizer IDs fed to the model. Fixed
+/// eight-byte big-endian lanes preserve ordering and boundaries without relying on JSON number
+/// formatting, making fp16/candidate prompt equality independently auditable.
+public func taskTokenIDsSHA256(_ tokenIDs: [Int]) -> String {
+    var data = Data()
+    data.reserveCapacity(tokenIDs.count * MemoryLayout<Int64>.size)
+    for tokenID in tokenIDs {
+        var encoded = Int64(tokenID).bigEndian
+        withUnsafeBytes(of: &encoded) { data.append(contentsOf: $0) }
+    }
+    return sha256Hex(data)
+}
+
 public enum TaskCoherenceEvidenceError: Error, Equatable, Sendable {
     case unsupportedSchema(Int)
     case invalidIdentifier(String)
@@ -51,6 +64,60 @@ public struct TaskCoherencePromptLayoutEvidence:
         self.minimumCompletedTileCount = minimumCompletedTileCount
     }
 
+    /// Derives a conservative material span from four tokenizer passes. Tokenizers may resegment
+    /// several tokens at either concatenation boundary, so the material ends immediately before
+    /// the suffix/query tokens that remain an exact common suffix of the complete prompt. The
+    /// prefix+material common prefix is retained as an independent lower bound, preventing a
+    /// repeated suffix token sequence from understating the span.
+    public static func derive(
+        prefixTokenIDs: [Int],
+        prefixAndMaterialTokenIDs: [Int],
+        suffixAndQueryTokenIDs: [Int],
+        promptTokenIDs: [Int]
+    ) throws -> TaskCoherencePromptLayoutEvidence {
+        func commonPrefix(_ lhs: [Int], _ rhs: [Int]) -> Int {
+            var count = 0
+            while count < lhs.count, count < rhs.count,
+                lhs[count] == rhs[count]
+            {
+                count += 1
+            }
+            return count
+        }
+
+        func commonSuffix(_ lhs: [Int], _ rhs: [Int]) -> Int {
+            var count = 0
+            while count < lhs.count, count < rhs.count,
+                lhs[lhs.count - count - 1] == rhs[rhs.count - count - 1]
+            {
+                count += 1
+            }
+            return count
+        }
+
+        let materialStart = commonPrefix(prefixTokenIDs, promptTokenIDs)
+        let prefixMaterialCommon = commonPrefix(
+            prefixAndMaterialTokenIDs, promptTokenIDs)
+        let stableSuffixTokens = commonSuffix(
+            suffixAndQueryTokenIDs, promptTokenIDs)
+        let suffixBoundary = promptTokenIDs.count - stableSuffixTokens
+        let materialEnd = max(prefixMaterialCommon, suffixBoundary)
+        let sink = Self.sinkTokens
+        let tile = Self.tileTokens
+        guard promptTokenIDs.count > sink, materialEnd >= sink else {
+            throw TaskCoherenceEvidenceError.invalidPromptLayout
+        }
+        let compressedEnd = sink
+            + ((promptTokenIDs.count - sink) / tile) * tile
+        let minimumTiles = (materialEnd - sink + tile - 1) / tile
+        return try TaskCoherencePromptLayoutEvidence(
+            promptTokens: promptTokenIDs.count,
+            materialStartToken: materialStart,
+            materialEndToken: materialEnd,
+            compressedRegionEndToken: compressedEnd,
+            minimumCompletedTileCount: minimumTiles).validated()
+    }
+
     @discardableResult
     public func validated() throws -> Self {
         let sink = Self.sinkTokens
@@ -86,6 +153,11 @@ public struct TaskCoherenceCacheEngagementEvidence:
     public let kvarnCompressedTokens: Int?
     public let kvarnCodecIterations: Int?
     public let kvarnExecutionMode: String?
+    /// Native engagement captured from the fresh, full-prompt cache used to score a restricted
+    /// choice. Structured-tool rows do not run this second scoring pass and leave these nil.
+    public let scoringCachedTokens: Int?
+    public let scoringKVarNCompletedTileCount: Int?
+    public let scoringKVarNCompressedTokens: Int?
 
     public init(
         cachedTokens: Int?,
@@ -93,7 +165,10 @@ public struct TaskCoherenceCacheEngagementEvidence:
         kvarnCompletedTileCount: Int?,
         kvarnCompressedTokens: Int?,
         kvarnCodecIterations: Int?,
-        kvarnExecutionMode: String?
+        kvarnExecutionMode: String?,
+        scoringCachedTokens: Int? = nil,
+        scoringKVarNCompletedTileCount: Int? = nil,
+        scoringKVarNCompressedTokens: Int? = nil
     ) {
         self.cachedTokens = cachedTokens
         self.affineTokens = affineTokens
@@ -101,6 +176,92 @@ public struct TaskCoherenceCacheEngagementEvidence:
         self.kvarnCompressedTokens = kvarnCompressedTokens
         self.kvarnCodecIterations = kvarnCodecIterations
         self.kvarnExecutionMode = kvarnExecutionMode
+        self.scoringCachedTokens = scoringCachedTokens
+        self.scoringKVarNCompletedTileCount =
+            scoringKVarNCompletedTileCount
+        self.scoringKVarNCompressedTokens = scoringKVarNCompressedTokens
+    }
+}
+
+/// Exact tokenizer boundary for one case. Model/config/checkpoint hashes do not cover mutable
+/// tokenizer files, so task evidence also binds the actual prompt IDs and the four globally pinned
+/// restricted-choice token IDs. Candidate/reference pairing requires this value byte-for-byte.
+public struct TaskCoherenceTokenizationEvidence:
+    Codable, Equatable, Sendable
+{
+    public let tokenizerManifestSHA256: String
+    public let promptTokenIDsSHA256: String
+    public let restrictedChoiceLabelTokenIDs: [String: Int]?
+
+    public init(
+        tokenizerManifestSHA256: String,
+        promptTokenIDsSHA256: String,
+        restrictedChoiceLabelTokenIDs: [String: Int]?
+    ) {
+        self.tokenizerManifestSHA256 = tokenizerManifestSHA256
+        self.promptTokenIDsSHA256 = promptTokenIDsSHA256
+        self.restrictedChoiceLabelTokenIDs = restrictedChoiceLabelTokenIDs
+    }
+}
+
+/// Frozen decoding/scoring controls shared by every case in a qualification run. These fields are
+/// evidence, not CLI defaults: candidate/reference comparison is invalid when truncation, sampling,
+/// label spelling, or tokenizer special-token handling differs.
+public struct TaskCoherenceRunConfiguration:
+    Codable, Equatable, Sendable
+{
+    public let temperature: Double
+    public let restrictedChoiceMaxTokens: Int
+    public let structuredToolMaxTokens: Int
+    public let restrictedChoiceLabelTokenSpellings: [String: String]
+    public let restrictedChoiceAddsSpecialTokens: Bool
+    public let structuredToolSkipsSpecialTokens: Bool
+
+    public init(
+        temperature: Double,
+        restrictedChoiceMaxTokens: Int,
+        structuredToolMaxTokens: Int,
+        restrictedChoiceLabelTokenSpellings: [String: String],
+        restrictedChoiceAddsSpecialTokens: Bool,
+        structuredToolSkipsSpecialTokens: Bool
+    ) {
+        self.temperature = temperature
+        self.restrictedChoiceMaxTokens = restrictedChoiceMaxTokens
+        self.structuredToolMaxTokens = structuredToolMaxTokens
+        self.restrictedChoiceLabelTokenSpellings =
+            restrictedChoiceLabelTokenSpellings
+        self.restrictedChoiceAddsSpecialTokens =
+            restrictedChoiceAddsSpecialTokens
+        self.structuredToolSkipsSpecialTokens = structuredToolSkipsSpecialTokens
+    }
+
+    public static func qualificationV2(
+        structuredToolMaxTokens: Int
+    ) -> TaskCoherenceRunConfiguration {
+        TaskCoherenceRunConfiguration(
+            temperature: 0,
+            restrictedChoiceMaxTokens: 1,
+            structuredToolMaxTokens: structuredToolMaxTokens,
+            restrictedChoiceLabelTokenSpellings:
+                TaskRestrictedChoiceScorer.labelTokenSpellings,
+            restrictedChoiceAddsSpecialTokens: false,
+            structuredToolSkipsSpecialTokens: true)
+    }
+
+    @discardableResult
+    public func validated() throws -> Self {
+        guard temperature.isFinite, temperature == 0,
+            restrictedChoiceMaxTokens == 1,
+            (1 ... 512).contains(structuredToolMaxTokens),
+            restrictedChoiceLabelTokenSpellings
+                == TaskRestrictedChoiceScorer.labelTokenSpellings,
+            restrictedChoiceAddsSpecialTokens == false,
+            structuredToolSkipsSpecialTokens
+        else {
+            throw TaskCoherenceEvidenceError.mismatchedArtifact(
+                "run-configuration")
+        }
+        return self
     }
 }
 
@@ -114,6 +275,8 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
     /// Nil only for the fp16 task baseline. Every lossy row names the exact raw fp16 JSONL digest.
     public let referenceArtifactSHA256: String?
     public let promptContentHash: String
+    public let runConfiguration: TaskCoherenceRunConfiguration
+    public let tokenization: TaskCoherenceTokenizationEvidence
     public let layout: TaskCoherencePromptLayoutEvidence
     public let generatedTokenCount: Int
     /// The exact scorer input: one of A/B/C/D or the decoded structured-tool generation.
@@ -129,6 +292,8 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
         identity: TaskCoherenceRunIdentity,
         referenceArtifactSHA256: String?,
         promptContentHash: String,
+        runConfiguration: TaskCoherenceRunConfiguration,
+        tokenization: TaskCoherenceTokenizationEvidence,
         layout: TaskCoherencePromptLayoutEvidence,
         generatedTokenCount: Int,
         scoredOutput: String,
@@ -142,6 +307,8 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
         self.identity = identity
         self.referenceArtifactSHA256 = referenceArtifactSHA256
         self.promptContentHash = promptContentHash
+        self.runConfiguration = runConfiguration
+        self.tokenization = tokenization
         self.layout = layout
         self.generatedTokenCount = generatedTokenCount
         self.scoredOutput = scoredOutput
@@ -160,6 +327,7 @@ public struct TaskCoherenceArtifactSummary: Codable, Equatable, Sendable {
     public let artifactSHA256: String
     public let referenceArtifactSHA256: String?
     public let identity: TaskCoherenceRunIdentity
+    public let runConfiguration: TaskCoherenceRunConfiguration
     public let provenance: Provenance
     public let caseCount: Int
     /// Canonical corpus-order cases keep layout, output, and engagement inside the validation
@@ -174,6 +342,7 @@ public struct TaskCoherenceArtifactSummary: Codable, Equatable, Sendable {
         artifactSHA256: String,
         referenceArtifactSHA256: String?,
         identity: TaskCoherenceRunIdentity,
+        runConfiguration: TaskCoherenceRunConfiguration,
         provenance: Provenance,
         caseCount: Int,
         cases: [TaskCoherenceCasePayload],
@@ -185,6 +354,7 @@ public struct TaskCoherenceArtifactSummary: Codable, Equatable, Sendable {
         self.artifactSHA256 = artifactSHA256
         self.referenceArtifactSHA256 = referenceArtifactSHA256
         self.identity = identity
+        self.runConfiguration = runConfiguration
         self.provenance = provenance
         self.caseCount = caseCount
         self.cases = cases
@@ -193,6 +363,11 @@ public struct TaskCoherenceArtifactSummary: Codable, Equatable, Sendable {
 }
 
 public enum TaskCoherenceArtifact {
+    /// Schema 1 predated authenticated tokenizer/layout/run controls and never shipped from a
+    /// runnable task CLI. Schema 2 is the first qualification-capable artifact and rejects any
+    /// partial legacy rows rather than guessing missing evidence.
+    public static let schemaVersion = 2
+
     private static let affineTiers: Set<String> = [
         "affine-k4v2-g64",
         "affine-k4v2-g128",
@@ -214,6 +389,13 @@ public enum TaskCoherenceArtifact {
         "kvarn-k4v2-g128": "kvarn-k4v2-g128-i8",
         "kvarn-k4v2-g128-i16": "kvarn-k4v2-g128-i16",
     ]
+
+    /// Closed runnable mapping shared by preflight CLI validation and artifact adjudication.
+    /// KVTuner schedules remain excluded until their external schedule digest is bound into
+    /// both runtime construction and task evidence.
+    public static func expectedCellID(forTier tier: String) -> String? {
+        tierCellIDs[tier]
+    }
 
     /// Strict JSON Lines decoding: exactly one optional trailing newline is accepted. Blank rows,
     /// partial writes, and malformed envelopes fail the whole artifact.
@@ -283,6 +465,8 @@ public enum TaskCoherenceArtifact {
                 row.payload.matrixID == first.payload.matrixID,
                 row.payload.cellID == first.payload.cellID,
                 row.payload.identity == first.payload.identity,
+                row.payload.runConfiguration
+                    == first.payload.runConfiguration,
                 row.payload.referenceArtifactSHA256
                     == first.payload.referenceArtifactSHA256
             else {
@@ -304,6 +488,20 @@ public enum TaskCoherenceArtifact {
             }
             return payload
         }
+        let restrictedTokenizations = zip(corpus.items, cases).compactMap {
+            item, payload in
+            item.scoringMode == .restrictedChoice
+                ? payload.tokenization.restrictedChoiceLabelTokenIDs : nil
+        }
+        guard Set(cases.map {
+            $0.tokenization.tokenizerManifestSHA256
+        }).count == 1,
+            let firstTokenization = restrictedTokenizations.first,
+            restrictedTokenizations.allSatisfy({ $0 == firstTokenization })
+        else {
+            throw TaskCoherenceEvidenceError.mismatchedArtifact(
+                "label-tokenization")
+        }
         let scores = cases.map(\.score)
         return TaskCoherenceArtifactSummary(
             schemaVersion: first.payload.schemaVersion,
@@ -313,6 +511,7 @@ public enum TaskCoherenceArtifact {
             referenceArtifactSHA256:
                 first.payload.referenceArtifactSHA256,
             identity: first.payload.identity,
+            runConfiguration: first.payload.runConfiguration,
             provenance: first.provenance,
             caseCount: rows.count,
             cases: cases,
@@ -334,7 +533,7 @@ public enum TaskCoherenceArtifact {
         guard record.subcommand == "task-coherence" else {
             throw TaskCoherenceEvidenceError.mismatchedArtifact("subcommand")
         }
-        guard payload.schemaVersion == 1 else {
+        guard payload.schemaVersion == schemaVersion else {
             throw TaskCoherenceEvidenceError.unsupportedSchema(
                 payload.schemaVersion)
         }
@@ -371,9 +570,28 @@ public enum TaskCoherenceArtifact {
         else {
             throw TaskCoherenceEvidenceError.mismatchedArtifact("prompt")
         }
+        try payload.runConfiguration.validated()
+        guard isHex(
+            payload.tokenization.tokenizerManifestSHA256, length: 64),
+            isHex(payload.tokenization.promptTokenIDsSHA256, length: 64)
+        else {
+            throw TaskCoherenceEvidenceError.mismatchedArtifact(
+                "prompt-tokenization")
+        }
         let derivedScore: TaskItemScore
         switch item.scoringMode {
         case .restrictedChoice:
+            guard let labelTokenIDs =
+                payload.tokenization.restrictedChoiceLabelTokenIDs,
+                Set(labelTokenIDs.keys) == Set(["A", "B", "C", "D"]),
+                Set(labelTokenIDs.values).count == 4,
+                labelTokenIDs.values.allSatisfy({ $0 >= 0 }),
+                payload.generatedTokenCount
+                    == payload.runConfiguration.restrictedChoiceMaxTokens
+            else {
+                throw TaskCoherenceEvidenceError.mismatchedArtifact(
+                    "label-tokenization")
+            }
             guard ["A", "B", "C", "D"].contains(payload.scoredOutput),
                 let expected = item.expectedChoice
             else {
@@ -384,6 +602,13 @@ public enum TaskCoherenceArtifact {
                 correct: payload.scoredOutput == expected,
                 syntacticallyValid: nil)
         case .structuredTool:
+            guard payload.tokenization.restrictedChoiceLabelTokenIDs == nil,
+                payload.generatedTokenCount
+                    <= payload.runConfiguration.structuredToolMaxTokens
+            else {
+                throw TaskCoherenceEvidenceError.mismatchedArtifact(
+                    "label-tokenization")
+            }
             guard let expected = item.expectedTool else {
                 throw TaskCoherenceEvidenceError.mismatchedArtifact("score")
             }
@@ -401,7 +626,8 @@ public enum TaskCoherenceArtifact {
         try validateEngagement(
             payload.engagement, tier: payload.identity.kvQuantTier,
             layout: payload.layout,
-            generatedTokenCount: payload.generatedTokenCount)
+            generatedTokenCount: payload.generatedTokenCount,
+            scoringMode: item.scoringMode)
 
         if payload.identity.kvQuantTier == "fp16" {
             guard payload.referenceArtifactSHA256 == nil else {
@@ -421,14 +647,14 @@ public enum TaskCoherenceArtifact {
         _ engagement: TaskCoherenceCacheEngagementEvidence,
         tier: String,
         layout: TaskCoherencePromptLayoutEvidence,
-        generatedTokenCount: Int
+        generatedTokenCount: Int,
+        scoringMode: TaskCoherenceScoringMode
     ) throws {
-        let (generatedInputs, generatedUnderflow) = generatedTokenCount
-            .subtractingReportingOverflow(1)
+        // The submit-first production decoder consumes every emitted token into KV before making
+        // it visible to the caller. Its exact post-run cache offset is therefore prompt + N.
         let (expectedCachedTokens, cachedOverflow) = layout.promptTokens
-            .addingReportingOverflow(generatedInputs)
-        guard !generatedUnderflow, !cachedOverflow,
-            generatedInputs >= 0
+            .addingReportingOverflow(generatedTokenCount)
+        guard generatedTokenCount > 0, !cachedOverflow
         else {
             throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                 "cachedTokens")
@@ -438,23 +664,41 @@ public enum TaskCoherenceArtifact {
             engagement.kvarnCompressedTokens,
             engagement.kvarnCodecIterations,
         ]
+        let scoringKVarNValues = [
+            engagement.scoringKVarNCompletedTileCount,
+            engagement.scoringKVarNCompressedTokens,
+        ]
         if tier == "fp16" {
             guard engagement.cachedTokens == nil,
                 engagement.affineTokens == nil,
                 kvarnValues.allSatisfy({ $0 == nil }),
-                engagement.kvarnExecutionMode == nil
+                engagement.kvarnExecutionMode == nil,
+                engagement.scoringCachedTokens == nil,
+                scoringKVarNValues.allSatisfy({ $0 == nil })
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence("fp16")
             }
             return
         }
         if affineTiers.contains(tier) {
+            let validScoringEngagement: Bool
+            switch scoringMode {
+            case .restrictedChoice:
+                validScoringEngagement =
+                    engagement.scoringCachedTokens == layout.promptTokens
+                    && scoringKVarNValues.allSatisfy({ $0 == nil })
+            case .structuredTool:
+                validScoringEngagement =
+                    engagement.scoringCachedTokens == nil
+                    && scoringKVarNValues.allSatisfy({ $0 == nil })
+            }
             guard let cachedTokens = engagement.cachedTokens,
                 let affineTokens = engagement.affineTokens,
                 cachedTokens == expectedCachedTokens,
                 cachedTokens == affineTokens,
                 kvarnValues.allSatisfy({ $0 == nil }),
-                engagement.kvarnExecutionMode == nil
+                engagement.kvarnExecutionMode == nil,
+                validScoringEngagement
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "affine")
@@ -462,6 +706,30 @@ public enum TaskCoherenceArtifact {
             return
         }
         if let expectedIterations = kvarnIterations[tier] {
+            let validScoringEngagement: Bool
+            switch scoringMode {
+            case .restrictedChoice:
+                if let scoringCachedTokens = engagement.scoringCachedTokens,
+                    let scoringCompleted =
+                        engagement.scoringKVarNCompletedTileCount,
+                    let scoringCompressed =
+                        engagement.scoringKVarNCompressedTokens
+                {
+                    validScoringEngagement =
+                        scoringCachedTokens == layout.promptTokens
+                        && checkedKVarNGeometry(
+                            cachedTokens: scoringCachedTokens,
+                            completedTiles: scoringCompleted,
+                            compressedTokens: scoringCompressed)
+                        && scoringCompleted >= layout.minimumCompletedTileCount
+                } else {
+                    validScoringEngagement = false
+                }
+            case .structuredTool:
+                validScoringEngagement =
+                    engagement.scoringCachedTokens == nil
+                    && scoringKVarNValues.allSatisfy({ $0 == nil })
+            }
             guard let cachedTokens = engagement.cachedTokens,
                 engagement.affineTokens == nil,
                 let completed = engagement.kvarnCompletedTileCount,
@@ -477,7 +745,8 @@ public enum TaskCoherenceArtifact {
                     compressedTokens: compressed),
                 completed >= layout.minimumCompletedTileCount,
                 iterations == expectedIterations,
-                engagement.kvarnExecutionMode == "uncompiled-correctness"
+                engagement.kvarnExecutionMode == "uncompiled-correctness",
+                validScoringEngagement
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "kvarn")
@@ -511,7 +780,7 @@ public enum TaskCoherenceArtifact {
         _ summary: TaskCoherenceArtifactSummary,
         corpus: TaskCoherenceCorpus
     ) throws {
-        guard summary.schemaVersion == 1 else {
+        guard summary.schemaVersion == schemaVersion else {
             throw TaskCoherenceEvidenceError.unsupportedSchema(
                 summary.schemaVersion)
         }
@@ -636,9 +905,14 @@ public struct TaskCoherencePromotionEvidence:
             reference.identity.kvQuantTier == "fp16",
             reference.cellID == "fp16",
             candidate.matrixID == reference.matrixID,
+            candidate.runConfiguration == reference.runConfiguration,
             candidate.referenceArtifactSHA256 == reference.artifactSHA256,
             TaskCoherenceArtifact.matchingRuntime(
-                candidate.provenance, reference.provenance)
+                candidate.provenance, reference.provenance),
+            zip(candidate.cases, reference.cases).allSatisfy({
+                $0.tokenization == $1.tokenization
+                    && $0.layout == $1.layout
+            })
         else {
             throw TaskCoherenceEvidenceError.referenceArtifactMismatch
         }

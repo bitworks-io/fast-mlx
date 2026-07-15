@@ -18,6 +18,13 @@ enum SwiftEngineDriverError: Error, CustomStringConvertible {
     }
 }
 
+/// Exact result of one restricted-choice scoring forward. Only actor-safe CPU values cross the
+/// engine boundary; the MLX arrays and concrete cache objects remain actor-confined.
+struct TaskChoiceLogitsResult: Sendable {
+    let logits: [Float]
+    let engagement: EngagementCounters
+}
+
 /// Single-owner actor over the spike's compiled decode core. Owns BOTH the model and the
 /// `CompiledMLXDecoder` (one isolation region) because `logprobs` needs direct forward access
 /// to full-vocab logits, which the token-only `Decoder` protocol deliberately doesn't expose.
@@ -137,6 +144,60 @@ actor HarnessEngineActor {
         }
         captureQuantizedScoringTelemetry(kind, cache: cache, minTokens: prompt.count)
         return rows
+    }
+
+    /// Scores the four-choice task head with one fresh full-prompt cache and returns engagement
+    /// from that exact local cache. The ordinary scoring accessors retain maximum telemetry for
+    /// KL accounting; they are intentionally not used here because a prior larger run could make
+    /// a silently unengaged task row appear valid.
+    func taskChoiceLogits(
+        prompt: [Int], kvCache kind: KVCacheKind
+    ) -> TaskChoiceLogitsResult {
+        precondition(!prompt.isEmpty, "task scoring requires a nonempty prompt")
+        let cache = makeScoringCache(kind: kind, capacity: prompt.count)
+        let ids = MLXArray(prompt).reshaped([1, prompt.count])
+        let logits = model(ids, cache: cache)
+        let last = logits[0..., -1, 0...]
+        let row = last.asType(.float32).asArray(Float.self)
+        var counts: [String: Int] = [:]
+
+        switch kind {
+        case .fp16:
+            break
+        case .affine(let tier):
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "affine task-scoring cache contains a different cache type")
+            let telemetry = AffineKVCacheTelemetry.capture(
+                tier: tier, caches: affineCaches)
+            precondition(
+                telemetry.cachedTokens == prompt.count,
+                "affine task-scoring cache did not consume the full prompt")
+            counts["scoring_cached_tokens"] = telemetry.cachedTokens
+        case .kvarn(let cell):
+            let kvarnCaches = cache.compactMap { $0 as? KVarNKVCache }
+            precondition(
+                kvarnCaches.count == cache.count,
+                "KVarN task-scoring cache contains a different cache type")
+            let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+            precondition(
+                telemetry.tier == cell.tier
+                    && telemetry.iterations == cell.iterations
+                    && telemetry.executionMode == .uncompiledCorrectness
+                    && telemetry.cachedTokens == prompt.count,
+                "KVarN task-scoring telemetry does not match its runtime cell")
+            counts["scoring_cached_tokens"] = telemetry.cachedTokens
+            counts["scoring_kvarn_completed_tiles"] =
+                telemetry.completedTileCount
+            counts["scoring_kvarn_compressed_tokens"] =
+                telemetry.compressedTokens
+        case .turboQuant:
+            preconditionFailure(
+                "TurboQuant is outside the authenticated task-coherence tier map")
+        }
+        return TaskChoiceLogitsResult(
+            logits: row, engagement: EngagementCounters(counts))
     }
 
     /// TEACHER-FORCED `logprobs`: row i is the next-token distribution given
@@ -347,6 +408,25 @@ struct SwiftEngineDriver: EngineDriver {
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
         let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
+    }
+
+    func taskChoiceLogits(
+        prompt: [Int], config: RunConfig
+    ) async throws -> TaskChoiceLogitsResult {
+        guard !prompt.isEmpty else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "empty task-scoring prompt")
+        }
+        guard config.maxTokens == 1 else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "maxTokens=\(config.maxTokens) on one-position task scoring")
+        }
+        let kind = try Self.cacheKind(config, allowSpec: false)
+        if case .turboQuant = kind {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "TurboQuant has no authenticated task-coherence cell")
+        }
+        return await engine.taskChoiceLogits(prompt: prompt, kvCache: kind)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {

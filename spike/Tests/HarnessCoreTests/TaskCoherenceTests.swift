@@ -80,6 +80,9 @@ final class TaskCoherenceTests: XCTestCase {
     }
 
     func testRestrictedChoiceScorerUsesOnlyFourPinnedTokenIDs() throws {
+        XCTAssertEqual(TaskRestrictedChoiceScorer.labelTokenSpellings, [
+            "A": " A", "B": " B", "C": " C", "D": " D",
+        ])
         let logits: [Float] = [100, 0.2, 0.9, 0.7, 0.1]
         let labels = ["A": 1, "B": 2, "C": 3, "D": 4]
 

@@ -7,6 +7,22 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
     private let candidateCellID = "affine-k4v2-g128"
     private let cleanSHA = String(repeating: "a", count: 40)
 
+    func testRunnableTaskTierCellMappingIsClosed() {
+        XCTAssertEqual(
+            TaskCoherenceArtifact.expectedCellID(forTier: "fp16"), "fp16")
+        XCTAssertEqual(
+            TaskCoherenceArtifact.expectedCellID(
+                forTier: "affine-k8v2-g128"),
+            "affine-k8v2-g128")
+        XCTAssertEqual(
+            TaskCoherenceArtifact.expectedCellID(
+                forTier: "kvarn-k4v2-g128"),
+            "kvarn-k4v2-g128-i8")
+        XCTAssertNil(TaskCoherenceArtifact.expectedCellID(forTier: "tq2.5"))
+        XCTAssertNil(TaskCoherenceArtifact.expectedCellID(
+            forTier: "kvtuner-unbound"))
+    }
+
     func testPromptLayoutRequiresMaterialInsideCompletedCompressedTiles() {
         XCTAssertNoThrow(try TaskCoherencePromptLayoutEvidence(
             promptTokens: 512,
@@ -33,6 +49,52 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         }
     }
 
+    func testPromptLayoutDerivesConservativeTokenizerBoundarySpan() throws {
+        let stablePrefix = Array(0 ..< 140)
+        let stableMaterial = stablePrefix + Array(200 ..< 300)
+        let stablePrompt = stableMaterial + Array(400 ..< 700)
+        let stable = try TaskCoherencePromptLayoutEvidence.derive(
+            prefixTokenIDs: stablePrefix,
+            prefixAndMaterialTokenIDs: stableMaterial,
+            suffixAndQueryTokenIDs: Array(400 ..< 700),
+            promptTokenIDs: stablePrompt)
+        XCTAssertEqual(stable.materialStartToken, 140)
+        XCTAssertEqual(stable.materialEndToken, 240)
+
+        var mergedPrefix = stablePrefix
+        mergedPrefix[139] = 9_999
+        var mergedMaterial = stableMaterial
+        mergedMaterial[239] = 8_888
+        let merged = try TaskCoherencePromptLayoutEvidence.derive(
+            prefixTokenIDs: mergedPrefix,
+            prefixAndMaterialTokenIDs: mergedMaterial,
+            suffixAndQueryTokenIDs: Array(400 ..< 700),
+            promptTokenIDs: stablePrompt)
+        XCTAssertEqual(merged.materialStartToken, 139)
+        XCTAssertEqual(merged.materialEndToken, 240)
+        XCTAssertEqual(merged.compressedRegionEndToken, 512)
+        XCTAssertEqual(merged.minimumCompletedTileCount, 1)
+    }
+
+    func testPromptLayoutIncludesEveryTokenResegmentedAtMaterialSuffixBoundary() throws {
+        let prefix = Array(0 ..< 140)
+        let prefixAndMaterial = prefix + Array(200 ..< 300)
+        let stableSuffix = Array(402 ..< 700)
+        let prompt = Array(prefixAndMaterial.dropLast(2))
+            + [9_900, 9_901, 9_902]
+            + stableSuffix
+
+        let layout = try TaskCoherencePromptLayoutEvidence.derive(
+            prefixTokenIDs: prefix,
+            prefixAndMaterialTokenIDs: prefixAndMaterial,
+            suffixAndQueryTokenIDs: [8_000, 8_001] + stableSuffix,
+            promptTokenIDs: prompt)
+
+        // The three replacement tokens all belong to the uncertain material/suffix boundary.
+        // A single-divergent-token heuristic returns 239 and understates compressed coverage.
+        XCTAssertEqual(layout.materialEndToken, 241)
+    }
+
     func testStrictJSONLRejectsEmptyInternalRowsAndMalformedRecords() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
         let rows = try makeRows(
@@ -44,6 +106,40 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             Data("\(line)\n\n\(line)\n".utf8)))
         XCTAssertThrowsError(try TaskCoherenceArtifact.decodeJSONL(
             Data("{not-json}\n".utf8)))
+    }
+
+    func testLegacyTaskSchemaCannotQualifyWithV2Fields() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        var rows = try makeRows(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceArtifactSHA256: nil)
+        let first = rows[0]
+        rows[0] = ResultRecord(
+            subcommand: first.subcommand,
+            provenance: first.provenance,
+            payload: TaskCoherenceCasePayload(
+                schemaVersion: 1,
+                matrixID: first.payload.matrixID,
+                cellID: first.payload.cellID,
+                identity: first.payload.identity,
+                referenceArtifactSHA256:
+                    first.payload.referenceArtifactSHA256,
+                promptContentHash: first.payload.promptContentHash,
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
+                layout: first.payload.layout,
+                generatedTokenCount: first.payload.generatedTokenCount,
+                scoredOutput: first.payload.scoredOutput,
+                outputSHA256: first.payload.outputSHA256,
+                score: first.payload.score,
+                engagement: first.payload.engagement))
+
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)) { error in
+                XCTAssertEqual(
+                    error as? TaskCoherenceEvidenceError,
+                    .unsupportedSchema(1))
+            }
     }
 
     func testSummaryRequiresEveryFrozenCaseExactlyOnce() throws {
@@ -76,6 +172,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 referenceArtifactSHA256:
                     first.payload.referenceArtifactSHA256,
                 promptContentHash: "forged-prompt",
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
                 layout: first.payload.layout,
                 generatedTokenCount: first.payload.generatedTokenCount,
                 scoredOutput: first.payload.scoredOutput,
@@ -104,6 +202,11 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         let reference = try summary(
             corpus: corpus, tier: "fp16", cellID: "fp16",
             referenceDigest: nil)
+        XCTAssertEqual(
+            Set(reference.cases.map {
+                $0.tokenization.tokenizerManifestSHA256
+            }).count,
+            1)
         var rows = try makeRows(
             corpus: corpus, tier: "kvarn-k4v2-g128",
             cellID: "kvarn-k4v2-g128-i8",
@@ -120,6 +223,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 referenceArtifactSHA256:
                     first.payload.referenceArtifactSHA256,
                 promptContentHash: first.payload.promptContentHash,
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
                 layout: first.payload.layout,
                 generatedTokenCount: first.payload.generatedTokenCount,
                 scoredOutput: first.payload.scoredOutput,
@@ -211,6 +316,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             identity: first.identity,
             referenceArtifactSHA256: first.referenceArtifactSHA256,
             promptContentHash: first.promptContentHash,
+            runConfiguration: first.runConfiguration,
+            tokenization: first.tokenization,
             layout: first.layout,
             generatedTokenCount: first.generatedTokenCount,
             scoredOutput: first.scoredOutput,
@@ -229,6 +336,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             referenceArtifactSHA256:
                 candidate.referenceArtifactSHA256,
             identity: candidate.identity,
+            runConfiguration: candidate.runConfiguration,
             provenance: candidate.provenance,
             caseCount: candidate.caseCount,
             cases: forgedCases,
@@ -254,6 +362,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 referenceArtifactSHA256:
                     first.payload.referenceArtifactSHA256,
                 promptContentHash: first.payload.promptContentHash,
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
                 layout: first.payload.layout,
                 generatedTokenCount: first.payload.generatedTokenCount,
                 scoredOutput: "tampered-output",
@@ -288,6 +398,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 referenceArtifactSHA256:
                     stale.payload.referenceArtifactSHA256,
                 promptContentHash: stale.payload.promptContentHash,
+                runConfiguration: stale.payload.runConfiguration,
+                tokenization: stale.payload.tokenization,
                 layout: stale.payload.layout,
                 generatedTokenCount: stale.payload.generatedTokenCount,
                 scoredOutput: stale.payload.scoredOutput,
@@ -302,6 +414,229 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     kvarnExecutionMode: nil)))
         XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
             artifactData(rows), corpus: corpus))
+    }
+
+    func testRestrictedChoiceScoringRunMustAlsoEngageLossyCache() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        var rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256)
+        let first = rows[0]
+        rows[0] = ResultRecord(
+            subcommand: first.subcommand,
+            provenance: first.provenance,
+            payload: TaskCoherenceCasePayload(
+                schemaVersion: first.payload.schemaVersion,
+                matrixID: first.payload.matrixID,
+                cellID: first.payload.cellID,
+                identity: first.payload.identity,
+                referenceArtifactSHA256:
+                    first.payload.referenceArtifactSHA256,
+                promptContentHash: first.payload.promptContentHash,
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
+                layout: first.payload.layout,
+                generatedTokenCount: first.payload.generatedTokenCount,
+                scoredOutput: first.payload.scoredOutput,
+                outputSHA256: first.payload.outputSHA256,
+                score: first.payload.score,
+                engagement: TaskCoherenceCacheEngagementEvidence(
+                    cachedTokens: first.payload.engagement.cachedTokens,
+                    affineTokens: first.payload.engagement.affineTokens,
+                    kvarnCompletedTileCount: nil,
+                    kvarnCompressedTokens: nil,
+                    kvarnCodecIterations: nil,
+                    kvarnExecutionMode: nil,
+                    scoringCachedTokens:
+                        first.payload.layout.promptTokens - 1,
+                    scoringKVarNCompletedTileCount: nil,
+                    scoringKVarNCompressedTokens: nil)))
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus))
+    }
+
+    func testCandidateAssessmentBindsExactPromptAndLabelTokenization() throws {
+        XCTAssertEqual(taskTokenIDsSHA256([7, 11, 13]),
+            taskTokenIDsSHA256([7, 11, 13]))
+        XCTAssertNotEqual(taskTokenIDsSHA256([7, 11, 13]),
+            taskTokenIDsSHA256([7, 13, 11]))
+
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        var rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256)
+        for index in rows.indices where
+            rows[index].payload.score.domain != .structuredTool
+        {
+            let row = rows[index]
+            rows[index] = ResultRecord(
+                subcommand: row.subcommand,
+                provenance: row.provenance,
+                payload: TaskCoherenceCasePayload(
+                    schemaVersion: row.payload.schemaVersion,
+                    matrixID: row.payload.matrixID,
+                    cellID: row.payload.cellID,
+                    identity: row.payload.identity,
+                    referenceArtifactSHA256:
+                        row.payload.referenceArtifactSHA256,
+                    promptContentHash: row.payload.promptContentHash,
+                    runConfiguration: row.payload.runConfiguration,
+                    tokenization: TaskCoherenceTokenizationEvidence(
+                        tokenizerManifestSHA256:
+                            row.payload.tokenization.tokenizerManifestSHA256,
+                        promptTokenIDsSHA256:
+                            row.payload.tokenization.promptTokenIDsSHA256,
+                        restrictedChoiceLabelTokenIDs: [
+                            "A": 101, "B": 202, "C": 303, "D": 405,
+                        ]),
+                    layout: row.payload.layout,
+                    generatedTokenCount: row.payload.generatedTokenCount,
+                    scoredOutput: row.payload.scoredOutput,
+                    outputSHA256: row.payload.outputSHA256,
+                    score: row.payload.score,
+                    engagement: row.payload.engagement))
+        }
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus))
+    }
+
+    func testCandidateAssessmentBindsTokenizerManifest() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        var rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256)
+        for index in rows.indices {
+            let row = rows[index]
+            rows[index] = ResultRecord(
+                subcommand: row.subcommand,
+                provenance: row.provenance,
+                payload: TaskCoherenceCasePayload(
+                    schemaVersion: row.payload.schemaVersion,
+                    matrixID: row.payload.matrixID,
+                    cellID: row.payload.cellID,
+                    identity: row.payload.identity,
+                    referenceArtifactSHA256:
+                        row.payload.referenceArtifactSHA256,
+                    promptContentHash: row.payload.promptContentHash,
+                    runConfiguration: row.payload.runConfiguration,
+                    tokenization: TaskCoherenceTokenizationEvidence(
+                        tokenizerManifestSHA256:
+                            String(repeating: "c", count: 64),
+                        promptTokenIDsSHA256:
+                            row.payload.tokenization.promptTokenIDsSHA256,
+                        restrictedChoiceLabelTokenIDs:
+                            row.payload.tokenization
+                                .restrictedChoiceLabelTokenIDs),
+                    layout: row.payload.layout,
+                    generatedTokenCount: row.payload.generatedTokenCount,
+                    scoredOutput: row.payload.scoredOutput,
+                    outputSHA256: row.payload.outputSHA256,
+                    score: row.payload.score,
+                    engagement: row.payload.engagement))
+        }
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus))
+    }
+
+    func testCandidateAssessmentBindsExactPromptLayout() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        var rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256)
+        for index in rows.indices {
+            let row = rows[index]
+            rows[index] = ResultRecord(
+                subcommand: row.subcommand,
+                provenance: row.provenance,
+                payload: TaskCoherenceCasePayload(
+                    schemaVersion: row.payload.schemaVersion,
+                    matrixID: row.payload.matrixID,
+                    cellID: row.payload.cellID,
+                    identity: row.payload.identity,
+                    referenceArtifactSHA256:
+                        row.payload.referenceArtifactSHA256,
+                    promptContentHash: row.payload.promptContentHash,
+                    runConfiguration: row.payload.runConfiguration,
+                    tokenization: row.payload.tokenization,
+                    layout: TaskCoherencePromptLayoutEvidence(
+                        promptTokens: 512,
+                        materialStartToken: 128,
+                        materialEndToken: 384,
+                        compressedRegionEndToken: 512,
+                        minimumCompletedTileCount: 2),
+                    generatedTokenCount: row.payload.generatedTokenCount,
+                    scoredOutput: row.payload.scoredOutput,
+                    outputSHA256: row.payload.outputSHA256,
+                    score: row.payload.score,
+                    engagement: row.payload.engagement))
+        }
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus))
+    }
+
+    func testCandidateAssessmentBindsExactRunConfiguration() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let reference = try summary(
+            corpus: corpus, tier: "fp16", cellID: "fp16",
+            referenceDigest: nil)
+        var rows = try makeRows(
+            corpus: corpus, tier: candidateCellID,
+            cellID: candidateCellID,
+            referenceArtifactSHA256: reference.artifactSHA256)
+        for index in rows.indices {
+            let row = rows[index]
+            rows[index] = ResultRecord(
+                subcommand: row.subcommand,
+                provenance: row.provenance,
+                payload: TaskCoherenceCasePayload(
+                    schemaVersion: row.payload.schemaVersion,
+                    matrixID: row.payload.matrixID,
+                    cellID: row.payload.cellID,
+                    identity: row.payload.identity,
+                    referenceArtifactSHA256:
+                        row.payload.referenceArtifactSHA256,
+                    promptContentHash: row.payload.promptContentHash,
+                    runConfiguration:
+                        TaskCoherenceRunConfiguration.qualificationV2(
+                            structuredToolMaxTokens: 512),
+                    tokenization: row.payload.tokenization,
+                    layout: row.payload.layout,
+                    generatedTokenCount: row.payload.generatedTokenCount,
+                    scoredOutput: row.payload.scoredOutput,
+                    outputSHA256: row.payload.outputSHA256,
+                    score: row.payload.score,
+                    engagement: row.payload.engagement))
+        }
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus))
     }
 
     func testUnknownTierAndOverflowingKVarNEvidenceFailClosed() throws {
@@ -339,6 +674,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 referenceArtifactSHA256:
                     first.payload.referenceArtifactSHA256,
                 promptContentHash: first.payload.promptContentHash,
+                runConfiguration: first.payload.runConfiguration,
+                tokenization: first.payload.tokenization,
                 layout: first.payload.layout,
                 generatedTokenCount: first.payload.generatedTokenCount,
                 scoredOutput: first.payload.scoredOutput,
@@ -378,6 +715,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     referenceArtifactSHA256:
                         row.payload.referenceArtifactSHA256,
                     promptContentHash: row.payload.promptContentHash,
+                    runConfiguration: row.payload.runConfiguration,
+                    tokenization: row.payload.tokenization,
                     layout: row.payload.layout,
                     generatedTokenCount:
                         row.payload.generatedTokenCount,
@@ -439,7 +778,9 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         return corpus.items.map { item in
             let structured = item.domain == .structuredTool
             let generatedTokenCount = structured ? 24 : 1
-            let expectedCachedTokens = 512 + generatedTokenCount - 1
+            // The compiled decoder keeps one submitted lookahead in KV, so after emitting N
+            // tokens its exact post-run cache offset is prompt + N.
+            let expectedCachedTokens = 512 + generatedTokenCount
             let scoredOutput: String
             if let expectedTool = item.expectedTool {
                 scoredOutput = String(
@@ -449,13 +790,17 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 scoredOutput = item.expectedChoice!
             }
             let engagement: TaskCoherenceCacheEngagementEvidence
+            let restricted = item.scoringMode == .restrictedChoice
             if tier == "fp16" {
                 engagement = TaskCoherenceCacheEngagementEvidence(
                     cachedTokens: nil, affineTokens: nil,
                     kvarnCompletedTileCount: nil,
                     kvarnCompressedTokens: nil,
                     kvarnCodecIterations: nil,
-                    kvarnExecutionMode: nil)
+                    kvarnExecutionMode: nil,
+                    scoringCachedTokens: nil,
+                    scoringKVarNCompletedTileCount: nil,
+                    scoringKVarNCompressedTokens: nil)
             } else if tier.hasPrefix("kvarn-") {
                 engagement = TaskCoherenceCacheEngagementEvidence(
                     cachedTokens: expectedCachedTokens, affineTokens: nil,
@@ -463,7 +808,10 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     kvarnCompressedTokens: 384,
                     kvarnCodecIterations:
                         tier.hasSuffix("-i16") ? 16 : 8,
-                    kvarnExecutionMode: "uncompiled-correctness")
+                    kvarnExecutionMode: "uncompiled-correctness",
+                    scoringCachedTokens: restricted ? 512 : nil,
+                    scoringKVarNCompletedTileCount: restricted ? 3 : nil,
+                    scoringKVarNCompressedTokens: restricted ? 384 : nil)
             } else {
                 engagement = TaskCoherenceCacheEngagementEvidence(
                     cachedTokens: expectedCachedTokens,
@@ -471,18 +819,32 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     kvarnCompletedTileCount: nil,
                     kvarnCompressedTokens: nil,
                     kvarnCodecIterations: nil,
-                    kvarnExecutionMode: nil)
+                    kvarnExecutionMode: nil,
+                    scoringCachedTokens: restricted ? 512 : nil,
+                    scoringKVarNCompletedTileCount: nil,
+                    scoringKVarNCompressedTokens: nil)
             }
             return ResultRecord(
                 subcommand: "task-coherence",
                 provenance: runProvenance,
                 payload: TaskCoherenceCasePayload(
-                    schemaVersion: 1,
+                    schemaVersion: TaskCoherenceArtifact.schemaVersion,
                     matrixID: matrixID,
                     cellID: cellID,
                     identity: identity,
                     referenceArtifactSHA256: referenceArtifactSHA256,
                     promptContentHash: fnv1a64(item.prompt.utf8),
+                    runConfiguration:
+                        TaskCoherenceRunConfiguration.qualificationV2(
+                            structuredToolMaxTokens: 96),
+                    tokenization: TaskCoherenceTokenizationEvidence(
+                        tokenizerManifestSHA256:
+                            String(repeating: "b", count: 64),
+                        promptTokenIDsSHA256: taskTokenIDsSHA256(
+                            Array(0 ..< 512)),
+                        restrictedChoiceLabelTokenIDs: structured
+                            ? nil
+                            : ["A": 101, "B": 202, "C": 303, "D": 404]),
                     layout: TaskCoherencePromptLayoutEvidence(
                         promptTokens: 512,
                         materialStartToken: 128,

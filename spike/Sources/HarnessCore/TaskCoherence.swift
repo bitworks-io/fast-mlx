@@ -239,6 +239,13 @@ public struct TaskCoherenceCorpus: Codable, Equatable, Sendable {
 
 public enum TaskRestrictedChoiceScorer {
     private static let labels = ["A", "B", "C", "D"]
+    /// Source-locked tokenizer spellings for the four next-token candidates. Leading spaces are
+    /// intentional: every frozen question ends in non-whitespace prose, and common BPE/SentencePiece
+    /// vocabularies represent a word-boundary label as one space-prefixed token. The runtime must
+    /// still prove each spelling maps to one distinct token for the measured checkpoint.
+    public static let labelTokenSpellings = [
+        "A": " A", "B": " B", "C": " C", "D": " D",
+    ]
 
     /// Selects the best of four pinned label-token logits. Logits outside those token IDs are
     /// deliberately ignored, so a high-probability free-form continuation cannot change scoring.

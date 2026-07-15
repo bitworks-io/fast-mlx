@@ -13,6 +13,8 @@ enum ProvenanceCLI {
     enum EvidenceIdentityError: Error, CustomStringConvertible {
         case unreadableModelConfig(String)
         case missingCheckpointWeights(String)
+        case missingTokenizerFiles(String)
+        case invalidTokenizerFile(String)
 
         var description: String {
             switch self {
@@ -20,6 +22,10 @@ enum ProvenanceCLI {
                 return "cannot fingerprint model config at \(path)"
             case .missingCheckpointWeights(let path):
                 return "checkpoint manifest at \(path) contains no safetensors files"
+            case .missingTokenizerFiles(let path):
+                return "tokenizer manifest at \(path) contains no recognized tokenizer files"
+            case .invalidTokenizerFile(let path):
+                return "tokenizer manifest entry is dangling or not a regular file: \(path)"
             }
         }
     }
@@ -149,6 +155,60 @@ enum ProvenanceCLI {
             checkpointManifestHash: try checkpointManifestHash(at: modelPath))
     }
 
+    /// Cryptographic content manifest for every local file that can affect raw prompt encoding or
+    /// generated-token decoding. Weight/config identity deliberately stays cheap and separate;
+    /// task evidence needs this stronger tokenizer boundary because a mutable tokenizer.json can
+    /// otherwise change both the scored prompt and structured output under identical model hashes.
+    static func tokenizerManifestSHA256(at modelPath: String) throws -> String {
+        let directory = URL(fileURLWithPath: modelPath)
+        let recognizedNames: Set<String> = [
+            "added_tokens.json", "merges.txt", "sentencepiece.bpe.model",
+            "special_tokens_map.json", "spiece.model", "tokenizer.model",
+            "vocab.json", "vocab.txt",
+        ]
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles])
+            .filter { url in
+                let name = url.lastPathComponent.lowercased()
+                return name.hasPrefix("tokenizer")
+                    || recognizedNames.contains(name)
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !candidates.isEmpty else {
+            throw EvidenceIdentityError.missingTokenizerFiles(modelPath)
+        }
+
+        let files = try candidates.map { logicalURL -> (URL, URL) in
+            let resolvedURL = logicalURL.resolvingSymlinksInPath()
+            let values = try? resolvedURL.resourceValues(
+                forKeys: [.isRegularFileKey])
+            guard values?.isRegularFile == true else {
+                throw EvidenceIdentityError.invalidTokenizerFile(
+                    logicalURL.path)
+            }
+            return (logicalURL, resolvedURL)
+        }
+
+        var manifest = Data()
+        func appendLength(_ value: Int) {
+            var encoded = UInt64(value).bigEndian
+            withUnsafeBytes(of: &encoded) {
+                manifest.append(contentsOf: $0)
+            }
+        }
+        for (logicalURL, resolvedURL) in files {
+            let name = Data(logicalURL.lastPathComponent.utf8)
+            let contents = try Data(contentsOf: resolvedURL)
+            appendLength(name.count)
+            manifest.append(name)
+            appendLength(contents.count)
+            manifest.append(contents)
+        }
+        return sha256Hex(manifest)
+    }
+
     /// Manifest equality alone cannot prove tensor equality, so `sameWeights` also requires both
     /// CLI paths to resolve to the same filesystem location. Symlink aliases remain valid; copied
     /// lookalike checkpoints remain conservatively classified as different weights.
@@ -174,6 +234,33 @@ enum ProvenanceCLI {
         modelPath: String, referenceVersions: ReferenceDriver.ReferenceVersions?,
         corpus: MeasurementCorpus?, modelCheckpointManifestHash: String? = nil
     ) -> (provenance: Provenance, quant: ModelQuantInfo) {
+        build(
+            modelPath: modelPath, referenceVersions: referenceVersions,
+            corpusID: corpus?.corpusId,
+            corpusContentHash: corpus?.contentHash,
+            modelCheckpointManifestHash: modelCheckpointManifestHash)
+    }
+
+    /// Task coherence uses a distinct frozen corpus type but the same provenance envelope. A
+    /// dedicated overload prevents callers from passing nil and producing an artifact that only
+    /// fails after an expensive model run.
+    static func build(
+        modelPath: String, referenceVersions: ReferenceDriver.ReferenceVersions?,
+        taskCorpus: TaskCoherenceCorpus,
+        modelCheckpointManifestHash: String
+    ) -> (provenance: Provenance, quant: ModelQuantInfo) {
+        build(
+            modelPath: modelPath, referenceVersions: referenceVersions,
+            corpusID: taskCorpus.id,
+            corpusContentHash: taskCorpus.contentHash,
+            modelCheckpointManifestHash: modelCheckpointManifestHash)
+    }
+
+    private static func build(
+        modelPath: String, referenceVersions: ReferenceDriver.ReferenceVersions?,
+        corpusID: String?, corpusContentHash: String?,
+        modelCheckpointManifestHash: String?
+    ) -> (provenance: Provenance, quant: ModelQuantInfo) {
         let (configHash, quant) = modelConfig(at: modelPath)
         let provenance = Provenance(
             date: nowISO8601(),
@@ -188,8 +275,8 @@ enum ProvenanceCLI {
             modelConfigHash: configHash,
             modelCheckpointManifestHash: modelCheckpointManifestHash,
             modelQuant: quant,
-            corpusId: corpus?.corpusId,
-            corpusContentHash: corpus?.contentHash,
+            corpusId: corpusID,
+            corpusContentHash: corpusContentHash,
             nonce: nonce())
         return (provenance, quant)
     }

@@ -1163,6 +1163,7 @@ struct Harness {
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
         case "service-soak": await runServiceSoakBench(flags)
         case "kl": await runKL(flags)
+        case "task-coherence": await runTaskCoherence(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
@@ -1213,6 +1214,13 @@ struct Harness {
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
                  [--promotion-evidence false] require full storage + clean-SHA coherence gate
+          task-coherence --model <PATH>       frozen 80-case secondary coherence/task gate
+                 --matrix-id <ID> --cell-id <ID> --evidence <NEW-OR-EMPTY-FILE>
+                 [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN runtime tier
+                 [--reference-task-evidence <FP16-JSONL>]
+                                               required for every lossy candidate; forbidden for fp16
+                 [--summary-evidence <NEW-OR-EMPTY-FILE>]
+                 [--max-tool-tokens 96]       structured-output budget (1...512)
 
         common flags: --python <PY=~/harness-venv/bin/python> --script <scripts/harness_reference.py>
         """)
