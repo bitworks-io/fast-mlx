@@ -152,31 +152,43 @@ public enum KVarNMLXCodec {
             valueAbsorbedBias: valueAbsorbedBias)
     }
 
+    /// Returns an equivalent record whose arrays are backed by independent, already-materialized
+    /// storage. This is primarily useful for measuring decode without retaining the encode graph.
+    package static func detachedStorageCopy(
+        of record: KVarNMLXRecord
+    ) throws -> KVarNMLXRecord {
+        guard isValidRecord(record) else { throw KVarNMLXError.invalidRecord }
+
+        func payload(_ array: MLXArray) -> MLXArray {
+            MLXArray(array.asArray(UInt8.self)).reshaped(array.shape)
+        }
+        func metadata(_ array: MLXArray) -> MLXArray {
+            MLXArray(array.asArray(Float16.self)).reshaped(array.shape)
+        }
+
+        return KVarNMLXRecord(
+            configuration: record.configuration,
+            batchSize: record.batchSize,
+            headCount: record.headCount,
+            keyDType: record.keyDType,
+            valueDType: record.valueDType,
+            keyPayload: payload(record.keyPayload),
+            keyAbsorbedScale: metadata(record.keyAbsorbedScale),
+            keyAbsorbedBias: metadata(record.keyAbsorbedBias),
+            keyTokenScale: metadata(record.keyTokenScale),
+            valuePayload: payload(record.valuePayload),
+            valueChannelScale: metadata(record.valueChannelScale),
+            valueAbsorbedScale: metadata(record.valueAbsorbedScale),
+            valueAbsorbedBias: metadata(record.valueAbsorbedBias))
+    }
+
     public static func dequantize(
         _ record: KVarNMLXRecord
     ) throws -> KVarNMLXReconstruction {
         let configuration = record.configuration
         let d = configuration.headDimension
         let g = configuration.groupSize
-        let rows = record.batchSize * record.headCount
-        let metadata = [
-            record.keyAbsorbedScale, record.keyAbsorbedBias, record.keyTokenScale,
-            record.valueChannelScale, record.valueAbsorbedScale, record.valueAbsorbedBias,
-        ]
-        guard record.keyPayload.shape == [rows, d, g * configuration.keyBits / 8],
-            record.keyAbsorbedScale.shape == [rows, d],
-            record.keyAbsorbedBias.shape == [rows, d],
-            record.keyTokenScale.shape == [rows, g],
-            record.valuePayload.shape == [rows, g, d * configuration.valueBits / 8],
-            record.valueChannelScale.shape == [rows, d],
-            record.valueAbsorbedScale.shape == [rows, g],
-            record.valueAbsorbedBias.shape == [rows, g],
-            record.keyPayload.dtype == .uint8,
-            record.valuePayload.dtype == .uint8,
-            metadata.allSatisfy({ $0.dtype == .float16 }),
-            supportedInputDTypes.contains(record.keyDType),
-            supportedInputDTypes.contains(record.valueDType)
-        else { throw KVarNMLXError.invalidRecord }
+        guard isValidRecord(record) else { throw KVarNMLXError.invalidRecord }
 
         let keyQuantized = unpack(
             record.keyPayload, columns: g, bits: configuration.keyBits)
@@ -204,6 +216,33 @@ public enum KVarNMLXCodec {
             isFinite(values).all().item(Bool.self)
         else { throw KVarNMLXError.nonFiniteOutput }
         return KVarNMLXReconstruction(keys: keys, values: values)
+    }
+
+    private static func isValidRecord(_ record: KVarNMLXRecord) -> Bool {
+        let configuration = record.configuration
+        let d = configuration.headDimension
+        let g = configuration.groupSize
+        guard record.batchSize > 0, record.headCount > 0 else { return false }
+        let (rows, rowOverflow) = record.batchSize.multipliedReportingOverflow(
+            by: record.headCount)
+        guard !rowOverflow else { return false }
+        let metadata = [
+            record.keyAbsorbedScale, record.keyAbsorbedBias, record.keyTokenScale,
+            record.valueChannelScale, record.valueAbsorbedScale, record.valueAbsorbedBias,
+        ]
+        return record.keyPayload.shape == [rows, d, g * configuration.keyBits / 8]
+            && record.keyAbsorbedScale.shape == [rows, d]
+            && record.keyAbsorbedBias.shape == [rows, d]
+            && record.keyTokenScale.shape == [rows, g]
+            && record.valuePayload.shape == [rows, g, d * configuration.valueBits / 8]
+            && record.valueChannelScale.shape == [rows, d]
+            && record.valueAbsorbedScale.shape == [rows, g]
+            && record.valueAbsorbedBias.shape == [rows, g]
+            && record.keyPayload.dtype == .uint8
+            && record.valuePayload.dtype == .uint8
+            && metadata.allSatisfy { $0.dtype == .float16 }
+            && supportedInputDTypes.contains(record.keyDType)
+            && supportedInputDTypes.contains(record.valueDType)
     }
 
     private struct BalancedTile {

@@ -184,6 +184,41 @@ final class KVarNKVCacheTests: XCTestCase {
         }
     }
 
+    func testDetachedStorageCopyPreservesEveryRecordByteAndReconstruction() throws {
+        let configuration = try KVarNMLXConfiguration(
+            headDimension: 4, groupSize: 4,
+            keyBits: 4, valueBits: 2, iterations: 8)
+        let source = MLXArray((0 ..< 32).map { Float16(sin(Double($0) * 0.17)) })
+            .reshaped([1, 2, 4, 4])
+        let record = try KVarNMLXCodec.quantize(
+            keys: source, values: source * Float16(-0.5),
+            configuration: configuration)
+
+        let detached = try KVarNMLXCodec.detachedStorageCopy(of: record)
+
+        let originalArrays = recordArrays(record)
+        let detachedArrays = recordArrays(detached)
+        XCTAssertEqual(originalArrays.count, detachedArrays.count)
+        for (original, copy) in zip(originalArrays, detachedArrays) {
+            XCTAssertEqual(original.shape, copy.shape)
+            XCTAssertEqual(original.dtype, copy.dtype)
+            if original.dtype == .uint8 {
+                XCTAssertEqual(original.asArray(UInt8.self), copy.asArray(UInt8.self))
+            } else {
+                XCTAssertEqual(
+                    original.asArray(Float16.self).map(\.bitPattern),
+                    copy.asArray(Float16.self).map(\.bitPattern))
+            }
+        }
+
+        let originalReconstruction = try KVarNMLXCodec.dequantize(record)
+        let detachedReconstruction = try KVarNMLXCodec.dequantize(detached)
+        XCTAssertTrue((originalReconstruction.keys .== detachedReconstruction.keys)
+            .all().item(Bool.self))
+        XCTAssertTrue((originalReconstruction.values .== detachedReconstruction.values)
+            .all().item(Bool.self))
+    }
+
     func testCodecKeepsDistinctKVHeadsIsolated() throws {
         let dimension = 4
         let elementCount = dimension * dimension
@@ -256,6 +291,22 @@ final class KVarNKVCacheTests: XCTestCase {
             valueAbsorbedScale: record.valueAbsorbedScale,
             valueAbsorbedBias: record.valueAbsorbedBias)
         XCTAssertThrowsError(try KVarNMLXCodec.dequantize(wrongMetadata)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
+        }
+
+        let overflowingRows = KVarNMLXRecord(
+            configuration: record.configuration,
+            batchSize: Int.max, headCount: 2,
+            keyDType: record.keyDType, valueDType: record.valueDType,
+            keyPayload: record.keyPayload,
+            keyAbsorbedScale: record.keyAbsorbedScale,
+            keyAbsorbedBias: record.keyAbsorbedBias,
+            keyTokenScale: record.keyTokenScale,
+            valuePayload: record.valuePayload,
+            valueChannelScale: record.valueChannelScale,
+            valueAbsorbedScale: record.valueAbsorbedScale,
+            valueAbsorbedBias: record.valueAbsorbedBias)
+        XCTAssertThrowsError(try KVarNMLXCodec.dequantize(overflowingRows)) {
             XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
         }
     }
@@ -507,6 +558,14 @@ final class KVarNKVCacheTests: XCTestCase {
         return zip(lhs, rhs).reduce(into: 0) { count, pair in
             if pair.0 != pair.1 { count += 1 }
         }
+    }
+
+    private func recordArrays(_ record: KVarNMLXRecord) -> [MLXArray] {
+        [
+            record.keyPayload, record.keyAbsorbedScale, record.keyAbsorbedBias,
+            record.keyTokenScale, record.valuePayload, record.valueChannelScale,
+            record.valueAbsorbedScale, record.valueAbsorbedBias,
+        ]
     }
 
     private func assertRecordRow(
