@@ -10,6 +10,7 @@ public enum KVTunerSensitivityError: Error, Equatable, Sendable {
     case invalidLayerCount
     case invalidPrecisionPairs
     case invalidProtocol(String)
+    case invalidCaptureEnvironment(String)
     case sampleCountOverflow
     case incompleteSamples(expected: Int, actual: Int)
     case nonCanonicalSample(position: Int)
@@ -68,6 +69,145 @@ public struct KVTunerSensitivitySample: Codable, Equatable, Sendable {
     }
 }
 
+/// Path-free receipt for the implementation and machine that produced one sensitivity artifact.
+/// Sensitivity values are inputs to executable candidate policies, so a model/checkpoint digest
+/// alone is insufficient: the capture must come from a clean Release harness with the exact
+/// pinned MLX packages and allocator-cache bound.
+public struct KVTunerSensitivityCaptureEnvironment:
+    Codable, Equatable, Sendable
+{
+    public static let requiredBuildConfiguration = "Release"
+    public static let requiredMLXSwiftVersion = "0.31.6"
+    public static let requiredMLXSwiftLMRevision =
+        "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"
+    public static let requiredMemoryCacheLimitBytes = 8 << 30
+
+    public var harnessGitSHA: String
+    public var buildConfiguration: String
+    public var mlxSwiftVersion: String
+    public var mlxSwiftLMRevision: String
+    public var hardwareChip: String
+    public var hardwareRAMBytes: UInt64
+    public var hardwareOS: String
+    public var memoryCacheLimitBytes: Int
+
+    public init(
+        harnessGitSHA: String,
+        buildConfiguration: String,
+        mlxSwiftVersion: String,
+        mlxSwiftLMRevision: String,
+        hardwareChip: String,
+        hardwareRAMBytes: UInt64,
+        hardwareOS: String,
+        memoryCacheLimitBytes: Int
+    ) {
+        self.harnessGitSHA = harnessGitSHA
+        self.buildConfiguration = buildConfiguration
+        self.mlxSwiftVersion = mlxSwiftVersion
+        self.mlxSwiftLMRevision = mlxSwiftLMRevision
+        self.hardwareChip = hardwareChip
+        self.hardwareRAMBytes = hardwareRAMBytes
+        self.hardwareOS = hardwareOS
+        self.memoryCacheLimitBytes = memoryCacheLimitBytes
+    }
+
+    public func validatedSHA256() throws -> String {
+        guard Self.isLowercaseHex(harnessGitSHA, length: 40) else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "harnessGitSHA")
+        }
+        guard buildConfiguration == Self.requiredBuildConfiguration else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "buildConfiguration")
+        }
+        guard mlxSwiftVersion == Self.requiredMLXSwiftVersion else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "mlxSwiftVersion")
+        }
+        guard mlxSwiftLMRevision == Self.requiredMLXSwiftLMRevision else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "mlxSwiftLMRevision")
+        }
+        guard Self.isPathFreeEvidence(hardwareChip) else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "hardwareChip")
+        }
+        guard hardwareRAMBytes > 0 else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "hardwareRAMBytes")
+        }
+        guard Self.isPathFreeEvidence(hardwareOS) else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "hardwareOS")
+        }
+        guard memoryCacheLimitBytes
+                == Self.requiredMemoryCacheLimitBytes
+        else {
+            throw KVTunerSensitivityError.invalidCaptureEnvironment(
+                "memoryCacheLimitBytes")
+        }
+
+        var transcript = EnvironmentTranscript(
+            domain: "fast-mlx.kvtuner-sensitivity-environment.v1")
+        for value in [
+            harnessGitSHA,
+            buildConfiguration,
+            mlxSwiftVersion,
+            mlxSwiftLMRevision,
+            hardwareChip,
+            hardwareOS,
+        ] {
+            transcript.appendString(value)
+        }
+        transcript.appendUInt64(hardwareRAMBytes)
+        transcript.appendUInt64(UInt64(memoryCacheLimitBytes))
+        return sha256Hex(transcript.data)
+    }
+
+    private static func isPathFreeEvidence(_ value: String) -> Bool {
+        guard !value.isEmpty, value != "unknown", value.count <= 256,
+            value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+            !value.contains("/"), !value.contains("\\"),
+            !value.contains("\n"), !value.contains("\r")
+        else { return false }
+        return value.unicodeScalars.allSatisfy {
+            !CharacterSet.controlCharacters.contains($0)
+        }
+    }
+
+    private static func isLowercaseHex(
+        _ value: String,
+        length: Int
+    ) -> Bool {
+        guard value.count == length else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdef").contains($0)
+        }
+    }
+
+    private struct EnvironmentTranscript {
+        var data = Data()
+
+        init(domain: String) {
+            data.append(contentsOf: domain.utf8)
+            data.append(0)
+        }
+
+        mutating func appendString(_ value: String) {
+            let bytes = Data(value.utf8)
+            appendUInt64(UInt64(bytes.count))
+            data.append(bytes)
+        }
+
+        mutating func appendUInt64(_ value: UInt64) {
+            var encoded = value.bigEndian
+            withUnsafeBytes(of: &encoded) {
+                data.append(contentsOf: $0)
+            }
+        }
+    }
+}
+
 /// Immutable-on-disk input to deterministic Pareto pruning and grouping. It intentionally binds
 /// group size because MLX affine sensitivities at g64 and g128 are different experiments.
 public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
@@ -102,6 +242,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
     public var aggregationID: String
     public var dbscanEpsilon: Double
     public var dbscanMinSamples: Int
+    public var captureEnvironment: KVTunerSensitivityCaptureEnvironment
     public var samples: [KVTunerSensitivitySample]
 
     public init(
@@ -126,6 +267,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
         aggregationID: String,
         dbscanEpsilon: Double,
         dbscanMinSamples: Int,
+        captureEnvironment: KVTunerSensitivityCaptureEnvironment,
         samples: [KVTunerSensitivitySample]
     ) {
         self.schemaVersion = schemaVersion
@@ -149,14 +291,16 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
         self.aggregationID = aggregationID
         self.dbscanEpsilon = dbscanEpsilon
         self.dbscanMinSamples = dbscanMinSamples
+        self.captureEnvironment = captureEnvironment
         self.samples = samples
     }
 
     @discardableResult
     public func validated() throws -> KVTunerSensitivityArtifact {
-        guard schemaVersion == 1 else {
+        guard schemaVersion == 2 else {
             throw KVTunerSensitivityError.unsupportedSchema(schemaVersion)
         }
+        _ = try captureEnvironment.validatedSHA256()
         for identifier in [
             matrixID,
             calibrationCorpusID,

@@ -59,7 +59,7 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             }
         }
         let sensitivity = try KVTunerSensitivityArtifact(
-            schemaVersion: 1,
+            schemaVersion: 2,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
@@ -81,6 +81,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             aggregationID: "ordered-incremental-mean-v1",
             dbscanEpsilon: 0.05,
             dbscanMinSamples: 2,
+            captureEnvironment:
+                KVTunerTestFixtures.sensitivityCaptureEnvironment(),
             samples: samples).validated(
                 calibrationManifest: manifest,
                 exactCalibrationManifestData: manifestData)
@@ -178,7 +180,7 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
         })
         XCTAssertEqual(
             policy.runtimePolicySHA256,
-            "1a8096fe98adcd8fcee9dbd0ef384c64f99855ce2a07e3f41e3b647c2cfafdaf")
+            "d6787cb170a8bd910969a01ba7029ae3fb9684683552f7e484efcb89a9efb470")
         XCTAssertEqual(policy, try load(inputs))
     }
 

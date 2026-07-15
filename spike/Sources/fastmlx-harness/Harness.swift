@@ -1307,6 +1307,11 @@ struct Harness {
         case "service-soak": await runServiceSoakBench(flags)
         case "kl": await runKL(flags)
         case "task-coherence": await runTaskCoherence(flags)
+        case "kvtuner-manifest": await runKVTunerManifest(flags)
+        case "kvtuner-sensitivity": await runKVTunerSensitivity(flags)
+        case "kvtuner-candidate": await runKVTunerCandidate(flags)
+        case "kvtuner-search": await runKVTunerSearch(flags)
+        case "kvtuner-bundle": await runKVTunerBundle(flags)
         case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
@@ -1366,6 +1371,19 @@ struct Harness {
                                                required for every lossy candidate; forbidden for fp16
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]
                  [--max-tool-tokens 96]       structured-output budget (1...512)
+          kvtuner-manifest --model <PATH> --prompt-fixture <JSON> --normalized-targets <JSON>
+                 --output <NEW-OR-EXACT-FILE>
+          kvtuner-sensitivity --model <PATH> --manifest <JSON> --matrix-id <ID>
+                 --group-size 64|128 --output <NEW-OR-EXACT-FILE>
+          kvtuner-candidate --model <PATH> --manifest <JSON> --sensitivity <JSON>
+                 --target-pair-bits <N> --max-candidates <N> --output-dir <DIR>
+                 [--candidate-ordinal <ZERO-BASED>] complete run or resumable single candidate
+          kvtuner-search --model <PATH> --manifest <JSON> --sensitivity <JSON>
+                 --target-pair-bits <N> --max-candidates <N> --candidate-dir <DIR>
+                 --output <SEARCH.json> --schedule-output <SCHEDULE.json>
+          kvtuner-bundle --model <PATH> --manifest <JSON> --sensitivity <JSON>
+                 --search <JSON> --schedule <JSON> --candidate-dir <DIR>
+                 --output <QUALIFICATION-BUNDLE.json>
 
         common flags: --python <PY=~/harness-venv/bin/python> --script <scripts/harness_reference.py>
         """)

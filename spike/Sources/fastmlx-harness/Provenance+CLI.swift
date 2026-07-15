@@ -5,6 +5,63 @@ import HarnessCore
 import Darwin
 #endif
 
+/// A qualification run may use live Git only when the Git metadata belongs to a directory with
+/// fast-mlx's source-checkout markers. This deliberately ignores unrelated ancestor repositories
+/// around the rsynced package tree, which must authenticate through `.harness-sha` instead.
+func kvtunerQualificationSourceRepositoryRoot(
+    startingAt start: URL
+) -> URL? {
+    let pathComponents = start.standardizedFileURL.pathComponents
+    for componentCount in stride(
+        from: pathComponents.count, through: 1, by: -1
+    ) {
+        let directory = URL(
+            fileURLWithPath: NSString.path(withComponents: Array(
+                pathComponents.prefix(componentCount))),
+            isDirectory: true)
+        let manager = FileManager.default
+        let hasGitMetadata = manager.fileExists(
+            atPath: directory.appendingPathComponent(".git").path)
+        let hasWorkingAgreement = manager.fileExists(
+            atPath: directory.appendingPathComponent("AGENTS.md").path)
+        let hasSpikePackage = manager.fileExists(
+            atPath: directory.appendingPathComponent(
+                "spike/Package.swift").path)
+        if hasGitMetadata && hasWorkingAgreement && hasSpikePackage {
+            return directory
+        }
+    }
+    return nil
+}
+
+/// Qualification evidence never accepts `HARNESS_GIT_SHA`: an environment override could label
+/// arbitrary or dirty code as a clean commit. A live repository is authoritative even when dirty;
+/// the deploy stamp is used only when the synchronized bench tree has no `.git` directory.
+func resolveKVTunerQualificationHarnessGitSHA(
+    liveGitOutput: String?,
+    liveRepositoryPresent: Bool,
+    shaFile: String?
+) throws -> String {
+    let source: String
+    if let liveGitOutput {
+        source = liveGitOutput
+    } else if liveRepositoryPresent {
+        throw KVTunerQualificationCLIError.liveGitUnavailable
+    } else {
+        source = shaFile ?? "unknown"
+    }
+    let value = source
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard value.utf8.count == 40,
+        value.utf8.allSatisfy({
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
+        })
+    else {
+        throw KVTunerQualificationCLIError.invalidHarnessGitSHA(value)
+    }
+    return value
+}
+
 /// CLI-side glue for Task 5 provenance: everything here is I/O (sysctl, git, file reads) that a
 /// pure `HarnessCore` (Foundation-only, no shell-out) deliberately cannot do. `HarnessCore.
 /// Provenance`/`ResultRecord` — the typed struct and its JSONL encoding — stay pure and TDD'd;
@@ -66,6 +123,41 @@ enum ProvenanceCLI {
             env: ProcessInfo.processInfo.environment["HARNESS_GIT_SHA"],
             shaFile: try? String(contentsOfFile: ".harness-sha", encoding: .utf8),
             gitOutput: liveGitSHA())
+    }
+
+    static func qualificationHarnessGitSHA() throws -> String {
+        let currentDirectory = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true)
+        let repositoryRoot = kvtunerQualificationSourceRepositoryRoot(
+            startingAt: currentDirectory)
+        return try resolveKVTunerQualificationHarnessGitSHA(
+            liveGitOutput: repositoryRoot.flatMap {
+                liveGitSHA(repositoryRoot: $0)
+            },
+            liveRepositoryPresent: repositoryRoot != nil,
+            shaFile: try? String(
+                contentsOfFile: ".harness-sha", encoding: .utf8))
+    }
+
+    private static func liveGitSHA(repositoryRoot: URL) -> String? {
+        let expectedRoot = repositoryRoot.standardizedFileURL
+        guard let reportedRoot = runGit([
+            "-C", expectedRoot.path, "rev-parse", "--show-toplevel",
+        ])?.trimmingCharacters(in: .whitespacesAndNewlines),
+            URL(fileURLWithPath: reportedRoot).standardizedFileURL
+                == expectedRoot,
+            let sha = runGit([
+                "-C", expectedRoot.path, "rev-parse", "HEAD",
+            ])?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !sha.isEmpty,
+            let status = runGit([
+                "-C", expectedRoot.path, "status", "--porcelain",
+                "--untracked-files=normal", "--", "spike", "experiments",
+            ])
+        else { return nil }
+        return status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? sha : "\(sha)-dirty"
     }
 
     private static func liveGitSHA() -> String? {

@@ -107,6 +107,7 @@ public struct KVTunerCandidateExecutionEnvironment:
     public static let requiredMLXSwiftVersion = "0.31.6"
     public static let requiredMLXSwiftLMRevision =
         "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"
+    public static let requiredMemoryCacheLimitBytes: UInt64 = 8 << 30
 
     public var harnessGitSHA: String
     public var buildConfiguration: String
@@ -114,6 +115,7 @@ public struct KVTunerCandidateExecutionEnvironment:
     public var mlxSwiftLMRevision: String
     public var hardwareChip: String
     public var hardwareRAMBytes: UInt64
+    public var memoryCacheLimitBytes: UInt64
     public var hardwareOS: String
     public var modelConfigHash: String
     public var modelConfigSHA256: String
@@ -127,6 +129,7 @@ public struct KVTunerCandidateExecutionEnvironment:
         mlxSwiftLMRevision: String,
         hardwareChip: String,
         hardwareRAMBytes: UInt64,
+        memoryCacheLimitBytes: UInt64,
         hardwareOS: String,
         modelConfigHash: String,
         modelConfigSHA256: String,
@@ -139,6 +142,7 @@ public struct KVTunerCandidateExecutionEnvironment:
         self.mlxSwiftLMRevision = mlxSwiftLMRevision
         self.hardwareChip = hardwareChip
         self.hardwareRAMBytes = hardwareRAMBytes
+        self.memoryCacheLimitBytes = memoryCacheLimitBytes
         self.hardwareOS = hardwareOS
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
@@ -172,6 +176,10 @@ public struct KVTunerCandidateExecutionEnvironment:
         guard hardwareRAMBytes > 0 else {
             throw KVTunerCandidateEvaluationArtifactError
                 .invalidExecutionEnvironment("hardwareRAMBytes")
+        }
+        guard memoryCacheLimitBytes == Self.requiredMemoryCacheLimitBytes else {
+            throw KVTunerCandidateEvaluationArtifactError
+                .invalidExecutionEnvironment("memoryCacheLimitBytes")
         }
         guard Self.isPathFreeEvidence(hardwareOS) else {
             throw KVTunerCandidateEvaluationArtifactError
@@ -220,6 +228,7 @@ public struct KVTunerCandidateExecutionEnvironment:
             transcript.appendString(value)
         }
         transcript.appendUInt64(hardwareRAMBytes)
+        transcript.appendUInt64(memoryCacheLimitBytes)
         return sha256Hex(transcript.data)
     }
 
@@ -927,7 +936,7 @@ public struct KVTunerCandidateEvaluationArtifact:
         }
     }
 
-    private static func canonicalStoppedOutput(
+    static func canonicalStoppedOutput(
         _ rawOutput: String,
         stopSequences: [String]
     ) -> String {

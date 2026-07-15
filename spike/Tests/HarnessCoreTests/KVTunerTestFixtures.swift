@@ -29,6 +29,21 @@ enum KVTunerTestFixtures {
         let search: [String]
     }
 
+    static func sensitivityCaptureEnvironment()
+        -> KVTunerSensitivityCaptureEnvironment
+    {
+        KVTunerSensitivityCaptureEnvironment(
+            harnessGitSHA: String(repeating: "a", count: 40),
+            buildConfiguration: "Release",
+            mlxSwiftVersion: "0.31.6",
+            mlxSwiftLMRevision:
+                "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareRAMBytes: 274_877_906_944,
+            hardwareOS: "macOS 26.5.2",
+            memoryCacheLimitBytes: 8 << 30)
+    }
+
     static func calibrationManifest() throws -> KVTunerCalibrationManifest {
         let url = try XCTUnwrap(Bundle.module.url(
             forResource: "kvtuner-gsm8k-prompt-hashes",
@@ -169,7 +184,7 @@ enum KVTunerTestFixtures {
             }
         }
         let sensitivity = try KVTunerSensitivityArtifact(
-            schemaVersion: 1,
+            schemaVersion: 2,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
@@ -191,6 +206,7 @@ enum KVTunerTestFixtures {
             aggregationID: "ordered-incremental-mean-v1",
             dbscanEpsilon: 0.05,
             dbscanMinSamples: 2,
+            captureEnvironment: sensitivityCaptureEnvironment(),
             samples: samples).validated(
                 calibrationManifest: manifest,
                 exactCalibrationManifestData: manifestData)

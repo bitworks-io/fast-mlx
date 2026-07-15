@@ -183,7 +183,7 @@ final class KVTunerCalibrationManifestTests: XCTestCase {
             }
         }
         var sensitivity = KVTunerSensitivityArtifact(
-            schemaVersion: 1,
+            schemaVersion: 2,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
@@ -205,6 +205,8 @@ final class KVTunerCalibrationManifestTests: XCTestCase {
             aggregationID: "ordered-incremental-mean-v1",
             dbscanEpsilon: 0.05,
             dbscanMinSamples: 2,
+            captureEnvironment:
+                KVTunerTestFixtures.sensitivityCaptureEnvironment(),
             samples: samples)
 
         XCTAssertNoThrow(try sensitivity.validated(

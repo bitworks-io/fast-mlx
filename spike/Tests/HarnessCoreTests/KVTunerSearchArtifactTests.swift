@@ -37,6 +37,9 @@ final class KVTunerSearchArtifactTests: XCTestCase {
                 "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
             hardwareChip: "Apple M3 Ultra",
             hardwareRAMBytes: 274_877_906_944,
+            memoryCacheLimitBytes:
+                KVTunerCandidateExecutionEnvironment
+                    .requiredMemoryCacheLimitBytes,
             hardwareOS: "macOS 26.5.2",
             modelConfigHash: policy.modelConfigHash,
             modelConfigSHA256: policy.modelConfigSHA256,
@@ -157,31 +160,19 @@ final class KVTunerSearchArtifactTests: XCTestCase {
                 exactCalibrationManifestData: manifestData,
                 decodeTokenIDs: decodeTokenIDs)
         }
-        let selected = try KVTunerScheduleSearch.select(
-            candidates: candidates,
-            evaluations: evaluations,
-            requiredRuntimePolicySHA256ByCandidate:
-                runtimePolicies.map(\.runtimePolicySHA256))
-        let search = KVTunerSearchArtifact(
-            schemaVersion: 2,
-            searchMode: "exhaustive-grouped-v1",
-            evaluationProtocol: .canonical,
-            sourceSensitivityArtifactSHA256:
-                sha256Hex(sensitivityData),
-            promptManifestSHA256: manifestSHA,
-            modelConfigHash: manifest.modelConfigHash,
-            modelConfigSHA256: manifest.modelConfigSHA256,
-            checkpointManifestHash: manifest.checkpointManifestHash,
-            tokenizerSHA256: manifest.tokenizerSHA256,
-            groupSize: 64,
+        let search = try KVTunerSearchArtifact.makeAuthenticated(
             targetPairBitTotal: 36,
-            seed: 1234,
-            candidateListSHA256:
-                try KVTunerScheduleSearch.candidateListSHA256(candidates),
-            candidates: candidates,
-            evaluations: evaluations,
-            selectedCandidateOrdinal: selected.ordinal)
-        let searchData = try encoder.encode(search)
+            maxCandidates: 10,
+            sensitivityArtifact: sensitivity,
+            exactSensitivityArtifactData: sensitivityData,
+            calibrationManifest: manifest,
+            exactCalibrationManifestData: manifestData,
+            exactCandidateEvaluationArtifactData: evaluationData,
+            exactModelConfigData: configData,
+            eosTokenID: 255,
+            tokenizePrompt: KVTunerTestFixtures.tokenizer(for: manifest),
+            decodeTokenIDs: decodeTokenIDs)
+        let searchData = try KVTunerArtifactCodec.encode(search)
         return Inputs(
             configData: configData,
             manifest: manifest,
@@ -461,14 +452,20 @@ final class KVTunerSearchArtifactTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let scheduleData = try encoder.encode(schedule)
-        let bundle = KVTunerQualificationBundle(
-            schemaVersion: 1,
-            scheduleData: scheduleData,
-            calibrationManifestData: inputs.manifestData,
-            sensitivityArtifactData: inputs.sensitivityData,
-            searchArtifactData: inputs.searchData,
-            candidateEvaluationArtifactData: inputs.evaluationData)
-        let bundleData = try encoder.encode(bundle)
+        let bundle = try KVTunerQualificationBundle.makeAuthenticated(
+            exactScheduleData: scheduleData,
+            exactCalibrationManifestData: inputs.manifestData,
+            exactSensitivityArtifactData: inputs.sensitivityData,
+            exactSearchArtifactData: inputs.searchData,
+            exactCandidateEvaluationArtifactData: inputs.evaluationData,
+            exactModelConfigData: inputs.configData,
+            eosTokenID: 255,
+            expectedCheckpointManifestHash:
+                inputs.manifest.checkpointManifestHash,
+            tokenizePrompt:
+                KVTunerTestFixtures.tokenizer(for: inputs.manifest),
+            decodeTokenIDs: decodeTokenIDs)
+        let bundleData = try KVTunerArtifactCodec.encode(bundle)
         let evaluationCorpus = try KVTunerEvaluationCorpusIdentity(
             id: "task-coherence-v2",
             aggregateDigest: "0123456789abcdef",

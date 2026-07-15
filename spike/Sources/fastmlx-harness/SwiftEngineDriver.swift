@@ -206,6 +206,31 @@ actor HarnessEngineActor {
         return results
     }
 
+    /// Captures KVTuner's offline per-layer metrics inside the model's isolation region. The
+    /// exact config comes from the source snapshot sampled around this live model load; callers
+    /// provide only Sendable token IDs and receive only scalar samples.
+    func captureKVTunerSensitivity(
+        promptTokenIDs: [[Int]],
+        groupSize: Int,
+        expectedRuntimeIdentity: KVTunerCandidateRuntimeIdentity
+    ) throws -> [KVTunerSensitivitySample] {
+        guard let kvtunerRuntimeIdentity else {
+            throw KVTunerCandidateRuntimeIdentityError.missingRuntimeIdentity
+        }
+        guard kvtunerRuntimeIdentity == expectedRuntimeIdentity else {
+            throw KVTunerCandidateRuntimeIdentityError
+                .sourceIdentityChangedDuringModelLoad
+        }
+        return try KVTunerSensitivityCapture.capture(
+            model: model,
+            exactModelConfigData:
+                kvtunerRuntimeIdentity.exactModelConfigData,
+            promptTokenIDs: promptTokenIDs,
+            groupSize: groupSize,
+            precisionPairs:
+                KVTunerSensitivityArtifact.canonicalPrecisionPairs)
+    }
+
     /// Speculative-decoding generate (PLD first): routes to `CompiledMLXDecoder.generateSpec`,
     /// which drafts from the context, batch-verifies, accept-walks, and rolls the KV back —
     /// byte-identical to the plain greedy loop at temp 0 by construction. Same decoder-per-kind
@@ -623,6 +648,34 @@ struct SwiftEngineDriver: EngineDriver {
             policy: policy)
     }
 
+    /// Qualification-only sensitivity capture. Canonical cardinality and group sizes are
+    /// enforced before entering the actor so partial or unsupported experiments cannot be
+    /// serialized as protocol evidence.
+    func captureKVTunerSensitivity(
+        prompts: [[Int]],
+        groupSize: Int,
+        expectedRuntimeIdentity: KVTunerCandidateRuntimeIdentity
+    ) async throws -> [KVTunerSensitivitySample] {
+        guard prompts.count
+                == KVTunerSensitivityArtifact.requiredSensitivityPromptCount
+        else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner sensitivity prompt count=\(prompts.count)")
+        }
+        guard prompts.allSatisfy({ !$0.isEmpty }) else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "empty KVTuner sensitivity prompt")
+        }
+        guard [64, 128].contains(groupSize) else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner sensitivity groupSize=\(groupSize)")
+        }
+        return try await engine.captureKVTunerSensitivity(
+            promptTokenIDs: prompts,
+            groupSize: groupSize,
+            expectedRuntimeIdentity: expectedRuntimeIdentity)
+    }
+
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
         let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.teacherForcedLogprobs(prompt: prompt, forced: forcedContinuation, kvCache: kind)
@@ -704,7 +757,7 @@ struct SwiftEngineDriver: EngineDriver {
 /// The (Sendable) tokenizer is bound into its own local BEFORE `ctx.model` is sent into the
 /// actor init — detaching it from the region that transfers — so CPU-side encode/decode stays
 /// usable afterward (same region discipline as the spike's `loadActor`).
-private func captureKVTunerCandidateRuntimeSourceSnapshot(
+func captureKVTunerQualificationRuntimeSourceSnapshot(
     modelPath: String
 ) throws -> KVTunerCandidateRuntimeSourceSnapshot {
     let modelDirectory = URL(fileURLWithPath: modelPath)
@@ -719,7 +772,7 @@ private func captureKVTunerCandidateRuntimeSourceSnapshot(
 
 func loadSwiftDriver(
     modelPath: String,
-    requireKVTunerCandidateIdentity: Bool = false
+    requireKVTunerQualificationIdentity: Bool = false
 ) async throws -> (
     driver: SwiftEngineDriver,
     tokenizer: MLXLMCommon.Tokenizer,
@@ -731,9 +784,10 @@ func loadSwiftDriver(
     // same box. 8GB is far above any measurement path's steady-state reuse working set (decode
     // transients are MBs; a scoring chunk's logits are ~150MB) but keeps two co-resident
     // processes comfortably inside physical RAM. harness_reference.py sets the same bound.
-    Memory.cacheLimit = 8 << 30
-    let sourceIdentityBeforeLoad = requireKVTunerCandidateIdentity
-        ? try captureKVTunerCandidateRuntimeSourceSnapshot(
+    Memory.cacheLimit =
+        KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes
+    let sourceIdentityBeforeLoad = requireKVTunerQualificationIdentity
+        ? try captureKVTunerQualificationRuntimeSourceSnapshot(
             modelPath: modelPath)
         : nil
     let ctx = try await loadModel(
@@ -745,7 +799,8 @@ func loadSwiftDriver(
     let runtimeIdentity: KVTunerCandidateRuntimeIdentity?
     if let sourceIdentityBeforeLoad {
         let sourceIdentityAfterLoad = try
-            captureKVTunerCandidateRuntimeSourceSnapshot(modelPath: modelPath)
+            captureKVTunerQualificationRuntimeSourceSnapshot(
+                modelPath: modelPath)
         let stableSourceIdentity = try
             KVTunerCandidateRuntimeSourceSnapshot.validateUnchanged(
                 before: sourceIdentityBeforeLoad,

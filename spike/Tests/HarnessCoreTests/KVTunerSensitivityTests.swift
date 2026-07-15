@@ -6,6 +6,21 @@ import XCTest
 final class KVTunerSensitivityTests: XCTestCase {
     private let pairs = KVTunerSensitivityArtifact.canonicalPrecisionPairs
 
+    private func captureEnvironment(
+        cacheLimitBytes: Int = 8 << 30
+    ) -> KVTunerSensitivityCaptureEnvironment {
+        KVTunerSensitivityCaptureEnvironment(
+            harnessGitSHA: String(repeating: "a", count: 40),
+            buildConfiguration: "Release",
+            mlxSwiftVersion: "0.31.6",
+            mlxSwiftLMRevision:
+                "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareRAMBytes: 274_877_906_944,
+            hardwareOS: "macOS 26.5.2",
+            memoryCacheLimitBytes: cacheLimitBytes)
+    }
+
     private func artifact(
         groupSize: Int = 64,
         layerOutputs: [[Double]] = [
@@ -37,7 +52,7 @@ final class KVTunerSensitivityTests: XCTestCase {
             }
         }
         return KVTunerSensitivityArtifact(
-            schemaVersion: 1,
+            schemaVersion: 2,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: "0123456789abcdef",
             modelConfigSHA256: String(repeating: "c", count: 64),
@@ -59,6 +74,7 @@ final class KVTunerSensitivityTests: XCTestCase {
             aggregationID: "ordered-incremental-mean-v1",
             dbscanEpsilon: 0.05,
             dbscanMinSamples: 2,
+            captureEnvironment: captureEnvironment(),
             samples: samples)
     }
 
@@ -201,6 +217,25 @@ final class KVTunerSensitivityTests: XCTestCase {
             XCTAssertEqual(
                 error as? KVTunerSensitivityError,
                 .invalidProtocol("dbscanEpsilon"))
+        }
+    }
+
+    func testValidationRequiresCleanReleaseCaptureEnvironment() {
+        var dirtySHA = artifact()
+        dirtySHA.captureEnvironment.harnessGitSHA += "-dirty"
+        XCTAssertThrowsError(try dirtySHA.validated()) { error in
+            XCTAssertEqual(
+                error as? KVTunerSensitivityError,
+                .invalidCaptureEnvironment("harnessGitSHA"))
+        }
+
+        var wrongCacheLimit = artifact()
+        wrongCacheLimit.captureEnvironment = captureEnvironment(
+            cacheLimitBytes: 0)
+        XCTAssertThrowsError(try wrongCacheLimit.validated()) { error in
+            XCTAssertEqual(
+                error as? KVTunerSensitivityError,
+                .invalidCaptureEnvironment("memoryCacheLimitBytes"))
         }
     }
 

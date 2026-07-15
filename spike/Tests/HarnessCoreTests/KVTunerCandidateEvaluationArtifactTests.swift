@@ -32,11 +32,49 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
                 "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
             hardwareChip: "Apple M3 Ultra",
             hardwareRAMBytes: 274_877_906_944,
+            memoryCacheLimitBytes:
+                KVTunerCandidateExecutionEnvironment
+                    .requiredMemoryCacheLimitBytes,
             hardwareOS: "macOS 26.5.2",
             modelConfigHash: policy.modelConfigHash,
             modelConfigSHA256: policy.modelConfigSHA256,
             checkpointManifestHash: policy.checkpointManifestHash,
             tokenizerSHA256: policy.tokenizerSHA256)
+    }
+
+    private func expectedEnvironmentSHA256(
+        _ environment: KVTunerCandidateExecutionEnvironment
+    ) -> String {
+        var transcript = Data(
+            "fast-mlx.kvtuner-candidate-environment.v1\0".utf8)
+        func appendUInt64(_ value: UInt64) {
+            var encoded = value.bigEndian
+            withUnsafeBytes(of: &encoded) {
+                transcript.append(contentsOf: $0)
+            }
+        }
+        func appendString(_ value: String) {
+            let bytes = Data(value.utf8)
+            appendUInt64(UInt64(bytes.count))
+            transcript.append(bytes)
+        }
+        for value in [
+            environment.harnessGitSHA,
+            environment.buildConfiguration,
+            environment.mlxSwiftVersion,
+            environment.mlxSwiftLMRevision,
+            environment.hardwareChip,
+            environment.hardwareOS,
+            environment.modelConfigHash,
+            environment.modelConfigSHA256,
+            environment.checkpointManifestHash,
+            environment.tokenizerSHA256,
+        ] {
+            appendString(value)
+        }
+        appendUInt64(environment.hardwareRAMBytes)
+        appendUInt64(environment.memoryCacheLimitBytes)
+        return sha256Hex(transcript)
     }
 
     private func receipt(
@@ -95,7 +133,7 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
             exactModelConfigData: runtimeInputs.configData,
             runtimePolicy: policy,
             eosTokenID: 255)
-        let rows = try runtimeInputs.manifest.searchPrompts.enumerated().map {
+        let generatedRows = try runtimeInputs.manifest.searchPrompts.enumerated().map {
             ordinal, prompt in
             let target = runtimeInputs.manifest.searchNormalizedTargets[ordinal]
             let answer = ordinal == wrongOrdinal ? "999999999" : target
@@ -105,15 +143,10 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
             let rawPrefix =
                 "reasoning... final answer: $\(answer).<|im_end|>ignoredQuestion:later"
             let generatedTokenIDs = Array(rawPrefix.utf8).map(Int.init) + [255]
-            let raw = try decodeTokenIDs(generatedTokenIDs)
-            return KVTunerCandidateOutputRow(
-                ordinal: ordinal,
-                promptSHA256: prompt.promptSHA256,
+            return KVTunerCandidateGeneratedRow(
+                promptOrdinal: ordinal,
                 promptTokenIDsSHA256: prompt.tokenIDsSHA256,
                 generatedTokenIDs: generatedTokenIDs,
-                rawDecodedUTF8: Data(raw.utf8),
-                outputUTF8: Data(
-                    "reasoning... final answer: $\(answer).".utf8),
                 finishReason: .endOfSequence,
                 runtimeReceipt: try receipt(
                     policy: policy,
@@ -121,20 +154,17 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
                     promptTokenCount: prompt.tokenIDs.count,
                     generatedTokenCount: generatedTokenIDs.count))
         }
-        let artifact = KVTunerCandidateEvaluationArtifact(
-            schemaVersion: 2,
-            evaluationProtocol: .canonical,
-            promptManifestSHA256: sha256Hex(runtimeInputs.manifestData),
-            candidateOrdinal: policy.candidateOrdinal,
-            candidateSHA256: policy.candidateSHA256,
-            runtimePolicySHA256: policy.runtimePolicySHA256,
+        let artifact = try KVTunerCandidateEvaluationArtifact.makeAuthenticated(
+            runtimePolicy: policy,
+            runtimeContract: runtimeContract,
             executionEnvironment: environment(policy: policy),
-            rows: rows)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
+            calibrationManifest: runtimeInputs.manifest,
+            exactCalibrationManifestData: runtimeInputs.manifestData,
+            generatedRows: generatedRows,
+            decodeTokenIDs: decodeTokenIDs)
         return Inputs(
             artifact: artifact,
-            data: try encoder.encode(artifact),
+            data: try KVTunerArtifactCodec.encode(artifact),
             runtimePolicy: policy,
             runtimeContract: runtimeContract,
             configData: runtimeInputs.configData,
@@ -189,7 +219,9 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
         XCTAssertEqual(
             summary.runtimePolicySHA256,
             inputs.runtimePolicy.runtimePolicySHA256)
-        XCTAssertEqual(summary.environmentSHA256.count, 64)
+        XCTAssertEqual(
+            summary.environmentSHA256,
+            expectedEnvironmentSHA256(inputs.artifact.executionEnvironment))
     }
 
     func testDecoderClassifiesSchemaBeforeCurrentShape() {
@@ -381,6 +413,45 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
                 artifact: mutated,
                 data: try encoder.encode(mutated)))
         }
+    }
+
+    func testEnvironmentRequiresCanonicalMemoryCacheLimit() throws {
+        let inputs = try inputs()
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: inputs.data)
+                as? [String: Any])
+        let originalEnvironment = try XCTUnwrap(
+            object["executionEnvironment"] as? [String: Any])
+
+        var missingObject = object
+        var missingEnvironment = originalEnvironment
+        missingEnvironment.removeValue(forKey: "memoryCacheLimitBytes")
+        missingObject["executionEnvironment"] = missingEnvironment
+        let missingData = try JSONSerialization.data(
+            withJSONObject: missingObject,
+            options: [.sortedKeys])
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            KVTunerCandidateEvaluationArtifact.self,
+            from: missingData))
+
+        var wrongObject = object
+        var wrongEnvironment = originalEnvironment
+        wrongEnvironment["memoryCacheLimitBytes"] = UInt64(4) << 30
+        wrongObject["executionEnvironment"] = wrongEnvironment
+        let wrongData = try JSONSerialization.data(
+            withJSONObject: wrongObject,
+            options: [.sortedKeys])
+        let wrongArtifact = try JSONDecoder().decode(
+            KVTunerCandidateEvaluationArtifact.self,
+            from: wrongData)
+        XCTAssertThrowsError(try validate(
+            inputs,
+            artifact: wrongArtifact,
+            data: wrongData)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerCandidateEvaluationArtifactError,
+                    .invalidExecutionEnvironment("memoryCacheLimitBytes"))
+            }
     }
 
     func testRuntimeReceiptRejectsPolicyCacheGeometryAndByteSubstitution() throws {
