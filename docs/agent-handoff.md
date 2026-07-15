@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-14
+Last reviewed: 2026-07-15
 
 For the next Codex/Claude Code/human agent. Decision-focused; links to the durable specs rather than duplicating them.
 
@@ -64,6 +64,18 @@ all 33 predicates 3,519/3,519, and held peak RSS drift to 2.2444% (<5%). Compact
 dynamic PLD↔batch default is wired; sampled generation and non-dense state remain rejected.
 Production routing and real client-disconnect propagation are captured in the
 [serving-route task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
+
+**Public evidence/community platform — ROADMAP CAPTURED (2026-07-15).** The
+[oMLX public-ecosystem review](reference/2026-07-15-omlx-public-ecosystem-review.md) confirms that
+oMLX's proof-led site, community benchmark explorer, shareable results, update channels, and
+release/community feedback loop are strong product references. Its public M5 Max/Qwen3-32B rows
+put fast-mlx's current single-request numbers in the same broad performance band, but the protocols
+are not aligned and **no cross-engine winner is established**. The
+[implementation task and agent spawn packets](task-inbox/2026-07-15-public-evidence-community-platform.md)
+define a parallel product lane: a dial/frontier website, versioned public evidence schema,
+automated lab collection, same-box oMLX/MLX-LM comparison, explicit-opt-in community submissions,
+machine-readable agent surfaces, and a signed stable/RC/dev updater. This does not reorder the
+optimization queue below. No site, public ingest, or updater has been implemented yet.
 
 ## ▶ Open work queue — pick the next flywheel cycle
 
