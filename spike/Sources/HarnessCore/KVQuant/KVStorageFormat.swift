@@ -4,6 +4,8 @@ public enum KVStorageFormatError: Error, Equatable, Sendable {
     case invalidGeometry
     case invalidFormat
     case invalidAllocation
+    case invalidLayerPolicy
+    case layerCountMismatch(expected: Int, actual: Int)
     case arithmeticOverflow
 }
 
@@ -65,6 +67,19 @@ public struct KVStorageAllocation: Equatable, Sendable {
     public let totalBytes: Int
 }
 
+/// Persistent native-affine storage for one complete KVTuner layer policy plus the logical
+/// materialization workspace used by the existing sequential materialize-then-attend path.
+/// The workspace is the maximum for any one layer, never the sum across persistent layer caches.
+/// This is a storage prediction only; it does not imply compressed-domain attention or a speedup.
+public struct KVTunerStorageAllocation: Equatable, Sendable {
+    public let payloadBytes: Int
+    public let metadataBytes: Int
+    public let controlBytes: Int
+    public let workspaceBytes: Int
+    public let totalPersistentBytes: Int
+    public let totalBytes: Int
+}
+
 /// Format-aware, integer byte accounting. Unlike `KVQuantTier.bytesPerElement`, this is suitable
 /// for fast-mlx evidence: it counts distinct K/V widths, metadata, caller-selected local record
 /// alignment, and the local KVarN design's fixed fp16 state. Actual MLX array bytes must reconcile
@@ -105,6 +120,77 @@ public struct KVStorageFormat: Equatable, Sendable {
             kind: .kvarn, keyBits: keyBits, valueBits: valueBits,
             groupSize: groupSize, sinkTokens: sinkTokens,
             metadataScalarBytes: metadataScalarBytes, alignment: alignment)
+    }
+
+    /// Predicts the current native-affine layout for a complete, canonically ordered KVTuner
+    /// policy. Scale/bias metadata is fp16 and each persistent layer owns one Int32 offset,
+    /// matching the affine cache contract that this pure accountant will reconcile against.
+    public static func kvtunerAllocation(
+        layerPolicy: [KVLayerPrecision],
+        groupSize: Int,
+        geometry: KVStorageGeometry,
+        capacityTokens: Int,
+        sequences: Int,
+        maximumLayerWorkspaceBytes: Int
+    ) throws -> KVTunerStorageAllocation {
+        guard geometry.layerCount > 0, geometry.kvHeadCount > 0,
+            geometry.headDimension > 0
+        else { throw KVStorageFormatError.invalidGeometry }
+        guard capacityTokens > 0, sequences > 0, maximumLayerWorkspaceBytes >= 0 else {
+            throw KVStorageFormatError.invalidAllocation
+        }
+        guard layerPolicy.count == geometry.layerCount else {
+            throw KVStorageFormatError.layerCountMismatch(
+                expected: geometry.layerCount, actual: layerPolicy.count)
+        }
+        guard kvtunerGroupSizes.contains(groupSize) else {
+            throw KVStorageFormatError.invalidFormat
+        }
+
+        let perLayerGeometry = KVStorageGeometry(
+            layerCount: 1,
+            kvHeadCount: geometry.kvHeadCount,
+            headDimension: geometry.headDimension)
+        var payloadBytes = 0
+        var metadataBytes = 0
+        for (position, precision) in layerPolicy.enumerated() {
+            guard precision.layer == position else {
+                throw KVStorageFormatError.invalidLayerPolicy
+            }
+            guard kvtunerPrecisionPairs.contains(
+                PrecisionPair(keyBits: precision.keyBits, valueBits: precision.valueBits))
+            else { throw KVStorageFormatError.invalidFormat }
+
+            let allocation = try affine(
+                keyBits: precision.keyBits,
+                valueBits: precision.valueBits,
+                groupSize: groupSize,
+                metadataScalarBytes: kvtunerMetadataScalarBytes
+            ).allocation(
+                geometry: perLayerGeometry,
+                capacityTokens: capacityTokens,
+                sequences: sequences,
+                workspaceBytes: 0)
+            payloadBytes = try sum([payloadBytes, allocation.payloadBytes])
+            metadataBytes = try sum([metadataBytes, allocation.metadataBytes])
+        }
+
+        let controlBytes = try product([
+            layerPolicy.count, kvtunerControlBytesPerLayer,
+        ])
+        let totalPersistentBytes = try sum([
+            payloadBytes, metadataBytes, controlBytes,
+        ])
+        let totalBytes = try sum([
+            totalPersistentBytes, maximumLayerWorkspaceBytes,
+        ])
+        return KVTunerStorageAllocation(
+            payloadBytes: payloadBytes,
+            metadataBytes: metadataBytes,
+            controlBytes: controlBytes,
+            workspaceBytes: maximumLayerWorkspaceBytes,
+            totalPersistentBytes: totalPersistentBytes,
+            totalBytes: totalBytes)
     }
 
     public func unitLayout(geometry: KVStorageGeometry) throws -> KVStorageUnitLayout {
@@ -238,6 +324,20 @@ public struct KVStorageFormat: Equatable, Sendable {
     }
 
     private static let supportedBits: Set<Int> = [2, 4, 8]
+
+    private struct PrecisionPair: Hashable {
+        let keyBits: Int
+        let valueBits: Int
+    }
+
+    private static let kvtunerPrecisionPairs: Set<PrecisionPair> = [
+        PrecisionPair(keyBits: 8, valueBits: 4),
+        PrecisionPair(keyBits: 8, valueBits: 2),
+        PrecisionPair(keyBits: 4, valueBits: 2),
+    ]
+    private static let kvtunerGroupSizes: Set<Int> = [64, 128]
+    private static let kvtunerMetadataScalarBytes = 2
+    private static let kvtunerControlBytesPerLayer = MemoryLayout<Int32>.size
 
     private static func packedBytes(elements: Int, bits: Int) throws -> Int {
         let bitCount = try product([elements, bits])

@@ -51,6 +51,134 @@ final class KVStorageFormatTests: XCTestCase {
         XCTAssertEqual(g64.totalBytes, 112)
     }
 
+    func testKVTunerAllocationSumsMixedPersistentLayersButKeepsOneWorkspace() throws {
+        let geometry = KVStorageGeometry(
+            layerCount: 3, kvHeadCount: 2, headDimension: 128)
+        let policy = [
+            KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            KVLayerPrecision(layer: 1, keyBits: 8, valueBits: 2),
+            KVLayerPrecision(layer: 2, keyBits: 4, valueBits: 2),
+        ]
+
+        let allocation = try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: policy,
+            groupSize: 64,
+            geometry: geometry,
+            capacityTokens: 10,
+            sequences: 2,
+            maximumLayerWorkspaceBytes: 20_480)
+
+        XCTAssertEqual(allocation.payloadBytes, 17_920)
+        XCTAssertEqual(allocation.metadataBytes, 1_920)
+        XCTAssertEqual(allocation.controlBytes, 12)
+        XCTAssertEqual(allocation.workspaceBytes, 20_480)
+        XCTAssertEqual(allocation.totalPersistentBytes, 19_852)
+        XCTAssertEqual(allocation.totalBytes, 40_332)
+    }
+
+    func testKVTunerAllocationRejectsIncompleteGeometryAndLayerCountMismatch() {
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [],
+            groupSize: 64,
+            geometry: KVStorageGeometry(
+                layerCount: 0, kvHeadCount: 1, headDimension: 128),
+            capacityTokens: 1,
+            sequences: 1,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .invalidGeometry)
+        }
+
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: KVStorageGeometry(
+                layerCount: 2, kvHeadCount: 1, headDimension: 128),
+            capacityTokens: 1,
+            sequences: 1,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(
+                error as? KVStorageFormatError,
+                .layerCountMismatch(expected: 2, actual: 1))
+        }
+
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: d128,
+            capacityTokens: 1,
+            sequences: 0,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .invalidAllocation)
+        }
+    }
+
+    func testKVTunerAllocationRejectsNoncanonicalAndUnsupportedPolicy() {
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 1, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: d128,
+            capacityTokens: 1,
+            sequences: 1,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .invalidLayerPolicy)
+        }
+
+        for (policy, groupSize) in [
+            ([KVLayerPrecision(layer: 0, keyBits: 4, valueBits: 4)], 64),
+            ([KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4)], 32),
+        ] {
+            XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+                layerPolicy: policy,
+                groupSize: groupSize,
+                geometry: d128,
+                capacityTokens: 1,
+                sequences: 1,
+                maximumLayerWorkspaceBytes: 0
+            )) { error in
+                XCTAssertEqual(error as? KVStorageFormatError, .invalidFormat)
+            }
+        }
+    }
+
+    func testKVTunerAllocationOverflowFailsClosedWithoutTrapping() {
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: KVStorageGeometry(
+                layerCount: 1, kvHeadCount: Int.max, headDimension: 128),
+            capacityTokens: 1,
+            sequences: 1,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .arithmeticOverflow)
+        }
+
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: d128,
+            capacityTokens: 1,
+            sequences: 1,
+            maximumLayerWorkspaceBytes: Int.max
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .arithmeticOverflow)
+        }
+    }
+
     func testKVarNAllocationIncludesSinkTailPackedSlotsAndWorkspace() throws {
         let geometry = KVStorageGeometry(layerCount: 2, kvHeadCount: 3, headDimension: 128)
         let format = KVStorageFormat.kvarn(
