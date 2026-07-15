@@ -1,4 +1,5 @@
 import Foundation
+import HarnessCore
 import MLX
 import MLXLMCommon
 
@@ -27,11 +28,17 @@ public enum KVCacheExecutionMode: String, Equatable, Sendable {
     case uncompiledCorrectness = "uncompiled-correctness"
 }
 
+public enum KVCacheKindError: Error, Equatable, Sendable {
+    case layerCountMismatch(expected: Int, actual: Int)
+    case invalidKVTunerConfiguration(layer: Int)
+}
+
 /// Which KV-cache implementation a decode/scoring path runs with — selected from the
 /// harness's `RunConfig.kvQuant` tier string.
 public enum KVCacheKind: Sendable, Hashable {
     case fp16
     case affine(AffineKVTier)
+    case kvtuner(KVTunerRuntimeSelection)
     case turboQuant(TurboQuantTier)
     case kvarn(KVarNKVRuntimeCell)
 
@@ -70,12 +77,54 @@ public enum KVCacheKind: Sendable, Hashable {
             CompiledKVCache(capacity: capacity)
         case .affine(let tier):
             AffineKVCache(capacity: capacity, configuration: tier.configuration)
+        case .kvtuner:
+            preconditionFailure(
+                "KVTuner requires the layer-aware makeCaches factory")
         case .turboQuant(let tier):
             TurboQuantKVCache(capacity: capacity, tier: tier)
         case .kvarn(let cell):
             KVarNKVCache(
                 capacity: capacity, tier: cell.tier,
                 iterations: cell.iterations)
+        }
+    }
+
+    /// Build the complete cache list for one model. Uniform formats repeat one cache kind;
+    /// KVTuner consumes its immutable authenticated layer policy in canonical index order.
+    /// A count or configuration mismatch is an explicit error and never becomes fp16.
+    public func makeCaches(
+        layerCount: Int, capacity: Int
+    ) throws -> [any CompiledCache] {
+        switch self {
+        case .kvtuner(let selection):
+            guard selection.layers.count == layerCount else {
+                throw KVCacheKindError.layerCountMismatch(
+                    expected: selection.layers.count, actual: layerCount)
+            }
+            return try selection.layers.enumerated().map {
+                position, policy in
+                guard policy.layer == position else {
+                    throw KVCacheKindError.invalidKVTunerConfiguration(
+                        layer: position)
+                }
+                let configuration: AffineKVCacheConfiguration
+                do {
+                    configuration = try AffineKVCacheConfiguration(
+                        keyBits: policy.keyBits,
+                        valueBits: policy.valueBits,
+                        keyGroupSize: selection.groupSize,
+                        valueGroupSize: selection.groupSize)
+                } catch {
+                    throw KVCacheKindError.invalidKVTunerConfiguration(
+                        layer: position)
+                }
+                return AffineKVCache(
+                    capacity: capacity, configuration: configuration)
+            }
+        case .fp16, .affine, .turboQuant, .kvarn:
+            return (0 ..< layerCount).map { _ in
+                makeCache(capacity: capacity)
+            }
         }
     }
 
@@ -87,7 +136,7 @@ public enum KVCacheKind: Sendable, Hashable {
         switch self {
         case .kvarn:
             return .uncompiledCorrectness
-        case .fp16, .affine, .turboQuant:
+        case .fp16, .affine, .kvtuner, .turboQuant:
             return .compiled
         }
     }
@@ -99,7 +148,7 @@ public enum KVCacheKind: Sendable, Hashable {
         switch self {
         case .fp16:
             return true
-        case .affine, .turboQuant, .kvarn:
+        case .affine, .kvtuner, .turboQuant, .kvarn:
             return false
         }
     }

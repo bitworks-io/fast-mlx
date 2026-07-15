@@ -295,6 +295,9 @@ func runVerify(_ flags: Flags) async {
             case .affine:
                 marker = "affine_tokens"
                 markerFloor = promptTokens.count + 1
+            case .kvtuner:
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVTuner verify requires a schedule-bound CLI selection")
             case .turboQuant:
                 marker = "turboquant_tokens"
                 markerFloor = promptTokens.count + 1
@@ -380,6 +383,9 @@ func runVerify(_ flags: Flags) async {
                 affineMetadataBytes = candidate.engagement.counts["affine_metadata_bytes"]
                 affineControlBytes = candidate.engagement.counts["affine_control_bytes"]
                 affineWorkspaceBytes = candidate.engagement.counts["affine_workspace_bytes"]
+            case .kvtuner:
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVTuner verify requires a schedule-bound CLI selection")
             case .turboQuant:
                 turboquantTokens = markerValue
             case .kvarn(let cell):
@@ -752,7 +758,7 @@ func runKL(_ flags: Flags) async {
                     candidateTier: cell.rawValue,
                     candidateIterations: cell.iterations)
             }
-        case .fp16, .affine, .turboQuant:
+        case .fp16, .affine, .kvtuner, .turboQuant:
             guard try flags.strictString(
                 "kvarn-memory-gate", default: "").isEmpty
             else {
@@ -975,6 +981,9 @@ func runKL(_ flags: Flags) async {
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
+        case .kvtuner:
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner KL evidence requires a schedule-bound CLI selection")
         case .kvarn(let cell):
             guard let telemetry = await driver.kvarnScoringTelemetry(
                 for: cell)

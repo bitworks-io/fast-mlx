@@ -1,4 +1,5 @@
 import Foundation
+import HarnessCore
 import MLX
 import MLXLMCommon
 
@@ -190,6 +191,149 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
             metadataBytes: sum(snapshots.map(\.metadataBytes)),
             controlBytes: sum(snapshots.map(\.controlBytes)),
             materializationWorkspaceBytes: first.materializationWorkspaceBytes)
+    }
+}
+
+public enum KVTunerKVCacheTelemetryError: Error, Equatable, Sendable {
+    case layerCountMismatch(expected: Int, actual: Int)
+    case configurationMismatch(layer: Int)
+    case unallocatedLayer(Int)
+    case inconsistentGeometry(layer: Int)
+    case inconsistentOffset(layer: Int)
+    case byteCountOverflow
+}
+
+/// Actor-safe scalar evidence for one authenticated heterogeneous affine policy. The exact
+/// schedule digest and frozen layer decisions travel with the actual MLX-array byte totals;
+/// no MLX array crosses the inference actor boundary.
+public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
+    public let artifactSHA256: String
+    public let matrixID: String
+    public let cellID: String
+    public let groupSize: Int
+    public let layers: [KVTunerRuntimeLayerPolicy]
+    public let cachedTokens: Int
+    public let layerCount: Int
+    public let capacityTokens: Int
+    public let sequences: Int
+    public let kvHeadCount: Int
+    public let headDimension: Int
+    public let metadataScalarBytes: Int
+    public let payloadBytes: Int
+    public let metadataBytes: Int
+    public let controlBytes: Int
+    public let materializationWorkspaceBytes: Int
+    public let totalPersistentBytes: Int
+    public let totalBytes: Int
+
+    /// Capture must run in the cache owner's inference actor after allocation. Persistent
+    /// bytes sum every layer; workspace is the largest one-layer full-precision K/V pair,
+    /// because transformer layers materialize and consume their caches sequentially.
+    public static func capture(
+        selection: KVTunerRuntimeSelection,
+        caches: [AffineKVCache]
+    ) throws -> KVTunerKVCacheTelemetry {
+        guard caches.count == selection.layers.count else {
+            throw KVTunerKVCacheTelemetryError.layerCountMismatch(
+                expected: selection.layers.count, actual: caches.count)
+        }
+
+        var snapshots: [AffineKVCacheStorageSnapshot] = []
+        snapshots.reserveCapacity(caches.count)
+        for (position, pair) in zip(caches, selection.layers).enumerated() {
+            let (cache, policy) = pair
+            let expected: AffineKVCacheConfiguration
+            do {
+                expected = try AffineKVCacheConfiguration(
+                    keyBits: policy.keyBits,
+                    valueBits: policy.valueBits,
+                    keyGroupSize: selection.groupSize,
+                    valueGroupSize: selection.groupSize)
+            } catch {
+                throw KVTunerKVCacheTelemetryError.configurationMismatch(
+                    layer: position)
+            }
+            guard cache.configuration == expected else {
+                throw KVTunerKVCacheTelemetryError.configurationMismatch(
+                    layer: position)
+            }
+            guard let snapshot = cache.storageSnapshot() else {
+                throw KVTunerKVCacheTelemetryError.unallocatedLayer(position)
+            }
+            snapshots.append(snapshot)
+        }
+        guard let first = snapshots.first, let firstCache = caches.first else {
+            throw KVTunerKVCacheTelemetryError.layerCountMismatch(
+                expected: selection.layers.count, actual: 0)
+        }
+        guard first.keyHeadDimension == first.valueHeadDimension else {
+            throw KVTunerKVCacheTelemetryError.inconsistentGeometry(layer: 0)
+        }
+
+        let cachedTokens = Int(firstCache.offsetArr.item(Int32.self))
+        for position in snapshots.indices.dropFirst() {
+            let snapshot = snapshots[position]
+            guard snapshot.capacityTokens == first.capacityTokens,
+                snapshot.sequences == first.sequences,
+                snapshot.kvHeadCount == first.kvHeadCount,
+                snapshot.keyHeadDimension == first.keyHeadDimension,
+                snapshot.valueHeadDimension == first.valueHeadDimension,
+                snapshot.metadataScalarBytes == first.metadataScalarBytes
+            else {
+                throw KVTunerKVCacheTelemetryError.inconsistentGeometry(
+                    layer: position)
+            }
+            guard Int(caches[position].offsetArr.item(Int32.self))
+                == cachedTokens
+            else {
+                throw KVTunerKVCacheTelemetryError.inconsistentOffset(
+                    layer: position)
+            }
+        }
+
+        func checkedSum(_ values: [Int]) throws -> Int {
+            var result = 0
+            for value in values {
+                let (next, overflow) = result.addingReportingOverflow(value)
+                guard !overflow else {
+                    throw KVTunerKVCacheTelemetryError.byteCountOverflow
+                }
+                result = next
+            }
+            return result
+        }
+
+        let payloadBytes = try checkedSum(snapshots.map(\.payloadBytes))
+        let metadataBytes = try checkedSum(snapshots.map(\.metadataBytes))
+        let controlBytes = try checkedSum(snapshots.map(\.controlBytes))
+        let workspaceBytes = snapshots.map(\.materializationWorkspaceBytes)
+            .max() ?? 0
+        let totalPersistentBytes = try checkedSum([
+            payloadBytes, metadataBytes, controlBytes,
+        ])
+        let totalBytes = try checkedSum([
+            totalPersistentBytes, workspaceBytes,
+        ])
+
+        return KVTunerKVCacheTelemetry(
+            artifactSHA256: selection.artifactSHA256,
+            matrixID: selection.matrixID,
+            cellID: selection.cellID,
+            groupSize: selection.groupSize,
+            layers: selection.layers,
+            cachedTokens: cachedTokens,
+            layerCount: caches.count,
+            capacityTokens: first.capacityTokens,
+            sequences: first.sequences,
+            kvHeadCount: first.kvHeadCount,
+            headDimension: first.keyHeadDimension,
+            metadataScalarBytes: first.metadataScalarBytes,
+            payloadBytes: payloadBytes,
+            metadataBytes: metadataBytes,
+            controlBytes: controlBytes,
+            materializationWorkspaceBytes: workspaceBytes,
+            totalPersistentBytes: totalPersistentBytes,
+            totalBytes: totalBytes)
     }
 }
 

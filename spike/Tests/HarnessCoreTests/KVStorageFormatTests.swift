@@ -66,6 +66,7 @@ final class KVStorageFormatTests: XCTestCase {
             geometry: geometry,
             capacityTokens: 10,
             sequences: 2,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: 20_480)
 
         XCTAssertEqual(allocation.payloadBytes, 17_920)
@@ -74,6 +75,19 @@ final class KVStorageFormatTests: XCTestCase {
         XCTAssertEqual(allocation.workspaceBytes, 20_480)
         XCTAssertEqual(allocation.totalPersistentBytes, 19_852)
         XCTAssertEqual(allocation.totalBytes, 40_332)
+
+        let float32Metadata = try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: policy,
+            groupSize: 64,
+            geometry: geometry,
+            capacityTokens: 10,
+            sequences: 2,
+            metadataScalarBytes: 4,
+            maximumLayerWorkspaceBytes: 40_960)
+        XCTAssertEqual(float32Metadata.payloadBytes, allocation.payloadBytes)
+        XCTAssertEqual(float32Metadata.metadataBytes, allocation.metadataBytes * 2)
+        XCTAssertEqual(float32Metadata.controlBytes, allocation.controlBytes)
+        XCTAssertEqual(float32Metadata.workspaceBytes, 40_960)
     }
 
     func testKVTunerAllocationRejectsIncompleteGeometryAndLayerCountMismatch() {
@@ -84,6 +98,7 @@ final class KVStorageFormatTests: XCTestCase {
                 layerCount: 0, kvHeadCount: 1, headDimension: 128),
             capacityTokens: 1,
             sequences: 1,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: 0
         )) { error in
             XCTAssertEqual(error as? KVStorageFormatError, .invalidGeometry)
@@ -98,6 +113,7 @@ final class KVStorageFormatTests: XCTestCase {
                 layerCount: 2, kvHeadCount: 1, headDimension: 128),
             capacityTokens: 1,
             sequences: 1,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: 0
         )) { error in
             XCTAssertEqual(
@@ -113,6 +129,21 @@ final class KVStorageFormatTests: XCTestCase {
             geometry: d128,
             capacityTokens: 1,
             sequences: 0,
+            metadataScalarBytes: 2,
+            maximumLayerWorkspaceBytes: 0
+        )) { error in
+            XCTAssertEqual(error as? KVStorageFormatError, .invalidAllocation)
+        }
+
+        XCTAssertThrowsError(try KVStorageFormat.kvtunerAllocation(
+            layerPolicy: [
+                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
+            ],
+            groupSize: 64,
+            geometry: d128,
+            capacityTokens: 1,
+            sequences: 1,
+            metadataScalarBytes: 0,
             maximumLayerWorkspaceBytes: 0
         )) { error in
             XCTAssertEqual(error as? KVStorageFormatError, .invalidAllocation)
@@ -128,6 +159,7 @@ final class KVStorageFormatTests: XCTestCase {
             geometry: d128,
             capacityTokens: 1,
             sequences: 1,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: 0
         )) { error in
             XCTAssertEqual(error as? KVStorageFormatError, .invalidLayerPolicy)
@@ -143,6 +175,7 @@ final class KVStorageFormatTests: XCTestCase {
                 geometry: d128,
                 capacityTokens: 1,
                 sequences: 1,
+                metadataScalarBytes: 2,
                 maximumLayerWorkspaceBytes: 0
             )) { error in
                 XCTAssertEqual(error as? KVStorageFormatError, .invalidFormat)
@@ -160,6 +193,7 @@ final class KVStorageFormatTests: XCTestCase {
                 layerCount: 1, kvHeadCount: Int.max, headDimension: 128),
             capacityTokens: 1,
             sequences: 1,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: 0
         )) { error in
             XCTAssertEqual(error as? KVStorageFormatError, .arithmeticOverflow)
@@ -173,6 +207,7 @@ final class KVStorageFormatTests: XCTestCase {
             geometry: d128,
             capacityTokens: 1,
             sequences: 1,
+            metadataScalarBytes: 2,
             maximumLayerWorkspaceBytes: Int.max
         )) { error in
             XCTAssertEqual(error as? KVStorageFormatError, .arithmeticOverflow)

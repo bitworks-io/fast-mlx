@@ -14,12 +14,17 @@ public struct RunConfig: Sendable, Hashable {
     /// Canonical engine KV-cache tier (`nil`/`fp16`, named affine/KVarN cell, or TurboQuant tier).
     /// The engine parser owns the closed allowlist and rejects unknown spellings.
     public var kvQuant: String?
+    /// Authenticated immutable KVTuner policy. Its exact artifact digest participates in the
+    /// runtime cache key; a cell spelling alone is never enough to select heterogeneous layers.
+    public var kvtunerSelection: KVTunerRuntimeSelection?
     public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
                 specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
-                kvQuant: String? = nil) {
+                kvQuant: String? = nil,
+                kvtunerSelection: KVTunerRuntimeSelection? = nil) {
         self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode
         self.specNgram = specNgram; self.specMaxDraft = specMaxDraft
         self.specCompiledVerify = specCompiledVerify; self.kvQuant = kvQuant
+        self.kvtunerSelection = kvtunerSelection
     }
     public static func greedy(maxTokens: Int) -> RunConfig { .init(temperature: 0, maxTokens: maxTokens) }
 }

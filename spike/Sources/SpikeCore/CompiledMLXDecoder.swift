@@ -76,7 +76,13 @@ public struct CompiledMLXDecoder: Decoder {
         if caches.isEmpty {
             let layerCount = model.newCache(parameters: nil).count
             let cap = ((promptLength + reserve + chunk - 1) / chunk) * chunk
-            caches = (0 ..< layerCount).map { _ in kvCacheKind.makeCache(capacity: cap) }
+            do {
+                caches = try kvCacheKind.makeCaches(
+                    layerCount: layerCount, capacity: cap)
+            } catch {
+                preconditionFailure(
+                    "KV-cache policy does not match the loaded model: \(error)")
+            }
         }
         while promptLength + 1 > caches[0].capacity {
             for cache in caches { cache.grow(by: chunk) }
@@ -308,6 +314,23 @@ public struct CompiledMLXDecoder: Decoder {
             affineCaches.count == caches.count,
             "affine tier requested but the decoder contains a different cache type")
         return AffineKVCacheTelemetry.capture(tier: tier, caches: affineCaches)
+    }
+
+    /// Post-run exact schedule identity plus heterogeneous affine-array bytes. The schedule
+    /// digest is part of `KVCacheKind`, so decoder reuse cannot cross artifact boundaries.
+    public func kvtunerKVTelemetry() -> KVTunerKVCacheTelemetry? {
+        guard case .kvtuner(let selection) = kvCacheKind else { return nil }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "KVTuner decoder contains a different cache type")
+        do {
+            return try KVTunerKVCacheTelemetry.capture(
+                selection: selection, caches: affineCaches)
+        } catch {
+            preconditionFailure(
+                "KVTuner decoder telemetry does not match its schedule: \(error)")
+        }
     }
 
     /// Post-run KVarN engagement, runtime cell, geometry, and exact storage bytes. All MLX

@@ -123,20 +123,24 @@ public struct KVStorageFormat: Equatable, Sendable {
     }
 
     /// Predicts the current native-affine layout for a complete, canonically ordered KVTuner
-    /// policy. Scale/bias metadata is fp16 and each persistent layer owns one Int32 offset,
-    /// matching the affine cache contract that this pure accountant will reconcile against.
+    /// policy. The caller supplies the observed scale/bias scalar width because native MLX
+    /// preserves the cache input dtype; each persistent layer owns one Int32 offset. Passing
+    /// runtime telemetry here makes the pure prediction reconcile without assuming fp16.
     public static func kvtunerAllocation(
         layerPolicy: [KVLayerPrecision],
         groupSize: Int,
         geometry: KVStorageGeometry,
         capacityTokens: Int,
         sequences: Int,
+        metadataScalarBytes: Int,
         maximumLayerWorkspaceBytes: Int
     ) throws -> KVTunerStorageAllocation {
         guard geometry.layerCount > 0, geometry.kvHeadCount > 0,
             geometry.headDimension > 0
         else { throw KVStorageFormatError.invalidGeometry }
-        guard capacityTokens > 0, sequences > 0, maximumLayerWorkspaceBytes >= 0 else {
+        guard capacityTokens > 0, sequences > 0, metadataScalarBytes > 0,
+            maximumLayerWorkspaceBytes >= 0
+        else {
             throw KVStorageFormatError.invalidAllocation
         }
         guard layerPolicy.count == geometry.layerCount else {
@@ -165,7 +169,7 @@ public struct KVStorageFormat: Equatable, Sendable {
                 keyBits: precision.keyBits,
                 valueBits: precision.valueBits,
                 groupSize: groupSize,
-                metadataScalarBytes: kvtunerMetadataScalarBytes
+                metadataScalarBytes: metadataScalarBytes
             ).allocation(
                 geometry: perLayerGeometry,
                 capacityTokens: capacityTokens,
@@ -336,7 +340,6 @@ public struct KVStorageFormat: Equatable, Sendable {
         PrecisionPair(keyBits: 4, valueBits: 2),
     ]
     private static let kvtunerGroupSizes: Set<Int> = [64, 128]
-    private static let kvtunerMetadataScalarBytes = 2
     private static let kvtunerControlBytesPerLayer = MemoryLayout<Int32>.size
 
     private static func packedBytes(elements: Int, bits: Int) throws -> Int {
