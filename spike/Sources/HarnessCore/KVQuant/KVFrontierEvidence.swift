@@ -675,7 +675,7 @@ public extension KVarNMemoryGateEvidence {
                 row.expectedEvaluatedArrayCount == expectedArrayCount,
                 row.valuesFinite,
                 row.highWater.observedPeakActiveBytes > 0,
-                row.highWater.transientActiveAboveRetainedBytes > 0,
+                row.highWater.transientActiveAboveRetainedBytes >= 0,
                 row.highWater.transientActiveAboveRetainedBytes
                     <= row.highWater.observedPeakActiveBytes,
                 row.status == "PASS"
@@ -722,6 +722,10 @@ public extension KVarNMemoryGateEvidence {
                 \.highWater.observedPeakActiveBytes).max(),
             let maximumCapacity = cacheBoundaryRows.map(
                 \.configuration.capacity).max()
+        else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
+        let transientPeaks = [encodePeak, decodePeak, cacheBoundaryPeak]
+        guard transientPeaks.allSatisfy({ $0 > 0 }),
+            maximumPeak >= (transientPeaks.max() ?? 0)
         else { throw KVFrontierEvidenceError.invalidMemoryGateEvidence }
 
         return KVarNMemoryGateEvidence(

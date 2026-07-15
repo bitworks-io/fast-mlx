@@ -467,6 +467,65 @@ final class KVFrontierEvidenceTests: XCTestCase {
         }
     }
 
+    func testKVarNMemoryGateAllowsZeroTransientRepeatsButRequiresAPositivePhasePeak() throws {
+        let rows = memoryProbeRows()
+        let oneZeroRepeat = rows.map { row in
+            row.configuration.phase == "cache-boundary"
+                && row.configuration.capacity == 4_096
+                && row.configuration.run == 1
+                ? memoryProbeRow(
+                    phase: row.configuration.phase,
+                    capacity: row.configuration.capacity,
+                    run: row.configuration.run,
+                    iterations: row.configuration.iterations,
+                    peak: row.highWater.observedPeakActiveBytes,
+                    transient: 0)
+                : row
+        }
+        XCTAssertNoThrow(try KVarNMemoryGateEvidence.derived(
+            from: oneZeroRepeat,
+            artifactSHA256: String(repeating: "b", count: 64),
+            runtimeTier: "kvarn-k4v2-g128").validated(
+                candidateTier: "kvarn-k4v2-g128",
+                candidateIterations: 8))
+
+        for invalidRows in [
+            rows.map { row in
+                row.configuration.phase == "encode"
+                    ? memoryProbeRow(
+                        phase: row.configuration.phase,
+                        capacity: row.configuration.capacity,
+                        run: row.configuration.run,
+                        iterations: row.configuration.iterations,
+                        peak: row.highWater.observedPeakActiveBytes,
+                        transient: 0)
+                    : row
+            },
+            rows.enumerated().map { index, row in
+                index == 0
+                    ? memoryProbeRow(
+                        phase: row.configuration.phase,
+                        capacity: row.configuration.capacity,
+                        run: row.configuration.run,
+                        iterations: row.configuration.iterations,
+                        peak: row.highWater.observedPeakActiveBytes,
+                        transient: -1)
+                    : row
+            },
+        ] {
+            XCTAssertThrowsError(try KVarNMemoryGateEvidence.derived(
+                from: invalidRows,
+                artifactSHA256: String(repeating: "b", count: 64),
+                runtimeTier: "kvarn-k4v2-g128").validated(
+                    candidateTier: "kvarn-k4v2-g128",
+                    candidateIterations: 8)) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidMemoryGateEvidence)
+            }
+        }
+    }
+
     func testKVarNRawMemoryArtifactJSONLRejectsEmptyRows() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
