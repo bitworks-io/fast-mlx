@@ -918,3 +918,54 @@ public enum TaskCoherenceCorpusV1 {
         return items
     }
 }
+
+/// The qualification corpus used by the runtime harness. V1's long-retrieval rows ask the model
+/// to join a random recovery code to a later option table after thousands of repetitive tokens.
+/// Qwen3-32B's fp16-KV control collapses that compound task to an all-A prior at every depth, so
+/// the reference lands exactly at chance and cannot adjudicate cache loss. V2 keeps the same
+/// answer-bearing needle position, filler depths, balanced labels, and option table, but states
+/// the option label in the distant needle and asks the final query to copy that exact field. The
+/// task therefore isolates long-context retention while the unchanged >chance reference gate
+/// continues to fail closed.
+public enum TaskCoherenceCorpusV2 {
+    public static func make() throws -> TaskCoherenceCorpus {
+        let v1 = try TaskCoherenceCorpusV1.make()
+        let items = try v1.items.map { item -> TaskCoherenceItem in
+            guard item.domain == .longRetrieval else { return item }
+            let prefix = "long-retrieval-"
+            guard item.id.hasPrefix(prefix),
+                let index = Int(item.id.dropFirst(prefix.count)),
+                let expected = item.expectedChoice
+            else { throw TaskCoherenceError.invalidItem(item.id) }
+
+            let archiveID = String(format: "ARCHIVE-%02d", index)
+            let answer = String(format: "CODE-%04d", 7000 + index * 17)
+            let needle =
+                "Critical archive mapping: \(archiveID) has recovery code \(answer)."
+            guard item.material.components(separatedBy: needle).count == 2 else {
+                throw TaskCoherenceError.invalidItem(item.id)
+            }
+            let explicitNeedle = needle
+                + " The correct option label for \(archiveID) is \(expected)."
+            let material = item.material.replacingOccurrences(
+                of: needle, with: explicitNeedle)
+            let query =
+                "According to the earlier correct-option-label statement for \(archiveID), "
+                + "copy that single label. Answer:"
+            return TaskCoherenceItem(
+                id: item.id,
+                domain: item.domain,
+                scoringMode: item.scoringMode,
+                prefix: item.prefix,
+                material: material,
+                suffix: item.suffix,
+                query: query,
+                expectedChoice: expected,
+                expectedTool: nil)
+        }
+        return try TaskCoherenceCorpus(
+            schemaVersion: 1,
+            id: "kvarn-task-coherence-v2",
+            items: items)
+    }
+}

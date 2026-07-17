@@ -138,6 +138,31 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
             renamed.items.count)
     }
 
+    func testExactBuiltInTaskCorpusV2ReceivesAuditedSourceProvenance() throws {
+        let corpus = try TaskCoherenceCorpusV2.make()
+        let identity = try KVTunerEvaluationCorpusIdentity
+            .taskCoherenceCorpus(corpus)
+
+        XCTAssertEqual(identity.id, corpus.id)
+        XCTAssertEqual(identity.aggregateDigest, corpus.contentHash)
+        XCTAssertEqual(
+            identity.sourceProvenance,
+            .firstPartyAuditedNoGSM8K)
+        XCTAssertEqual(
+            identity.canonicalEntryDigests,
+            corpus.items.map {
+                KVTunerPromptDigest.exactText($0.prompt)
+            }.sorted())
+        XCTAssertEqual(
+            identity.canonicalSourceItemDigests.count,
+            corpus.items.count)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                KVTunerEvaluationCorpusIdentity.self,
+                from: JSONEncoder().encode(identity)),
+            identity)
+    }
+
     func testOnlyExactBuiltInMeasurementCorpusReceivesAuditedSourceProvenance() throws {
         let corpus = try builtInMeasurementCorpus()
         let identity = try KVTunerEvaluationCorpusIdentity.measurementCorpus(

@@ -28,6 +28,40 @@ final class TaskCoherenceTests: XCTestCase {
         XCTAssertEqual(try TaskCoherenceCorpusV1.make(), corpus)
     }
 
+    func testFrozenCorpusV2PreservesControlsAndMakesLongRetrievalExplicit() throws {
+        let v1 = try TaskCoherenceCorpusV1.make()
+        let v2 = try TaskCoherenceCorpusV2.make()
+
+        XCTAssertEqual(v1.contentHash, "0f16e3abc00ec7c8")
+        XCTAssertEqual(v2.schemaVersion, 1)
+        XCTAssertEqual(v2.id, "kvarn-task-coherence-v2")
+        XCTAssertEqual(v2.contentHash, "1740d0d07f586def")
+        XCTAssertEqual(v2.items.count, 80)
+        XCTAssertEqual(
+            v2.items.filter { $0.domain != .longRetrieval },
+            v1.items.filter { $0.domain != .longRetrieval })
+
+        let longRetrieval = v2.items.filter {
+            $0.domain == .longRetrieval
+        }
+        XCTAssertEqual(longRetrieval.count, 20)
+        XCTAssertEqual(
+            Dictionary(grouping: longRetrieval, by: \.expectedChoice)
+                .mapValues(\.count),
+            ["A": 5, "B": 5, "C": 5, "D": 5])
+
+        for (index, item) in longRetrieval.enumerated() {
+            let archiveID = String(format: "ARCHIVE-%02d", index)
+            let expected = try XCTUnwrap(item.expectedChoice)
+            XCTAssertTrue(item.material.contains(
+                "The correct option label for \(archiveID) is \(expected)."))
+            XCTAssertEqual(
+                item.query,
+                "According to the earlier correct-option-label statement for \(archiveID), copy that single label. Answer:")
+        }
+        XCTAssertEqual(try TaskCoherenceCorpusV2.make(), v2)
+    }
+
     func testCorpusRejectsDuplicateIDsAndMismatchedScoringContracts() throws {
         let valid = try TaskCoherenceCorpusV1.make()
         var duplicate = valid.items

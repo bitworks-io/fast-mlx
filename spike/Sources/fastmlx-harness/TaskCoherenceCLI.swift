@@ -446,7 +446,7 @@ private func printTaskAssessment(_ assessment: TaskCoherenceAssessment) {
 func runTaskCoherence(_ flags: Flags) async {
     do {
         let plan = try parseTaskCoherenceRunPlan(flags)
-        let corpus = try TaskCoherenceCorpusV1.make()
+        let corpus = try TaskCoherenceCorpusV2.make()
         let modelIdentity = try ProvenanceCLI.modelEvidenceIdentity(
             at: plan.modelPath)
         let tokenizerManifestSHA256 =

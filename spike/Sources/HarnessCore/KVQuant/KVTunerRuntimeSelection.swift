@@ -79,12 +79,42 @@ private enum KVTunerEvaluationCorpusAudit {
     // They are not the legacy FNV aggregate identifiers used in result presentation.
     static let measurementTranscriptSHA256 =
         "f862ae55be658c3c352beb881423cb3077d57cef893d605525cc4963bfcdfd90"
-    static let taskCoherenceTranscriptSHA256 =
+    static let taskCoherenceV1TranscriptSHA256 =
         "e13644bccc0865c77935982dd5d717a7b8350fb8c6a204f6628dafcdf33fd809"
+    static let taskCoherenceV2TranscriptSHA256 =
+        "e3207cfa924523c461b100a48afde8cb21d8f056baf7870ad3edd47f7992a431"
     static let measurementIdentitySHA256 =
         "a6621294b3c3ab887cd6ae95906c5b15328fbd0eab6d4a7aeed24fab59bfafa3"
-    static let taskCoherenceIdentitySHA256 =
+    static let taskCoherenceV1IdentitySHA256 =
         "d6af1e7afad23011869b2744dd55b96107740ecfa073c3a4e6e9581af3f6d681"
+    static let taskCoherenceV2IdentitySHA256 =
+        "a146bc7605ac9962ad66aa832ab77e0b17d69f9a11a39dc98706ed772c5174c9"
+
+    static func expectedTaskCoherenceTranscriptSHA256(
+        id: String,
+        aggregateDigest: String
+    ) -> String? {
+        switch (id, aggregateDigest) {
+        case ("kvarn-task-coherence-v1", "0f16e3abc00ec7c8"):
+            taskCoherenceV1TranscriptSHA256
+        case ("kvarn-task-coherence-v2", "1740d0d07f586def"):
+            taskCoherenceV2TranscriptSHA256
+        default:
+            nil
+        }
+    }
+
+    static func isRecognizedAuditedIdentity(
+        transcriptSHA256: String,
+        identitySHA256: String
+    ) -> Bool {
+        (transcriptSHA256 == measurementTranscriptSHA256
+            && identitySHA256 == measurementIdentitySHA256)
+            || (transcriptSHA256 == taskCoherenceV1TranscriptSHA256
+                && identitySHA256 == taskCoherenceV1IdentitySHA256)
+            || (transcriptSHA256 == taskCoherenceV2TranscriptSHA256
+                && identitySHA256 == taskCoherenceV2IdentitySHA256)
+    }
 
     static func measurementTranscriptSHA256(
         _ corpus: MeasurementCorpus
@@ -293,14 +323,16 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
     ) throws -> KVTunerEvaluationCorpusIdentity {
         let transcriptSHA256 = KVTunerEvaluationCorpusAudit
             .taskCoherenceTranscriptSHA256(corpus)
+        let expectedTranscriptSHA256 = KVTunerEvaluationCorpusAudit
+            .expectedTaskCoherenceTranscriptSHA256(
+                id: corpus.id,
+                aggregateDigest: corpus.contentHash)
         let isAuditedBuiltIn = corpus.schemaVersion == 1
-            && corpus.id == "kvarn-task-coherence-v1"
-            && corpus.contentHash == "0f16e3abc00ec7c8"
+            && expectedTranscriptSHA256 != nil
             && corpus.items.count
                 == TaskCoherenceCorpus.requiredItemsPerDomain
                     * TaskCoherenceDomain.allCases.count
-            && transcriptSHA256 == KVTunerEvaluationCorpusAudit
-                .taskCoherenceTranscriptSHA256
+            && transcriptSHA256 == expectedTranscriptSHA256
         guard isAuditedBuiltIn else {
             throw KVTunerEvaluationCorpusIdentityError
                 .canonicalSourceItemsRequired
@@ -388,18 +420,9 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
                 decoded.canonicalSourceItemDigests,
             auditedContentTranscriptSHA256: transcriptSHA256)
         guard sourceDigests == decoded.canonicalSourceItemDigests,
-            (transcriptSHA256
-                == KVTunerEvaluationCorpusAudit
-                    .measurementTranscriptSHA256
-                && identitySHA256
-                    == KVTunerEvaluationCorpusAudit
-                        .measurementIdentitySHA256)
-                || (transcriptSHA256
-                    == KVTunerEvaluationCorpusAudit
-                        .taskCoherenceTranscriptSHA256
-                    && identitySHA256
-                        == KVTunerEvaluationCorpusAudit
-                            .taskCoherenceIdentitySHA256)
+            KVTunerEvaluationCorpusAudit.isRecognizedAuditedIdentity(
+                transcriptSHA256: transcriptSHA256,
+                identitySHA256: identitySHA256)
         else {
             throw DecodingError.dataCorruptedError(
                 forKey: .sourceProvenance,
