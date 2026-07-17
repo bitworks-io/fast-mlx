@@ -10,6 +10,43 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
     private let checkpointManifestHash = "fedcba9876543210"
     private let cleanSHA = String(repeating: "a", count: 40)
 
+    func testQualificationV3RecordsStructuredChatTemplateAndDecodesLegacyV2() throws {
+        let v3 = TaskCoherenceRunConfiguration.qualificationV3(
+            structuredToolMaxTokens: 96)
+
+        XCTAssertEqual(v3.restrictedChoicePromptFormat, .rawV1)
+        XCTAssertEqual(
+            v3.structuredToolPromptFormat,
+            .checkpointChatTemplateGenerationPromptThinkingDisabledV1)
+        XCTAssertNoThrow(try v3.validated())
+
+        let encodedV3 = try JSONEncoder().encode(v3)
+        let v3Object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: encodedV3)
+                as? [String: Any])
+        XCTAssertEqual(
+            v3Object["restrictedChoicePromptFormat"] as? String,
+            "raw-v1")
+        XCTAssertEqual(
+            v3Object["structuredToolPromptFormat"] as? String,
+            "checkpoint-chat-template-generation-prompt-thinking-disabled-v1")
+
+        let v2 = TaskCoherenceRunConfiguration.qualificationV2(
+            structuredToolMaxTokens: 96)
+        var legacyObject = try XCTUnwrap(
+            try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(v2)) as? [String: Any])
+        legacyObject.removeValue(forKey: "restrictedChoicePromptFormat")
+        legacyObject.removeValue(forKey: "structuredToolPromptFormat")
+        let legacyData = try JSONSerialization.data(
+            withJSONObject: legacyObject)
+
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                TaskCoherenceRunConfiguration.self, from: legacyData),
+            v2)
+    }
+
     func testRunnableTaskTierCellMappingIsClosed() {
         XCTAssertEqual(
             TaskCoherenceArtifact.expectedCellID(forTier: "fp16"), "fp16")

@@ -216,6 +216,18 @@ public struct TaskCoherenceTokenizationEvidence:
 /// Frozen decoding/scoring controls shared by every case in a qualification run. These fields are
 /// evidence, not CLI defaults: candidate/reference comparison is invalid when truncation, sampling,
 /// label spelling, or tokenizer special-token handling differs.
+public enum TaskCoherencePromptFormat: String, Codable, Sendable {
+    /// Historical task qualification behavior: tokenize the frozen prompt text directly.
+    case rawV1 = "raw-v1"
+
+    /// Render the frozen prompt as one user message through the checkpoint chat template. The
+    /// MLXLM tokenizer bridge adds the assistant generation prompt, while the caller supplies
+    /// `enable_thinking=false` so structured output starts at the answer rather than a reasoning
+    /// preamble. The long name is intentional evidence: it freezes all three controls.
+    case checkpointChatTemplateGenerationPromptThinkingDisabledV1 =
+        "checkpoint-chat-template-generation-prompt-thinking-disabled-v1"
+}
+
 public struct TaskCoherenceRunConfiguration:
     Codable, Equatable, Sendable
 {
@@ -225,6 +237,8 @@ public struct TaskCoherenceRunConfiguration:
     public let restrictedChoiceLabelTokenSpellings: [String: String]
     public let restrictedChoiceAddsSpecialTokens: Bool
     public let structuredToolSkipsSpecialTokens: Bool
+    public let restrictedChoicePromptFormat: TaskCoherencePromptFormat
+    public let structuredToolPromptFormat: TaskCoherencePromptFormat
 
     public init(
         temperature: Double,
@@ -232,7 +246,9 @@ public struct TaskCoherenceRunConfiguration:
         structuredToolMaxTokens: Int,
         restrictedChoiceLabelTokenSpellings: [String: String],
         restrictedChoiceAddsSpecialTokens: Bool,
-        structuredToolSkipsSpecialTokens: Bool
+        structuredToolSkipsSpecialTokens: Bool,
+        restrictedChoicePromptFormat: TaskCoherencePromptFormat = .rawV1,
+        structuredToolPromptFormat: TaskCoherencePromptFormat = .rawV1
     ) {
         self.temperature = temperature
         self.restrictedChoiceMaxTokens = restrictedChoiceMaxTokens
@@ -242,6 +258,8 @@ public struct TaskCoherenceRunConfiguration:
         self.restrictedChoiceAddsSpecialTokens =
             restrictedChoiceAddsSpecialTokens
         self.structuredToolSkipsSpecialTokens = structuredToolSkipsSpecialTokens
+        self.restrictedChoicePromptFormat = restrictedChoicePromptFormat
+        self.structuredToolPromptFormat = structuredToolPromptFormat
     }
 
     public static func qualificationV2(
@@ -254,7 +272,25 @@ public struct TaskCoherenceRunConfiguration:
             restrictedChoiceLabelTokenSpellings:
                 TaskRestrictedChoiceScorer.labelTokenSpellings,
             restrictedChoiceAddsSpecialTokens: false,
-            structuredToolSkipsSpecialTokens: true)
+            structuredToolSkipsSpecialTokens: true,
+            restrictedChoicePromptFormat: .rawV1,
+            structuredToolPromptFormat: .rawV1)
+    }
+
+    public static func qualificationV3(
+        structuredToolMaxTokens: Int
+    ) -> TaskCoherenceRunConfiguration {
+        TaskCoherenceRunConfiguration(
+            temperature: 0,
+            restrictedChoiceMaxTokens: 1,
+            structuredToolMaxTokens: structuredToolMaxTokens,
+            restrictedChoiceLabelTokenSpellings:
+                TaskRestrictedChoiceScorer.labelTokenSpellings,
+            restrictedChoiceAddsSpecialTokens: false,
+            structuredToolSkipsSpecialTokens: true,
+            restrictedChoicePromptFormat: .rawV1,
+            structuredToolPromptFormat:
+                .checkpointChatTemplateGenerationPromptThinkingDisabledV1)
     }
 
     @discardableResult
@@ -265,12 +301,54 @@ public struct TaskCoherenceRunConfiguration:
             restrictedChoiceLabelTokenSpellings
                 == TaskRestrictedChoiceScorer.labelTokenSpellings,
             restrictedChoiceAddsSpecialTokens == false,
-            structuredToolSkipsSpecialTokens
+            structuredToolSkipsSpecialTokens,
+            restrictedChoicePromptFormat == .rawV1,
+            structuredToolPromptFormat == .rawV1
+                || structuredToolPromptFormat
+                    == .checkpointChatTemplateGenerationPromptThinkingDisabledV1
         else {
             throw TaskCoherenceEvidenceError.mismatchedArtifact(
                 "run-configuration")
         }
         return self
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case temperature
+        case restrictedChoiceMaxTokens
+        case structuredToolMaxTokens
+        case restrictedChoiceLabelTokenSpellings
+        case restrictedChoiceAddsSpecialTokens
+        case structuredToolSkipsSpecialTokens
+        case restrictedChoicePromptFormat
+        case structuredToolPromptFormat
+    }
+
+    /// Schema-2 V1/V2 evidence predates explicit prompt-format fields. Missing fields decode to
+    /// the historical raw path, preserving durable artifact readability without allowing those
+    /// rows to compare equal to the new chat-templated qualification configuration.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            temperature: try container.decode(
+                Double.self, forKey: .temperature),
+            restrictedChoiceMaxTokens: try container.decode(
+                Int.self, forKey: .restrictedChoiceMaxTokens),
+            structuredToolMaxTokens: try container.decode(
+                Int.self, forKey: .structuredToolMaxTokens),
+            restrictedChoiceLabelTokenSpellings: try container.decode(
+                [String: String].self,
+                forKey: .restrictedChoiceLabelTokenSpellings),
+            restrictedChoiceAddsSpecialTokens: try container.decode(
+                Bool.self, forKey: .restrictedChoiceAddsSpecialTokens),
+            structuredToolSkipsSpecialTokens: try container.decode(
+                Bool.self, forKey: .structuredToolSkipsSpecialTokens),
+            restrictedChoicePromptFormat: try container.decodeIfPresent(
+                TaskCoherencePromptFormat.self,
+                forKey: .restrictedChoicePromptFormat) ?? .rawV1,
+            structuredToolPromptFormat: try container.decodeIfPresent(
+                TaskCoherencePromptFormat.self,
+                forKey: .structuredToolPromptFormat) ?? .rawV1)
     }
 }
 

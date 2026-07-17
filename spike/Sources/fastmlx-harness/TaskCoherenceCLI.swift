@@ -60,6 +60,13 @@ private struct PreparedTaskCoherenceCase {
     let layout: TaskCoherencePromptLayoutEvidence
 }
 
+struct TaskCoherencePromptTokenSegments: Equatable {
+    let prefix: [Int]
+    let prefixAndMaterial: [Int]
+    let suffixAndQuery: [Int]
+    let prompt: [Int]
+}
+
 private func requireTaskIdentifier(_ value: String, flag: String) throws {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty, trimmed == value, value != "unknown",
@@ -291,20 +298,65 @@ private func taskLabelTokenIDs(
     return result
 }
 
+private func taskPromptTokenIDs(
+    _ text: String,
+    format: TaskCoherencePromptFormat,
+    tokenizer: MLXLMCommon.Tokenizer
+) throws -> [Int] {
+    switch format {
+    case .rawV1:
+        tokenizer.encode(text: text)
+    case .checkpointChatTemplateGenerationPromptThinkingDisabledV1:
+        try tokenizer.applyChatTemplate(
+            messages: [["role": "user", "content": text]],
+            tools: nil,
+            additionalContext: ["enable_thinking": false])
+    }
+}
+
+func taskCoherencePromptTokenSegments(
+    item: TaskCoherenceItem,
+    runConfiguration: TaskCoherenceRunConfiguration,
+    tokenizer: MLXLMCommon.Tokenizer
+) throws -> TaskCoherencePromptTokenSegments {
+    // Restricted-choice scoring is bound to its historical leading-space label tokens, so only
+    // the generative structured-tool lane may opt into checkpoint chat framing.
+    let format: TaskCoherencePromptFormat
+    switch item.scoringMode {
+    case .restrictedChoice:
+        format = runConfiguration.restrictedChoicePromptFormat
+    case .structuredTool:
+        format = runConfiguration.structuredToolPromptFormat
+    }
+    return try TaskCoherencePromptTokenSegments(
+        prefix: taskPromptTokenIDs(
+            item.prefix, format: format, tokenizer: tokenizer),
+        prefixAndMaterial: taskPromptTokenIDs(
+            item.prefix + item.material,
+            format: format, tokenizer: tokenizer),
+        suffixAndQuery: taskPromptTokenIDs(
+            item.suffix + item.query,
+            format: format, tokenizer: tokenizer),
+        prompt: taskPromptTokenIDs(
+            item.prompt, format: format, tokenizer: tokenizer))
+}
+
 private func prepareTaskCoherenceCases(
     corpus: TaskCoherenceCorpus,
     tokenizer: MLXLMCommon.Tokenizer,
     tokenizerManifestSHA256: String,
-    labelTokenIDs: [String: Int]
+    labelTokenIDs: [String: Int],
+    runConfiguration: TaskCoherenceRunConfiguration
 ) throws -> [PreparedTaskCoherenceCase] {
     try corpus.items.map { item in
-        let promptTokens = tokenizer.encode(text: item.prompt)
+        let segments = try taskCoherencePromptTokenSegments(
+            item: item, runConfiguration: runConfiguration,
+            tokenizer: tokenizer)
+        let promptTokens = segments.prompt
         let layout = try TaskCoherencePromptLayoutEvidence.derive(
-            prefixTokenIDs: tokenizer.encode(text: item.prefix),
-            prefixAndMaterialTokenIDs: tokenizer.encode(
-                text: item.prefix + item.material),
-            suffixAndQueryTokenIDs: tokenizer.encode(
-                text: item.suffix + item.query),
+            prefixTokenIDs: segments.prefix,
+            prefixAndMaterialTokenIDs: segments.prefixAndMaterial,
+            suffixAndQueryTokenIDs: segments.suffixAndQuery,
             promptTokenIDs: promptTokens)
         return PreparedTaskCoherenceCase(
             item: item,
@@ -452,7 +504,7 @@ func runTaskCoherence(_ flags: Flags) async {
         let tokenizerManifestSHA256 =
             try ProvenanceCLI.tokenizerManifestSHA256(at: plan.modelPath)
         let runConfiguration =
-            TaskCoherenceRunConfiguration.qualificationV2(
+            TaskCoherenceRunConfiguration.qualificationV3(
                 structuredToolMaxTokens: plan.maxToolTokens)
         let (provenance, _) = ProvenanceCLI.build(
             modelPath: plan.modelPath, referenceVersions: nil,
@@ -503,7 +555,8 @@ func runTaskCoherence(_ flags: Flags) async {
             corpus: corpus,
             tokenizer: tokenizer,
             tokenizerManifestSHA256: tokenizerManifestSHA256,
-            labelTokenIDs: labelTokenIDs)
+            labelTokenIDs: labelTokenIDs,
+            runConfiguration: runConfiguration)
         if let reference {
             guard reference.cases.count == preparedCases.count else {
                 throw TaskCoherenceCLIError.invalidReference(

@@ -246,6 +246,27 @@ final class TaskCoherenceTests: XCTestCase {
         }
     }
 
+    func testReferenceStructuredSyntaxBelowNinetyPercentCannotAdjudicateCandidate() throws {
+        let corpus = try TaskCoherenceCorpusV2.make()
+        let invalidReference = scores(correctByDomain: [
+            .math: 16, .code: 10, .structuredTool: 16,
+            .longRetrieval: 20,
+        ], structuredValid: 16)
+
+        XCTAssertThrowsError(try TaskCoherenceAssessment.derive(
+            candidate: run(
+                invalidReference, tier: "kvarn-k4v2-g128",
+                corpus: corpus),
+            reference: run(
+                invalidReference, tier: "fp16", corpus: corpus),
+            corpus: corpus
+        )) {
+            XCTAssertEqual(
+                $0 as? TaskCoherenceError,
+                .invalidReferenceStructuredValidity)
+        }
+    }
+
     func testAssessmentRequiresSameCorpusModelAndFP16Reference() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
         let complete = scores(correctByDomain: [
