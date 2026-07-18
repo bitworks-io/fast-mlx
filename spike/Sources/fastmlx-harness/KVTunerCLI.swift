@@ -7,7 +7,7 @@ struct PreparedKVTunerRun {
     let binding: KVTunerScheduleBinding
 }
 
-enum KVTunerCLIError: Error, CustomStringConvertible {
+enum KVTunerCLIError: Error, Equatable, CustomStringConvertible {
     case missingSchedule
     case unexpectedSchedule(tier: String)
     case tierCellMismatch(tier: String, cell: String)

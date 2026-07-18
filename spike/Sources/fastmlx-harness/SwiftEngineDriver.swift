@@ -82,6 +82,7 @@ actor HarnessEngineActor {
     func generate(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind)
         -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
+            prefillDurationSeconds: Double?,
             turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?,
             kvtunerTelemetry: KVTunerKVCacheTelemetry?,
             kvarnTelemetry: KVarNKVCacheTelemetry?
@@ -99,13 +100,17 @@ actor HarnessEngineActor {
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
         guard maxTokens > 0 else {
-            return ([], submitTime, [], nil, nil, nil, nil)
+            return ([], submitTime, [], nil, nil, nil, nil, nil)
         }
         var tokens: [Int] = []
         var tokenTimes: [Double] = []
+        let prefillStartedAt = ProcessInfo.processInfo.systemUptime
         var tok = decoder.prefill(prompt)
+        let prefillDurationSeconds =
+            ProcessInfo.processInfo.systemUptime - prefillStartedAt
+        let prefillEnd = Date().timeIntervalSinceReferenceDate
         tokens.append(tok)
-        tokenTimes.append(Date().timeIntervalSinceReferenceDate)
+        tokenTimes.append(prefillEnd)
         while tokens.count < maxTokens && tok != eos {
             tok = decoder.step(last: tok)
             tokens.append(tok)
@@ -139,7 +144,8 @@ actor HarnessEngineActor {
                 "KVarN tier requested but matching KVarN telemetry did not engage")
         }
         return (
-            tokens, submitTime, tokenTimes, turboQuantTokens, affineTelemetry,
+            tokens, submitTime, tokenTimes, prefillDurationSeconds,
+            turboQuantTokens, affineTelemetry,
             kvtunerTelemetry, kvarnTelemetry)
     }
 
@@ -236,7 +242,10 @@ actor HarnessEngineActor {
     /// byte-identical to the plain greedy loop at temp 0 by construction. Same decoder-per-kind
     /// reuse as `generate` (compiled step + compiled verify survive across runs; in-place reset).
     func generateSpec(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind, spec: SpecDecodeConfig)
-        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats)
+        -> (
+            tokens: [Int], submitTime: Double, tokenTimes: [Double],
+            prefillDurationSeconds: Double?, stats: SpecDecodeStats
+        )
     {
         if decoders[kind] == nil {
             decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
@@ -553,7 +562,8 @@ struct SwiftEngineDriver: EngineDriver {
                 engagement: .init(counts),
                 acceptanceRate: out.stats.acceptanceRate,
                 submitTime: out.submitTime,
-                tokenTimes: out.tokenTimes)
+                tokenTimes: out.tokenTimes,
+                prefillDurationSeconds: out.prefillDurationSeconds)
         }
         let out = await engine.generate(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
         var counts = ["decode": out.tokens.count]
@@ -598,7 +608,8 @@ struct SwiftEngineDriver: EngineDriver {
             engagement: .init(counts),
             acceptanceRate: nil, // plain (non-speculative) decode
             submitTime: out.submitTime,
-            tokenTimes: out.tokenTimes)
+            tokenTimes: out.tokenTimes,
+            prefillDurationSeconds: out.prefillDurationSeconds)
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {

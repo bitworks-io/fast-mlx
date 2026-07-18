@@ -18,9 +18,64 @@ final class BenchMatrixTests: XCTestCase {
     let row = BenchRow(
       label: "harness", workload: .decode, mode: .none, model: "Qwen3-32B-4bit",
       decodeTokS: 42.5, ttftMs: 120.3, quant: "int4", concurrency: 1, hardware: "Apple M3 Ultra")
-    XCTAssertTrue(BenchRow.csvHeader.hasSuffix(",hardware"))
-    XCTAssertTrue(row.csvLine.hasSuffix(",Apple M3 Ultra"))
-    XCTAssertEqual(row.csvLine, "harness,decode,none,Qwen3-32B-4bit,42.5,120.3,int4,1,Apple M3 Ultra")
+    XCTAssertTrue(BenchRow.csvHeader.hasPrefix(
+      "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency,hardware"))
+    XCTAssertTrue(row.csvLine.contains(",Apple M3 Ultra,"))
+    XCTAssertEqual(
+      row.csvLine,
+      "harness,decode,none,Qwen3-32B-4bit,42.5,120.3,int4,1,Apple M3 Ultra,,,,,,,,,,")
+  }
+
+  func testBenchRowCSVAppendsDirectPrefillMetricsWithoutReorderingExistingColumns() {
+    let row = BenchRow(
+      label: "harness", workload: .decode, mode: .none, model: "Qwen3-32B-4bit",
+      decodeTokS: 42.5, ttftMs: 120.3, quant: "int4", concurrency: 1,
+      hardware: "Apple M3 Ultra", prefillTokS: 912.4, prefillMs: 48.2,
+      promptTokensMin: 43, promptTokensMax: 44,
+      kvQuantTier: "kvtuner-g128-b3.046875",
+      matrixID: "kvarn-qwen3-32b-v1",
+      cellID: "kvtuner-g128-b3.046875",
+      workloadNonce: "kvarn-frontier-20260718",
+      kvtunerScheduleSHA256: String(repeating: "a", count: 64),
+      kvtunerBundleSHA256: String(repeating: "b", count: 64))
+
+    XCTAssertEqual(
+      BenchRow.csvHeader,
+      "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency,hardware,prefill_tok_s,prefill_ms,prompt_tokens_min,prompt_tokens_max,kv_quant_tier,matrix_id,cell_id,workload_nonce,kvtuner_schedule_sha256,kvtuner_bundle_sha256")
+    XCTAssertEqual(
+      row.csvLine,
+      "harness,decode,none,Qwen3-32B-4bit,42.5,120.3,int4,1,Apple M3 Ultra,912.4,48.2,43,44,kvtuner-g128-b3.046875,kvarn-qwen3-32b-v1,kvtuner-g128-b3.046875,kvarn-frontier-20260718,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+  }
+
+  func testPrefillThroughputUsesTheDirectTimedSpan() throws {
+    XCTAssertEqual(
+      try XCTUnwrap(prefillTokensPerSecond(promptTokens: 512, durationSeconds: 0.25)),
+      2_048,
+      accuracy: 1e-9)
+    XCTAssertNil(prefillTokensPerSecond(promptTokens: 0, durationSeconds: 0.25))
+    XCTAssertNil(prefillTokensPerSecond(promptTokens: 512, durationSeconds: 0))
+    XCTAssertNil(prefillTokensPerSecond(promptTokens: 512, durationSeconds: -.infinity))
+  }
+
+  func testBenchWorkloadIdentityPinsEverySaltedPrompt() throws {
+    let workload = try BenchWorkloadIdentity(
+      basePrompt: defaultBenchPrompt,
+      nonce: "kvarn-frontier-20260718",
+      iterations: 4)
+
+    XCTAssertEqual(workload.prompts.count, 4)
+    XCTAssertEqual(
+      workload.prompt(run: 2),
+      "\(defaultBenchPrompt) [run=2 nonce=kvarn-frontier-20260718]")
+    XCTAssertEqual(workload.prompts[2], workload.prompt(run: 2))
+    XCTAssertEqual(Set(workload.prompts).count, workload.prompts.count)
+  }
+
+  func testBenchWorkloadIdentityRejectsInvalidNonceAndIterationCount() {
+    XCTAssertThrowsError(try BenchWorkloadIdentity(
+      basePrompt: defaultBenchPrompt, nonce: "contains space", iterations: 4))
+    XCTAssertThrowsError(try BenchWorkloadIdentity(
+      basePrompt: defaultBenchPrompt, nonce: "frontier", iterations: 0))
   }
 
   func testServiceWorkloadIdentityPinsTheSamePromptAcrossPolicyProcesses() throws {

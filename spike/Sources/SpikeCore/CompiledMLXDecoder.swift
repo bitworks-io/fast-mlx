@@ -146,21 +146,30 @@ public struct CompiledMLXDecoder: Decoder {
     ///
     public mutating func generateSpec(
         prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
-    ) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats) {
+    ) -> (
+        tokens: [Int], submitTime: Double, tokenTimes: [Double],
+        prefillDurationSeconds: Double?, stats: SpecDecodeStats
+    ) {
         precondition(
             kvCacheKind.supportsSpecDecode,
             "speculative decoding is not qualified for the selected KV-cache tier")
         var stats = SpecDecodeStats()
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, [], stats) }
+        guard maxTokens > 0 else {
+            return ([], submitTime, [], nil, stats)
+        }
 
         // Start in the same submit-first state as the plain loop. A cold request can therefore
         // stay on the base pipeline from token one; a hot request pays one transition verify,
         // then remains in the one-forward-per-round speculative invariant.
+        let prefillStartedAt = ProcessInfo.processInfo.systemUptime
         var last = prefill(prompt)
+        let prefillDurationSeconds =
+            ProcessInfo.processInfo.systemUptime - prefillStartedAt
+        let prefillEnd = Date().timeIntervalSinceReferenceDate
         var lastArr: MLXArray? = nil
         var tokens = [last]
-        var times = [Date().timeIntervalSinceReferenceDate]
+        var times = [prefillEnd]
         var context = prompt + [last]
         var gate = spec.gate
         var done = tokens.count >= maxTokens || last == eos
@@ -286,7 +295,8 @@ public struct CompiledMLXDecoder: Decoder {
             for _ in emit { times.append(t) }
             done = stop
         }
-        return (tokens, submitTime, times, stats)
+        return (
+            tokens, submitTime, times, prefillDurationSeconds, stats)
     }
 
     /// Reset caches IN PLACE (same MLXArray identities) so the compiled step function

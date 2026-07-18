@@ -9,10 +9,9 @@ import SpikeCore
 typealias Flags = CLIFlags
 
 /// Known-good prompts from the spike's equivalence work (see 2026-07-08-swift-spike-verdict.md):
-/// "The capital of France is" matched 60/60 on the MoE target model. Still used as the `verify`
-/// / `bench` default `--prompt` — the versioned corpus below is `kl`'s measurement input.
+/// "The capital of France is" matched 60/60 on the MoE target model. Still used as `verify`'s
+/// default `--prompt`; bench has its own replayable workload identity and `kl` uses a corpus.
 let knownGoodPrompt = "The capital of France is"
-let benchPrompt = "Explain how continuous batching improves LLM serving throughput."
 let knownKVQuantTiers = (
     ["fp16"] + AffineKVTier.allCases.map(\.rawValue)
         + KVarNKVRuntimeCell.allCases.map(\.rawValue)
@@ -160,6 +159,31 @@ struct BenchPayload: Codable, Sendable {
     /// Steps taken while the yield-gate had PLD disabled — the "gate kept a low-repetition
     /// workload flat" evidence the shape-(c) verdict reads.
     let specGateDisabledSteps: Int?
+    /// Direct actor-timed prefill metrics. Optional so historical bench JSONL remains decodable.
+    let prefillTokS: Double?
+    let prefillMs: Double?
+    let promptTokensMin: Int?
+    let promptTokensMax: Int?
+    let prefillTimingSource: String?
+    /// Exact cross-process workload identity and salted prompt byte hashes.
+    let workloadNonce: String?
+    let workloadPromptSHA256: [String]?
+    /// Matrix/cell identity plus the full authenticated frozen KVTuner binding when engaged.
+    let matrixID: String?
+    let cellID: String?
+    let kvtunerSchedule: KVTunerScheduleBinding?
+    /// Maximum scalar engagement receipts across post-warmup runs (bytes/tokens/layers/codec).
+    let engagementMax: [String: Int]?
+    /// Raw post-warmup samples needed to recompute every reported runtime aggregate. Optional so
+    /// historical bench evidence remains decodable.
+    let maxTokens: Int?
+    let measuredRuns: Int?
+    let promptTokenCountsByRun: [Int]?
+    let prefillDurationSecondsByRun: [Double]?
+    let prefillTokSByRun: [Double]?
+    let decodeTokSByRun: [Double]?
+    let ttftMsByRun: [Double]?
+    let generatedTokenCountsByRun: [Int]?
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -590,69 +614,97 @@ func runVerifySpec(_ flags: Flags) async {
 // MARK: - bench (cell matrix -> CSV)
 
 func runBench(_ flags: Flags) async {
-    guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness bench --model <PATH> [--prompt <TEXT>] [--max-tokens 256] [--runs 3] [--label <L>] [--csv <FILE>] [--evidence <FILE=harness-evidence.jsonl>]")
-        exit(2)
-    }
     do {
         // Validate the requested measurement before the build-mode or model-load gates so a
         // misspelled/missing flag cannot be reported as an unrelated environment failure.
-        let kvQuantTier = try requestedKVQuantTier(flags)
-        guard KVCacheKind(kvQuant: kvQuantTier) != nil else {
-            print("bench FAILED: unknown --kv-quant tier \(kvQuantTier ?? "fp16") (known: \(knownKVQuantTiers))")
-            exit(2)
-        }
-        let requestedSpec = try flags.strictString("spec", default: "")
-        let spec: String? = requestedSpec.isEmpty ? nil : requestedSpec
-        if let spec, spec != "pld" {
-            print("bench FAILED: unknown --spec drafter \(spec) (known: pld)")
-            exit(2)
-        }
-        if spec != nil, let rejectedTier = kvQuantTier {
-            print(
-                "bench FAILED: specDecode=pld with kvQuant=\(rejectedTier) "
-                    + "(unmeasured combination; use fp16)")
-            exit(2)
-        }
+        let plan = try parseBenchPlan(flags)
         try assertReleaseBuild()
-        let prompt = flags.string("prompt", default: benchPrompt)
-        let maxTokens = flags.int("max-tokens", default: 256)
-        let runs = flags.int("runs", default: 3)
-        let label = flags.string("label", default: "harness")
-        // Spec-decode arm (Task 6): `--spec pld` times the SAME decode workload through the
-        // speculative path; the CSV/evidence `mode` column records which arm produced the number.
-        let ngram = flags.int("ngram", default: 3)
-        let maxDraft = flags.int("max-draft", default: 8)
-        let compiledVerify = flags.string("compiled-verify", default: "false") == "true"
-        let mode: Mode = spec == nil ? .none : .pld
-        let (driver, tokenizer, _) = try await loadSwiftDriver(modelPath: modelPath)
+        let preparedKVTuner: PreparedKVTunerRun?
+        if isKVTunerTier(plan.kvQuantTier ?? "fp16") {
+            guard let matrixID = plan.matrixID else {
+                throw BenchCLIError.missingMatrixID
+            }
+            preparedKVTuner = try await prepareKVTunerRun(
+                schedulePath: plan.kvtunerSchedulePath,
+                modelPath: plan.modelPath,
+                matrixID: matrixID,
+                cellID: plan.cellID,
+                modelIdentity: try ProvenanceCLI.modelEvidenceIdentity(
+                    at: plan.modelPath),
+                evaluationCorpus:
+                    KVTunerEvaluationCorpusIdentity.benchWorkload(
+                        plan.workload))
+        } else {
+            preparedKVTuner = nil
+        }
+        let mode: Mode = plan.spec == nil ? .none : .pld
+        let (driver, tokenizer, _) = try await loadSwiftDriver(
+            modelPath: plan.modelPath)
 
-        let modelName = URL(fileURLWithPath: modelPath).lastPathComponent
+        let modelName = URL(fileURLWithPath: plan.modelPath).lastPathComponent
         // Task 5: the model's OWN declared quantization (config.json), not a dirname-substring
         // guess — a mislabeled checkpoint directory can no longer record the wrong tier.
-        let quant = ProvenanceCLI.modelConfig(at: modelPath).quant.label
+        let quant = ProvenanceCLI.modelConfig(at: plan.modelPath).quant.label
         let hardware = ProvenanceCLI.chipBrand()
         let cell = Cell(workload: .decode, mode: mode, model: modelName, quant: quant, concurrency: 1)
-        let nonce = String(Int.random(in: 0..<1_000_000))
 
         var ttfts: [Double] = []
+        var prefillRates: [Double] = []
+        var prefillDurations: [Double] = []
+        var promptTokenCounts: [Int] = []
+        var decodeRates: [Double] = []
+        var ttftMilliseconds: [Double] = []
+        var generatedTokenCounts: [Int] = []
+        var engagementMax: [String: Int] = [:]
         var draftedTotal = 0, acceptedTotal = 0
         var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
-        let agg = try await BenchRunner().run(cell: cell, iterations: runs + 1, nonce: nonce, basePrompt: prompt) { i, salted in
+        let agg = try await BenchRunner().run(
+            cell: cell,
+            iterations: plan.workload.iterations,
+            nonce: plan.workload.nonce,
+            basePrompt: plan.workload.basePrompt
+        ) { i, salted in
+            precondition(
+                salted == plan.workload.prompt(run: i),
+                "bench runner changed the authenticated workload")
             let promptTokens = tokenizer.encode(text: salted)
             let result = try await driver.generate(
                 prompt: promptTokens,
                 config: RunConfig(
-                    temperature: 0, maxTokens: maxTokens, specDecode: spec, specNgram: ngram,
-                    specMaxDraft: maxDraft, specCompiledVerify: compiledVerify, kvQuant: kvQuantTier))
+                    temperature: 0,
+                    maxTokens: plan.maxTokens,
+                    specDecode: plan.spec,
+                    specNgram: plan.ngram,
+                    specMaxDraft: plan.maxDraft,
+                    specCompiledVerify: plan.compiledVerify,
+                    kvQuant: plan.kvQuantTier,
+                    kvtunerSelection: preparedKVTuner?.selection))
             guard !result.tokenTimes.isEmpty else {
                 print("# run \(i): produced zero tokens -> skipped")
                 return nil
             }
+            guard let prefillDuration = result.prefillDurationSeconds else {
+                throw BenchCLIError.missingPrefillTiming
+            }
+            guard let prefillRate = prefillTokensPerSecond(
+                promptTokens: promptTokens.count,
+                durationSeconds: prefillDuration)
+            else {
+                throw BenchCLIError.invalidPrefillTiming
+            }
+            try validateBenchRuntimeEngagement(
+                tier: plan.kvQuantTier ?? "fp16",
+                engagement: result.engagement,
+                expectedKVTunerLayerCount:
+                    preparedKVTuner?.selection.layers.count)
             let metrics = DecodeMetrics(submitTime: result.submitTime, tokenTimes: result.tokenTimes)
+            guard let decodeRate = metrics.decodeTokensPerSecond else {
+                print("# run \(i): produced one token -> skipped")
+                return nil
+            }
             let tag = i == 0 ? "warmup (dropped)" : "run \(i)"
             var specNote = ""
-            if spec != nil {
+            if plan.spec != nil {
                 let drafted = result.engagement.counts["spec_drafted"] ?? 0
                 let accepted = result.engagement.counts["spec_accepted"] ?? 0
                 let gateDisabled = result.engagement.counts["spec_gate_disabled_steps"] ?? 0
@@ -666,45 +718,114 @@ func runBench(_ flags: Flags) async {
                     gateDisabledTotal += gateDisabled
                 }
             }
-            print("# \(tag): \(metrics.generatedTokenCount) tokens, ttft=\(fmt(metrics.ttftSeconds))s, decode_tok_s=\(fmt(metrics.decodeTokensPerSecond ?? .nan, 2))\(specNote)")
-            if i > 0 { ttfts.append(metrics.ttftSeconds) }
-            return metrics.decodeTokensPerSecond
+            print(
+                "# \(tag): \(metrics.generatedTokenCount) tokens, "
+                    + "prompt_tokens=\(promptTokens.count), "
+                    + "prefill=\(fmt(prefillDuration))s, "
+                    + "prefill_tok_s=\(fmt(prefillRate, 2)), "
+                    + "ttft=\(fmt(metrics.ttftSeconds))s, "
+                    + "decode_tok_s=\(fmt(decodeRate, 2))\(specNote)")
+            if i > 0 {
+                ttfts.append(metrics.ttftSeconds)
+                prefillRates.append(prefillRate)
+                prefillDurations.append(prefillDuration)
+                promptTokenCounts.append(promptTokens.count)
+                decodeRates.append(decodeRate)
+                ttftMilliseconds.append(metrics.ttftSeconds * 1_000)
+                generatedTokenCounts.append(metrics.generatedTokenCount)
+                for (key, value) in result.engagement.counts {
+                    engagementMax[key] = max(engagementMax[key] ?? value, value)
+                }
+            }
+            return decodeRate
         }
         guard agg.runs > 0 else {
             print("bench FAILED: no measurable post-warmup runs")
             exit(1)
         }
+        guard prefillRates.count == agg.runs,
+            prefillDurations.count == agg.runs,
+            promptTokenCounts.count == agg.runs,
+            decodeRates.count == agg.runs,
+            ttftMilliseconds.count == agg.runs,
+            generatedTokenCounts.count == agg.runs
+        else {
+            throw BenchCLIError.invalidPrefillTiming
+        }
         let avgTtftMs = ttfts.isEmpty ? 0 : ttfts.reduce(0, +) / Double(ttfts.count) * 1000
+        let avgPrefillTokS = prefillRates.reduce(0, +)
+            / Double(prefillRates.count)
+        let avgPrefillMs = prefillDurations.reduce(0, +)
+            / Double(prefillDurations.count) * 1000
         let row = BenchRow(
-            label: label, workload: .decode, mode: mode, model: modelName,
+            label: plan.label, workload: .decode, mode: mode, model: modelName,
             decodeTokS: (agg.mean * 100).rounded() / 100, ttftMs: (avgTtftMs * 10).rounded() / 10,
-            quant: quant, concurrency: 1, hardware: hardware)
+            quant: quant, concurrency: 1, hardware: hardware,
+            prefillTokS: (avgPrefillTokS * 100).rounded() / 100,
+            prefillMs: (avgPrefillMs * 10).rounded() / 10,
+            promptTokensMin: promptTokenCounts.min(),
+            promptTokensMax: promptTokenCounts.max(),
+            kvQuantTier: plan.kvQuantTier ?? "fp16",
+            matrixID: plan.matrixID,
+            cellID: plan.cellID,
+            workloadNonce: plan.workload.nonce,
+            kvtunerScheduleSHA256:
+                preparedKVTuner?.binding.artifactSHA256,
+            kvtunerBundleSHA256:
+                preparedKVTuner?.binding.qualificationBundleSHA256)
         print(BenchRow.csvHeader)
         print(row.csvLine)
-        if let csvPath = flags.string("csv") {
-            let url = URL(fileURLWithPath: csvPath)
-            let existing = (try? String(contentsOf: url, encoding: String.Encoding.utf8)) ?? ""
-            var content: String = existing.isEmpty ? BenchRow.csvHeader + "\n" : existing
-            content += row.csvLine + "\n"
-            try content.write(to: url, atomically: true, encoding: String.Encoding.utf8)
+        if let csvPath = plan.csvPath {
+            try appendBenchCSVRow(row, to: csvPath)
             print("# appended to \(csvPath)")
         }
 
-        let (provenance, _) = ProvenanceCLI.build(modelPath: modelPath, referenceVersions: nil, corpus: nil)
+        let (provenance, _) = ProvenanceCLI.build(
+            modelPath: plan.modelPath,
+            referenceVersions: nil,
+            corpus: nil)
         let payload = BenchPayload(
-            label: label, workload: Workload.decode.rawValue, mode: mode.rawValue,
+            label: plan.label, workload: Workload.decode.rawValue, mode: mode.rawValue,
             decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
-            kvQuantTier: kvQuantTier ?? "fp16", concurrency: 1,
-            specNgram: spec == nil ? nil : ngram,
-            specMaxDraft: spec == nil ? nil : maxDraft,
-            specCompiledVerify: spec == nil ? nil : compiledVerify,
-            specDrafted: spec == nil ? nil : draftedTotal,
-            specAccepted: spec == nil ? nil : acceptedTotal,
-            specAcceptanceRate: spec == nil || draftedTotal == 0 ? nil : Double(acceptedTotal) / Double(draftedTotal),
-            specVerifySteps: spec == nil ? nil : verifyStepsTotal,
-            specNormalSteps: spec == nil ? nil : normalStepsTotal,
-            specGateDisabledSteps: spec == nil ? nil : gateDisabledTotal)
-        appendJSONLRecord(ResultRecord(subcommand: "bench", provenance: provenance, payload: payload), to: evidencePath(flags))
+            kvQuantTier: plan.kvQuantTier ?? "fp16", concurrency: 1,
+            specNgram: plan.spec == nil ? nil : plan.ngram,
+            specMaxDraft: plan.spec == nil ? nil : plan.maxDraft,
+            specCompiledVerify: plan.spec == nil ? nil : plan.compiledVerify,
+            specDrafted: plan.spec == nil ? nil : draftedTotal,
+            specAccepted: plan.spec == nil ? nil : acceptedTotal,
+            specAcceptanceRate: plan.spec == nil || draftedTotal == 0
+                ? nil : Double(acceptedTotal) / Double(draftedTotal),
+            specVerifySteps: plan.spec == nil ? nil : verifyStepsTotal,
+            specNormalSteps: plan.spec == nil ? nil : normalStepsTotal,
+            specGateDisabledSteps: plan.spec == nil ? nil : gateDisabledTotal,
+            prefillTokS: row.prefillTokS,
+            prefillMs: row.prefillMs,
+            promptTokensMin: row.promptTokensMin,
+            promptTokensMax: row.promptTokensMax,
+            prefillTimingSource: "actor-decoder-prefill-wall-v1",
+            workloadNonce: plan.workload.nonce,
+            workloadPromptSHA256: plan.workload.prompts.map {
+                sha256Hex(Data($0.utf8))
+            },
+            matrixID: plan.matrixID,
+            cellID: plan.cellID,
+            kvtunerSchedule: preparedKVTuner?.binding,
+            engagementMax: engagementMax,
+            maxTokens: plan.maxTokens,
+            measuredRuns: agg.runs,
+            promptTokenCountsByRun: promptTokenCounts,
+            prefillDurationSecondsByRun: prefillDurations,
+            prefillTokSByRun: prefillRates,
+            decodeTokSByRun: decodeRates,
+            ttftMsByRun: ttftMilliseconds,
+            generatedTokenCountsByRun: generatedTokenCounts)
+        try appendRequiredJSONLRecord(
+            ResultRecord(
+                subcommand: "bench",
+                provenance: provenance,
+                payload: payload),
+            to: plan.evidencePath)
+        print("# provenance: appended to \(plan.evidencePath)")
     } catch BenchGuardError.debugBuild {
         print("bench FAILED: Debug build — perf numbers would be meaningless. Build with -configuration Release.")
         exit(1)
@@ -1335,8 +1456,13 @@ struct Harness {
                  [--ngram 3] [--max-draft 8]   PLD-off on the SAME engine must be byte-identical
                  [--compiled-verify false]     at temp 0, with an engagement delta (drafting
                                                happened); acceptance rate is reported; fp16 KV only
-          bench  --model <PATH>               stream-timed decode bench -> CSV (Release builds only)
+          bench  --model <PATH>               direct-prefill + stream-timed decode (Release only)
                  [--kv-quant <TIER>]          KV tier for timed decode (\(kvQuantUsageTiers))
+                 [--matrix-id <ID>] [--cell-id <ID>]  explicit frontier identity
+                 [--kvtuner-schedule <BUNDLE>] frozen schedule (required for kvtuner-* tier)
+                 [--workload-nonce <ID>]      replay identical salted prompts across KV cells
+                 [--runs 3] [--max-tokens 256] one warmup plus measured batch-1 runs
+                 [--csv <FILE>] [--evidence <JSONL>] authenticated runtime artifacts
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled

@@ -302,6 +302,38 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
         return identity
     }
 
+    /// Leakage identity for the exact salted prompts used by the batch-1 runtime frontier.
+    /// Only the pinned first-party default source is admitted; custom prompts must supply real
+    /// canonical upstream source rows through the public initializer instead of borrowing this
+    /// audited identity.
+    public static func benchWorkload(
+        _ workload: BenchWorkloadIdentity
+    ) throws -> KVTunerEvaluationCorpusIdentity {
+        let expectedPromptSHA256 =
+            "452da42133ba5e7f9aab14c8870acb54e078ca7aff0f893f80c54f76fddee6fc"
+        guard workload.basePrompt == defaultBenchPrompt,
+            sha256Hex(Data(workload.basePrompt.utf8)) == expectedPromptSHA256
+        else {
+            throw KVTunerEvaluationCorpusIdentityError
+                .canonicalSourceItemsRequired
+        }
+        let id = "fastmlx-bench-decode-v1"
+        let prompts = workload.prompts
+        let entryDigests = prompts
+            .map(KVTunerPromptDigest.exactText)
+            .sorted()
+        let aggregateDigest = fnv1a64(
+            ([id] + prompts).joined(separator: "\0").utf8)
+        var sourceTranscript = Data(
+            "fast-mlx.kvtuner-bench-source.v1\0".utf8)
+        sourceTranscript.append(contentsOf: workload.basePrompt.utf8)
+        return try KVTunerEvaluationCorpusIdentity(
+            id: id,
+            aggregateDigest: aggregateDigest,
+            canonicalEntryDigests: entryDigests,
+            canonicalSourceItemDigests: [sha256Hex(sourceTranscript)])
+    }
+
     public static func measurementCorpus(
         _ corpus: MeasurementCorpus,
         canonicalSourceItemDigests: [String]

@@ -148,7 +148,7 @@ func runServiceBench(_ flags: Flags) async {
             throw ServiceBenchCLIError.invalidArguments(
                 "--ngram and --max-draft must be positive")
         }
-        let prompt = flags.string("prompt", default: benchPrompt)
+        let prompt = flags.string("prompt", default: defaultBenchPrompt)
         let label = flags.string("label", default: "continuous-service")
         let workloadIdentity = try ServiceWorkloadIdentity(
             nonce: flags.strictString("workload-nonce", default: ProvenanceCLI.nonce()))

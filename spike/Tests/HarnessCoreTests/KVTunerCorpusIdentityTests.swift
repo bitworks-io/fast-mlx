@@ -290,6 +290,40 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
             policy)
     }
 
+    func testBenchWorkloadIdentityBindsExactSaltedPromptsAndAuditedSource() throws {
+        let workload = try BenchWorkloadIdentity(
+            basePrompt: defaultBenchPrompt,
+            nonce: "kvarn-frontier-20260718",
+            iterations: 4)
+        let identity = try KVTunerEvaluationCorpusIdentity.benchWorkload(
+            workload)
+
+        XCTAssertEqual(identity.id, "fastmlx-bench-decode-v1")
+        XCTAssertEqual(
+            identity.canonicalEntryDigests,
+            workload.prompts.map(KVTunerPromptDigest.exactText).sorted())
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                KVTunerEvaluationCorpusIdentity.self,
+                from: JSONEncoder().encode(identity)),
+            identity)
+    }
+
+    func testBenchWorkloadIdentityRejectsAnUnauditedCustomPrompt() throws {
+        let workload = try BenchWorkloadIdentity(
+            basePrompt: "A custom benchmark prompt",
+            nonce: "kvarn-frontier-20260718",
+            iterations: 4)
+
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.benchWorkload(workload)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerEvaluationCorpusIdentityError,
+                .canonicalSourceItemsRequired)
+        }
+    }
+
     func testCustomConstructionRequiresSourceRowsAndCannotDecodeAuditedAssertion() throws {
         XCTAssertThrowsError(try KVTunerEvaluationCorpusIdentity(
             id: "evaluation-v1",

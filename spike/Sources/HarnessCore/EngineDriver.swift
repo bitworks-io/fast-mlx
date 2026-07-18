@@ -37,10 +37,14 @@ public struct RunResult: Sendable {
     public var acceptanceRate: Double?     // for spec-decode runs; nil otherwise
     public var submitTime: Double
     public var tokenTimes: [Double]
+    /// Direct wall time spent inside `decoder.prefill`; nil for untimed/reference drivers.
+    public var prefillDurationSeconds: Double?
     public init(tokens: [Int], engagement: EngagementCounters = .init(), acceptanceRate: Double? = nil,
-                submitTime: Double = 0, tokenTimes: [Double] = []) {
+                submitTime: Double = 0, tokenTimes: [Double] = [],
+                prefillDurationSeconds: Double? = nil) {
         self.tokens = tokens; self.engagement = engagement; self.acceptanceRate = acceptanceRate
         self.submitTime = submitTime; self.tokenTimes = tokenTimes
+        self.prefillDurationSeconds = prefillDurationSeconds
     }
 }
 
