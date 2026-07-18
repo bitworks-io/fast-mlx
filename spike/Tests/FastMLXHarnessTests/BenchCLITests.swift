@@ -170,7 +170,15 @@ final class BenchCLITests: XCTestCase {
     func testBenchEngagementAcceptsMeasuredLossyRuns() throws {
         XCTAssertNoThrow(try validateBenchRuntimeEngagement(
             tier: "affine-k4v2-g64",
-            engagement: .init(["affine_tokens": 256]),
+            engagement: .init([
+                "affine_tokens": 256,
+                "affine_layers": 64,
+                "affine_capacity_tokens": 512,
+                "affine_payload_bytes": 1_000,
+                "affine_metadata_bytes": 100,
+                "affine_control_bytes": 4,
+                "affine_workspace_bytes": 200,
+            ]),
             expectedKVTunerLayerCount: nil))
         XCTAssertNoThrow(try validateBenchRuntimeEngagement(
             tier: "kvarn-k4v2-g128-i16",
@@ -179,6 +187,12 @@ final class BenchCLITests: XCTestCase {
                 "kvarn_completed_tiles": 1,
                 "kvarn_compressed_tokens": 128,
                 "kvarn_codec_iterations": 16,
+                "kvarn_layers": 64,
+                "kvarn_capacity_tokens": 512,
+                "kvarn_payload_bytes": 1_000,
+                "kvarn_metadata_bytes": 100,
+                "kvarn_control_bytes": 4,
+                "kvarn_workspace_bytes": 200,
             ]),
             expectedKVTunerLayerCount: nil))
         XCTAssertNoThrow(try validateBenchRuntimeEngagement(
@@ -186,8 +200,18 @@ final class BenchCLITests: XCTestCase {
             engagement: .init([
                 "kvtuner_tokens": 256,
                 "kvtuner_layers": 64,
+                "kvtuner_capacity_tokens": 512,
+                "kvtuner_payload_bytes": 1_000,
+                "kvtuner_metadata_bytes": 100,
+                "kvtuner_control_bytes": 256,
+                "kvtuner_workspace_bytes": 200,
             ]),
             expectedKVTunerLayerCount: 64))
+
+        XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+            tier: "affine-k4v2-g64",
+            engagement: .init(["affine_tokens": 256]),
+            expectedKVTunerLayerCount: nil))
     }
 
     func testNonKVTunerBenchKeepsCustomPromptAndRejectsSchedule() throws {
@@ -243,6 +267,12 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNil(payload.decodeTokSByRun)
         XCTAssertNil(payload.ttftMsByRun)
         XCTAssertNil(payload.generatedTokenCountsByRun)
+        XCTAssertNil(payload.memoryCacheLimitBytes)
+        XCTAssertNil(payload.memoryRuns)
+        XCTAssertNil(payload.maxSampledPhysicalFootprintBytes)
+        XCTAssertNil(payload.maxMLXActiveBytes)
+        XCTAssertNil(payload.maxMLXCacheBytes)
+        XCTAssertNil(payload.maxMLXPeakBytes)
     }
 
     func testBenchCSVReadFailureIsNotTreatedAsAnEmptyFile() throws {

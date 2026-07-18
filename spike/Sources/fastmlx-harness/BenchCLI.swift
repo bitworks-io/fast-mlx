@@ -221,24 +221,38 @@ func validateBenchRuntimeEngagement(
     expectedKVTunerLayerCount: Int?
 ) throws {
     let counts = engagement.counts
+    func hasStorageReceipt(_ prefix: String) -> Bool {
+        guard let cachedTokens = counts["\(prefix)_tokens"],
+            let capacityTokens = counts["\(prefix)_capacity_tokens"]
+        else { return false }
+        return cachedTokens > 0
+            && capacityTokens >= cachedTokens
+            && (counts["\(prefix)_payload_bytes"] ?? 0) > 0
+            && (counts["\(prefix)_metadata_bytes"] ?? 0) > 0
+            && (counts["\(prefix)_control_bytes"] ?? 0) > 0
+            && (counts["\(prefix)_workspace_bytes"] ?? 0) > 0
+    }
     if tier == "fp16" { return }
     if isKVTunerTier(tier) {
         guard let expectedKVTunerLayerCount,
-            (counts["kvtuner_tokens"] ?? 0) > 0,
+            hasStorageReceipt("kvtuner"),
             counts["kvtuner_layers"] == expectedKVTunerLayerCount
         else { throw BenchCLIError.missingKVTunerEngagement }
         return
     }
     if AffineKVTier(rawValue: tier) != nil {
-        guard (counts["affine_tokens"] ?? 0) > 0 else {
+        guard hasStorageReceipt("affine"),
+            (counts["affine_layers"] ?? 0) > 0
+        else {
             throw BenchCLIError.missingLossyEngagement(tier)
         }
         return
     }
     if let cell = KVarNKVRuntimeCell(rawValue: tier) {
-        guard (counts["kvarn_tokens"] ?? 0) > 0,
+        guard hasStorageReceipt("kvarn"),
             (counts["kvarn_completed_tiles"] ?? 0) > 0,
             (counts["kvarn_compressed_tokens"] ?? 0) > 0,
+            (counts["kvarn_layers"] ?? 0) > 0,
             counts["kvarn_codec_iterations"] == cell.iterations
         else { throw BenchCLIError.missingLossyEngagement(tier) }
         return

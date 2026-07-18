@@ -78,6 +78,49 @@ final class BenchMatrixTests: XCTestCase {
       basePrompt: defaultBenchPrompt, nonce: "frontier", iterations: 0))
   }
 
+  func testBenchMemoryEvidencePreservesRawSamplesAndRecomputableHighWater() throws {
+    let first = try BenchRunMemoryEvidence(samples: [
+      ServiceMemorySample(
+        timestamp: 10, physicalFootprintBytes: 20_000,
+        mlxActiveBytes: 12_000, mlxCacheBytes: 1_000, mlxPeakBytes: 0),
+      ServiceMemorySample(
+        timestamp: 11, physicalFootprintBytes: 24_000,
+        mlxActiveBytes: 14_000, mlxCacheBytes: 2_000, mlxPeakBytes: 18_000),
+    ])
+    let second = try BenchRunMemoryEvidence(samples: [
+      ServiceMemorySample(
+        timestamp: 20, physicalFootprintBytes: 21_000,
+        mlxActiveBytes: 13_000, mlxCacheBytes: 1_500, mlxPeakBytes: 0),
+      ServiceMemorySample(
+        timestamp: 21, physicalFootprintBytes: 26_000,
+        mlxActiveBytes: 15_000, mlxCacheBytes: 2_500, mlxPeakBytes: 19_000),
+    ])
+    let aggregate = try BenchMemoryAggregate(runs: [first, second])
+
+    XCTAssertEqual(first.samples.count, 2)
+    XCTAssertEqual(first.summary.maxSampledFootprintBytes, 24_000)
+    XCTAssertEqual(first.summary.maxMLXPeakBytes, 18_000)
+    XCTAssertEqual(aggregate.measuredRuns, 2)
+    XCTAssertEqual(aggregate.maxSampledPhysicalFootprintBytes, 26_000)
+    XCTAssertEqual(aggregate.maxMLXActiveBytes, 15_000)
+    XCTAssertEqual(aggregate.maxMLXCacheBytes, 2_500)
+    XCTAssertEqual(aggregate.maxMLXPeakBytes, 19_000)
+    XCTAssertEqual(
+      try JSONDecoder().decode(
+        BenchRunMemoryEvidence.self,
+        from: JSONEncoder().encode(first)),
+      first)
+  }
+
+  func testBenchMemoryEvidenceFailsClosedForMissingOrMalformedSamples() throws {
+    let sample = ServiceMemorySample(
+      timestamp: 10, physicalFootprintBytes: 20_000,
+      mlxActiveBytes: 12_000, mlxCacheBytes: 1_000, mlxPeakBytes: 0)
+
+    XCTAssertThrowsError(try BenchRunMemoryEvidence(samples: [sample]))
+    XCTAssertThrowsError(try BenchMemoryAggregate(runs: []))
+  }
+
   func testServiceWorkloadIdentityPinsTheSamePromptAcrossPolicyProcesses() throws {
     let batchIdentity = try ServiceWorkloadIdentity(nonce: "frontier-20260714")
     let soloIdentity = try ServiceWorkloadIdentity(nonce: "frontier-20260714")

@@ -574,6 +574,8 @@ struct SwiftEngineDriver: EngineDriver {
         }
         if let affine = out.affineTelemetry {
             counts["affine_tokens"] = affine.cachedTokens
+            counts["affine_layers"] = affine.layerCount
+            counts["affine_capacity_tokens"] = affine.capacityTokens
             counts["affine_payload_bytes"] = affine.payloadBytes
             counts["affine_metadata_bytes"] = affine.metadataBytes
             counts["affine_control_bytes"] = affine.controlBytes
@@ -582,6 +584,7 @@ struct SwiftEngineDriver: EngineDriver {
         if let kvtuner = out.kvtunerTelemetry {
             counts["kvtuner_tokens"] = kvtuner.cachedTokens
             counts["kvtuner_layers"] = kvtuner.layerCount
+            counts["kvtuner_capacity_tokens"] = kvtuner.capacityTokens
             counts["kvtuner_payload_bytes"] = kvtuner.payloadBytes
             counts["kvtuner_metadata_bytes"] = kvtuner.metadataBytes
             counts["kvtuner_control_bytes"] = kvtuner.controlBytes
@@ -590,6 +593,8 @@ struct SwiftEngineDriver: EngineDriver {
         }
         if let kvarn = out.kvarnTelemetry {
             counts["kvarn_tokens"] = kvarn.cachedTokens
+            counts["kvarn_layers"] = kvarn.layerCount
+            counts["kvarn_capacity_tokens"] = kvarn.capacityTokens
             counts["kvarn_completed_tiles"] = kvarn.completedTileCount
             counts["kvarn_compressed_tokens"] = kvarn.compressedTokens
             counts["kvarn_payload_bytes"] = kvarn.payloadBytes

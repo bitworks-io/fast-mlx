@@ -86,6 +86,86 @@ public func prefillTokensPerSecond(
     return Double(promptTokens) / durationSeconds
 }
 
+public enum BenchMemoryEvidenceError: Error, Sendable, Equatable {
+    case invalidRunSampleCount(Int)
+    case emptyRuns
+}
+
+/// Raw, recomputable process/MLX memory evidence for one post-warmup batch-1 run. Exactly two
+/// samples are retained: immediately before generation (after resetting MLX's peak counter) and
+/// immediately after cache telemetry has been captured. Whole-process maximum RSS remains an
+/// independent per-process runner artifact because endpoint sampling cannot observe transients.
+public struct BenchRunMemoryEvidence: Sendable, Codable, Equatable {
+    public let samples: [ServiceMemorySample]
+    public let summary: ServiceMemorySummary
+
+    public init(samples: [ServiceMemorySample]) throws {
+        guard samples.count == 2 else {
+            throw BenchMemoryEvidenceError.invalidRunSampleCount(
+                samples.count)
+        }
+        self.samples = samples
+        self.summary = try summarizeServiceMemory(samples)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case samples
+        case summary
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let samples = try container.decode(
+            [ServiceMemorySample].self, forKey: .samples)
+        let claimedSummary = try container.decode(
+            ServiceMemorySummary.self, forKey: .summary)
+        let derived = try BenchRunMemoryEvidence(samples: samples)
+        guard claimedSummary == derived.summary else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .summary,
+                in: container,
+                debugDescription:
+                    "bench memory summary does not match its raw samples")
+        }
+        self = derived
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(samples, forKey: .samples)
+        try container.encode(summary, forKey: .summary)
+    }
+}
+
+/// Headline reducer used only for display/adjudication. Durable evidence keeps every run above,
+/// so all maxima remain independently recomputable rather than trusting these convenience fields.
+public struct BenchMemoryAggregate: Sendable, Equatable {
+    public let measuredRuns: Int
+    public let maxSampledPhysicalFootprintBytes: UInt64
+    public let maxMLXActiveBytes: Int
+    public let maxMLXCacheBytes: Int
+    public let maxMLXPeakBytes: Int
+
+    public init(runs: [BenchRunMemoryEvidence]) throws {
+        guard !runs.isEmpty else {
+            throw BenchMemoryEvidenceError.emptyRuns
+        }
+        measuredRuns = runs.count
+        maxSampledPhysicalFootprintBytes = runs.map {
+            $0.summary.maxSampledFootprintBytes
+        }.max()!
+        maxMLXActiveBytes = runs.map {
+            $0.summary.maxMLXActiveBytes
+        }.max()!
+        maxMLXCacheBytes = runs.map {
+            $0.summary.maxMLXCacheBytes
+        }.max()!
+        maxMLXPeakBytes = runs.map {
+            $0.summary.maxMLXPeakBytes
+        }.max()!
+    }
+}
+
 public enum ServiceWorkloadIdentityError: Error, Sendable, Equatable {
     case invalidNonce
 }

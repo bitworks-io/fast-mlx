@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import HarnessCore
+import MLX
 import MLXLMCommon
 import SpikeCore
 
@@ -184,6 +185,15 @@ struct BenchPayload: Codable, Sendable {
     let decodeTokSByRun: [Double]?
     let ttftMsByRun: [Double]?
     let generatedTokenCountsByRun: [Int]?
+    /// Per-run unified-memory receipts sampled around generation after resetting MLX's peak
+    /// counter. Optional so historical bench rows remain decodable. Whole-process maximum RSS is
+    /// recorded independently by the isolated-cell runner.
+    let memoryCacheLimitBytes: Int?
+    let memoryRuns: [BenchRunMemoryEvidence]?
+    let maxSampledPhysicalFootprintBytes: UInt64?
+    let maxMLXActiveBytes: Int?
+    let maxMLXCacheBytes: Int?
+    let maxMLXPeakBytes: Int?
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -655,6 +665,7 @@ func runBench(_ flags: Flags) async {
         var decodeRates: [Double] = []
         var ttftMilliseconds: [Double] = []
         var generatedTokenCounts: [Int] = []
+        var memoryRuns: [BenchRunMemoryEvidence] = []
         var engagementMax: [String: Int] = [:]
         var draftedTotal = 0, acceptedTotal = 0
         var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
@@ -668,6 +679,11 @@ func runBench(_ flags: Flags) async {
                 salted == plan.workload.prompt(run: i),
                 "bench runner changed the authenticated workload")
             let promptTokens = tokenizer.encode(text: salted)
+            // The allocator peak is process-global and otherwise carries model-load or prior-run
+            // history. Reset only the counter; active/cache allocations remain intact and are
+            // sampled on both sides of this exact batch-1 generation.
+            Memory.peakMemory = 0
+            let memoryStart = serviceMemorySample()
             let result = try await driver.generate(
                 prompt: promptTokens,
                 config: RunConfig(
@@ -679,6 +695,9 @@ func runBench(_ flags: Flags) async {
                     specCompiledVerify: plan.compiledVerify,
                     kvQuant: plan.kvQuantTier,
                     kvtunerSelection: preparedKVTuner?.selection))
+            let memoryEnd = serviceMemorySample()
+            let memoryEvidence = try BenchRunMemoryEvidence(
+                samples: [memoryStart, memoryEnd])
             guard !result.tokenTimes.isEmpty else {
                 print("# run \(i): produced zero tokens -> skipped")
                 return nil
@@ -733,6 +752,7 @@ func runBench(_ flags: Flags) async {
                 decodeRates.append(decodeRate)
                 ttftMilliseconds.append(metrics.ttftSeconds * 1_000)
                 generatedTokenCounts.append(metrics.generatedTokenCount)
+                memoryRuns.append(memoryEvidence)
                 for (key, value) in result.engagement.counts {
                     engagementMax[key] = max(engagementMax[key] ?? value, value)
                 }
@@ -748,10 +768,12 @@ func runBench(_ flags: Flags) async {
             promptTokenCounts.count == agg.runs,
             decodeRates.count == agg.runs,
             ttftMilliseconds.count == agg.runs,
-            generatedTokenCounts.count == agg.runs
+            generatedTokenCounts.count == agg.runs,
+            memoryRuns.count == agg.runs
         else {
             throw BenchCLIError.invalidPrefillTiming
         }
+        let memoryAggregate = try BenchMemoryAggregate(runs: memoryRuns)
         let avgTtftMs = ttfts.isEmpty ? 0 : ttfts.reduce(0, +) / Double(ttfts.count) * 1000
         let avgPrefillTokS = prefillRates.reduce(0, +)
             / Double(prefillRates.count)
@@ -775,6 +797,14 @@ func runBench(_ flags: Flags) async {
                 preparedKVTuner?.binding.qualificationBundleSHA256)
         print(BenchRow.csvHeader)
         print(row.csvLine)
+        print(
+            "# memory: sampled_footprint_max="
+                + "\(memoryAggregate.maxSampledPhysicalFootprintBytes), "
+                + "mlx_active_max=\(memoryAggregate.maxMLXActiveBytes), "
+                + "mlx_cache_max=\(memoryAggregate.maxMLXCacheBytes), "
+                + "mlx_peak_max=\(memoryAggregate.maxMLXPeakBytes), "
+                + "cache_limit="
+                + "\(KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
         if let csvPath = plan.csvPath {
             try appendBenchCSVRow(row, to: csvPath)
             print("# appended to \(csvPath)")
@@ -818,7 +848,16 @@ func runBench(_ flags: Flags) async {
             prefillTokSByRun: prefillRates,
             decodeTokSByRun: decodeRates,
             ttftMsByRun: ttftMilliseconds,
-            generatedTokenCountsByRun: generatedTokenCounts)
+            generatedTokenCountsByRun: generatedTokenCounts,
+            memoryCacheLimitBytes:
+                KVTunerSensitivityCaptureEnvironment
+                    .requiredMemoryCacheLimitBytes,
+            memoryRuns: memoryRuns,
+            maxSampledPhysicalFootprintBytes:
+                memoryAggregate.maxSampledPhysicalFootprintBytes,
+            maxMLXActiveBytes: memoryAggregate.maxMLXActiveBytes,
+            maxMLXCacheBytes: memoryAggregate.maxMLXCacheBytes,
+            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes)
         try appendRequiredJSONLRecord(
             ResultRecord(
                 subcommand: "bench",
