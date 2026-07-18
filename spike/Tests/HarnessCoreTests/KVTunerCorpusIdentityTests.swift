@@ -298,7 +298,7 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
         let identity = try KVTunerEvaluationCorpusIdentity.benchWorkload(
             workload)
 
-        XCTAssertEqual(identity.id, "fastmlx-bench-decode-v1")
+        XCTAssertEqual(identity.id, "fastmlx-bench-decode-v2")
         XCTAssertEqual(
             identity.canonicalEntryDigests,
             workload.prompts.map(KVTunerPromptDigest.exactText).sorted())

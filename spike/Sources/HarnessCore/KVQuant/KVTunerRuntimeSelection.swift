@@ -310,14 +310,14 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
         _ workload: BenchWorkloadIdentity
     ) throws -> KVTunerEvaluationCorpusIdentity {
         let expectedPromptSHA256 =
-            "452da42133ba5e7f9aab14c8870acb54e078ca7aff0f893f80c54f76fddee6fc"
+            "aaa70310381eb25ba917e680397c141e494ae62e174dc42de3e5f0b2a4a261a4"
         guard workload.basePrompt == defaultBenchPrompt,
             sha256Hex(Data(workload.basePrompt.utf8)) == expectedPromptSHA256
         else {
             throw KVTunerEvaluationCorpusIdentityError
                 .canonicalSourceItemsRequired
         }
-        let id = "fastmlx-bench-decode-v1"
+        let id = "fastmlx-bench-decode-v2"
         let prompts = workload.prompts
         let entryDigests = prompts
             .map(KVTunerPromptDigest.exactText)
@@ -325,7 +325,7 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
         let aggregateDigest = fnv1a64(
             ([id] + prompts).joined(separator: "\0").utf8)
         var sourceTranscript = Data(
-            "fast-mlx.kvtuner-bench-source.v1\0".utf8)
+            "fast-mlx.kvtuner-bench-source.v2\0".utf8)
         sourceTranscript.append(contentsOf: workload.basePrompt.utf8)
         return try KVTunerEvaluationCorpusIdentity(
             id: id,

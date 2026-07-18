@@ -6,7 +6,9 @@ public enum Mode: String, Sendable, CaseIterable { case none, pld, dspark }
 /// Audited first-party prompt used by the batch-1 runtime frontier. KVTuner permits only this
 /// source because an arbitrary prompt cannot truthfully assert disjoint upstream source rows.
 public let defaultBenchPrompt =
-    "Explain how continuous batching improves LLM serving throughput."
+    "Explain in at least 250 words how continuous batching improves LLM serving throughput. "
+    + "Cover request scheduling, chunked prefill, decode interleaving, fairness, memory pressure, "
+    + "and cancellation."
 
 public struct Cell: Sendable, Hashable {
     public let workload: Workload

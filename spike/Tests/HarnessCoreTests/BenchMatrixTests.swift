@@ -71,6 +71,12 @@ final class BenchMatrixTests: XCTestCase {
     XCTAssertEqual(Set(workload.prompts).count, workload.prompts.count)
   }
 
+  func testDefaultBenchWorkloadRequestsEnoughOutputToCrossCompressedTile() {
+    XCTAssertEqual(
+      defaultBenchPrompt,
+      "Explain in at least 250 words how continuous batching improves LLM serving throughput. Cover request scheduling, chunked prefill, decode interleaving, fairness, memory pressure, and cancellation.")
+  }
+
   func testBenchWorkloadIdentityRejectsInvalidNonceAndIterationCount() {
     XCTAssertThrowsError(try BenchWorkloadIdentity(
       basePrompt: defaultBenchPrompt, nonce: "contains space", iterations: 4))
