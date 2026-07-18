@@ -237,7 +237,7 @@ lossy row was a measured speed win on the materialize-then-attend path.
   user-facing dial labels, marginal loss, actual capacity, speed, caveats, and PROMOTE/SHELVE outcome.
 - [x] Write a `docs/content/` explanation centered on what the Apple evidence changed.
 - [x] Produce the verification packet, run a focused review, secret-scan, and inspect the diff.
-- [ ] Commit coherent changes with the required co-author trailer and merge `--no-ff` only after
+- [x] Commit coherent changes with the required co-author trailer and merge `--no-ff` only after
   fresh proof.
 - [x] If a format advances, update the next queue item to fused compressed-domain attention using
   the selected layout; otherwise record why the more exotic kernel investment was avoided.
@@ -253,7 +253,7 @@ This is not a broad-model claim: a second materially different popular model fam
 same gate before generalizing beyond Qwen3-32B-4bit. The final packet is recorded in
 [`docs/verification-evidence.md`](../../verification-evidence.md): pure and MLX-coupled suites,
 Release build, JSON/link/diff checks, focused re-review, and staged secret scan all pass. The
-repository check-in/merge item remains unchecked until those actions actually complete.
+coherent closure commit `687b09f` was merged `--no-ff` to `main` as `f435312` after that proof.
 
 ## Build and safety invariants
 

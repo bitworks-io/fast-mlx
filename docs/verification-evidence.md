@@ -360,6 +360,7 @@ completion SHA-256 `732d4e3486a8502dd09ec44628875d1e5435fbd3648ec6c8024b8f01047d
 
 **Review and residual risk:** focused review found and corrected one 256-byte accounting wording
 error and required the recovery chain above to be explicit. Final review, link/JSON validation,
-diff checks, banned-concurrency scan, and staged secret scan are part of the closing packet. The
+diff checks, banned-concurrency scan, and staged secret scan pass. Coherent closure `687b09f` was
+merged `--no-ff` to `main` as `f435312`. The
 largest remaining technical risk is that storage reduction has not become a compiled speed path;
 fused compressed-domain attention and a second model family are the next gates.
