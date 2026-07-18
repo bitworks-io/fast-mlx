@@ -1,14 +1,30 @@
 ---
-status: active
+status: complete
 type: quantization-spike
 priority: high
 created: 2026-07-12
 source: sol-audit
-planning_ready: true
-implementation_ready: true
+planning_ready: false
+implementation_ready: false
+completed: 2026-07-18
 ---
 
 # KVarN K4V2 and asymmetric mixed-precision KV frontier
+
+## Completion
+
+Completed 2026-07-18. Dated verdict:
+[`docs/superpowers/verdicts/2026-07-18-kvarn-kv-frontier.md`](../superpowers/verdicts/2026-07-18-kvarn-kv-frontier.md);
+content piece:
+[`docs/content/2026-07-18-when-smaller-kv-is-not-faster.md`](../content/2026-07-18-when-smaller-kv-is-not-faster.md).
+
+Decision: promote fp16 KV as the Transparent baseline, affine K4V2-g64 as Balanced capacity,
+frozen KVTuner as explicit Max-fit capacity, and KVarN i8 as capacity-only Max-fit plus fused
+compressed-domain attention candidate. Shelve affine K8 controls and KVarN i16; reject the g128
+4-bit affine cells that crossed the hard floor.
+
+Boundary: this is Qwen3-32B-4bit, same-weights, M5 Max evidence only. It selected useful
+capacity tiers and storage primitives; it did not prove a speed win or broad model support.
 
 ## Raw Capture
 
@@ -50,8 +66,7 @@ loss that may be exposed through the dial.
 
 ## Next Step
 
-Execute the dated implementation plan in
-[`docs/superpowers/plans/2026-07-14-kvarn-kv-frontier.md`](../superpowers/plans/2026-07-14-kvarn-kv-frontier.md):
-start with the pinned pure/reference tile transform, exact storage accountant, and offline
-per-layer configuration artifact. Do not begin Metal work until the quality/size matrix selects
-a winner.
+Closed. Continue with the selected follow-on gate:
+[`2026-07-12-fused-compressed-kv-attention.md`](2026-07-12-fused-compressed-kv-attention.md).
+Carry forward KVarN i8 plus shared affine/KVTuner storage primitives and require direct 32K/128K
+end-to-end proof before any speed-tier claim.

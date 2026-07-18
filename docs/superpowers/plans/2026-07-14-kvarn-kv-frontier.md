@@ -1,6 +1,6 @@
 # KVarN / asymmetric KV-cache frontier implementation plan
 
-**Status:** active — affine control closed; KVarN MLX cache next
+**Status:** complete — closed 2026-07-18 with selected lossy tiers and no lossy speed win
 
 **Technique class:** `LOSSY_FRONTIER`
 
@@ -188,14 +188,23 @@ owes at least 24 positions per short entry and 128 per long entry.
 
 ### Phase 3 — KVarN correctness-first MLX cache
 
-- [ ] Port the reference with MLX operations and native packed affine storage after variance
+- [x] Port the reference with MLX operations and native packed affine storage after variance
   normalization. Keep the fp16 sink and incomplete tail explicit.
-- [ ] Verify the MLX transform against the same fixture and the pure Swift oracle, including 8
+- [x] Verify the MLX transform against the same fixture and the pure Swift oracle, including 8
   versus 16 iterations and 2-bit V packing.
-- [ ] Integrate KVarN as an unambiguously named cache kind with engagement/storage telemetry.
+- [x] Integrate KVarN as an unambiguously named cache kind with engagement/storage telemetry.
   If tile-boundary mutation cannot be captured safely, use the explicit uncompiled correctness path
   and record that fact; do not weaken actor confinement or pretend it is a speed path.
-- [ ] Add frozen KVTuner per-layer cache selection only after uniform affine cells pass.
+- [x] Add frozen KVTuner per-layer cache selection only after uniform affine cells pass.
+
+Phase 3 proof (2026-07-18): the final clean runtime evidence is stamped
+`f88d26eeb3793cc1d5d8f2118043c190977ee6e0`. The KVarN canonical memory artifact is
+SHA-256 `7b21459cf1afc1a038b87c017c1fdacd18644b08b4b63a07318d74faba2dcfd2`; the task/KL
+source packet is `d9071a93955be2e148dc381638d4a71a8286c59e`; and the KL manifest is
+SHA-256 `3be8693aa169e2e5b4c2692f7fdc115783271fb735d27e50b0d5c3cb798990df`. Final local/on-box
+verification recorded 389 XCTest + 17 Swift Testing pure tests, 30 `FastMLXHarnessTests`,
+92 `SpikeCoreTests`, and a Release build. KVarN remained on the explicit uncompiled correctness
+path, so this phase proves correctness/selection/storage telemetry, not a compiled speed path.
 
 The present storage frontier remains intentionally batch-1. Before any selected quantized format
 is admitted to continuous batching, add the adversarial compaction case: merge unequal rows,
@@ -205,23 +214,46 @@ end from surviving padded offsets can corrupt the cache; that is a correctness b
 
 ### Phase 4 — clean-SHA matrix on the bench Mac
 
-- [ ] Sync with `spike/scripts/sync_llmbench.sh`, build Release through Xcode, and record model,
+- [x] Sync with `spike/scripts/sync_llmbench.sh`, build Release through Xcode, and record model,
   package, harness, hardware, OS, cache-limit, corpus, and checkpoint provenance.
-- [ ] Run same-weights fp16-KV pipeline floor, then the declared affine/KVTuner/KVarN cells at
+- [x] Run same-weights fp16-KV pipeline floor, then the declared affine/KVTuner/KVarN cells at
   identical positions. Run the lossy triad and coherence predicates before expensive 24K scoring.
-- [ ] Measure actual cache bytes, peak active/cache/RSS memory, batch-1 prefill/decode, and capacity.
+- [x] Measure actual cache bytes, peak active/cache/RSS memory, batch-1 prefill/decode, and capacity.
   Any raised wired-memory limit is paired with an explicit `Memory.cacheLimit`.
-- [ ] Preserve raw JSONL/log artifacts and derive a compact matrix without dropping failed cells.
+- [x] Preserve raw JSONL/log artifacts and derive a compact matrix without dropping failed cells.
+
+Phase 4 proof (2026-07-18): the compact evidence is
+[`docs/superpowers/verdicts/kvarn-kv-frontier-evidence-2026-07-18.jsonl`](../verdicts/kvarn-kv-frontier-evidence-2026-07-18.jsonl)
+and the final adjudication is
+[`docs/superpowers/verdicts/2026-07-18-kvarn-kv-frontier.md`](../verdicts/2026-07-18-kvarn-kv-frontier.md).
+The matrix is model-specific to Qwen3-32B-4bit on the bench Apple system. It reports actual
+cache-array storage plus workspace, teacher-forced KL/perplexity/top-1/tail metrics, task checks,
+batch-1 prefill/decode, and peak RSS. Every lossy retained row improved KV-budget capacity, but no
+lossy row was a measured speed win on the materialize-then-attend path.
 
 ### Phase 5 — adjudication and check-in
 
-- [ ] Write `docs/superpowers/verdicts/2026-07-XX-kvarn-kv-frontier.md` with one finding per cell,
+- [x] Write `docs/superpowers/verdicts/2026-07-18-kvarn-kv-frontier.md` with one finding per cell,
   user-facing dial labels, marginal loss, actual capacity, speed, caveats, and PROMOTE/SHELVE outcome.
-- [ ] Write a `docs/content/` explanation centered on what the Apple evidence changed.
-- [ ] Produce the verification packet, run a focused review, secret-scan, inspect the diff, commit
-  coherent changes with the required co-author trailer, and merge `--no-ff` only after fresh proof.
-- [ ] If a format advances, update the next queue item to fused compressed-domain attention using
+- [x] Write a `docs/content/` explanation centered on what the Apple evidence changed.
+- [x] Produce the verification packet, run a focused review, secret-scan, and inspect the diff.
+- [ ] Commit coherent changes with the required co-author trailer and merge `--no-ff` only after
+  fresh proof.
+- [x] If a format advances, update the next queue item to fused compressed-domain attention using
   the selected layout; otherwise record why the more exotic kernel investment was avoided.
+
+Phase 5 proof (2026-07-18): the selected verdict is fp16 KV as the **Transparent** baseline,
+affine K4V2-g64 as **Balanced** capacity, frozen KVTuner as explicit **Max-fit** capacity, and
+KVarN i8 as **Max-fit capacity-only** plus the fused compressed-domain attention candidate.
+The K8 affine controls and KVarN i16 were shelved when they failed to create a separate practical
+frontier; the two g128 4-bit affine cells were rejected for hard-floor failure. The reader-facing
+writeup is
+[`docs/content/2026-07-18-when-smaller-kv-is-not-faster.md`](../../content/2026-07-18-when-smaller-kv-is-not-faster.md).
+This is not a broad-model claim: a second materially different popular model family must pass the
+same gate before generalizing beyond Qwen3-32B-4bit. The final packet is recorded in
+[`docs/verification-evidence.md`](../../verification-evidence.md): pure and MLX-coupled suites,
+Release build, JSON/link/diff checks, focused re-review, and staged secret scan all pass. The
+repository check-in/merge item remains unchecked until those actions actually complete.
 
 ## Build and safety invariants
 

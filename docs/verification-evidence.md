@@ -16,6 +16,7 @@ SHA without copying machine-local paths or transient output.
 | As a maintainer, I can enter continuous-batching actor integration only after dense cache shapes are exact and compile-stable. | Scalar-aligned merge/append/filter/extract preserves logits, greedy tokens, row identity, and one trace per stable shape; unsupported state layouts fail closed. | 9 focused `BatchedCompiledKVCacheTests`; 29/29 total `SpikeCoreTests` through Xcode; 134 HarnessCore XCTest + 17 Swift Testing tests off-box. | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed+shapeless PASS with zero initial max-logit delta; 64-step B=4/B=8 fixed PASS; `qwen3_moe` rejected before load. | 2026-07-12 | Historical Phase-1 gate; Phase 2 and Phase 3 are closed below. |
 | As an operator, concurrent dense streams can join, leave, and prefill in chunks without changing greedy output or exhausting an unbounded queue. | B1→drain→B2→B1 and B3→B2 remain token/byte exact; decode precedes bounded prefill; queue, per-request context, and aggregate logical context are capped; speculation is rejected locally for this runtime. | 16 scheduler + 10 coordinator pure tests within 145 HarnessCore XCTest + 17 Swift Testing; 12 cache-history-sensitive runtime tests within 41/41 Xcode `SpikeCoreTests`. | Clean `2a5a5f4`: Qwen3-32B-4bit staggered join and middle-cancel probes PASS; Qwen3-4B-4bit chunk-size-1 interleave PASS; zero batched speculation. | 2026-07-12 | Historical Phase-2 gate; byte admission, service frontier, cancellation latency, and soak are closed by Phase 3 below. |
 | As a dense-Qwen service operator, I can select the measured exact policy for an isolated request or a simultaneous burst without hidden queueing, state-poison, cancellation, or resident-memory failure. | Same-workload C=1/2/4/8 frontier selects solo PLD at C=1 and batch-no-spec at C≥2; exact transition/cancellation, conservative byte admission, A/B/A, responsiveness, and the full 24-hour RSS gate pass. | 166 HarnessCore XCTest + 17 Swift Testing tests off-box; 48/48 `SpikeCoreTests` through Xcode; final-SHA real-model probes and fail-closed `qwen3_moe` smoke. | Clean `7a775f6` frontier: batch +45.8%/+58.6%/+74.7% at C=2/4/8; clean `0aed280` soak: 86,412.85 measured seconds, all 33 predicates 3,519/3,519, peak RSS drift 2.2444%. | 2026-07-14 | Explicit probe path only; production routing/API, network disconnect propagation, sampling, non-dense state, other models and hardware remain open. |
+| As a constrained-hardware operator, I can choose a measured KV-capacity tier with quantified loss, while incoherent cells remain unavailable. | Same-weights Qwen3-32B cells bind actual storage, teacher-forced quality, task coherence, runtime, and clean provenance; hard-floor failures reject; every promoted label states capacity versus speed. | 389 HarnessCore XCTest + 17 Swift Testing tests off-box; 30/30 `FastMLXHarnessTests`; 92/92 `SpikeCoreTests`; Release build through Xcode. | Clean `d9071a9` task/KL packet and `f88d26e` runtime packet: Transparent fp16, Balanced K4V2-g64, Max-fit KVTuner, capacity-only KVarN i8; two aggressive cells reject. | 2026-07-18 | Qwen3-32B-4bit on one M5 Max; no lossy speed win, compiled KVarN/fused attention, or broad-model claim. |
 
 ## Current Verification Commands
 
@@ -294,3 +295,43 @@ launch/build log `bd36cbcd25d7f67560178b128f4ead7124fea622bbb4f4dbf9444e00353931
 implementation, the Qwen3-32B 24/128-position matrix, monotonicity, capacity benefit, or a dial
 verdict. The exploratory affine predicate counts (4/8, 7/8, 7/8, 7/8, and 3/8 across the five
 cells) are deliberately non-authoritative until the frozen full matrix runs.
+
+## KVarN / asymmetric KV frontier final acceptance pass — 2026-07-18
+
+**Story:** an Apple-Silicon operator constrained by context or concurrency can select a measured
+KV-capacity tier with its real quality and runtime costs visible, while cells below the coherence
+floor remain unavailable and exactness contracts elsewhere in the engine remain unchanged.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Same-weights reference fidelity | **PASS** | The fp16 reference and all retained candidates bind the Qwen3-32B-4bit checkpoint, model/config identities, task corpus v2, tokenizer/prompt layout, and per-cell task/KL artifacts. The compact packet records every KL evidence/sidecar and task raw/summary SHA-256. |
+| Honest size and capacity accounting | **PASS** | fp16 is explicitly exact-accounted as 6,330,777,600 bytes at 24,150 tokens. Lossy rows use directly measured cache-array bytes plus workspace. KVTuner/KVarN's separate 256 control bytes are preserved distinctly; derived capacity ranges from 2.7826x to 4.5110x. |
+| Lossy frontier fails closed | **PASS** | `affine-k4v2-g128` and `affine-k4v4-g128` are retained as hard-floor failures and rejected from the dial. Unknown tiers, malformed schedules, missing evidence, non-finite metrics, and lossy KV plus PLD remain rejected. |
+| Runnable selection and frozen-policy controls | **PASS** | Uniform affine cells, frozen KVTuner, and KVarN i8/i16 engaged under their declared identities. KVTuner authenticates its frozen bundle/schedule; KVarN reports the explicit uncompiled correctness path instead of claiming compiled execution. |
+| Context-locked quality | **PASS** | Eligible cells completed teacher-forced KL, pooled perplexity delta, top-1 agreement, and 24K tail-p95 against the locked reference context. Free-running output was used only for task/coherence adjudication. |
+| Task/coherence floor and user freedom | **PASS** | The admitted fp16 reference scored 16/10/20/20 with 20/20 structured syntax. Retained lossy cells stayed above the predeclared per-domain/syntax floor; aggressive cells that collapsed structured behavior were rejected rather than exposed as an expert setting. |
+| Same-workload Apple runtime evidence | **PASS** | Clean runtime SHA `f88d26eeb3793cc1d5d8f2118043c190977ee6e0` completed all seven cells with one authenticated JSONL row per cell and absent watchdog. fp16 measured 28.46 decode / 376.33 prefill tok/s; no lossy cell was faster, so promotion is capacity-only where applicable. |
+| Flywheel closure and claim boundary | **PASS** | The dated verdict promotes fp16 Transparent, affine K4V2-g64 Balanced capacity, frozen KVTuner Max-fit capacity, and KVarN i8 capacity-only Max-fit/fused candidate; it shelves or rejects the rest and links a reader-facing content piece. The result is Qwen3-32B-4bit/model-specific; a materially different popular family is required before broad support claims. |
+
+**Fresh verification:** `swift test --package-path spike --filter HarnessCoreTests` passes 389
+XCTest + 17 Swift Testing tests. On the clean synced bench tree, Xcode with
+`-skipPackagePluginValidation` passes 30/30 `FastMLXHarnessTests` and 92/92 `SpikeCoreTests`; the
+Release `fastmlx-harness` build succeeds. MLX-coupled targets were not run through SwiftPM.
+
+**Evidence authentication:** compact JSONL
+[`kvarn-kv-frontier-evidence-2026-07-18.jsonl`](superpowers/verdicts/kvarn-kv-frontier-evidence-2026-07-18.jsonl)
+parses as 12 records. The task/KL source/harness is clean `d9071a93955be2e148dc381638d4a71a8286c59e`;
+the KL manifest is `3be8693aa169e2e5b4c2692f7fdc115783271fb735d27e50b0d5c3cb798990df`;
+the same-SHA KVarN memory gate is
+`7b21459cf1afc1a038b87c017c1fdacd18644b08b4b63a07318d74faba2dcfd2`.
+The original KL wrapper status remains `ABORTED` after a post-measurement pipefail. Reviewed
+recovery finalization authenticated all seven immutable rows/sidecars twice and records finalizer
+SHA-256 `096c38dfcb648bf7cf3870c12f24b9419bff398668a0ef13402c1009f0dcdeb4`, recovery
+SHA-256 `9548bd792bcd836a92b9612a70026ad54c77adc16395df1e0b6a1fed3a8d7077`, and recovered
+completion SHA-256 `732d4e3486a8502dd09ec44628875d1e5435fbd3648ec6c8024b8f01047de4dc`.
+
+**Review and residual risk:** focused review found and corrected one 256-byte accounting wording
+error and required the recovery chain above to be explicit. Final review, link/JSON validation,
+diff checks, banned-concurrency scan, and staged secret scan are part of the closing packet. The
+largest remaining technical risk is that storage reduction has not become a compiled speed path;
+fused compressed-domain attention and a second model family are the next gates.

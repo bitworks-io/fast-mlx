@@ -1,10 +1,10 @@
 ---
-status: captured
+status: planning-ready
 type: metal-kernel-spike
 priority: high
 created: 2026-07-12
 source: carry-forward-plus-sol-audit
-planning_ready: false
+planning_ready: true
 implementation_ready: false
 ---
 
@@ -16,6 +16,11 @@ Eliminate the materialize-then-attend bottleneck. The current TurboQuant cache r
 the full-precision cache before attention; a better storage codec therefore cannot earn a
 decode-speed tier. Build a compressed-domain Metal path only after profiling the stock MLX
 primitives and defining an ordinary affine K/V baseline.
+
+2026-07-18 selection update: this is now the top engine gate after the KVarN/asymmetric KV
+frontier verdict. Carry forward KVarN i8 plus the shared affine/KVTuner storage primitives
+selected or retained by the dated KVarN evidence. Do not overclaim the prior cycle: it promoted
+capacity tiers and selected fused-kernel inputs, but measured no lossy speed win.
 
 ## Planning Seed
 
@@ -35,6 +40,10 @@ Acceptance signals:
 - packed bytes/token include scales, biases, alignment, and workspace;
 - end-to-end 32K and 128K decode beats materialize-then-attend and the base path; a kernel-only
   microbenchmark cannot promote the feature;
+- the full 32K and 128K proofs include quality, actual storage, peak memory, decode/prefill, and
+  runnable user/operator workload evidence for the selected KVarN i8 and affine/KVTuner paths;
+- a second materially different popular model family validates the frontier before broad support
+  claims or shared default policy;
 - MLX-coupled tests use Xcode on the bench box and preserve actor confinement.
 
 Known failure cases: materializing head expansion, silent mask errors, inferring the write end from
