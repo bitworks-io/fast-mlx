@@ -18,6 +18,24 @@ enum SwiftEngineDriverError: Error, CustomStringConvertible {
     }
 }
 
+/// Exact result of one restricted-choice scoring forward. Only actor-safe CPU values cross the
+/// engine boundary; the MLX arrays and concrete cache objects remain actor-confined.
+struct TaskChoiceLogitsResult: Sendable {
+    let logits: [Float]
+    let engagement: EngagementCounters
+}
+
+/// Actor-safe output of the private KVTuner candidate generation path. The generated token IDs
+/// are paired with telemetry captured from the exact decoder/cache instance before its MLX arrays
+/// leave actor isolation.
+struct KVTunerCandidateRunResult: Sendable {
+    let promptOrdinal: Int
+    let promptTokenIDsSHA256: String
+    let tokens: [Int]
+    let finishReason: KVTunerCandidateFinishReason
+    let telemetry: KVTunerCandidateKVCacheTelemetry
+}
+
 /// Single-owner actor over the spike's compiled decode core. Owns BOTH the model and the
 /// `CompiledMLXDecoder` (one isolation region) because `logprobs` needs direct forward access
 /// to full-vocab logits, which the token-only `Decoder` protocol deliberately doesn't expose.
@@ -27,22 +45,53 @@ enum SwiftEngineDriverError: Error, CustomStringConvertible {
 /// (the next step's compiled forward is asyncEval'd before the current token's `.item()`).
 actor HarnessEngineActor {
     private let model: any LanguageModel
+    /// Captured from the same model directory and live tokenizer used to construct `model`.
+    /// Candidate policies must reconcile against this independent identity inside the actor.
+    private let kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity?
     /// One decoder per KV-cache kind, built lazily and kept alive so each kind's compiled
     /// step function survives across runs (an fp16 baseline and a TurboQuant candidate can
     /// alternate within one verify invocation without retracing either).
     private var decoders: [KVCacheKind: CompiledMLXDecoder] = [:]
+    /// Largest affine scoring allocation observed in this actor. Scoring caches are ephemeral,
+    /// so their scalar geometry/byte evidence must be retained before the arrays are released.
+    private var maximumAffineScoringTelemetry: AffineKVCacheTelemetry?
+    /// Heterogeneous affine policies are keyed by the immutable exact-byte selection, so two
+    /// same-cell artifacts cannot share retained scoring evidence.
+    private var maximumKVTunerScoringTelemetry: [
+        KVTunerRuntimeSelection: KVTunerKVCacheTelemetry
+    ] = [:]
+    /// KVarN cells share packed geometry but not codec work. Key retained scalar evidence by
+    /// runtime cell so an i8 scoring pass can never be mislabeled as i16 (or vice versa).
+    private var maximumKVarNScoringTelemetry: [
+        KVarNKVRuntimeCell: KVarNKVCacheTelemetry
+    ] = [:]
 
-    init(model: sending any LanguageModel) {
+    init(
+        model: sending any LanguageModel,
+        kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity? = nil
+    ) {
         self.model = model
+        self.kvtunerRuntimeIdentity = kvtunerRuntimeIdentity
     }
 
     /// Greedy decode via the compiled core. The returned ids INCLUDE a terminal eos if one is
     /// produced (mirroring scripts/harness_reference.py exactly, so token streams diff cleanly).
-    /// `turboQuantTokens` is the in-graph engagement marker from the quantized cache (nil on
-    /// fp16 runs) — proof the quant path ran, read AFTER timing so it cannot skew the numbers.
+    /// Quantized-cache engagement is read AFTER timing so its synchronization cannot skew the
+    /// benchmark. Affine and KVarN return Sendable scalar snapshots; TurboQuant retains its
+    /// legacy token marker until that format's evidence schema is generalized.
     func generate(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind)
-        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], turboQuantTokens: Int?)
+        -> (
+            tokens: [Int], submitTime: Double, tokenTimes: [Double],
+            prefillDurationSeconds: Double?,
+            turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?,
+            kvtunerTelemetry: KVTunerKVCacheTelemetry?,
+            kvarnTelemetry: KVarNKVCacheTelemetry?
+        )
     {
+        if case .kvtunerCandidate = kind {
+            preconditionFailure(
+                "KVTuner candidates require the private qualification path")
+        }
         if decoders[kind] == nil {
             decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
         }
@@ -50,24 +99,142 @@ actor HarnessEngineActor {
         defer { decoders[kind] = decoder }
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, [], nil) }
+        guard maxTokens > 0 else {
+            return ([], submitTime, [], nil, nil, nil, nil, nil)
+        }
         var tokens: [Int] = []
         var tokenTimes: [Double] = []
+        let prefillStartedAt = ProcessInfo.processInfo.systemUptime
         var tok = decoder.prefill(prompt)
+        let prefillDurationSeconds =
+            ProcessInfo.processInfo.systemUptime - prefillStartedAt
+        let prefillEnd = Date().timeIntervalSinceReferenceDate
         tokens.append(tok)
-        tokenTimes.append(Date().timeIntervalSinceReferenceDate)
+        tokenTimes.append(prefillEnd)
         while tokens.count < maxTokens && tok != eos {
             tok = decoder.step(last: tok)
             tokens.append(tok)
             tokenTimes.append(Date().timeIntervalSinceReferenceDate)
         }
         let turboQuantTokens = decoder.turboQuantCachedTokens()
+        let affineTelemetry = decoder.affineKVTelemetry()
+        let kvtunerTelemetry = decoder.kvtunerKVTelemetry()
+        let kvarnTelemetry = decoder.kvarnKVTelemetry()
         if case .turboQuant = kind {
             // A TurboQuant run whose decoder somehow holds an fp16 cache is a plumbing bug,
             // not a measurement — fail loudly (mirrors requireSupported's contract).
             precondition(turboQuantTokens != nil, "TurboQuant tier requested but the quantized cache did not engage")
         }
-        return (tokens, submitTime, tokenTimes, turboQuantTokens)
+        if case .affine = kind {
+            precondition(
+                affineTelemetry != nil,
+                "affine tier requested but the affine cache did not engage")
+        }
+        if case .kvtuner(let selection) = kind {
+            precondition(
+                kvtunerTelemetry?.artifactSHA256
+                    == selection.artifactSHA256,
+                "KVTuner tier requested but matching schedule telemetry did not engage")
+        }
+        if case .kvarn(let cell) = kind {
+            precondition(
+                kvarnTelemetry?.tier == cell.tier
+                    && kvarnTelemetry?.iterations == cell.iterations
+                    && kvarnTelemetry?.executionMode == .uncompiledCorrectness,
+                "KVarN tier requested but matching KVarN telemetry did not engage")
+        }
+        return (
+            tokens, submitTime, tokenTimes, prefillDurationSeconds,
+            turboQuantTokens, affineTelemetry,
+            kvtunerTelemetry, kvarnTelemetry)
+    }
+
+    /// Greedy candidate generation for exhaustive KVTuner qualification only. This has no
+    /// `RunConfig` or tier-string entry point, cannot be combined with speculation, and returns
+    /// the exact policy/cache receipt needed by schema-2 candidate evidence.
+    func evaluateKVTunerCandidateCohort(
+        prompts: [[Int]],
+        maxTokens: Int,
+        policy: KVTunerCandidateRuntimePolicy
+    ) throws -> [KVTunerCandidateRunResult] {
+        precondition(!prompts.isEmpty, "KVTuner candidate cohort must be nonempty")
+        precondition(
+            prompts.allSatisfy { !$0.isEmpty },
+            "KVTuner candidate prompts must be nonempty")
+        precondition(maxTokens > 0, "KVTuner candidate maxTokens must be positive")
+        guard let kvtunerRuntimeIdentity else {
+            throw KVTunerCandidateRuntimeIdentityError.missingRuntimeIdentity
+        }
+        _ = try kvtunerRuntimeIdentity.validate(runtimePolicy: policy)
+        let kind = KVCacheKind.kvtunerCandidate(policy)
+        // The decoder is local to exactly one complete prompt cohort. Prompts reuse its compiled
+        // graph and monotonically grown allocation, but retries and later candidates start from a
+        // fresh cache so first-row capacity evidence is reproducible and memory cannot accumulate
+        // with the number of candidates visited.
+        var decoder = CompiledMLXDecoder(model: model, kvCache: kind)
+        var results: [KVTunerCandidateRunResult] = []
+        results.reserveCapacity(prompts.count)
+        for (promptOrdinal, prompt) in prompts.enumerated() {
+            decoder.reset()
+            var tokens: [Int] = []
+            var token = decoder.prefill(prompt)
+            tokens.append(token)
+            while tokens.count < maxTokens
+                && token != kvtunerRuntimeIdentity.eosTokenID
+            {
+                token = decoder.step(last: token)
+                tokens.append(token)
+            }
+            guard let telemetry = decoder.kvtunerCandidateKVTelemetry() else {
+                preconditionFailure(
+                    "KVTuner candidate decoder did not return candidate telemetry")
+            }
+            precondition(
+                telemetry.runtimePolicySHA256
+                    == policy.runtimePolicySHA256,
+                "KVTuner candidate telemetry does not match its runtime policy")
+            let finishReason: KVTunerCandidateFinishReason
+            if tokens.last == kvtunerRuntimeIdentity.eosTokenID {
+                finishReason = .endOfSequence
+            } else {
+                precondition(
+                    tokens.count == maxTokens,
+                    "KVTuner candidate stopped without EOS or exhausting its generation budget")
+                finishReason = .generationBudgetExhausted
+            }
+            results.append(KVTunerCandidateRunResult(
+                promptOrdinal: promptOrdinal,
+                promptTokenIDsSHA256: taskTokenIDsSHA256(prompt),
+                tokens: tokens,
+                finishReason: finishReason,
+                telemetry: telemetry))
+        }
+        return results
+    }
+
+    /// Captures KVTuner's offline per-layer metrics inside the model's isolation region. The
+    /// exact config comes from the source snapshot sampled around this live model load; callers
+    /// provide only Sendable token IDs and receive only scalar samples.
+    func captureKVTunerSensitivity(
+        promptTokenIDs: [[Int]],
+        groupSize: Int,
+        expectedRuntimeIdentity: KVTunerCandidateRuntimeIdentity
+    ) throws -> [KVTunerSensitivitySample] {
+        guard let kvtunerRuntimeIdentity else {
+            throw KVTunerCandidateRuntimeIdentityError.missingRuntimeIdentity
+        }
+        guard kvtunerRuntimeIdentity == expectedRuntimeIdentity else {
+            throw KVTunerCandidateRuntimeIdentityError
+                .sourceIdentityChangedDuringModelLoad
+        }
+        return try KVTunerSensitivityCapture.capture(
+            model: model,
+            exactModelConfigData:
+                kvtunerRuntimeIdentity.exactModelConfigData,
+            promptTokenIDs: promptTokenIDs,
+            groupSize: groupSize,
+            precisionPairs:
+                KVTunerSensitivityArtifact.canonicalPrecisionPairs)
     }
 
     /// Speculative-decoding generate (PLD first): routes to `CompiledMLXDecoder.generateSpec`,
@@ -75,7 +242,10 @@ actor HarnessEngineActor {
     /// byte-identical to the plain greedy loop at temp 0 by construction. Same decoder-per-kind
     /// reuse as `generate` (compiled step + compiled verify survive across runs; in-place reset).
     func generateSpec(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind, spec: SpecDecodeConfig)
-        -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats)
+        -> (
+            tokens: [Int], submitTime: Double, tokenTimes: [Double],
+            prefillDurationSeconds: Double?, stats: SpecDecodeStats
+        )
     {
         if decoders[kind] == nil {
             decoders[kind] = CompiledMLXDecoder(model: model, kvCache: kind)
@@ -104,8 +274,83 @@ actor HarnessEngineActor {
             if tok == eos { break }
             y = MLXArray([tok]).reshaped([1, 1])
         }
-        assertTurboQuantEngaged(kind, cache: cache, minTokens: prompt.count)
+        captureQuantizedScoringTelemetry(kind, cache: cache, minTokens: prompt.count)
         return rows
+    }
+
+    /// Scores the four-choice task head with one fresh full-prompt cache and returns engagement
+    /// from that exact local cache. The ordinary scoring accessors retain maximum telemetry for
+    /// KL accounting; they are intentionally not used here because a prior larger run could make
+    /// a silently unengaged task row appear valid.
+    func taskChoiceLogits(
+        prompt: [Int], kvCache kind: KVCacheKind
+    ) -> TaskChoiceLogitsResult {
+        precondition(!prompt.isEmpty, "task scoring requires a nonempty prompt")
+        let cache = makeScoringCache(kind: kind, capacity: prompt.count)
+        let ids = MLXArray(prompt).reshaped([1, prompt.count])
+        let logits = model(ids, cache: cache)
+        let last = logits[0..., -1, 0...]
+        let row = last.asType(.float32).asArray(Float.self)
+        var counts: [String: Int] = [:]
+
+        switch kind {
+        case .fp16:
+            break
+        case .affine(let tier):
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "affine task-scoring cache contains a different cache type")
+            let telemetry = AffineKVCacheTelemetry.capture(
+                tier: tier, caches: affineCaches)
+            precondition(
+                telemetry.cachedTokens == prompt.count,
+                "affine task-scoring cache did not consume the full prompt")
+            counts["scoring_cached_tokens"] = telemetry.cachedTokens
+        case .kvtuner(let selection):
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "KVTuner task-scoring cache contains a different cache type")
+            let telemetry: KVTunerKVCacheTelemetry
+            do {
+                telemetry = try KVTunerKVCacheTelemetry.capture(
+                    selection: selection, caches: affineCaches)
+            } catch {
+                preconditionFailure(
+                    "KVTuner task-scoring telemetry mismatch: \(error)")
+            }
+            precondition(
+                telemetry.cachedTokens == prompt.count,
+                "KVTuner task-scoring cache did not consume the full prompt")
+            counts["scoring_cached_tokens"] = telemetry.cachedTokens
+            counts["scoring_kvtuner_layers"] = telemetry.layerCount
+        case .kvtunerCandidate:
+            preconditionFailure(
+                "KVTuner candidates are generation-only qualification inputs")
+        case .kvarn(let cell):
+            let kvarnCaches = cache.compactMap { $0 as? KVarNKVCache }
+            precondition(
+                kvarnCaches.count == cache.count,
+                "KVarN task-scoring cache contains a different cache type")
+            let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+            precondition(
+                telemetry.tier == cell.tier
+                    && telemetry.iterations == cell.iterations
+                    && telemetry.executionMode == .uncompiledCorrectness
+                    && telemetry.cachedTokens == prompt.count,
+                "KVarN task-scoring telemetry does not match its runtime cell")
+            counts["scoring_cached_tokens"] = telemetry.cachedTokens
+            counts["scoring_kvarn_completed_tiles"] =
+                telemetry.completedTileCount
+            counts["scoring_kvarn_compressed_tokens"] =
+                telemetry.compressedTokens
+        case .turboQuant:
+            preconditionFailure(
+                "TurboQuant is outside the authenticated task-coherence tier map")
+        }
+        return TaskChoiceLogitsResult(
+            logits: row, engagement: EngagementCounters(counts))
     }
 
     /// TEACHER-FORCED `logprobs`: row i is the next-token distribution given
@@ -162,33 +407,128 @@ actor HarnessEngineActor {
                 rows.append(logits[0..., sel.localIndex, 0...].asType(.float32).asArray(Float.self))
             }
         }
-        assertTurboQuantEngaged(kind, cache: cache, minTokens: input.count)
+        captureQuantizedScoringTelemetry(kind, cache: cache, minTokens: input.count)
         return rows
     }
 
     /// Scoring-path cache selection (Task 7): the MEASUREMENT forwards must run the same KV
     /// tier the config asked for, not silently fp16 — Phase 3's KL/ppl numbers come through
-    /// here, not through the compiled decode path. fp16 keeps the stock model cache; a
-    /// TurboQuant tier gets one `TurboQuantKVCache` per layer, sized for the whole pass
-    /// up-front (scoring knows its total length; no chunked growth needed).
+    /// here, not through the compiled decode path. fp16 keeps the stock model cache; affine,
+    /// KVarN, and TurboQuant tiers get their requested concrete cache per layer, sized for the
+    /// whole pass up front (scoring knows its total length; no chunked growth needed).
     private func makeScoringCache(kind: KVCacheKind, capacity: Int) -> [any KVCache] {
         switch kind {
         case .fp16:
             return model.newCache(parameters: nil)
-        case .turboQuant:
+        case .affine, .kvtuner, .turboQuant, .kvarn:
             let layerCount = model.newCache(parameters: nil).count
-            return (0 ..< layerCount).map { _ in kind.makeCache(capacity: max(capacity, 1)) }
+            do {
+                return try kind.makeCaches(
+                    layerCount: layerCount,
+                    capacity: max(capacity, 1))
+            } catch {
+                preconditionFailure(
+                    "scoring KV-cache policy does not match the loaded model: \(error)")
+            }
+        case .kvtunerCandidate:
+            preconditionFailure(
+                "KVTuner candidates are unavailable to generic scoring paths")
         }
     }
 
-    /// Engagement backstop for the scoring paths: when a TurboQuant tier was requested, the
-    /// cache must BE a TurboQuantKVCache and must have cached every scored position — a
-    /// silent fp16 fallback here would let Phase 3 "measure" the wrong thing.
-    private func assertTurboQuantEngaged(_ kind: KVCacheKind, cache: [any KVCache], minTokens: Int) {
-        guard case .turboQuant = kind else { return }
-        guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
-            preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+    /// Engagement backstop for the scoring paths: a requested lossy cache must have the
+    /// matching concrete type and must have cached every scored position. A silent fp16
+    /// fallback here would make the quality evidence measure the wrong thing.
+    private func captureQuantizedScoringTelemetry(
+        _ kind: KVCacheKind, cache: [any KVCache], minTokens: Int
+    ) {
+        switch kind {
+        case .fp16:
+            return
+        case .affine(let tier):
+            guard let affine = cache.first as? AffineKVCache, affine.offset >= minTokens else {
+                preconditionFailure("affine tier requested but the affine scoring cache did not engage")
+            }
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "affine scoring cache contains a different cache type")
+            let telemetry = AffineKVCacheTelemetry.capture(
+                tier: tier, caches: affineCaches)
+            if maximumAffineScoringTelemetry.map({
+                telemetry.capacityTokens > $0.capacityTokens
+            }) ?? true {
+                maximumAffineScoringTelemetry = telemetry
+            }
+        case .kvtuner(let selection):
+            guard let affine = cache.first as? AffineKVCache,
+                affine.offset >= minTokens
+            else {
+                preconditionFailure(
+                    "KVTuner requested but its scoring cache did not engage")
+            }
+            let affineCaches = cache.compactMap { $0 as? AffineKVCache }
+            precondition(
+                affineCaches.count == cache.count,
+                "KVTuner scoring cache contains a different cache type")
+            let telemetry: KVTunerKVCacheTelemetry
+            do {
+                telemetry = try KVTunerKVCacheTelemetry.capture(
+                    selection: selection, caches: affineCaches)
+            } catch {
+                preconditionFailure(
+                    "KVTuner scoring telemetry mismatch: \(error)")
+            }
+            if maximumKVTunerScoringTelemetry[selection].map({
+                telemetry.capacityTokens > $0.capacityTokens
+            }) ?? true {
+                maximumKVTunerScoringTelemetry[selection] = telemetry
+            }
+        case .kvtunerCandidate:
+            preconditionFailure(
+                "KVTuner candidates are unavailable to generic scoring paths")
+        case .turboQuant:
+            guard let tq = cache.first as? TurboQuantKVCache, tq.offset >= minTokens else {
+                preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
+            }
+        case .kvarn(let cell):
+            guard let kvarn = cache.first as? KVarNKVCache,
+                kvarn.offset >= minTokens
+            else {
+                preconditionFailure("KVarN tier requested but the KVarN scoring cache did not engage")
+            }
+            let kvarnCaches = cache.compactMap { $0 as? KVarNKVCache }
+            precondition(
+                kvarnCaches.count == cache.count,
+                "KVarN scoring cache contains a different cache type")
+            let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+            precondition(
+                telemetry.tier == cell.tier
+                    && telemetry.iterations == cell.iterations
+                    && telemetry.executionMode == .uncompiledCorrectness,
+                "KVarN scoring telemetry does not match its requested runtime cell")
+            if maximumKVarNScoringTelemetry[cell].map({
+                telemetry.capacityTokens > $0.capacityTokens
+            }) ?? true {
+                maximumKVarNScoringTelemetry[cell] = telemetry
+            }
         }
+    }
+
+    func affineScoringTelemetry() -> AffineKVCacheTelemetry? {
+        maximumAffineScoringTelemetry
+    }
+
+    func kvtunerScoringTelemetry(
+        for selection: KVTunerRuntimeSelection
+    ) -> KVTunerKVCacheTelemetry? {
+        maximumKVTunerScoringTelemetry[selection]
+    }
+
+    func kvarnScoringTelemetry(
+        for cell: KVarNKVRuntimeCell
+    ) -> KVarNKVCacheTelemetry? {
+        maximumKVarNScoringTelemetry[cell]
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -222,7 +562,8 @@ struct SwiftEngineDriver: EngineDriver {
                 engagement: .init(counts),
                 acceptanceRate: out.stats.acceptanceRate,
                 submitTime: out.submitTime,
-                tokenTimes: out.tokenTimes)
+                tokenTimes: out.tokenTimes,
+                prefillDurationSeconds: out.prefillDurationSeconds)
         }
         let out = await engine.generate(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
         var counts = ["decode": out.tokens.count]
@@ -231,17 +572,124 @@ struct SwiftEngineDriver: EngineDriver {
             // engagement marker (delta-checked by `verify`; absent on fp16 runs).
             counts["turboquant_tokens"] = tq
         }
+        if let affine = out.affineTelemetry {
+            counts["affine_tokens"] = affine.cachedTokens
+            counts["affine_layers"] = affine.layerCount
+            counts["affine_capacity_tokens"] = affine.capacityTokens
+            counts["affine_payload_bytes"] = affine.payloadBytes
+            counts["affine_metadata_bytes"] = affine.metadataBytes
+            counts["affine_control_bytes"] = affine.controlBytes
+            counts["affine_workspace_bytes"] = affine.materializationWorkspaceBytes
+        }
+        if let kvtuner = out.kvtunerTelemetry {
+            counts["kvtuner_tokens"] = kvtuner.cachedTokens
+            counts["kvtuner_layers"] = kvtuner.layerCount
+            counts["kvtuner_capacity_tokens"] = kvtuner.capacityTokens
+            counts["kvtuner_payload_bytes"] = kvtuner.payloadBytes
+            counts["kvtuner_metadata_bytes"] = kvtuner.metadataBytes
+            counts["kvtuner_control_bytes"] = kvtuner.controlBytes
+            counts["kvtuner_workspace_bytes"] =
+                kvtuner.materializationWorkspaceBytes
+        }
+        if let kvarn = out.kvarnTelemetry {
+            counts["kvarn_tokens"] = kvarn.cachedTokens
+            counts["kvarn_layers"] = kvarn.layerCount
+            counts["kvarn_capacity_tokens"] = kvarn.capacityTokens
+            counts["kvarn_completed_tiles"] = kvarn.completedTileCount
+            counts["kvarn_compressed_tokens"] = kvarn.compressedTokens
+            counts["kvarn_payload_bytes"] = kvarn.payloadBytes
+            counts["kvarn_metadata_bytes"] = kvarn.metadataBytes
+            counts["kvarn_alignment_padding_bytes"] = kvarn.alignmentPaddingBytes
+            counts["kvarn_fp16_sink_bytes"] = kvarn.fp16SinkBytes
+            counts["kvarn_fp16_tail_bytes"] = kvarn.fp16TailBytes
+            counts["kvarn_control_bytes"] = kvarn.controlBytes
+            counts["kvarn_workspace_bytes"] = kvarn.materializationWorkspaceBytes
+            counts["kvarn_codec_iterations"] = kvarn.iterations
+            counts["kvarn_uncompiled_correctness"] =
+                kvarn.executionMode == .uncompiledCorrectness ? 1 : 0
+        }
         return RunResult(
             tokens: out.tokens,
             engagement: .init(counts),
             acceptanceRate: nil, // plain (non-speculative) decode
             submitTime: out.submitTime,
-            tokenTimes: out.tokenTimes)
+            tokenTimes: out.tokenTimes,
+            prefillDurationSeconds: out.prefillDurationSeconds)
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
         let kind = try Self.cacheKind(config, allowSpec: false)
         return await engine.logprobs(prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind)
+    }
+
+    func taskChoiceLogits(
+        prompt: [Int], config: RunConfig
+    ) async throws -> TaskChoiceLogitsResult {
+        guard !prompt.isEmpty else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "empty task-scoring prompt")
+        }
+        guard config.maxTokens == 1 else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "maxTokens=\(config.maxTokens) on one-position task scoring")
+        }
+        let kind = try Self.cacheKind(config, allowSpec: false)
+        if case .turboQuant = kind {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "TurboQuant has no authenticated task-coherence cell")
+        }
+        return await engine.taskChoiceLogits(prompt: prompt, kvCache: kind)
+    }
+
+    /// Private, policy-typed qualification seam. Unlike `generate(config:)`, there is no string
+    /// parsing or user-selectable dial route which could execute an unevaluated candidate.
+    func evaluateKVTunerCandidateCohort(
+        prompts: [[Int]],
+        maxTokens: Int,
+        policy: KVTunerCandidateRuntimePolicy
+    ) async throws -> [KVTunerCandidateRunResult] {
+        guard !prompts.isEmpty,
+            prompts.allSatisfy({ !$0.isEmpty })
+        else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "empty KVTuner candidate cohort or prompt")
+        }
+        guard maxTokens > 0 else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner candidate maxTokens=\(maxTokens)")
+        }
+        return try await engine.evaluateKVTunerCandidateCohort(
+            prompts: prompts,
+            maxTokens: maxTokens,
+            policy: policy)
+    }
+
+    /// Qualification-only sensitivity capture. Canonical cardinality and group sizes are
+    /// enforced before entering the actor so partial or unsupported experiments cannot be
+    /// serialized as protocol evidence.
+    func captureKVTunerSensitivity(
+        prompts: [[Int]],
+        groupSize: Int,
+        expectedRuntimeIdentity: KVTunerCandidateRuntimeIdentity
+    ) async throws -> [KVTunerSensitivitySample] {
+        guard prompts.count
+                == KVTunerSensitivityArtifact.requiredSensitivityPromptCount
+        else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner sensitivity prompt count=\(prompts.count)")
+        }
+        guard prompts.allSatisfy({ !$0.isEmpty }) else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "empty KVTuner sensitivity prompt")
+        }
+        guard [64, 128].contains(groupSize) else {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVTuner sensitivity groupSize=\(groupSize)")
+        }
+        return try await engine.captureKVTunerSensitivity(
+            promptTokenIDs: prompts,
+            groupSize: groupSize,
+            expectedRuntimeIdentity: expectedRuntimeIdentity)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], config: RunConfig) async throws -> [[Float]] {
@@ -255,9 +703,25 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, forced: forcedContinuation, positions: positions, kvCache: kind)
     }
 
-    /// Validates the whole config and maps `kvQuant` to a cache kind. nil/"fp16" → fp16;
-    /// "tq2.5"/"tq3.5" (or "tqB2"/"tqB3") → the TurboQuant cache. Anything else throws —
-    /// a "measurement" must never silently measure something other than what was asked for.
+    func affineScoringTelemetry() async -> AffineKVCacheTelemetry? {
+        await engine.affineScoringTelemetry()
+    }
+
+    func kvtunerScoringTelemetry(
+        for selection: KVTunerRuntimeSelection
+    ) async -> KVTunerKVCacheTelemetry? {
+        await engine.kvtunerScoringTelemetry(for: selection)
+    }
+
+    func kvarnScoringTelemetry(
+        for cell: KVarNKVRuntimeCell
+    ) async -> KVarNKVCacheTelemetry? {
+        await engine.kvarnScoringTelemetry(for: cell)
+    }
+
+    /// Validates the whole config and maps `kvQuant` through `KVCacheKind`'s closed affine /
+    /// KVarN / TurboQuant allowlist. Anything else throws — a measurement must never silently
+    /// run a different cache from the one requested.
     /// The scoring paths pass `allowSpec: false`: speculation changes how a decode loop steps,
     /// not what a teacher-forced forward scores, so a spec config there is a caller bug.
     private static func cacheKind(_ config: RunConfig, allowSpec: Bool = true) throws -> KVCacheKind {
@@ -267,16 +731,27 @@ struct SwiftEngineDriver: EngineDriver {
         if !allowSpec, let spec = config.specDecode {
             throw SwiftEngineDriverError.unsupportedConfig("specDecode=\(spec) on a scoring path (decode-only feature)")
         }
+        if let selection = config.kvtunerSelection {
+            guard config.kvQuant == selection.cellID else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "KVTuner selection cell \(selection.cellID) != kvQuant=\(config.kvQuant ?? "nil")")
+            }
+            return .kvtuner(selection)
+        }
+        if config.kvQuant?.hasPrefix("kvtuner-") == true {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "kvQuant=\(config.kvQuant!) requires an authenticated KVTuner selection")
+        }
         guard let kind = KVCacheKind(kvQuant: config.kvQuant) else {
             throw SwiftEngineDriverError.unsupportedConfig(
-                "kvQuant=\(config.kvQuant ?? "nil") (known tiers: fp16, tq2.5/tqB2, tq3.5/tqB3)")
+                "kvQuant=\(config.kvQuant ?? "fp16") (unknown tier)")
         }
         return kind
     }
 
     /// Maps `RunConfig.specDecode` to the engine's spec-decode configuration. nil → plain decode;
     /// "pld" → prompt-lookup drafter with the config's ngram/K/compile-strategy knobs. Unknown
-    /// drafters and unmeasured tier combinations (spec + TurboQuant KV) fail loudly.
+    /// drafters and every unmeasured spec + lossy-KV combination fail loudly.
     private static func specConfig(_ config: RunConfig) throws -> SpecDecodeConfig? {
         guard let spec = config.specDecode else { return nil }
         guard spec == "pld" else {
@@ -298,20 +773,62 @@ struct SwiftEngineDriver: EngineDriver {
 /// The (Sendable) tokenizer is bound into its own local BEFORE `ctx.model` is sent into the
 /// actor init — detaching it from the region that transfers — so CPU-side encode/decode stays
 /// usable afterward (same region discipline as the spike's `loadActor`).
-func loadSwiftDriver(modelPath: String) async throws -> (driver: SwiftEngineDriver, tokenizer: MLXLMCommon.Tokenizer, eos: Int) {
+func captureKVTunerQualificationRuntimeSourceSnapshot(
+    modelPath: String
+) throws -> KVTunerCandidateRuntimeSourceSnapshot {
+    let modelDirectory = URL(fileURLWithPath: modelPath)
+    return try KVTunerCandidateRuntimeSourceSnapshot.load(
+        exactModelConfigData: Data(
+            contentsOf: modelDirectory.appendingPathComponent("config.json")),
+        checkpointManifestHash: try ProvenanceCLI.checkpointManifestHash(
+            at: modelPath),
+        tokenizerSHA256: try ProvenanceCLI.tokenizerManifestSHA256(
+            at: modelPath))
+}
+
+func loadSwiftDriver(
+    modelPath: String,
+    requireKVTunerQualificationIdentity: Bool = false
+) async throws -> (
+    driver: SwiftEngineDriver,
+    tokenizer: MLXLMCommon.Tokenizer,
+    eos: Int
+) {
     // Bound MLX's buffer cache for the measurement process. The default cache limit tracks the
     // (raised) GPU memory limit, so unreusable transients can hoard tens of GB before anything
     // evicts — and the harness runs a Python reference process with its own allocator on the
     // same box. 8GB is far above any measurement path's steady-state reuse working set (decode
     // transients are MBs; a scoring chunk's logits are ~150MB) but keeps two co-resident
     // processes comfortably inside physical RAM. harness_reference.py sets the same bound.
-    Memory.cacheLimit = 8 << 30
+    Memory.cacheLimit =
+        KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes
+    let sourceIdentityBeforeLoad = requireKVTunerQualificationIdentity
+        ? try captureKVTunerQualificationRuntimeSourceSnapshot(
+            modelPath: modelPath)
+        : nil
     let ctx = try await loadModel(
         from: URL(fileURLWithPath: modelPath),
         using: #huggingFaceTokenizerLoader()
     )
     let tokenizer = ctx.tokenizer
     let eos = tokenizer.eosToken.flatMap { tokenizer.convertTokenToId($0) } ?? -1
-    let engine = HarnessEngineActor(model: ctx.model)
+    let runtimeIdentity: KVTunerCandidateRuntimeIdentity?
+    if let sourceIdentityBeforeLoad {
+        let sourceIdentityAfterLoad = try
+            captureKVTunerQualificationRuntimeSourceSnapshot(
+                modelPath: modelPath)
+        let stableSourceIdentity = try
+            KVTunerCandidateRuntimeSourceSnapshot.validateUnchanged(
+                before: sourceIdentityBeforeLoad,
+                after: sourceIdentityAfterLoad)
+        runtimeIdentity = try KVTunerCandidateRuntimeIdentity.load(
+            sourceSnapshot: stableSourceIdentity,
+            eosTokenID: eos)
+    } else {
+        runtimeIdentity = nil
+    }
+    let engine = HarnessEngineActor(
+        model: ctx.model,
+        kvtunerRuntimeIdentity: runtimeIdentity)
     return (SwiftEngineDriver(engine: engine, eos: eos), tokenizer, eos)
 }

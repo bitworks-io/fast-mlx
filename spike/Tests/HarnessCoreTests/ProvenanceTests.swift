@@ -1,4 +1,5 @@
 import XCTest
+import Dispatch
 @testable import HarnessCore
 
 final class ProvenanceTests: XCTestCase {
@@ -107,6 +108,125 @@ final class ProvenanceTests: XCTestCase {
         XCTAssertNotEqual(a, b, "nonce differs -> encoded record must differ")
     }
 
+    func testRequiredWriterAppendsCompleteDurableJSONLines() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("evidence.jsonl")
+        let a = ResultRecord(
+            subcommand: "kl", provenance: sampleProvenance(nonce: "n1"),
+            payload: SamplePayload(klMedian: 0.1, positions: 1))
+        let b = ResultRecord(
+            subcommand: "kl", provenance: sampleProvenance(nonce: "n2"),
+            payload: SamplePayload(klMedian: 0.2, positions: 2))
+
+        try RequiredJSONLWriter.append(a, to: url)
+        try RequiredJSONLWriter.append(b, to: url)
+
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(contents.hasSuffix("\n"))
+        let lines = contents.split(separator: "\n")
+        XCTAssertEqual(lines.count, 2)
+        for line in lines {
+            XCTAssertNoThrow(try JSONSerialization.jsonObject(with: Data(line.utf8)))
+        }
+    }
+
+    func testRequiredWriterRefusesToAppendAfterCorruptPartialLine() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("evidence.jsonl")
+        try Data("partial".utf8).write(to: url)
+        let record = ResultRecord(
+            subcommand: "kl", provenance: sampleProvenance(),
+            payload: SamplePayload(klMedian: 0.1, positions: 1))
+
+        XCTAssertThrowsError(try RequiredJSONLWriter.append(record, to: url))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "partial")
+    }
+
+    func testRequiredWriterRefusesMalformedCompleteExistingLine() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("evidence.jsonl")
+        try Data("garbage\n".utf8).write(to: url)
+        let record = ResultRecord(
+            subcommand: "kl", provenance: sampleProvenance(),
+            payload: SamplePayload(klMedian: 0.1, positions: 1))
+
+        XCTAssertThrowsError(try RequiredJSONLWriter.append(record, to: url)) {
+            XCTAssertEqual(
+                $0 as? RequiredJSONLWriterError,
+                .malformedExistingLine(line: 1))
+        }
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "garbage\n")
+    }
+
+    func testRequiredWriterRefusesJSONThatIsNotAResultRecordEnvelope() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("evidence.jsonl")
+        try Data("{}\n".utf8).write(to: url)
+        let record = ResultRecord(
+            subcommand: "kl", provenance: sampleProvenance(),
+            payload: SamplePayload(klMedian: 0.1, positions: 1))
+
+        XCTAssertThrowsError(try RequiredJSONLWriter.append(record, to: url)) {
+            XCTAssertEqual(
+                $0 as? RequiredJSONLWriterError,
+                .malformedExistingLine(line: 1))
+        }
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), "{}\n")
+    }
+
+    func testRequiredWriterSerializesConcurrentAppendsWithoutLosingRows() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("evidence.jsonl")
+        let writes = 128
+        let template = sampleProvenance()
+
+        DispatchQueue.concurrentPerform(iterations: writes) { index in
+            let provenance = Provenance(
+                date: template.date, hardwareChip: template.hardwareChip,
+                hardwareRAMBytes: template.hardwareRAMBytes,
+                hardwareOS: template.hardwareOS,
+                harnessGitSHA: template.harnessGitSHA,
+                mlxSwiftVersion: template.mlxSwiftVersion,
+                referenceMLXVersion: template.referenceMLXVersion,
+                referenceMLXLMVersion: template.referenceMLXLMVersion,
+                modelPath: template.modelPath,
+                modelConfigHash: template.modelConfigHash,
+                modelCheckpointManifestHash: template.modelCheckpointManifestHash,
+                modelQuant: template.modelQuant,
+                corpusId: template.corpusId,
+                corpusContentHash: template.corpusContentHash,
+                nonce: "n\(index)")
+            let record = ResultRecord(
+                subcommand: "kl", provenance: provenance,
+                payload: SamplePayload(klMedian: Double(index), positions: index + 1))
+            try! RequiredJSONLWriter.append(record, to: url)
+        }
+
+        let data = try Data(contentsOf: url)
+        XCTAssertEqual(data.last, 0x0a)
+        let records = try data.split(separator: 0x0a).map {
+            try JSONDecoder().decode(ResultRecord<SamplePayload>.self, from: Data($0))
+        }
+        XCTAssertEqual(records.count, writes)
+        XCTAssertEqual(Set(records.map(\.provenance.nonce)).count, writes)
+        XCTAssertEqual(Set(records.map(\.payload.positions)).count, writes)
+    }
+
     // MARK: harness git SHA resolution (deployed hosts have no .git; the deploy step writes
     // a .harness-sha file the binary reads — env var stays the explicit override)
 
@@ -116,9 +236,16 @@ final class ProvenanceTests: XCTestCase {
             "aaa111")
     }
 
-    func testSHAResolutionFallsBackToShaFileThenGit() {
-        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: "bbb222\n", gitOutput: "ccc333"), "bbb222")
+    func testSHAResolutionFallsBackToShaFileWhenLiveGitIsUnavailable() {
+        XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: "bbb222\n", gitOutput: nil), "bbb222")
         XCTAssertEqual(resolveHarnessGitSHA(env: nil, shaFile: nil, gitOutput: "ccc333\n"), "ccc333")
+    }
+
+    func testSHAResolutionPrefersLiveGitOverStaleDeployedStamp() {
+        XCTAssertEqual(
+            resolveHarnessGitSHA(
+                env: nil, shaFile: "stale-stamp\n", gitOutput: "live-head-dirty\n"),
+            "live-head-dirty")
     }
 
     func testSHAResolutionTrimsAndRejectsEmptyOrMultilineValues() {

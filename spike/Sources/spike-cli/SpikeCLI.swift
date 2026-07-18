@@ -263,6 +263,9 @@ struct SpikeCLI {
                 cancelAfter: flags.int("cancel-after", default: 2),
                 prefillChunkSize: flags.int("prefill-chunk", default: 16))
 
+        case "kvarn-memory-probe":
+            kvarnMemoryProbe(flags: flags)
+
         default:
             print("spike ok: \(Spike.ok)")
         }

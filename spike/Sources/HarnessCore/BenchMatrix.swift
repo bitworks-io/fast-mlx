@@ -3,6 +3,13 @@ import Foundation
 public enum Workload: String, Sendable, CaseIterable { case prefill, decode, echo, code }
 public enum Mode: String, Sendable, CaseIterable { case none, pld, dspark }
 
+/// Audited first-party prompt used by the batch-1 runtime frontier. KVTuner permits only this
+/// source because an arbitrary prompt cannot truthfully assert disjoint upstream source rows.
+public let defaultBenchPrompt =
+    "Explain in at least 250 words how continuous batching improves LLM serving throughput. "
+    + "Cover request scheduling, chunked prefill, decode interleaving, fairness, memory pressure, "
+    + "and cancellation."
+
 public struct Cell: Sendable, Hashable {
     public let workload: Workload
     public let mode: Mode
@@ -31,6 +38,134 @@ public func aggregateRates(_ rates: [Double?]) -> RateAggregate {
 /// understate decode cost (backlog methodology: never bench a cached prefix as if it were cold).
 public func saltPrompt(run: Int, nonce: String, _ basePrompt: String) -> String {
     "\(basePrompt) [run=\(run) nonce=\(nonce)]"
+}
+
+public enum BenchWorkloadIdentityError: Error, Sendable, Equatable {
+    case invalidNonce
+    case invalidIterations
+}
+
+/// Exact prompt set shared across separately launched KV-tier measurements. An explicit nonce is
+/// part of durable evidence so every cell can replay identical cold, salted prompt bytes.
+public struct BenchWorkloadIdentity: Sendable, Equatable {
+    public let basePrompt: String
+    public let nonce: String
+    public let iterations: Int
+
+    public init(basePrompt: String, nonce: String, iterations: Int) throws {
+        guard iterations > 0 else {
+            throw BenchWorkloadIdentityError.invalidIterations
+        }
+        do {
+            _ = try ServiceWorkloadIdentity(nonce: nonce)
+        } catch {
+            throw BenchWorkloadIdentityError.invalidNonce
+        }
+        self.basePrompt = basePrompt
+        self.nonce = nonce
+        self.iterations = iterations
+    }
+
+    public func prompt(run: Int) -> String {
+        precondition((0..<iterations).contains(run), "bench run outside workload identity")
+        return saltPrompt(run: run, nonce: nonce, basePrompt)
+    }
+
+    public var prompts: [String] {
+        (0..<iterations).map(prompt(run:))
+    }
+}
+
+/// Direct prefill rate from the actor-timed `decoder.prefill` span. This never derives prefill
+/// from TTFT, which also contains first-token bookkeeping and is a distinct latency metric.
+public func prefillTokensPerSecond(
+    promptTokens: Int,
+    durationSeconds: Double
+) -> Double? {
+    guard promptTokens > 0, durationSeconds.isFinite, durationSeconds > 0 else {
+        return nil
+    }
+    return Double(promptTokens) / durationSeconds
+}
+
+public enum BenchMemoryEvidenceError: Error, Sendable, Equatable {
+    case invalidRunSampleCount(Int)
+    case emptyRuns
+}
+
+/// Raw, recomputable process/MLX memory evidence for one post-warmup batch-1 run. Exactly two
+/// samples are retained: immediately before generation (after resetting MLX's peak counter) and
+/// immediately after cache telemetry has been captured. Whole-process maximum RSS remains an
+/// independent per-process runner artifact because endpoint sampling cannot observe transients.
+public struct BenchRunMemoryEvidence: Sendable, Codable, Equatable {
+    public let samples: [ServiceMemorySample]
+    public let summary: ServiceMemorySummary
+
+    public init(samples: [ServiceMemorySample]) throws {
+        guard samples.count == 2 else {
+            throw BenchMemoryEvidenceError.invalidRunSampleCount(
+                samples.count)
+        }
+        self.samples = samples
+        self.summary = try summarizeServiceMemory(samples)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case samples
+        case summary
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let samples = try container.decode(
+            [ServiceMemorySample].self, forKey: .samples)
+        let claimedSummary = try container.decode(
+            ServiceMemorySummary.self, forKey: .summary)
+        let derived = try BenchRunMemoryEvidence(samples: samples)
+        guard claimedSummary == derived.summary else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .summary,
+                in: container,
+                debugDescription:
+                    "bench memory summary does not match its raw samples")
+        }
+        self = derived
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(samples, forKey: .samples)
+        try container.encode(summary, forKey: .summary)
+    }
+}
+
+/// Headline reducer used only for display/adjudication. Durable evidence keeps every run above,
+/// so all maxima remain independently recomputable rather than trusting these convenience fields.
+public struct BenchMemoryAggregate: Sendable, Equatable {
+    public let measuredRuns: Int
+    public let maxSampledPhysicalFootprintBytes: UInt64
+    public let maxMLXActiveBytes: Int
+    public let maxMLXCacheBytes: Int
+    public let maxMLXPeakBytes: Int
+
+    public init(runs: [BenchRunMemoryEvidence]) throws {
+        guard !runs.isEmpty else {
+            throw BenchMemoryEvidenceError.emptyRuns
+        }
+        measuredRuns = runs.count
+        maxSampledPhysicalFootprintBytes = runs.map {
+            $0.summary.maxSampledFootprintBytes
+        }.max()!
+        maxMLXActiveBytes = runs.map {
+            $0.summary.maxMLXActiveBytes
+        }.max()!
+        maxMLXCacheBytes = runs.map {
+            $0.summary.maxMLXCacheBytes
+        }.max()!
+        maxMLXPeakBytes = runs.map {
+            $0.summary.maxMLXPeakBytes
+        }.max()!
+    }
 }
 
 public enum ServiceWorkloadIdentityError: Error, Sendable, Equatable {
@@ -89,17 +224,65 @@ public struct BenchRow: Sendable {
     public let quant: String
     public let concurrency: Int
     public let hardware: String
+    public let prefillTokS: Double?
+    public let prefillMs: Double?
+    public let promptTokensMin: Int?
+    public let promptTokensMax: Int?
+    public let kvQuantTier: String?
+    public let matrixID: String?
+    public let cellID: String?
+    public let workloadNonce: String?
+    public let kvtunerScheduleSHA256: String?
+    public let kvtunerBundleSHA256: String?
 
-    public init(label: String, workload: Workload, mode: Mode, model: String, decodeTokS: Double, ttftMs: Double, quant: String, concurrency: Int, hardware: String) {
+    public init(
+        label: String, workload: Workload, mode: Mode, model: String,
+        decodeTokS: Double, ttftMs: Double, quant: String,
+        concurrency: Int, hardware: String,
+        prefillTokS: Double? = nil, prefillMs: Double? = nil,
+        promptTokensMin: Int? = nil, promptTokensMax: Int? = nil,
+        kvQuantTier: String? = nil, matrixID: String? = nil,
+        cellID: String? = nil, workloadNonce: String? = nil,
+        kvtunerScheduleSHA256: String? = nil,
+        kvtunerBundleSHA256: String? = nil
+    ) {
         self.label = label; self.workload = workload; self.mode = mode; self.model = model
         self.decodeTokS = decodeTokS; self.ttftMs = ttftMs; self.quant = quant; self.concurrency = concurrency
         self.hardware = hardware
+        self.prefillTokS = prefillTokS; self.prefillMs = prefillMs
+        self.promptTokensMin = promptTokensMin; self.promptTokensMax = promptTokensMax
+        self.kvQuantTier = kvQuantTier; self.matrixID = matrixID
+        self.cellID = cellID; self.workloadNonce = workloadNonce
+        self.kvtunerScheduleSHA256 = kvtunerScheduleSHA256
+        self.kvtunerBundleSHA256 = kvtunerBundleSHA256
     }
 
-    public static let csvHeader = "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency,hardware"
+    public static let csvHeader =
+        "label,workload,mode,model,decode_tok_s,ttft_ms,quant,concurrency,hardware"
+        + ",prefill_tok_s,prefill_ms,prompt_tokens_min,prompt_tokens_max"
+        + ",kv_quant_tier,matrix_id,cell_id,workload_nonce"
+        + ",kvtuner_schedule_sha256,kvtuner_bundle_sha256"
 
     public var csvLine: String {
-        "\(label),\(workload.rawValue),\(mode.rawValue),\(model),\(decodeTokS),\(ttftMs),\(quant),\(concurrency),\(hardware)"
+        let prefillTokSText = prefillTokS.map { String($0) } ?? ""
+        let prefillMsText = prefillMs.map { String($0) } ?? ""
+        let promptTokensMinText = promptTokensMin.map { String($0) } ?? ""
+        let promptTokensMaxText = promptTokensMax.map { String($0) } ?? ""
+        let directPrefill = [
+            prefillTokSText,
+            prefillMsText,
+            promptTokensMinText,
+            promptTokensMaxText,
+        ].joined(separator: ",")
+        let runtimeIdentity = [
+            kvQuantTier ?? "",
+            matrixID ?? "",
+            cellID ?? "",
+            workloadNonce ?? "",
+            kvtunerScheduleSHA256 ?? "",
+            kvtunerBundleSHA256 ?? "",
+        ].joined(separator: ",")
+        return "\(label),\(workload.rawValue),\(mode.rawValue),\(model),\(decodeTokS),\(ttftMs),\(quant),\(concurrency),\(hardware),\(directPrefill),\(runtimeIdentity)"
     }
 }
 

@@ -46,7 +46,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SpikeCoreTests",
-            dependencies: ["SpikeCore"],
+            dependencies: [
+                "SpikeCore",
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // HarnessCore is PURE — NO MLX/SpikeCore dependency — so it (and HarnessCoreTests) build+test off-box with `swift test`.
@@ -72,6 +75,22 @@ let package = Package(
         .testTarget(
             name: "HarnessCoreTests",
             dependencies: ["HarnessCore"],
+            resources: [.process("Fixtures")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // MLX-coupled harness orchestration tests. These must run through Xcode on the bench Mac
+        // so the mlx-swift package plugin emits the required Metal library.
+        .testTarget(
+            name: "FastMLXHarnessTests",
+            dependencies: [
+                "fastmlx-harness",
+                "HarnessCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // MLX-free by design: real host introspection (sysctlbyname, Metal) so the capacity

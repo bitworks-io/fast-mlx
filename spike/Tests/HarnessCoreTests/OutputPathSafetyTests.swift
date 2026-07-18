@@ -58,6 +58,27 @@ final class OutputPathSafetyTests: XCTestCase {
         XCTAssertTrue(outputPathIsSymbolicLink(link.path))
     }
 
+    func testDetectsNonexistentLeafAliasesThroughSymlinkedParent() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let realParent = directory.appendingPathComponent(
+            "real", isDirectory: true)
+        let aliasParent = directory.appendingPathComponent(
+            "alias", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: realParent,
+            withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: aliasParent,
+            withDestinationURL: realParent)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let direct = realParent.appendingPathComponent("evidence.jsonl")
+        let alias = aliasParent.appendingPathComponent("evidence.jsonl")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: direct.path))
+        XCTAssertTrue(outputPathsReferToSameFile(direct.path, alias.path))
+    }
+
     func testDistinctPathsOnTheSameVolumeRemainDistinct() {
         XCTAssertFalse(
             outputPathsReferToSameFile(

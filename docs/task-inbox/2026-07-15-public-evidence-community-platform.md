@@ -10,6 +10,16 @@ implementation_ready: false
 
 # Public evidence, community, benchmark automation, and release platform
 
+## 2026-07-18 owner policy override
+
+Competitor performance and feature analysis is a **private internal litmus** and will not be
+published. This override supersedes every older reference below to public head-to-head rows,
+`REPRODUCED EXTERNAL` publication, public competitor matrices, or a website comparison across
+engines. The public evidence schema, site, feeds, and community surfaces may publish fast-mlx's own
+reproducible results only. Same-box oMLX, mlx-serve, MLX-LM, or other-engine reproduction may still
+run privately to inform engineering priorities, but its artifacts must remain outside the public
+projection and publication pipeline.
+
 ## Raw Capture
 
 > Do a review of omlx.ai website, the community engagement and benchmarks is great, along with
@@ -24,10 +34,10 @@ implementation_ready: false
 
 ## Decision context
 
-The dated
+The dated, private-internal
 [`oMLX public ecosystem review`](../reference/2026-07-15-omlx-public-ecosystem-review.md) is the
 research input. The core decision is to reproduce oMLX's strongest loop—easy install, visible
-proof, community measurement, shareable comparisons, active releases—while making fast-mlx's
+proof, community measurement, shareable fast-mlx results, active releases—while making fast-mlx's
 measured speed-versus-loss dial and dated verdicts the differentiator.
 
 This is a **parallel product/platform lane**, not a replacement for the performance flywheel in

@@ -11,13 +11,20 @@ public struct RunConfig: Sendable, Hashable {
     /// padded to K so the trace replays), false/nil = uncompiled verify forward. The locked
     /// decision is "choose on-box — measure both", so the harness can select either.
     public var specCompiledVerify: Bool?
-    public var kvQuant: String?      // "fp16" | "8" | "turbo4" | nil
+    /// Canonical engine KV-cache tier (`nil`/`fp16`, named affine/KVarN cell, or TurboQuant tier).
+    /// The engine parser owns the closed allowlist and rejects unknown spellings.
+    public var kvQuant: String?
+    /// Authenticated immutable KVTuner policy. Its exact artifact digest participates in the
+    /// runtime cache key; a cell spelling alone is never enough to select heterogeneous layers.
+    public var kvtunerSelection: KVTunerRuntimeSelection?
     public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
                 specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
-                kvQuant: String? = nil) {
+                kvQuant: String? = nil,
+                kvtunerSelection: KVTunerRuntimeSelection? = nil) {
         self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode
         self.specNgram = specNgram; self.specMaxDraft = specMaxDraft
         self.specCompiledVerify = specCompiledVerify; self.kvQuant = kvQuant
+        self.kvtunerSelection = kvtunerSelection
     }
     public static func greedy(maxTokens: Int) -> RunConfig { .init(temperature: 0, maxTokens: maxTokens) }
 }
@@ -30,10 +37,14 @@ public struct RunResult: Sendable {
     public var acceptanceRate: Double?     // for spec-decode runs; nil otherwise
     public var submitTime: Double
     public var tokenTimes: [Double]
+    /// Direct wall time spent inside `decoder.prefill`; nil for untimed/reference drivers.
+    public var prefillDurationSeconds: Double?
     public init(tokens: [Int], engagement: EngagementCounters = .init(), acceptanceRate: Double? = nil,
-                submitTime: Double = 0, tokenTimes: [Double] = []) {
+                submitTime: Double = 0, tokenTimes: [Double] = [],
+                prefillDurationSeconds: Double? = nil) {
         self.tokens = tokens; self.engagement = engagement; self.acceptanceRate = acceptanceRate
         self.submitTime = submitTime; self.tokenTimes = tokenTimes
+        self.prefillDurationSeconds = prefillDurationSeconds
     }
 }
 

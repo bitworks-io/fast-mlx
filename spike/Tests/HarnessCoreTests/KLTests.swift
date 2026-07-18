@@ -43,6 +43,26 @@ final class KLTests: XCTestCase {
     XCTAssertTrue(kl.isFinite, "expected finite KL, got \(kl)")
     XCTAssertEqual(kl, 0.6931, accuracy: 1e-3)
   }
+  func testTeacherForcedTop1AgreementComparesCandidateAndReferenceRows() throws {
+    let agreement = try teacherForcedTop1Agreement(
+      candidate: [[0, 3, 1], [4, 0, 1], [0, 2, 1]],
+      reference: [[0, 2, 1], [0, 4, 1], [0, 3, 1]])
+    XCTAssertEqual(agreement.matches, 2)
+    XCTAssertEqual(agreement.scoredPositions, 3)
+    XCTAssertEqual(agreement.rate, 2.0 / 3.0, accuracy: 1e-12)
+  }
+  func testTeacherForcedTop1AgreementRejectsShapeMismatch() {
+    XCTAssertThrowsError(try teacherForcedTop1Agreement(
+      candidate: [[0, 1]], reference: [[0, 1], [1, 0]]))
+    XCTAssertThrowsError(try teacherForcedTop1Agreement(
+      candidate: [[0, 1]], reference: [[0, 1, 2]]))
+  }
+  func testTeacherForcedTop1AgreementRejectsNonFiniteLogits() {
+    XCTAssertThrowsError(try teacherForcedTop1Agreement(
+      candidate: [[0, .nan]], reference: [[0, 1]]))
+    XCTAssertThrowsError(try teacherForcedTop1Agreement(
+      candidate: [[0, 1]], reference: [[0, .infinity]]))
+  }
   func testKLDivergenceMetricMeasuresMedianAcrossScriptedDrivers() async throws {
     // End-to-end coverage of KLDivergenceMetric.measure. logprobs are FULL-VOCAB, index ==
     // token id (per the EngineDriver contract), so index-aligned KL is meaningful here.

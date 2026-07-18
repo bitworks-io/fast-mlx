@@ -14,8 +14,8 @@ public func outputPathIsSymbolicLink(_ path: String) -> Bool {
 /// covers case variants that do not exist yet on the default case-insensitive APFS filesystem;
 /// waiting until both files exist is too late for append-only evidence and atomic progress files.
 public func outputPathsReferToSameFile(_ left: String, _ right: String) -> Bool {
-    let leftURL = URL(fileURLWithPath: left).standardizedFileURL.resolvingSymlinksInPath()
-    let rightURL = URL(fileURLWithPath: right).standardizedFileURL.resolvingSymlinksInPath()
+    let leftURL = canonicalOutputURL(left)
+    let rightURL = canonicalOutputURL(right)
     if leftURL == rightURL { return true }
 
     let leftCaseSensitive = volumeSupportsCaseSensitiveNames(containing: leftURL)
@@ -37,6 +37,26 @@ public func outputPathsReferToSameFile(_ left: String, _ right: String) -> Bool 
         return false
     }
     return leftDevice == rightDevice && leftInode == rightInode
+}
+
+/// `URL.resolvingSymlinksInPath()` does not resolve a symlinked parent when the final leaf does
+/// not exist. Walk to the nearest existing ancestor, resolve that object, then reattach the absent
+/// components so two future files under real/aliased parents compare identically before creation.
+private func canonicalOutputURL(_ path: String) -> URL {
+    let fileManager = FileManager.default
+    var candidate = URL(fileURLWithPath: path).standardizedFileURL
+    var missingComponents: [String] = []
+    while !fileManager.fileExists(atPath: candidate.path) {
+        let parent = candidate.deletingLastPathComponent()
+        guard parent.path != candidate.path else { break }
+        missingComponents.append(candidate.lastPathComponent)
+        candidate = parent
+    }
+    var resolved = candidate.resolvingSymlinksInPath().standardizedFileURL
+    for component in missingComponents.reversed() {
+        resolved.appendPathComponent(component)
+    }
+    return resolved.standardizedFileURL
 }
 
 private func volumeSupportsCaseSensitiveNames(containing url: URL) -> Bool? {

@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// FNV-1a 64-bit over raw bytes — the harness's one dependency-free (Foundation-only) content
 /// fingerprint, shared by `MeasurementCorpusLoader.contentHash` and the model-config hash below.
 /// Not cryptographic; the goal is stable "did this change" identity for provenance records.
@@ -41,12 +47,12 @@ public enum ModelQuantInfoLoader {
 }
 
 /// Pure precedence for resolving the harness git SHA (the I/O lives in the CLI): an explicit
-/// `HARNESS_GIT_SHA` env value wins; then the deploy-written `.harness-sha` file (rsync'd bench
-/// hosts have no `.git`, so the deploy step captures the SHA at sync time); then local
-/// `git rev-parse HEAD` output; "unknown" if none yields a usable value. A usable value is a
+/// `HARNESS_GIT_SHA` env value wins; then live Git output (which can carry a `-dirty` suffix);
+/// then the deploy-written `.harness-sha` file (rsync'd bench hosts have no `.git`, so the deploy
+/// step captures the SHA at sync time); "unknown" if none yields a usable value. A usable value is a
 /// single non-empty line after trimming — a multi-line value is an error message, not a SHA.
 public func resolveHarnessGitSHA(env: String?, shaFile: String?, gitOutput: String?) -> String {
-    for candidate in [env, shaFile, gitOutput] {
+    for candidate in [env, gitOutput, shaFile] {
         guard let candidate else { continue }
         let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.contains("\n") else { continue }
@@ -70,6 +76,7 @@ public struct Provenance: Sendable, Codable, Equatable {
     public let referenceMLXLMVersion: String?
     public let modelPath: String
     public let modelConfigHash: String          // fnv1a64 of the model's config.json bytes
+    public let modelCheckpointManifestHash: String?
     public let modelQuant: ModelQuantInfo
     public let corpusId: String?                // nil for subcommands that don't use the corpus
     public let corpusContentHash: String?
@@ -79,13 +86,17 @@ public struct Provenance: Sendable, Codable, Equatable {
         date: String, hardwareChip: String, hardwareRAMBytes: UInt64, hardwareOS: String,
         harnessGitSHA: String, mlxSwiftVersion: String,
         referenceMLXVersion: String?, referenceMLXLMVersion: String?,
-        modelPath: String, modelConfigHash: String, modelQuant: ModelQuantInfo,
+        modelPath: String, modelConfigHash: String,
+        modelCheckpointManifestHash: String? = nil,
+        modelQuant: ModelQuantInfo,
         corpusId: String?, corpusContentHash: String?, nonce: String
     ) {
         self.date = date; self.hardwareChip = hardwareChip; self.hardwareRAMBytes = hardwareRAMBytes
         self.hardwareOS = hardwareOS; self.harnessGitSHA = harnessGitSHA; self.mlxSwiftVersion = mlxSwiftVersion
         self.referenceMLXVersion = referenceMLXVersion; self.referenceMLXLMVersion = referenceMLXLMVersion
-        self.modelPath = modelPath; self.modelConfigHash = modelConfigHash; self.modelQuant = modelQuant
+        self.modelPath = modelPath; self.modelConfigHash = modelConfigHash
+        self.modelCheckpointManifestHash = modelCheckpointManifestHash
+        self.modelQuant = modelQuant
         self.corpusId = corpusId; self.corpusContentHash = corpusContentHash; self.nonce = nonce
     }
 }
@@ -123,5 +134,83 @@ public extension ResultRecord {
         guard let text = String(data: data, encoding: .utf8) else { throw JSONLError.notUTF8 }
         guard !text.contains("\n") else { throw JSONLError.containsNewline }
         return text
+    }
+}
+
+public enum RequiredJSONLWriterError: Error, Equatable, Sendable {
+    case nonFileURL
+    case destinationIsNotRegularFile
+    case unterminatedExistingFile
+    case malformedExistingLine(line: Int)
+    case ioFailure(operation: String, code: Int32)
+}
+
+/// Required, append-only evidence writer. It refuses to append after a partial/corrupt line and
+/// synchronizes successful writes before returning, so a promotion command cannot report success
+/// when its typed evidence was not durably preserved.
+public enum RequiredJSONLWriter {
+    public static func append<Payload: Codable & Sendable>(
+        _ record: ResultRecord<Payload>, to url: URL
+    ) throws {
+        guard url.isFileURL else { throw RequiredJSONLWriterError.nonFileURL }
+        let data = Data((try record.jsonLine() + "\n").utf8)
+
+        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return open(
+                path, O_RDWR | O_CREAT | O_APPEND | O_CLOEXEC | O_NOFOLLOW,
+                0o600)
+        }
+        guard descriptor >= 0 else {
+            let code = errno
+            if code == EISDIR || code == ELOOP {
+                throw RequiredJSONLWriterError.destinationIsNotRegularFile
+            }
+            throw RequiredJSONLWriterError.ioFailure(operation: "open", code: code)
+        }
+        defer { _ = close(descriptor) }
+
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw RequiredJSONLWriterError.ioFailure(
+                operation: "flock", code: errno)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            throw RequiredJSONLWriterError.ioFailure(
+                operation: "fstat", code: errno)
+        }
+        guard (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            throw RequiredJSONLWriterError.destinationIsNotRegularFile
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let end = try handle.seekToEnd()
+        if end > 0 {
+            try handle.seek(toOffset: end - 1)
+            guard try handle.read(upToCount: 1) == Data([0x0a]) else {
+                throw RequiredJSONLWriterError.unterminatedExistingFile
+            }
+            try handle.seek(toOffset: 0)
+            let existing = try handle.readToEnd() ?? Data()
+            let lines = existing.split(
+                separator: 0x0a, omittingEmptySubsequences: false).dropLast()
+            for (index, line) in lines.enumerated() {
+                guard !line.isEmpty,
+                    let object = try? JSONSerialization.jsonObject(with: Data(line)),
+                    let envelope = object as? [String: Any],
+                    envelope["subcommand"] is String,
+                    envelope["provenance"] is [String: Any],
+                    envelope.keys.contains("payload")
+                else {
+                    throw RequiredJSONLWriterError.malformedExistingLine(
+                        line: index + 1)
+                }
+            }
+        }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+        try handle.synchronize()
     }
 }

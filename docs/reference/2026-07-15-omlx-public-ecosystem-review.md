@@ -1,5 +1,12 @@
 # oMLX public ecosystem review — patterns for fast-mlx
 
+> **Private internal reference — owner policy updated 2026-07-18.** The external measurements and
+> comparative analysis in this artifact are engineering litmus only and must not be published as
+> fast-mlx product copy, benchmark rows, website comparisons, feeds, or release claims. Public
+> surfaces report fast-mlx's own reproducible results. Any older “publishable comparison,”
+> `REPRODUCED EXTERNAL`, or cross-engine site recommendation below is superseded; a same-box
+> competitor lane may continue privately to inform priorities.
+
 - **Date checked:** 2026-07-15
 - **Scope:** public website, benchmark explorer and submission path, distribution/update path,
   release/community loop, and use of oMLX data as a fast-mlx performance reference

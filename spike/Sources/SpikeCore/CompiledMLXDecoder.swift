@@ -14,9 +14,9 @@ import MLXLMCommon
 ///
 /// The KV-cache position is carried by the caches as in-graph state (array offset +
 /// fixed-size buffers), which is what makes the trace valid for every step. The cache
-/// implementation is selected by `KVCacheKind` — fp16 `CompiledKVCache` or a TurboQuant
-/// tier's `TurboQuantKVCache`; both satisfy `CompiledCache`, the contract this decoder
-/// needs (Updatable state, chunked grow, identity-preserving reset).
+/// implementation is selected by `KVCacheKind` — fp16, native affine, or TurboQuant;
+/// each satisfies `CompiledCache`, the contract this decoder needs (Updatable state,
+/// chunked grow, identity-preserving reset).
 /// Keeps MLXDecoder's submit-first lookahead: the next step's compiled call is
 /// submitted (asyncEval) BEFORE the current token's blocking `.item()` readback.
 public struct CompiledMLXDecoder: Decoder {
@@ -26,7 +26,9 @@ public struct CompiledMLXDecoder: Decoder {
     /// `MLX.compile`: `false` runs the same step closure uncompiled (correctness path;
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
     private let compileStepEnabled: Bool
-    private let chunk = 256
+    public let executionMode: KVCacheExecutionMode
+    private let chunk =
+        KVTunerCandidateRuntimeContract.cacheGrowthChunkTokens
     /// Decode headroom preallocated beyond the prompt (rounded up to `chunk`).
     private let reserve: Int
 
@@ -42,13 +44,16 @@ public struct CompiledMLXDecoder: Decoder {
     private var cachedTokens = 0 // host-side position; caches' host mirror goes stale
 
     public init(
-        model: any LanguageModel, reserve: Int = 384,
+        model: any LanguageModel,
+        reserve: Int = KVTunerCandidateRuntimeContract.cacheReserveTokens,
         kvCache: KVCacheKind = .fp16, compileStep: Bool = true
     ) {
+        let executionMode = kvCache.executionMode(requestingCompilation: compileStep)
         self.model = model
         self.reserve = reserve
         self.kvCacheKind = kvCache
-        self.compileStepEnabled = compileStep
+        self.compileStepEnabled = executionMode == .compiled
+        self.executionMode = executionMode
     }
 
     public mutating func prefill(_ promptTokens: [Int]) -> Int {
@@ -73,7 +78,13 @@ public struct CompiledMLXDecoder: Decoder {
         if caches.isEmpty {
             let layerCount = model.newCache(parameters: nil).count
             let cap = ((promptLength + reserve + chunk - 1) / chunk) * chunk
-            caches = (0 ..< layerCount).map { _ in kvCacheKind.makeCache(capacity: cap) }
+            do {
+                caches = try kvCacheKind.makeCaches(
+                    layerCount: layerCount, capacity: cap)
+            } catch {
+                preconditionFailure(
+                    "KV-cache policy does not match the loaded model: \(error)")
+            }
         }
         while promptLength + 1 > caches[0].capacity {
             for cache in caches { cache.grow(by: chunk) }
@@ -135,18 +146,30 @@ public struct CompiledMLXDecoder: Decoder {
     ///
     public mutating func generateSpec(
         prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
-    ) -> (tokens: [Int], submitTime: Double, tokenTimes: [Double], stats: SpecDecodeStats) {
+    ) -> (
+        tokens: [Int], submitTime: Double, tokenTimes: [Double],
+        prefillDurationSeconds: Double?, stats: SpecDecodeStats
+    ) {
+        precondition(
+            kvCacheKind.supportsSpecDecode,
+            "speculative decoding is not qualified for the selected KV-cache tier")
         var stats = SpecDecodeStats()
         let submitTime = Date().timeIntervalSinceReferenceDate
-        guard maxTokens > 0 else { return ([], submitTime, [], stats) }
+        guard maxTokens > 0 else {
+            return ([], submitTime, [], nil, stats)
+        }
 
         // Start in the same submit-first state as the plain loop. A cold request can therefore
         // stay on the base pipeline from token one; a hot request pays one transition verify,
         // then remains in the one-forward-per-round speculative invariant.
+        let prefillStartedAt = ProcessInfo.processInfo.systemUptime
         var last = prefill(prompt)
+        let prefillDurationSeconds =
+            ProcessInfo.processInfo.systemUptime - prefillStartedAt
+        let prefillEnd = Date().timeIntervalSinceReferenceDate
         var lastArr: MLXArray? = nil
         var tokens = [last]
-        var times = [Date().timeIntervalSinceReferenceDate]
+        var times = [prefillEnd]
         var context = prompt + [last]
         var gate = spec.gate
         var done = tokens.count >= maxTokens || last == eos
@@ -272,7 +295,8 @@ public struct CompiledMLXDecoder: Decoder {
             for _ in emit { times.append(t) }
             done = stop
         }
-        return (tokens, submitTime, times, stats)
+        return (
+            tokens, submitTime, times, prefillDurationSeconds, stats)
     }
 
     /// Reset caches IN PLACE (same MLXArray identities) so the compiled step function
@@ -290,5 +314,74 @@ public struct CompiledMLXDecoder: Decoder {
     public func turboQuantCachedTokens() -> Int? {
         guard let cache = caches.first as? TurboQuantKVCache else { return nil }
         return Int(cache.offsetArr.item(Int32.self))
+    }
+
+    /// Post-run affine engagement, geometry, and exact storage bytes. The capture happens
+    /// while this decoder and its MLX arrays remain in the inference actor; only a Sendable
+    /// scalar snapshot crosses back to the harness.
+    public func affineKVTelemetry() -> AffineKVCacheTelemetry? {
+        guard case .affine(let tier) = kvCacheKind else { return nil }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "affine tier requested but the decoder contains a different cache type")
+        return AffineKVCacheTelemetry.capture(tier: tier, caches: affineCaches)
+    }
+
+    /// Post-run exact schedule identity plus heterogeneous affine-array bytes. The schedule
+    /// digest is part of `KVCacheKind`, so decoder reuse cannot cross artifact boundaries.
+    public func kvtunerKVTelemetry() -> KVTunerKVCacheTelemetry? {
+        guard case .kvtuner(let selection) = kvCacheKind else { return nil }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "KVTuner decoder contains a different cache type")
+        do {
+            return try KVTunerKVCacheTelemetry.capture(
+                selection: selection, caches: affineCaches)
+        } catch {
+            preconditionFailure(
+                "KVTuner decoder telemetry does not match its schedule: \(error)")
+        }
+    }
+
+    /// Post-run preselection-candidate receipt. The candidate policy is a distinct cache kind
+    /// with no user-facing parser route, so a decoder cannot be reused across candidate digests
+    /// and only authenticated search orchestration can request this evidence.
+    public func kvtunerCandidateKVTelemetry()
+        -> KVTunerCandidateKVCacheTelemetry?
+    {
+        guard case .kvtunerCandidate(let policy) = kvCacheKind else {
+            return nil
+        }
+        let affineCaches = caches.compactMap { $0 as? AffineKVCache }
+        precondition(
+            affineCaches.count == caches.count,
+            "KVTuner candidate decoder contains a different cache type")
+        do {
+            return try KVTunerCandidateKVCacheTelemetry.capture(
+                policy: policy, caches: affineCaches)
+        } catch {
+            preconditionFailure(
+                "KVTuner candidate telemetry does not match its policy: \(error)")
+        }
+    }
+
+    /// Post-run KVarN engagement, runtime cell, geometry, and exact storage bytes. All MLX
+    /// arrays remain inside the decoder's inference actor; only this scalar `Sendable` snapshot
+    /// crosses into harness evidence.
+    public func kvarnKVTelemetry() -> KVarNKVCacheTelemetry? {
+        guard case .kvarn(let cell) = kvCacheKind else { return nil }
+        let kvarnCaches = caches.compactMap { $0 as? KVarNKVCache }
+        precondition(
+            kvarnCaches.count == caches.count,
+            "KVarN tier requested but the decoder contains a different cache type")
+        let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+        precondition(
+            telemetry.tier == cell.tier
+                && telemetry.iterations == cell.iterations
+                && telemetry.executionMode == executionMode,
+            "KVarN decoder telemetry does not match its requested runtime cell")
+        return telemetry
     }
 }

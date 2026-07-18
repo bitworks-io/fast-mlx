@@ -23,6 +23,42 @@ public func perPositionKLs(reference: [[Float]], candidate: [[Float]]) -> [Doubl
     }
 }
 
+public struct TeacherForcedTop1Agreement: Equatable, Sendable {
+    public let matches: Int
+    public let scoredPositions: Int
+    public var rate: Double { Double(matches) / Double(scoredPositions) }
+}
+
+/// Context-locked top-1 agreement between candidate and reference distributions. Unlike
+/// comparing the candidate argmax with a natural-document forced token, this directly compares
+/// both models at every identical teacher-forced context, including sampled long-context rows.
+public func teacherForcedTop1Agreement(
+    candidate: [[Float]], reference: [[Float]]
+) throws -> TeacherForcedTop1Agreement {
+    guard candidate.count == reference.count else {
+        throw QualityMetricError.rowCountMismatch(
+            side: "top1", got: candidate.count, expected: reference.count)
+    }
+    guard !candidate.isEmpty else { throw QualityMetricError.noScoredRows }
+    var matches = 0
+    for index in candidate.indices {
+        guard !candidate[index].isEmpty, candidate[index].count == reference[index].count else {
+            throw QualityMetricError.vocabularyMismatch(
+                position: index, candidate: candidate[index].count,
+                reference: reference[index].count)
+        }
+        guard candidate[index].allSatisfy(\.isFinite) else {
+            throw QualityMetricError.nonFiniteLogit(side: "candidate", position: index)
+        }
+        guard reference[index].allSatisfy(\.isFinite) else {
+            throw QualityMetricError.nonFiniteLogit(side: "reference", position: index)
+        }
+        if argmax(candidate[index]) == argmax(reference[index]) { matches += 1 }
+    }
+    return TeacherForcedTop1Agreement(
+        matches: matches, scoredPositions: candidate.count)
+}
+
 /// The metric's median convention (sorted, upper-middle element). Exposed for the same reason.
 public func medianOf(_ values: [Double]) -> Double {
     guard !values.isEmpty else { return 0 }
@@ -59,12 +95,21 @@ public enum QualityMetricError: Error, CustomStringConvertible, Sendable {
     /// A driver returned a different number of teacher-forced rows than forced positions —
     /// it is not fulfilling the contract, and a silently truncated score would lie.
     case rowCountMismatch(side: String, got: Int, expected: Int)
+    case vocabularyMismatch(position: Int, candidate: Int, reference: Int)
+    case nonFiniteLogit(side: String, position: Int)
+    case noScoredRows
     public var description: String {
         switch self {
         case .emptyContinuation(let prompt):
             return "reference produced an empty continuation for prompt \(prompt) — no positions to score"
         case .rowCountMismatch(let side, let got, let expected):
             return "\(side) returned \(got) teacher-forced rows for \(expected) forced positions"
+        case .vocabularyMismatch(let position, let candidate, let reference):
+            return "top1 row \(position) has candidate vocab \(candidate), reference vocab \(reference)"
+        case .nonFiniteLogit(let side, let position):
+            return "\(side) top1 row \(position) contains a non-finite logit"
+        case .noScoredRows:
+            return "top1 agreement has no teacher-forced rows to score"
         }
     }
 }
@@ -207,3 +252,11 @@ public struct PerplexityMetric: QualityMetric {
 }
 
 func softmax(_ x: [Float]) -> [Float] { let m = x.max() ?? 0; let e = x.map { expf($0 - m) }; let s = e.reduce(0,+); return e.map { $0/s } }
+
+private func argmax(_ values: [Float]) -> Int {
+    var best = 0
+    for index in values.indices.dropFirst() where values[index] > values[best] {
+        best = index
+    }
+    return best
+}

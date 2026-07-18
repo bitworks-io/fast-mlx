@@ -16,6 +16,7 @@ SHA without copying machine-local paths or transient output.
 | As a maintainer, I can enter continuous-batching actor integration only after dense cache shapes are exact and compile-stable. | Scalar-aligned merge/append/filter/extract preserves logits, greedy tokens, row identity, and one trace per stable shape; unsupported state layouts fail closed. | 9 focused `BatchedCompiledKVCacheTests`; 29/29 total `SpikeCoreTests` through Xcode; 134 HarnessCore XCTest + 17 Swift Testing tests off-box. | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed+shapeless PASS with zero initial max-logit delta; 64-step B=4/B=8 fixed PASS; `qwen3_moe` rejected before load. | 2026-07-12 | Historical Phase-1 gate; Phase 2 and Phase 3 are closed below. |
 | As an operator, concurrent dense streams can join, leave, and prefill in chunks without changing greedy output or exhausting an unbounded queue. | B1→drain→B2→B1 and B3→B2 remain token/byte exact; decode precedes bounded prefill; queue, per-request context, and aggregate logical context are capped; speculation is rejected locally for this runtime. | 16 scheduler + 10 coordinator pure tests within 145 HarnessCore XCTest + 17 Swift Testing; 12 cache-history-sensitive runtime tests within 41/41 Xcode `SpikeCoreTests`. | Clean `2a5a5f4`: Qwen3-32B-4bit staggered join and middle-cancel probes PASS; Qwen3-4B-4bit chunk-size-1 interleave PASS; zero batched speculation. | 2026-07-12 | Historical Phase-2 gate; byte admission, service frontier, cancellation latency, and soak are closed by Phase 3 below. |
 | As a dense-Qwen service operator, I can select the measured exact policy for an isolated request or a simultaneous burst without hidden queueing, state-poison, cancellation, or resident-memory failure. | Same-workload C=1/2/4/8 frontier selects solo PLD at C=1 and batch-no-spec at C≥2; exact transition/cancellation, conservative byte admission, A/B/A, responsiveness, and the full 24-hour RSS gate pass. | 166 HarnessCore XCTest + 17 Swift Testing tests off-box; 48/48 `SpikeCoreTests` through Xcode; final-SHA real-model probes and fail-closed `qwen3_moe` smoke. | Clean `7a775f6` frontier: batch +45.8%/+58.6%/+74.7% at C=2/4/8; clean `0aed280` soak: 86,412.85 measured seconds, all 33 predicates 3,519/3,519, peak RSS drift 2.2444%. | 2026-07-14 | Explicit probe path only; production routing/API, network disconnect propagation, sampling, non-dense state, other models and hardware remain open. |
+| As a constrained-hardware operator, I can choose a measured KV-capacity tier with quantified loss, while incoherent cells remain unavailable. | Same-weights Qwen3-32B cells bind actual storage, teacher-forced quality, task coherence, runtime, and clean provenance; hard-floor failures reject; every promoted label states capacity versus speed. | 389 HarnessCore XCTest + 17 Swift Testing tests off-box; 30/30 `FastMLXHarnessTests`; 92/92 `SpikeCoreTests`; Release build through Xcode. | Clean `d9071a9` task/KL packet and `f88d26e` runtime packet: Transparent fp16, Balanced K4V2-g64, Max-fit KVTuner, capacity-only KVarN i8; two aggressive cells reject. | 2026-07-18 | Qwen3-32B-4bit on one M5 Max; no lossy speed win, compiled KVarN/fused attention, or broad-model claim. |
 
 ## Current Verification Commands
 
@@ -239,6 +240,11 @@ additional dense families, and MoE/hybrid/recurrent/vision layouts remain separa
 
 ## Public evidence/community platform research acceptance pass — 2026-07-15
 
+**Owner-policy update (2026-07-18):** this remains proof that the research and planning artifact
+was completed. Its competitor-performance portion is private internal litmus only. The public
+platform may publish fast-mlx evidence, not head-to-head or reproduced-external rows; the policy
+override in the linked task supersedes the earlier publication language below.
+
 **Story:** a prospective user, maintainer, or research agent can use one source-qualified review
 and one agent-ready backlog artifact to understand fast-mlx's relative standing, build a public
 proof/community loop, and avoid unsafe benchmark-publication or update mechanisms.
@@ -259,3 +265,101 @@ explicit implementation decisions.
 
 **Overall verdict:** ALL PASS for the review and durable-roadmap acceptance criteria. Website,
 ingest, competitor runner, community upload, and updater implementation remain open work.
+
+## KVarN Phase 0 evidence-contract acceptance pass — 2026-07-14
+
+**Story:** a bench operator can record exploratory KV-quality rows, but cannot promote a dial cell
+unless the row proves same weights, context-locked 24K quality, canonical format geometry, honest
+actual storage, clean provenance, and durable append-only persistence.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Typed identity and comparison contract | **PASS** | `KLPayload` and `KVFrontierEvidence` bind matrix/cell identity, candidate/reference config and checkpoint-manifest hashes, same-weights fp16-KV baseline, canonical tier geometry, corpus identity, and the outer result provenance. Historical optional fields still decode. |
+| Teacher-forced quality cannot be mislabeled | **PASS** | New rows require finite context-locked top-1 evidence plus short and long cohorts. Promotion requires a distribution actually scored at context depth >=24,000; a shallow custom `long-context` tag fails closed. The available perplexity, long-tail, and top-1 garbage-floor predicates are enforced before persistence. |
+| Storage claims fail closed | **PASS** | The validator reconstructs the predicted allocation from `KVStorageFormat`, rejects fabricated or mismatched breakdowns, and requires predicted bytes to equal actual bytes for promotion. Until Phase 2 supplies real arrays, promotion exits 1 with `missingFormat` and writes no artifact. |
+| Evidence persistence is durable under contention | **PASS** | The writer rejects corrupt/partial prior rows, opens without following symlinks, holds an exclusive file lock across validation and `O_APPEND`, and synchronizes before success. A 128-writer regression preserves 128 unique, decodable rows. |
+| Clean-SHA Apple proof | **PASS** | Commit `e1a3cff6cc95ffcd980cc8e05709fdb0ab7edc39` was stamped by the sync script. Xcode passes 48/48 `SpikeCoreTests`; the Release harness builds. Qwen3-4B same-weights fp16-KV scores the five-entry v2 corpus through a 24,150-token context and writes one schema-valid exploratory row; the corresponding promotion run refuses to write. |
+
+**Pure verification:** focused evidence/provenance/quality tests 28/28; full HarnessCore run 211
+XCTest + 17 Swift Testing, zero failures. Line coverage: `KVFrontierEvidence.swift` 93.63%,
+`Provenance.swift` 85.12%, `QualityMetric.swift` 87.50%. Final focused re-review: no issues.
+Diff check, banned-concurrency scan, and staged gitleaks scan pass.
+
+**Bench artifact hashes:** Xcode test log
+`e1fb2f34004490f76d3e973b443e6ef1a79db08250b970ccfdbcb1f3c01a96e9`; Release build log
+`34a9ec8a7f0a51edb548d43c993a99e3edb4d7cbe7d4b100ab26945d5471634c`; provenance
+`7f726e19b5262e105033ff765886095b0c8fc78f08832edc5eda6bdfa90e0396`; exploratory JSONL
+`edbce7dfc17a3b7d14f0049a29daa6dd41d80067c83e4b988ca63dbabd481716`; exploratory log
+`11744e02b897fd92d66c36b8a9035c6d775ef0ddb8e9f5982a8dea60bcd31435`; promotion-refusal log
+`bcf8c4290d2df7f9ea9b3d749c4421e0b56c7956f0f21a853cc320e9516672d4`.
+
+**Boundary:** this closes only the Phase 0 evidence gate. It is not an affine/KVarN performance
+or capacity result. Phase 2 must reconcile native MLX array bytes—including compile-control state
+and materialization workspace—before any dial cell can become promotion-eligible.
+
+## KVarN Phase 2 affine-control acceptance pass — 2026-07-14
+
+**Story:** a bench operator can select every declared affine KV control and receive native-array,
+teacher-forced evidence whose storage and per-entry sample claims fail closed, without treating a
+small plumbing smoke as a quality verdict.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Runnable controls fail closed | **PASS** | `fp16`, K4V2/K8V2 at groups 64/128, and K4V4-g128 parse independently and report the selected geometry. Unknown or incompatible tiers fail before scoring; lossy KV plus PLD remains rejected. Qwen3-4B smokes engaged all five affine cells. |
+| Native storage is honest | **PASS** | `AffineKVCache` stores packed K/V plus native scale/bias arrays and reports payload, metadata, workspace, and control bytes from real MLX arrays. Clean `4c1bfe1` K8V2-g128 predicts and observes exactly 1,112,832,000 payload + 55,641,600 metadata + 98,918,400 workspace = 1,267,392,000 bytes, plus 144 control bytes. |
+| Cache lifecycle preserves the MLX contract | **PASS** | Xcode tests cover materialize/read, growth, reset, truncation, mask behavior, two-bit packing, compile integration, and accounting. MLX state remains actor-owned; no banned concurrency escape was introduced. Engine SHA `d4bda35dbfa78c079fa970bbb8aaf1526a0022f7` passes 56/56 `SpikeCoreTests` through Xcode; the extracted result summary records 56 passed, 0 failed, 0 skipped. |
+| Teacher-forced evidence is entry-complete | **PASS** | Each short/long aggregate is now backed by unique real corpus entry IDs and scored-position counts whose overflow-safe sums must match. Promotion requires every short entry >=24 and every long entry >=128. A clean undersampled promotion run exits 1 at the first 2/24 short entry and creates no JSONL. |
+| Current clean-SHA integration is reproducible | **PASS** | Synced clean `4c1bfe1f6947b184a6fc8834e0787bbfd4e3354a` builds Release and produces a schema-valid exploratory K8V2-g128 row across all three short and two long entries. Full pure verification passes 217 XCTest + 17 Swift Testing tests; focused re-review reports no issue. |
+
+**Artifact hashes:** current clean Release log
+`a9c56edf34592939da2f01fd7d5c7670064419f7d1e7b68b6eea9c73b49f1237`; final-engine Xcode
+result summary `ccc7795197c52ce98a035c30326388ebaba6eb363ff2beed695b904b72bc455a`;
+launch/build log `bd36cbcd25d7f67560178b128f4ead7124fea622bbb4f4dbf9444e00353931b2`; exploratory JSONL
+`ecd8760845b9e727df64731f400b04544f4943425efeeae1fd1dae3f5de38a3e`; promotion-refusal log
+`9188293d41b06d39b0a971db7c828d7d726e0d7f14de47ee1af1380bb6fa667b`; refusal status artifact
+`4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+
+**Boundary:** this closes affine runtime/control plumbing and its evidence gate—not the KVarN
+implementation, the Qwen3-32B 24/128-position matrix, monotonicity, capacity benefit, or a dial
+verdict. The exploratory affine predicate counts (4/8, 7/8, 7/8, 7/8, and 3/8 across the five
+cells) are deliberately non-authoritative until the frozen full matrix runs.
+
+## KVarN / asymmetric KV frontier final acceptance pass — 2026-07-18
+
+**Story:** an Apple-Silicon operator constrained by context or concurrency can select a measured
+KV-capacity tier with its real quality and runtime costs visible, while cells below the coherence
+floor remain unavailable and exactness contracts elsewhere in the engine remain unchanged.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Same-weights reference fidelity | **PASS** | The fp16 reference and all retained candidates bind the Qwen3-32B-4bit checkpoint, model/config identities, task corpus v2, tokenizer/prompt layout, and per-cell task/KL artifacts. The compact packet records every KL evidence/sidecar and task raw/summary SHA-256. |
+| Honest size and capacity accounting | **PASS** | fp16 is explicitly exact-accounted as 6,330,777,600 bytes at 24,150 tokens. Lossy rows use directly measured cache-array bytes plus workspace. KVTuner/KVarN's separate 256 control bytes are preserved distinctly; derived capacity ranges from 2.7826x to 4.5110x. |
+| Lossy frontier fails closed | **PASS** | `affine-k4v2-g128` and `affine-k4v4-g128` are retained as hard-floor failures and rejected from the dial. Unknown tiers, malformed schedules, missing evidence, non-finite metrics, and lossy KV plus PLD remain rejected. |
+| Runnable selection and frozen-policy controls | **PASS** | Uniform affine cells, frozen KVTuner, and KVarN i8/i16 engaged under their declared identities. KVTuner authenticates its frozen bundle/schedule; KVarN reports the explicit uncompiled correctness path instead of claiming compiled execution. |
+| Context-locked quality | **PASS** | Eligible cells completed teacher-forced KL, pooled perplexity delta, top-1 agreement, and 24K tail-p95 against the locked reference context. Free-running output was used only for task/coherence adjudication. |
+| Task/coherence floor and user freedom | **PASS** | The admitted fp16 reference scored 16/10/20/20 with 20/20 structured syntax. Retained lossy cells stayed above the predeclared per-domain/syntax floor; aggressive cells that collapsed structured behavior were rejected rather than exposed as an expert setting. |
+| Same-workload Apple runtime evidence | **PASS** | Clean runtime SHA `f88d26eeb3793cc1d5d8f2118043c190977ee6e0` completed all seven cells with one authenticated JSONL row per cell and absent watchdog. fp16 measured 28.46 decode / 376.33 prefill tok/s; no lossy cell was faster, so promotion is capacity-only where applicable. |
+| Flywheel closure and claim boundary | **PASS** | The dated verdict promotes fp16 Transparent, affine K4V2-g64 Balanced capacity, frozen KVTuner Max-fit capacity, and KVarN i8 capacity-only Max-fit/fused candidate; it shelves or rejects the rest and links a reader-facing content piece. The result is Qwen3-32B-4bit/model-specific; a materially different popular family is required before broad support claims. |
+
+**Fresh verification:** `swift test --package-path spike --filter HarnessCoreTests` passes 389
+XCTest + 17 Swift Testing tests. On the clean synced bench tree, Xcode with
+`-skipPackagePluginValidation` passes 30/30 `FastMLXHarnessTests` and 92/92 `SpikeCoreTests`; the
+Release `fastmlx-harness` build succeeds. MLX-coupled targets were not run through SwiftPM.
+
+**Evidence authentication:** compact JSONL
+[`kvarn-kv-frontier-evidence-2026-07-18.jsonl`](superpowers/verdicts/kvarn-kv-frontier-evidence-2026-07-18.jsonl)
+parses as 12 records. The task/KL source/harness is clean `d9071a93955be2e148dc381638d4a71a8286c59e`;
+the KL manifest is `3be8693aa169e2e5b4c2692f7fdc115783271fb735d27e50b0d5c3cb798990df`;
+the same-SHA KVarN memory gate is
+`7b21459cf1afc1a038b87c017c1fdacd18644b08b4b63a07318d74faba2dcfd2`.
+The original KL wrapper status remains `ABORTED` after a post-measurement pipefail. Reviewed
+recovery finalization authenticated all seven immutable rows/sidecars twice and records finalizer
+SHA-256 `096c38dfcb648bf7cf3870c12f24b9419bff398668a0ef13402c1009f0dcdeb4`, recovery
+SHA-256 `9548bd792bcd836a92b9612a70026ad54c77adc16395df1e0b6a1fed3a8d7077`, and recovered
+completion SHA-256 `732d4e3486a8502dd09ec44628875d1e5435fbd3648ec6c8024b8f01047de4dc`.
+
+**Review and residual risk:** focused review found and corrected one 256-byte accounting wording
+error and required the recovery chain above to be explicit. Final review, link/JSON validation,
+diff checks, banned-concurrency scan, and staged secret scan are part of the closing packet. The
+largest remaining technical risk is that storage reduction has not become a compiled speed path;
+fused compressed-domain attention and a second model family are the next gates.
