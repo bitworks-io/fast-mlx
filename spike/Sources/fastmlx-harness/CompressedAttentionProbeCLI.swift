@@ -288,7 +288,7 @@ final class CompressedAttentionProbeOutputLease {
 
 /// Strong identities for every mutable model-side input used to label the synthetic geometry
 /// probe. Checkpoint identity authenticates the exact config/index bytes plus each sorted shard's
-/// logical name, size, and complete contents. Promotion therefore cannot silently retain an
+/// logical name, size, and complete contents. Qualification therefore cannot silently retain an
 /// identity after a same-size checkpoint replacement.
 func compressedAttentionProbeModelIdentity(
     modelID: String,
@@ -427,9 +427,11 @@ func validateCompressedAttentionProbeModelGeometry(
         throw CompressedAttentionProbeCLIError
             .modelGeometryMismatch("headDimension")
     }
-    guard plan.contextTokens <= maxContext else {
+    let (contextWindowTokens, contextWindowOverflow) = plan.contextTokens
+        .addingReportingOverflow(plan.outputTokens)
+    guard !contextWindowOverflow, contextWindowTokens <= maxContext else {
         throw CompressedAttentionProbeCLIError
-            .modelGeometryMismatch("contextTokens")
+            .modelGeometryMismatch("contextWindowTokens")
     }
 }
 
@@ -506,7 +508,7 @@ func executeCompressedAttentionProbe(
                 .unsupportedOperationLayout
         }
         #if DEBUG
-        if command.plan.promotionEvidence {
+        if command.plan.qualificationEvidence {
             throw CompressedAttentionProbeCLIError.releaseBuildRequired
         }
         #endif
@@ -543,7 +545,7 @@ func executeCompressedAttentionProbe(
             memoryLimitBytes: command.memoryLimitBytes,
             cacheLimitBytes: command.cacheLimitBytes,
             wiredLimitBytes: command.wiredLimitBytes,
-            cacheResetPolicy: .preserveAcrossPair)
+            cacheResetPolicy: .preserveAcrossRun)
         var rows: [CompressedAttentionProbeRunRow] = []
         rows.reserveCapacity(totalMeasuredRows)
 
@@ -611,6 +613,7 @@ func executeCompressedAttentionProbe(
                 rows: rows)
         let evidence = try CompressedAttentionProbeEvidence(
             schemaVersion: CompressedAttentionProbeEvidence.schemaVersion,
+            evidenceKind: .checkpointAuthenticatedSyntheticGeometry,
             artifactID: artifactID,
             plan: planIdentity,
             model: modelIdentity,
@@ -635,6 +638,7 @@ private func compressedAttentionProbeSupports(
     switch (plan.operation, plan.layout) {
     case (.fp16SDPA, .fp16),
         (.swiftLMQuantizedAttention, .affine),
+        (.splitAffineQuantizedMM, .affine),
         (.materializeThenSDPA, .affine):
         true
     default:
@@ -664,7 +668,7 @@ private func compressedAttentionProbeReferencePlan(
         seed: plan.seed,
         workloadNonce: plan.workloadNonce,
         harnessGitSHA: plan.harnessGitSHA,
-        promotionEvidence: plan.promotionEvidence,
+        qualificationEvidence: plan.qualificationEvidence,
         evidenceOutputPath: plan.evidenceOutputPath,
         progressOutputPath: plan.progressOutputPath)
 }
@@ -683,14 +687,11 @@ private func compressedAttentionProbeMeasure(
     role: CompressedAttentionProbeRunRole,
     position: CompressedAttentionProbeRunPosition
 ) async throws -> CompressedAttentionProbeMeasuredRun {
-    await runner.resetPeakMemory()
-    let memoryBefore = await runner.memorySnapshot()
     let systemBefore = compressedAttentionProbeSystemSnapshot()
     let startedAt = ProcessInfo.processInfo.systemUptime
     let result = try await runner.runFixture(plan: plan)
     let endedAt = ProcessInfo.processInfo.systemUptime
     let systemAfter = compressedAttentionProbeSystemSnapshot()
-    let memoryAfter = await runner.memorySnapshot()
     return CompressedAttentionProbeMeasuredRun(
         role: role,
         operation: role == .candidate ? plan.operation : .fp16SDPA,
@@ -701,8 +702,8 @@ private func compressedAttentionProbeMeasure(
             monotonicEndSeconds: endedAt,
             wallClockSeconds: endedAt - startedAt,
             attentionSeconds: result.attentionSeconds),
-        memoryBefore: memoryBefore,
-        memoryAfter: memoryAfter,
+        memoryBefore: result.attentionMemoryBefore,
+        memoryAfter: result.attentionMemoryAfter,
         systemBefore: systemBefore,
         systemAfter: systemAfter)
 }
@@ -713,18 +714,13 @@ private func compressedAttentionProbeRow(
     memorySettings: CompressedAttentionProbeMemorySettings
 ) throws -> CompressedAttentionProbeRunRow {
     let result = measured.result
-    let observedPeakAboveBaseline = max(
-        0, measured.memoryAfter.peakBytes
-            - measured.memoryBefore.activeBytes)
-    let declaredStateAndMaterialization = result.persistentBytes
-        + result.materializationWorkspaceBytes
-    let otherWorkspaceBytes = max(
-        0, observedPeakAboveBaseline - declaredStateAndMaterialization)
-    let peakTemporaryBytes = result.materializationWorkspaceBytes
-        + otherWorkspaceBytes
-    let totalBytes = try compressedAttentionProbeCheckedSum([
-        result.persistentBytes, peakTemporaryBytes,
-    ])
+    let mlxMemory = CompressedAttentionProbeMLXMemoryReceipts(
+        before: measured.memoryBefore,
+        after: measured.memoryAfter)
+    let workspace = try CompressedAttentionProbeWorkspaceBytes.derive(
+        persistentKVBytes: result.persistentBytes,
+        materializationBytes: result.materializationWorkspaceBytes,
+        mlxMemory: mlxMemory)
     let bytes = CompressedAttentionProbeByteReceipts(
         payloadBytes: result.payloadBytes,
         scaleBytes: result.scaleBytes,
@@ -734,9 +730,9 @@ private func compressedAttentionProbeRow(
         fp16ResidentBytes: result.fp16ResidentBytes,
         persistentKVBytes: result.persistentBytes,
         materializationBytes: result.materializationWorkspaceBytes,
-        otherWorkspaceBytes: otherWorkspaceBytes,
-        peakTemporaryBytes: peakTemporaryBytes,
-        totalBytes: totalBytes)
+        otherWorkspaceBytes: workspace.otherWorkspaceBytes,
+        peakTemporaryBytes: workspace.peakTemporaryBytes,
+        totalBytes: workspace.totalBytes)
     return CompressedAttentionProbeRunRow(
         role: measured.role,
         operation: measured.operation,
@@ -744,9 +740,7 @@ private func compressedAttentionProbeRow(
         receipts: CompressedAttentionProbeRunReceipts(
             timing: measured.timing,
             bytes: bytes,
-            mlxMemory: CompressedAttentionProbeMLXMemoryReceipts(
-                before: measured.memoryBefore,
-                after: measured.memoryAfter),
+            mlxMemory: mlxMemory,
             processRSS: CompressedAttentionProbeProcessRSS(
                 residentSizeBeforeBytes:
                     measured.systemBefore.residentBytes,
@@ -836,21 +830,6 @@ private func compressedAttentionProbeThermalState(
     case .critical: .critical
     @unknown default: .unknown
     }
-}
-
-private func compressedAttentionProbeCheckedSum(_ values: [Int]) throws
-    -> Int
-{
-    var result = 0
-    for value in values {
-        let (next, overflow) = result.addingReportingOverflow(value)
-        guard !overflow else {
-            throw CompressedAttentionProbeCLIError
-                .unsupportedOperationLayout
-        }
-        result = next
-    }
-    return result
 }
 
 func runCompressedAttentionProbe(_ arguments: [String]) async {

@@ -5,7 +5,7 @@ import XCTest
 final class CompressedAttentionProbePlanTests: XCTestCase {
     private let cleanSHA = String(repeating: "a", count: 40)
 
-    func testPromotionPlanPinsTheAuthenticatedLongContextGeometry() throws {
+    func testQualificationPlanPinsTheAuthenticatedLongContextGeometry() throws {
         let plan = try CompressedAttentionProbePlan(
             operation: .swiftLMQuantizedAttention,
             contextTokens: 32_768,
@@ -27,15 +27,15 @@ final class CompressedAttentionProbePlanTests: XCTestCase {
             seed: 2_026_071_800,
             workloadNonce: "fused-kv-qwen3-g64",
             harnessGitSHA: cleanSHA,
-            promotionEvidence: true)
+            qualificationEvidence: true)
 
-        XCTAssertTrue(plan.isPromotionContext)
+        XCTAssertTrue(plan.isQualificationContext)
         XCTAssertEqual(plan.gqaRepeatCount, 8)
         XCTAssertEqual(plan.totalKVScalarCount, 67_108_864)
         XCTAssertEqual(plan.operation.rawValue, "swiftlm-quantized-attention")
     }
 
-    func testExploratoryPlanAllowsSmallFixturesButCannotClaimPromotion() throws {
+    func testExploratoryPlanAllowsSmallFixturesButCannotClaimQualification() throws {
         let plan = try CompressedAttentionProbePlan(
             operation: .materializeThenSDPA,
             contextTokens: 16,
@@ -57,29 +57,74 @@ final class CompressedAttentionProbePlanTests: XCTestCase {
             seed: 7,
             workloadNonce: "small-fixture",
             harnessGitSHA: cleanSHA,
-            promotionEvidence: false)
+            qualificationEvidence: false)
 
-        XCTAssertFalse(plan.isPromotionContext)
+        XCTAssertFalse(plan.isQualificationContext)
         XCTAssertEqual(plan.gqaRepeatCount, 4)
     }
 
-    func testPromotionRejectsUnapprovedContextAndTooFewMeasuredRuns() {
+    func testQualificationRejectsUnapprovedWindowAndTooFewMeasuredRuns() {
         XCTAssertThrowsError(try makePlan(
             contextTokens: 16_384,
             measuredRuns: 3,
-            promotionEvidence: true)) {
+            qualificationEvidence: true)) {
                 XCTAssertEqual(
                     $0 as? CompressedAttentionProbePlanError,
-                    .unapprovedPromotionContext(16_384))
+                    .unapprovedQualificationWindow(
+                        contextTokens: 16_384,
+                        outputTokens: 128))
             }
 
         XCTAssertThrowsError(try makePlan(
             contextTokens: 8_192,
             measuredRuns: 2,
-            promotionEvidence: true)) {
+            qualificationEvidence: true)) {
                 XCTAssertEqual(
                     $0 as? CompressedAttentionProbePlanError,
-                    .insufficientPromotionRuns(2))
+                    .insufficientQualificationRuns(2))
+            }
+    }
+
+    func testQualificationAllowsNear128KOnlyWhenOutputCompletesTheWindow()
+        throws
+    {
+        let plan = try makePlan(
+            contextTokens: 130_944,
+            outputTokens: 128,
+            qualificationEvidence: true)
+
+        XCTAssertTrue(plan.isQualificationContext)
+        XCTAssertThrowsError(try makePlan(
+            contextTokens: 131_072,
+            outputTokens: 128,
+            qualificationEvidence: true)) {
+                XCTAssertEqual(
+                    $0 as? CompressedAttentionProbePlanError,
+                    .unapprovedQualificationWindow(
+                        contextTokens: 131_072,
+                        outputTokens: 128))
+            }
+        XCTAssertThrowsError(try makePlan(
+            contextTokens: 1,
+            queryTokens: 1,
+            prefillChunkTokens: 1,
+            outputTokens: 131_071,
+            qualificationEvidence: true)) {
+                XCTAssertEqual(
+                    $0 as? CompressedAttentionProbePlanError,
+                    .unapprovedQualificationWindow(
+                        contextTokens: 1,
+                        outputTokens: 131_071))
+            }
+        XCTAssertThrowsError(try makePlan(
+            contextTokens: 130_944,
+            outputTokens: 64,
+            qualificationEvidence: true)) {
+                XCTAssertEqual(
+                    $0 as? CompressedAttentionProbePlanError,
+                    .unapprovedQualificationWindow(
+                        contextTokens: 130_944,
+                        outputTokens: 64))
             }
     }
 
@@ -109,6 +154,22 @@ final class CompressedAttentionProbePlanTests: XCTestCase {
             layout: .kvarn(
                 keyBits: 4, valueBits: 2, groupSize: 128,
                 sinkTokens: 128, iterations: 8)))
+
+        XCTAssertNoThrow(try makePlan(
+            operation: .splitAffineQuantizedMM,
+            layout: .affine(
+                keyBits: 4, valueBits: 2,
+                keyGroupSize: 64, valueGroupSize: 32)))
+
+        XCTAssertThrowsError(try makePlan(
+            operation: .splitAffineQuantizedMM,
+            layout: .kvarn(
+                keyBits: 4, valueBits: 2, groupSize: 128,
+                sinkTokens: 128, iterations: 8))) {
+                XCTAssertEqual(
+                    $0 as? CompressedAttentionProbePlanError,
+                    .operationLayoutMismatch)
+            }
     }
 
     func testGeometryAndQuantizationFailClosedBeforeAllocation() {
@@ -249,7 +310,7 @@ final class CompressedAttentionProbePlanTests: XCTestCase {
         seed: Int = 7,
         workloadNonce: String = "fused-kv-fixture",
         harnessGitSHA: String? = nil,
-        promotionEvidence: Bool = false,
+        qualificationEvidence: Bool = false,
         evidenceOutputPath: String = "compressed-attention-probe.jsonl",
         progressOutputPath: String = "compressed-attention-probe.progress.json"
     ) throws -> CompressedAttentionProbePlan {
@@ -272,7 +333,7 @@ final class CompressedAttentionProbePlanTests: XCTestCase {
             seed: seed,
             workloadNonce: workloadNonce,
             harnessGitSHA: harnessGitSHA ?? cleanSHA,
-            promotionEvidence: promotionEvidence,
+            qualificationEvidence: qualificationEvidence,
             evidenceOutputPath: evidenceOutputPath,
             progressOutputPath: progressOutputPath)
     }

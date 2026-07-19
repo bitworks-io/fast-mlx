@@ -36,6 +36,17 @@ public enum CompressedAttentionProbeLayoutKind:
     case kvarn
 }
 
+/// Identifies what this artifact actually measured. The Phase-0 probe authenticates a
+/// checkpoint and constrains tensors to its declared attention geometry, but deliberately does
+/// not load or execute model weights. Keeping that boundary in the signed payload prevents a
+/// synthetic kernel profile from being mistaken for loaded-model or dial-promotion evidence.
+public enum CompressedAttentionProbeEvidenceKind:
+    String, Codable, Equatable, Sendable
+{
+    case checkpointAuthenticatedSyntheticGeometry =
+        "checkpoint-authenticated-synthetic-geometry"
+}
+
 /// Codable projection of `CompressedAttentionProbeLayout`. It keeps the public evidence artifact
 /// pure while validating through the same layout rules as `CompressedAttentionProbePlan`.
 public struct CompressedAttentionProbeLayoutIdentity:
@@ -147,7 +158,7 @@ public struct CompressedAttentionProbePlanIdentity:
     public let seed: Int
     public let workloadNonce: String
     public let harnessGitSHA: String
-    public let promotionEvidence: Bool
+    public let qualificationEvidence: Bool
     public let evidenceOutputPath: String
     public let progressOutputPath: String
 
@@ -170,7 +181,7 @@ public struct CompressedAttentionProbePlanIdentity:
         seed: Int,
         workloadNonce: String,
         harnessGitSHA: String,
-        promotionEvidence: Bool,
+        qualificationEvidence: Bool,
         evidenceOutputPath: String,
         progressOutputPath: String
     ) {
@@ -192,7 +203,7 @@ public struct CompressedAttentionProbePlanIdentity:
         self.seed = seed
         self.workloadNonce = workloadNonce
         self.harnessGitSHA = harnessGitSHA
-        self.promotionEvidence = promotionEvidence
+        self.qualificationEvidence = qualificationEvidence
         self.evidenceOutputPath = evidenceOutputPath
         self.progressOutputPath = progressOutputPath
     }
@@ -218,7 +229,7 @@ public struct CompressedAttentionProbePlanIdentity:
             seed: plan.seed,
             workloadNonce: plan.workloadNonce,
             harnessGitSHA: plan.harnessGitSHA,
-            promotionEvidence: plan.promotionEvidence,
+            qualificationEvidence: plan.qualificationEvidence,
             evidenceOutputPath: plan.evidenceOutputPath,
             progressOutputPath: plan.progressOutputPath)
     }
@@ -244,7 +255,7 @@ public struct CompressedAttentionProbePlanIdentity:
                 seed: seed,
                 workloadNonce: workloadNonce,
                 harnessGitSHA: harnessGitSHA,
-                promotionEvidence: promotionEvidence,
+                qualificationEvidence: qualificationEvidence,
                 evidenceOutputPath: evidenceOutputPath,
                 progressOutputPath: progressOutputPath)
         } catch {
@@ -382,6 +393,57 @@ public struct CompressedAttentionProbeByteReceipts:
         self.otherWorkspaceBytes = otherWorkspaceBytes
         self.peakTemporaryBytes = peakTemporaryBytes
         self.totalBytes = totalBytes
+    }
+}
+
+/// Workspace totals derived from the raw MLX high-water receipt and the independently known
+/// materialization allocation. MLX resets the peak counter to zero, so an allocation-free
+/// measured section can report a post-run peak below the already-resident active baseline. The
+/// effective peak therefore floors the raw counter at that baseline instead of inventing a
+/// baseline-inclusive MLX counter value.
+public struct CompressedAttentionProbeWorkspaceBytes:
+    Equatable, Sendable
+{
+    public let otherWorkspaceBytes: Int
+    public let peakTemporaryBytes: Int
+    public let totalBytes: Int
+
+    public static func derive(
+        persistentKVBytes: Int,
+        materializationBytes: Int,
+        mlxMemory: CompressedAttentionProbeMLXMemoryReceipts
+    ) throws -> Self {
+        guard persistentKVBytes >= 0,
+            materializationBytes >= 0,
+            mlxMemory.before.activeBytes >= 0,
+            mlxMemory.after.peakBytes >= 0
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
+        }
+        let effectivePeakBytes = max(
+            mlxMemory.after.peakBytes,
+            mlxMemory.before.activeBytes)
+        let observedPeakAboveBaseline = effectivePeakBytes
+            - mlxMemory.before.activeBytes
+        let otherWorkspaceBytes = max(
+            0,
+            observedPeakAboveBaseline - materializationBytes)
+        guard let peakTemporaryBytes = checkedSum(
+            materializationBytes, otherWorkspaceBytes),
+            let totalBytes = checkedSum(
+                persistentKVBytes, peakTemporaryBytes)
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
+        }
+        return Self(
+            otherWorkspaceBytes: otherWorkspaceBytes,
+            peakTemporaryBytes: peakTemporaryBytes,
+            totalBytes: totalBytes)
+    }
+
+    private static func checkedSum(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
     }
 }
 
@@ -594,8 +656,7 @@ public struct CompressedAttentionProbeProcessRSS:
 public enum CompressedAttentionProbeCacheResetPolicy:
     String, Codable, Equatable, Sendable
 {
-    case preserveAcrossPair = "preserve-across-pair"
-    case clearBeforePair = "clear-before-pair"
+    case preserveAcrossRun = "preserve-across-run"
 }
 
 public struct CompressedAttentionProbeMemorySettings:
@@ -796,7 +857,7 @@ public struct CompressedAttentionProbeRunRow:
 public struct CompressedAttentionProbeEvidence:
     Codable, Equatable, Sendable
 {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let packedRTolerance = 2e-3
     public static let packedATolerance = 2e-3
     /// Matches the pinned MLX float16 SDPA qualification envelope in
@@ -805,6 +866,7 @@ public struct CompressedAttentionProbeEvidence:
     public static let fp16ATolerance = 3e-4
 
     public let schemaVersion: Int
+    public let evidenceKind: CompressedAttentionProbeEvidenceKind
     public let artifactID: String
     public let plan: CompressedAttentionProbePlanIdentity
     public let model: CompressedAttentionProbeModelIdentity
@@ -813,6 +875,7 @@ public struct CompressedAttentionProbeEvidence:
 
     public init(
         schemaVersion: Int,
+        evidenceKind: CompressedAttentionProbeEvidenceKind,
         artifactID: String,
         plan: CompressedAttentionProbePlanIdentity,
         model: CompressedAttentionProbeModelIdentity,
@@ -820,6 +883,7 @@ public struct CompressedAttentionProbeEvidence:
         rows: [CompressedAttentionProbeRunRow]
     ) {
         self.schemaVersion = schemaVersion
+        self.evidenceKind = evidenceKind
         self.artifactID = artifactID
         self.plan = plan
         self.model = model
@@ -839,6 +903,7 @@ public struct CompressedAttentionProbeEvidence:
         let placeholder = String(repeating: "0", count: 64)
         let evidence = Self(
             schemaVersion: schemaVersion,
+            evidenceKind: .checkpointAuthenticatedSyntheticGeometry,
             artifactID: placeholder,
             plan: plan,
             model: model,
@@ -860,6 +925,7 @@ public struct CompressedAttentionProbeEvidence:
     ) throws -> String {
         let payload = ArtifactIdentityPayload(
             schemaVersion: schemaVersion,
+            evidenceKind: .checkpointAuthenticatedSyntheticGeometry,
             plan: plan,
             model: model,
             package: package,
@@ -867,7 +933,7 @@ public struct CompressedAttentionProbeEvidence:
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         var transcript = Data(
-            "fastmlx-compressed-attention-artifact-v1\n".utf8)
+            "fastmlx-compressed-attention-artifact-v2\n".utf8)
         transcript.append(try encoder.encode(payload))
         return sha256Hex(transcript)
     }
@@ -877,6 +943,9 @@ public struct CompressedAttentionProbeEvidence:
         guard schemaVersion == Self.schemaVersion else {
             throw CompressedAttentionProbeEvidenceError
                 .unsupportedSchema(schemaVersion)
+        }
+        guard evidenceKind == .checkpointAuthenticatedSyntheticGeometry else {
+            throw CompressedAttentionProbeEvidenceError.invalidPlanIdentity
         }
         guard Self.isSHA256(artifactID) else {
             throw CompressedAttentionProbeEvidenceError.invalidArtifactID
@@ -903,7 +972,7 @@ public struct CompressedAttentionProbeEvidence:
         let materializedPlan = try plan.materializedPlan()
         try model.validate()
         try package.validate(
-            promotionEvidence: materializedPlan.promotionEvidence)
+            qualificationEvidence: materializedPlan.qualificationEvidence)
 
         let expectedRows = materializedPlan.measuredRuns * 2
         guard rows.count == expectedRows else {
@@ -973,6 +1042,7 @@ public struct CompressedAttentionProbeEvidence:
 
     private struct ArtifactIdentityPayload: Codable {
         let schemaVersion: Int
+        let evidenceKind: CompressedAttentionProbeEvidenceKind
         let plan: CompressedAttentionProbePlanIdentity
         let model: CompressedAttentionProbeModelIdentity
         let package: CompressedAttentionProbePackageIdentity
@@ -1095,7 +1165,7 @@ private extension CompressedAttentionProbeModelIdentity {
 }
 
 private extension CompressedAttentionProbePackageIdentity {
-    func validate(promotionEvidence: Bool) throws {
+    func validate(qualificationEvidence: Bool) throws {
         guard CompressedAttentionProbeEvidence.isEvidenceValue(
             mlxSwiftVersion)
         else {
@@ -1119,19 +1189,19 @@ private extension CompressedAttentionProbePackageIdentity {
             throw CompressedAttentionProbeEvidenceError
                 .invalidIdentity("harnessBuildConfiguration")
         }
-        guard !promotionEvidence
+        guard !qualificationEvidence
             || mlxSwiftVersion == Self.qualifiedMLXSwiftVersion
         else {
             throw CompressedAttentionProbeEvidenceError
                 .invalidIdentity("mlxSwiftVersion")
         }
-        guard !promotionEvidence
+        guard !qualificationEvidence
             || mlxSwiftLMRevision == Self.qualifiedMLXSwiftLMRevision
         else {
             throw CompressedAttentionProbeEvidenceError
                 .invalidIdentity("mlxSwiftLMRevision")
         }
-        guard !promotionEvidence
+        guard !qualificationEvidence
             || harnessBuildConfiguration
                 == Self.qualifiedBuildConfiguration
         else {
@@ -1175,10 +1245,22 @@ private extension CompressedAttentionProbeRunReceipts {
             operation: operation,
             plan: plan)
         try mlxMemory.validate()
+        let expectedWorkspace = try CompressedAttentionProbeWorkspaceBytes
+            .derive(
+                persistentKVBytes: bytes.persistentKVBytes,
+                materializationBytes: bytes.materializationBytes,
+                mlxMemory: mlxMemory)
+        guard bytes.otherWorkspaceBytes
+                == expectedWorkspace.otherWorkspaceBytes,
+            bytes.peakTemporaryBytes == expectedWorkspace.peakTemporaryBytes,
+            bytes.totalBytes == expectedWorkspace.totalBytes
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
+        }
         try processRSS.validate()
         try memorySettings.validate()
-        try power.validate(promotionEvidence: plan.promotionEvidence)
-        try thermal.validate(promotionEvidence: plan.promotionEvidence)
+        try power.validate(qualificationEvidence: plan.qualificationEvidence)
+        try thermal.validate(qualificationEvidence: plan.qualificationEvidence)
         try numericControls.validate()
         try hashes.validate()
     }
@@ -1298,7 +1380,9 @@ private extension CompressedAttentionProbeByteReceipts {
                 throw CompressedAttentionProbeEvidenceError
                     .invalidByteAccounting
             }
-        case (_, .swiftLMQuantizedAttention), (_, .fp16SDPA):
+        case (_, .swiftLMQuantizedAttention),
+            (_, .splitAffineQuantizedMM),
+            (_, .fp16SDPA):
             guard materializationBytes == 0 else {
                 throw CompressedAttentionProbeEvidenceError
                     .invalidByteAccounting
@@ -1310,9 +1394,8 @@ private extension CompressedAttentionProbeByteReceipts {
 }
 
 private extension CompressedAttentionProbeMLXMemorySnapshot {
-    func validate() throws {
-        guard activeBytes >= 0, cacheBytes >= 0, peakBytes >= 0,
-            peakBytes >= activeBytes
+    func validateNonnegative() throws {
+        guard activeBytes >= 0, cacheBytes >= 0, peakBytes >= 0
         else {
             throw CompressedAttentionProbeEvidenceError.invalidMemoryCounters
         }
@@ -1321,9 +1404,18 @@ private extension CompressedAttentionProbeMLXMemorySnapshot {
 
 private extension CompressedAttentionProbeMLXMemoryReceipts {
     func validate() throws {
-        try before.validate()
-        try after.validate()
-        guard after.peakBytes >= before.peakBytes else {
+        try before.validateNonnegative()
+        try after.validateNonnegative()
+        // The probe resets MLX's peak counter only after the prepared cache/query state is
+        // resident. A zero pre-run peak is the authenticated boundary marker. The raw post-run
+        // counter only records allocations after that reset and is not guaranteed to include the
+        // resident baseline; workspace derivation accounts for that documented raw behavior.
+        let rawCounterIsPlausible = after.peakBytes == 0
+            ? after.activeBytes <= before.activeBytes
+            : after.peakBytes >= max(
+                before.activeBytes,
+                after.activeBytes)
+        guard before.peakBytes == 0, rawCounterIsPlausible else {
             throw CompressedAttentionProbeEvidenceError.invalidMemoryCounters
         }
     }
@@ -1352,8 +1444,8 @@ private extension CompressedAttentionProbeMemorySettings {
 }
 
 private extension CompressedAttentionProbePowerReceipts {
-    func validate(promotionEvidence: Bool) throws {
-        guard !promotionEvidence
+    func validate(qualificationEvidence: Bool) throws {
+        guard !qualificationEvidence
             || (lowPowerModeEnabledBefore == lowPowerModeEnabledAfter
                 && powerSourceBefore == powerSourceAfter
                 && powerSourceBefore != .unavailable)
@@ -1364,8 +1456,8 @@ private extension CompressedAttentionProbePowerReceipts {
 }
 
 private extension CompressedAttentionProbeThermalReceipts {
-    func validate(promotionEvidence: Bool) throws {
-        guard !promotionEvidence
+    func validate(qualificationEvidence: Bool) throws {
+        guard !qualificationEvidence
             || (before == after && before != .unknown)
         else {
             throw CompressedAttentionProbeEvidenceError.invalidThermalState

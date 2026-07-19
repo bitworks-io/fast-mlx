@@ -364,3 +364,23 @@ diff checks, banned-concurrency scan, and staged secret scan pass. Coherent clos
 merged `--no-ff` to `main` as `f435312`. The
 largest remaining technical risk is that storage reduction has not become a compiled speed path;
 fused compressed-domain attention and a second model family are the next gates.
+
+## Fused compressed-attention Phase 0 implementation acceptance pass — 2026-07-18
+
+**Story:** a bench operator can compare independent K/V affine packed attention with fp16, the
+pinned symmetric Swift-LM helper, and materialize-then-attend using one authenticated synthetic
+geometry contract, without allowing that kernel probe to masquerade as loaded-model or dial
+promotion evidence.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Synthetic qualification identity fails closed | **PASS** | The CLI and schema use `qualification-evidence`, reject the legacy promotion flag, freeze 8K/32K and the exact 130,944+128 near-128K window, authenticate context+output against checkpoint config, and stamp schema v2 as `checkpoint-authenticated-synthetic-geometry`. |
+| Independent K/V packed path is real and actor-confined | **PASS** | `split-affine-quantized-mm` executes separate MLX affine `quantizedMM` operations for K and V with independent bits/groups, explicit precise softmax, GQA reshaping, and mask handling. It does not reconstruct dense K/V and is explicitly not labeled fused SDPA. Only scalar/value evidence leaves the owning actor. |
+| Timing and memory receipts isolate the attention path | **PASS** | Source generation, hashing, quantization, and host-detached prepared cache state occur before the peak reset. Timing/evaluation and the immediate post-attention snapshot exclude oracle work. Workspace totals are rederived from raw MLX receipts; impossible active growth and nonzero peaks below the prepared active baseline fail closed. |
+| Changed contracts and MLX behavior are freshly verified | **PASS** | Off-box `HarnessCoreTests` passes 429 XCTest plus 17 Swift Testing tests. After sync to the bench Mac, Xcode with `-skipPackagePluginValidation` passes 47/47 `FastMLXHarnessTests` and 92/92 `SpikeCoreTests`; the Release package build succeeds. MLX-coupled targets were not run through SwiftPM. |
+| Focused review and claim boundary | **PASS** | Review findings for arbitrary near-128K aliases, contradictory raw-memory receipts, cache-policy naming, and help wording were fixed test-first. Final focused re-review reports no remaining High/Medium findings. The plan and handoff state that these probes never load model weights and cannot support performance, family, or dial claims. |
+| Clean-SHA synthetic matrix | **PENDING** | Qwen 8K/32K, authenticated Qwen 128K refusal, and the frozen Llama near-128K synthetic cell remain to be captured and independently authenticated from the clean committed SHA. |
+| Runtime integration and promotion gate | **PENDING** | The portable router, scalar runtime, hostile batch-compaction case, loaded-model Qwen/Llama frontiers, teacher-forced loss, task floor, verdict, and content remain later phases. No PROMOTE or SHELVE conclusion is made by this packet. |
+
+**Overall verdict:** the Phase 0 contract/CLI/runner implementation slice passes. Measurement and
+all product-level claims remain open.

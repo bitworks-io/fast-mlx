@@ -69,8 +69,8 @@ public struct CompressedAttentionProbeCommand: Equatable, Sendable {
         }
         let stopTokenIDs = try Self.stopTokenIDs(
             values["stop-token-ids"] ?? "")
-        let promotionEvidence = try Self.boolean(
-            "promotion-evidence", in: values, default: false)
+        let qualificationEvidence = try Self.boolean(
+            "qualification-evidence", in: values, default: false)
 
         let memoryLimitBytes = try Self.integer(
             "memory-limit-bytes", in: values)
@@ -110,7 +110,7 @@ public struct CompressedAttentionProbeCommand: Equatable, Sendable {
             seed: try Self.integer("seed", in: values, default: 7),
             workloadNonce: try Self.required("workload-nonce", in: values),
             harnessGitSHA: harnessGitSHA,
-            promotionEvidence: promotionEvidence,
+            qualificationEvidence: qualificationEvidence,
             evidenceOutputPath: try Self.required("evidence", in: values),
             progressOutputPath: try Self.required("progress", in: values))
 
@@ -132,7 +132,7 @@ public struct CompressedAttentionProbeCommand: Equatable, Sendable {
         "query-tokens", "prefill-chunk-tokens", "output-tokens",
         "stop-token-ids", "batch-size", "query-heads", "kv-heads",
         "head-dimension", "dtype", "mask", "warmup-runs",
-        "measured-runs", "seed", "workload-nonce", "promotion-evidence",
+        "measured-runs", "seed", "workload-nonce", "qualification-evidence",
         "evidence", "progress", "memory-limit-bytes", "cache-limit-bytes",
         "wired-limit-bytes",
     ])

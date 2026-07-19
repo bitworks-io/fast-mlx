@@ -12,8 +12,9 @@ product, Python/research plane, engine-agnostic conformance and precision-loss h
 optimization dial with quantified quality loss. The product goal is to serve every model supported
 by the pinned MLX / MLX-Swift stack, with optimization investment prioritized for popular families
 and high-leverage operator workflows. Qwen3-32B is representative/model-specific evidence only.
-Broad support claims require model-support and architecture matrices plus at least one second,
-materially different popular family. Do not hardcode model names in shared paths.
+Broad support claims require model-support and architecture matrices plus at least one additional
+popular model with materially different attention geometry. Do not hardcode model names in shared
+paths.
 
 Design source: [`2026-07-08-fast-mlx-platform-design.md`](superpowers/specs/2026-07-08-fast-mlx-platform-design.md).
 
@@ -42,7 +43,9 @@ promoted, but no speed tier was proven. Verdict:
 content: [`2026-07-18-when-smaller-kv-is-not-faster.md`](content/2026-07-18-when-smaller-kv-is-not-faster.md).
 Promoted cells: fp16 KV as Transparent baseline, affine K4V2-g64 as Balanced capacity, frozen
 KVTuner as explicit Max-fit, and KVarN i8 as capacity-only Max-fit plus fused-kernel candidate.
-Shelved/rejected cells remain model-specific controls. This is Qwen3-32B-4bit evidence only.
+Shelved/rejected cells remain model-specific controls. This is Qwen3-32B-4bit evidence only; the
+frozen KVTuner schedule is Qwen-only unless independently calibrated and authenticated for another
+family.
 
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
@@ -50,9 +53,23 @@ notable spike, including negative results.
 ## Open Work Queue
 
 1. **Fused compressed-domain KV attention** — current top engine gate. Carry forward KVarN i8 plus
-   shared affine/KVTuner storage primitives. Prove full 32K/128K end-to-end behavior and the
-   batch-compaction poison case before any speed claim. Add a second materially different popular
-   family before broad support. [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
+   shared affine/KVTuner storage primitives. The current probe is checkpoint-authenticated,
+   config-constrained synthetic geometry evidence and never loads model weights, so it cannot prove
+   model-specific runtime/dial performance. Qualify Qwen3-32B at 8K smoke/32K only and record an
+   authenticated 128K refusal because its max context is 40,960. Qualify the staged
+   Llama-3.3-70B-Instruct-4bit checkpoint at 8K smoke/32K/near-128K only when prompt+output <=
+   131,072. Phase 0 should use Llama only for the near-128K synthetic geometry (plus an optional
+   identity canary), because repeating the full Q64/KV8/D128 synthetic matrix under both IDs is not
+   independent family evidence.
+   Both selected models share Q64/KV8/D128, so they do not prove cross-geometry generality. Prove
+   valid end-to-end behavior and the batch-compaction poison case before any speed claim. Add
+   another popular model with materially different attention geometry before broad/default support.
+   The Phase 0 producer now has a verified split independent-K/V affine quantized-matmul operation,
+   detached prepared-state timing boundary, schema-v2 synthetic-only evidence kind, and raw-MLX-bound
+   workspace receipts. The active gate is fresh clean-SHA Qwen 8K/32K capture, authenticated Qwen
+   128K refusal, and the frozen Llama near-128K synthetic cell; no Phase 0 timing is a model or dial
+   result.
+   [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
    [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
@@ -131,8 +148,9 @@ bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
 ```
 
-Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; no Qwen3-32B BF16
-target). Python: `~/harness-venv` (`transformers<5`).
+Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; staged
+Llama-3.3-70B-Instruct-4bit checkpoint; no Qwen3-32B BF16 target). Python: `~/harness-venv`
+(`transformers<5`).
 
 ## Commit / Checkin
 

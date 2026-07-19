@@ -20,7 +20,8 @@ attention or turn structural cache corruption into a quality tradeoff.
 
 This is one engine gate, not the fast-mlx product boundary. The implementation should be reusable by
 models supported by the pinned MLX stack, while qualification starts with popular representative
-families and keeps every support claim scoped to the model/architecture matrix below.
+families and keeps every support claim scoped to the model/architecture matrix below. The product
+remains model-generic; Qwen/Llama evidence must not become hardcoded product behavior.
 
 ## Exploration result and initial architecture decision
 
@@ -43,13 +44,19 @@ Therefore the first implementation is a **stock-primitive profiling gate**, not 
 kernel:
 
 - compare stock fp16 SDPA, the pinned Swift-LM quantized-attention helper, and the current
-  materialize-then-attend affine/KVarN paths at identical tensor geometry;
-- authenticate numeric output, latency, storage, workspace, and provenance at 8K/32K/128K;
+  materialize-then-attend affine/KVarN paths at authenticated, config-constrained synthetic tensor
+  geometry;
+- authenticate numeric output, latency, storage, workspace, and provenance at the context lengths
+  allowed by each selected checkpoint config;
 - decide from measured evidence whether the first integrated path should extend the existing
   quantized-matmul route or justify a custom Metal kernel;
 - do not modify ephemeral `.build/checkouts`. Any model-router hook needed after Phase 0 must be a
   portable pinned dependency revision/fork or an accepted upstream change, with license and diff
   review. A machine-local checkout patch cannot become promotion evidence.
+
+Phase 0 geometry probes authenticate against checkpoint config metadata but never load model
+weights. They can prove packed-attention structural behavior for a model-compatible geometry; they
+cannot prove model-specific runtime, dial, quality, or end-to-end performance claims.
 
 The first MLX-coupled causal-prefill fixture also found that the pinned Swift-LM helper's symbolic
 `.causal` branch fills masked scores with `Float.leastNormalMagnitude`, a positive value, rather
@@ -63,26 +70,38 @@ regression fixture or carry an authenticated upstream fix.
 
 | Family / architecture | Phase | Intended proof | Initial disposition |
 | --- | --- | --- | --- |
-| Qwen3 dense GQA, Qwen3-32B-4bit | first | Existing KVarN source model; head-dim/GQA, 8K then 32K/128K, scalar and hostile batch transition | required evidence target; model-specific |
-| Llama dense GQA, 128K-capable popular checkpoint | second | Different model family and tokenizer/config identity using the shared attention router | required before any dense-GQA cross-family/default claim; checkpoint must be source-locked before download/run |
+| Qwen3 dense GQA, Qwen3-32B-4bit | first | Existing KVarN source model; Q64/KV8/D128, 8K smoke then 32K, scalar and hostile batch transition | required evidence target; model-specific; max context is 40,960, so 128K must be an authenticated refusal |
+| Llama dense GQA, Llama-3.3-70B-Instruct-4bit | second | Different model family and tokenizer/config identity using the shared attention router; Q64/KV8/D128; 8K smoke, 32K, and near-128K with prompt+output <= 131,072 | required before any dense-GQA same-geometry cross-family claim; checkpoint must be source-locked before download/run |
 | Gemma local/global or rotating-cache family | later boundary | Sliding/local mask and cache-lifecycle semantics | fail closed until rotating/window cache proof exists |
 | Dense/MoE models whose attention uses the shared router | later matrix | Attention compatibility separate from expert/runtime behavior | no inherited claim from Qwen/Llama |
 | Hybrid/recurrent/MLA/VLM/diffusion or custom attention | out of initial gate | Architecture-specific state, mask, sink, or cache contract | unsupported and rejected explicitly |
 
-Two families do not imply every MLX model is qualified. If Qwen3 and Llama pass, the claim remains
-limited to the tested dense full-attention GQA geometry and exact model identities. KVTuner schedules
-remain model-specific and must fail authentication on the second family.
+Two families do not imply every MLX model is qualified. The selected Qwen3 and Llama checkpoints
+share Q64/KV8/D128 attention geometry, so a passing pair can support only a same-geometry
+dense-GQA claim for the exact authenticated identities. It does not prove cross-geometry
+generality. Broad product/default claims need another popular model with materially different
+attention geometry. KVTuner schedules remain Qwen-only unless independently calibrated and
+authenticated for Llama or any later family.
 
 ## Acceptance criteria and proof
 
 1. **Authenticated probe plan.** A pure value contract names the operation (`fp16-sdpa`,
-   `swiftlm-quantized-attention`, or `materialize-then-sdpa`), KV context length, query-token
+   `swiftlm-quantized-attention`, `split-affine-quantized-mm`, or
+   `materialize-then-sdpa`), KV context length, query-token
    length, prefill chunk shape, requested output-token count, explicit stop-token set, B/Q/KV
    heads, head dimension, K/V bits and groups, mask, dtype, warmups/runs, source SHA, workload
    nonce, and output path. Decode-shaped (`Tq=1`) and prefill-shaped cells have distinct workload
    identities and can never enter one comparison aggregate.
-   Only the predeclared 8K/32K/128K contexts are promotion-capable. Proof: local failing-first
-   `HarnessCoreTests` for missing, unknown, overflowed, aliased, symlinked, or inconsistent inputs.
+   Only predeclared qualification cells allowed by the authenticated checkpoint config are strict
+   evidence-capable. The qualification flag is intentionally not named or treated as promotion:
+   every artifact declares `checkpoint-authenticated-synthetic-geometry`, and no probe run loads
+   model weights. The synthetic probe uses Qwen 8K/32K plus an authenticated 128K refusal and
+   Llama at the frozen near-128K pair of 130,944 cached tokens plus 128 requested output tokens
+   (with an optional low-cost identity canary); repeating the same Q64/KV8/D128
+   synthetic matrix under both model IDs is not independent family evidence. Loaded-model proof
+   separately uses Qwen 8K/32K and Llama 8K/32K/near-128K with prompt+output at or below 131,072.
+   Proof: local failing-first `HarnessCoreTests`
+   for missing, unknown, overflowed, aliased, symlinked, or inconsistent inputs.
 2. **Numeric control.** The fp16 probe control agrees with stock SDPA at the pinned MLX
    float16 qualification envelope, `rtol=3e-4`, `atol=3e-4`. Evidence reports raw maximum
    absolute and relative errors plus the maximum mixed-tolerance ratio
@@ -96,19 +115,25 @@ remain model-specific and must fail authentication on the second family.
    JSONL.
 3. **Honest engagement and memory.** Every row records actual persistent packed arrays, scales,
    biases, control bytes, alignment, materialization bytes, and peak temporary workspace. It also
-   records MLX active/cache/peak memory and process footprint. A nominal tier name is insufficient.
+   records MLX active/cache/peak memory and process footprint. Workspace totals must be derived
+   from and validate against the raw MLX peak receipt. Because resetting MLX peak memory does not
+   inject the already-resident active baseline into the counter, the effective peak is
+   `max(raw post-reset peak, pre-run active bytes)`. The authenticated cache policy names the
+   actual run-wide preservation boundary. A nominal tier name is insufficient.
 4. **Profile-before-kernel gate.** Phase 0 records warmed per-step latency distributions for stock
-   fp16 SDPA, pinned quantized attention, and current materialize-then-attend paths at 8K/32K/128K.
-   A runtime integration design is selected only after the data identifies the dominant cost.
-   Kernel-only evidence may authorize engineering work but cannot promote a dial tier.
+   fp16 SDPA, pinned quantized attention, and current materialize-then-attend paths at the
+   checkpoint-config-allowed synthetic geometries. A runtime integration design is selected only
+   after the data identifies the dominant cost. Kernel-only or synthetic-geometry evidence may
+   authorize engineering work but cannot promote a dial tier.
 5. **Portable model-router seam.** If integration proceeds, models using the shared attention
    helper can invoke one actor-confined packed-cache attention contract without importing
    fast-mlx or hardcoding model names. The dependency source and exact patch/revision are pinned.
    Unknown or unsupported model attention paths return a typed refusal before model execution.
 6. **Selected formats consume packed state.** Affine K4V2-g64 and frozen KVTuner use their actual
    independent K/V widths; KVarN i8 uses its actual selected transform/layout. No path expands
-   KV heads or reconstructs the full cache. KVTuner authenticates the frozen bundle and layer
-   schedule before arrays are allocated.
+   KV heads or reconstructs the full cache. KVTuner authenticates the frozen Qwen bundle and layer
+   schedule before arrays are allocated, and remains unavailable for Llama unless a Llama-specific
+   calibration is independently produced and authenticated.
 7. **Cache lifecycle correctness.** Growth, rollback, reset, masks, GQA, head dimensions, and
    compilation preserve the existing contracts. The hostile batch case merges unequal rows,
    removes the longest row at the zero-padding boundary, appends again, and proves explicit
@@ -118,14 +143,16 @@ remain model-specific and must fail authentication on the second family.
    mismatch, non-finite values, arithmetic overflow, partial evidence, or a missing workspace
    receipt aborts the run. Lossy KV plus PLD remains rejected. No silent fp16/materialized fallback
    occurs after a request starts.
-9. **End-to-end Apple frontier.** Promotion requires identical 32K and 128K model workloads for
-   fp16, materialize, and packed-attention cells. Evidence includes direct prefill/decode,
+9. **End-to-end Apple frontier.** Promotion requires identical model workloads within each
+   checkpoint's context limit: Qwen 32K plus authenticated 128K refusal, and Llama 32K plus
+   near-128K with prompt+output <= 131,072. Evidence includes direct prefill/decode,
    TTFT/TPOT, actual cache bytes/capacity, MLX active/cache/peak, process RSS, task floor, and
    teacher-forced KL/perplexity/tail-p95. At least three post-warmup runs are retained, not only
    aggregates. The evidence binds query/prefill/output/stop shape as well as KV context length.
 10. **Speed gate.** A speed-tier candidate must beat both its same-storage materialize path and
-    fp16 base decode at 32K and 128K by at least 5% in every retained post-warmup run, without a
-    greater than 5% prefill regression. Cells run in a deterministic counterbalanced/interleaved
+    fp16 base decode at every promotion-capable model workload for that checkpoint by at least 5%
+    in every retained post-warmup run, without a greater than 5% prefill regression. Cells run in a
+    deterministic counterbalanced/interleaved
     order with identical explicit `Memory.cacheLimit`, `Memory.memoryLimit`, wired-memory setting,
     model residency,
     prompt/output/stop identity, and cache-reset policy. Every row records run position, monotonic
@@ -137,17 +164,21 @@ remain model-specific and must fail authentication on the second family.
 11. **User-controlled loss.** Transparent/Balanced/Max-fit classification uses the already-locked
     teacher-forced and task hard floor. Useful aggressive points above the floor remain available
     with measured warnings; incoherent points remain impossible to select.
-12. **Cross-family scope and closure.** Qwen3 is adjudicated first. A source-locked Llama-family
-    checkpoint repeats the applicable gate before any cross-family/default claim. The cycle ends
-    with a dated PROMOTE/SHELVE verdict, compact evidence, a `docs/content/` piece, verification
-    packet, focused review, secret scan, coherent commits, and `--no-ff` merge only after fresh proof.
+12. **Cross-family scope and closure.** Qwen3 is adjudicated first at 8K smoke/32K with an
+    authenticated 128K refusal. A source-locked Llama-family checkpoint repeats the applicable
+    8K/32K/near-128K gate before any same-geometry cross-family claim. Another popular model with
+    materially different attention geometry is required before any broad/default product claim. The
+    cycle ends with a dated PROMOTE/SHELVE verdict, compact evidence, a `docs/content/` piece,
+    verification packet, focused review, secret scan, coherent commits, and `--no-ff` merge only
+    after fresh proof.
 
 ## Happy, failure, and recovery paths
 
 - **Happy path:** a deterministic Qwen3 geometry probe shows packed attention avoids full-cache
-  materialization with acceptable numeric behavior and a meaningful long-context latency win. The
-  portable router seam is integrated behind an experimental flag, scalar decode passes, the hostile
-  batch transition passes, and full 32K/128K model evidence advances one or more measured dial cells.
+  materialization with acceptable numeric behavior at 8K smoke/32K and refuses 128K because the
+  authenticated config max context is 40,960. The portable router seam is integrated behind an
+  experimental flag, scalar decode passes, the hostile batch transition passes, and valid Qwen plus
+  Llama end-to-end model evidence advances one or more measured dial cells.
 - **Stock primitive is sufficient:** extend the existing quantized-attention route with the
   smallest portable contract that supports independent K/V geometry; do not write custom Metal
   merely for novelty.
@@ -171,7 +202,9 @@ remain model-specific and must fail authentication on the second family.
   `spike/scripts/sync_llmbench.sh`, then Xcode tests/build on the bench Mac with
   `-skipPackagePluginValidation`. Never use `swift test` for those targets.
 - Phase 0 probe outputs: fresh-output directory, held runner lock, atomic progress heartbeat,
-  absent watchdog on success, clean source/package/model identity, exact row count and hashes.
+  absent watchdog on success, clean source/package/checkpoint-config identity, exact row count and
+  hashes. Probe rows are synthetic geometry evidence; end-to-end model evidence requires separate
+  model-weight runs.
 - Long contexts: if `iogpu.wired_limit_mb` is raised, record and set the explicit
   `Memory.cacheLimit` recommended by the capacity model.
 - Quality: teacher-forced/context-locked primary metrics; free-running task/coherence checks are
@@ -184,11 +217,14 @@ remain model-specific and must fail authentication on the second family.
 - [x] TDD a pure `CompressedAttentionProbePlan` and immutable evidence schema, including
   operation/context/query/prefill/output/stop/geometry/layout/provenance identities, paired run
   order and environment receipts, and exact raw-run retention.
-- [ ] Add an MLX-coupled probe CLI that compares stock fp16 SDPA, pinned Swift-LM quantized
-  attention, and materialize-then-attend from the same packed bytes.
-- [ ] Run small deterministic correctness fixtures, then interleaved 8K/32K/128K Qwen and
-  Llama-compatible decode and prefill geometries on the bench Mac. Record materialization,
-  workspace high-water bytes, fixed cache/wired-memory settings, MLX cache state, and thermal state.
+- [x] Complete verification of the MLX-coupled probe CLI comparing stock fp16 SDPA, pinned
+  Swift-LM quantized attention, split K/V affine quantized matmuls, and
+  materialize-then-attend from the same packed bytes.
+- [ ] Run small deterministic correctness fixtures, then interleaved Qwen 8K smoke/32K plus
+  authenticated 128K refusal and one Llama near-128K synthetic geometry (optionally an 8K identity
+  canary) on the bench Mac. Do not repeat the full same-geometry matrix under both checkpoint IDs.
+  Record materialization, workspace high-water bytes, fixed cache/wired-memory settings, MLX cache
+  state, and thermal state.
 - [ ] Write a short architecture decision from the measured bottleneck. Stop here if a direct
   packed path lacks a credible speed envelope.
 
@@ -217,14 +253,19 @@ remain model-specific and must fail authentication on the second family.
 
 ### Phase 4 — end-to-end Qwen frontier
 
-- [ ] Run 8K as the bounded smoke, then 32K and 128K only from the clean verified SHA.
+- [ ] Run 8K as the bounded smoke, then 32K only from the clean verified SHA; record the
+  authenticated 128K refusal because Qwen3-32B max context is 40,960.
 - [ ] Compare fp16, same-storage materialize, packed affine K4V2-g64, frozen KVTuner, and KVarN i8.
 - [ ] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
 
 ### Phase 5 — second family and adjudication
 
-- [ ] Source-lock the selected Llama-family checkpoint and repeat the applicable 32K/128K gate.
-- [ ] Keep model-specific KVTuner unavailable unless separately calibrated and authenticated.
+- [ ] Source-lock the selected Llama-3.3-70B-family checkpoint and repeat the applicable 8K
+  smoke/32K/near-128K gate with prompt+output <= 131,072.
+- [ ] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
+  Llama.
+- [ ] Add a third popular, materially different attention geometry before broad/default product
+  support claims.
 - [ ] Quantify Transparent/Balanced/Max-fit speed/capacity/loss, write verdict/content, verify,
   review, scan, commit, and merge only if every claimed gate has fresh proof.
 

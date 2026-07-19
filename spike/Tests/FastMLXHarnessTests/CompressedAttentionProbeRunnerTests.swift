@@ -31,10 +31,39 @@ final class CompressedAttentionProbeRunnerTests: XCTestCase {
         XCTAssertEqual(result.materializationWorkspaceBytes, 0)
         XCTAssertGreaterThan(result.attentionSeconds, 0)
         XCTAssertEqual(result.outputTop1Index, result.oracleTop1Index)
+        assertIsolatedAttentionMemory(result)
         assertSHA256(result.sourceKVTensorSHA256)
         assertSHA256(result.packedKVTensorSHA256)
         assertSHA256(result.queryTensorSHA256)
         assertSHA256(result.outputTensorSHA256)
+    }
+
+    func testSplitAffineQuantizedMMConsumesIndependentK4V2State()
+        async throws
+    {
+        let result = try await CompressedAttentionProbeRunner().runFixture(
+            plan: makePlan(
+                operation: .splitAffineQuantizedMM,
+                queryTokens: 16,
+                mask: .causal,
+                layout: .affine(
+                    keyBits: 4, valueBits: 2,
+                    keyGroupSize: 64, valueGroupSize: 32)))
+
+        XCTAssertEqual(result.outputShape, [1, 8, 16, 128])
+        XCTAssertTrue(result.valuesFinite)
+        XCTAssertTrue(
+            result.structuralEquivalent,
+            "max=\(result.maxAbsoluteError) ratio=\(result.maximumToleranceRatio)")
+        XCTAssertTrue(result.top1Matches)
+        XCTAssertGreaterThan(result.payloadBytes, 0)
+        XCTAssertGreaterThan(result.scaleBytes, 0)
+        XCTAssertGreaterThan(result.biasBytes, 0)
+        XCTAssertEqual(result.fp16ResidentBytes, 0)
+        XCTAssertEqual(result.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(result.attentionSeconds, 0)
+        XCTAssertEqual(result.outputTop1Index, result.oracleTop1Index)
+        assertIsolatedAttentionMemory(result)
     }
 
     func testMaterializeThenAttendReportsTheFullAffineWorkspace() async throws {
@@ -53,6 +82,7 @@ final class CompressedAttentionProbeRunnerTests: XCTestCase {
         XCTAssertLessThan(result.persistentBytes, result.materializationWorkspaceBytes)
         XCTAssertEqual(result.materializationWorkspaceBytes, 65_536)
         XCTAssertGreaterThan(result.attentionSeconds, 0)
+        assertIsolatedAttentionMemory(result)
     }
 
     func testCausalPrefillShapeIsNotCollapsedIntoDecodeShape() async throws {
@@ -108,6 +138,7 @@ final class CompressedAttentionProbeRunnerTests: XCTestCase {
         XCTAssertEqual(
             result.sourceKVTensorSHA256,
             result.packedKVTensorSHA256)
+        assertIsolatedAttentionMemory(result)
     }
 
     func testCandidateAndReferenceBindTheSameSourceAndQueryProjections() async throws {
@@ -191,7 +222,7 @@ final class CompressedAttentionProbeRunnerTests: XCTestCase {
             seed: 7,
             workloadNonce: "fused-kv-mlx-fixture",
             harnessGitSHA: cleanSHA,
-            promotionEvidence: false)
+            qualificationEvidence: false)
     }
 
     private func assertSHA256(
@@ -204,5 +235,23 @@ final class CompressedAttentionProbeRunnerTests: XCTestCase {
             value.allSatisfy { $0.isNumber || ("a" ... "f").contains($0) },
             file: file,
             line: line)
+    }
+
+    private func assertIsolatedAttentionMemory(
+        _ result: CompressedAttentionProbeNumericResult,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(
+            result.attentionMemoryBefore.peakBytes, 0,
+            "peak must reset after fixture preparation",
+            file: file, line: line)
+        XCTAssertGreaterThan(
+            result.attentionMemoryBefore.activeBytes, 0,
+            file: file, line: line)
+        XCTAssertGreaterThanOrEqual(
+            result.attentionMemoryAfter.peakBytes,
+            result.attentionMemoryBefore.activeBytes,
+            file: file, line: line)
     }
 }

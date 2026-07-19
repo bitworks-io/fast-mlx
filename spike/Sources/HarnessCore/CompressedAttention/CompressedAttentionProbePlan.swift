@@ -3,6 +3,7 @@ import Foundation
 public enum CompressedAttentionProbeOperation: String, Codable, Sendable, CaseIterable {
     case fp16SDPA = "fp16-sdpa"
     case swiftLMQuantizedAttention = "swiftlm-quantized-attention"
+    case splitAffineQuantizedMM = "split-affine-quantized-mm"
     case materializeThenSDPA = "materialize-then-sdpa"
 }
 
@@ -45,8 +46,9 @@ public enum CompressedAttentionProbePlanError: Error, Equatable, Sendable {
     case invalidHarnessGitSHA
     case operationLayoutMismatch
     case unsupportedStockQuantizedLayout
-    case unapprovedPromotionContext(Int)
-    case insufficientPromotionRuns(Int)
+    case unapprovedQualificationWindow(
+        contextTokens: Int, outputTokens: Int)
+    case insufficientQualificationRuns(Int)
     case invalidOutputPath(String)
     case symbolicLinkOutput(String)
     case outputPathCollision(String)
@@ -54,10 +56,14 @@ public enum CompressedAttentionProbePlanError: Error, Equatable, Sendable {
 }
 
 /// Pure, allocation-free validation for a compressed-attention profiling cell. MLX-coupled code
-/// must accept one of these plans rather than inferring geometry or promotion status from flags.
+/// must accept one of these plans rather than inferring geometry or qualification status from
+/// flags.
 public struct CompressedAttentionProbePlan: Equatable, Sendable {
-    public static let promotionContextTokens: Set<Int> = [8_192, 32_768, 131_072]
-    public static let minimumPromotionRuns = 3
+    public static let qualificationContextTokens: Set<Int> = [8_192, 32_768]
+    public static let near128KQualificationContextTokens = 130_944
+    public static let near128KQualificationOutputTokens = 128
+    public static let qualificationTotalWindowTokens = 131_072
+    public static let minimumQualificationRuns = 3
 
     public let operation: CompressedAttentionProbeOperation
     public let contextTokens: Int
@@ -77,10 +83,13 @@ public struct CompressedAttentionProbePlan: Equatable, Sendable {
     public let seed: Int
     public let workloadNonce: String
     public let harnessGitSHA: String
-    public let promotionEvidence: Bool
+    /// Enables the strict long-context capture contract. Passing this gate is necessary but never
+    /// sufficient for dial promotion: this probe measures synthetic attention geometry, not a
+    /// loaded model or user workload.
+    public let qualificationEvidence: Bool
     public let evidenceOutputPath: String
     public let progressOutputPath: String
-    public let isPromotionContext: Bool
+    public let isQualificationContext: Bool
     public let gqaRepeatCount: Int
     public let totalKVScalarCount: Int
     public let totalQueryScalarCount: Int
@@ -104,7 +113,7 @@ public struct CompressedAttentionProbePlan: Equatable, Sendable {
         seed: Int,
         workloadNonce: String,
         harnessGitSHA: String,
-        promotionEvidence: Bool,
+        qualificationEvidence: Bool,
         evidenceOutputPath: String = "compressed-attention-probe.jsonl",
         progressOutputPath: String = "compressed-attention-probe.progress.json"
     ) throws {
@@ -182,14 +191,28 @@ public struct CompressedAttentionProbePlan: Equatable, Sendable {
             headDimension,
         ])
 
-        if promotionEvidence {
-            guard Self.promotionContextTokens.contains(contextTokens) else {
-                throw CompressedAttentionProbePlanError.unapprovedPromotionContext(
-                    contextTokens)
+        let (totalWindowTokens, windowOverflow) = contextTokens
+            .addingReportingOverflow(outputTokens)
+        guard !windowOverflow else {
+            throw CompressedAttentionProbePlanError.arithmeticOverflow
+        }
+        let isQualificationContext = Self.qualificationContextTokens
+            .contains(contextTokens)
+            || (contextTokens == Self.near128KQualificationContextTokens
+                && outputTokens == Self.near128KQualificationOutputTokens
+                && totalWindowTokens
+                    == Self.qualificationTotalWindowTokens)
+
+        if qualificationEvidence {
+            guard isQualificationContext else {
+                throw CompressedAttentionProbePlanError
+                    .unapprovedQualificationWindow(
+                        contextTokens: contextTokens,
+                        outputTokens: outputTokens)
             }
-            guard measuredRuns >= Self.minimumPromotionRuns else {
-                throw CompressedAttentionProbePlanError.insufficientPromotionRuns(
-                    measuredRuns)
+            guard measuredRuns >= Self.minimumQualificationRuns else {
+                throw CompressedAttentionProbePlanError
+                    .insufficientQualificationRuns(measuredRuns)
             }
         }
 
@@ -211,11 +234,11 @@ public struct CompressedAttentionProbePlan: Equatable, Sendable {
         self.seed = seed
         self.workloadNonce = workloadNonce
         self.harnessGitSHA = harnessGitSHA
-        self.promotionEvidence = promotionEvidence
+        self.qualificationEvidence = qualificationEvidence
         self.evidenceOutputPath = evidenceOutputPath
         self.progressOutputPath = progressOutputPath
-        self.isPromotionContext = promotionEvidence
-            && Self.promotionContextTokens.contains(contextTokens)
+        self.isQualificationContext = qualificationEvidence
+            && isQualificationContext
         self.gqaRepeatCount = queryHeadCount / kvHeadCount
         self.totalKVScalarCount = scalarCount
         self.totalQueryScalarCount = queryScalarCount
@@ -271,6 +294,10 @@ public struct CompressedAttentionProbePlan: Equatable, Sendable {
         case (.swiftLMQuantizedAttention, _):
             throw CompressedAttentionProbePlanError
                 .unsupportedStockQuantizedLayout
+        case (.splitAffineQuantizedMM, .affine):
+            return
+        case (.splitAffineQuantizedMM, _):
+            throw CompressedAttentionProbePlanError.operationLayoutMismatch
         case (.materializeThenSDPA, .affine),
             (.materializeThenSDPA, .kvarn):
             return

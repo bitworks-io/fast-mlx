@@ -48,7 +48,7 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
                 "--measured-runs", "1",
                 "--seed", "7",
                 "--workload-nonce", "probe-cli-e2e",
-                "--promotion-evidence", "false",
+                "--qualification-evidence", "false",
                 "--evidence", evidenceURL.path,
                 "--progress", progressURL.path,
                 "--memory-limit-bytes", String(1 << 30),
@@ -76,10 +76,30 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             command: command,
             packageIdentity: package)
         XCTAssertNoThrow(try evidence.validated())
+        XCTAssertEqual(
+            evidence.evidenceKind,
+            .checkpointAuthenticatedSyntheticGeometry)
         XCTAssertEqual(evidence.rows.count, 2)
         XCTAssertEqual(
             evidence.rows.map(\.role),
             [.candidate, .fp16Reference])
+        for row in evidence.rows {
+            let receipts = try XCTUnwrap(row.receipts)
+            XCTAssertEqual(receipts.mlxMemory.before.peakBytes, 0)
+            let derivedWorkspace = try CompressedAttentionProbeWorkspaceBytes
+                .derive(
+                    persistentKVBytes: receipts.bytes.persistentKVBytes,
+                    materializationBytes: receipts.bytes.materializationBytes,
+                    mlxMemory: receipts.mlxMemory)
+            XCTAssertEqual(
+                receipts.bytes.otherWorkspaceBytes,
+                derivedWorkspace.otherWorkspaceBytes)
+            XCTAssertEqual(
+                receipts.bytes.peakTemporaryBytes,
+                derivedWorkspace.peakTemporaryBytes)
+            XCTAssertEqual(receipts.bytes.totalBytes, derivedWorkspace.totalBytes)
+            XCTAssertGreaterThan(receipts.bytes.otherWorkspaceBytes, 0)
+        }
         let persisted = try JSONDecoder().decode(
             CompressedAttentionProbeEvidence.self,
             from: Data(contentsOf: evidenceURL))
@@ -307,7 +327,7 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             seed: 7,
             workloadNonce: "geometry-match",
             harnessGitSHA: cleanSHA,
-            promotionEvidence: false)
+            qualificationEvidence: false)
         XCTAssertNoThrow(try validateCompressedAttentionProbeModelGeometry(
             plan: matching,
             modelPath: directory.path))
@@ -331,7 +351,7 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             seed: 7,
             workloadNonce: "geometry-mismatch",
             harnessGitSHA: cleanSHA,
-            promotionEvidence: false)
+            qualificationEvidence: false)
         XCTAssertThrowsError(
             try validateCompressedAttentionProbeModelGeometry(
                 plan: mismatched,
@@ -340,6 +360,52 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             XCTAssertEqual(
                 error as? CompressedAttentionProbeCLIError,
                 .modelGeometryMismatch("queryHeadCount"))
+        }
+    }
+
+    func testModelGeometryRejectsContextPlusOutputPastAuthenticatedWindow()
+        throws
+    {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("""
+        {
+          "hidden_size": 1024,
+          "max_position_embeddings": 8192,
+          "num_attention_heads": 8,
+          "num_key_value_heads": 2
+        }
+        """.utf8).write(
+            to: directory.appendingPathComponent("config.json"))
+        let plan = try CompressedAttentionProbePlan(
+            operation: .fp16SDPA,
+            contextTokens: 8_192,
+            queryTokens: 1,
+            prefillChunkTokens: 32,
+            outputTokens: 16,
+            stopTokenIDs: [],
+            batchSize: 1,
+            queryHeadCount: 8,
+            kvHeadCount: 2,
+            headDimension: 128,
+            dtype: .float16,
+            mask: .causal,
+            layout: .fp16,
+            warmupRuns: 1,
+            measuredRuns: 1,
+            seed: 7,
+            workloadNonce: "geometry-window-overrun",
+            harnessGitSHA: cleanSHA,
+            qualificationEvidence: false)
+
+        XCTAssertThrowsError(
+            try validateCompressedAttentionProbeModelGeometry(
+                plan: plan,
+                modelPath: directory.path)
+        ) { error in
+            XCTAssertEqual(
+                error as? CompressedAttentionProbeCLIError,
+                .modelGeometryMismatch("contextWindowTokens"))
         }
     }
 

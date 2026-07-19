@@ -5,7 +5,7 @@ import XCTest
 final class CompressedAttentionProbeCommandTests: XCTestCase {
     private let cleanSHA = String(repeating: "a", count: 40)
 
-    func testParsesAuthenticatedAffinePromotionCommand() throws {
+    func testParsesAuthenticatedAffineQualificationCommand() throws {
         let command = try CompressedAttentionProbeCommand(
             arguments: affineArguments(),
             harnessGitSHA: cleanSHA)
@@ -23,10 +23,32 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
         XCTAssertEqual(command.plan.contextTokens, 32_768)
         XCTAssertEqual(command.plan.queryTokens, 1)
         XCTAssertEqual(command.plan.stopTokenIDs, [151_643, 151_645])
-        XCTAssertTrue(command.plan.promotionEvidence)
+        XCTAssertTrue(command.plan.qualificationEvidence)
         XCTAssertEqual(command.memoryLimitBytes, 32 << 30)
         XCTAssertEqual(command.cacheLimitBytes, 8 << 30)
         XCTAssertEqual(command.wiredLimitBytes, 0)
+    }
+
+    func testParsesSplitAffineQuantizedMMWithIndependentKVGeometry() throws {
+        var arguments = affineArguments()
+        replaceFlag(
+            "operation", with: "split-affine-quantized-mm",
+            in: &arguments)
+        replaceFlag("value-bits", with: "2", in: &arguments)
+        replaceFlag("value-group-size", with: "32", in: &arguments)
+
+        let command = try CompressedAttentionProbeCommand(
+            arguments: arguments,
+            harnessGitSHA: cleanSHA)
+
+        XCTAssertEqual(command.plan.operation, .splitAffineQuantizedMM)
+        XCTAssertEqual(
+            command.plan.layout,
+            .affine(
+                keyBits: 4,
+                valueBits: 2,
+                keyGroupSize: 64,
+                valueGroupSize: 32))
     }
 
     func testParsesFP16ExploratoryCommandWithoutLayoutOptions() throws {
@@ -39,7 +61,7 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
             "--prefill-chunk-tokens", "32",
         ]
         replaceFlag("measured-runs", with: "1", in: &arguments)
-        replaceFlag("promotion-evidence", with: "false", in: &arguments)
+        replaceFlag("qualification-evidence", with: "false", in: &arguments)
 
         let command = try CompressedAttentionProbeCommand(
             arguments: arguments,
@@ -49,7 +71,7 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
         XCTAssertEqual(command.plan.mask, .causal)
         XCTAssertEqual(command.plan.dtype, .float16)
         XCTAssertEqual(command.plan.queryTokens, 16)
-        XCTAssertFalse(command.plan.promotionEvidence)
+        XCTAssertFalse(command.plan.qualificationEvidence)
     }
 
     func testUnknownDuplicatePositionalAndMissingValuesFailClosed() {
@@ -66,6 +88,20 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
         removeFlag("seed", from: &missingValue)
         missingValue.append("--seed")
         assertCommandError(missingValue, .missingFlagValue("seed"))
+
+        var legacyPromotionFlag = affineArguments()
+        replaceFlag(
+            "qualification-evidence",
+            with: "true",
+            in: &legacyPromotionFlag)
+        if let index = legacyPromotionFlag.firstIndex(
+            of: "--qualification-evidence")
+        {
+            legacyPromotionFlag[index] = "--promotion-evidence"
+        }
+        assertCommandError(
+            legacyPromotionFlag,
+            .unknownFlag("promotion-evidence"))
     }
 
     func testMissingRequiredAndMalformedScalarFlagsFailClosed() {
@@ -80,10 +116,10 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
             .invalidInteger(flag: "context-tokens", value: "many"))
 
         var invalidBoolean = affineArguments()
-        replaceFlag("promotion-evidence", with: "yes", in: &invalidBoolean)
+        replaceFlag("qualification-evidence", with: "yes", in: &invalidBoolean)
         assertCommandError(
             invalidBoolean,
-            .invalidBoolean(flag: "promotion-evidence", value: "yes"))
+            .invalidBoolean(flag: "qualification-evidence", value: "yes"))
     }
 
     func testModelIDStopIDsAndEnumsFailClosed() {
@@ -125,7 +161,7 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
             "--key-bits", "4",
         ]
         replaceFlag("measured-runs", with: "1", in: &fp16)
-        replaceFlag("promotion-evidence", with: "false", in: &fp16)
+        replaceFlag("qualification-evidence", with: "false", in: &fp16)
         assertCommandError(fp16, .unusedLayoutFlag("key-bits"))
     }
 
@@ -195,7 +231,7 @@ final class CompressedAttentionProbeCommandTests: XCTestCase {
             "--measured-runs", "3",
             "--seed", "7",
             "--workload-nonce", "fused-kv-qwen3-v1",
-            "--promotion-evidence", "true",
+            "--qualification-evidence", "true",
             "--evidence", "/tmp/probe.json",
             "--progress", "/tmp/probe.progress.json",
             "--memory-limit-bytes", String(32 << 30),

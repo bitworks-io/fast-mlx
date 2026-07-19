@@ -7,6 +7,7 @@ import MLXLMCommon
 enum CompressedAttentionProbeRunnerError: Error, Equatable {
     case missingAffineBias
     case unsupportedLayout
+    case unsupportedMaskGeometry
     case byteCountOverflow
     case nonFiniteOutput
 }
@@ -31,6 +32,8 @@ struct CompressedAttentionProbeNumericResult: Equatable, Sendable {
     let fp16ResidentBytes: Int
     let persistentBytes: Int
     let materializationWorkspaceBytes: Int
+    let attentionMemoryBefore: CompressedAttentionProbeMLXMemorySnapshot
+    let attentionMemoryAfter: CompressedAttentionProbeMLXMemorySnapshot
     let sourceKVTensorSHA256: String
     let packedKVTensorSHA256: String
     let queryTensorSHA256: String
@@ -61,6 +64,28 @@ actor CompressedAttentionProbeRunner {
         let valueGroupSize: Int
     }
 
+    private struct AffineComponents {
+        let payload: Int
+        let scales: Int
+        let biases: Int
+        let total: Int
+    }
+
+    private enum PreparedStorage {
+        case fp16(keys: MLXArray, values: MLXArray)
+        case affine(pair: AffinePair, components: AffineComponents)
+    }
+
+    private struct PreparedFixture {
+        let queries: MLXArray
+        let storage: PreparedStorage
+        let scale: Float
+        let mask: ProbeMask
+        let sourceKVTensorSHA256: String
+        let packedKVTensorSHA256: String
+        let queryTensorSHA256: String
+    }
+
     private struct ProbeMask {
         let mode: MLXFast.ScaledDotProductAttentionMaskMode
         let additive: MLXArray?
@@ -71,11 +96,7 @@ actor CompressedAttentionProbeRunner {
         Memory.cacheLimit = cacheLimitBytes
     }
 
-    func resetPeakMemory() {
-        Memory.peakMemory = 0
-    }
-
-    func memorySnapshot() -> CompressedAttentionProbeMLXMemorySnapshot {
+    private func memorySnapshot() -> CompressedAttentionProbeMLXMemorySnapshot {
         let snapshot = Memory.snapshot()
         return CompressedAttentionProbeMLXMemorySnapshot(
             activeBytes: snapshot.activeMemory,
@@ -89,36 +110,16 @@ actor CompressedAttentionProbeRunner {
         guard supportsFixture(plan) else {
             throw CompressedAttentionProbeRunnerError.unsupportedLayout
         }
+        let prepared = try prepareFixture(plan: plan)
         let dtype = mlxDType(plan.dtype)
-        let queryShape = [
-            plan.batchSize, plan.queryHeadCount,
-            plan.queryTokens, plan.headDimension,
-        ]
-        let cacheShape = [
-            plan.batchSize, plan.kvHeadCount,
-            plan.contextTokens, plan.headDimension,
-        ]
-        let queries = MLXRandom.normal(
-            queryShape, key: MLXRandom.key(UInt64(plan.seed)))
-            .asType(dtype)
-        let keys = MLXRandom.normal(
-            cacheShape, key: MLXRandom.key(UInt64(plan.seed) &+ 1))
-            .asType(dtype)
-        let values = MLXRandom.normal(
-            cacheShape, key: MLXRandom.key(UInt64(plan.seed) &+ 2))
-            .asType(dtype)
-        eval(queries, keys, values)
-        let sourceKVTensorSHA256 = tensorSHA256([keys, values])
-        let queryTensorSHA256 = tensorSHA256([queries])
-        let scale = Float(1 / sqrt(Double(plan.headDimension)))
-        let mask = mlxMask(
-            plan.mask,
-            queryTokens: plan.queryTokens,
-            contextTokens: plan.contextTokens,
-            dtype: dtype)
+
+        // Everything above this boundary is fixture preparation: source generation, hashing,
+        // quantization, and host-round-tripped cache detachment. Reset only now so the MLX peak
+        // below is the prepared-state baseline plus the attention path, never preparation/oracle.
+        Memory.peakMemory = 0
+        let attentionMemoryBefore = memorySnapshot()
 
         let output: MLXArray
-        let oracle: MLXArray
         let attentionSeconds: Double
         let payloadBytes: Int
         let scaleBytes: Int
@@ -128,23 +129,16 @@ actor CompressedAttentionProbeRunner {
         let fp16ResidentBytes: Int
         let persistentBytes: Int
         let materializationWorkspaceBytes: Int
-        let packedKVTensorSHA256: String
 
-        switch (plan.operation, plan.layout) {
-        case (.fp16SDPA, .fp16):
+        switch (plan.operation, prepared.storage) {
+        case let (.fp16SDPA, .fp16(keys, values)):
             let startedAt = ProcessInfo.processInfo.systemUptime
             output = MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask.mode)
+                queries: prepared.queries, keys: keys, values: values,
+                scale: prepared.scale, mask: prepared.mask.mode)
             eval(output)
             attentionSeconds = ProcessInfo.processInfo.systemUptime
                 - startedAt
-            oracle = referenceAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                additiveMask: mask.additive)
             payloadBytes = 0
             scaleBytes = 0
             biasBytes = 0
@@ -155,37 +149,21 @@ actor CompressedAttentionProbeRunner {
             ])
             persistentBytes = fp16ResidentBytes
             materializationWorkspaceBytes = 0
-            packedKVTensorSHA256 = sourceKVTensorSHA256
 
-        case let (
-            .swiftLMQuantizedAttention,
-            .affine(keyBits, valueBits, keyGroupSize, valueGroupSize)):
-            let pair = try affinePair(
-                keys: keys, values: values,
-                keyBits: keyBits, valueBits: valueBits,
-                keyGroupSize: keyGroupSize,
-                valueGroupSize: valueGroupSize)
+        case let (.swiftLMQuantizedAttention, .affine(pair, components)):
             let startedAt = ProcessInfo.processInfo.systemUptime
             output = quantizedScaledDotProductAttention(
-                queries: queries,
+                queries: prepared.queries,
                 quantizedKeys: pair.keys,
                 quantizedValues: pair.values,
-                scale: scale,
-                mask: mask.mode,
-                groupSize: keyGroupSize,
-                bits: keyBits,
+                scale: prepared.scale,
+                mask: prepared.mask.mode,
+                groupSize: pair.keyGroupSize,
+                bits: pair.keyBits,
                 mode: .affine)
             eval(output)
             attentionSeconds = ProcessInfo.processInfo.systemUptime
                 - startedAt
-            let materialized = dequantize(pair: pair, dtype: dtype)
-            oracle = referenceAttention(
-                queries: queries,
-                keys: materialized.keys,
-                values: materialized.values,
-                scale: scale,
-                additiveMask: mask.additive)
-            let components = try affinePersistentComponents(pair)
             payloadBytes = components.payload
             scaleBytes = components.scales
             biasBytes = components.biases
@@ -194,34 +172,37 @@ actor CompressedAttentionProbeRunner {
             fp16ResidentBytes = 0
             persistentBytes = components.total
             materializationWorkspaceBytes = 0
-            packedKVTensorSHA256 = tensorSHA256(
-                affineArrays(pair))
 
-        case let (
-            .materializeThenSDPA,
-            .affine(keyBits, valueBits, keyGroupSize, valueGroupSize)):
-            let pair = try affinePair(
-                keys: keys, values: values,
-                keyBits: keyBits, valueBits: valueBits,
-                keyGroupSize: keyGroupSize,
-                valueGroupSize: valueGroupSize)
+        case let (.splitAffineQuantizedMM, .affine(pair, components)):
             let startedAt = ProcessInfo.processInfo.systemUptime
-            let materialized = dequantize(pair: pair, dtype: dtype)
-            output = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: materialized.keys,
-                values: materialized.values,
-                scale: scale, mask: mask.mode)
+            output = try splitAffineQuantizedAttention(
+                queries: prepared.queries,
+                pair: pair,
+                scale: prepared.scale,
+                attentionMask: prepared.mask.additive)
             eval(output)
             attentionSeconds = ProcessInfo.processInfo.systemUptime
                 - startedAt
-            oracle = referenceAttention(
-                queries: queries,
+            payloadBytes = components.payload
+            scaleBytes = components.scales
+            biasBytes = components.biases
+            controlBytes = 0
+            alignmentPaddingBytes = 0
+            fp16ResidentBytes = 0
+            persistentBytes = components.total
+            materializationWorkspaceBytes = 0
+
+        case let (.materializeThenSDPA, .affine(pair, components)):
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            let materialized = dequantize(pair: pair, dtype: dtype)
+            output = MLXFast.scaledDotProductAttention(
+                queries: prepared.queries,
                 keys: materialized.keys,
                 values: materialized.values,
-                scale: scale,
-                additiveMask: mask.additive)
-            let components = try affinePersistentComponents(pair)
+                scale: prepared.scale, mask: prepared.mask.mode)
+            eval(output)
+            attentionSeconds = ProcessInfo.processInfo.systemUptime
+                - startedAt
             payloadBytes = components.payload
             scaleBytes = components.scales
             biasBytes = components.biases
@@ -233,11 +214,33 @@ actor CompressedAttentionProbeRunner {
                 materialized.keys.nbytes,
                 materialized.values.nbytes,
             ])
-            packedKVTensorSHA256 = tensorSHA256(
-                affineArrays(pair))
 
         default:
             throw CompressedAttentionProbeRunnerError.unsupportedLayout
+        }
+
+        let attentionMemoryAfter = memorySnapshot()
+
+        // The structural oracle is intentionally outside both the timed interval and the MLX
+        // attention-memory high-water. Affine controls materialize from the same detached packed
+        // cache state that the candidate consumed.
+        let oracle: MLXArray
+        switch prepared.storage {
+        case let .fp16(keys, values):
+            oracle = referenceAttention(
+                queries: prepared.queries,
+                keys: keys,
+                values: values,
+                scale: prepared.scale,
+                additiveMask: prepared.mask.additive)
+        case let .affine(pair, _):
+            let materialized = dequantize(pair: pair, dtype: dtype)
+            oracle = referenceAttention(
+                queries: prepared.queries,
+                keys: materialized.keys,
+                values: materialized.values,
+                scale: prepared.scale,
+                additiveMask: prepared.mask.additive)
         }
 
         eval(output, oracle)
@@ -295,9 +298,11 @@ actor CompressedAttentionProbeRunner {
             fp16ResidentBytes: fp16ResidentBytes,
             persistentBytes: persistentBytes,
             materializationWorkspaceBytes: materializationWorkspaceBytes,
-            sourceKVTensorSHA256: sourceKVTensorSHA256,
-            packedKVTensorSHA256: packedKVTensorSHA256,
-            queryTensorSHA256: queryTensorSHA256,
+            attentionMemoryBefore: attentionMemoryBefore,
+            attentionMemoryAfter: attentionMemoryAfter,
+            sourceKVTensorSHA256: prepared.sourceKVTensorSHA256,
+            packedKVTensorSHA256: prepared.packedKVTensorSHA256,
+            queryTensorSHA256: prepared.queryTensorSHA256,
             outputTensorSHA256: outputTensorSHA256)
     }
 
@@ -354,11 +359,207 @@ actor CompressedAttentionProbeRunner {
         switch (plan.operation, plan.layout) {
         case (.fp16SDPA, .fp16),
             (.swiftLMQuantizedAttention, .affine),
+            (.splitAffineQuantizedMM, .affine),
             (.materializeThenSDPA, .affine):
             return true
         default:
             return false
         }
+    }
+
+    private func prepareFixture(
+        plan: CompressedAttentionProbePlan
+    ) throws -> PreparedFixture {
+        let dtype = mlxDType(plan.dtype)
+        let queryShape = [
+            plan.batchSize, plan.queryHeadCount,
+            plan.queryTokens, plan.headDimension,
+        ]
+        let cacheShape = [
+            plan.batchSize, plan.kvHeadCount,
+            plan.contextTokens, plan.headDimension,
+        ]
+        let sourceQueries = MLXRandom.normal(
+            queryShape, key: MLXRandom.key(UInt64(plan.seed)))
+            .asType(dtype)
+        let sourceKeys = MLXRandom.normal(
+            cacheShape, key: MLXRandom.key(UInt64(plan.seed) &+ 1))
+            .asType(dtype)
+        let sourceValues = MLXRandom.normal(
+            cacheShape, key: MLXRandom.key(UInt64(plan.seed) &+ 2))
+            .asType(dtype)
+        eval(sourceQueries, sourceKeys, sourceValues)
+
+        let sourceKVTensorSHA256 = tensorSHA256([
+            sourceKeys, sourceValues,
+        ])
+        let queryTensorSHA256 = tensorSHA256([sourceQueries])
+        let queries = detachedStorage(sourceQueries)
+        let mask = detachedMask(mlxMask(
+            plan.mask,
+            queryTokens: plan.queryTokens,
+            contextTokens: plan.contextTokens,
+            dtype: dtype))
+        let storage: PreparedStorage
+        let packedKVTensorSHA256: String
+
+        switch (plan.operation, plan.layout) {
+        case (.fp16SDPA, .fp16):
+            let keys = detachedStorage(sourceKeys)
+            let values = detachedStorage(sourceValues)
+            storage = .fp16(keys: keys, values: values)
+            packedKVTensorSHA256 = tensorSHA256([keys, values])
+
+        case let (
+            operation,
+            .affine(keyBits, valueBits, keyGroupSize, valueGroupSize))
+            where operation == .swiftLMQuantizedAttention
+                || operation == .splitAffineQuantizedMM
+                || operation == .materializeThenSDPA:
+            let encoded = try affinePair(
+                keys: sourceKeys,
+                values: sourceValues,
+                keyBits: keyBits,
+                valueBits: valueBits,
+                keyGroupSize: keyGroupSize,
+                valueGroupSize: valueGroupSize)
+            let pair = detachedAffinePair(encoded)
+            let components = try affinePersistentComponents(pair)
+            storage = .affine(pair: pair, components: components)
+            packedKVTensorSHA256 = tensorSHA256(affineArrays(pair))
+
+        default:
+            throw CompressedAttentionProbeRunnerError.unsupportedLayout
+        }
+
+        return PreparedFixture(
+            queries: queries,
+            storage: storage,
+            scale: Float(1 / sqrt(Double(plan.headDimension))),
+            mask: mask,
+            sourceKVTensorSHA256: sourceKVTensorSHA256,
+            packedKVTensorSHA256: packedKVTensorSHA256,
+            queryTensorSHA256: queryTensorSHA256)
+    }
+
+    /// The host round trip is evidence-only. It ensures the measured cache arrays own already
+    /// materialized storage and cannot retain the source-generation or quantization graph.
+    private func detachedStorage(_ array: MLXArray) -> MLXArray {
+        MLXArray(data: array.asData(access: .copy))
+    }
+
+    private func detachedMask(_ mask: ProbeMask) -> ProbeMask {
+        guard let additive = mask.additive else { return mask }
+        let detached = detachedStorage(additive)
+        return ProbeMask(mode: .array(detached), additive: detached)
+    }
+
+    private func detachedAffinePair(_ pair: AffinePair) -> AffinePair {
+        func detached(_ tuple: QuantizedTuple) -> QuantizedTuple {
+            (
+                detachedStorage(tuple.weights),
+                detachedStorage(tuple.scales),
+                tuple.biases.map(detachedStorage)
+            )
+        }
+        return AffinePair(
+            keys: detached(pair.keys),
+            values: detached(pair.values),
+            keyDimension: pair.keyDimension,
+            valueDimension: pair.valueDimension,
+            keyBits: pair.keyBits,
+            valueBits: pair.valueBits,
+            keyGroupSize: pair.keyGroupSize,
+            valueGroupSize: pair.valueGroupSize)
+    }
+
+    /// Packed-domain affine attention expressed as two independently configured quantized
+    /// matrix multiplies with an explicit precise softmax between them. This avoids dense K/V
+    /// materialization and supports K4V2, but it is intentionally not called fused SDPA: prefill
+    /// still has an O(B * Hq * L * T) score/weight workspace.
+    private func splitAffineQuantizedAttention(
+        queries: MLXArray,
+        pair: AffinePair,
+        scale: Float,
+        attentionMask: MLXArray?
+    ) throws -> MLXArray {
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let queryTokens = queries.dim(2)
+        let dimension = queries.dim(3)
+        let kvHeads = pair.keys.weights.dim(1)
+        guard kvHeads > 0, queryHeads.isMultiple(of: kvHeads),
+            dimension == pair.keyDimension
+        else {
+            throw CompressedAttentionProbeRunnerError.unsupportedLayout
+        }
+        let repeats = queryHeads / kvHeads
+        let typedScale = MLXArray(scale).asType(queries.dtype)
+        var scaledQueries = queries * typedScale
+        var quantizedKeys = pair.keys
+        var quantizedValues = pair.values
+
+        if repeats > 1 {
+            scaledQueries = scaledQueries.reshaped([
+                batch, kvHeads, repeats, queryTokens, dimension,
+            ])
+            quantizedKeys = expandedQuantizedTuple(pair.keys)
+            quantizedValues = expandedQuantizedTuple(pair.values)
+        }
+
+        var scores = quantizedMM(
+            scaledQueries,
+            quantizedKeys.weights,
+            scales: quantizedKeys.scales,
+            biases: quantizedKeys.biases,
+            transpose: true,
+            groupSize: pair.keyGroupSize,
+            bits: pair.keyBits,
+            mode: .affine)
+        if var attentionMask {
+            if repeats > 1 && attentionMask.ndim == 4 {
+                attentionMask = attentionMask.expandedDimensions(axis: 2)
+            }
+            let validRanks = repeats > 1 ? [2, 5] : [2, 4]
+            guard validRanks.contains(attentionMask.ndim) else {
+                throw CompressedAttentionProbeRunnerError
+                    .unsupportedMaskGeometry
+            }
+            if attentionMask.dtype == .bool {
+                scores = MLX.where(
+                    attentionMask,
+                    scores,
+                    MLXArray(-Float.infinity).asType(scores.dtype))
+            } else {
+                scores = scores + attentionMask.asType(scores.dtype)
+            }
+        }
+        let weights = softmax(scores, axis: -1, precise: true)
+        var output = quantizedMM(
+            weights,
+            quantizedValues.weights,
+            scales: quantizedValues.scales,
+            biases: quantizedValues.biases,
+            transpose: false,
+            groupSize: pair.valueGroupSize,
+            bits: pair.valueBits,
+            mode: .affine)
+        if repeats > 1 {
+            output = output.reshaped([
+                batch, queryHeads, queryTokens, pair.valueDimension,
+            ])
+        }
+        return output
+    }
+
+    private func expandedQuantizedTuple(
+        _ tuple: QuantizedTuple
+    ) -> QuantizedTuple {
+        (
+            tuple.weights.expandedDimensions(axis: -3),
+            tuple.scales.expandedDimensions(axis: -3),
+            tuple.biases?.expandedDimensions(axis: -3)
+        )
     }
 
     /// An independent reference for the stock/fused operations. This deliberately expands the
@@ -510,7 +711,7 @@ actor CompressedAttentionProbeRunner {
 
     private func affinePersistentComponents(
         _ pair: AffinePair
-    ) throws -> (payload: Int, scales: Int, biases: Int, total: Int) {
+    ) throws -> AffineComponents {
         let payload = try checkedSum([
             pair.keys.weights.nbytes,
             pair.values.weights.nbytes,
@@ -523,7 +724,7 @@ actor CompressedAttentionProbeRunner {
             pair.keys.biases?.nbytes ?? 0,
             pair.values.biases?.nbytes ?? 0,
         ])
-        return (
+        return AffineComponents(
             payload: payload,
             scales: scales,
             biases: biases,
