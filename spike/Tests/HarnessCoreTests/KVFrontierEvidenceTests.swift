@@ -355,12 +355,13 @@ final class KVFrontierEvidenceTests: XCTestCase {
         tier: String = "kvarn-k4v2-g128",
         capacityTokens: Int = 24_192,
         kvHeadCount: Int = 8,
-        headDimension: Int = 128
+        headDimension: Int = 128,
+        layerCount: Int = 2
     ) throws -> (KVFormatGeometryEvidence, KVStorageEvidence) {
         let format = KVFormatGeometryEvidence(
             kind: .kvarn, tier: tier,
             keyBits: 4, valueBits: 2, groupSize: 128,
-            sinkTokens: 128, layerCount: 2,
+            sinkTokens: 128, layerCount: layerCount,
             kvHeadCount: kvHeadCount,
             headDimension: headDimension,
             capacityTokens: capacityTokens, sequences: 1,
@@ -371,7 +372,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             sinkTokens: 128, metadataScalarBytes: 2, alignment: 8
         ).allocation(
             geometry: KVStorageGeometry(
-                layerCount: 2, kvHeadCount: kvHeadCount,
+                layerCount: layerCount, kvHeadCount: kvHeadCount,
                 headDimension: headDimension),
             capacityTokens: capacityTokens, sequences: 1,
             workspaceBytes: workspaceBytes)
@@ -1205,6 +1206,186 @@ final class KVFrontierEvidenceTests: XCTestCase {
             XCTAssertEqual(
                 $0 as? KVFrontierEvidenceError,
                 .invalidMemoryGateEvidence)
+        }
+    }
+
+    func testKVarNDirectAttentionPromotionRequiresExactI8BindingAndWorkspace()
+        throws
+    {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256)
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+        let (format, storage) = try kvarnFormatAndStorage(
+            layerCount: admission.layerCount)
+        let direct = frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format,
+            storage: storage,
+            controlBytes: admission.layerCount * MemoryLayout<Int32>.size,
+            executionMode: "uncompiled-correctness",
+            codecIterations: 8,
+            memoryGate: kvarnMemoryGate(),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: storage.actual.workspaceBytes)
+
+        XCTAssertNoThrow(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct).validatedForPromotion())
+
+        let roundTripped = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONEncoder().encode(payload(
+                kvQuantTier: "kvarn-k4v2-g128",
+                frontier: direct)))
+        XCTAssertNoThrow(try roundTripped.validatedForPromotion())
+
+        let (i16Format, i16Storage) = try kvarnFormatAndStorage(
+            tier: "kvarn-k4v2-g128-i16",
+            layerCount: admission.layerCount)
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128-i16",
+            frontier: frontier(
+                schemaVersion: 2,
+                candidate: model,
+                reference: model,
+                cellID: "kvarn-k4v2-g128-i16",
+                format: i16Format,
+                storage: i16Storage,
+                controlBytes:
+                    admission.layerCount * MemoryLayout<Int32>.size,
+                executionMode: "uncompiled-correctness",
+                codecIterations: 16,
+                memoryGate: kvarnMemoryGate(
+                    tier: "kvarn-k4v2-g128-i16", iterations: 16),
+                compressedKVAttention: binding,
+                materializationWorkspaceBytes: 0,
+                attentionWorkspaceBytes:
+                    i16Storage.actual.workspaceBytes)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+    }
+
+    func testKVarNDirectAttentionPromotionRejectsWrongRouteAndWorkspace()
+        throws
+    {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256)
+        let kvarnBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+        let affineBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitAffineQuantizedMM,
+            observedOperation: .splitQuantizedMM,
+            admission: admission)
+        let (format, storage) = try kvarnFormatAndStorage(
+            layerCount: admission.layerCount)
+        let controlBytes = admission.layerCount
+            * MemoryLayout<Int32>.size
+
+        func direct(
+            binding: CompressedKVAttentionRuntimeBinding = kvarnBinding,
+            memoryGate: KVarNMemoryGateEvidence? = kvarnMemoryGate(),
+            materializationWorkspaceBytes: Int = 0,
+            attentionWorkspaceBytes: Int? = nil
+        ) -> KVFrontierEvidence {
+            frontier(
+                schemaVersion: 2,
+                candidate: model,
+                reference: model,
+                cellID: "kvarn-k4v2-g128-i8",
+                format: format,
+                storage: storage,
+                controlBytes: controlBytes,
+                executionMode: "uncompiled-correctness",
+                codecIterations: 8,
+                memoryGate: memoryGate,
+                compressedKVAttention: binding,
+                materializationWorkspaceBytes:
+                    materializationWorkspaceBytes,
+                attentionWorkspaceBytes: attentionWorkspaceBytes
+                    ?? storage.actual.workspaceBytes)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct(binding: affineBinding)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct(
+                materializationWorkspaceBytes: 1,
+                attentionWorkspaceBytes:
+                    storage.actual.workspaceBytes - 1)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct(
+                materializationWorkspaceBytes:
+                    storage.actual.workspaceBytes,
+                attentionWorkspaceBytes: 0)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct(memoryGate: nil)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .missingMemoryGateEvidence)
+        }
+
+        let affineWorkspace = breakdown(workspaceBytes: 4_096)
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "affine-k4v2-g128",
+            frontier: frontier(
+                schemaVersion: 2,
+                candidate: model,
+                reference: model,
+                format: geometry(),
+                storage: KVStorageEvidence(
+                    predicted: affineWorkspace,
+                    actual: affineWorkspace),
+                controlBytes: 256,
+                compressedKVAttention: kvarnBinding,
+                materializationWorkspaceBytes: 0,
+                attentionWorkspaceBytes: 4_096)
+        ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
         }
     }
 

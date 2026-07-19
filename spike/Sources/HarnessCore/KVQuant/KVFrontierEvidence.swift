@@ -1499,8 +1499,11 @@ private extension KVFrontierEvidence {
     private func validateCompressedKVAttention(
         candidateTier: String
     ) throws {
+        let requestsDirectKVarN = candidateCompressedKVAttention?.request
+            == .splitKVarNQuantizedMM
         let requiresBinding = candidateFormat.map {
             $0.kind == .affine || $0.kind == .kvtuner
+                || ($0.kind == .kvarn && requestsDirectKVarN)
         } ?? false
         if schemaVersion == 1 {
             guard candidateCompressedKVAttention == nil,
@@ -1530,7 +1533,8 @@ private extension KVFrontierEvidence {
         }
         guard let format = candidateFormat,
             let storage,
-            format.kind == .affine || format.kind == .kvtuner,
+            format.kind == .affine || format.kind == .kvtuner
+                || format.kind == .kvarn,
             format.tier == candidateTier,
             binding.admission.modelConfigHash == candidateModel.configHash,
             binding.admission.checkpointManifestHash
@@ -1563,7 +1567,11 @@ private extension KVFrontierEvidence {
                     tokenizerSHA256: schedule.tokenizerSHA256,
                     layerCount: schedule.layers.count,
                     groupSize: schedule.groupSize)
-            case .fp16, .kvarn:
+            case .kvarn:
+                try binding.admission.validateAffineGeometry(
+                    keyGroupSize: format.groupSize,
+                    valueGroupSize: format.groupSize)
+            case .fp16:
                 throw KVFrontierEvidenceError.invalidRuntimeEvidence
             }
         } catch let error as KVFrontierEvidenceError {
@@ -1587,13 +1595,25 @@ private extension KVFrontierEvidence {
         }
         switch binding.request {
         case .splitAffineQuantizedMM:
-            guard materializationWorkspace == 0,
+            guard format.kind == .affine || format.kind == .kvtuner,
+                materializationWorkspace == 0,
+                attentionWorkspace > 0
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        case .splitKVarNQuantizedMM:
+            guard format.kind == .kvarn,
+                candidateTier == "kvarn-k4v2-g128",
+                cellID == "kvarn-k4v2-g128-i8",
+                candidateCodecIterations == 8,
+                materializationWorkspace == 0,
                 attentionWorkspace > 0
             else {
                 throw KVFrontierEvidenceError.invalidRuntimeEvidence
             }
         case .materialize:
-            guard materializationWorkspace > 0,
+            guard format.kind == .affine || format.kind == .kvtuner,
+                materializationWorkspace > 0,
                 attentionWorkspace == 0
             else {
                 throw KVFrontierEvidenceError.invalidRuntimeEvidence

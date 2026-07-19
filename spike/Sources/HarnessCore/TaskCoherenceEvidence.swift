@@ -526,6 +526,10 @@ public enum TaskCoherenceArtifact {
         guard let binding else { return }
         do {
             try binding.validated()
+            guard binding.request != .splitKVarNQuantizedMM else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "compressed-attention")
+            }
             guard binding.admission.modelConfigHash
                     == identity.modelConfigHash,
                 binding.admission.checkpointManifestHash
@@ -1296,6 +1300,16 @@ public struct TaskCoherencePromotionEvidence:
         else {
             throw TaskCoherenceEvidenceError.invalidPromotionProvenance(
                 "runtime")
+        }
+        // The current task-coherence schema can authenticate materialized affine/KVTuner
+        // execution, but it cannot yet prove that a KVarN task run used the direct packed
+        // attention route. Keep otherwise valid direct-route KL evidence non-promotable until
+        // the task artifact carries and validates the same route receipt.
+        if frontier.candidateCompressedKVAttention?.request
+            == .splitKVarNQuantizedMM
+        {
+            throw TaskCoherenceEvidenceError.klEvidenceMismatch(
+                "compressed-attention")
         }
         let schedulePairMatches: Bool
         switch (

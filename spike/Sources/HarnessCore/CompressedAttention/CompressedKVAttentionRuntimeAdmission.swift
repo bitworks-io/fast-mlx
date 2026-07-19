@@ -7,6 +7,7 @@ public enum CompressedKVAttentionRequest:
 {
     case materialize
     case splitAffineQuantizedMM = "split-affine-quantized-mm"
+    case splitKVarNQuantizedMM = "split-kvarn-quantized-mm"
 
     /// KVTuner always owns an affine cache, so even its historical materialize-before-attend
     /// route must be explicit in new evidence. Other tiers keep their existing nil default.
@@ -25,6 +26,7 @@ public enum CompressedKVAttentionObservedOperation:
 {
     case materializedKV = "materialized-kv"
     case splitQuantizedMM = "split-quantized-mm"
+    case splitKVarNQuantizedMM = "split-kvarn-quantized-mm"
 }
 
 public enum CompressedKVAttentionModelFamily:
@@ -426,6 +428,8 @@ public struct CompressedKVAttentionRuntimeBinding:
             expected = .materializedKV
         case .splitAffineQuantizedMM:
             expected = .splitQuantizedMM
+        case .splitKVarNQuantizedMM:
+            expected = .splitKVarNQuantizedMM
         }
         guard observedOperation == expected else {
             throw CompressedKVAttentionRuntimeAdmissionError

@@ -357,6 +357,36 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
         }
     }
 
+    func testKVarNDirectRequestHasADistinctDurableOperationReceipt() throws {
+        XCTAssertEqual(
+            CompressedKVAttentionRequest.splitKVarNQuantizedMM.rawValue,
+            "split-kvarn-quantized-mm")
+        XCTAssertEqual(
+            CompressedKVAttentionObservedOperation.splitKVarNQuantizedMM
+                .rawValue,
+            "split-kvarn-quantized-mm")
+
+        let admitted = try admission(for: qwenConfig())
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admitted)
+
+        XCTAssertEqual(binding.request, .splitKVarNQuantizedMM)
+        XCTAssertEqual(
+            binding.observedOperation,
+            .splitKVarNQuantizedMM)
+        XCTAssertThrowsError(try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitQuantizedMM,
+            admission: admitted
+        )) {
+            XCTAssertEqual(
+                $0 as? CompressedKVAttentionRuntimeAdmissionError,
+                .attentionOperationMismatch)
+        }
+    }
+
     private func admission(
         for data: Data
     ) throws -> CompressedKVAttentionRuntimeAdmission {

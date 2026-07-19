@@ -229,6 +229,39 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         }
     }
 
+    func testTaskCompressedAttentionRejectsKVarNReceiptUntilItsSchemaExists()
+        throws
+    {
+        let admission = try compressedAttentionAdmission()
+        let identity = TaskCoherenceRunIdentity(
+            corpusID: "kvarn-task-coherence-v2",
+            corpusContentHash: "1740d0d07f586def",
+            modelConfigHash: admission.modelConfigHash,
+            modelCheckpointManifestHash:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256:
+                admission.checkpointContentSHA256,
+            kvQuantTier: "affine-k4v2-g128")
+        let tokenization = TaskCoherenceTokenizationEvidence(
+            tokenizerManifestSHA256: admission.tokenizerSHA256,
+            promptTokenIDsSHA256: String(repeating: "c", count: 64),
+            restrictedChoiceLabelTokenIDs: nil)
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+
+        XCTAssertThrowsError(try TaskCoherenceArtifact
+            .validateCompressedKVAttention(
+                binding,
+                identity: identity,
+                tokenization: tokenization)) {
+            XCTAssertEqual(
+                $0 as? TaskCoherenceEvidenceError,
+                .invalidRuntimeEvidence("compressed-attention"))
+        }
+    }
+
     func testTaskCompressedAttentionSchemaThreeIsRequiredForAffineBindings() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
         let admission = try compressedAttentionAdmission()
@@ -813,6 +846,42 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         let wrongCell = try validKLRecord(cellID: "affine-k4v2-g64")
         XCTAssertThrowsError(try evidence.validated(
             with: wrongCell, corpus: corpus))
+    }
+
+    func testPromotionRejectsDirectKVarNKLUntilTaskRouteEvidenceExists()
+        throws
+    {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
+        let reference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                admission.checkpointContentSHA256)
+        let candidate = try summary(
+            corpus: corpus,
+            tier: "kvarn-k4v2-g128",
+            cellID: "kvarn-k4v2-g128-i8",
+            referenceDigest: reference.artifactSHA256,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash)
+        let promotion = try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus)
+        let directKL = try validKVarNDirectKLRecord()
+
+        XCTAssertNoThrow(try directKL.validatedForPromotionEvidence())
+        XCTAssertThrowsError(try promotion.validated(
+            with: directKL, corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .klEvidenceMismatch("compressed-attention"))
+            }
     }
 
     func testKVTunerPromotionPairsTheExactTaskAndKLSchedule() throws {
@@ -1749,6 +1818,149 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             nonce: "kl-run")
         return ResultRecord(
             subcommand: "kl", provenance: measurementProvenance,
+            payload: payload)
+    }
+
+    private func validKVarNDirectKLRecord() throws
+        -> ResultRecord<KLPayload>
+    {
+        let admission = try compressedAttentionAdmission()
+        let capacityTokens = 24_192
+        let workspaceBytes = capacityTokens * admission.kvHeadCount
+            * admission.headDimension * MemoryLayout<Float>.size
+        let format = KVFormatGeometryEvidence(
+            kind: .kvarn,
+            tier: "kvarn-k4v2-g128",
+            keyBits: 4,
+            valueBits: 2,
+            groupSize: 128,
+            sinkTokens: 128,
+            layerCount: admission.layerCount,
+            kvHeadCount: admission.kvHeadCount,
+            headDimension: admission.headDimension,
+            capacityTokens: capacityTokens,
+            sequences: 1,
+            metadataScalarBytes: 2,
+            recordAlignment: 8)
+        let allocation = try KVStorageFormat.kvarn(
+            keyBits: 4,
+            valueBits: 2,
+            groupSize: 128,
+            sinkTokens: 128,
+            metadataScalarBytes: 2,
+            alignment: 8
+        ).allocation(
+            geometry: KVStorageGeometry(
+                layerCount: admission.layerCount,
+                kvHeadCount: admission.kvHeadCount,
+                headDimension: admission.headDimension),
+            capacityTokens: capacityTokens,
+            sequences: 1,
+            workspaceBytes: workspaceBytes)
+        let actual = KVStorageBreakdownEvidence(
+            payloadBytes: allocation.payloadBytes,
+            metadataBytes: allocation.metadataBytes,
+            alignmentPaddingBytes: allocation.alignmentPaddingBytes,
+            fp16SinkBytes: allocation.fp16SinkBytes,
+            fp16TailBytes: allocation.fp16TailBytes,
+            workspaceBytes: allocation.workspaceBytes,
+            totalBytes: allocation.totalBytes)
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256)
+        let memoryGate = KVarNMemoryGateEvidence(
+            schemaVersion: 1,
+            artifactSHA256: String(repeating: "f", count: 64),
+            harnessGitSHA: cleanSHA,
+            mlxSwiftVersion: "0.31.6",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareOS: "macOS 15.5",
+            hardwareRAMBytes: 256 * 1_024 * 1_024 * 1_024,
+            runtimeTier: "kvarn-k4v2-g128",
+            codecIterations: 8,
+            cacheBoundaryMaximumCapacityTokens: capacityTokens,
+            encodeSampleCount: 3,
+            decodeSampleCount: 3,
+            cacheBoundarySampleCount: 9,
+            encodeTransientPeakBytes: 28_147_712,
+            decodeTransientPeakBytes: 2_310_144,
+            cacheBoundaryTransientPeakBytes: 48_037_888,
+            maximumPeakActiveBytes: 1_000_000_000)
+        let compressedBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+        let frontier = KVFrontierEvidence(
+            schemaVersion: 2,
+            matrixID: matrixID,
+            cellID: "kvarn-k4v2-g128-i8",
+            sameWeights: true,
+            comparisonBaseline: .sameWeightsFP16KV,
+            referenceKVQuantTier: "fp16",
+            candidateModel: model,
+            referenceModel: model,
+            candidateFormat: format,
+            storage: try format.storageEvidence(actual: actual),
+            actualControlBytes:
+                admission.layerCount * MemoryLayout<Int32>.size,
+            candidateExecutionMode: "uncompiled-correctness",
+            candidateCodecIterations: 8,
+            candidateMemoryGate: memoryGate,
+            candidateCompressedKVAttention: compressedBinding,
+            candidateMaterializationWorkspaceBytes: 0,
+            candidateAttentionWorkspaceBytes: workspaceBytes)
+        let template = try validKLRecord().payload
+        let payload = KLPayload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            klMedianNats: template.klMedianNats,
+            klLongContextTailP95Nats:
+                template.klLongContextTailP95Nats,
+            klPooledMedianNats: template.klPooledMedianNats,
+            klPooledP95Nats: template.klPooledP95Nats,
+            pplCandidate: template.pplCandidate,
+            pplReference: template.pplReference,
+            pplDeltaPct: template.pplDeltaPct,
+            totalPositions: template.totalPositions,
+            entryCount: template.entryCount,
+            teacherForcedTop1AgreementCount:
+                template.teacherForcedTop1AgreementCount,
+            teacherForcedTop1ScoredPositions:
+                template.teacherForcedTop1ScoredPositions,
+            teacherForcedTop1AgreementRate:
+                template.teacherForcedTop1AgreementRate,
+            frontier: frontier,
+            shortEntryCount: template.shortEntryCount,
+            shortScoredPositions: template.shortScoredPositions,
+            longContextEntryCount: template.longContextEntryCount,
+            longContextScoredPositions:
+                template.longContextScoredPositions,
+            shortEntryScoring: template.shortEntryScoring,
+            longContextEntryScoring: template.longContextEntryScoring,
+            longContextMaxDocumentTokens:
+                template.longContextMaxDocumentTokens,
+            longContextMaxScoredContextTokens:
+                template.longContextMaxScoredContextTokens)
+        let measurementProvenance = Provenance(
+            date: "2026-07-15T00:10:00Z",
+            hardwareChip: "Apple M3 Ultra",
+            hardwareRAMBytes: 256 * 1_024 * 1_024 * 1_024,
+            hardwareOS: "macOS 15.5",
+            harnessGitSHA: cleanSHA,
+            mlxSwiftVersion: "0.31.6",
+            referenceMLXVersion: "0.32.0",
+            referenceMLXLMVersion: "0.29.0",
+            modelPath: "/models/qwen3-32b",
+            modelConfigHash: admission.modelConfigHash,
+            modelCheckpointManifestHash:
+                admission.checkpointManifestHash,
+            modelQuant: ModelQuantInfo(bits: 4, groupSize: 64),
+            corpusId: "measurement-corpus-v2",
+            corpusContentHash: "measurement-corpus-hash",
+            nonce: "kvarn-direct-kl-run")
+        return ResultRecord(
+            subcommand: "kl",
+            provenance: measurementProvenance,
             payload: payload)
     }
 
