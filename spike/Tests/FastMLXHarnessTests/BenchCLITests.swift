@@ -4,6 +4,7 @@ import XCTest
 @testable import fastmlx_harness
 
 final class BenchCLITests: XCTestCase {
+    private let checkpointContentSHA256 = String(repeating: "d", count: 64)
     private let kvtunerArguments = [
         "--model", "/models/Qwen3-32B-4bit",
         "--kv-quant", "kvtuner-g128-b3.046875",
@@ -56,6 +57,70 @@ final class BenchCLITests: XCTestCase {
         XCTAssertEqual(plan.workload.iterations, 4)
         XCTAssertEqual(plan.workload.nonce, "kvarn-frontier-20260718")
         XCTAssertEqual(plan.workload.basePrompt, defaultBenchPrompt)
+        XCTAssertNil(plan.compressedKVAttention)
+    }
+
+    func testBenchPlanRequiresExplicitKnownAttentionRouteOnAffineBackedTiers() throws {
+        let split = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))
+        XCTAssertEqual(
+            split.compressedKVAttention,
+            .splitAffineQuantizedMM)
+        XCTAssertEqual(
+            split.compressedKVAttentionExpectedCheckpointContentSHA256,
+            checkpointContentSHA256)
+
+        let materialized = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "materialize",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))
+        XCTAssertEqual(materialized.compressedKVAttention, .materialize)
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "fp16",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .unsupportedAttentionTier("fp16"))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "custom-kernel",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .unknownAttentionOperation("custom-kernel"))
+        }
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "split-affine-quantized-mm",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidCheckpointContentSHA256(""))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidCheckpointContentSHA256(
+                    checkpointContentSHA256))
+        }
     }
 
     func testKVTunerBenchPlanRejectsTierCellMismatchAndCustomPrompt() throws {
@@ -141,6 +206,52 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
+    func testBenchPlanBuildsBoundedDeterministicLongPrompt() throws {
+        let plan = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--prompt-repeat", "3",
+        ]))
+        XCTAssertEqual(plan.promptRepeat, 3)
+        XCTAssertEqual(
+            plan.workload.basePrompt,
+            Array(repeating: defaultBenchPrompt, count: 3)
+                .joined(separator: "\n"))
+
+        for value in [0, 4_097] {
+            XCTAssertThrowsError(try parseBenchPlan(Flags([
+                "--model", "/models/Qwen3-32B-4bit",
+                "--prompt-repeat", String(value),
+            ]))) {
+                XCTAssertEqual(
+                    $0 as? BenchCLIError,
+                    .invalidPromptRepeat(value))
+            }
+        }
+    }
+
+    func testBenchContextWindowFailsClosedBeforeGeneration() throws {
+        XCTAssertNoThrow(try validateBenchContextWindow(
+            promptTokenCounts: [32_768, 32_770],
+            maxTokens: 8,
+            maxPositionEmbeddings: 40_960))
+
+        XCTAssertThrowsError(try validateBenchContextWindow(
+            promptTokenCounts: [40_953],
+            maxTokens: 8,
+            maxPositionEmbeddings: 40_960)) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .contextLimitExceeded(
+                    promptTokens: 40_953,
+                    maxTokens: 8,
+                    limit: 40_960))
+        }
+        XCTAssertThrowsError(try validateBenchContextWindow(
+            promptTokenCounts: [Int.max],
+            maxTokens: 8,
+            maxPositionEmbeddings: Int.max))
+    }
+
     func testBenchEngagementRejectsVacuousLossyRuns() throws {
         XCTAssertNoThrow(try validateBenchRuntimeEngagement(
             tier: "fp16", engagement: .init(),
@@ -214,6 +325,110 @@ final class BenchCLITests: XCTestCase {
             expectedKVTunerLayerCount: nil))
     }
 
+    func testBenchEngagementAuthenticatesSplitWorkspaceBreakdown() throws {
+        let splitCounts = EngagementCounters([
+            "affine_tokens": 256,
+            "affine_layers": 64,
+            "affine_capacity_tokens": 512,
+            "affine_payload_bytes": 1_000,
+            "affine_metadata_bytes": 100,
+            "affine_control_bytes": 4,
+            "affine_workspace_bytes": 256,
+            "affine_materialization_bytes": 0,
+            "affine_attention_workspace_bytes": 256,
+            "affine_attention_split": 1,
+            "affine_attention_materialized": 0,
+        ])
+        XCTAssertNoThrow(try validateBenchRuntimeEngagement(
+            tier: "affine-k4v2-g64",
+            engagement: splitCounts,
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitAffineQuantizedMM))
+        XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+            tier: "affine-k4v2-g64",
+            engagement: splitCounts,
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .materialize))
+
+        var falseZero = splitCounts.counts
+        falseZero["affine_workspace_bytes"] = 0
+        falseZero["affine_attention_workspace_bytes"] = 0
+        XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+            tier: "affine-k4v2-g64",
+            engagement: .init(falseZero),
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitAffineQuantizedMM))
+    }
+
+    func testBenchCompressedAttentionWorkspaceMustFitRawMLXPeakReceipt() throws {
+        let splitCounts = EngagementCounters([
+            "affine_workspace_bytes": 256,
+            "affine_materialization_bytes": 0,
+            "affine_attention_workspace_bytes": 256,
+            "affine_attention_split": 1,
+            "affine_attention_materialized": 0,
+        ])
+
+        XCTAssertNoThrow(try validateBenchCompressedAttentionMemoryReceipt(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            engagement: splitCounts,
+            maxMLXPeakBytes: 256))
+        XCTAssertThrowsError(try validateBenchCompressedAttentionMemoryReceipt(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            engagement: splitCounts,
+            maxMLXPeakBytes: 255)) {
+                XCTAssertEqual(
+                    $0 as? BenchCLIError,
+                    .compressedAttentionWorkspaceExceedsMLXPeak(
+                        workspaceBytes: 256,
+                        peakBytes: 255))
+            }
+        XCTAssertNoThrow(try validateBenchCompressedAttentionMemoryReceipt(
+            tier: "affine-k4v2-g64",
+            request: nil,
+            engagement: .init(),
+            maxMLXPeakBytes: 0))
+    }
+
+    func testBenchBindingUsesObservedCountersRatherThanRequestedMode() throws {
+        let config = Data(
+            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+        let admission = try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: config,
+                checkpointManifestHash: "0123456789abcdef",
+                checkpointContentSHA256:
+                    String(repeating: "d", count: 64),
+                tokenizerSHA256:
+                    String(repeating: "a", count: 64)))
+        let split = EngagementCounters([
+            "affine_attention_split": 1,
+            "affine_attention_materialized": 0,
+        ])
+
+        let binding = try makeBenchCompressedKVAttentionRuntimeBinding(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            admission: admission,
+            engagement: split)
+        XCTAssertEqual(
+            binding?.observedOperation, .splitQuantizedMM)
+
+        XCTAssertThrowsError(
+            try makeBenchCompressedKVAttentionRuntimeBinding(
+                tier: "affine-k4v2-g64",
+                request: .materialize,
+                admission: admission,
+                engagement: split)
+        ) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .missingCompressedAttentionEvidence)
+        }
+    }
+
     func testNonKVTunerBenchKeepsCustomPromptAndRejectsSchedule() throws {
         let plan = try parseBenchPlan(Flags([
             "--model", "/models/Qwen3-32B-4bit",
@@ -273,6 +488,8 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNil(payload.maxMLXActiveBytes)
         XCTAssertNil(payload.maxMLXCacheBytes)
         XCTAssertNil(payload.maxMLXPeakBytes)
+        XCTAssertNil(payload.compressedKVAttention)
+        XCTAssertNil(payload.promptRepeat)
     }
 
     func testBenchCSVReadFailureIsNotTreatedAsAnEmptyFile() throws {

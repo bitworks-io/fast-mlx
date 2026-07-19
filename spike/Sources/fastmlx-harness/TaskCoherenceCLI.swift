@@ -51,6 +51,8 @@ private struct TaskCoherenceRunPlan {
     let referenceEvidencePath: String?
     let kvtunerSchedulePath: String?
     let maxToolTokens: Int
+    let compressedKVAttention: CompressedKVAttentionRequest?
+    let compressedKVAttentionExpectedCheckpointContentSHA256: String?
 }
 
 private struct PreparedTaskCoherenceCase {
@@ -133,6 +135,11 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
     let kvtunerSchedule = try flags.strictString(
         "kvtuner-schedule", default: "")
     let maxToolTokens = try flags.strictInt("max-tool-tokens", default: 96)
+    let compressedKVAttention = try requestedCompressedKVAttention(
+        flags, tier: tier)
+    let compressedKVAttentionExpectedCheckpointContentSHA256 = try
+        requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
+            flags, request: compressedKVAttention)
 
     guard !modelPath.isEmpty else {
         throw TaskCoherenceCLIError.missingFlag("model")
@@ -183,7 +190,10 @@ private func parseTaskCoherenceRunPlan(_ flags: Flags) throws
         referenceEvidencePath: reference.isEmpty ? nil : reference,
         kvtunerSchedulePath:
             kvtunerSchedule.isEmpty ? nil : kvtunerSchedule,
-        maxToolTokens: maxToolTokens)
+        maxToolTokens: maxToolTokens,
+        compressedKVAttention: compressedKVAttention,
+        compressedKVAttentionExpectedCheckpointContentSHA256:
+            compressedKVAttentionExpectedCheckpointContentSHA256)
 }
 
 private func cleanTaskHarnessSHA(_ value: String) -> Bool {
@@ -461,6 +471,63 @@ private func taskEngagement(
             scoring?.counts["scoring_kvarn_compressed_tokens"])
 }
 
+func taskCompressedKVAttentionBinding(
+    tier: String,
+    request: CompressedKVAttentionRequest?,
+    admission: CompressedKVAttentionRuntimeAdmission?,
+    generated: EngagementCounters,
+    scoring: EngagementCounters?
+) throws -> CompressedKVAttentionRuntimeBinding? {
+    guard let request else { return nil }
+    let affineBacked = AffineKVTier(rawValue: tier) != nil
+        || isKVTunerTier(tier)
+    guard affineBacked else {
+        throw TaskCoherenceCLIError.missingEngagement(
+            "compressed-attention unsupported tier")
+    }
+    guard let admission else {
+        throw TaskCoherenceCLIError.missingEngagement(
+            "compressed-attention admission")
+    }
+    let prefix = isKVTunerTier(tier) ? "kvtuner" : "affine"
+    func observed(
+        _ counts: [String: Int],
+        splitKey: String,
+        materializedKey: String
+    ) throws -> CompressedKVAttentionObservedOperation {
+        switch (counts[splitKey], counts[materializedKey]) {
+        case (1, 0): return .splitQuantizedMM
+        case (0, 1): return .materializedKV
+        default:
+            throw TaskCoherenceCLIError.missingEngagement(
+                "compressed-attention operation")
+        }
+    }
+    let generationOperation = try observed(
+        generated.counts,
+        splitKey: "\(prefix)_attention_split",
+        materializedKey: "\(prefix)_attention_materialized")
+    if let scoring {
+        let scoringOperation = try observed(
+            scoring.counts,
+            splitKey: "scoring_attention_split",
+            materializedKey: "scoring_attention_materialized")
+        guard scoringOperation == generationOperation else {
+            throw TaskCoherenceCLIError.missingEngagement(
+                "compressed-attention scoring agreement")
+        }
+    }
+    do {
+        return try CompressedKVAttentionRuntimeBinding(
+            request: request,
+            observedOperation: generationOperation,
+            admission: admission)
+    } catch {
+        throw TaskCoherenceCLIError.missingEngagement(
+            "compressed-attention request agreement")
+    }
+}
+
 private func printTaskSummary(_ summary: TaskCoherenceArtifactSummary) {
     print("# task artifact sha256=\(summary.artifactSHA256) cases=\(summary.caseCount)")
     for domain in TaskCoherenceDomain.allCases {
@@ -500,7 +567,9 @@ func runTaskCoherence(_ flags: Flags) async {
         let plan = try parseTaskCoherenceRunPlan(flags)
         let corpus = try TaskCoherenceCorpusV2.make()
         let modelIdentity = try ProvenanceCLI.modelEvidenceIdentity(
-            at: plan.modelPath)
+            at: plan.modelPath,
+            checkpointContentSHA256:
+                plan.compressedKVAttentionExpectedCheckpointContentSHA256)
         let tokenizerManifestSHA256 =
             try ProvenanceCLI.tokenizerManifestSHA256(at: plan.modelPath)
         let runConfiguration =
@@ -548,7 +617,13 @@ func runTaskCoherence(_ flags: Flags) async {
 
         print("# task-coherence loading model after all artifact preflight gates passed")
         let (driver, tokenizer, _) = try await loadSwiftDriver(
-            modelPath: plan.modelPath)
+            modelPath: plan.modelPath,
+            kvQuantTier: plan.tier == "fp16" ? nil : plan.tier,
+            kvtunerSelection: preparedKVTuner?.selection,
+            compressedKVAttention: plan.compressedKVAttention,
+            compressedKVAttentionExpectedCheckpointContentSHA256:
+                plan
+                    .compressedKVAttentionExpectedCheckpointContentSHA256)
         let labelTokenIDs = try taskLabelTokenIDs(tokenizer: tokenizer)
         print("# restricted-choice token IDs: \(labelTokenIDs)")
         let preparedCases = try prepareTaskCoherenceCases(
@@ -579,7 +654,11 @@ func runTaskCoherence(_ flags: Flags) async {
                 temperature: 0,
                 maxTokens: maxTokens,
                 kvQuant: configTier,
-                kvtunerSelection: preparedKVTuner?.selection)
+                kvtunerSelection: preparedKVTuner?.selection,
+                compressedKVAttention: plan.compressedKVAttention,
+                compressedKVAttentionExpectedCheckpointContentSHA256:
+                    plan
+                        .compressedKVAttentionExpectedCheckpointContentSHA256)
         }
         let identity = TaskCoherenceRunIdentity(
             corpusID: corpus.id,
@@ -587,8 +666,14 @@ func runTaskCoherence(_ flags: Flags) async {
             modelConfigHash: modelIdentity.configHash,
             modelCheckpointManifestHash:
                 modelIdentity.checkpointManifestHash,
+            modelCheckpointContentSHA256:
+                modelIdentity.checkpointContentSHA256,
             kvQuantTier: plan.tier,
             kvtunerSchedule: preparedKVTuner?.binding)
+        let evidenceSchemaVersion =
+            plan.compressedKVAttention != nil
+            ? TaskCoherenceArtifact.compressedAttentionSchemaVersion
+            : TaskCoherenceArtifact.schemaVersion
 
         for (index, prepared) in preparedCases.enumerated() {
             let item = prepared.item
@@ -647,8 +732,14 @@ func runTaskCoherence(_ flags: Flags) async {
                 kvtunerSchedule: preparedKVTuner?.binding,
                 generated: generation.engagement,
                 scoring: scoringEngagement)
+            let compressedKVAttention = try taskCompressedKVAttentionBinding(
+                tier: plan.tier,
+                request: plan.compressedKVAttention,
+                admission: driver.compressedKVAttentionAdmission,
+                generated: generation.engagement,
+                scoring: scoringEngagement)
             let payload = TaskCoherenceCasePayload(
-                schemaVersion: TaskCoherenceArtifact.schemaVersion,
+                schemaVersion: evidenceSchemaVersion,
                 matrixID: plan.matrixID,
                 cellID: plan.cellID,
                 identity: identity,
@@ -661,7 +752,8 @@ func runTaskCoherence(_ flags: Flags) async {
                 scoredOutput: scoredOutput,
                 outputSHA256: sha256Hex(Data(scoredOutput.utf8)),
                 score: score,
-                engagement: engagement)
+                engagement: engagement,
+                compressedKVAttention: compressedKVAttention)
             try requireDistinctTaskPaths([
                 plan.evidencePath,
                 plan.summaryEvidencePath ?? "",

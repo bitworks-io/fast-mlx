@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import HarnessCore
 import MLX
@@ -257,24 +258,130 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             to: directory.appendingPathComponent("tokenizer_config.json"))
         try Data([0, 1, 2]).write(
             to: directory.appendingPathComponent("model-00001-of-00001.safetensors"))
+        let originalWeights = [
+            (
+                name: "model-00001-of-00001.safetensors",
+                contents: Data([0, 1, 2])
+            ),
+        ]
 
         let first = try compressedAttentionProbeModelIdentity(
             modelID: "mlx-community/Qwen3-32B-4bit",
             modelPath: directory.path)
         XCTAssertEqual(first.modelConfigSHA256, sha256Hex(config))
         XCTAssertEqual(first.tokenizerConfigSHA256, sha256Hex(tokenizerConfig))
-        assertSHA256(first.checkpointManifestSHA256)
+        XCTAssertEqual(
+            first.checkpointManifestSHA256,
+            phase0CheckpointManifestSHA256(
+                config: config,
+                index: nil,
+                weights: originalWeights))
+        XCTAssertEqual(
+            first.checkpointManifestSHA256,
+            try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+                at: directory.path,
+                exactConfigData: config))
         assertSHA256(first.tokenizerSHA256)
 
         try Data([3, 1, 2]).write(
             to: directory.appendingPathComponent("model-00001-of-00001.safetensors"))
+        let replacedWeights = [
+            (
+                name: "model-00001-of-00001.safetensors",
+                contents: Data([3, 1, 2])
+            ),
+        ]
         let changed = try compressedAttentionProbeModelIdentity(
             modelID: "mlx-community/Qwen3-32B-4bit",
             modelPath: directory.path)
         XCTAssertNotEqual(
             first.checkpointManifestSHA256,
             changed.checkpointManifestSHA256)
+        XCTAssertEqual(
+            changed.checkpointManifestSHA256,
+            phase0CheckpointManifestSHA256(
+                config: config,
+                index: nil,
+                weights: replacedWeights))
         XCTAssertEqual(first.tokenizerSHA256, changed.tokenizerSHA256)
+    }
+
+    func testFullContentCheckpointManifestAuthenticatesSafeShardAliases()
+        throws
+    {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let target = directory.appendingPathComponent("target.bin")
+        let regularModel = directory.appendingPathComponent(
+            "regular", isDirectory: true)
+        let aliasModel = directory.appendingPathComponent(
+            "alias", isDirectory: true)
+        let renamedAliasModel = directory.appendingPathComponent(
+            "renamed-alias", isDirectory: true)
+        for model in [regularModel, aliasModel, renamedAliasModel] {
+            try FileManager.default.createDirectory(
+                at: model,
+                withIntermediateDirectories: false)
+            try Data("{\"model_type\":\"qwen3\"}".utf8).write(
+                to: model.appendingPathComponent("config.json"))
+        }
+        try Data([9, 8, 7, 6]).write(to: target)
+        try Data([9, 8, 7, 6]).write(
+            to: regularModel.appendingPathComponent(
+                "model-00001-of-00001.safetensors"))
+        try FileManager.default.createSymbolicLink(
+            at: aliasModel.appendingPathComponent(
+                "model-00001-of-00001.safetensors"),
+            withDestinationURL: target)
+        try FileManager.default.createSymbolicLink(
+            at: renamedAliasModel.appendingPathComponent(
+                "model-00002-of-00002.safetensors"),
+            withDestinationURL: target)
+
+        let regular = try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+            at: regularModel.path)
+        let alias = try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+            at: aliasModel.path)
+        let renamedAlias = try ProvenanceCLI
+            .fullContentCheckpointManifestSHA256(at: renamedAliasModel.path)
+
+        XCTAssertEqual(regular, alias)
+        XCTAssertNotEqual(alias, renamedAlias)
+    }
+
+    func testFullContentCheckpointManifestRejectsNonRegularShardAlias()
+        throws
+    {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let model = directory.appendingPathComponent("model", isDirectory: true)
+        let target = directory.appendingPathComponent(
+            "target-directory", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: model,
+            withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: false)
+        try Data("{\"model_type\":\"qwen3\"}".utf8).write(
+            to: model.appendingPathComponent("config.json"))
+        let logicalShard = model.appendingPathComponent(
+            "model-00001-of-00001.safetensors")
+        try FileManager.default.createSymbolicLink(
+            at: logicalShard,
+            withDestinationURL: target)
+
+        XCTAssertThrowsError(
+            try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+                at: model.path)
+        ) { error in
+            guard case let ProvenanceCLI.EvidenceIdentityError
+                .invalidCheckpointWeight(path) = error,
+                path == logicalShard.path
+            else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     func testModelIdentityFailsClosedWhenRequiredFilesAreMissing() throws {
@@ -450,5 +557,41 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
             },
             file: file,
             line: line)
+    }
+
+    private func phase0CheckpointManifestSHA256(
+        config: Data,
+        index: Data?,
+        weights: [(name: String, contents: Data)]
+    ) -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data(
+            "fastmlx-checkpoint-content-manifest-v2\n".utf8))
+        updatePhase0ManifestField(config, hasher: &hasher)
+        updatePhase0ManifestField(index ?? Data(), hasher: &hasher)
+        for weight in weights.sorted(by: { $0.name < $1.name }) {
+            updatePhase0ManifestField(
+                Data(weight.name.utf8),
+                hasher: &hasher)
+            var size = UInt64(weight.contents.count).bigEndian
+            withUnsafeBytes(of: &size) {
+                hasher.update(data: Data($0))
+            }
+            hasher.update(data: weight.contents)
+        }
+        return hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
+    }
+
+    private func updatePhase0ManifestField(
+        _ field: Data,
+        hasher: inout SHA256
+    ) {
+        var count = UInt64(field.count).bigEndian
+        withUnsafeBytes(of: &count) {
+            hasher.update(data: Data($0))
+        }
+        hasher.update(data: field)
     }
 }

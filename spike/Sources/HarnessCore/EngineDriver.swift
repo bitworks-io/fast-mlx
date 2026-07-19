@@ -17,14 +17,27 @@ public struct RunConfig: Sendable, Hashable {
     /// Authenticated immutable KVTuner policy. Its exact artifact digest participates in the
     /// runtime cache key; a cell spelling alone is never enough to select heterogeneous layers.
     public var kvtunerSelection: KVTunerRuntimeSelection?
+    /// Explicit affine-cache attention route. nil preserves the qualified legacy materialized
+    /// path; split attention additionally requires a pre-load model admission.
+    public var compressedKVAttention: CompressedKVAttentionRequest?
+    /// Predeclared full checkpoint-content identity for an explicit compressed-attention run.
+    /// This comes from a frozen qualification/source-lock artifact, never from the live
+    /// checkpoint's own assertion. nil is valid only when no explicit route is requested.
+    public var compressedKVAttentionExpectedCheckpointContentSHA256: String?
     public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
                 specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
                 kvQuant: String? = nil,
-                kvtunerSelection: KVTunerRuntimeSelection? = nil) {
+                kvtunerSelection: KVTunerRuntimeSelection? = nil,
+                compressedKVAttention: CompressedKVAttentionRequest? = nil,
+                compressedKVAttentionExpectedCheckpointContentSHA256:
+                    String? = nil) {
         self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode
         self.specNgram = specNgram; self.specMaxDraft = specMaxDraft
         self.specCompiledVerify = specCompiledVerify; self.kvQuant = kvQuant
         self.kvtunerSelection = kvtunerSelection
+        self.compressedKVAttention = compressedKVAttention
+        self.compressedKVAttentionExpectedCheckpointContentSHA256 =
+            compressedKVAttentionExpectedCheckpointContentSHA256
     }
     public static func greedy(maxTokens: Int) -> RunConfig { .init(temperature: 0, maxTokens: maxTokens) }
 }

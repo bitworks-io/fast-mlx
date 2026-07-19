@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import HarnessCore
 
@@ -71,6 +72,8 @@ enum ProvenanceCLI {
         case unreadableModelConfig(String)
         case missingCheckpointWeights(String)
         case missingTokenizerFiles(String)
+        case unreadableCheckpointManifestFile(String)
+        case invalidCheckpointWeight(String)
         case invalidTokenizerFile(String)
 
         var description: String {
@@ -81,6 +84,10 @@ enum ProvenanceCLI {
                 return "checkpoint manifest at \(path) contains no safetensors files"
             case .missingTokenizerFiles(let path):
                 return "tokenizer manifest at \(path) contains no recognized tokenizer files"
+            case .unreadableCheckpointManifestFile(let path):
+                return "cannot fingerprint checkpoint manifest file at \(path)"
+            case .invalidCheckpointWeight(let path):
+                return "checkpoint manifest entry is dangling or not a regular file: \(path)"
             case .invalidTokenizerFile(let path):
                 return "tokenizer manifest entry is dangling or not a regular file: \(path)"
             }
@@ -233,18 +240,109 @@ enum ProvenanceCLI {
         return fnv1a64(bytes)
     }
 
+    /// Phase-0 compressed-attention checkpoint identity. This intentionally preserves the
+    /// domain-separated v2 byte stream: exact config bytes, exact index bytes or an empty index
+    /// field, then each sorted logical shard name, resolved regular-file size, and streamed
+    /// content bytes.
+    static func fullContentCheckpointManifestSHA256(
+        at modelPath: String,
+        exactConfigData: Data? = nil
+    ) throws -> String {
+        let directory = URL(fileURLWithPath: modelPath)
+            .standardizedFileURL
+        let manager = FileManager.default
+        let configURL = directory.appendingPathComponent("config.json")
+        let configData: Data
+        if let exactConfigData {
+            configData = exactConfigData
+        } else {
+            do {
+                configData = try Data(contentsOf: configURL)
+            } catch {
+                throw EvidenceIdentityError.unreadableCheckpointManifestFile(
+                    configURL.path)
+            }
+        }
+
+        let weightURLs = try manager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+            options: [.skipsHiddenFiles])
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard !weightURLs.isEmpty else {
+            throw EvidenceIdentityError.missingCheckpointWeights(modelPath)
+        }
+
+        var manifest = SHA256()
+        manifest.update(data: Data(
+            "fastmlx-checkpoint-content-manifest-v2\n".utf8))
+        updateCheckpointContentManifestField(configData, hasher: &manifest)
+
+        let indexURL = directory.appendingPathComponent(
+            "model.safetensors.index.json")
+        if manager.fileExists(atPath: indexURL.path) {
+            let indexData: Data
+            do {
+                indexData = try Data(contentsOf: indexURL)
+            } catch {
+                throw EvidenceIdentityError.unreadableCheckpointManifestFile(
+                    indexURL.path)
+            }
+            updateCheckpointContentManifestField(indexData, hasher: &manifest)
+        } else {
+            updateCheckpointContentManifestField(Data(), hasher: &manifest)
+        }
+
+        for logicalURL in weightURLs {
+            let reportedLogicalURL = URL(
+                fileURLWithPath: modelPath,
+                isDirectory: true
+            ).appendingPathComponent(logicalURL.lastPathComponent)
+            let resolvedURL = logicalURL.resolvingSymlinksInPath()
+            let values: URLResourceValues
+            do {
+                values = try resolvedURL.resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey])
+            } catch {
+                throw EvidenceIdentityError.invalidCheckpointWeight(
+                    reportedLogicalURL.path)
+            }
+            guard values.isRegularFile == true, let size = values.fileSize,
+                size >= 0
+            else {
+                throw EvidenceIdentityError.invalidCheckpointWeight(
+                    reportedLogicalURL.path)
+            }
+            updateCheckpointContentManifestField(
+                Data(logicalURL.lastPathComponent.utf8),
+                hasher: &manifest)
+            try updateCheckpointContentManifestFile(
+                resolvedURL,
+                logicalURL: reportedLogicalURL,
+                expectedSize: size,
+                hasher: &manifest)
+        }
+
+        return checkpointContentManifestSHA256Hex(manifest.finalize())
+    }
+
     /// Promotion evidence uses both config bytes and a checkpoint manifest fingerprint. The
     /// latter is deliberately not described as a tensor-content hash: it covers config/index
     /// bytes plus sorted shard names and sizes so identity remains cheap enough to gather before
     /// a timed run.
-    static func modelEvidenceIdentity(at modelPath: String) throws -> KVModelEvidenceIdentity {
+    static func modelEvidenceIdentity(
+        at modelPath: String,
+        checkpointContentSHA256: String? = nil
+    ) throws -> KVModelEvidenceIdentity {
         let configHash = modelConfig(at: modelPath).hash
         guard configHash != "unknown" else {
             throw EvidenceIdentityError.unreadableModelConfig(modelPath)
         }
         return KVModelEvidenceIdentity(
             configHash: configHash,
-            checkpointManifestHash: try checkpointManifestHash(at: modelPath))
+            checkpointManifestHash: try checkpointManifestHash(at: modelPath),
+            checkpointContentSHA256: checkpointContentSHA256)
     }
 
     /// Cryptographic content manifest for every local file that can affect raw prompt encoding or
@@ -371,6 +469,68 @@ enum ProvenanceCLI {
             corpusContentHash: corpusContentHash,
             nonce: nonce())
         return (provenance, quant)
+    }
+
+    private static func updateCheckpointContentManifestField(
+        _ field: Data,
+        hasher: inout SHA256
+    ) {
+        var count = UInt64(field.count).bigEndian
+        withUnsafeBytes(of: &count) {
+            hasher.update(data: Data($0))
+        }
+        hasher.update(data: field)
+    }
+
+    private static func updateCheckpointContentManifestFile(
+        _ url: URL,
+        logicalURL: URL,
+        expectedSize: Int,
+        hasher: inout SHA256
+    ) throws {
+        var encodedSize = UInt64(expectedSize).bigEndian
+        withUnsafeBytes(of: &encodedSize) {
+            hasher.update(data: Data($0))
+        }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw EvidenceIdentityError.unreadableCheckpointManifestFile(
+                logicalURL.path)
+        }
+        defer { try? handle.close() }
+
+        var bytesRead = 0
+        do {
+            while let chunk = try handle.read(upToCount: 8 << 20),
+                !chunk.isEmpty
+            {
+                let (nextCount, overflow) = bytesRead.addingReportingOverflow(
+                    chunk.count)
+                guard !overflow, nextCount <= expectedSize else {
+                    throw EvidenceIdentityError.invalidCheckpointWeight(
+                        logicalURL.path)
+                }
+                bytesRead = nextCount
+                hasher.update(data: chunk)
+            }
+        } catch let error as EvidenceIdentityError {
+            throw error
+        } catch {
+            throw EvidenceIdentityError.unreadableCheckpointManifestFile(
+                logicalURL.path)
+        }
+        guard bytesRead == expectedSize else {
+            throw EvidenceIdentityError.invalidCheckpointWeight(
+                logicalURL.path)
+        }
+    }
+
+    private static func checkpointContentManifestSHA256Hex(
+        _ digest: SHA256.Digest
+    ) -> String {
+        digest.map { String(format: "%02x", $0) }.joined()
     }
 }
 

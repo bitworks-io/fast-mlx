@@ -371,6 +371,10 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
     public let outputSHA256: String
     public let score: TaskItemScore
     public let engagement: TaskCoherenceCacheEngagementEvidence
+    /// Explicit attention request plus the operation observed after this exact case. Optional
+    /// keeps historical task artifacts readable; Phase-2 qualification requires it separately.
+    public let compressedKVAttention:
+        CompressedKVAttentionRuntimeBinding?
 
     public init(
         schemaVersion: Int,
@@ -386,7 +390,9 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
         scoredOutput: String,
         outputSHA256: String,
         score: TaskItemScore,
-        engagement: TaskCoherenceCacheEngagementEvidence
+        engagement: TaskCoherenceCacheEngagementEvidence,
+        compressedKVAttention:
+            CompressedKVAttentionRuntimeBinding? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.matrixID = matrixID
@@ -402,6 +408,7 @@ public struct TaskCoherenceCasePayload: Codable, Equatable, Sendable {
         self.outputSHA256 = outputSHA256
         self.score = score
         self.engagement = engagement
+        self.compressedKVAttention = compressedKVAttention
     }
 }
 
@@ -454,6 +461,9 @@ public enum TaskCoherenceArtifact {
     /// runnable task CLI. Schema 2 is the first qualification-capable artifact and rejects any
     /// partial legacy rows rather than guessing missing evidence.
     public static let schemaVersion = 2
+    /// Schema 3 requires an authenticated request/observed-operation binding on every affine or
+    /// KVTuner row. Schema 2 remains readable for the frozen pre-compressed-attention corpus.
+    public static let compressedAttentionSchemaVersion = 3
 
     private static let affineTiers: Set<String> = [
         "affine-k4v2-g64",
@@ -483,6 +493,68 @@ public enum TaskCoherenceArtifact {
     public static func expectedCellID(forTier tier: String) -> String? {
         if let cellID = tierCellIDs[tier] { return cellID }
         return isCanonicalKVTunerCellID(tier) ? tier : nil
+    }
+
+    /// Authenticate a decoded task receipt against the exact run identity and tokenizer. The
+    /// caller derives the observed operation from post-forward counters; this validator prevents
+    /// a forged Codable payload from turning the request into its own proof.
+    static func validateCompressedKVAttention(
+        _ binding: CompressedKVAttentionRuntimeBinding?,
+        identity: TaskCoherenceRunIdentity,
+        tokenization: TaskCoherenceTokenizationEvidence
+    ) throws {
+        guard let binding else { return }
+        do {
+            try binding.validated()
+            guard binding.admission.modelConfigHash
+                    == identity.modelConfigHash,
+                binding.admission.checkpointManifestHash
+                    == identity.modelCheckpointManifestHash,
+                binding.admission.checkpointContentSHA256
+                    == identity.modelCheckpointContentSHA256,
+                binding.admission.tokenizerSHA256
+                    == tokenization.tokenizerManifestSHA256
+            else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "compressed-attention")
+            }
+            if affineTiers.contains(identity.kvQuantTier) {
+                let groupSize: Int
+                if identity.kvQuantTier.hasSuffix("-g64") {
+                    groupSize = 64
+                } else if identity.kvQuantTier.hasSuffix("-g128") {
+                    groupSize = 128
+                } else {
+                    throw TaskCoherenceEvidenceError
+                        .invalidRuntimeEvidence("compressed-attention")
+                }
+                try binding.admission.validateAffineGeometry(
+                    keyGroupSize: groupSize,
+                    valueGroupSize: groupSize)
+            } else if isCanonicalKVTunerCellID(
+                identity.kvQuantTier)
+            {
+                guard let schedule = identity.kvtunerSchedule else {
+                    throw TaskCoherenceEvidenceError
+                        .invalidRuntimeEvidence("compressed-attention")
+                }
+                try binding.admission.validateScheduleIdentity(
+                    modelConfigHash: schedule.modelConfigHash,
+                    checkpointManifestHash:
+                        schedule.checkpointManifestHash,
+                    tokenizerSHA256: schedule.tokenizerSHA256,
+                    layerCount: schedule.layers.count,
+                    groupSize: schedule.groupSize)
+            } else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "compressed-attention")
+            }
+        } catch let error as TaskCoherenceEvidenceError {
+            throw error
+        } catch {
+            throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                "compressed-attention")
+        }
     }
 
     /// Strict JSON Lines decoding: exactly one optional trailing newline is accepted. Blank rows,
@@ -556,7 +628,9 @@ public enum TaskCoherenceArtifact {
                 row.payload.runConfiguration
                     == first.payload.runConfiguration,
                 row.payload.referenceArtifactSHA256
-                    == first.payload.referenceArtifactSHA256
+                    == first.payload.referenceArtifactSHA256,
+                row.payload.compressedKVAttention
+                    == first.payload.compressedKVAttention
             else {
                 throw TaskCoherenceEvidenceError.mismatchedArtifact("run")
             }
@@ -621,7 +695,9 @@ public enum TaskCoherenceArtifact {
         guard record.subcommand == "task-coherence" else {
             throw TaskCoherenceEvidenceError.mismatchedArtifact("subcommand")
         }
-        guard payload.schemaVersion == schemaVersion else {
+        guard [schemaVersion, compressedAttentionSchemaVersion].contains(
+            payload.schemaVersion)
+        else {
             throw TaskCoherenceEvidenceError.unsupportedSchema(
                 payload.schemaVersion)
         }
@@ -697,6 +773,37 @@ public enum TaskCoherenceArtifact {
             throw TaskCoherenceEvidenceError.mismatchedArtifact(
                 "prompt-tokenization")
         }
+        let requiresCompressedBinding = affineTiers.contains(
+            payload.identity.kvQuantTier)
+            || isCanonicalKVTunerCellID(payload.identity.kvQuantTier)
+        switch payload.schemaVersion {
+        case schemaVersion:
+            guard payload.compressedKVAttention == nil,
+                payload.identity.modelCheckpointContentSHA256 == nil
+            else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "compressed-attention-schema")
+            }
+        case compressedAttentionSchemaVersion:
+            guard requiresCompressedBinding
+                == (payload.compressedKVAttention != nil),
+                requiresCompressedBinding
+                    == (payload.identity.modelCheckpointContentSHA256 != nil),
+                (payload.identity.modelCheckpointContentSHA256.map {
+                    isHex($0, length: 64)
+                } ?? true)
+            else {
+                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
+                    "compressed-attention-schema")
+            }
+        default:
+            throw TaskCoherenceEvidenceError.unsupportedSchema(
+                payload.schemaVersion)
+        }
+        try validateCompressedKVAttention(
+            payload.compressedKVAttention,
+            identity: payload.identity,
+            tokenization: payload.tokenization)
         let derivedScore: TaskItemScore
         switch item.scoringMode {
         case .restrictedChoice:
@@ -949,7 +1056,9 @@ public enum TaskCoherenceArtifact {
         _ summary: TaskCoherenceArtifactSummary,
         corpus: TaskCoherenceCorpus
     ) throws {
-        guard summary.schemaVersion == schemaVersion else {
+        guard [schemaVersion, compressedAttentionSchemaVersion].contains(
+            summary.schemaVersion)
+        else {
             throw TaskCoherenceEvidenceError.unsupportedSchema(
                 summary.schemaVersion)
         }
@@ -1174,6 +1283,8 @@ public struct TaskCoherencePromotionEvidence:
                 == frontier.candidateModel.configHash,
             candidate.identity.modelCheckpointManifestHash
                 == frontier.candidateModel.checkpointManifestHash,
+            candidate.identity.modelCheckpointContentSHA256
+                == frontier.candidateModel.checkpointContentSHA256,
             reference.identity.modelConfigHash
                 == frontier.referenceModel.configHash,
             reference.identity.modelCheckpointManifestHash

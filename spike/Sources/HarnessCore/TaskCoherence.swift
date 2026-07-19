@@ -522,6 +522,9 @@ public struct TaskCoherenceRunIdentity: Codable, Equatable, Sendable {
     public let corpusContentHash: String
     public let modelConfigHash: String
     public let modelCheckpointManifestHash: String
+    /// Full model-content identity used by compressed-attention qualification. Historical task
+    /// evidence omits this field and remains decodable.
+    public let modelCheckpointContentSHA256: String?
     public let kvQuantTier: String
     /// Exact authenticated heterogeneous policy. Uniform fp16/affine/KVarN runs must leave this
     /// nil; a KVTuner tier is not a runnable identity without it.
@@ -532,6 +535,7 @@ public struct TaskCoherenceRunIdentity: Codable, Equatable, Sendable {
         corpusContentHash: String,
         modelConfigHash: String,
         modelCheckpointManifestHash: String,
+        modelCheckpointContentSHA256: String? = nil,
         kvQuantTier: String,
         kvtunerSchedule: KVTunerScheduleBinding? = nil
     ) {
@@ -539,6 +543,7 @@ public struct TaskCoherenceRunIdentity: Codable, Equatable, Sendable {
         self.corpusContentHash = corpusContentHash
         self.modelConfigHash = modelConfigHash
         self.modelCheckpointManifestHash = modelCheckpointManifestHash
+        self.modelCheckpointContentSHA256 = modelCheckpointContentSHA256
         self.kvQuantTier = kvQuantTier
         self.kvtunerSchedule = kvtunerSchedule
     }

@@ -9,14 +9,23 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     case missingWorkloadNonce
     case tierCellMismatch(tier: String, cell: String)
     case unauditedKVTunerPrompt
+    case invalidPromptRepeat(Int)
+    case contextLimitExceeded(
+        promptTokens: Int, maxTokens: Int, limit: Int)
     case invalidRuns(Int)
     case invalidMaxTokens(Int)
     case unknownSpec(String)
     case unmeasuredSpecKV(String)
+    case unknownAttentionOperation(String)
+    case unsupportedAttentionTier(String)
+    case invalidCheckpointContentSHA256(String)
     case missingPrefillTiming
     case invalidPrefillTiming
     case missingKVTunerEngagement
     case missingLossyEngagement(String)
+    case missingCompressedAttentionEvidence
+    case compressedAttentionWorkspaceExceedsMLXPeak(
+        workspaceBytes: Int, peakBytes: Int)
     case csvSchemaMismatch
     case outputPathCollision(String)
     case symbolicLinkOutput(String)
@@ -35,6 +44,11 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "bench requires --kv-quant and --cell-id to identify the same executed tier; got \(tier) and \(cell)"
         case .unauditedKVTunerPrompt:
             return "KVTuner bench accepts only the audited built-in prompt; custom --prompt needs a separately authenticated source identity"
+        case .invalidPromptRepeat(let value):
+            return "bench --prompt-repeat must be between 1 and 4096; actual=\(value)"
+        case .contextLimitExceeded(
+            let promptTokens, let maxTokens, let limit):
+            return "bench prompt plus output budget exceeds the authenticated model context: prompt=\(promptTokens), max_tokens=\(maxTokens), limit=\(limit)"
         case .invalidRuns(let runs):
             return "bench --runs must be positive and bounded; actual=\(runs)"
         case .invalidMaxTokens(let value):
@@ -43,6 +57,12 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "unknown --spec drafter \(spec) (known: pld)"
         case .unmeasuredSpecKV(let tier):
             return "specDecode=pld with kvQuant=\(tier) is an unmeasured combination; use fp16"
+        case .unknownAttentionOperation(let operation):
+            return "unknown --kv-attention operation \(operation) (known: materialize, split-affine-quantized-mm)"
+        case .unsupportedAttentionTier(let tier):
+            return "--kv-attention is valid only for an affine-backed KV tier, not \(tier)"
+        case .invalidCheckpointContentSHA256(let value):
+            return "--checkpoint-content-sha256 must be one lowercase 64-character digest exactly when --kv-attention is requested; actual=\(value)"
         case .missingPrefillTiming:
             return "engine returned no direct prefill timing"
         case .invalidPrefillTiming:
@@ -51,6 +71,11 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "KVTuner schedule did not produce matching runtime engagement"
         case .missingLossyEngagement(let tier):
             return "bench tier \(tier) did not produce non-vacuous runtime engagement"
+        case .missingCompressedAttentionEvidence:
+            return "bench compressed-attention request did not produce one matching observed-operation receipt"
+        case .compressedAttentionWorkspaceExceedsMLXPeak(
+            let workspaceBytes, let peakBytes):
+            return "bench compressed-attention logical workspace exceeds the raw MLX peak receipt: workspace=\(workspaceBytes), peak=\(peakBytes)"
         case .csvSchemaMismatch:
             return "existing bench CSV header does not match the direct-prefill schema"
         case .outputPathCollision(let path):
@@ -68,6 +93,7 @@ struct BenchPlan: Sendable {
     let matrixID: String?
     let kvtunerSchedulePath: String
     let workload: BenchWorkloadIdentity
+    let promptRepeat: Int
     let maxTokens: Int
     let runs: Int
     let label: String
@@ -75,8 +101,50 @@ struct BenchPlan: Sendable {
     let ngram: Int
     let maxDraft: Int
     let compiledVerify: Bool
+    let compressedKVAttention: CompressedKVAttentionRequest?
+    let compressedKVAttentionExpectedCheckpointContentSHA256: String?
     let evidencePath: String
     let csvPath: String?
+}
+
+func requestedCompressedKVAttention(
+    _ flags: Flags,
+    tier: String
+) throws -> CompressedKVAttentionRequest? {
+    let attentionText = try flags.strictString(
+        "kv-attention", default: "")
+    guard !attentionText.isEmpty else { return nil }
+    guard let request = CompressedKVAttentionRequest(
+        rawValue: attentionText)
+    else {
+        throw BenchCLIError.unknownAttentionOperation(attentionText)
+    }
+    guard AffineKVTier(rawValue: tier) != nil || isKVTunerTier(tier) else {
+        throw BenchCLIError.unsupportedAttentionTier(tier)
+    }
+    return request
+}
+
+func requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
+    _ flags: Flags,
+    request: CompressedKVAttentionRequest?
+) throws -> String? {
+    let value = try flags.strictString(
+        "checkpoint-content-sha256", default: "")
+    guard request != nil else {
+        guard value.isEmpty else {
+            throw BenchCLIError.invalidCheckpointContentSHA256(value)
+        }
+        return nil
+    }
+    guard value.utf8.count == 64,
+        value.utf8.allSatisfy({
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
+        })
+    else {
+        throw BenchCLIError.invalidCheckpointContentSHA256(value)
+    }
+    return value
 }
 
 func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
@@ -133,11 +201,17 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         }
     }
 
-    let prompt = try flags.strictString(
+    let promptTemplate = try flags.strictString(
         "prompt", default: defaultBenchPrompt)
-    if kvtuner, prompt != defaultBenchPrompt {
+    if kvtuner, promptTemplate != defaultBenchPrompt {
         throw BenchCLIError.unauditedKVTunerPrompt
     }
+    let promptRepeat = try flags.strictInt("prompt-repeat", default: 1)
+    guard (1 ... 4_096).contains(promptRepeat) else {
+        throw BenchCLIError.invalidPromptRepeat(promptRepeat)
+    }
+    let prompt = Array(repeating: promptTemplate, count: promptRepeat)
+        .joined(separator: "\n")
     let runs = try flags.strictInt("runs", default: 3)
     guard (1 ... 100).contains(runs) else {
         throw BenchCLIError.invalidRuns(runs)
@@ -163,6 +237,12 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         throw BenchCLIError.unmeasuredSpecKV(runtimeTier)
     }
 
+    let compressedKVAttention = try requestedCompressedKVAttention(
+        flags, tier: runtimeTier)
+    let compressedKVAttentionExpectedCheckpointContentSHA256 = try
+        requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
+            flags, request: compressedKVAttention)
+
     return BenchPlan(
         modelPath: modelPath,
         kvQuantTier: kvQuantTier,
@@ -170,6 +250,7 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         matrixID: matrixText.isEmpty ? nil : matrixText,
         kvtunerSchedulePath: schedulePath,
         workload: workload,
+        promptRepeat: promptRepeat,
         maxTokens: maxTokens,
         runs: runs,
         label: try flags.strictString("label", default: "harness"),
@@ -178,8 +259,35 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         maxDraft: try flags.strictInt("max-draft", default: 8),
         compiledVerify: try flags.strictBool(
             "compiled-verify", default: false),
+        compressedKVAttention: compressedKVAttention,
+        compressedKVAttentionExpectedCheckpointContentSHA256:
+            compressedKVAttentionExpectedCheckpointContentSHA256,
         evidencePath: evidencePath,
         csvPath: csvPath.isEmpty ? nil : csvPath)
+}
+
+/// Validate every exact salted workload before the first model forward. This keeps an
+/// over-context long-prompt calibration from allocating or mutating a cache and then leaving a
+/// partial evidence file. `addingReportingOverflow` also makes adversarial CLI integer input fail
+/// closed instead of wrapping into an apparently admissible request.
+func validateBenchContextWindow(
+    promptTokenCounts: [Int],
+    maxTokens: Int,
+    maxPositionEmbeddings: Int
+) throws {
+    for promptTokens in promptTokenCounts {
+        let (requested, overflow) = promptTokens.addingReportingOverflow(
+            maxTokens)
+        guard promptTokens > 0, maxTokens > 0,
+            maxPositionEmbeddings > 0, !overflow,
+            requested <= maxPositionEmbeddings
+        else {
+            throw BenchCLIError.contextLimitExceeded(
+                promptTokens: promptTokens,
+                maxTokens: maxTokens,
+                limit: maxPositionEmbeddings)
+        }
+    }
 }
 
 /// Append one runtime row without treating a failed read as an empty destination. A pre-existing
@@ -218,30 +326,62 @@ func appendBenchCSVRow(_ row: BenchRow, to path: String) throws {
 func validateBenchRuntimeEngagement(
     tier: String,
     engagement: EngagementCounters,
-    expectedKVTunerLayerCount: Int?
+    expectedKVTunerLayerCount: Int?,
+    requestedCompressedKVAttention: CompressedKVAttentionRequest? = nil
 ) throws {
     let counts = engagement.counts
-    func hasStorageReceipt(_ prefix: String) -> Bool {
+    func hasStorageReceipt(
+        _ prefix: String,
+        attentionRequest: CompressedKVAttentionRequest? = nil
+    ) -> Bool {
         guard let cachedTokens = counts["\(prefix)_tokens"],
             let capacityTokens = counts["\(prefix)_capacity_tokens"]
         else { return false }
-        return cachedTokens > 0
+        let baseReceipt = cachedTokens > 0
             && capacityTokens >= cachedTokens
             && (counts["\(prefix)_payload_bytes"] ?? 0) > 0
             && (counts["\(prefix)_metadata_bytes"] ?? 0) > 0
             && (counts["\(prefix)_control_bytes"] ?? 0) > 0
-            && (counts["\(prefix)_workspace_bytes"] ?? 0) > 0
+        guard baseReceipt else { return false }
+        let workspace = counts["\(prefix)_workspace_bytes"] ?? -1
+        let materialization =
+            counts["\(prefix)_materialization_bytes"] ?? -1
+        let attentionWorkspace =
+            counts["\(prefix)_attention_workspace_bytes"] ?? -1
+        switch attentionRequest {
+        case nil:
+            // Historical/default rows are materialize-then-attend and retain the old receipt.
+            return workspace > 0
+        case .materialize:
+            return workspace > 0
+                && materialization > 0
+                && attentionWorkspace == 0
+                && workspace == materialization
+                && counts["\(prefix)_attention_materialized"] == 1
+                && counts["\(prefix)_attention_split"] == 0
+        case .splitAffineQuantizedMM:
+            return workspace > 0
+                && materialization == 0
+                && attentionWorkspace > 0
+                && workspace == attentionWorkspace
+                && counts["\(prefix)_attention_split"] == 1
+                && counts["\(prefix)_attention_materialized"] == 0
+        }
     }
     if tier == "fp16" { return }
     if isKVTunerTier(tier) {
         guard let expectedKVTunerLayerCount,
-            hasStorageReceipt("kvtuner"),
+            hasStorageReceipt(
+                "kvtuner",
+                attentionRequest: requestedCompressedKVAttention),
             counts["kvtuner_layers"] == expectedKVTunerLayerCount
         else { throw BenchCLIError.missingKVTunerEngagement }
         return
     }
     if AffineKVTier(rawValue: tier) != nil {
-        guard hasStorageReceipt("affine"),
+        guard hasStorageReceipt(
+            "affine",
+            attentionRequest: requestedCompressedKVAttention),
             (counts["affine_layers"] ?? 0) > 0
         else {
             throw BenchCLIError.missingLossyEngagement(tier)
@@ -263,5 +403,71 @@ func validateBenchRuntimeEngagement(
         guard (counts["turboquant_tokens"] ?? 0) > 0 else {
             throw BenchCLIError.missingLossyEngagement(tier)
         }
+    }
+}
+
+/// Reconcile the route-specific logical workspace with the independent raw allocator receipt.
+/// The raw peak also includes model/persistent allocations, so it is an upper envelope rather
+/// than an equality claim; a smaller peak proves that at least one receipt is false or partial.
+func validateBenchCompressedAttentionMemoryReceipt(
+    tier: String,
+    request: CompressedKVAttentionRequest?,
+    engagement: EngagementCounters,
+    maxMLXPeakBytes: Int
+) throws {
+    guard request != nil else { return }
+    let prefix = isKVTunerTier(tier) ? "kvtuner" : "affine"
+    guard let workspaceBytes =
+            engagement.counts["\(prefix)_workspace_bytes"],
+        workspaceBytes > 0,
+        maxMLXPeakBytes >= workspaceBytes
+    else {
+        throw BenchCLIError.compressedAttentionWorkspaceExceedsMLXPeak(
+            workspaceBytes:
+                engagement.counts["\(prefix)_workspace_bytes"] ?? -1,
+            peakBytes: maxMLXPeakBytes)
+    }
+}
+
+/// Convert post-run counters into a durable binding. The requested mode is only an expectation;
+/// the observed operation comes exclusively from cache telemetry aggregated after execution.
+func makeBenchCompressedKVAttentionRuntimeBinding(
+    tier: String,
+    request: CompressedKVAttentionRequest?,
+    admission: CompressedKVAttentionRuntimeAdmission?,
+    engagement: EngagementCounters
+) throws -> CompressedKVAttentionRuntimeBinding? {
+    guard let request else { return nil }
+    guard let admission else {
+        throw BenchCLIError.missingCompressedAttentionEvidence
+    }
+    let prefix: String
+    if isKVTunerTier(tier) {
+        prefix = "kvtuner"
+    } else if AffineKVTier(rawValue: tier) != nil {
+        prefix = "affine"
+    } else {
+        throw BenchCLIError.unsupportedAttentionTier(tier)
+    }
+    let counts = engagement.counts
+    let observed: CompressedKVAttentionObservedOperation
+    switch (
+        counts["\(prefix)_attention_split"],
+        counts["\(prefix)_attention_materialized"]
+    ) {
+    case (1, 0):
+        observed = .splitQuantizedMM
+    case (0, 1):
+        observed = .materializedKV
+    default:
+        throw BenchCLIError.missingCompressedAttentionEvidence
+    }
+    do {
+        return try CompressedKVAttentionRuntimeBinding(
+            request: request,
+            observedOperation: observed,
+            admission: admission)
+    } catch {
+        throw BenchCLIError.missingCompressedAttentionEvidence
     }
 }

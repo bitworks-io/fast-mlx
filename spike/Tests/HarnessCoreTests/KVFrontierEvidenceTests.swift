@@ -22,6 +22,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
     private func breakdown(
         capacityTokens: Int = 24_192,
+        workspaceBytes: Int = 0,
         total: Int? = nil
     ) -> KVStorageBreakdownEvidence {
         let tokenHeads = capacityTokens * 64 * 8
@@ -30,11 +31,12 @@ final class KVFrontierEvidenceTests: XCTestCase {
         return KVStorageBreakdownEvidence(
             payloadBytes: payloadBytes, metadataBytes: metadataBytes,
             alignmentPaddingBytes: 0, fp16SinkBytes: 0, fp16TailBytes: 0,
-            workspaceBytes: 0,
-            totalBytes: total ?? payloadBytes + metadataBytes)
+            workspaceBytes: workspaceBytes,
+            totalBytes: total ?? payloadBytes + metadataBytes + workspaceBytes)
     }
 
     private func frontier(
+        schemaVersion: Int = 1,
         sameWeights: Bool = true,
         baseline: KVComparisonBaseline = .sameWeightsFP16KV,
         candidate: KVModelEvidenceIdentity? = nil,
@@ -47,12 +49,16 @@ final class KVFrontierEvidenceTests: XCTestCase {
         executionMode: String? = nil,
         codecIterations: Int? = nil,
         memoryGate: KVarNMemoryGateEvidence? = nil,
-        kvtunerSchedule: KVTunerScheduleBinding? = nil
+        kvtunerSchedule: KVTunerScheduleBinding? = nil,
+        compressedKVAttention:
+            CompressedKVAttentionRuntimeBinding? = nil,
+        materializationWorkspaceBytes: Int? = nil,
+        attentionWorkspaceBytes: Int? = nil
     ) -> KVFrontierEvidence {
         let same = identity()
         let bytes = breakdown()
         return KVFrontierEvidence(
-            schemaVersion: 1, matrixID: matrixID, cellID: cellID,
+            schemaVersion: schemaVersion, matrixID: matrixID, cellID: cellID,
             sameWeights: sameWeights, comparisonBaseline: baseline,
             referenceKVQuantTier: "fp16",
             candidateModel: candidate ?? same,
@@ -63,7 +69,24 @@ final class KVFrontierEvidenceTests: XCTestCase {
             candidateExecutionMode: executionMode,
             candidateCodecIterations: codecIterations,
             candidateMemoryGate: memoryGate,
-            candidateKVTunerSchedule: kvtunerSchedule)
+            candidateKVTunerSchedule: kvtunerSchedule,
+            candidateCompressedKVAttention: compressedKVAttention,
+            candidateMaterializationWorkspaceBytes:
+                materializationWorkspaceBytes,
+            candidateAttentionWorkspaceBytes: attentionWorkspaceBytes)
+    }
+
+    private func compressedAttentionAdmission() throws
+        -> CompressedKVAttentionRuntimeAdmission
+    {
+        let config = Data(
+            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":8192,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+        return try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: config,
+                checkpointManifestHash: "0123456789abcdef",
+                checkpointContentSHA256: String(repeating: "d", count: 64),
+                tokenizerSHA256: String(repeating: "c", count: 64)))
     }
 
     private func kvarnMemoryGate(
@@ -471,6 +494,216 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertEqual(
             decoded.frontier?.storage?.actual.totalBytes,
             breakdown().totalBytes)
+    }
+
+    func testCompressedAttentionFrontierAuthenticatesObservedOperationAndIdentity() throws {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256)
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitAffineQuantizedMM,
+            observedOperation: .splitQuantizedMM,
+            admission: admission)
+        let splitBytes = breakdown(workspaceBytes: 4_096)
+        let row = payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            storage: KVStorageEvidence(
+                predicted: splitBytes, actual: splitBytes),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: 4_096))
+
+        XCTAssertNoThrow(try row.validatedForPromotion())
+
+        let wrongContentModel = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: String(repeating: "0", count: 64))
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: wrongContentModel,
+            reference: wrongContentModel,
+            storage: KVStorageEvidence(
+                predicted: splitBytes, actual: splitBytes),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: 4_096)).validatedForPromotion()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(row)) as? [String: Any])
+        var frontierObject = try XCTUnwrap(
+            object["frontier"] as? [String: Any])
+        var bindingObject = try XCTUnwrap(
+            frontierObject["candidateCompressedKVAttention"]
+                as? [String: Any])
+        bindingObject["observedOperation"] = "materialized-kv"
+        frontierObject["candidateCompressedKVAttention"] = bindingObject
+        object["frontier"] = frontierObject
+        let forged = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertThrowsError(try forged.validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+
+        frontierObject.removeValue(
+            forKey: "candidateCompressedKVAttention")
+        object["frontier"] = frontierObject
+        let missingBinding = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertThrowsError(try missingBinding.validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+
+        frontierObject = try XCTUnwrap(object["frontier"] as? [String: Any])
+        frontierObject["candidateCompressedKVAttention"] = bindingObject
+        frontierObject.removeValue(
+            forKey: "candidateAttentionWorkspaceBytes")
+        object["frontier"] = frontierObject
+        let missingWorkspace = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertThrowsError(try missingWorkspace.validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+    }
+
+    func testHistoricalSchemaOneFrontierForbidsCompressedAttentionEvidence() throws {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256)
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .materialize,
+            observedOperation: .materializedKV,
+            admission: admission)
+
+        XCTAssertNoThrow(try payload().validatedForPromotion())
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            candidate: model,
+            reference: model,
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 4_096,
+            attentionWorkspaceBytes: 0)).validatedForPromotion()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+    }
+
+    func testCompressedAttentionSchemaTwoReconcilesWorkspaceComponents() throws {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256)
+        let materializedBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .materialize,
+            observedOperation: .materializedKV,
+            admission: admission)
+        let materializedBytes = breakdown(workspaceBytes: 4_096)
+
+        XCTAssertNoThrow(try payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            storage: KVStorageEvidence(
+                predicted: materializedBytes, actual: materializedBytes),
+            compressedKVAttention: materializedBinding,
+            materializationWorkspaceBytes: 4_096,
+            attentionWorkspaceBytes: 0)).validatedForPromotion())
+
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            storage: KVStorageEvidence(
+                predicted: materializedBytes, actual: materializedBytes),
+            compressedKVAttention: materializedBinding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: 4_096)).validatedForPromotion()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+
+        let splitBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitAffineQuantizedMM,
+            observedOperation: .splitQuantizedMM,
+            admission: admission)
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            storage: KVStorageEvidence(
+                predicted: materializedBytes, actual: materializedBytes),
+            compressedKVAttention: splitBinding,
+            materializationWorkspaceBytes: 1,
+            attentionWorkspaceBytes: 4_095)).validatedForPromotion()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+
+        let mismatchedStorage = breakdown(workspaceBytes: 4_097)
+        XCTAssertThrowsError(try payload(frontier: frontier(
+            schemaVersion: 2,
+            candidate: model,
+            reference: model,
+            storage: KVStorageEvidence(
+                predicted: mismatchedStorage, actual: mismatchedStorage),
+            compressedKVAttention: splitBinding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: 4_096)).validatedForPromotion()) {
+                XCTAssertEqual(
+                    $0 as? KVFrontierEvidenceError,
+                    .invalidRuntimeEvidence)
+            }
+    }
+
+    func testKVTunerSchemaTwoRequiresCompressedAttentionBinding() throws {
+        let schedule = try kvtunerBinding()
+        let measured = try kvtunerFormatAndStorage(binding: schedule)
+
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: schedule.cellID,
+            frontier: frontier(
+                schemaVersion: 2,
+                candidate: KVModelEvidenceIdentity(
+                    configHash: schedule.modelConfigHash,
+                    checkpointManifestHash: schedule.checkpointManifestHash),
+                reference: KVModelEvidenceIdentity(
+                    configHash: schedule.modelConfigHash,
+                    checkpointManifestHash: schedule.checkpointManifestHash),
+                cellID: schedule.cellID,
+                format: measured.format,
+                storage: measured.storage,
+                controlBytes: measured.allocation.controlBytes,
+                kvtunerSchedule: schedule,
+                materializationWorkspaceBytes:
+                    measured.storage.actual.workspaceBytes,
+                attentionWorkspaceBytes: 0)).validatedForPromotion()) {
+                    XCTAssertEqual(
+                        $0 as? KVFrontierEvidenceError,
+                        .invalidRuntimeEvidence)
+                }
     }
 
     func testHistoricalFrontierWithoutControlBytesStillDecodesButCannotPromote() throws {

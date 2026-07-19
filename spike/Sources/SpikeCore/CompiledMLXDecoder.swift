@@ -22,6 +22,7 @@ import MLXLMCommon
 public struct CompiledMLXDecoder: Decoder {
     private let model: any LanguageModel
     private let kvCacheKind: KVCacheKind
+    private let affineAttentionMode: AffineKVAttentionMode
     /// Escape hatch for cache implementations whose update ops fail to trace under
     /// `MLX.compile`: `false` runs the same step closure uncompiled (correctness path;
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
@@ -29,6 +30,10 @@ public struct CompiledMLXDecoder: Decoder {
     public let executionMode: KVCacheExecutionMode
     private let chunk =
         KVTunerCandidateRuntimeContract.cacheGrowthChunkTokens
+    /// Split affine attention exposes its score tensor, so an all-at-once long prefill would
+    /// allocate O(prompt²) temporary storage. Bound the query side while retaining one fixed
+    /// cache and exact causal semantics; this matches mlx-lm's standard prefill step size.
+    private static let splitAttentionPrefillChunkSize = 512
     /// Decode headroom preallocated beyond the prompt (rounded up to `chunk`).
     private let reserve: Int
 
@@ -46,12 +51,15 @@ public struct CompiledMLXDecoder: Decoder {
     public init(
         model: any LanguageModel,
         reserve: Int = KVTunerCandidateRuntimeContract.cacheReserveTokens,
-        kvCache: KVCacheKind = .fp16, compileStep: Bool = true
+        kvCache: KVCacheKind = .fp16,
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        compileStep: Bool = true
     ) {
         let executionMode = kvCache.executionMode(requestingCompilation: compileStep)
         self.model = model
         self.reserve = reserve
         self.kvCacheKind = kvCache
+        self.affineAttentionMode = affineAttentionMode
         self.compileStepEnabled = executionMode == .compiled
         self.executionMode = executionMode
     }
@@ -80,7 +88,9 @@ public struct CompiledMLXDecoder: Decoder {
             let cap = ((promptLength + reserve + chunk - 1) / chunk) * chunk
             do {
                 caches = try kvCacheKind.makeCaches(
-                    layerCount: layerCount, capacity: cap)
+                    layerCount: layerCount,
+                    capacity: cap,
+                    affineAttentionMode: affineAttentionMode)
             } catch {
                 preconditionFailure(
                     "KV-cache policy does not match the loaded model: \(error)")
@@ -90,8 +100,35 @@ public struct CompiledMLXDecoder: Decoder {
             for cache in caches { cache.grow(by: chunk) }
         }
 
-        let ids = MLXArray(promptTokens).reshaped([1, promptLength])
-        let logits = model(ids, cache: caches) // uncompiled prefill, dynamic cache ops
+        let logits: MLXArray
+        if affineAttentionMode == .splitQuantizedMM,
+            promptLength > Self.splitAttentionPrefillChunkSize
+        {
+            var lastChunkLogits: MLXArray?
+            var start = 0
+            while start < promptLength {
+                let end = min(
+                    start + Self.splitAttentionPrefillChunkSize,
+                    promptLength)
+                let chunkTokens = Array(promptTokens[start..<end])
+                let ids = MLXArray(chunkTokens).reshaped([
+                    1, chunkTokens.count,
+                ])
+                let chunkLogits = model(ids, cache: caches)
+                // Bound the lazy graph and make each cache mutation visible before the next
+                // chunk reads the in-graph offset and packed buffers.
+                eval(chunkLogits)
+                lastChunkLogits = chunkLogits
+                start = end
+            }
+            guard let lastChunkLogits else {
+                preconditionFailure("prefill requires at least one prompt token")
+            }
+            logits = lastChunkLogits
+        } else {
+            let ids = MLXArray(promptTokens).reshaped([1, promptLength])
+            logits = model(ids, cache: caches)
+        }
         let first = argMax(logits[0..., -1, 0...], axis: -1) // [1]
         cachedTokens = promptLength
 

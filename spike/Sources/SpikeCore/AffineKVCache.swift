@@ -13,7 +13,9 @@ public enum AffineKVCacheConfigurationError: Error, Equatable, Sendable {
 /// The default remains the previously qualified materialize-then-attend behavior. The packed
 /// route is an explicit experimental opt-in so adding the shared router cannot silently activate
 /// it for an unqualified model architecture.
-public enum AffineKVAttentionMode: String, Codable, Equatable, Sendable {
+public enum AffineKVAttentionMode:
+    String, Codable, Equatable, Hashable, Sendable
+{
     case materialize
     case splitQuantizedMM = "split-quantized-mm"
 }
@@ -127,6 +129,13 @@ public struct AffineKVCacheStorageSnapshot: Equatable, Sendable {
     /// recent update. Transformer layers consume these sequentially, so this is one layer's
     /// pair rather than the sum across every persistent layer cache.
     public let materializationWorkspaceBytes: Int
+    /// Logical score plus softmax-weight arrays owned by the explicit split-attention graph.
+    /// This is zero on the materialized route. Raw allocator peak remains a separate bench
+    /// receipt because MLX may fuse or reuse buffers internally.
+    public let attentionWorkspaceBytes: Int
+    /// Route-specific logical workspace. The two components are mutually exclusive today, but
+    /// retaining their sum makes future composed paths fail visibly instead of dropping a term.
+    public let workspaceBytes: Int
     /// Actual cache read operation observed while building the most recent attention graph.
     public let attentionOperation: AffineKVAttentionOperation
 
@@ -149,6 +158,8 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
     public let metadataBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let attentionWorkspaceBytes: Int
+    public let workspaceBytes: Int
     public let attentionOperation: AffineKVAttentionOperation
 
     public var dataArrayBytes: Int { payloadBytes + metadataBytes }
@@ -183,6 +194,9 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
                     && $0.metadataScalarBytes == first.metadataScalarBytes
                     && $0.materializationWorkspaceBytes
                         == first.materializationWorkspaceBytes
+                    && $0.attentionWorkspaceBytes
+                        == first.attentionWorkspaceBytes
+                    && $0.workspaceBytes == first.workspaceBytes
                     && $0.attentionOperation == first.attentionOperation
             },
             "affine layer-cache geometry is inconsistent")
@@ -214,6 +228,8 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
             metadataBytes: sum(snapshots.map(\.metadataBytes)),
             controlBytes: sum(snapshots.map(\.controlBytes)),
             materializationWorkspaceBytes: first.materializationWorkspaceBytes,
+            attentionWorkspaceBytes: first.attentionWorkspaceBytes,
+            workspaceBytes: first.workspaceBytes,
             attentionOperation: first.attentionOperation)
     }
 }
@@ -242,6 +258,8 @@ private struct KVTunerAffineCacheAggregate {
     let metadataBytes: Int
     let controlBytes: Int
     let materializationWorkspaceBytes: Int
+    let attentionWorkspaceBytes: Int
+    let workspaceBytes: Int
     let attentionOperation: AffineKVAttentionOperation
     let totalPersistentBytes: Int
     let totalBytes: Int
@@ -297,6 +315,11 @@ private struct KVTunerAffineCacheAggregate {
                 snapshot.keyHeadDimension == first.keyHeadDimension,
                 snapshot.valueHeadDimension == first.valueHeadDimension,
                 snapshot.metadataScalarBytes == first.metadataScalarBytes
+                    && snapshot.materializationWorkspaceBytes
+                        == first.materializationWorkspaceBytes
+                    && snapshot.attentionWorkspaceBytes
+                        == first.attentionWorkspaceBytes
+                    && snapshot.workspaceBytes == first.workspaceBytes
                     && snapshot.attentionOperation == first.attentionOperation
             else {
                 throw KVTunerKVCacheTelemetryError.inconsistentGeometry(
@@ -325,8 +348,12 @@ private struct KVTunerAffineCacheAggregate {
         let payloadBytes = try checkedSum(snapshots.map(\.payloadBytes))
         let metadataBytes = try checkedSum(snapshots.map(\.metadataBytes))
         let controlBytes = try checkedSum(snapshots.map(\.controlBytes))
-        let workspaceBytes = snapshots.map(\.materializationWorkspaceBytes)
+        let materializationWorkspaceBytes = snapshots.map(
+            \.materializationWorkspaceBytes)
             .max() ?? 0
+        let attentionWorkspaceBytes = snapshots.map(\.attentionWorkspaceBytes)
+            .max() ?? 0
+        let workspaceBytes = snapshots.map(\.workspaceBytes).max() ?? 0
         let totalPersistentBytes = try checkedSum([
             payloadBytes, metadataBytes, controlBytes,
         ])
@@ -344,7 +371,9 @@ private struct KVTunerAffineCacheAggregate {
             payloadBytes: payloadBytes,
             metadataBytes: metadataBytes,
             controlBytes: controlBytes,
-            materializationWorkspaceBytes: workspaceBytes,
+            materializationWorkspaceBytes: materializationWorkspaceBytes,
+            attentionWorkspaceBytes: attentionWorkspaceBytes,
+            workspaceBytes: workspaceBytes,
             attentionOperation: first.attentionOperation,
             totalPersistentBytes: totalPersistentBytes,
             totalBytes: totalBytes)
@@ -371,13 +400,15 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
     public let metadataBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let attentionWorkspaceBytes: Int
+    public let workspaceBytes: Int
     public let attentionOperation: AffineKVAttentionOperation
     public let totalPersistentBytes: Int
     public let totalBytes: Int
 
     /// Capture must run in the cache owner's inference actor after allocation. Persistent
-    /// bytes sum every layer; workspace is the largest one-layer full-precision K/V pair,
-    /// because transformer layers materialize and consume their caches sequentially.
+    /// bytes sum every layer; workspace is the largest one-layer route-specific workspace,
+    /// because transformer layers materialize/attend and consume their temporaries sequentially.
     public static func capture(
         selection: KVTunerRuntimeSelection,
         caches: [AffineKVCache]
@@ -404,6 +435,9 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
             controlBytes: aggregate.controlBytes,
             materializationWorkspaceBytes:
                 aggregate.materializationWorkspaceBytes,
+            attentionWorkspaceBytes:
+                aggregate.attentionWorkspaceBytes,
+            workspaceBytes: aggregate.workspaceBytes,
             attentionOperation: aggregate.attentionOperation,
             totalPersistentBytes: aggregate.totalPersistentBytes,
             totalBytes: aggregate.totalBytes)
@@ -543,6 +577,7 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
     private var keyOutputDType: DType?
     private var valueOutputDType: DType?
     private var materializationWorkspaceBytes: Int?
+    private var attentionWorkspaceBytes: Int?
     private var attentionOperation: AffineKVAttentionOperation?
 
     /// Host-side mirror used only by uncompiled prefill/control code. Compiled replays update
@@ -584,6 +619,7 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
             materializedValues.nbytes)
         precondition(!overflow, "affine materialization workspace byte count overflow")
         materializationWorkspaceBytes = workspaceBytes
+        attentionWorkspaceBytes = 0
         attentionOperation = .materializedKV
         return (materializedKeys, materializedValues)
     }
@@ -691,13 +727,28 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
         }
         offsetArr._updateInternal(MLXArray([Int32(0)]))
         offset = 0
+        // Workspace is a per-run high-water mark. The operation stays populated so the
+        // identity-preserving cache remains inspectable immediately after reset; the next
+        // uncompiled prefill re-observes the fixed route and rebuilds both byte counters before
+        // any evidence is captured. Zeroing (rather than nil-ing) also preserves legacy
+        // KVTuner lifecycle telemetry while preventing a long prior run from inflating a short
+        // measured run.
+        materializationWorkspaceBytes = 0
+        attentionWorkspaceBytes = 0
     }
 
     public func storageSnapshot() -> AffineKVCacheStorageSnapshot? {
         guard let kPayload, let kScales, let kBiases,
             let vPayload, let vScales, let vBiases,
-            let materializationWorkspaceBytes, let attentionOperation
+            let materializationWorkspaceBytes, let attentionWorkspaceBytes,
+            let attentionOperation
         else { return nil }
+        let (workspaceBytes, workspaceOverflow) =
+            materializationWorkspaceBytes.addingReportingOverflow(
+                attentionWorkspaceBytes)
+        precondition(
+            !workspaceOverflow,
+            "affine total workspace byte count overflow")
         precondition(
             [kScales, kBiases, vScales, vBiases].allSatisfy {
                 $0.itemSize == kScales.itemSize
@@ -714,6 +765,8 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
             metadataBytes: kScales.nbytes + kBiases.nbytes + vScales.nbytes + vBiases.nbytes,
             controlBytes: offsetArr.nbytes,
             materializationWorkspaceBytes: materializationWorkspaceBytes,
+            attentionWorkspaceBytes: attentionWorkspaceBytes,
+            workspaceBytes: workspaceBytes,
             attentionOperation: attentionOperation)
     }
 
@@ -848,6 +901,14 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
             mode: .affine)
         scores = apply(mask: mask, to: scores, groupedQueryRepeats: repeats)
         let weights = softmax(scores, axis: -1, precise: true)
+        let (workspaceBytes, workspaceOverflow) = scores.nbytes
+            .addingReportingOverflow(weights.nbytes)
+        precondition(
+            !workspaceOverflow,
+            "split attention workspace byte count overflow")
+        attentionWorkspaceBytes = max(
+            attentionWorkspaceBytes ?? 0,
+            workspaceBytes)
         var output = quantizedMM(
             weights,
             valueWeights,

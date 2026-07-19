@@ -101,6 +101,8 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(storage.metadataBytes, 128)
         XCTAssertEqual(storage.controlBytes, 4)
         XCTAssertEqual(storage.materializationWorkspaceBytes, 8_192)
+        XCTAssertEqual(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.materializationWorkspaceBytes)
         XCTAssertEqual(storage.dataArrayBytes, 1_664)
         XCTAssertEqual(storage.totalPersistentBytes, 1_668)
         XCTAssertEqual(cache.innerState().count, 7)
@@ -147,7 +149,50 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(
             storage.materializationWorkspaceBytes, 0,
             "the shared router must consume the independent packed K/V buffers directly")
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.attentionWorkspaceBytes)
         XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testSplitAttentionWorkspaceReceiptRetainsPrefillHighWater() throws {
+        let cache = AffineKVCache(
+            capacity: 8,
+            configuration: try configuration(keyBits: 4, valueBits: 4),
+            attentionMode: .splitQuantizedMM)
+        let scale = Float(1 / sqrt(128.0))
+
+        let prefill = attentionWithCacheUpdate(
+            queries: randomKV(
+                batch: 1, heads: 2, tokens: 4, dimension: 128, seed: 80),
+            keys: randomKV(
+                batch: 1, heads: 1, tokens: 4, dimension: 128, seed: 81),
+            values: randomKV(
+                batch: 1, heads: 1, tokens: 4, dimension: 128, seed: 82),
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(n: 4, windowSize: nil, returnArray: true))
+        eval(prefill)
+        let prefillWorkspace = try XCTUnwrap(cache.storageSnapshot())
+            .attentionWorkspaceBytes
+
+        let decode = attentionWithCacheUpdate(
+            queries: randomKV(
+                batch: 1, heads: 2, tokens: 1, dimension: 128, seed: 83),
+            keys: randomKV(
+                batch: 1, heads: 1, tokens: 1, dimension: 128, seed: 84),
+            values: randomKV(
+                batch: 1, heads: 1, tokens: 1, dimension: 128, seed: 85),
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(n: 1, windowSize: nil, returnArray: true))
+        eval(decode)
+
+        let final = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(final.materializationWorkspaceBytes, 0)
+        XCTAssertEqual(
+            final.attentionWorkspaceBytes,
+            prefillWorkspace,
+            "a one-token decode must not erase the larger prefill workspace receipt")
     }
 
     func testSharedAttentionRouterKeepsMaterializationAsTheDefault() throws {
@@ -175,6 +220,8 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.attentionMode, .materialize)
         let storage = try XCTUnwrap(cache.storageSnapshot())
         XCTAssertEqual(storage.materializationWorkspaceBytes, 2_048)
+        XCTAssertEqual(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.materializationWorkspaceBytes)
         XCTAssertEqual(storage.attentionOperation, .materializedKV)
     }
 
@@ -311,6 +358,8 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(output[0, 0, 1, 0].item(Float.self), 26.5, accuracy: 1e-2)
         let storage = try XCTUnwrap(cache.storageSnapshot())
         XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.attentionWorkspaceBytes)
         XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
     }
 
@@ -473,6 +522,10 @@ final class AffineKVCacheTests: XCTestCase {
         // Layers execute sequentially, so the logical materialization workspace is one
         // full K/V pair, not the sum of all three layer-local pairs.
         XCTAssertEqual(telemetry.materializationWorkspaceBytes, 8_192)
+        XCTAssertEqual(telemetry.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(
+            telemetry.workspaceBytes,
+            telemetry.materializationWorkspaceBytes)
         XCTAssertEqual(telemetry.attentionOperation, .materializedKV)
         XCTAssertEqual(telemetry.dataArrayBytes, 4_992)
         XCTAssertEqual(telemetry.totalPersistentBytes, 5_004)
@@ -630,6 +683,8 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.offsetArr.item(Int32.self), 3)
         let storage = try XCTUnwrap(cache.storageSnapshot())
         XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.attentionWorkspaceBytes)
         XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
     }
 }

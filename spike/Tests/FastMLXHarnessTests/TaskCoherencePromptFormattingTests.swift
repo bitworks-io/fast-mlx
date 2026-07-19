@@ -1,3 +1,4 @@
+import Foundation
 import HarnessCore
 import MLXLMCommon
 import XCTest
@@ -105,5 +106,86 @@ final class TaskCoherencePromptFormattingTests: XCTestCase {
             layout.materialEndToken, layout.materialStartToken)
         XCTAssertGreaterThan(
             layout.minimumCompletedTileCount, 0)
+    }
+
+    func testTaskCompressedAttentionBindingUsesPostForwardGenerationAndScoringReceipts() throws {
+        let admission = try compressedAttentionAdmission()
+        let split = EngagementCounters([
+            "affine_attention_split": 1,
+            "affine_attention_materialized": 0,
+        ])
+        let scoringSplit = EngagementCounters([
+            "scoring_attention_split": 1,
+            "scoring_attention_materialized": 0,
+        ])
+
+        let binding = try taskCompressedKVAttentionBinding(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            admission: admission,
+            generated: split,
+            scoring: scoringSplit)
+
+        XCTAssertEqual(binding?.request, .splitAffineQuantizedMM)
+        XCTAssertEqual(binding?.observedOperation, .splitQuantizedMM)
+        XCTAssertEqual(binding?.admission, admission)
+    }
+
+    func testTaskCompressedAttentionBindingRejectsTelemetryOrScoringDisagreement() throws {
+        let admission = try compressedAttentionAdmission()
+        let split = EngagementCounters([
+            "affine_attention_split": 1,
+            "affine_attention_materialized": 0,
+        ])
+        let materialized = EngagementCounters([
+            "affine_attention_split": 0,
+            "affine_attention_materialized": 1,
+        ])
+        let scoringMaterialized = EngagementCounters([
+            "scoring_attention_split": 0,
+            "scoring_attention_materialized": 1,
+        ])
+
+        XCTAssertThrowsError(try taskCompressedKVAttentionBinding(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            admission: admission,
+            generated: materialized,
+            scoring: nil))
+        XCTAssertThrowsError(try taskCompressedKVAttentionBinding(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            admission: admission,
+            generated: split,
+            scoring: scoringMaterialized))
+        XCTAssertThrowsError(try taskCompressedKVAttentionBinding(
+            tier: "affine-k4v2-g64",
+            request: .splitAffineQuantizedMM,
+            admission: nil,
+            generated: split,
+            scoring: nil))
+    }
+
+    func testTaskCompressedAttentionBindingKeepsHistoricalDefaultAbsent() throws {
+        XCTAssertNil(try taskCompressedKVAttentionBinding(
+            tier: "fp16",
+            request: nil,
+            admission: nil,
+            generated: EngagementCounters(),
+            scoring: nil))
+    }
+
+    private func compressedAttentionAdmission() throws
+        -> CompressedKVAttentionRuntimeAdmission
+    {
+        let config = Data(
+            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+        return try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: config,
+                checkpointManifestHash: "0123456789abcdef",
+                checkpointContentSHA256:
+                    String(repeating: "d", count: 64),
+                tokenizerSHA256: String(repeating: "a", count: 64)))
     }
 }

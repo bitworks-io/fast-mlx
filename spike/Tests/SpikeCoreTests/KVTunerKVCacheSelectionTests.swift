@@ -156,6 +156,19 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
         XCTAssertFalse(kind.supportsSpecDecode)
     }
 
+    func testSelectionFactoryThreadsExplicitSplitModeToEveryScheduledLayer() throws {
+        let kind = KVCacheKind.kvtuner(try selection())
+        let caches = try kind.makeCaches(
+            layerCount: 3,
+            capacity: 7,
+            affineAttentionMode: .splitQuantizedMM)
+        let affine = try XCTUnwrap(caches as? [AffineKVCache])
+
+        XCTAssertEqual(
+            affine.map(\.attentionMode),
+            Array(repeating: .splitQuantizedMM, count: 3))
+    }
+
     func testRuntimeFactoryRejectsLayerCountMismatchWithoutFallback() throws {
         let kind = KVCacheKind.kvtuner(try selection())
 
@@ -318,6 +331,10 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
         XCTAssertEqual(
             telemetry.materializationWorkspaceBytes,
             snapshots.map(\.materializationWorkspaceBytes).max())
+        XCTAssertEqual(telemetry.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(
+            telemetry.workspaceBytes,
+            telemetry.materializationWorkspaceBytes)
 
         let predicted = try KVStorageFormat.kvtunerAllocation(
             layerPolicy: selection.layers.map {

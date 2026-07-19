@@ -1,5 +1,4 @@
 import Darwin
-import CryptoKit
 import Foundation
 import HarnessCore
 import IOKit.ps
@@ -310,61 +309,15 @@ func compressedAttentionProbeModelIdentity(
             .unreadableModelFile(tokenizerConfigURL.path)
     }
 
-    let manager = FileManager.default
-    let weightURLs = try manager.contentsOfDirectory(
-        at: directory,
-        includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-        options: [.skipsHiddenFiles])
-        .filter { $0.pathExtension == "safetensors" }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-    guard !weightURLs.isEmpty else {
-        throw CompressedAttentionProbeCLIError
-            .missingCheckpointWeights(modelPath)
-    }
-
-    var checkpointManifest = SHA256()
-    checkpointManifest.update(data: Data(
-        "fastmlx-checkpoint-content-manifest-v2\n".utf8))
-    updateCompressedAttentionProbeManifestField(
-        configData, hasher: &checkpointManifest)
-    let indexURL = directory.appendingPathComponent(
-        "model.safetensors.index.json")
-    if manager.fileExists(atPath: indexURL.path) {
-        guard let indexData = try? Data(contentsOf: indexURL) else {
-            throw CompressedAttentionProbeCLIError
-                .unreadableModelFile(indexURL.path)
-        }
-        updateCompressedAttentionProbeManifestField(
-            indexData, hasher: &checkpointManifest)
-    } else {
-        updateCompressedAttentionProbeManifestField(
-            Data(), hasher: &checkpointManifest)
-    }
-    for logicalURL in weightURLs {
-        let resolvedURL = logicalURL.resolvingSymlinksInPath()
-        let values = try resolvedURL.resourceValues(
-            forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values.isRegularFile == true, let size = values.fileSize,
-            size >= 0
-        else {
-            throw CompressedAttentionProbeCLIError
-                .invalidCheckpointWeight(logicalURL.path)
-        }
-        updateCompressedAttentionProbeManifestField(
-            Data(logicalURL.lastPathComponent.utf8),
-            hasher: &checkpointManifest)
-        try updateCompressedAttentionProbeManifestFile(
-            resolvedURL,
-            expectedSize: size,
-            hasher: &checkpointManifest)
-    }
+    let checkpointManifestSHA256 =
+        try compressedAttentionProbeCheckpointManifestSHA256(
+            modelPath: modelPath,
+            exactConfigData: configData)
 
     return CompressedAttentionProbeModelIdentity(
         modelID: modelID,
         modelConfigSHA256: sha256Hex(configData),
-        checkpointManifestSHA256:
-            compressedAttentionProbeSHA256Hex(
-                checkpointManifest.finalize()),
+        checkpointManifestSHA256: checkpointManifestSHA256,
         tokenizerSHA256: try ProvenanceCLI.tokenizerManifestSHA256(
             at: directory.path),
         tokenizerConfigSHA256: sha256Hex(tokenizerConfigData))
@@ -890,63 +843,28 @@ private func compressedAttentionProbeSwiftCompilerVersion() -> String {
     }
 }
 
-private func updateCompressedAttentionProbeManifestField(
-    _ field: Data,
-    hasher: inout SHA256
-) {
-    var count = UInt64(field.count).bigEndian
-    withUnsafeBytes(of: &count) {
-        hasher.update(data: Data($0))
-    }
-    hasher.update(data: field)
-}
-
-private func updateCompressedAttentionProbeManifestFile(
-    _ url: URL,
-    expectedSize: Int,
-    hasher: inout SHA256
-) throws {
-    var encodedSize = UInt64(expectedSize).bigEndian
-    withUnsafeBytes(of: &encodedSize) {
-        hasher.update(data: Data($0))
-    }
-    let handle: FileHandle
+private func compressedAttentionProbeCheckpointManifestSHA256(
+    modelPath: String,
+    exactConfigData: Data
+) throws -> String {
     do {
-        handle = try FileHandle(forReadingFrom: url)
-    } catch {
-        throw CompressedAttentionProbeCLIError
-            .unreadableModelFile(url.path)
-    }
-    defer { try? handle.close() }
-
-    var bytesRead = 0
-    do {
-        while let chunk = try handle.read(upToCount: 8 << 20),
-            !chunk.isEmpty
-        {
-            let (nextCount, overflow) = bytesRead.addingReportingOverflow(
-                chunk.count)
-            guard !overflow, nextCount <= expectedSize else {
-                throw CompressedAttentionProbeCLIError
-                    .invalidCheckpointWeight(url.path)
-            }
-            bytesRead = nextCount
-            hasher.update(data: chunk)
+        return try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+            at: modelPath,
+            exactConfigData: exactConfigData)
+    } catch let error as ProvenanceCLI.EvidenceIdentityError {
+        switch error {
+        case .missingCheckpointWeights(let path):
+            throw CompressedAttentionProbeCLIError
+                .missingCheckpointWeights(path)
+        case .invalidCheckpointWeight(let path):
+            throw CompressedAttentionProbeCLIError
+                .invalidCheckpointWeight(path)
+        case .unreadableCheckpointManifestFile(let path),
+             .unreadableModelConfig(let path):
+            throw CompressedAttentionProbeCLIError.unreadableModelFile(path)
+        case .missingTokenizerFiles(_),
+             .invalidTokenizerFile(_):
+            throw error
         }
-    } catch let error as CompressedAttentionProbeCLIError {
-        throw error
-    } catch {
-        throw CompressedAttentionProbeCLIError
-            .unreadableModelFile(url.path)
     }
-    guard bytesRead == expectedSize else {
-        throw CompressedAttentionProbeCLIError
-            .invalidCheckpointWeight(url.path)
-    }
-}
-
-private func compressedAttentionProbeSHA256Hex(
-    _ digest: SHA256.Digest
-) -> String {
-    digest.map { String(format: "%02x", $0) }.joined()
 }
