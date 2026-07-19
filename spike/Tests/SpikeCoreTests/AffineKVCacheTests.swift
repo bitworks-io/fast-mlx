@@ -1,4 +1,5 @@
 import MLX
+import MLXLMCommon
 import MLXRandom
 import XCTest
 
@@ -105,6 +106,214 @@ final class AffineKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.innerState().count, 7)
     }
 
+    func testSharedAttentionRouterUsesPackedIndependentKVWithoutMaterialization() throws {
+        let configuration = try AffineKVCacheConfiguration(
+            keyBits: 4, valueBits: 2,
+            keyGroupSize: 64, valueGroupSize: 128)
+        let cache = AffineKVCache(
+            capacity: 6,
+            configuration: configuration,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = AffineKVCache(capacity: 6, configuration: configuration)
+        let queries = randomKV(
+            batch: 1, heads: 4, tokens: 2, dimension: 128, seed: 5)
+        let keys = randomKV(
+            batch: 1, heads: 2, tokens: 2, dimension: 128, seed: 6)
+        let values = randomKV(
+            batch: 1, heads: 2, tokens: 2, dimension: 128, seed: 7)
+        let mask = cache.makeMask(n: 2, windowSize: nil, returnArray: true)
+        let scale = Float(1 / sqrt(128.0))
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask)
+        let (oracleKeys, oracleValues) = oracleCache.update(
+            keys: keys, values: values)
+        let oracle = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: oracleKeys,
+            values: oracleValues,
+            scale: scale,
+            mask: mask)
+        eval(output, oracle)
+
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+        XCTAssertTrue(output.allClose(oracle, rtol: 5e-2, atol: 5e-2).item(Bool.self))
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(
+            storage.materializationWorkspaceBytes, 0,
+            "the shared router must consume the independent packed K/V buffers directly")
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testSharedAttentionRouterKeepsMaterializationAsTheDefault() throws {
+        let configuration = try AffineKVCacheConfiguration(
+            keyBits: 4, valueBits: 2,
+            keyGroupSize: 64, valueGroupSize: 128)
+        let cache = AffineKVCache(capacity: 4, configuration: configuration)
+        let queries = randomKV(
+            batch: 1, heads: 2, tokens: 1, dimension: 128, seed: 8)
+        let keys = randomKV(
+            batch: 1, heads: 1, tokens: 1, dimension: 128, seed: 9)
+        let values = randomKV(
+            batch: 1, heads: 1, tokens: 1, dimension: 128, seed: 10)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: Float(1 / sqrt(128.0)),
+            mask: cache.makeMask(n: 1, windowSize: nil, returnArray: true))
+        eval(output)
+
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+        XCTAssertEqual(cache.attentionMode, .materialize)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 2_048)
+        XCTAssertEqual(storage.attentionOperation, .materializedKV)
+    }
+
+    func testSplitAttentionNoneMaskStillExcludesUnwrittenCapacity() throws {
+        let cache = AffineKVCache(
+            capacity: 4,
+            configuration: try configuration(keyBits: 4, valueBits: 4),
+            attentionMode: .splitQuantizedMM)
+        let queries = MLXArray.zeros([1, 1, 1, 128], dtype: .float16)
+        let keys = MLXArray.zeros([1, 1, 1, 128], dtype: .float16)
+        let values = MLXArray.ones([1, 1, 1, 128], dtype: .float16)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: 1,
+            mask: .none)
+        eval(output)
+
+        XCTAssertEqual(output[0, 0, 0, 0].item(Float.self), 1, accuracy: 1e-3)
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+    }
+
+    func testSplitAttentionAppliesAdditiveMaskAndUnwrittenMaskTogether() throws {
+        let cache = AffineKVCache(
+            capacity: 4,
+            configuration: try configuration(keyBits: 4, valueBits: 4),
+            attentionMode: .splitQuantizedMM)
+        let queries = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let keys = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let values = stacked([
+            MLXArray.ones([1, 1, 128], dtype: .float16),
+            MLXArray.full(
+                [1, 1, 128], values: MLXArray(Float16(100))),
+        ], axis: 2)
+        let additiveMask = MLXArray([
+            Float(0), -Float.infinity, 0, 0,
+            Float(0), -Float.infinity, 0, 0,
+        ]).reshaped([1, 1, 2, 4])
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: 1,
+            mask: .array(additiveMask))
+        eval(output)
+
+        XCTAssertEqual(output[0, 0, 0, 0].item(Float.self), 1, accuracy: 1e-3)
+        XCTAssertEqual(output[0, 0, 1, 0].item(Float.self), 1, accuracy: 1e-3)
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+    }
+
+    func testSplitAttentionAcceptsRankFiveGroupedQueryMask() throws {
+        let cache = AffineKVCache(
+            capacity: 4,
+            configuration: try configuration(keyBits: 4, valueBits: 4),
+            attentionMode: .splitQuantizedMM)
+        let queries = MLXArray.zeros([1, 2, 1, 128], dtype: .float16)
+        let keys = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let values = stacked([
+            MLXArray.ones([1, 1, 128], dtype: .float16),
+            MLXArray.full(
+                [1, 1, 128], values: MLXArray(Float16(3))),
+        ], axis: 2)
+        let groupedMask = MLXArray([
+            Float(0), -Float.infinity, 0, 0,
+            -Float.infinity, 0, 0, 0,
+        ]).reshaped([1, 1, 2, 1, 4])
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: 1,
+            mask: .array(groupedMask))
+        eval(output)
+
+        XCTAssertEqual(output[0, 0, 0, 0].item(Float.self), 1, accuracy: 1e-3)
+        XCTAssertEqual(output[0, 1, 0, 0].item(Float.self), 3, accuracy: 1e-3)
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+    }
+
+    func testSplitAttentionCausalMaskUsesLowerRightCachedPrefix() throws {
+        let configuration = try configuration(
+            keyBits: 4, valueBits: 4,
+            keyGroupSize: 128, valueGroupSize: 128)
+        let cache = AffineKVCache(
+            capacity: 4,
+            configuration: configuration,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = AffineKVCache(capacity: 4, configuration: configuration)
+        let prefixKeys = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let prefixValues = stacked([
+            MLXArray.ones([1, 1, 128], dtype: .float16),
+            MLXArray.full(
+                [1, 1, 128], values: MLXArray(Float16(2))),
+        ], axis: 2)
+        _ = cache.update(keys: prefixKeys, values: prefixValues)
+        _ = oracleCache.update(keys: prefixKeys, values: prefixValues)
+
+        let queries = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let keys = MLXArray.zeros([1, 1, 2, 128], dtype: .float16)
+        let values = stacked([
+            MLXArray.full(
+                [1, 1, 128], values: MLXArray(Float16(3))),
+            MLXArray.full(
+                [1, 1, 128], values: MLXArray(Float16(100))),
+        ], axis: 2)
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: 1,
+            mask: .causal)
+        let (oracleKeys, oracleValues) = oracleCache.update(
+            keys: keys, values: values)
+        let oracle = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: oracleKeys,
+            values: oracleValues,
+            scale: 1,
+            mask: .causal)
+        eval(output, oracle)
+
+        XCTAssertTrue(output.allClose(oracle, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+        XCTAssertEqual(output[0, 0, 0, 0].item(Float.self), 2, accuracy: 1e-2)
+        XCTAssertEqual(output[0, 0, 1, 0].item(Float.self), 26.5, accuracy: 1e-2)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
     func testConfigurationRejectsUnsupportedBitsAndGroupsWithoutFallback() {
         XCTAssertThrowsError(try configuration(keyBits: 3)) {
             XCTAssertEqual(
@@ -147,6 +356,9 @@ final class AffineKVCacheTests: XCTestCase {
             XCTAssertEqual(cache.configuration.valueBits, tier.valueBits)
             XCTAssertEqual(cache.configuration.keyGroupSize, tier.groupSize)
             XCTAssertEqual(cache.configuration.valueGroupSize, tier.groupSize)
+            XCTAssertEqual(
+                cache.attentionMode, .materialize,
+                "product cache factories must not opt unqualified models into packed attention")
         }
 
         XCTAssertNil(KVCacheKind(kvQuant: "affine-k4v2-g96"))
@@ -261,6 +473,7 @@ final class AffineKVCacheTests: XCTestCase {
         // Layers execute sequentially, so the logical materialization workspace is one
         // full K/V pair, not the sum of all three layer-local pairs.
         XCTAssertEqual(telemetry.materializationWorkspaceBytes, 8_192)
+        XCTAssertEqual(telemetry.attentionOperation, .materializedKV)
         XCTAssertEqual(telemetry.dataArrayBytes, 4_992)
         XCTAssertEqual(telemetry.totalPersistentBytes, 5_004)
     }
@@ -349,5 +562,74 @@ final class AffineKVCacheTests: XCTestCase {
                 .abs().max().item(Float.self),
             1e-3,
             "compiled replay must not overwrite the first decode row")
+    }
+
+    func testCompiledSplitAttentionReplayAdvancesOffsetWithoutMaterialization() throws {
+        let configuration = try configuration(
+            keyBits: 4, valueBits: 4,
+            keyGroupSize: 128, valueGroupSize: 128)
+        let cache = AffineKVCache(
+            capacity: 6,
+            configuration: configuration,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = AffineKVCache(capacity: 6, configuration: configuration)
+        let scale = Float(1 / sqrt(128.0))
+
+        func inputs(seed: UInt64) -> [MLXArray] {
+            [
+                randomKV(batch: 1, heads: 2, tokens: 1, dimension: 128, seed: seed),
+                randomKV(batch: 1, heads: 1, tokens: 1, dimension: 128, seed: seed + 1),
+                randomKV(batch: 1, heads: 1, tokens: 1, dimension: 128, seed: seed + 2),
+            ]
+        }
+
+        let prefill = inputs(seed: 50)
+        let prefillMask = cache.makeMask(n: 1, windowSize: nil, returnArray: true)
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: prefill[0], keys: prefill[1], values: prefill[2],
+            cache: cache, scale: scale, mask: prefillMask)
+        let oraclePrefillMask = oracleCache.makeMask(
+            n: 1, windowSize: nil, returnArray: true)
+        let (oraclePrefillKeys, oraclePrefillValues) = oracleCache.update(
+            keys: prefill[1], values: prefill[2])
+        let oraclePrefill = MLXFast.scaledDotProductAttention(
+            queries: prefill[0], keys: oraclePrefillKeys,
+            values: oraclePrefillValues, scale: scale,
+            mask: oraclePrefillMask)
+        eval(prefillOutput, oraclePrefill)
+        XCTAssertTrue(
+            prefillOutput.allClose(oraclePrefill, rtol: 5e-2, atol: 5e-2)
+                .item(Bool.self))
+
+        let step = compile(inputs: [cache], outputs: [cache]) { arguments in
+            let mask = cache.makeMask(n: 1, windowSize: nil, returnArray: true)
+            return [attentionWithCacheUpdate(
+                queries: arguments[0],
+                keys: arguments[1],
+                values: arguments[2],
+                cache: cache,
+                scale: scale,
+                mask: mask)]
+        }
+        for seed in [UInt64(60), UInt64(70)] {
+            let next = inputs(seed: seed)
+            let output = step(next)[0]
+            let oracleMask = oracleCache.makeMask(
+                n: 1, windowSize: nil, returnArray: true)
+            let (oracleKeys, oracleValues) = oracleCache.update(
+                keys: next[1], values: next[2])
+            let oracle = MLXFast.scaledDotProductAttention(
+                queries: next[0], keys: oracleKeys, values: oracleValues,
+                scale: scale, mask: oracleMask)
+            eval(output, oracle)
+            XCTAssertTrue(isFinite(output).all().item(Bool.self))
+            XCTAssertTrue(
+                output.allClose(oracle, rtol: 5e-2, atol: 5e-2).item(Bool.self))
+        }
+
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 3)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
     }
 }

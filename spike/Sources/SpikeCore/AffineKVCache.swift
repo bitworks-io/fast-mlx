@@ -8,6 +8,25 @@ public enum AffineKVCacheConfigurationError: Error, Equatable, Sendable {
     case unsupportedGroupSize(Int)
 }
 
+/// How a shared attention helper is allowed to consume an affine cache.
+///
+/// The default remains the previously qualified materialize-then-attend behavior. The packed
+/// route is an explicit experimental opt-in so adding the shared router cannot silently activate
+/// it for an unqualified model architecture.
+public enum AffineKVAttentionMode: String, Codable, Equatable, Sendable {
+    case materialize
+    case splitQuantizedMM = "split-quantized-mm"
+}
+
+/// The cache read path most recently built into an MLX graph.
+///
+/// This is intentionally distinct from the requested mode: a requested packed route is not
+/// evidence of engagement until an attention forward actually calls it.
+public enum AffineKVAttentionOperation: String, Codable, Equatable, Sendable {
+    case materializedKV = "materialized-kv"
+    case splitQuantizedMM = "split-quantized-mm"
+}
+
 /// Native MLX affine-packing controls for one KV cache.
 ///
 /// K and V are deliberately independent: asymmetric cells such as K4V2 are first-class
@@ -108,6 +127,8 @@ public struct AffineKVCacheStorageSnapshot: Equatable, Sendable {
     /// recent update. Transformer layers consume these sequentially, so this is one layer's
     /// pair rather than the sum across every persistent layer cache.
     public let materializationWorkspaceBytes: Int
+    /// Actual cache read operation observed while building the most recent attention graph.
+    public let attentionOperation: AffineKVAttentionOperation
 
     public var dataArrayBytes: Int { payloadBytes + metadataBytes }
     public var totalPersistentBytes: Int { dataArrayBytes + controlBytes }
@@ -128,6 +149,7 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
     public let metadataBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let attentionOperation: AffineKVAttentionOperation
 
     public var dataArrayBytes: Int { payloadBytes + metadataBytes }
     public var totalPersistentBytes: Int { dataArrayBytes + controlBytes }
@@ -161,6 +183,7 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
                     && $0.metadataScalarBytes == first.metadataScalarBytes
                     && $0.materializationWorkspaceBytes
                         == first.materializationWorkspaceBytes
+                    && $0.attentionOperation == first.attentionOperation
             },
             "affine layer-cache geometry is inconsistent")
 
@@ -190,7 +213,8 @@ public struct AffineKVCacheTelemetry: Equatable, Sendable {
             payloadBytes: sum(snapshots.map(\.payloadBytes)),
             metadataBytes: sum(snapshots.map(\.metadataBytes)),
             controlBytes: sum(snapshots.map(\.controlBytes)),
-            materializationWorkspaceBytes: first.materializationWorkspaceBytes)
+            materializationWorkspaceBytes: first.materializationWorkspaceBytes,
+            attentionOperation: first.attentionOperation)
     }
 }
 
@@ -218,6 +242,7 @@ private struct KVTunerAffineCacheAggregate {
     let metadataBytes: Int
     let controlBytes: Int
     let materializationWorkspaceBytes: Int
+    let attentionOperation: AffineKVAttentionOperation
     let totalPersistentBytes: Int
     let totalBytes: Int
 
@@ -272,6 +297,7 @@ private struct KVTunerAffineCacheAggregate {
                 snapshot.keyHeadDimension == first.keyHeadDimension,
                 snapshot.valueHeadDimension == first.valueHeadDimension,
                 snapshot.metadataScalarBytes == first.metadataScalarBytes
+                    && snapshot.attentionOperation == first.attentionOperation
             else {
                 throw KVTunerKVCacheTelemetryError.inconsistentGeometry(
                     layer: position)
@@ -319,6 +345,7 @@ private struct KVTunerAffineCacheAggregate {
             metadataBytes: metadataBytes,
             controlBytes: controlBytes,
             materializationWorkspaceBytes: workspaceBytes,
+            attentionOperation: first.attentionOperation,
             totalPersistentBytes: totalPersistentBytes,
             totalBytes: totalBytes)
     }
@@ -344,6 +371,7 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
     public let metadataBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let attentionOperation: AffineKVAttentionOperation
     public let totalPersistentBytes: Int
     public let totalBytes: Int
 
@@ -376,6 +404,7 @@ public struct KVTunerKVCacheTelemetry: Equatable, Sendable {
             controlBytes: aggregate.controlBytes,
             materializationWorkspaceBytes:
                 aggregate.materializationWorkspaceBytes,
+            attentionOperation: aggregate.attentionOperation,
             totalPersistentBytes: aggregate.totalPersistentBytes,
             totalBytes: aggregate.totalBytes)
     }
@@ -411,6 +440,7 @@ public struct KVTunerCandidateKVCacheTelemetry: Equatable, Sendable {
     public let metadataBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let attentionOperation: AffineKVAttentionOperation
     public let totalPersistentBytes: Int
     public let totalBytes: Int
 
@@ -476,6 +506,7 @@ public struct KVTunerCandidateKVCacheTelemetry: Equatable, Sendable {
             controlBytes: aggregate.controlBytes,
             materializationWorkspaceBytes:
                 aggregate.materializationWorkspaceBytes,
+            attentionOperation: aggregate.attentionOperation,
             totalPersistentBytes: aggregate.totalPersistentBytes,
             totalBytes: aggregate.totalBytes)
     }
@@ -484,16 +515,17 @@ public struct KVTunerCandidateKVCacheTelemetry: Equatable, Sendable {
 /// Fixed-capacity, compile-capturable KV cache backed by MLX's native affine packing.
 ///
 /// Incoming K and V rows are independently packed and scattered into fixed-shape buffers.
-/// Reads dequantize the full buffers before the existing fused attention path, preserving
-/// the same mask, RoPE, growth, truncation, and in-place reset contract as
-/// `CompiledKVCache`. This is a correctness-first storage path; compressed-domain attention
-/// remains a separate optimization.
+/// The default read dequantizes the full buffers before the existing fused attention path.
+/// Qualified callers can explicitly opt into independent packed K/V matrix multiplies. Both
+/// routes preserve the same mask, RoPE, growth, truncation, and in-place reset contract as
+/// `CompiledKVCache`.
 ///
 /// This class intentionally does not conform to `Sendable`: every instance is confined to
 /// the inference actor because its MLX state is non-Sendable.
-public final class AffineKVCache: KVCache, Updatable {
+public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
     public private(set) var capacity: Int
     public let configuration: AffineKVCacheConfiguration
+    public let attentionMode: AffineKVAttentionMode
 
     // Lazily allocated from the first model K/V tensors so batch, head count, head dimension,
     // and metadata dtype match the active model. Internal visibility supports on-box layout
@@ -511,15 +543,21 @@ public final class AffineKVCache: KVCache, Updatable {
     private var keyOutputDType: DType?
     private var valueOutputDType: DType?
     private var materializationWorkspaceBytes: Int?
+    private var attentionOperation: AffineKVAttentionOperation?
 
     /// Host-side mirror used only by uncompiled prefill/control code. Compiled replays update
     /// `offsetArr` in graph, matching `CompiledKVCache`'s documented contract.
     public private(set) var offset: Int = 0
 
-    public init(capacity: Int, configuration: AffineKVCacheConfiguration) {
+    public init(
+        capacity: Int,
+        configuration: AffineKVCacheConfiguration,
+        attentionMode: AffineKVAttentionMode = .materialize
+    ) {
         precondition(capacity > 0, "capacity must be positive")
         self.capacity = capacity
         self.configuration = configuration
+        self.attentionMode = attentionMode
     }
 
     public var maxSize: Int? { nil }
@@ -532,6 +570,53 @@ public final class AffineKVCache: KVCache, Updatable {
     public var ropeOffset: RoPEOffset { .batch(offsetArr) }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        store(keys: keys, values: values)
+
+        let materializedKeys = materialize(
+            payload: kPayload!, scales: kScales!, biases: kBiases!,
+            dimension: keyDimension!, bits: configuration.keyBits,
+            groupSize: configuration.keyGroupSize, dtype: keyOutputDType!)
+        let materializedValues = materialize(
+            payload: vPayload!, scales: vScales!, biases: vBiases!,
+            dimension: valueDimension!, bits: configuration.valueBits,
+            groupSize: configuration.valueGroupSize, dtype: valueOutputDType!)
+        let (workspaceBytes, overflow) = materializedKeys.nbytes.addingReportingOverflow(
+            materializedValues.nbytes)
+        precondition(!overflow, "affine materialization workspace byte count overflow")
+        materializationWorkspaceBytes = workspaceBytes
+        attentionOperation = .materializedKV
+        return (materializedKeys, materializedValues)
+    }
+
+    /// Update the fixed-shape packed cache and attend through two independently configured
+    /// quantized matrix multiplies. No dense K/V tensor is reconstructed. This is not fused SDPA:
+    /// the score/weight tensor remains an explicit temporary, especially for prefill.
+    public func updateAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        precondition(scale.isFinite && scale > 0, "attention scale must be finite and positive")
+        switch attentionMode {
+        case .materialize:
+            let (cachedKeys, cachedValues) = update(keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask)
+        case .splitQuantizedMM:
+            store(keys: keys, values: values)
+            materializationWorkspaceBytes = 0
+            attentionOperation = .splitQuantizedMM
+            return packedAttention(queries: queries, scale: scale, mask: mask)
+        }
+    }
+
+    private func store(keys: MLXArray, values: MLXArray) {
         validateInput(keys: keys, values: values)
         let tokenCount = keys.dim(2)
         let keyCode = encode(
@@ -557,20 +642,6 @@ public final class AffineKVCache: KVCache, Updatable {
         vBiases = putAlong(vBiases!, indices, values: valueCode.biases, axis: 2)
         offsetArr = offsetArr + MLXArray([Int32(tokenCount)])
         offset += tokenCount
-
-        let materializedKeys = materialize(
-            payload: kPayload!, scales: kScales!, biases: kBiases!,
-            dimension: keyDimension!, bits: configuration.keyBits,
-            groupSize: configuration.keyGroupSize, dtype: keyOutputDType!)
-        let materializedValues = materialize(
-            payload: vPayload!, scales: vScales!, biases: vBiases!,
-            dimension: valueDimension!, bits: configuration.valueBits,
-            groupSize: configuration.valueGroupSize, dtype: valueOutputDType!)
-        let (workspaceBytes, overflow) = materializedKeys.nbytes.addingReportingOverflow(
-            materializedValues.nbytes)
-        precondition(!overflow, "affine materialization workspace byte count overflow")
-        materializationWorkspaceBytes = workspaceBytes
-        return (materializedKeys, materializedValues)
     }
 
     public func makeMask(
@@ -625,7 +696,7 @@ public final class AffineKVCache: KVCache, Updatable {
     public func storageSnapshot() -> AffineKVCacheStorageSnapshot? {
         guard let kPayload, let kScales, let kBiases,
             let vPayload, let vScales, let vBiases,
-            let materializationWorkspaceBytes
+            let materializationWorkspaceBytes, let attentionOperation
         else { return nil }
         precondition(
             [kScales, kBiases, vScales, vBiases].allSatisfy {
@@ -642,7 +713,8 @@ public final class AffineKVCache: KVCache, Updatable {
             payloadBytes: kPayload.nbytes + vPayload.nbytes,
             metadataBytes: kScales.nbytes + kBiases.nbytes + vScales.nbytes + vBiases.nbytes,
             controlBytes: offsetArr.nbytes,
-            materializationWorkspaceBytes: materializationWorkspaceBytes)
+            materializationWorkspaceBytes: materializationWorkspaceBytes,
+            attentionOperation: attentionOperation)
     }
 
     private struct StoredCode {
@@ -724,6 +796,141 @@ public final class AffineKVCache: KVCache, Updatable {
             biases: biases.reshaped([-1, metadataWidth]),
             groupSize: groupSize, bits: bits, mode: .affine, dtype: dtype
         ).reshaped([batch, heads, tokens, dimension])
+    }
+
+    private func packedAttention(
+        queries: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        precondition(queries.ndim == 4, "queries must be rank 4")
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let queryTokens = queries.dim(2)
+        let dimension = queries.dim(3)
+        let kvHeads = kPayload!.dim(1)
+        precondition(
+            batch == kPayload!.dim(0) && kvHeads > 0
+                && queryHeads.isMultiple(of: kvHeads),
+            "query and packed-cache batch/head geometry is incompatible")
+        precondition(
+            dimension == keyDimension,
+            "query dimension does not match packed key dimension")
+
+        let repeats = queryHeads / kvHeads
+        var scaledQueries = queries * MLXArray(scale).asType(queries.dtype)
+        var keyWeights = kPayload!
+        var keyScales = kScales!
+        var keyBiases: MLXArray? = kBiases!
+        var valueWeights = vPayload!
+        var valueScales = vScales!
+        var valueBiases: MLXArray? = vBiases!
+        if repeats > 1 {
+            scaledQueries = scaledQueries.reshaped([
+                batch, kvHeads, repeats, queryTokens, dimension,
+            ])
+            keyWeights = keyWeights.expandedDimensions(axis: -3)
+            keyScales = keyScales.expandedDimensions(axis: -3)
+            keyBiases = keyBiases?.expandedDimensions(axis: -3)
+            valueWeights = valueWeights.expandedDimensions(axis: -3)
+            valueScales = valueScales.expandedDimensions(axis: -3)
+            valueBiases = valueBiases?.expandedDimensions(axis: -3)
+        }
+
+        var scores = quantizedMM(
+            scaledQueries,
+            keyWeights,
+            scales: keyScales,
+            biases: keyBiases,
+            transpose: true,
+            groupSize: configuration.keyGroupSize,
+            bits: configuration.keyBits,
+            mode: .affine)
+        scores = apply(mask: mask, to: scores, groupedQueryRepeats: repeats)
+        let weights = softmax(scores, axis: -1, precise: true)
+        var output = quantizedMM(
+            weights,
+            valueWeights,
+            scales: valueScales,
+            biases: valueBiases,
+            transpose: false,
+            groupSize: configuration.valueGroupSize,
+            bits: configuration.valueBits,
+            mode: .affine)
+        if repeats > 1 {
+            output = output.reshaped([
+                batch, queryHeads, queryTokens, valueDimension!,
+            ])
+        }
+        return output
+    }
+
+    private func apply(
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        to scores: MLXArray,
+        groupedQueryRepeats: Int
+    ) -> MLXArray {
+        switch mask {
+        case .none:
+            return maskUnwrittenCacheRows(in: scores)
+        case .causal:
+            let queryTokens = scores.dim(-2)
+            let keyTokens = scores.dim(-1)
+            let queryPositions = MLXArray(0 ..< queryTokens)
+                + offsetArr - MLXArray([Int32(queryTokens)])
+            let keyPositions = MLXArray(0 ..< keyTokens)
+            let causallyAllowed = greaterEqual(
+                queryPositions.expandedDimensions(axis: -1),
+                keyPositions.expandedDimensions(axis: -2))
+            let written = keyPositions .< offsetArr
+            return MLX.where(
+                causallyAllowed & written,
+                scores,
+                MLXArray(-Float.infinity).asType(scores.dtype))
+        case .array(let array):
+            return maskUnwrittenCacheRows(in: apply(
+                array: array,
+                to: scores,
+                groupedQueryRepeats: groupedQueryRepeats))
+        case .arrays(let arrays):
+            precondition(arrays.count <= 1, "only one attention mask array is supported")
+            guard let array = arrays.first else {
+                return maskUnwrittenCacheRows(in: scores)
+            }
+            return maskUnwrittenCacheRows(in: apply(
+                array: array,
+                to: scores,
+                groupedQueryRepeats: groupedQueryRepeats))
+        }
+    }
+
+    private func maskUnwrittenCacheRows(in scores: MLXArray) -> MLXArray {
+        let keyPositions = MLXArray(0 ..< scores.dim(-1))
+        let written = keyPositions .< offsetArr
+        return MLX.where(
+            written,
+            scores,
+            MLXArray(-Float.infinity).asType(scores.dtype))
+    }
+
+    private func apply(
+        array: MLXArray,
+        to scores: MLXArray,
+        groupedQueryRepeats: Int
+    ) -> MLXArray {
+        var array = array
+        if groupedQueryRepeats > 1 && array.ndim == 4 {
+            array = array.expandedDimensions(axis: 2)
+        }
+        let validRanks = groupedQueryRepeats > 1 ? [2, 5] : [2, 4]
+        precondition(validRanks.contains(array.ndim), "unsupported attention-mask rank")
+        if array.dtype == .bool {
+            return MLX.where(
+                array,
+                scores,
+                MLXArray(-Float.infinity).asType(scores.dtype))
+        }
+        return scores + array.asType(scores.dtype)
     }
 
     // MARK: - KVCache protocol surface unused by fast-mlx's decode path
