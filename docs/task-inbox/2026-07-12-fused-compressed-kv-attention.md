@@ -1,11 +1,11 @@
 ---
-status: planning-ready
+status: active
 type: metal-kernel-spike
 priority: high
 created: 2026-07-12
 source: carry-forward-plus-sol-audit
 planning_ready: true
-implementation_ready: false
+implementation_ready: true
 ---
 
 # Fused compressed-domain KV attention
@@ -60,5 +60,9 @@ end-to-end negative. Structural cache corruption is a correctness bug, never qua
 
 ## Next Step
 
-Profile fp16, affine materialize-then-attend, and current MLX quantized primitives at
-8K/32K/128K; write a kernel contract only if attention traffic is the measured bottleneck.
+Continue Phase 0 of the dated
+[`2026-07-18-fused-compressed-kv-attention.md`](../superpowers/plans/2026-07-18-fused-compressed-kv-attention.md)
+plan. The authenticated plan/evidence contract and deterministic MLX fixture are complete; add the
+fresh-output probe CLI/evidence producer, then profile fp16, affine materialize-then-attend, and the
+pinned Swift-LM quantized-attention helper at 8K/32K/128K.
+Write a portable runtime/kernel contract only after measured evidence identifies the bottleneck.
