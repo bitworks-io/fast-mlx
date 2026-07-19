@@ -319,6 +319,37 @@ search, schedule, runtime, task, and KL evidence.
 - [ ] Authenticate search and schedule, then freeze a new qualification bundle before any KVTuner
   runtime, task, KL, or end-to-end row.
 
+#### Candidate-run recovery — 2026-07-19
+
+The original clean-`5e6abb6` candidate process published and independently authenticated ordinals
+0...4, then macOS killed the harness while ordinal 5 was in flight. The kernel recorded
+`no paging space` and selected `fastmlx-harness` as the largest compressed process at 153,803 MB.
+This is an infrastructure/lifetime failure, not a candidate-quality or model verdict. The hash-bound
+failure record has SHA-256
+`48ce0f5f76748e08711dc571084f2eec1aaf2f6884a038ab42f7bcbb4f1fe655`; the captured kernel excerpt
+has SHA-256 `0d12fa549850e3ab2d30df8426a4d088ef8e7e80cfcc009e9af848f83e888abe`.
+
+The lifetime audit found that the exhaustive runner loads one MLX model/driver for the complete
+pending set. It creates a new compiled decoder per candidate and resets that decoder per prompt,
+but neither reset clears MLX's process-level allocations. The same process therefore accumulated
+compressed memory across candidates despite prompt/cache resets.
+
+Recovery uses the existing exact-byte/idempotent single-ordinal path with one fresh harness process
+per remaining ordinal. It preserves the same clean source SHA, Release binary SHA
+`20aff66121fa7d7d82e3fa664f0ae3e9be514e337201114ca5775c8c79f862cd`, manifest SHA above, and
+sensitivity SHA above; it does not rebuild, resync, or mix execution environments mid-cohort. The
+held-lock wrapper has SHA-256
+`427b7c3a0378ec6e878348be5fde15956f7891037b9ffeaaf2981c3bfc134765`. A first launcher attempt
+failed closed before starting a harness because the crashed wrapper had removed the empty lock
+artifact; that attempt is preserved at SHA-256
+`81deb8fe369e4d575cf4b9663cc072a946c3a3bf02c7505e6ba42ddf51703efc`. Attempt 2 recreated the lock
+artifact, acquired it, and started ordinal 5. Promotion remains blocked until all 64 candidates and
+the final exact-set/search/bundle validation pass.
+
+A permanent runner fix must be TDD'd after this source-locked cohort completes. It should make the
+process-lifetime boundary explicit rather than treating decoder reset as proof that process memory
+cannot accumulate.
+
 The historical KVarN-cycle bundle remains immutable evidence for its dated verdict. It is not
 rewritten or silently upgraded and cannot authorize the new runtime path.
 
@@ -336,7 +367,12 @@ rewritten or silently upgraded and cannot authorize the new runtime path.
 - [ ] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
   Llama.
 - [ ] Add a third popular, materially different attention geometry before broad/default product
-  support claims.
+  support claims. The current first candidate is
+  [`mlx-community/Phi-4-mini-instruct-4bit`](https://huggingface.co/mlx-community/Phi-4-mini-instruct-4bit/tree/ac1c269cb4222a4e136a3d09edad301056c1f36a)
+  at revision `ac1c269cb4222a4e136a3d09edad301056c1f36a`, using its `phi3` registry identity
+  (Q24/KV8/D128, partial RoPE); prove registry/load/runtime support before accepting it. Gemma 3
+  remains the next rotating local/global-cache semantic boundary, not a substitute for that load
+  proof.
 - [ ] Quantify Transparent/Balanced/Max-fit speed/capacity/loss, write verdict/content, verify,
   review, scan, commit, and merge only if every claimed gate has fresh proof.
 

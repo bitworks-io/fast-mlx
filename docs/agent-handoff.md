@@ -90,9 +90,18 @@ notable spike, including negative results.
    by artifact ID `fused-compressed-kv-qwen3-32b-v1-5e6abb6`; its schema-v2 manifest SHA-256 is
    `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f`; its schema-v3 g128
    sensitivity SHA-256 is `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc`.
-   The canonical 64-candidate, target-pair-bits-390 run is the current long-running stage. Neither
-   the Phase 0 synthetic timings nor the implementation tests are model, prefill, end-to-end,
-   family-generalization, or dial results.
+   The original same-process candidate runner published and authenticated ordinals 0...4 before
+   macOS killed it for `no paging space` at 153,803 MB compressed memory. Failure artifact SHA-256:
+   `48ce0f5f76748e08711dc571084f2eec1aaf2f6884a038ab42f7bcbb4f1fe655`; kernel excerpt SHA-256:
+   `0d12fa549850e3ab2d30df8426a4d088ef8e7e80cfcc009e9af848f83e888abe`. This is an infrastructure
+   lifetime failure, not a quality verdict. The exact source-locked recovery runs each remaining
+   ordinal in a fresh process under held lock, reusing the same Release binary, manifest,
+   sensitivity, model, and exact-byte/idempotent artifact validation. Wrapper SHA-256:
+   `427b7c3a0378ec6e878348be5fde15956f7891037b9ffeaaf2981c3bfc134765`. Attempt 2 is active from
+   ordinal 5; do not rebuild, resync, duplicate, search, bundle, or promote until all 64 candidates
+   pass the exact-set gate. The permanent runner fix must make the process-lifetime boundary
+   explicit after this cohort. Neither the Phase 0 synthetic timings nor the implementation tests
+   are model, prefill, end-to-end, family-generalization, or dial results.
    [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
