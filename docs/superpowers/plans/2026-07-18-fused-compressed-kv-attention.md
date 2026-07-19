@@ -54,8 +54,9 @@ kernel:
   portable pinned dependency revision/fork or an accepted upstream change, with license and diff
   review. A machine-local checkout patch cannot become promotion evidence.
 
-Phase 0 geometry probes authenticate against checkpoint config metadata but never load model
-weights. They can prove packed-attention structural behavior for a model-compatible geometry; they
+Phase 0 geometry probes stream checkpoint bytes for content authentication but do not instantiate
+or execute those weights as MLX model tensors. They can prove packed-attention structural behavior
+for a model-compatible geometry; they
 cannot prove model-specific runtime, dial, quality, or end-to-end performance claims.
 
 The first MLX-coupled causal-prefill fixture also found that the pinned Swift-LM helper's symbolic
@@ -220,13 +221,44 @@ authenticated for Llama or any later family.
 - [x] Complete verification of the MLX-coupled probe CLI comparing stock fp16 SDPA, pinned
   Swift-LM quantized attention, split K/V affine quantized matmuls, and
   materialize-then-attend from the same packed bytes.
-- [ ] Run small deterministic correctness fixtures, then interleaved Qwen 8K smoke/32K plus
+- [x] Run small deterministic correctness fixtures, then interleaved Qwen 8K smoke/32K plus
   authenticated 128K refusal and one Llama near-128K synthetic geometry (optionally an 8K identity
   canary) on the bench Mac. Do not repeat the full same-geometry matrix under both checkpoint IDs.
   Record materialization, workspace high-water bytes, fixed cache/wired-memory settings, MLX cache
   state, and thermal state.
-- [ ] Write a short architecture decision from the measured bottleneck. Stop here if a direct
+- [x] Write a short architecture decision from the measured bottleneck. Stop here if a direct
   packed path lacks a credible speed envelope.
+
+#### Phase 0 measured architecture decision — 2026-07-18
+
+Clean `07219679280abd2f7cefbeef86b71bbec018a1c2` produced 12 probe-evidence-schema-v2
+synthetic artifacts and 72 retained measured rows plus the authenticated Qwen refusal. The compact
+index uses its own schema v1 and records the five/five/two source artifact counts explicitly. The
+evidence is [`fused-compressed-kv-phase0-evidence-2026-07-18.jsonl`](../verdicts/fused-compressed-kv-phase0-evidence-2026-07-18.jsonl);
+its SHA-256 is `bb8387e2f4b6d1ac4862f09816a5517c2a34b4f7e7a9383f300d3002c13a3cf5` and
+the 77-file bench manifest has SHA-256
+`6f999443363267a8a6429140766027fa0f1f14df4b0f400a257171d2230d2d89`.
+
+- Qwen 8K decode was a correctness/memory smoke, not a timing conclusion: sub-millisecond paired
+  ratios crossed both sides of `1.0`, including split K4V2 at `0.9224...1.1439x` fp16.
+- At Qwen 32K decode, split K4V2 used 29,360,128 persistent bytes plus 4,751,366 peak temporary
+  bytes and measured `0.5360...0.5758x` its paired fp16 attention time in all three runs. The
+  same-storage materialize control used 138,559,488 peak temporary bytes and measured
+  `0.8999...1.3628x` fp16. Symmetric stock K4V4 also showed a credible packed route at
+  `0.5276...0.6221x` fp16.
+- At the Llama-compatible near-128K geometry, split K4V2 used 117,325,824 persistent bytes plus
+  17,317,894 peak temporary bytes and measured `0.3866...0.4557x` fp16. Its same-storage
+  materialize control required 553,664,512 peak temporary bytes and measured
+  `0.6869...0.8310x` fp16. Qwen refused the same 130,944+128 window before MLX allocation because
+  its authenticated maximum is 40,960.
+
+**Decision:** proceed to the portable router seam by extending the existing quantized-matmul
+route to independent K/V geometry. Do not start with a custom Metal kernel: the pinned primitives
+already show a credible long-context decode envelope and remove full-cache materialization. The
+split operation is not fused SDPA and retains score/weight workspace; long-context prefill,
+loaded-model TTFT/TPOT, cache lifecycle, hostile batch compaction, KVTuner schedule routing, KVarN,
+quality, and end-to-end speed remain unproven gates. Because Qwen and Llama share Q64/KV8/D128,
+the Llama geometry row is not independent cross-geometry or model-runtime evidence.
 
 ### Phase 1 — portable attention-router seam
 

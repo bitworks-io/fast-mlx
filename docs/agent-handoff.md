@@ -54,7 +54,8 @@ notable spike, including negative results.
 
 1. **Fused compressed-domain KV attention** — current top engine gate. Carry forward KVarN i8 plus
    shared affine/KVTuner storage primitives. The current probe is checkpoint-authenticated,
-   config-constrained synthetic geometry evidence and never loads model weights, so it cannot prove
+   config-constrained synthetic geometry evidence: it streams checkpoint bytes for content
+   authentication but does not instantiate or execute them as MLX model tensors, so it cannot prove
    model-specific runtime/dial performance. Qualify Qwen3-32B at 8K smoke/32K only and record an
    authenticated 128K refusal because its max context is 40,960. Qualify the staged
    Llama-3.3-70B-Instruct-4bit checkpoint at 8K smoke/32K/near-128K only when prompt+output <=
@@ -64,11 +65,13 @@ notable spike, including negative results.
    Both selected models share Q64/KV8/D128, so they do not prove cross-geometry generality. Prove
    valid end-to-end behavior and the batch-compaction poison case before any speed claim. Add
    another popular model with materially different attention geometry before broad/default support.
-   The Phase 0 producer now has a verified split independent-K/V affine quantized-matmul operation,
-   detached prepared-state timing boundary, schema-v2 synthetic-only evidence kind, and raw-MLX-bound
-   workspace receipts. The active gate is fresh clean-SHA Qwen 8K/32K capture, authenticated Qwen
-   128K refusal, and the frozen Llama near-128K synthetic cell; no Phase 0 timing is a model or dial
-   result.
+   Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`: the verified split
+   independent-K/V affine path avoids materialization and shows a credible 32K/near-128K synthetic
+   decode envelope, while Qwen's 128K request refuses before allocation. The measured decision is
+   to extend the portable quantized-matmul route, not begin with custom Metal. The active gate is
+   Phase 1's model-generic router seam and fail-closed contract, followed by actor-confined scalar
+   runtime integration. Phase 0 timings did not instantiate or execute checkpoint weights as MLX
+   model tensors and are not model, prefill, end-to-end, family-generalization, or dial results.
    [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.

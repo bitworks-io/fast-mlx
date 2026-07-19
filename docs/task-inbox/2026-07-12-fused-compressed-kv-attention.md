@@ -66,19 +66,14 @@ end-to-end negative. Structural cache corruption is a correctness bug, never qua
 
 ## Next Step
 
-Continue Phase 0 of the dated
+Continue Phase 1 of the dated
 [`2026-07-18-fused-compressed-kv-attention.md`](../superpowers/plans/2026-07-18-fused-compressed-kv-attention.md)
-plan. The authenticated plan/evidence contract and deterministic MLX fixture are complete. The
-fresh-output producer now verifies the split independent-K/V affine quantized-matmul path and
-raw-MLX-bound workspace accounting through pure contracts, MLX-coupled Xcode tests, and a Release
-build. Capture the clean-SHA matrix for fp16, affine materialize-then-attend, split K4V2, and the
-pinned Swift-LM quantized-attention helper at checkpoint-config-constrained synthetic geometries.
-These are qualification artifacts, never promotion artifacts:
-Qwen 8K smoke/32K plus authenticated 128K refusal, then one Llama near-128K geometry (with an
-optional low-cost identity canary). Do not repeat the full Q64/KV8/D128 synthetic matrix under both
-model IDs; loaded-model qualification separately runs Llama 8K/32K/near-128K with prompt+output <=
-131,072. The synthetic near-128K qualification cell is frozen at 130,944 cached tokens plus 128
-requested output tokens; arbitrary pairs that merely add to the limit are not qualification
-cells. The probe never loads model weights and cannot prove model-specific runtime/dial
-performance.
-Write a portable runtime/kernel contract only after measured evidence identifies the bottleneck.
+plan. Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`. Its synthetic
+decode evidence selected the existing quantized-matmul route with independent K/V geometry and
+deferred custom Metal; it streamed checkpoint bytes only for content authentication and did not
+instantiate or execute them as MLX model tensors, so it did not prove prefill, end-to-end, model,
+family, or dial performance. Define and TDD the smallest model-generic packed-attention router seam,
+including independent K/V geometry, exact mask/GQA behavior, frozen-schedule authentication,
+unsupported architecture and non-finite refusal, and a portable pinned dependency strategy. Then
+integrate actor-confined affine K4V2-g64 and frozen Qwen KVTuner scalar runtime before KVarN or
+batch compaction.
