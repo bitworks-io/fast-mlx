@@ -1472,6 +1472,9 @@ struct Harness {
         case "kvtuner-candidate": await runKVTunerCandidate(flags)
         case "kvtuner-search": await runKVTunerSearch(flags)
         case "kvtuner-bundle": await runKVTunerBundle(flags)
+        case "compressed-attention-probe":
+            await runCompressedAttentionProbe(
+                Array(arguments.dropFirst(2)))
         case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
@@ -1533,6 +1536,15 @@ struct Harness {
                  [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN/KVTuner runtime tier
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
                  [--reference-task-evidence <FP16-JSONL>]
+          compressed-attention-probe          fresh paired synthetic attention profiler
+                 --model <PATH> --model-id <REPO/ID>
+                 --operation fp16-sdpa|swiftlm-quantized-attention|materialize-then-sdpa
+                 --layout fp16|affine --context-tokens 8192|32768|131072
+                 --query-tokens <N> --prefill-chunk-tokens <N>
+                 --query-heads <N> --kv-heads <N> --head-dimension <N>
+                 --workload-nonce <ID> --evidence <NEW-FILE> --progress <NEW-FILE>
+                 --memory-limit-bytes <N> --cache-limit-bytes <N> --wired-limit-bytes <N>
+                 [--promotion-evidence false] [layout-specific flags]
                                                required for every lossy candidate; forbidden for fp16
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]
                  [--max-tool-tokens 96]       structured-output budget (1...512)

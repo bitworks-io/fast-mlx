@@ -83,7 +83,10 @@ remain model-specific and must fail authentication on the second family.
    identities and can never enter one comparison aggregate.
    Only the predeclared 8K/32K/128K contexts are promotion-capable. Proof: local failing-first
    `HarnessCoreTests` for missing, unknown, overflowed, aliased, symlinked, or inconsistent inputs.
-2. **Numeric control.** The fp16 probe control agrees with stock SDPA at `rtol=1e-4`, `atol=1e-5`.
+2. **Numeric control.** The fp16 probe control agrees with stock SDPA at the pinned MLX
+   float16 qualification envelope, `rtol=3e-4`, `atol=3e-4`. Evidence reports raw maximum
+   absolute and relative errors plus the maximum mixed-tolerance ratio
+   `abs(error) / (atol + rtol * abs(reference))`; the ratio must be at most `1`.
    Every packed affine, KVTuner, and KVarN fixture is compared to dequantize-then-attend from the
    exact same authenticated packed bytes and must pass `rtol=2e-3`, `atol=2e-3` plus identical
    top-1 output; max/mean error is also reported. These are structural equivalence thresholds,

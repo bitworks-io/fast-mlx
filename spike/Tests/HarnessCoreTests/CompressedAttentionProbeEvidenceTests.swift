@@ -10,7 +10,57 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
     private let hashD = String(repeating: "d", count: 64)
     private let hashE = String(repeating: "e", count: 64)
     private let hashF = String(repeating: "f", count: 64)
-    private let artifactHash = String(repeating: "0", count: 64)
+
+    func testAffineByteGeometryMatchesIndependentClosedFormFixture() throws {
+        let plan = try CompressedAttentionProbePlan(
+            operation: .materializeThenSDPA,
+            contextTokens: 64,
+            queryTokens: 1,
+            prefillChunkTokens: 32,
+            outputTokens: 16,
+            stopTokenIDs: [],
+            batchSize: 1,
+            queryHeadCount: 8,
+            kvHeadCount: 2,
+            headDimension: 128,
+            dtype: .float16,
+            mask: .causal,
+            layout: .affine(
+                keyBits: 4, valueBits: 4,
+                keyGroupSize: 64, valueGroupSize: 64),
+            warmupRuns: 1,
+            measuredRuns: 1,
+            seed: 7,
+            workloadNonce: "independent-byte-geometry",
+            harnessGitSHA: cleanSHA,
+            promotionEvidence: false)
+
+        let candidate = try CompressedAttentionProbeExpectedByteGeometry
+            .derive(
+                plan: plan,
+                role: .candidate,
+                operation: .materializeThenSDPA)
+        XCTAssertEqual(candidate.payloadBytes, 16_384)
+        XCTAssertEqual(candidate.scaleBytes, 1_024)
+        XCTAssertEqual(candidate.biasBytes, 1_024)
+        XCTAssertEqual(candidate.controlBytes, 0)
+        XCTAssertEqual(candidate.alignmentPaddingBytes, 0)
+        XCTAssertEqual(candidate.fp16ResidentBytes, 0)
+        XCTAssertEqual(candidate.persistentKVBytes, 18_432)
+        XCTAssertEqual(candidate.materializationBytes, 65_536)
+
+        let reference = try CompressedAttentionProbeExpectedByteGeometry
+            .derive(
+                plan: plan,
+                role: .fp16Reference,
+                operation: .fp16SDPA)
+        XCTAssertEqual(reference.payloadBytes, 0)
+        XCTAssertEqual(reference.scaleBytes, 0)
+        XCTAssertEqual(reference.biasBytes, 0)
+        XCTAssertEqual(reference.fp16ResidentBytes, 65_536)
+        XCTAssertEqual(reference.persistentKVBytes, 65_536)
+        XCTAssertEqual(reference.materializationBytes, 0)
+    }
 
     func testPromotionEvidencePreservesRawPairedRowsAndRoundTrips() throws {
         let evidence = try makeEvidence()
@@ -28,6 +78,155 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
         XCTAssertEqual(
             validated.rows.filter { $0.role == .candidate }.map(\.position.runPosition),
             [0, 1, 0])
+    }
+
+    func testArtifactIdentityAuthenticatesCanonicalPayloadWithoutRecursion() throws {
+        let plan = try makePlan()
+        let model = modelIdentity()
+        let package = CompressedAttentionProbePackageIdentity(
+            mlxSwiftVersion: "0.31.6",
+            mlxSwiftLMRevision:
+                "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
+            swiftVersion: "6.0",
+            harnessBuildConfiguration: "Release")
+        let rows = makeRows()
+
+        let first = try CompressedAttentionProbeEvidence.deriveArtifactID(
+            plan: CompressedAttentionProbePlanIdentity(plan: plan),
+            model: model,
+            package: package,
+            rows: rows)
+        let second = try CompressedAttentionProbeEvidence.deriveArtifactID(
+            plan: CompressedAttentionProbePlanIdentity(plan: plan),
+            model: model,
+            package: package,
+            rows: rows)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.count, 64)
+
+        var changedRows = rows
+        changedRows[0] = row(
+            role: .candidate,
+            block: 0,
+            position: 0,
+            receipts: runReceipts(
+                timing: CompressedAttentionProbeTiming(
+                    monotonicStartSeconds: 100,
+                    monotonicEndSeconds: 100.13,
+                    wallClockSeconds: 0.13,
+                    attentionSeconds: 0.08)))
+        let changed = try CompressedAttentionProbeEvidence.deriveArtifactID(
+            plan: CompressedAttentionProbePlanIdentity(plan: plan),
+            model: model,
+            package: package,
+            rows: changedRows)
+        XCTAssertNotEqual(first, changed)
+    }
+
+    func testValidatedEvidenceRejectsPayloadTamperingWithRetainedArtifactID() throws {
+        let original = try makeEvidence()
+        var tamperedRows = original.rows
+        tamperedRows[0] = row(
+            role: .candidate,
+            block: 0,
+            position: 0,
+            receipts: runReceipts(
+                timing: CompressedAttentionProbeTiming(
+                    monotonicStartSeconds: 100,
+                    monotonicEndSeconds: 100.13,
+                    wallClockSeconds: 0.13,
+                    attentionSeconds: 0.08)))
+        let tampered = CompressedAttentionProbeEvidence(
+            schemaVersion: original.schemaVersion,
+            artifactID: original.artifactID,
+            plan: original.plan,
+            model: original.model,
+            package: original.package,
+            rows: tamperedRows)
+
+        XCTAssertThrowsError(try tampered.validated()) {
+            XCTAssertEqual(
+                $0 as? CompressedAttentionProbeEvidenceError,
+                .invalidArtifactID)
+        }
+    }
+
+    func testPromotionEvidenceRequiresTheQualifiedPackageAndReleaseBuild() throws {
+        let debugPackage = CompressedAttentionProbePackageIdentity(
+            mlxSwiftVersion: "0.31.6",
+            mlxSwiftLMRevision:
+                "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
+            swiftVersion: "6.0",
+            harnessBuildConfiguration: "Debug")
+        XCTAssertThrowsError(try makeEvidence(package: debugPackage)) {
+            XCTAssertEqual(
+                $0 as? CompressedAttentionProbeEvidenceError,
+                .invalidIdentity("harnessBuildConfiguration"))
+        }
+
+        let unpinnedPackage = CompressedAttentionProbePackageIdentity(
+            mlxSwiftVersion: "0.31.5",
+            mlxSwiftLMRevision:
+                "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
+            swiftVersion: "6.0",
+            harnessBuildConfiguration: "Release")
+        XCTAssertThrowsError(try makeEvidence(package: unpinnedPackage)) {
+            XCTAssertEqual(
+                $0 as? CompressedAttentionProbeEvidenceError,
+                .invalidIdentity("mlxSwiftVersion"))
+        }
+    }
+
+    func testExploratoryEvidenceMayRecordADifferentValidPackage() throws {
+        let plan = try CompressedAttentionProbePlan(
+            operation: .swiftLMQuantizedAttention,
+            contextTokens: 128,
+            queryTokens: 1,
+            prefillChunkTokens: 32,
+            outputTokens: 16,
+            stopTokenIDs: [],
+            batchSize: 1,
+            queryHeadCount: 8,
+            kvHeadCount: 2,
+            headDimension: 128,
+            dtype: .float16,
+            mask: .none,
+            layout: .affine(
+                keyBits: 4, valueBits: 4,
+                keyGroupSize: 64, valueGroupSize: 64),
+            warmupRuns: 1,
+            measuredRuns: 1,
+            seed: 7,
+            workloadNonce: "exploratory-package",
+            harnessGitSHA: cleanSHA,
+            promotionEvidence: false)
+        let debugPackage = CompressedAttentionProbePackageIdentity(
+            mlxSwiftVersion: "0.31.5",
+            mlxSwiftLMRevision: String(repeating: "b", count: 40),
+            swiftVersion: "6.0",
+            harnessBuildConfiguration: "Debug")
+
+        XCTAssertNoThrow(try makeEvidence(
+            plan: plan,
+            package: debugPackage,
+            rows: [
+                row(
+                    role: .candidate,
+                    block: 0,
+                    position: 0,
+                    receipts: runReceipts(
+                        role: .candidate,
+                        bytes: defaultBytes(
+                            role: .candidate, plan: plan))),
+                row(
+                    role: .fp16Reference,
+                    block: 0,
+                    position: 1,
+                    receipts: runReceipts(
+                        role: .fp16Reference,
+                        bytes: defaultBytes(
+                            role: .fp16Reference, plan: plan))),
+            ]).validated())
     }
 
     func testDuplicateOrInvalidRunPositionsFailClosed() throws {
@@ -113,6 +312,7 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
             promotionEvidence: false)
         let unavailableCandidate = runReceipts(
             role: .candidate,
+            bytes: defaultBytes(role: .candidate, plan: plan),
             power: CompressedAttentionProbePowerReceipts(
                 lowPowerModeEnabledBefore: false,
                 lowPowerModeEnabledAfter: false,
@@ -120,6 +320,7 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
                 powerSourceAfter: .unavailable))
         let unavailableReference = runReceipts(
             role: .fp16Reference,
+            bytes: defaultBytes(role: .fp16Reference, plan: plan),
             power: CompressedAttentionProbePowerReceipts(
                 lowPowerModeEnabledBefore: false,
                 lowPowerModeEnabledAfter: false,
@@ -168,41 +369,45 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
 
         receipts = runReceipts(
             numericControls: CompressedAttentionProbeNumericControls(
-                packedMaxAbsoluteError: 0.0021,
-                packedMaxRelativeError: 0.001,
-                packedTop1TokenID: 42,
-                unpackedTop1TokenID: 42,
-                fp16MaxAbsoluteError: 0.000001,
-                fp16MaxRelativeError: 0.00001,
-                fp16Top1TokenID: 42,
-                referenceTop1TokenID: 42))
+                candidateMaxAbsoluteError: 0.0021,
+                candidateMaxRelativeError: 0.001,
+                candidateMaximumToleranceRatio: 1.01,
+                candidateTop1Index: 42,
+                candidateOracleTop1Index: 42,
+                referenceMaxAbsoluteError: 0.000001,
+                referenceMaxRelativeError: 0.00001,
+                referenceMaximumToleranceRatio: 0.5,
+                referenceTop1Index: 42,
+                referenceOracleTop1Index: 42))
         rows = makeRows()
         rows[0] = row(
             role: .candidate, block: 0, position: 0, receipts: receipts)
         XCTAssertThrowsError(try makeEvidence(rows: rows).validated()) {
             XCTAssertEqual(
                 $0 as? CompressedAttentionProbeEvidenceError,
-                .packedStructuralMismatch)
+                .candidateStructuralMismatch)
         }
 
         receipts = runReceipts(
             role: .fp16Reference,
             numericControls: CompressedAttentionProbeNumericControls(
-                packedMaxAbsoluteError: 0.001,
-                packedMaxRelativeError: 0.001,
-                packedTop1TokenID: 42,
-                unpackedTop1TokenID: 42,
-                fp16MaxAbsoluteError: 0.000001,
-                fp16MaxRelativeError: 0.00011,
-                fp16Top1TokenID: 42,
-                referenceTop1TokenID: 42))
+                candidateMaxAbsoluteError: 0.001,
+                candidateMaxRelativeError: 0.001,
+                candidateMaximumToleranceRatio: 0.5,
+                candidateTop1Index: 42,
+                candidateOracleTop1Index: 42,
+                referenceMaxAbsoluteError: 0.00048828125,
+                referenceMaxRelativeError: 0.188,
+                referenceMaximumToleranceRatio: 1.01,
+                referenceTop1Index: 42,
+                referenceOracleTop1Index: 42))
         rows = makeRows()
         rows[1] = row(
             role: .fp16Reference, block: 0, position: 1, receipts: receipts)
         XCTAssertThrowsError(try makeEvidence(rows: rows).validated()) {
             XCTAssertEqual(
                 $0 as? CompressedAttentionProbeEvidenceError,
-                .fp16ControlMismatch)
+                .referenceControlMismatch)
         }
     }
 
@@ -249,10 +454,10 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
             receipts: runReceipts(
                 role: .fp16Reference,
                 hashes: CompressedAttentionProbeHashes(
-                    sourceKVProjectionSHA256: hashC,
-                    packedKVProjectionSHA256: hashA,
-                    inputTokenIDsSHA256: hashB,
-                    outputTokenIDsSHA256: hashE)))
+                    sourceKVTensorSHA256: hashC,
+                    packedKVTensorSHA256: hashA,
+                    queryTensorSHA256: hashB,
+                    outputTensorSHA256: hashE)))
         XCTAssertThrowsError(try makeEvidence(rows: rows).validated()) {
             XCTAssertEqual(
                 $0 as? CompressedAttentionProbeEvidenceError,
@@ -327,6 +532,33 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
             receipts: runReceipts(
                 role: .fp16Reference,
                 bytes: defaultBytes(role: .candidate)))
+        XCTAssertThrowsError(try makeEvidence(rows: rows).validated()) {
+            XCTAssertEqual(
+                $0 as? CompressedAttentionProbeEvidenceError,
+                .invalidByteAccounting)
+        }
+    }
+
+    func testSelfConsistentButGeometryImpossibleByteReceiptsFailClosed() throws {
+        let impossibleForEightK = CompressedAttentionProbeByteReceipts(
+            payloadBytes: 2_048,
+            scaleBytes: 1_024,
+            biasBytes: 1_024,
+            controlBytes: 0,
+            alignmentPaddingBytes: 0,
+            fp16ResidentBytes: 0,
+            persistentKVBytes: 4_096,
+            materializationBytes: 0,
+            otherWorkspaceBytes: 1_024,
+            peakTemporaryBytes: 1_024,
+            totalBytes: 5_120)
+        var rows = makeRows()
+        rows[0] = row(
+            role: .candidate,
+            block: 0,
+            position: 0,
+            receipts: runReceipts(bytes: impossibleForEightK))
+
         XCTAssertThrowsError(try makeEvidence(rows: rows).validated()) {
             XCTAssertEqual(
                 $0 as? CompressedAttentionProbeEvidenceError,
@@ -447,6 +679,7 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
     private func makeEvidence(
         plan: CompressedAttentionProbePlan? = nil,
         model: CompressedAttentionProbeModelIdentity? = nil,
+        package: CompressedAttentionProbePackageIdentity? = nil,
         rows: [CompressedAttentionProbeRunRow]? = nil
     ) throws -> CompressedAttentionProbeEvidence {
         let evidencePlan: CompressedAttentionProbePlan
@@ -455,19 +688,30 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
         } else {
             evidencePlan = try makePlan()
         }
-        return CompressedAttentionProbeEvidence(
-            schemaVersion: 1,
-            artifactID: artifactHash,
-            plan: CompressedAttentionProbePlanIdentity(
-                plan: evidencePlan),
-            model: model ?? modelIdentity(),
-            package: CompressedAttentionProbePackageIdentity(
+        let planIdentity = CompressedAttentionProbePlanIdentity(
+            plan: evidencePlan)
+        let modelIdentity = model ?? modelIdentity()
+        let packageIdentity = package
+            ?? CompressedAttentionProbePackageIdentity(
                 mlxSwiftVersion: "0.31.6",
                 mlxSwiftLMRevision:
                     "702e5a0eaf990e1f6d3db2b6e7d8872858a44055",
                 swiftVersion: "6.0",
-                harnessBuildConfiguration: "Release"),
-            rows: rows ?? makeRows())
+                harnessBuildConfiguration: "Release")
+        let evidenceRows = rows ?? makeRows()
+        let artifactID = try CompressedAttentionProbeEvidence
+            .deriveArtifactID(
+                plan: planIdentity,
+                model: modelIdentity,
+                package: packageIdentity,
+                rows: evidenceRows)
+        return CompressedAttentionProbeEvidence(
+            schemaVersion: 1,
+            artifactID: artifactID,
+            plan: planIdentity,
+            model: modelIdentity,
+            package: packageIdentity,
+            rows: evidenceRows)
     }
 
     private func makePlan() throws -> CompressedAttentionProbePlan {
@@ -612,52 +856,48 @@ final class CompressedAttentionProbeEvidenceTests: XCTestCase {
                 after: .nominal),
             numericControls: numericControls
                 ?? CompressedAttentionProbeNumericControls(
-                    packedMaxAbsoluteError: 0.001,
-                    packedMaxRelativeError: 0.001,
-                    packedTop1TokenID: 42,
-                    unpackedTop1TokenID: 42,
-                    fp16MaxAbsoluteError: 0.000001,
-                    fp16MaxRelativeError: 0.00001,
-                    fp16Top1TokenID: 42,
-                    referenceTop1TokenID: 42),
+                    candidateMaxAbsoluteError: 0.001,
+                    candidateMaxRelativeError: 0.001,
+                    candidateMaximumToleranceRatio: 0.5,
+                    candidateTop1Index: 42,
+                    candidateOracleTop1Index: 42,
+                    referenceMaxAbsoluteError: 0.000001,
+                    referenceMaxRelativeError: 0.00001,
+                    referenceMaximumToleranceRatio: 0.5,
+                    referenceTop1Index: 42,
+                    referenceOracleTop1Index: 42),
             hashes: hashes ?? CompressedAttentionProbeHashes(
-                sourceKVProjectionSHA256: hashF,
-                packedKVProjectionSHA256: hashA,
-                inputTokenIDsSHA256: hashB,
-                outputTokenIDsSHA256: hashE))
+                sourceKVTensorSHA256: hashF,
+                packedKVTensorSHA256: hashA,
+                queryTensorSHA256: hashB,
+                outputTensorSHA256: hashE))
     }
 
     private func defaultBytes(
-        role: CompressedAttentionProbeRunRole
+        role: CompressedAttentionProbeRunRole,
+        plan: CompressedAttentionProbePlan? = nil
     ) -> CompressedAttentionProbeByteReceipts {
-        switch role {
-        case .candidate:
-            return CompressedAttentionProbeByteReceipts(
-                payloadBytes: 2_048,
-                scaleBytes: 1_024,
-                biasBytes: 1_024,
-                controlBytes: 0,
-                alignmentPaddingBytes: 0,
-                fp16ResidentBytes: 0,
-                persistentKVBytes: 4_096,
-                materializationBytes: 0,
-                otherWorkspaceBytes: 1_024,
-                peakTemporaryBytes: 1_024,
-                totalBytes: 5_120)
-        case .fp16Reference:
-            return CompressedAttentionProbeByteReceipts(
-                payloadBytes: 0,
-                scaleBytes: 0,
-                biasBytes: 0,
-                controlBytes: 0,
-                alignmentPaddingBytes: 0,
-                fp16ResidentBytes: 4_096,
-                persistentKVBytes: 4_096,
-                materializationBytes: 0,
-                otherWorkspaceBytes: 1_024,
-                peakTemporaryBytes: 1_024,
-                totalBytes: 5_120)
-        }
+        let plan = plan ?? (try! makePlan())
+        let operation: CompressedAttentionProbeOperation = role == .candidate
+            ? plan.operation
+            : .fp16SDPA
+        let geometry = try! CompressedAttentionProbeExpectedByteGeometry
+            .derive(plan: plan, role: role, operation: operation)
+        let otherWorkspaceBytes = 1_024
+        let peakTemporaryBytes = geometry.materializationBytes
+            + otherWorkspaceBytes
+        return CompressedAttentionProbeByteReceipts(
+            payloadBytes: geometry.payloadBytes,
+            scaleBytes: geometry.scaleBytes,
+            biasBytes: geometry.biasBytes,
+            controlBytes: geometry.controlBytes,
+            alignmentPaddingBytes: geometry.alignmentPaddingBytes,
+            fp16ResidentBytes: geometry.fp16ResidentBytes,
+            persistentKVBytes: geometry.persistentKVBytes,
+            materializationBytes: geometry.materializationBytes,
+            otherWorkspaceBytes: otherWorkspaceBytes,
+            peakTemporaryBytes: peakTemporaryBytes,
+            totalBytes: geometry.persistentKVBytes + peakTemporaryBytes)
     }
 
     private func defaultTiming(

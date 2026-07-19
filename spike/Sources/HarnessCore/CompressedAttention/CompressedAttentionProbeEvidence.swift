@@ -24,8 +24,8 @@ public enum CompressedAttentionProbeEvidenceError:
     case pairedBlockIdentityMismatch(Int)
     case invalidHash(String)
     case invalidMetric(String)
-    case packedStructuralMismatch
-    case fp16ControlMismatch
+    case candidateStructuralMismatch
+    case referenceControlMismatch
 }
 
 public enum CompressedAttentionProbeLayoutKind:
@@ -280,6 +280,11 @@ public struct CompressedAttentionProbeModelIdentity:
 public struct CompressedAttentionProbePackageIdentity:
     Codable, Equatable, Sendable
 {
+    public static let qualifiedMLXSwiftVersion = "0.31.6"
+    public static let qualifiedMLXSwiftLMRevision =
+        "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"
+    public static let qualifiedBuildConfiguration = "Release"
+
     public let mlxSwiftVersion: String
     public let mlxSwiftLMRevision: String
     public let swiftVersion: String
@@ -377,6 +382,162 @@ public struct CompressedAttentionProbeByteReceipts:
         self.otherWorkspaceBytes = otherWorkspaceBytes
         self.peakTemporaryBytes = peakTemporaryBytes
         self.totalBytes = totalBytes
+    }
+}
+
+/// Geometry-derived persistent and materialization bytes for one authenticated probe row.
+/// These values are independent of allocator telemetry: evidence records the actual array byte
+/// receipts, then validation requires them to equal this plan-derived contract exactly.
+public struct CompressedAttentionProbeExpectedByteGeometry:
+    Equatable, Sendable
+{
+    public let payloadBytes: Int
+    public let scaleBytes: Int
+    public let biasBytes: Int
+    public let controlBytes: Int
+    public let alignmentPaddingBytes: Int
+    public let fp16ResidentBytes: Int
+    public let persistentKVBytes: Int
+    public let materializationBytes: Int
+
+    public static func derive(
+        plan: CompressedAttentionProbePlan,
+        role: CompressedAttentionProbeRunRole,
+        operation: CompressedAttentionProbeOperation
+    ) throws -> Self {
+        let scalarBytes = 2
+        let fp16Bytes = try product([plan.totalKVScalarCount, scalarBytes])
+        let payload: Int
+        let scales: Int
+        let biases: Int
+        let control: Int
+        let padding: Int
+        let fp16Resident: Int
+
+        if role == .fp16Reference || plan.layout == .fp16 {
+            payload = 0
+            scales = 0
+            biases = 0
+            control = 0
+            padding = 0
+            fp16Resident = fp16Bytes
+        } else {
+            switch plan.layout {
+            case .fp16:
+                throw CompressedAttentionProbeEvidenceError
+                    .invalidByteAccounting
+            case let .affine(
+                keyBits, valueBits, keyGroupSize, valueGroupSize):
+                let oneSideScalars = try product([
+                    plan.batchSize,
+                    plan.kvHeadCount,
+                    plan.contextTokens,
+                    plan.headDimension,
+                ])
+                payload = try sum([
+                    try product([oneSideScalars, keyBits]) / 8,
+                    try product([oneSideScalars, valueBits]) / 8,
+                ])
+                let metadataScalars = try product([
+                    plan.batchSize,
+                    plan.kvHeadCount,
+                    plan.contextTokens,
+                ])
+                scales = try product([
+                    metadataScalars,
+                    plan.headDimension / keyGroupSize
+                        + plan.headDimension / valueGroupSize,
+                    scalarBytes,
+                ])
+                biases = scales
+                control = 0
+                padding = 0
+                fp16Resident = 0
+            case let .kvarn(
+                keyBits, valueBits, groupSize, sinkTokens, _):
+                let headSequences = try product([
+                    plan.batchSize, plan.kvHeadCount,
+                ])
+                let postSinkTokens = max(0, plan.contextTokens - sinkTokens)
+                let slots = (postSinkTokens + groupSize - 1) / groupSize
+                let keyPayloadUnit = try product([
+                    plan.headDimension, groupSize, keyBits,
+                ]) / 8
+                let valuePayloadUnit = try product([
+                    groupSize, plan.headDimension, valueBits,
+                ]) / 8
+                let payloadUnit = try sum([
+                    keyPayloadUnit, valuePayloadUnit,
+                ])
+                let scaleUnit = try product([
+                    2 * (plan.headDimension + groupSize), scalarBytes,
+                ])
+                let biasUnit = try product([
+                    plan.headDimension + groupSize, scalarBytes,
+                ])
+                let storedUnits = try product([headSequences, slots])
+                payload = try product([storedUnits, payloadUnit])
+                scales = try product([storedUnits, scaleUnit])
+                biases = try product([storedUnits, biasUnit])
+                control = MemoryLayout<Int32>.size
+                let rawUnit = try sum([payloadUnit, scaleUnit, biasUnit])
+                let alignment = 8
+                let alignedUnit = ((rawUnit + alignment - 1) / alignment)
+                    * alignment
+                padding = try product([
+                    storedUnits, alignedUnit - rawUnit,
+                ])
+                fp16Resident = try product([
+                    headSequences,
+                    sinkTokens + groupSize,
+                    plan.headDimension,
+                    2,
+                    scalarBytes,
+                ])
+            }
+        }
+
+        let persistent = try sum([
+            payload, scales, biases, control, padding, fp16Resident,
+        ])
+        let materialization = role == .candidate
+            && operation == .materializeThenSDPA
+            ? fp16Bytes
+            : 0
+        return Self(
+            payloadBytes: payload,
+            scaleBytes: scales,
+            biasBytes: biases,
+            controlBytes: control,
+            alignmentPaddingBytes: padding,
+            fp16ResidentBytes: fp16Resident,
+            persistentKVBytes: persistent,
+            materializationBytes: materialization)
+    }
+
+    private static func product(_ values: [Int]) throws -> Int {
+        var result = 1
+        for value in values {
+            guard value >= 0 else {
+                throw CompressedAttentionProbeEvidenceError
+                    .invalidByteAccounting
+            }
+            let (next, overflow) = result.multipliedReportingOverflow(by: value)
+            guard !overflow else {
+                throw CompressedAttentionProbeEvidenceError
+                    .invalidByteAccounting
+            }
+            result = next
+        }
+        return result
+    }
+
+    private static func sum(_ values: [Int]) throws -> Int {
+        guard let result = CompressedAttentionProbeEvidence.checkedSum(values)
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
+        }
+        return result
     }
 }
 
@@ -515,54 +676,63 @@ public struct CompressedAttentionProbeThermalReceipts:
 public struct CompressedAttentionProbeNumericControls:
     Codable, Equatable, Sendable
 {
-    public let packedMaxAbsoluteError: Double
-    public let packedMaxRelativeError: Double
-    public let packedTop1TokenID: Int
-    public let unpackedTop1TokenID: Int
-    public let fp16MaxAbsoluteError: Double
-    public let fp16MaxRelativeError: Double
-    public let fp16Top1TokenID: Int
-    public let referenceTop1TokenID: Int
+    public let candidateMaxAbsoluteError: Double
+    public let candidateMaxRelativeError: Double
+    /// Maximum per-element `abs(error) / (atol + rtol * abs(reference))`.
+    /// Values at or below one satisfy the frozen mixed tolerance even when the raw relative
+    /// error is large for a reference value near zero.
+    public let candidateMaximumToleranceRatio: Double
+    public let candidateTop1Index: Int
+    public let candidateOracleTop1Index: Int
+    public let referenceMaxAbsoluteError: Double
+    public let referenceMaxRelativeError: Double
+    public let referenceMaximumToleranceRatio: Double
+    public let referenceTop1Index: Int
+    public let referenceOracleTop1Index: Int
 
     public init(
-        packedMaxAbsoluteError: Double,
-        packedMaxRelativeError: Double,
-        packedTop1TokenID: Int,
-        unpackedTop1TokenID: Int,
-        fp16MaxAbsoluteError: Double,
-        fp16MaxRelativeError: Double,
-        fp16Top1TokenID: Int,
-        referenceTop1TokenID: Int
+        candidateMaxAbsoluteError: Double,
+        candidateMaxRelativeError: Double,
+        candidateMaximumToleranceRatio: Double,
+        candidateTop1Index: Int,
+        candidateOracleTop1Index: Int,
+        referenceMaxAbsoluteError: Double,
+        referenceMaxRelativeError: Double,
+        referenceMaximumToleranceRatio: Double,
+        referenceTop1Index: Int,
+        referenceOracleTop1Index: Int
     ) {
-        self.packedMaxAbsoluteError = packedMaxAbsoluteError
-        self.packedMaxRelativeError = packedMaxRelativeError
-        self.packedTop1TokenID = packedTop1TokenID
-        self.unpackedTop1TokenID = unpackedTop1TokenID
-        self.fp16MaxAbsoluteError = fp16MaxAbsoluteError
-        self.fp16MaxRelativeError = fp16MaxRelativeError
-        self.fp16Top1TokenID = fp16Top1TokenID
-        self.referenceTop1TokenID = referenceTop1TokenID
+        self.candidateMaxAbsoluteError = candidateMaxAbsoluteError
+        self.candidateMaxRelativeError = candidateMaxRelativeError
+        self.candidateMaximumToleranceRatio = candidateMaximumToleranceRatio
+        self.candidateTop1Index = candidateTop1Index
+        self.candidateOracleTop1Index = candidateOracleTop1Index
+        self.referenceMaxAbsoluteError = referenceMaxAbsoluteError
+        self.referenceMaxRelativeError = referenceMaxRelativeError
+        self.referenceMaximumToleranceRatio = referenceMaximumToleranceRatio
+        self.referenceTop1Index = referenceTop1Index
+        self.referenceOracleTop1Index = referenceOracleTop1Index
     }
 }
 
 public struct CompressedAttentionProbeHashes:
     Codable, Equatable, Sendable
 {
-    public let sourceKVProjectionSHA256: String
-    public let packedKVProjectionSHA256: String
-    public let inputTokenIDsSHA256: String
-    public let outputTokenIDsSHA256: String
+    public let sourceKVTensorSHA256: String
+    public let packedKVTensorSHA256: String
+    public let queryTensorSHA256: String
+    public let outputTensorSHA256: String
 
     public init(
-        sourceKVProjectionSHA256: String,
-        packedKVProjectionSHA256: String,
-        inputTokenIDsSHA256: String,
-        outputTokenIDsSHA256: String
+        sourceKVTensorSHA256: String,
+        packedKVTensorSHA256: String,
+        queryTensorSHA256: String,
+        outputTensorSHA256: String
     ) {
-        self.sourceKVProjectionSHA256 = sourceKVProjectionSHA256
-        self.packedKVProjectionSHA256 = packedKVProjectionSHA256
-        self.inputTokenIDsSHA256 = inputTokenIDsSHA256
-        self.outputTokenIDsSHA256 = outputTokenIDsSHA256
+        self.sourceKVTensorSHA256 = sourceKVTensorSHA256
+        self.packedKVTensorSHA256 = packedKVTensorSHA256
+        self.queryTensorSHA256 = queryTensorSHA256
+        self.outputTensorSHA256 = outputTensorSHA256
     }
 }
 
@@ -629,8 +799,10 @@ public struct CompressedAttentionProbeEvidence:
     public static let schemaVersion = 1
     public static let packedRTolerance = 2e-3
     public static let packedATolerance = 2e-3
-    public static let fp16RTolerance = 1e-4
-    public static let fp16ATolerance = 1e-5
+    /// Matches the pinned MLX float16 SDPA qualification envelope in
+    /// `python/tests/test_fast_sdpa.py`.
+    public static let fp16RTolerance = 3e-4
+    public static let fp16ATolerance = 3e-4
 
     public let schemaVersion: Int
     public let artifactID: String
@@ -655,6 +827,51 @@ public struct CompressedAttentionProbeEvidence:
         self.rows = rows
     }
 
+    /// Derives the artifact identity from the complete validated payload while deliberately
+    /// excluding `artifactID` itself. This avoids a recursive self-hash while authenticating
+    /// every plan, model, package, row, and receipt field in one domain-separated transcript.
+    public static func deriveArtifactID(
+        plan: CompressedAttentionProbePlanIdentity,
+        model: CompressedAttentionProbeModelIdentity,
+        package: CompressedAttentionProbePackageIdentity,
+        rows: [CompressedAttentionProbeRunRow]
+    ) throws -> String {
+        let placeholder = String(repeating: "0", count: 64)
+        let evidence = Self(
+            schemaVersion: schemaVersion,
+            artifactID: placeholder,
+            plan: plan,
+            model: model,
+            package: package,
+            rows: rows)
+        _ = try evidence.validatePayload()
+        return try computeArtifactID(
+            plan: plan,
+            model: model,
+            package: package,
+            rows: rows)
+    }
+
+    private static func computeArtifactID(
+        plan: CompressedAttentionProbePlanIdentity,
+        model: CompressedAttentionProbeModelIdentity,
+        package: CompressedAttentionProbePackageIdentity,
+        rows: [CompressedAttentionProbeRunRow]
+    ) throws -> String {
+        let payload = ArtifactIdentityPayload(
+            schemaVersion: schemaVersion,
+            plan: plan,
+            model: model,
+            package: package,
+            rows: rows)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        var transcript = Data(
+            "fastmlx-compressed-attention-artifact-v1\n".utf8)
+        transcript.append(try encoder.encode(payload))
+        return sha256Hex(transcript)
+    }
+
     @discardableResult
     public func validated() throws -> CompressedAttentionProbeEvidence {
         guard schemaVersion == Self.schemaVersion else {
@@ -664,9 +881,29 @@ public struct CompressedAttentionProbeEvidence:
         guard Self.isSHA256(artifactID) else {
             throw CompressedAttentionProbeEvidenceError.invalidArtifactID
         }
+        let receiptHashes = try validatePayload()
+        let expectedArtifactID = try Self.computeArtifactID(
+            plan: plan,
+            model: model,
+            package: package,
+            rows: rows)
+        guard artifactID == expectedArtifactID,
+            !receiptHashes.contains(artifactID)
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidArtifactID
+        }
+        return self
+    }
+
+    private func validatePayload() throws -> Set<String> {
+        guard schemaVersion == Self.schemaVersion else {
+            throw CompressedAttentionProbeEvidenceError
+                .unsupportedSchema(schemaVersion)
+        }
         let materializedPlan = try plan.materializedPlan()
         try model.validate()
-        try package.validate()
+        try package.validate(
+            promotionEvidence: materializedPlan.promotionEvidence)
 
         let expectedRows = materializedPlan.measuredRuns * 2
         guard rows.count == expectedRows else {
@@ -702,15 +939,11 @@ public struct CompressedAttentionProbeEvidence:
             blockRows[position.pairedBlockIndex][position.runPosition] = row
             try row.validate(plan: materializedPlan)
             if let hashes = row.receipts?.hashes {
-                receiptHashes.insert(hashes.sourceKVProjectionSHA256)
-                receiptHashes.insert(hashes.packedKVProjectionSHA256)
-                receiptHashes.insert(hashes.inputTokenIDsSHA256)
-                receiptHashes.insert(hashes.outputTokenIDsSHA256)
+                receiptHashes.insert(hashes.sourceKVTensorSHA256)
+                receiptHashes.insert(hashes.packedKVTensorSHA256)
+                receiptHashes.insert(hashes.queryTensorSHA256)
+                receiptHashes.insert(hashes.outputTensorSHA256)
             }
-        }
-
-        guard !receiptHashes.contains(artifactID) else {
-            throw CompressedAttentionProbeEvidenceError.invalidArtifactID
         }
 
         for block in 0 ..< materializedPlan.measuredRuns {
@@ -735,7 +968,15 @@ public struct CompressedAttentionProbeEvidence:
             try Self.validatePairedBlock(
                 block, rows: blockRows[block])
         }
-        return self
+        return receiptHashes
+    }
+
+    private struct ArtifactIdentityPayload: Codable {
+        let schemaVersion: Int
+        let plan: CompressedAttentionProbePlanIdentity
+        let model: CompressedAttentionProbeModelIdentity
+        let package: CompressedAttentionProbePackageIdentity
+        let rows: [CompressedAttentionProbeRunRow]
     }
 
     fileprivate static func isSHA256(_ value: String) -> Bool {
@@ -799,10 +1040,10 @@ public struct CompressedAttentionProbeEvidence:
             throw CompressedAttentionProbeEvidenceError.invalidTiming
         }
         guard
-            first.hashes.sourceKVProjectionSHA256
-                == second.hashes.sourceKVProjectionSHA256,
-            first.hashes.inputTokenIDsSHA256
-                == second.hashes.inputTokenIDsSHA256,
+            first.hashes.sourceKVTensorSHA256
+                == second.hashes.sourceKVTensorSHA256,
+            first.hashes.queryTensorSHA256
+                == second.hashes.queryTensorSHA256,
             first.memorySettings == second.memorySettings,
             first.power.lowPowerModeEnabledBefore
                 == second.power.lowPowerModeEnabledBefore,
@@ -854,7 +1095,7 @@ private extension CompressedAttentionProbeModelIdentity {
 }
 
 private extension CompressedAttentionProbePackageIdentity {
-    func validate() throws {
+    func validate(promotionEvidence: Bool) throws {
         guard CompressedAttentionProbeEvidence.isEvidenceValue(
             mlxSwiftVersion)
         else {
@@ -874,6 +1115,25 @@ private extension CompressedAttentionProbePackageIdentity {
         }
         guard CompressedAttentionProbeEvidence.isEvidenceValue(
             harnessBuildConfiguration)
+        else {
+            throw CompressedAttentionProbeEvidenceError
+                .invalidIdentity("harnessBuildConfiguration")
+        }
+        guard !promotionEvidence
+            || mlxSwiftVersion == Self.qualifiedMLXSwiftVersion
+        else {
+            throw CompressedAttentionProbeEvidenceError
+                .invalidIdentity("mlxSwiftVersion")
+        }
+        guard !promotionEvidence
+            || mlxSwiftLMRevision == Self.qualifiedMLXSwiftLMRevision
+        else {
+            throw CompressedAttentionProbeEvidenceError
+                .invalidIdentity("mlxSwiftLMRevision")
+        }
+        guard !promotionEvidence
+            || harnessBuildConfiguration
+                == Self.qualifiedBuildConfiguration
         else {
             throw CompressedAttentionProbeEvidenceError
                 .invalidIdentity("harnessBuildConfiguration")
@@ -913,7 +1173,7 @@ private extension CompressedAttentionProbeRunReceipts {
         try bytes.validate(
             role: role,
             operation: operation,
-            layout: plan.layout)
+            plan: plan)
         try mlxMemory.validate()
         try processRSS.validate()
         try memorySettings.validate()
@@ -945,7 +1205,7 @@ private extension CompressedAttentionProbeByteReceipts {
     func validate(
         role: CompressedAttentionProbeRunRole,
         operation: CompressedAttentionProbeOperation,
-        layout: CompressedAttentionProbeLayout
+        plan: CompressedAttentionProbePlan
     ) throws {
         guard let expectedPersistent = CompressedAttentionProbeEvidence
             .checkedSum([
@@ -973,6 +1233,19 @@ private extension CompressedAttentionProbeByteReceipts {
         else {
             throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
         }
+        let geometry = try CompressedAttentionProbeExpectedByteGeometry.derive(
+            plan: plan, role: role, operation: operation)
+        guard payloadBytes == geometry.payloadBytes,
+            scaleBytes == geometry.scaleBytes,
+            biasBytes == geometry.biasBytes,
+            controlBytes == geometry.controlBytes,
+            alignmentPaddingBytes == geometry.alignmentPaddingBytes,
+            fp16ResidentBytes == geometry.fp16ResidentBytes,
+            persistentKVBytes == geometry.persistentKVBytes,
+            materializationBytes == geometry.materializationBytes
+        else {
+            throw CompressedAttentionProbeEvidenceError.invalidByteAccounting
+        }
         switch role {
         case .fp16Reference:
             guard payloadBytes == 0,
@@ -986,7 +1259,7 @@ private extension CompressedAttentionProbeByteReceipts {
                     .invalidByteAccounting
             }
         case .candidate:
-            switch layout {
+            switch plan.layout {
             case .fp16:
                 guard payloadBytes == 0,
                     scaleBytes == 0,
@@ -1103,36 +1376,32 @@ private extension CompressedAttentionProbeThermalReceipts {
 private extension CompressedAttentionProbeNumericControls {
     func validate() throws {
         let metrics = [
-            packedMaxAbsoluteError,
-            packedMaxRelativeError,
-            fp16MaxAbsoluteError,
-            fp16MaxRelativeError,
+            candidateMaxAbsoluteError,
+            candidateMaxRelativeError,
+            candidateMaximumToleranceRatio,
+            referenceMaxAbsoluteError,
+            referenceMaxRelativeError,
+            referenceMaximumToleranceRatio,
         ]
         guard metrics.allSatisfy({ $0.isFinite && $0 >= 0 }),
-            packedTop1TokenID >= 0,
-            unpackedTop1TokenID >= 0,
-            fp16Top1TokenID >= 0,
-            referenceTop1TokenID >= 0
+            candidateTop1Index >= 0,
+            candidateOracleTop1Index >= 0,
+            referenceTop1Index >= 0,
+            referenceOracleTop1Index >= 0
         else {
             throw CompressedAttentionProbeEvidenceError
                 .invalidMetric("numericControls")
         }
-        guard packedTop1TokenID == unpackedTop1TokenID,
-            packedMaxRelativeError
-                <= CompressedAttentionProbeEvidence.packedRTolerance,
-            packedMaxAbsoluteError
-                <= CompressedAttentionProbeEvidence.packedATolerance
+        guard candidateTop1Index == candidateOracleTop1Index,
+            candidateMaximumToleranceRatio <= 1
         else {
             throw CompressedAttentionProbeEvidenceError
-                .packedStructuralMismatch
+                .candidateStructuralMismatch
         }
-        guard fp16Top1TokenID == referenceTop1TokenID,
-            fp16MaxRelativeError
-                <= CompressedAttentionProbeEvidence.fp16RTolerance,
-            fp16MaxAbsoluteError
-                <= CompressedAttentionProbeEvidence.fp16ATolerance
+        guard referenceTop1Index == referenceOracleTop1Index,
+            referenceMaximumToleranceRatio <= 1
         else {
-            throw CompressedAttentionProbeEvidenceError.fp16ControlMismatch
+            throw CompressedAttentionProbeEvidenceError.referenceControlMismatch
         }
     }
 }
@@ -1140,10 +1409,10 @@ private extension CompressedAttentionProbeNumericControls {
 private extension CompressedAttentionProbeHashes {
     func validate() throws {
         for (name, value) in [
-            ("sourceKVProjectionSHA256", sourceKVProjectionSHA256),
-            ("packedKVProjectionSHA256", packedKVProjectionSHA256),
-            ("inputTokenIDsSHA256", inputTokenIDsSHA256),
-            ("outputTokenIDsSHA256", outputTokenIDsSHA256),
+            ("sourceKVTensorSHA256", sourceKVTensorSHA256),
+            ("packedKVTensorSHA256", packedKVTensorSHA256),
+            ("queryTensorSHA256", queryTensorSHA256),
+            ("outputTensorSHA256", outputTensorSHA256),
         ] {
             guard CompressedAttentionProbeEvidence.isSHA256(value) else {
                 throw CompressedAttentionProbeEvidenceError.invalidHash(name)
