@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-18
+Last reviewed: 2026-07-19
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -47,6 +47,18 @@ Shelved/rejected cells remain model-specific controls. This is Qwen3-32B-4bit ev
 frozen KVTuner schedule is Qwen-only unless independently calibrated and authenticated for another
 family.
 
+**Compressed-attention implementation Phases 1-3 — VERIFIED, NOT PROMOTED (2026-07-19):**
+clean `5e6abb6ebf13ea8641b26638278680e99884adea` now contains the portable packed-affine
+attention router, actor-confined affine/frozen-KVTuner scalar runtime, exact storage/workspace
+telemetry, and hostile-compaction-safe compressed continuous batching. The batch implementation
+tracks physical written end independently from surviving logical offsets and covers unequal-row
+merge, longest/zero-padding-boundary removal, append, mask width, survivor packed bytes/logits,
+and dense-control parity. The same change binds KVTuner config, checkpoint content, tokenizer,
+calibration, sensitivity, candidates, search, schedule, runtime, task, and KL evidence by exact
+content. Consequently, the historical KVarN-cycle bundle remains valid only for that dated verdict
+and cannot authorize the new runtime; a fresh qualification bundle is required. KVarN i8 direct
+packed attention and loaded-model Qwen/Llama frontiers remain open, so there is no new speed tier.
+
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
@@ -65,13 +77,17 @@ notable spike, including negative results.
    Both selected models share Q64/KV8/D128, so they do not prove cross-geometry generality. Prove
    valid end-to-end behavior and the batch-compaction poison case before any speed claim. Add
    another popular model with materially different attention geometry before broad/default support.
-   Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`: the verified split
-   independent-K/V affine path avoids materialization and shows a credible 32K/near-128K synthetic
-   decode envelope, while Qwen's 128K request refuses before allocation. The measured decision is
-   to extend the portable quantized-matmul route, not begin with custom Metal. The active gate is
-   Phase 1's model-generic router seam and fail-closed contract, followed by actor-confined scalar
-   runtime integration. Phase 0 timings did not instantiate or execute checkpoint weights as MLX
-   model tensors and are not model, prefill, end-to-end, family-generalization, or dial results.
+   Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`; implementation
+   Phases 1-3 are clean and verified at `5e6abb6ebf13ea8641b26638278680e99884adea` for the
+   packed-affine/KVTuner route. The active gates are (a) fresh exact-content KVTuner qualification,
+   because legacy schedule evidence now fails closed, (b) KVarN i8 direct packed attention, and
+   then (c) loaded-model Qwen/Llama end-to-end qualification. The new qualification run is rooted
+   by artifact ID `fused-compressed-kv-qwen3-32b-v1-5e6abb6`; its schema-v2 manifest SHA-256 is
+   `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f`; its schema-v3 g128
+   sensitivity SHA-256 is `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc`.
+   The canonical 64-candidate, target-pair-bits-390 run is the current long-running stage. Neither
+   the Phase 0 synthetic timings nor the implementation tests are model, prefill, end-to-end,
+   family-generalization, or dial results.
    [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.

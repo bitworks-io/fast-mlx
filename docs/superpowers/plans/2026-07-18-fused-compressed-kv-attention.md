@@ -1,6 +1,7 @@
 # Fused compressed-domain KV attention implementation plan
 
-**Status:** active — Phase 0 profiling/evidence work authorized; runtime integration remains gated
+**Status:** active — Phases 0-3 verified; exact-source requalification, KVarN direct attention,
+and loaded-model frontiers remain gated
 
 **Technique class:** `LOSSY_FRONTIER`
 
@@ -262,26 +263,58 @@ the Llama geometry row is not independent cross-geometry or model-runtime eviden
 
 ### Phase 1 — portable attention-router seam
 
-- [ ] Define the narrow packed-cache attention contract required by the selected formats and
+- [x] Define the narrow packed-cache attention contract required by the selected formats and
   review it against every pinned model call shape that uses the shared helper.
-- [ ] Choose a portable dependency strategy. Do not patch `.build/checkouts`; pin every source
+- [x] Choose a portable dependency strategy. Do not patch `.build/checkouts`; pin every source
   revision and keep the dependency diff upstream-reviewable.
-- [ ] TDD unsupported path, independent K/V geometry, mask, GQA, sink/window, and non-finite
+- [x] TDD unsupported path, independent K/V geometry, mask, GQA, sink/window, and non-finite
   failures before connecting any model.
+
+Clean implementation commit: `faa385f` (`Add portable packed-affine attention router`). The
+portable source is vendored and revision-pinned; the shared helper routes by cache capability, not
+model name. Unsupported/windowed/sink/non-finite paths fail closed.
 
 ### Phase 2 — actor-confined scalar runtime
 
-- [ ] Integrate affine K4V2-g64 and frozen KVTuner first, because their packed affine data maps
+- [x] Integrate affine K4V2-g64 and frozen KVTuner first, because their packed affine data maps
   most directly to quantized matrix multiplies.
 - [ ] Add KVarN i8 only after its query/key transform and value/output reconstruction are proven
   from the same packed bytes without materialization.
-- [ ] Preserve exact engagement, persistent bytes, workspace, reset, growth, and rollback receipts.
+- [x] Preserve exact engagement, persistent bytes, workspace, reset, growth, and rollback receipts
+  for the implemented affine/KVTuner formats. KVarN receipts remain part of its open item above.
+
+Clean implementation commit: `e2d719e` (`Add authenticated compressed KV attention runtime`).
+This is an implementation/correctness milestone, not a loaded-model speed result.
 
 ### Phase 3 — continuous-batch poison case
 
-- [ ] Implement merge/extract/filter only for a proven dense architecture class.
-- [ ] Track explicit physical written end independently of surviving logical/padded offsets.
-- [ ] Pass unequal-row merge -> longest-row removal -> append -> survivor byte/logit/mask parity.
+- [x] Implement merge/extract/filter only for a proven dense architecture class.
+- [x] Track explicit physical written end independently of surviving logical/padded offsets.
+- [x] Pass unequal-row merge -> longest-row removal -> append -> survivor byte/logit/mask parity.
+
+Clean implementation commit: `5e6abb6ebf13ea8641b26638278680e99884adea` (`Add
+provenance-bound compressed continuous batching`). Clean verification passes 457 XCTest + 17 Swift
+Testing HarnessCore tests, 65 FastMLXHarness tests, 127 SpikeCore tests, and the Release build.
+Focused review reports no remaining High/Medium findings; the commit scan reports no secrets or
+banned concurrency escape hatches. The same change migrates KVTuner from manifest-only checkpoint
+identity to exact checkpoint-content identity through calibration, sensitivity, candidates,
+search, schedule, runtime, task, and KL evidence.
+
+### Phase 3.5 — exact-source KVTuner requalification
+
+- [x] Produce a fresh schema-v2 calibration manifest from the clean Phase 3 SHA. Artifact SHA-256:
+  `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f`; checkpoint-content
+  SHA-256: `636f358d4f51c9394400fa46ef684b918e45c14d369d95df0399c80abc8a09d9`.
+- [x] Capture the clean-SHA g128 sensitivity artifact. Artifact SHA-256:
+  `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc`; 64 layers and 3,840
+  authenticated samples under artifact ID `fused-compressed-kv-qwen3-32b-v1-5e6abb6`.
+- [ ] Evaluate the exact canonical 64-candidate set at target pair-bits 390 through the resumable,
+  exact-byte/idempotent runner path. This is the current long-running stage.
+- [ ] Authenticate search and schedule, then freeze a new qualification bundle before any KVTuner
+  runtime, task, KL, or end-to-end row.
+
+The historical KVarN-cycle bundle remains immutable evidence for its dated verdict. It is not
+rewritten or silently upgraded and cannot authorize the new runtime path.
 
 ### Phase 4 — end-to-end Qwen frontier
 

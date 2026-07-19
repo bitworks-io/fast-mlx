@@ -385,3 +385,33 @@ promotion evidence.
 **Overall verdict:** Phase 0 passes and selects the portable independent-K/V quantized-matmul
 route. All loaded-model, prefill, lifecycle, batching, quality, product, and promotion claims remain
 open.
+
+## Fused compressed-attention Phases 1-3 implementation acceptance pass — 2026-07-19
+
+**Story:** an Apple-Silicon long-context operator can enter an experimental packed-affine or
+authenticated KVTuner runtime without full-cache materialization, and a continuous-batch survivor
+cannot be corrupted when the longest zero-padding-boundary row leaves. This implementation proof
+must not be mistaken for a loaded-model speed or dial-promotion result.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Portable model-generic router | **PASS** | Clean `faa385f` vendors the pinned Swift-LM source and routes the shared attention helper by cache capability rather than model name. Independent K/V geometry, explicit causal masks, GQA, unsupported window/sink paths, and non-finite refusal are regression-covered. |
+| Actor-confined scalar runtime and honest telemetry | **PASS** | Clean `e2d719e` integrates affine K4V2 and frozen KVTuner through the packed route while preserving reset/growth/rollback, exact engagement, persistent packed bytes, materialization bytes, and attention workspace. MLX state remains actor-confined and lossy KV plus PLD remains rejected. |
+| Hostile continuous-batch transition | **PASS** | Clean `5e6abb6ebf13ea8641b26638278680e99884adea` tracks a physical written end independently from logical row offsets. Tests merge unequal rows, remove the longest/zero-padding-boundary row, append again, and prove physical end, fixed mask width, survivor packed bytes/logits, growth, extraction, and dense-control parity. |
+| Exact KVTuner source and evidence binding | **PASS** | The same clean commit carries exact config and checkpoint-content SHA-256 through manifest, sensitivity, candidate evaluation, search, schedule, runtime selection, task, and KL evidence. Contentless or substituted fp16 references and same-manifest/different-content checkpoints fail closed. Historical schema-v1 qualification artifacts remain readable only where explicitly supported and cannot authorize the new content-bound path. |
+| Clean-SHA build and test proof | **PASS** | Off-box `HarnessCoreTests` passes 457 XCTest + 17 Swift Testing tests with zero failures. On the synced clean SHA, Xcode with `-skipPackagePluginValidation` passes 65/65 `FastMLXHarnessTests` and 127/127 `SpikeCoreTests`; the Release `fastmlx-harness` build succeeds. MLX-coupled targets were not run through SwiftPM. Pure log SHA-256 `15faac23858b973a95f0b51ab0ab55feaaee63bdb71c4f2f98f94efdfceedc08`; Xcode log `e7d1641a42e1ff85b1b4ba0a3787b271fb42ca7b317456e61ca18d0c1c952b9d`; Release log `86c3cd4dc482cd0e19739e6518fa366747431e8d1b6605d55a4d31d4177d4153`. |
+| Review and repository safety | **PASS** | Two focused reviews report no remaining High/Medium findings after exact-reference fixes. `git diff --check`, banned isolation/machine-path/key-marker scans, and commit-scoped gitleaks pass; the commit retains the required co-author trailer. |
+| Loaded-model speed, quality, and cross-family promotion | **PENDING** | KVarN i8 still materializes and needs its own direct packed-attention proof. Exact-source KVTuner requalification is in progress. Qwen 8K/32K plus 128K refusal, Llama 8K/32K/near-128K, TTFT/TPOT, task floor, teacher-forced loss, capacity, and same-workload speed remain unmeasured for this implementation. |
+
+**Fresh requalification boundary:** schema-v2 KVTuner manifest SHA-256
+`e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f` binds checkpoint-content
+SHA-256 `636f358d4f51c9394400fa46ef684b918e45c14d369d95df0399c80abc8a09d9`.
+Schema-v3 g128 sensitivity SHA-256
+`9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc` authenticates 64 layers and
+3,840 samples at the same clean SHA. The canonical 64 candidates, search, and a new qualification
+bundle remain pending. No old bundle is rewritten, and no PROMOTE/SHELVE verdict is issued by this
+implementation packet.
+
+**Coverage boundary:** the full acceptance suites above were rerun without coverage instrumentation.
+The prior Phase 0 coverage packet remains historical evidence; this packet does not claim a new
+line-coverage percentage.

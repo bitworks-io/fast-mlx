@@ -66,14 +66,14 @@ end-to-end negative. Structural cache corruption is a correctness bug, never qua
 
 ## Next Step
 
-Continue Phase 1 of the dated
+Continue the post-Phase-3 qualification work in the dated
 [`2026-07-18-fused-compressed-kv-attention.md`](../superpowers/plans/2026-07-18-fused-compressed-kv-attention.md)
-plan. Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`. Its synthetic
-decode evidence selected the existing quantized-matmul route with independent K/V geometry and
-deferred custom Metal; it streamed checkpoint bytes only for content authentication and did not
-instantiate or execute them as MLX model tensors, so it did not prove prefill, end-to-end, model,
-family, or dial performance. Define and TDD the smallest model-generic packed-attention router seam,
-including independent K/V geometry, exact mask/GQA behavior, frozen-schedule authentication,
-unsupported architecture and non-finite refusal, and a portable pinned dependency strategy. Then
-integrate actor-confined affine K4V2-g64 and frozen Qwen KVTuner scalar runtime before KVarN or
-batch compaction.
+plan. Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`; the portable
+router, actor-confined affine/KVTuner scalar runtime, and hostile-compaction-safe compressed batch
+path are clean and verified at `5e6abb6ebf13ea8641b26638278680e99884adea`. The exact-content
+provenance migration intentionally rejects the historical KVTuner bundle for new-runtime evidence.
+Finish its fresh manifest -> sensitivity -> 64-candidate -> search -> bundle chain, implement and
+prove KVarN i8 direct packed attention without materialization, then run the loaded-model Qwen
+8K/32K plus 128K refusal and Llama 8K/32K/near-128K frontiers. Preserve the same-workload
+speed/capacity/teacher-forced-loss/task-floor contract and do not promote from implementation tests
+or synthetic geometry.
