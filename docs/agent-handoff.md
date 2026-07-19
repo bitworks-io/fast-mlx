@@ -58,6 +58,11 @@ calibration, sensitivity, candidates, search, schedule, runtime, task, and KL ev
 content. Consequently, the historical KVarN-cycle bundle remains valid only for that dated verdict
 and cannot authorize the new runtime; a fresh qualification bundle is required. KVarN i8 direct
 packed attention and loaded-model Qwen/Llama frontiers remain open, so there is no new speed tier.
+Clean `3bb0a2a43fba9690dfaab86cb302a746c9556ef9` adds only the durable direct-KVarN
+request/receipt and promotion-evidence contract: exact K4V2/G128/i8 evidence can describe zero
+materialization plus positive attention workspace, while task/KL promotion fails closed until task
+evidence can authenticate the same route. The CLI/MLX runtime remains deliberately unimplemented
+and its pending red tests must run through Xcode on an available bench before production code.
 
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.

@@ -286,6 +286,12 @@ model name. Unsupported/windowed/sink/non-finite paths fail closed.
 Clean implementation commit: `e2d719e` (`Add authenticated compressed KV attention runtime`).
 This is an implementation/correctness milestone, not a loaded-model speed result.
 
+Clean pure-contract commit `3bb0a2a43fba9690dfaab86cb302a746c9556ef9` adds a distinct
+`split-kvarn-quantized-mm` request/receipt and fail-closed frontier/task-promotion rules for the
+exact K4V2/G128/i8 cell. It does not implement or prove the MLX route. The first packed K/V qMM
+and CLI tests remain pending Xcode red/green execution on a bench Mac; no direct-KVarN engagement
+or promotion row is valid yet.
+
 ### Phase 3 — continuous-batch poison case
 
 - [x] Implement merge/extract/filter only for a proven dense architecture class.
