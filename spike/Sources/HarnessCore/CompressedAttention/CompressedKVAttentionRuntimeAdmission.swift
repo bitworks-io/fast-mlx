@@ -7,6 +7,15 @@ public enum CompressedKVAttentionRequest:
 {
     case materialize
     case splitAffineQuantizedMM = "split-affine-quantized-mm"
+
+    /// KVTuner always owns an affine cache, so even its historical materialize-before-attend
+    /// route must be explicit in new evidence. Other tiers keep their existing nil default.
+    public static func effective(
+        explicit: Self?,
+        hasAuthenticatedKVTunerSchedule: Bool
+    ) -> Self? {
+        explicit ?? (hasAuthenticatedKVTunerSchedule ? .materialize : nil)
+    }
 }
 
 /// Operation actually reported by the cache after an attention forward. This lives in
@@ -322,13 +331,17 @@ public struct CompressedKVAttentionRuntimeAdmission:
 
     public func validateScheduleIdentity(
         modelConfigHash: String,
+        modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         layerCount: Int,
         groupSize: Int
     ) throws {
         guard self.modelConfigHash == modelConfigHash,
+            self.modelConfigSHA256 == modelConfigSHA256,
             self.checkpointManifestHash == checkpointManifestHash,
+            self.checkpointContentSHA256 == checkpointContentSHA256,
             self.tokenizerSHA256 == tokenizerSHA256,
             self.layerCount == layerCount
         else {

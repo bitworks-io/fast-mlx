@@ -965,11 +965,11 @@ func runKL(_ flags: Flags) async {
         // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
         let kvQuantTier = try requestedKVQuantTier(flags)
         let requestedKVQuantTier = kvQuantTier ?? "fp16"
-        let compressedKVAttention = try requestedCompressedKVAttention(
+        let explicitCompressedKVAttention = try requestedCompressedKVAttention(
             flags, tier: requestedKVQuantTier)
-        let compressedKVAttentionExpectedCheckpointContentSHA256 = try
+        let explicitCheckpointContentSHA256 = try
             requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
-                flags, request: compressedKVAttention)
+                flags, request: explicitCompressedKVAttention)
         let kvtunerSchedulePath = try flags.strictString(
             "kvtuner-schedule", default: "")
         try validateKVTunerScheduleFlag(
@@ -995,20 +995,14 @@ func runKL(_ flags: Flags) async {
         }
         let sameResolvedModel = ProvenanceCLI.sameResolvedModelPath(
             modelPath, referenceModelPath)
-        try CompressedKVAttentionRuntimeAdmission
-            .validateKLReferenceModel(
-                isSameResolvedModel: sameResolvedModel,
-                request: compressedKVAttention)
-        let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+        let preflightCandidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(
             at: modelPath,
             checkpointContentSHA256:
-                compressedKVAttentionExpectedCheckpointContentSHA256)
-        let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+                explicitCheckpointContentSHA256)
+        let preflightReferenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
             at: referenceModelPath,
             checkpointContentSHA256: sameResolvedModel
-                ? compressedKVAttentionExpectedCheckpointContentSHA256 : nil)
-        let sameWeights = sameResolvedModel
-            && candidateIdentity == referenceIdentity
+                ? explicitCheckpointContentSHA256 : nil)
         let corpus = try loadMeasurementCorpus(flags)
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(requestedKVQuantTier) {
@@ -1017,12 +1011,41 @@ func runKL(_ flags: Flags) async {
                 modelPath: modelPath,
                 matrixID: matrixID,
                 cellID: cellID,
-                modelIdentity: candidateIdentity,
+                modelIdentity: preflightCandidateIdentity,
                 evaluationCorpus:
                     KVTunerEvaluationCorpusIdentity.measurementCorpus(corpus))
         } else {
             preparedKVTuner = nil
         }
+        let effectiveAttention = try
+            effectiveCompressedKVAttentionConfiguration(
+                explicitRequest: explicitCompressedKVAttention,
+                explicitCheckpointContentSHA256:
+                    explicitCheckpointContentSHA256,
+                authenticatedKVTunerCheckpointContentSHA256:
+                    preparedKVTuner?.binding.checkpointContentSHA256)
+        let compressedKVAttention = effectiveAttention.request
+        let compressedKVAttentionExpectedCheckpointContentSHA256 =
+            effectiveAttention.checkpointContentSHA256
+        try CompressedKVAttentionRuntimeAdmission
+            .validateKLReferenceModel(
+                isSameResolvedModel: sameResolvedModel,
+                request: compressedKVAttention)
+        let candidateIdentity = KVModelEvidenceIdentity(
+            configHash: preflightCandidateIdentity.configHash,
+            checkpointManifestHash:
+                preflightCandidateIdentity.checkpointManifestHash,
+            checkpointContentSHA256:
+                compressedKVAttentionExpectedCheckpointContentSHA256)
+        let referenceIdentity = KVModelEvidenceIdentity(
+            configHash: preflightReferenceIdentity.configHash,
+            checkpointManifestHash:
+                preflightReferenceIdentity.checkpointManifestHash,
+            checkpointContentSHA256: sameResolvedModel
+                ? compressedKVAttentionExpectedCheckpointContentSHA256
+                : nil)
+        let sameWeights = sameResolvedModel
+            && candidateIdentity == referenceIdentity
         let requestedCacheKind: KVCacheKind
         if let selection = preparedKVTuner?.selection {
             requestedCacheKind = .kvtuner(selection)

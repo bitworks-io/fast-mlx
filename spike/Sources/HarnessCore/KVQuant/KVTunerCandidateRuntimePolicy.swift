@@ -35,6 +35,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
     /// manifest and sensitivity artifact before the policy becomes executable.
     public let modelConfigSHA256: String
     public let checkpointManifestHash: String
+    public let checkpointContentSHA256: String
     public let tokenizerSHA256: String
     public let groupSize: Int
     public let targetPairBitTotal: Int
@@ -52,6 +53,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         groupSize: Int,
         targetPairBitTotal: Int,
@@ -69,6 +71,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
         self.groupSize = groupSize
         self.targetPairBitTotal = targetPairBitTotal
@@ -86,6 +89,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         exactSensitivityArtifactData: Data,
         exactModelConfigData: Data,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         expectedTokenizerSHA256: String,
         targetPairBitTotal: Int,
         maxCandidates: Int,
@@ -144,7 +148,11 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         guard expectedCheckpointManifestHash
                 == manifest.checkpointManifestHash,
             sensitivity.checkpointManifestHash
-                == expectedCheckpointManifestHash
+                == expectedCheckpointManifestHash,
+            expectedCheckpointContentSHA256
+                == manifest.checkpointContentSHA256,
+            sensitivity.checkpointContentSHA256
+                == expectedCheckpointContentSHA256
         else {
             throw KVTunerCandidateRuntimePolicyError
                 .checkpointIdentityMismatch
@@ -226,6 +234,8 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             modelConfigSHA256: modelConfigSHA256,
             checkpointManifestHash:
                 sensitivity.checkpointManifestHash,
+            checkpointContentSHA256:
+                sensitivity.checkpointContentSHA256,
             tokenizerSHA256: sensitivity.tokenizerSHA256,
             groupSize: sensitivity.groupSize,
             targetPairBitTotal: targetPairBitTotal,
@@ -245,6 +255,8 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             modelConfigSHA256: modelConfigSHA256,
             checkpointManifestHash:
                 sensitivity.checkpointManifestHash,
+            checkpointContentSHA256:
+                sensitivity.checkpointContentSHA256,
             tokenizerSHA256: sensitivity.tokenizerSHA256,
             groupSize: sensitivity.groupSize,
             targetPairBitTotal: targetPairBitTotal,
@@ -263,6 +275,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         groupSize: Int
     ) throws -> KVTunerCandidateRuntimePolicy {
@@ -274,6 +287,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             [64, 128].contains(groupSize),
             isLowercaseHex(candidate.analysisSHA256, length: 64),
             isLowercaseHex(modelConfigSHA256, length: 64),
+            isLowercaseHex(checkpointContentSHA256, length: 64),
             isLowercaseHex(tokenizerSHA256, length: 64)
         else {
             throw KVTunerCandidateRuntimePolicyError
@@ -330,6 +344,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             modelConfigHash: modelConfigHash,
             modelConfigSHA256: modelConfigSHA256,
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             groupSize: groupSize,
             targetPairBitTotal: candidate.totalPairBits,
@@ -347,6 +362,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             modelConfigHash: modelConfigHash,
             modelConfigSHA256: modelConfigSHA256,
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             groupSize: groupSize,
             targetPairBitTotal: candidate.totalPairBits,
@@ -403,6 +419,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         groupSize: Int,
         targetPairBitTotal: Int,
@@ -411,7 +428,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
         layers: [KVTunerRuntimeLayerPolicy]
     ) -> String {
         var transcript = RuntimePolicyTranscript(
-            domain: "fast-mlx.kvtuner-candidate-runtime-policy.v1")
+            domain: "fast-mlx.kvtuner-candidate-runtime-policy.v2")
         for value in [
             calibrationManifestSHA256,
             sensitivityArtifactSHA256,
@@ -421,6 +438,7 @@ public struct KVTunerCandidateRuntimePolicy: Hashable, Sendable {
             modelConfigHash,
             modelConfigSHA256,
             checkpointManifestHash,
+            checkpointContentSHA256,
             tokenizerSHA256,
         ] {
             transcript.appendString(value)

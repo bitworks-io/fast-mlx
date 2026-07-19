@@ -241,9 +241,9 @@ private func validateTaskReferenceBeforeModelLoad(
     else {
         throw TaskCoherenceCLIError.invalidReference("corpus mismatch")
     }
-    guard reference.identity.modelConfigHash == identity.configHash,
-        reference.identity.modelCheckpointManifestHash
-            == identity.checkpointManifestHash
+    guard TaskCoherenceArtifact.referenceModelIdentityMatches(
+        reference: reference.identity,
+        candidate: identity)
     else {
         throw TaskCoherenceCLIError.invalidReference("model identity mismatch")
     }
@@ -566,10 +566,18 @@ func runTaskCoherence(_ flags: Flags) async {
     do {
         let plan = try parseTaskCoherenceRunPlan(flags)
         let corpus = try TaskCoherenceCorpusV2.make()
-        let modelIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+        // A newly generated fp16 reference is the root of every lossy comparison. Hash its exact
+        // checkpoint bytes once, outside all timed model work, so later compressed candidates can
+        // reject contentless or same-manifest/different-bytes references.
+        let fp16CheckpointContentSHA256 = plan.tier == "fp16"
+            ? try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+                at: plan.modelPath)
+            : nil
+        let preflightModelIdentity = try ProvenanceCLI.modelEvidenceIdentity(
             at: plan.modelPath,
             checkpointContentSHA256:
-                plan.compressedKVAttentionExpectedCheckpointContentSHA256)
+                plan.compressedKVAttentionExpectedCheckpointContentSHA256
+                ?? fp16CheckpointContentSHA256)
         let tokenizerManifestSHA256 =
             try ProvenanceCLI.tokenizerManifestSHA256(at: plan.modelPath)
         let runConfiguration =
@@ -579,12 +587,48 @@ func runTaskCoherence(_ flags: Flags) async {
             modelPath: plan.modelPath, referenceVersions: nil,
             taskCorpus: corpus,
             modelCheckpointManifestHash:
-                modelIdentity.checkpointManifestHash)
+                preflightModelIdentity.checkpointManifestHash)
         guard cleanTaskHarnessSHA(provenance.harnessGitSHA) else {
             throw TaskCoherenceCLIError.dirtyHarnessSHA(
                 provenance.harnessGitSHA)
         }
 
+        let preparedKVTuner: PreparedKVTunerRun?
+        if let schedulePath = plan.kvtunerSchedulePath {
+            preparedKVTuner = try await prepareKVTunerRun(
+                schedulePath: schedulePath,
+                modelPath: plan.modelPath,
+                matrixID: plan.matrixID,
+                cellID: plan.cellID,
+                modelIdentity: preflightModelIdentity,
+                evaluationCorpus:
+                    KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(
+                        corpus))
+        } else {
+            preparedKVTuner = nil
+        }
+        let effectiveAttention = try
+            effectiveCompressedKVAttentionConfiguration(
+                explicitRequest: plan.compressedKVAttention,
+                explicitCheckpointContentSHA256:
+                    plan
+                        .compressedKVAttentionExpectedCheckpointContentSHA256,
+                authenticatedKVTunerCheckpointContentSHA256:
+                    preparedKVTuner?.binding.checkpointContentSHA256)
+        let effectiveCompressedKVAttention = effectiveAttention.request
+        let effectiveCheckpointContentSHA256 =
+            effectiveAttention.checkpointContentSHA256
+        let modelIdentity = KVModelEvidenceIdentity(
+            configHash: preflightModelIdentity.configHash,
+            checkpointManifestHash:
+                preflightModelIdentity.checkpointManifestHash,
+            checkpointContentSHA256:
+                effectiveCheckpointContentSHA256
+                ?? preflightModelIdentity.checkpointContentSHA256)
+
+        // KVTuner's exact content identity is authenticated by its frozen bundle, so reference
+        // validation must happen after that identity is derived. Performing this check against
+        // the cheap preflight manifest would permit same-name/same-size checkpoint substitution.
         let reference: TaskCoherenceArtifactSummary?
         if let path = plan.referenceEvidencePath {
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -600,30 +644,14 @@ func runTaskCoherence(_ flags: Flags) async {
             reference = nil
         }
 
-        let preparedKVTuner: PreparedKVTunerRun?
-        if let schedulePath = plan.kvtunerSchedulePath {
-            preparedKVTuner = try await prepareKVTunerRun(
-                schedulePath: schedulePath,
-                modelPath: plan.modelPath,
-                matrixID: plan.matrixID,
-                cellID: plan.cellID,
-                modelIdentity: modelIdentity,
-                evaluationCorpus:
-                    KVTunerEvaluationCorpusIdentity.taskCoherenceCorpus(
-                        corpus))
-        } else {
-            preparedKVTuner = nil
-        }
-
         print("# task-coherence loading model after all artifact preflight gates passed")
         let (driver, tokenizer, _) = try await loadSwiftDriver(
             modelPath: plan.modelPath,
             kvQuantTier: plan.tier == "fp16" ? nil : plan.tier,
             kvtunerSelection: preparedKVTuner?.selection,
-            compressedKVAttention: plan.compressedKVAttention,
+            compressedKVAttention: effectiveCompressedKVAttention,
             compressedKVAttentionExpectedCheckpointContentSHA256:
-                plan
-                    .compressedKVAttentionExpectedCheckpointContentSHA256)
+                effectiveCheckpointContentSHA256)
         let labelTokenIDs = try taskLabelTokenIDs(tokenizer: tokenizer)
         print("# restricted-choice token IDs: \(labelTokenIDs)")
         let preparedCases = try prepareTaskCoherenceCases(
@@ -655,10 +683,9 @@ func runTaskCoherence(_ flags: Flags) async {
                 maxTokens: maxTokens,
                 kvQuant: configTier,
                 kvtunerSelection: preparedKVTuner?.selection,
-                compressedKVAttention: plan.compressedKVAttention,
+                compressedKVAttention: effectiveCompressedKVAttention,
                 compressedKVAttentionExpectedCheckpointContentSHA256:
-                    plan
-                        .compressedKVAttentionExpectedCheckpointContentSHA256)
+                    effectiveCheckpointContentSHA256)
         }
         let identity = TaskCoherenceRunIdentity(
             corpusID: corpus.id,
@@ -671,7 +698,7 @@ func runTaskCoherence(_ flags: Flags) async {
             kvQuantTier: plan.tier,
             kvtunerSchedule: preparedKVTuner?.binding)
         let evidenceSchemaVersion =
-            plan.compressedKVAttention != nil
+            modelIdentity.checkpointContentSHA256 != nil
             ? TaskCoherenceArtifact.compressedAttentionSchemaVersion
             : TaskCoherenceArtifact.schemaVersion
 
@@ -734,7 +761,7 @@ func runTaskCoherence(_ flags: Flags) async {
                 scoring: scoringEngagement)
             let compressedKVAttention = try taskCompressedKVAttentionBinding(
                 tier: plan.tier,
-                request: plan.compressedKVAttention,
+                request: effectiveCompressedKVAttention,
                 admission: driver.compressedKVAttentionAdmission,
                 generated: generation.engagement,
                 scoring: scoringEngagement)

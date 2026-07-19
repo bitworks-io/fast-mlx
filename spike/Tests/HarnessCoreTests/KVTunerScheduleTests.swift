@@ -6,15 +6,19 @@ final class KVTunerScheduleTests: XCTestCase {
     private let matrixID = "kvarn-qwen3-32b-v1"
     private let cellID = "kvtuner-g128-b4.5"
     private let configHash = "0123456789abcdef"
+    private let configSHA256 = String(repeating: "d", count: 64)
     private let checkpointHash = "fedcba9876543210"
+    private let checkpointContentSHA256 = String(repeating: "e", count: 64)
 
     private func validSchedule() -> KVTunerSchedule {
         KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
+            modelConfigSHA256: configSHA256,
             checkpointManifestHash: checkpointHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
@@ -46,10 +50,13 @@ final class KVTunerScheduleTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: expectedCellID ?? cellID,
             expectedModelConfigHash: configHash,
-            expectedCheckpointManifestHash: checkpointHash)
+            expectedModelConfigSHA256: configSHA256,
+            expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256)
     }
 
-    func testCompletePinnedV3ScheduleValidatesAndRoundTripsJSON() throws {
+    func testCompletePinnedV4ScheduleValidatesAndRoundTripsJSON() throws {
         let validated = try validate(validSchedule())
         let encoded = try JSONEncoder().encode(validated)
         let decoded = try JSONDecoder().decode(KVTunerSchedule.self, from: encoded)
@@ -110,7 +117,10 @@ final class KVTunerScheduleTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: "aaaaaaaaaaaaaaaa",
-            expectedCheckpointManifestHash: checkpointHash)) { error in
+            expectedModelConfigSHA256: configSHA256,
+            expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256)) { error in
                 XCTAssertEqual(
                     error as? KVTunerScheduleError,
                     .modelConfigHashMismatch)
@@ -120,7 +130,10 @@ final class KVTunerScheduleTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
-            expectedCheckpointManifestHash: "bbbbbbbbbbbbbbbb")) { error in
+            expectedModelConfigSHA256: configSHA256,
+            expectedCheckpointManifestHash: "bbbbbbbbbbbbbbbb",
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256)) { error in
                 XCTAssertEqual(
                     error as? KVTunerScheduleError,
                     .checkpointManifestHashMismatch)
@@ -410,7 +423,10 @@ final class KVTunerScheduleTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
-            expectedCheckpointManifestHash: checkpointHash))
+            expectedModelConfigSHA256: configSHA256,
+            expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256))
     }
 
     func testEvaluationCorpusRejectsAggregateOrEntryLevelCalibrationLeakage() {

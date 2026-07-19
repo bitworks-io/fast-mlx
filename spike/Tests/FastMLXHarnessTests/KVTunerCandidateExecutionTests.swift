@@ -45,6 +45,7 @@ private final class TinyCandidateModel:
 
 final class KVTunerCandidateExecutionTests: XCTestCase {
     private let checkpointHash = "fedcba9876543210"
+    private let checkpointContentSHA256 = String(repeating: "d", count: 64)
     private let tokenizerSHA256 = String(repeating: "c", count: 64)
     private let configData = Data(
         #"{"eos_token_id":2,"head_dim":128,"hidden_size":128,"model_type":"qwen3","num_attention_heads":1,"num_hidden_layers":3,"num_key_value_heads":1,"torch_dtype":"float16"}"#.utf8)
@@ -67,6 +68,7 @@ final class KVTunerCandidateExecutionTests: XCTestCase {
             modelConfigHash: fnv1a64(configData),
             modelConfigSHA256: sha256Hex(configData),
             checkpointManifestHash: checkpointHash ?? self.checkpointHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             groupSize: 128)
     }
@@ -75,6 +77,7 @@ final class KVTunerCandidateExecutionTests: XCTestCase {
         try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: configData,
             checkpointManifestHash: checkpointHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             eosTokenID: 2)
     }

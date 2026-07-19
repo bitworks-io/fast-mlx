@@ -33,6 +33,53 @@ private final class TinyDenseLanguageModel: Module, LanguageModel, KVCacheDimens
     }
 }
 
+private final class TinyCompressedBatchLanguageModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    let kvHeads = [2]
+    private let vocabularySize = 2_048
+    private(set) var newCacheCallCount = 0
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        newCacheCallCount += 1
+        return [KVCacheSimple()]
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        guard let cache = cache?.first else {
+            preconditionFailure("tiny compressed model requires one cache")
+        }
+        let scalar = inputs.asType(.float16).reshaped([
+            inputs.dim(0), 1, inputs.dim(1), 1,
+        ])
+        let keys = broadcast(
+            scalar, to: [inputs.dim(0), 2, inputs.dim(1), 128])
+        let values = keys
+        let queries = broadcast(
+            scalar, to: [inputs.dim(0), 4, inputs.dim(1), 128])
+        let mask = cache.makeMask(
+            n: inputs.dim(1), windowSize: nil, returnArray: true)
+        let attended = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: Float(1 / sqrt(128.0)),
+            mask: mask)
+        let target = (attended.mean(axes: [1, 3], keepDims: false) + 1)
+            .asType(.int32).expandedDimensions(axis: -1)
+        let vocabulary = MLXArray(Int32(0) ..< Int32(vocabularySize))
+            .reshaped([1, 1, vocabularySize])
+        return (target .== vocabulary).asType(.float32) * 100
+    }
+}
+
 final class DenseContinuousBatchRuntimeTests: XCTestCase {
     private func makeRuntime(
         allocationChunk: Int = 4,
@@ -75,6 +122,20 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
 
     private func emitted(_ results: [ContinuousBatchRuntimeDecodeResult]) -> [UInt64: [Int]] {
         Dictionary(uniqueKeysWithValues: results.map { ($0.id.rawValue, $0.tokens) })
+    }
+
+    private func makeCompressedRuntime() throws -> DenseContinuousBatchRuntime {
+        try DenseContinuousBatchRuntime(
+            testing: TinyCompressedBatchLanguageModel(),
+            allocationChunk: 4,
+            maxContextTokens: 64,
+            initialDecodeReserve: 3,
+            kvCacheKind: .affine(.k4v2G64),
+            affineAttentionMode: .splitQuantizedMM,
+            compressedKVAttentionAdmission: try makeCompressedBatchAdmission(),
+            keyValueHeadCount: 2,
+            headDimension: 128,
+            elementBytes: 2)
     }
 
     private func collect(_ stream: AsyncThrowingStream<Int, Error>) async throws -> [Int] {
@@ -144,6 +205,214 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
 
         XCTAssertEqual(emitted(first), [1: [11], 2: [21], 3: [31]])
         XCTAssertEqual(emitted(second), [1: [22], 3: [62]])
+    }
+
+    func testCompressedLongestRowDepartureMatchesUninterruptedScalarSurvivors() throws {
+        let shared = try makeCompressedRuntime()
+        let prompts: [UInt64: [Int]] = [
+            1: Array(1 ... 32),
+            2: Array(100 ... 147),
+            3: Array(50 ... 73),
+        ]
+        for id in [UInt64(1), 2, 3] {
+            try prefill(
+                shared,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: 8)
+        }
+
+        let first = try shared.decode(
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2), BatchRequestID(3)],
+                speculationAllowed: false))
+        XCTAssertEqual(shared.diagnostics().batchPhysicalWrittenEnd, 49)
+        shared.remove(BatchRequestID(2))
+        var continuations: [UInt64: [Int]] = [
+            1: emitted(first)[1]!,
+            3: emitted(first)[3]!,
+        ]
+        for _ in 0 ..< 3 {
+            let next = try shared.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(3)],
+                    speculationAllowed: false))
+            continuations[1]!.append(contentsOf: emitted(next)[1]!)
+            continuations[3]!.append(contentsOf: emitted(next)[3]!)
+        }
+
+        for id in [UInt64(1), 3] {
+            let scalar = try makeCompressedRuntime()
+            try prefill(
+                scalar,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: 8)
+            let expected = try (0 ..< 4).map { _ in
+                try scalar.decode(
+                    .solo(BatchRequestID(id), speculationAllowed: false))[0]
+                    .tokens[0]
+            }
+            XCTAssertEqual(continuations[id], expected, "survivor \(id)")
+        }
+    }
+
+    func testContinuousBatchRejectsKVarNUntilItsPackedBatchTransformIsQualified() {
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: TinyCompressedBatchLanguageModel(),
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .kvarn(.k4v2G128I8),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: try makeCompressedBatchAdmission(),
+                keyValueHeadCount: 2,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .unsupportedCompressedBatchCache)
+        }
+    }
+
+    func testCompressedBatchRequiresAdmissionBeforeTouchingModelCacheState() {
+        let model = TinyCompressedBatchLanguageModel()
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: model,
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                keyValueHeadCount: 2,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionRequired)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
+    }
+
+    func testCompressedBatchRejectsAdmissionGeometryBeforeTouchingModelCacheState() throws {
+        let model = TinyCompressedBatchLanguageModel()
+        let wrongGeometry = try makeCompressedBatchAdmission(
+            keyValueHeadCount: 1)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: model,
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: wrongGeometry,
+                keyValueHeadCount: 2,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
+    }
+
+    func testCompressedBatchRejectsLlamaAdmissionForQwenOnlyContinuousProof() throws {
+        let model = TinyCompressedBatchLanguageModel()
+        let llama = try makeCompressedBatchAdmission(
+            modelType: "llama",
+            architecture: "LlamaForCausalLM")
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: model,
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: llama,
+                keyValueHeadCount: 2,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
+    }
+
+    func testCompressedBatchRejectsDifferentExactModelConfigBeforeCacheCreation() throws {
+        let model = TinyCompressedBatchLanguageModel()
+        let admission = try makeCompressedBatchAdmission()
+        let proof = DenseContinuousBatchModelProof.testing(
+            maxPositionEmbeddings: 64,
+            vocabularySize: 2_048,
+            modelConfigHash: "fedcba9876543210",
+            modelConfigSHA256: String(repeating: "e", count: 64),
+            keyValueHeadCount: 2,
+            headDimension: 128,
+            elementBytes: 2)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                model: model,
+                verifiedBy: proof,
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: admission)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
+    }
+
+    func testCompressedBatchRejectsDifferentCheckpointContentBeforeCacheCreation() throws {
+        let model = TinyCompressedBatchLanguageModel()
+        let admission = try makeCompressedBatchAdmission()
+        let proof = DenseContinuousBatchModelProof.testing(
+            maxPositionEmbeddings: 64,
+            vocabularySize: 2_048,
+            modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: String(repeating: "e", count: 64),
+            tokenizerSHA256: admission.tokenizerSHA256,
+            keyValueHeadCount: 2,
+            headDimension: 128,
+            elementBytes: 2)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                model: model,
+                verifiedBy: proof,
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: admission)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
     }
 
     func testBatchToSoloSurvivorContinuesWithoutDuplicateOrDrop() throws {
@@ -242,7 +511,59 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
                 XCTAssertEqual(
                     $0 as? DenseContinuousBatchRuntimeError,
                     .unsupportedModelFamily("qwen3_moe"))
-            }
+        }
+    }
+
+    func testConfigDerivedProofBindsStableCheckpointAndTokenizerSource() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try makeCompressedBatchSourceSnapshot()
+        try source.exactModelConfigData.write(
+            to: directory.appendingPathComponent("config.json"))
+        let admission = try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: source)
+        let proof = try DenseContinuousBatchModelProof.verifying(
+            modelDirectory: directory,
+            stableCompressedSource: source)
+        let model = TinyCompressedBatchLanguageModel()
+
+        _ = try DenseContinuousBatchRuntime(
+            model: model,
+            verifiedBy: proof,
+            allocationChunk: 4,
+            maxContextTokens: 64,
+            initialDecodeReserve: 3,
+            kvCacheKind: .affine(.k4v2G64),
+            affineAttentionMode: .splitQuantizedMM,
+            compressedKVAttentionAdmission: admission)
+
+        XCTAssertEqual(model.newCacheCallCount, 1)
+    }
+
+    func testConfigDerivedProofRejectsSourceSnapshotForDifferentConfigBytes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try makeCompressedBatchSourceSnapshot()
+        var differentConfig = source.exactModelConfigData
+        differentConfig.append(0x0A)
+        try differentConfig.write(
+            to: directory.appendingPathComponent("config.json"))
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchModelProof.verifying(
+                modelDirectory: directory,
+                stableCompressedSource: source)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchSourceProofMismatch)
+        }
     }
 
     func testRuntimeCapabilityAndContextLimitsRejectAtAdmissionWithoutPoisoningCoordinator()

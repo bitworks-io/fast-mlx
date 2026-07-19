@@ -183,11 +183,12 @@ final class KVTunerCalibrationManifestTests: XCTestCase {
             }
         }
         var sensitivity = KVTunerSensitivityArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
             checkpointManifestHash: manifest.checkpointManifestHash,
+            checkpointContentSHA256: manifest.checkpointContentSHA256,
             tokenizerSHA256: manifest.tokenizerSHA256,
             calibrationCorpusID: manifest.corpusID,
             calibrationCorpusHash: manifestSHA,

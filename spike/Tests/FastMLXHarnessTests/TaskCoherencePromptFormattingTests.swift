@@ -47,6 +47,43 @@ private struct PromptTokenizer: MLXLMCommon.Tokenizer {
 }
 
 final class TaskCoherencePromptFormattingTests: XCTestCase {
+    func testKVTunerImplicitAttentionConfigurationBindsMaterializeAndExactCheckpoint() throws {
+        let checkpoint = String(repeating: "d", count: 64)
+        let implicit = try effectiveCompressedKVAttentionConfiguration(
+            explicitRequest: nil,
+            explicitCheckpointContentSHA256: nil,
+            authenticatedKVTunerCheckpointContentSHA256: checkpoint)
+        XCTAssertEqual(implicit.request, .materialize)
+        XCTAssertEqual(implicit.checkpointContentSHA256, checkpoint)
+
+        let explicit = try effectiveCompressedKVAttentionConfiguration(
+            explicitRequest: .splitAffineQuantizedMM,
+            explicitCheckpointContentSHA256: checkpoint,
+            authenticatedKVTunerCheckpointContentSHA256: checkpoint)
+        XCTAssertEqual(explicit.request, .splitAffineQuantizedMM)
+
+        XCTAssertThrowsError(try
+            effectiveCompressedKVAttentionConfiguration(
+                explicitRequest: .materialize,
+                explicitCheckpointContentSHA256:
+                    String(repeating: "e", count: 64),
+                authenticatedKVTunerCheckpointContentSHA256: checkpoint)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerCLIError,
+                .checkpointContentIdentityMismatch)
+        }
+
+        XCTAssertEqual(
+            try effectiveCompressedKVAttentionConfiguration(
+                explicitRequest: nil,
+                explicitCheckpointContentSHA256: nil,
+                authenticatedKVTunerCheckpointContentSHA256: nil),
+            EffectiveCompressedKVAttentionConfiguration(
+                request: nil,
+                checkpointContentSHA256: nil))
+    }
+
     func testRestrictedChoiceStaysRawWhileStructuredToolUsesCheckpointChatTemplate() throws {
         let corpus = try TaskCoherenceCorpusV2.make()
         let restricted = try XCTUnwrap(

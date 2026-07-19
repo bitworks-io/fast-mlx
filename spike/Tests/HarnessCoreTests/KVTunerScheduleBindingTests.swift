@@ -6,7 +6,9 @@ final class KVTunerScheduleBindingTests: XCTestCase {
     private let matrixID = "kvarn-qwen3-32b-v1"
     private let cellID = "kvtuner-g128-b4.5"
     private let configHash = "0123456789abcdef"
+    private let configSHA256 = String(repeating: "d", count: 64)
     private let checkpointHash = "fedcba9876543210"
+    private let checkpointContentSHA256 = String(repeating: "e", count: 64)
 
     private var evaluation: KVTunerEvaluationCorpusIdentity {
         get throws {
@@ -24,14 +26,23 @@ final class KVTunerScheduleBindingTests: XCTestCase {
     }
 
     private func selection(
+        modelConfigSHA256: String? = nil,
+        checkpointContentSHA256: String? = nil,
         evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
     ) throws -> KVTunerRuntimeSelection {
+        let selectedModelConfigSHA256 =
+            modelConfigSHA256 ?? configSHA256
+        let selectedCheckpointContentSHA256 =
+            checkpointContentSHA256 ?? self.checkpointContentSHA256
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
+            modelConfigSHA256: selectedModelConfigSHA256,
             checkpointManifestHash: checkpointHash,
+            checkpointContentSHA256:
+                selectedCheckpointContentSHA256,
             tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "calibration-v1",
@@ -62,7 +73,11 @@ final class KVTunerScheduleBindingTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256:
+                selectedModelConfigSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                selectedCheckpointContentSHA256,
             evaluationCorpora: evaluationCorpora ?? [try evaluation])
     }
 
@@ -80,8 +95,11 @@ final class KVTunerScheduleBindingTests: XCTestCase {
             expectedMatrixID: expectedMatrixID ?? matrixID,
             expectedCellID: expectedCellID ?? cellID,
             expectedModelConfigHash: expectedModelConfigHash ?? configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash:
                 expectedCheckpointManifestHash ?? checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: expectedLayerCount,
             requiredEvaluationCorpus:
                 requiredEvaluationCorpus ?? (try evaluation))
@@ -105,8 +123,8 @@ final class KVTunerScheduleBindingTests: XCTestCase {
         let loaded = try load(data)
 
         XCTAssertEqual(loaded, binding)
-        XCTAssertEqual(loaded.schemaVersion, 3)
-        XCTAssertEqual(loaded.scheduleSchemaVersion, 3)
+        XCTAssertEqual(loaded.schemaVersion, 4)
+        XCTAssertEqual(loaded.scheduleSchemaVersion, 4)
         XCTAssertEqual(loaded.artifactSHA256, selection.artifactSHA256)
         XCTAssertEqual(
             loaded.qualificationBundleSHA256,
@@ -114,7 +132,11 @@ final class KVTunerScheduleBindingTests: XCTestCase {
         XCTAssertEqual(loaded.matrixID, matrixID)
         XCTAssertEqual(loaded.cellID, cellID)
         XCTAssertEqual(loaded.modelConfigHash, configHash)
+        XCTAssertEqual(loaded.modelConfigSHA256, configSHA256)
         XCTAssertEqual(loaded.checkpointManifestHash, checkpointHash)
+        XCTAssertEqual(
+            loaded.checkpointContentSHA256,
+            checkpointContentSHA256)
         XCTAssertEqual(loaded.groupSize, 128)
         XCTAssertEqual(
             loaded.promptDigestAlgorithm,
@@ -162,6 +184,21 @@ final class KVTunerScheduleBindingTests: XCTestCase {
         }
     }
 
+    func testGenuineV3BindingShapeIsClassifiedBeforeV4FieldsDecode() throws {
+        let binding = KVTunerScheduleBinding(selection: try selection())
+        let data = try mutatedBinding(binding) { object in
+            object["schemaVersion"] = 3
+            object.removeValue(forKey: "modelConfigSHA256")
+            object.removeValue(forKey: "checkpointContentSHA256")
+        }
+
+        XCTAssertThrowsError(try load(data)) { error in
+            XCTAssertEqual(
+                error as? KVTunerScheduleBindingError,
+                .unsupportedBindingSchema(3))
+        }
+    }
+
     func testValidationRequiresEveryExternalIdentityAndExactEvaluation() throws {
         let binding = KVTunerScheduleBinding(selection: try selection())
         let evaluation = try evaluation
@@ -170,35 +207,78 @@ final class KVTunerScheduleBindingTests: XCTestCase {
             expectedMatrixID: "another-matrix",
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 2,
             requiredEvaluationCorpus: evaluation))
         XCTAssertThrowsError(try binding.validated(
             expectedMatrixID: matrixID,
             expectedCellID: "kvtuner-g64-b4.5",
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 2,
             requiredEvaluationCorpus: evaluation))
         XCTAssertThrowsError(try binding.validated(
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: "aaaaaaaaaaaaaaaa",
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 2,
             requiredEvaluationCorpus: evaluation))
         XCTAssertThrowsError(try binding.validated(
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: String(repeating: "0", count: 64),
+            expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
+            expectedLayerCount: 2,
+            requiredEvaluationCorpus: evaluation)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleBindingError,
+                    .invalidSchedule(.modelConfigSHA256Mismatch))
+            }
+        XCTAssertThrowsError(try binding.validated(
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: "bbbbbbbbbbbbbbbb",
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 2,
             requiredEvaluationCorpus: evaluation))
         XCTAssertThrowsError(try binding.validated(
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                String(repeating: "0", count: 64),
+            expectedLayerCount: 2,
+            requiredEvaluationCorpus: evaluation)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerScheduleBindingError,
+                    .invalidSchedule(.checkpointContentSHA256Mismatch))
+            }
+        XCTAssertThrowsError(try binding.validated(
+            expectedMatrixID: matrixID,
+            expectedCellID: cellID,
+            expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
+            expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 3,
             requiredEvaluationCorpus: evaluation))
 
@@ -213,7 +293,10 @@ final class KVTunerScheduleBindingTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
             expectedModelConfigHash: configHash,
+            expectedModelConfigSHA256: configSHA256,
             expectedCheckpointManifestHash: checkpointHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedLayerCount: 2,
             requiredEvaluationCorpus: sameNameButDifferentPrompt))
     }
@@ -248,6 +331,8 @@ final class KVTunerScheduleBindingTests: XCTestCase {
         let binding = KVTunerScheduleBinding(selection: try selection())
 
         for field in [
+            "modelConfigSHA256",
+            "checkpointContentSHA256",
             "seed",
             "objective",
             "sourceSensitivityArtifactSHA256",
@@ -309,6 +394,12 @@ final class KVTunerScheduleBindingTests: XCTestCase {
         let changed = try JSONDecoder().decode(
             KVTunerScheduleBinding.self, from: changedData)
         XCTAssertFalse(first.sameSchedule(as: changed))
+
+        let changedStrongIdentity = KVTunerScheduleBinding(
+            selection: try selection(
+                checkpointContentSHA256:
+                    String(repeating: "f", count: 64)))
+        XCTAssertFalse(first.sameSchedule(as: changedStrongIdentity))
     }
 }
 

@@ -16,25 +16,30 @@ public enum KVTunerCandidateRuntimeIdentityError:
 public struct KVTunerCandidateRuntimeSourceSnapshot: Equatable, Sendable {
     public let exactModelConfigData: Data
     public let checkpointManifestHash: String
+    public let checkpointContentSHA256: String
     public let tokenizerSHA256: String
 
     private init(
         exactModelConfigData: Data,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String
     ) {
         self.exactModelConfigData = exactModelConfigData
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
     }
 
     public static func load(
         exactModelConfigData: Data,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String
     ) throws -> KVTunerCandidateRuntimeSourceSnapshot {
         guard !exactModelConfigData.isEmpty,
             Self.isIdentityDigest(checkpointManifestHash),
+            Self.isLowercaseHex(checkpointContentSHA256, length: 64),
             Self.isLowercaseHex(tokenizerSHA256, length: 64)
         else {
             throw KVTunerCandidateRuntimeIdentityError.invalidIdentity
@@ -42,6 +47,7 @@ public struct KVTunerCandidateRuntimeSourceSnapshot: Equatable, Sendable {
         return KVTunerCandidateRuntimeSourceSnapshot(
             exactModelConfigData: exactModelConfigData,
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256)
     }
 
@@ -80,6 +86,7 @@ public struct KVTunerCandidateRuntimeIdentity: Equatable, Sendable {
     public let modelConfigHash: String
     public let modelConfigSHA256: String
     public let checkpointManifestHash: String
+    public let checkpointContentSHA256: String
     public let tokenizerSHA256: String
     public let eosTokenID: Int
 
@@ -92,6 +99,8 @@ public struct KVTunerCandidateRuntimeIdentity: Equatable, Sendable {
         self.modelConfigSHA256 = sha256Hex(
             sourceSnapshot.exactModelConfigData)
         self.checkpointManifestHash = sourceSnapshot.checkpointManifestHash
+        self.checkpointContentSHA256 =
+            sourceSnapshot.checkpointContentSHA256
         self.tokenizerSHA256 = sourceSnapshot.tokenizerSHA256
         self.eosTokenID = eosTokenID
     }
@@ -99,12 +108,14 @@ public struct KVTunerCandidateRuntimeIdentity: Equatable, Sendable {
     public static func load(
         exactModelConfigData: Data,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         eosTokenID: Int
     ) throws -> KVTunerCandidateRuntimeIdentity {
         let sourceSnapshot = try KVTunerCandidateRuntimeSourceSnapshot.load(
             exactModelConfigData: exactModelConfigData,
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256)
         return try load(
             sourceSnapshot: sourceSnapshot,
@@ -130,7 +141,9 @@ public struct KVTunerCandidateRuntimeIdentity: Equatable, Sendable {
         runtimePolicy: KVTunerCandidateRuntimePolicy
     ) throws -> KVTunerCandidateRuntimeContract {
         guard checkpointManifestHash
-                == runtimePolicy.checkpointManifestHash
+                == runtimePolicy.checkpointManifestHash,
+            checkpointContentSHA256
+                == runtimePolicy.checkpointContentSHA256
         else {
             throw KVTunerCandidateRuntimeIdentityError
                 .checkpointIdentityMismatch

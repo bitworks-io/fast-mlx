@@ -461,8 +461,10 @@ public enum TaskCoherenceArtifact {
     /// runnable task CLI. Schema 2 is the first qualification-capable artifact and rejects any
     /// partial legacy rows rather than guessing missing evidence.
     public static let schemaVersion = 2
-    /// Schema 3 requires an authenticated request/observed-operation binding on every affine or
-    /// KVTuner row. Schema 2 remains readable for the frozen pre-compressed-attention corpus.
+    /// Schema 3 carries exact checkpoint-content identity. Affine and KVTuner rows additionally
+    /// require an authenticated request/observed-operation binding; an fp16 reference carries
+    /// the exact content identity without claiming a compressed-attention operation. Schema 2
+    /// remains readable for the frozen pre-compressed-attention corpus.
     public static let compressedAttentionSchemaVersion = 3
 
     private static let affineTiers: Set<String> = [
@@ -493,6 +495,24 @@ public enum TaskCoherenceArtifact {
     public static func expectedCellID(forTier tier: String) -> String? {
         if let cellID = tierCellIDs[tier] { return cellID }
         return isCanonicalKVTunerCellID(tier) ? tier : nil
+    }
+
+    /// Historical candidates without an exact checkpoint identity may still consume historical
+    /// references. Once a candidate declares exact checkpoint content, however, a contentless or
+    /// differently sourced fp16 reference must fail closed even when its cheap manifest matches.
+    public static func referenceModelIdentityMatches(
+        reference: TaskCoherenceRunIdentity,
+        candidate: KVModelEvidenceIdentity
+    ) -> Bool {
+        guard reference.modelConfigHash == candidate.configHash,
+            reference.modelCheckpointManifestHash
+                == candidate.checkpointManifestHash
+        else { return false }
+        guard let checkpointContentSHA256 =
+            candidate.checkpointContentSHA256
+        else { return true }
+        return reference.modelCheckpointContentSHA256
+            == checkpointContentSHA256
     }
 
     /// Authenticate a decoded task receipt against the exact run identity and tokenizer. The
@@ -540,8 +560,11 @@ public enum TaskCoherenceArtifact {
                 }
                 try binding.admission.validateScheduleIdentity(
                     modelConfigHash: schedule.modelConfigHash,
+                    modelConfigSHA256: schedule.modelConfigSHA256,
                     checkpointManifestHash:
                         schedule.checkpointManifestHash,
+                    checkpointContentSHA256:
+                        schedule.checkpointContentSHA256,
                     tokenizerSHA256: schedule.tokenizerSHA256,
                     layerCount: schedule.layers.count,
                     groupSize: schedule.groupSize)
@@ -741,6 +764,10 @@ public enum TaskCoherenceArtifact {
         if isKVTuner {
             guard let schedule = payload.identity.kvtunerSchedule,
                 let layerCount = payload.engagement.kvtunerLayerCount,
+                payload.schemaVersion == compressedAttentionSchemaVersion,
+                let compressedBinding = payload.compressedKVAttention,
+                let checkpointContentSHA256 =
+                    payload.identity.modelCheckpointContentSHA256,
                 schedule.tokenizerSHA256
                     == payload.tokenization.tokenizerManifestSHA256
             else {
@@ -753,8 +780,12 @@ public enum TaskCoherenceArtifact {
                     expectedCellID: payload.cellID,
                     expectedModelConfigHash:
                         payload.identity.modelConfigHash,
+                    expectedModelConfigSHA256:
+                        compressedBinding.admission.modelConfigSHA256,
                     expectedCheckpointManifestHash:
                         payload.identity.modelCheckpointManifestHash,
+                    expectedCheckpointContentSHA256:
+                        checkpointContentSHA256,
                     expectedLayerCount: layerCount,
                     requiredEvaluationCorpus:
                         try corpus.kvtunerEvaluationCorpusIdentity)
@@ -785,9 +816,11 @@ public enum TaskCoherenceArtifact {
                     "compressed-attention-schema")
             }
         case compressedAttentionSchemaVersion:
+            let requiresCheckpointContent = requiresCompressedBinding
+                || payload.identity.kvQuantTier == "fp16"
             guard requiresCompressedBinding
                 == (payload.compressedKVAttention != nil),
-                requiresCompressedBinding
+                requiresCheckpointContent
                     == (payload.identity.modelCheckpointContentSHA256 != nil),
                 (payload.identity.modelCheckpointContentSHA256.map {
                     isHex($0, length: 64)
@@ -1207,6 +1240,15 @@ public struct TaskCoherencePromotionEvidence:
             candidate.matrixID == reference.matrixID,
             candidate.runConfiguration == reference.runConfiguration,
             candidate.referenceArtifactSHA256 == reference.artifactSHA256,
+            TaskCoherenceArtifact.referenceModelIdentityMatches(
+                reference: reference.identity,
+                candidate: KVModelEvidenceIdentity(
+                    configHash: candidate.identity.modelConfigHash,
+                    checkpointManifestHash:
+                        candidate.identity.modelCheckpointManifestHash,
+                    checkpointContentSHA256:
+                        candidate.identity
+                            .modelCheckpointContentSHA256)),
             TaskCoherenceArtifact.matchingRuntime(
                 candidate.provenance, reference.provenance),
             zip(candidate.cases, reference.cases).allSatisfy({
@@ -1288,7 +1330,9 @@ public struct TaskCoherencePromotionEvidence:
             reference.identity.modelConfigHash
                 == frontier.referenceModel.configHash,
             reference.identity.modelCheckpointManifestHash
-                == frontier.referenceModel.checkpointManifestHash
+                == frontier.referenceModel.checkpointManifestHash,
+            reference.identity.modelCheckpointContentSHA256
+                == frontier.referenceModel.checkpointContentSHA256
         else {
             throw TaskCoherenceEvidenceError.klEvidenceMismatch("matrix")
         }

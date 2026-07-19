@@ -69,7 +69,10 @@ func resolveSwiftEngineCacheSelection(
         }
         try admission.validateScheduleIdentity(
             modelConfigHash: selection.modelConfigHash,
+            modelConfigSHA256: selection.modelConfigSHA256,
             checkpointManifestHash: selection.checkpointManifestHash,
+            checkpointContentSHA256:
+                selection.checkpointContentSHA256,
             tokenizerSHA256: selection.tokenizerSHA256,
             layerCount: selection.layers.count,
             groupSize: selection.groupSize)
@@ -1023,11 +1026,16 @@ func captureKVTunerQualificationRuntimeSourceSnapshot(
     modelPath: String
 ) throws -> KVTunerCandidateRuntimeSourceSnapshot {
     let modelDirectory = URL(fileURLWithPath: modelPath)
+    let exactModelConfigData = try Data(
+        contentsOf: modelDirectory.appendingPathComponent("config.json"))
     return try KVTunerCandidateRuntimeSourceSnapshot.load(
-        exactModelConfigData: Data(
-            contentsOf: modelDirectory.appendingPathComponent("config.json")),
+        exactModelConfigData: exactModelConfigData,
         checkpointManifestHash: try ProvenanceCLI.checkpointManifestHash(
             at: modelPath),
+        checkpointContentSHA256:
+            try ProvenanceCLI.fullContentCheckpointManifestSHA256(
+                at: modelPath,
+                exactConfigData: exactModelConfigData),
         tokenizerSHA256: try ProvenanceCLI.tokenizerManifestSHA256(
             at: modelPath))
 }

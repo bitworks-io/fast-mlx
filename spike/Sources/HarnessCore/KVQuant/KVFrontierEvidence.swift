@@ -1341,7 +1341,11 @@ private extension KVFrontierEvidence {
         }
         if let schedule = candidateKVTunerSchedule {
             guard let evaluation = candidateKVTunerEvaluationCorpus,
-                schedule.evaluationCorpora == [evaluation]
+                schedule.evaluationCorpora == [evaluation],
+                schemaVersion == 2,
+                let compressedBinding = candidateCompressedKVAttention,
+                let checkpointContentSHA256 =
+                    candidateModel.checkpointContentSHA256
             else {
                 throw KVFrontierEvidenceError.invalidKVTunerSchedule
             }
@@ -1350,8 +1354,12 @@ private extension KVFrontierEvidence {
                     expectedMatrixID: matrixID,
                     expectedCellID: cellID,
                     expectedModelConfigHash: candidateModel.configHash,
+                    expectedModelConfigSHA256:
+                        compressedBinding.admission.modelConfigSHA256,
                     expectedCheckpointManifestHash:
                         candidateModel.checkpointManifestHash,
+                    expectedCheckpointContentSHA256:
+                        checkpointContentSHA256,
                     expectedLayerCount:
                         candidateFormat?.layerCount ?? schedule.layers.count,
                     requiredEvaluationCorpus: evaluation)
@@ -1547,8 +1555,11 @@ private extension KVFrontierEvidence {
                 }
                 try binding.admission.validateScheduleIdentity(
                     modelConfigHash: schedule.modelConfigHash,
+                    modelConfigSHA256: schedule.modelConfigSHA256,
                     checkpointManifestHash:
                         schedule.checkpointManifestHash,
+                    checkpointContentSHA256:
+                        schedule.checkpointContentSHA256,
                     tokenizerSHA256: schedule.tokenizerSHA256,
                     layerCount: schedule.layers.count,
                     groupSize: schedule.groupSize)

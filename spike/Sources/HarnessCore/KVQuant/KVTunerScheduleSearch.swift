@@ -145,6 +145,7 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
     public var modelConfigHash: String
     public var modelConfigSHA256: String
     public var checkpointManifestHash: String
+    public var checkpointContentSHA256: String
     public var tokenizerSHA256: String
     public var groupSize: Int
     public var targetPairBitTotal: Int
@@ -163,6 +164,7 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         groupSize: Int,
         targetPairBitTotal: Int,
@@ -181,6 +183,7 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
         self.groupSize = groupSize
         self.targetPairBitTotal = targetPairBitTotal
@@ -203,7 +206,7 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
         eosTokenID: Int,
         decodeTokenIDs: ([Int]) throws -> String
     ) throws -> KVTunerScheduleCandidate {
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw KVTunerSearchArtifactError.unsupportedSchema(schemaVersion)
         }
         guard searchMode == "exhaustive-grouped-v1" else {
@@ -221,6 +224,7 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
              sourceSensitivityArtifactSHA256),
             ("promptManifestSHA256", promptManifestSHA256),
             ("modelConfigSHA256", modelConfigSHA256),
+            ("checkpointContentSHA256", checkpointContentSHA256),
             ("tokenizerSHA256", tokenizerSHA256),
             ("candidateListSHA256", candidateListSHA256),
         ] {
@@ -263,6 +267,8 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
             modelConfigSHA256 == decodedSensitivity.modelConfigSHA256,
             checkpointManifestHash
                 == decodedSensitivity.checkpointManifestHash,
+            checkpointContentSHA256
+                == decodedSensitivity.checkpointContentSHA256,
             tokenizerSHA256 == decodedSensitivity.tokenizerSHA256,
             groupSize == decodedSensitivity.groupSize
         else {
@@ -314,6 +320,8 @@ public struct KVTunerSearchArtifact: Codable, Equatable, Sendable {
                 policy.modelConfigHash == modelConfigHash,
                 policy.modelConfigSHA256 == modelConfigSHA256,
                 policy.checkpointManifestHash == checkpointManifestHash,
+                policy.checkpointContentSHA256
+                    == checkpointContentSHA256,
                 policy.tokenizerSHA256 == tokenizerSHA256,
                 policy.groupSize == groupSize,
                 policy.targetPairBitTotal == targetPairBitTotal,
@@ -675,7 +683,8 @@ public enum KVTunerScheduleSearch {
         eosTokenID: Int,
         decodeTokenIDs: ([Int]) throws -> String,
         exactModelConfigData: Data,
-        expectedCheckpointManifestHash: String
+        expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String
     ) throws -> KVTunerSchedule {
         let decodedSearch: KVTunerSearchArtifact
         do {
@@ -716,7 +725,11 @@ public enum KVTunerScheduleSearch {
         guard expectedCheckpointManifestHash
                 == sensitivityArtifact.checkpointManifestHash,
             expectedCheckpointManifestHash
-                == calibrationManifest.checkpointManifestHash
+                == calibrationManifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256
+                == sensitivityArtifact.checkpointContentSHA256,
+            expectedCheckpointContentSHA256
+                == calibrationManifest.checkpointContentSHA256
         else {
             throw KVTunerScheduleSearchError.sensitivityArtifactMismatch
         }
@@ -754,12 +767,15 @@ public enum KVTunerScheduleSearch {
         let cellID =
             "kvtuner-g\(sensitivityArtifact.groupSize)-b\(nominalAverageBits)"
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: sensitivityArtifact.matrixID,
             cellID: cellID,
             modelConfigHash: sensitivityArtifact.modelConfigHash,
+            modelConfigSHA256: sensitivityArtifact.modelConfigSHA256,
             checkpointManifestHash:
                 sensitivityArtifact.checkpointManifestHash,
+            checkpointContentSHA256:
+                sensitivityArtifact.checkpointContentSHA256,
             tokenizerSHA256: sensitivityArtifact.tokenizerSHA256,
             groupSize: sensitivityArtifact.groupSize,
             calibrationCorpusID: calibrationManifest.corpusID,
@@ -784,8 +800,12 @@ public enum KVTunerScheduleSearch {
                 expectedCellID: cellID,
                 expectedModelConfigHash:
                     sensitivityArtifact.modelConfigHash,
+                expectedModelConfigSHA256:
+                    sensitivityArtifact.modelConfigSHA256,
                 expectedCheckpointManifestHash:
-                    sensitivityArtifact.checkpointManifestHash)
+                    sensitivityArtifact.checkpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    sensitivityArtifact.checkpointContentSHA256)
         } catch let error as KVTunerScheduleError {
             throw KVTunerScheduleSearchError.invalidSchedule(error)
         }

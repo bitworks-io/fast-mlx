@@ -4,11 +4,16 @@ import XCTest
 @testable import HarnessCore
 
 final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
+    private let alternateCheckpointContentSHA256 = String(
+        repeating: "b", count: 64)
+
     func testSourceSnapshotMustRemainIdenticalAcrossModelLoad() throws {
         let inputs = try KVTunerTestFixtures.candidateRuntimeInputs()
         let before = try KVTunerCandidateRuntimeSourceSnapshot.load(
             exactModelConfigData: inputs.configData,
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256)
 
         XCTAssertEqual(
@@ -18,6 +23,8 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         let changedConfig = try KVTunerCandidateRuntimeSourceSnapshot.load(
             exactModelConfigData: inputs.configData + Data(" ".utf8),
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256)
         XCTAssertThrowsError(
             try KVTunerCandidateRuntimeSourceSnapshot.validateUnchanged(
@@ -36,6 +43,8 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         let identity = try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: inputs.configData,
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256,
             eosTokenID: 255)
 
@@ -54,6 +63,8 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: inputs.configData,
             checkpointManifestHash: String(repeating: "0", count: 16),
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256,
             eosTokenID: 255).validate(runtimePolicy: policy)) { error in
                 XCTAssertEqual(
@@ -63,6 +74,18 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: inputs.configData,
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256: alternateCheckpointContentSHA256,
+            tokenizerSHA256: inputs.manifest.tokenizerSHA256,
+            eosTokenID: 255).validate(runtimePolicy: policy)) { error in
+                XCTAssertEqual(
+                    error as? KVTunerCandidateRuntimeIdentityError,
+                    .checkpointIdentityMismatch)
+            }
+        XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
+            exactModelConfigData: inputs.configData,
+            checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: String(repeating: "b", count: 64),
             eosTokenID: 255).validate(runtimePolicy: policy)) { error in
                 XCTAssertEqual(
@@ -75,6 +98,8 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: changedConfig,
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256,
             eosTokenID: 255).validate(runtimePolicy: policy)) { error in
                 XCTAssertEqual(
@@ -84,6 +109,8 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: inputs.configData,
             checkpointManifestHash: inputs.manifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizerSHA256: inputs.manifest.tokenizerSHA256,
             eosTokenID: 254).validate(runtimePolicy: policy)) { error in
                 XCTAssertEqual(
@@ -96,6 +123,7 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: Data(),
             checkpointManifestHash: "checkpoint",
+            checkpointContentSHA256: String(repeating: "a", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             eosTokenID: 1)) { error in
                 XCTAssertEqual(
@@ -105,11 +133,13 @@ final class KVTunerCandidateRuntimeIdentityTests: XCTestCase {
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: Data("{}".utf8),
             checkpointManifestHash: "checkpoint",
+            checkpointContentSHA256: String(repeating: "a", count: 64),
             tokenizerSHA256: "NOT-A-SHA",
             eosTokenID: 1))
         XCTAssertThrowsError(try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: Data("{}".utf8),
             checkpointManifestHash: "checkpoint",
+            checkpointContentSHA256: String(repeating: "a", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             eosTokenID: -1))
     }

@@ -36,7 +36,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
     }
 
     private func frontier(
-        schemaVersion: Int = 1,
+        schemaVersion: Int? = nil,
         sameWeights: Bool = true,
         baseline: KVComparisonBaseline = .sameWeightsFP16KV,
         candidate: KVModelEvidenceIdentity? = nil,
@@ -53,27 +53,67 @@ final class KVFrontierEvidenceTests: XCTestCase {
         compressedKVAttention:
             CompressedKVAttentionRuntimeBinding? = nil,
         materializationWorkspaceBytes: Int? = nil,
-        attentionWorkspaceBytes: Int? = nil
+        attentionWorkspaceBytes: Int? = nil,
+        autoBindKVTuner: Bool = true
     ) -> KVFrontierEvidence {
         let same = identity()
         let bytes = breakdown()
+        let resolvedStorage = storage
+            ?? KVStorageEvidence(predicted: bytes, actual: bytes)
+        let resolvedSchemaVersion = schemaVersion
+            ?? (kvtunerSchedule == nil ? 1 : 2)
+        func resolvedModel(
+            _ supplied: KVModelEvidenceIdentity?
+        ) -> KVModelEvidenceIdentity {
+            guard let schedule = kvtunerSchedule else {
+                return supplied ?? same
+            }
+            if let supplied,
+                supplied.configHash != schedule.modelConfigHash
+                    || supplied.checkpointManifestHash
+                        != schedule.checkpointManifestHash
+            {
+                return supplied
+            }
+            return KVModelEvidenceIdentity(
+                configHash: schedule.modelConfigHash,
+                checkpointManifestHash: schedule.checkpointManifestHash,
+                checkpointContentSHA256:
+                    supplied?.checkpointContentSHA256
+                        ?? schedule.checkpointContentSHA256)
+        }
+        let automaticBinding: CompressedKVAttentionRuntimeBinding?
+        if autoBindKVTuner, kvtunerSchedule != nil {
+            automaticBinding = try! CompressedKVAttentionRuntimeBinding(
+                request: .materialize,
+                observedOperation: .materializedKV,
+                admission: compressedAttentionAdmission())
+        } else {
+            automaticBinding = nil
+        }
         return KVFrontierEvidence(
-            schemaVersion: schemaVersion, matrixID: matrixID, cellID: cellID,
+            schemaVersion: resolvedSchemaVersion,
+            matrixID: matrixID, cellID: cellID,
             sameWeights: sameWeights, comparisonBaseline: baseline,
             referenceKVQuantTier: "fp16",
-            candidateModel: candidate ?? same,
-            referenceModel: reference ?? same,
+            candidateModel: resolvedModel(candidate),
+            referenceModel: resolvedModel(reference),
             candidateFormat: format ?? geometry(),
-            storage: storage ?? KVStorageEvidence(predicted: bytes, actual: bytes),
+            storage: resolvedStorage,
             actualControlBytes: controlBytes,
             candidateExecutionMode: executionMode,
             candidateCodecIterations: codecIterations,
             candidateMemoryGate: memoryGate,
             candidateKVTunerSchedule: kvtunerSchedule,
-            candidateCompressedKVAttention: compressedKVAttention,
+            candidateCompressedKVAttention:
+                compressedKVAttention ?? automaticBinding,
             candidateMaterializationWorkspaceBytes:
-                materializationWorkspaceBytes,
-            candidateAttentionWorkspaceBytes: attentionWorkspaceBytes)
+                materializationWorkspaceBytes
+                    ?? (automaticBinding == nil
+                        ? nil : resolvedStorage.actual.workspaceBytes),
+            candidateAttentionWorkspaceBytes:
+                attentionWorkspaceBytes
+                    ?? (automaticBinding == nil ? nil : 0))
     }
 
     private func compressedAttentionAdmission() throws
@@ -367,15 +407,16 @@ final class KVFrontierEvidenceTests: XCTestCase {
     ) throws -> KVTunerScheduleBinding {
         let matrixID = "kvarn-qwen3-32b-v1"
         let cellID = "kvtuner-g128-b4.5"
-        let configHash = "0123456789abcdef"
-        let checkpointHash = "fedcba9876543210"
+        let admission = try compressedAttentionAdmission()
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: cellID,
-            modelConfigHash: configHash,
-            checkpointManifestHash: checkpointHash,
-            tokenizerSHA256: String(repeating: "c", count: 64),
+            modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
             groupSize: 128,
             calibrationCorpusID: "calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -393,17 +434,24 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 repeating: "a", count: 64),
             sourceSearchArtifactSHA256: String(
                 repeating: "b", count: 64),
-            layers: [
-                KVLayerPrecision(layer: 0, keyBits: 8, valueBits: 4),
-                KVLayerPrecision(layer: 1, keyBits: 4, valueBits: 2),
-            ])
+            layers: (0 ..< admission.layerCount).map {
+                KVLayerPrecision(
+                    layer: $0,
+                    keyBits: $0.isMultiple(of: 2) ? 8 : 4,
+                    valueBits: $0.isMultiple(of: 2) ? 4 : 2)
+            })
         let selection = try KVTunerRuntimeSelection.loadForTesting(
             artifactData: JSONEncoder().encode(schedule),
-            expectedLayerCount: 2,
+            expectedLayerCount: admission.layerCount,
             expectedMatrixID: matrixID,
             expectedCellID: cellID,
-            expectedModelConfigHash: configHash,
-            expectedCheckpointManifestHash: checkpointHash,
+            expectedModelConfigHash: admission.modelConfigHash,
+            expectedModelConfigSHA256:
+                admission.modelConfigSHA256,
+            expectedCheckpointManifestHash:
+                admission.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                admission.checkpointContentSHA256,
             evaluationCorpora:
                 evaluationCorpora ?? [try kvtunerEvaluation()])
         return KVTunerScheduleBinding(selection: selection)
@@ -699,10 +747,11 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 kvtunerSchedule: schedule,
                 materializationWorkspaceBytes:
                     measured.storage.actual.workspaceBytes,
-                attentionWorkspaceBytes: 0)).validatedForPromotion()) {
+                attentionWorkspaceBytes: 0,
+                autoBindKVTuner: false)).validatedForPromotion()) {
                     XCTAssertEqual(
                         $0 as? KVFrontierEvidenceError,
-                        .invalidRuntimeEvidence)
+                        .invalidKVTunerSchedule)
                 }
     }
 

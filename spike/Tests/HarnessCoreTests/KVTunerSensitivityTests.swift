@@ -52,11 +52,12 @@ final class KVTunerSensitivityTests: XCTestCase {
             }
         }
         return KVTunerSensitivityArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: "0123456789abcdef",
             modelConfigSHA256: String(repeating: "c", count: 64),
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "d", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             calibrationCorpusID: "gsm8k-kvtuner-calibration-v1",
             calibrationCorpusHash: "1111111111111111",

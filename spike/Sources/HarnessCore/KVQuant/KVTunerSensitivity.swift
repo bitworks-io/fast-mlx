@@ -223,6 +223,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
     public var modelConfigHash: String
     public var modelConfigSHA256: String
     public var checkpointManifestHash: String
+    public var checkpointContentSHA256: String
     public var tokenizerSHA256: String
     public var calibrationCorpusID: String
     public var calibrationCorpusHash: String
@@ -251,6 +252,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         calibrationCorpusID: String,
         calibrationCorpusHash: String,
@@ -275,6 +277,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
         self.calibrationCorpusID = calibrationCorpusID
         self.calibrationCorpusHash = calibrationCorpusHash
@@ -297,7 +300,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
 
     @discardableResult
     public func validated() throws -> KVTunerSensitivityArtifact {
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw KVTunerSensitivityError.unsupportedSchema(schemaVersion)
         }
         _ = try captureEnvironment.validatedSHA256()
@@ -319,7 +322,8 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
             }
         }
         for digest in [
-            modelConfigSHA256, tokenizerSHA256, promptManifestSHA256,
+            modelConfigSHA256, checkpointContentSHA256, tokenizerSHA256,
+            promptManifestSHA256,
         ] {
             guard Self.isLowercaseHex(digest, length: 64) else {
                 throw KVTunerSensitivityError.invalidDigest(digest)
@@ -446,6 +450,7 @@ public struct KVTunerSensitivityArtifact: Codable, Equatable, Sendable {
         guard modelConfigHash == decoded.modelConfigHash,
             modelConfigSHA256 == decoded.modelConfigSHA256,
             checkpointManifestHash == decoded.checkpointManifestHash,
+            checkpointContentSHA256 == decoded.checkpointContentSHA256,
             tokenizerSHA256 == decoded.tokenizerSHA256,
             calibrationCorpusID == decoded.corpusID,
             calibrationCorpusHash == manifestSHA256,

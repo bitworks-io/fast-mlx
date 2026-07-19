@@ -557,6 +557,28 @@ public struct KVTunerCandidateKVCacheTelemetry: Equatable, Sendable {
 /// This class intentionally does not conform to `Sendable`: every instance is confined to
 /// the inference actor because its MLX state is non-Sendable.
 public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
+    /// Actor-confined packed state used only while rebuilding continuous-batch membership.
+    /// MLX arrays remain inside SpikeCore and never cross a concurrency boundary.
+    struct PackedBatchState {
+        let capacity: Int
+        let configuration: AffineKVCacheConfiguration
+        let attentionMode: AffineKVAttentionMode
+        let logicalOffset: Int
+        let kPayload: MLXArray
+        let kScales: MLXArray
+        let kBiases: MLXArray
+        let vPayload: MLXArray
+        let vScales: MLXArray
+        let vBiases: MLXArray
+        let keyDimension: Int
+        let valueDimension: Int
+        let keyOutputDType: DType
+        let valueOutputDType: DType
+        let materializationWorkspaceBytes: Int?
+        let attentionWorkspaceBytes: Int?
+        let attentionOperation: AffineKVAttentionOperation?
+    }
+
     public private(set) var capacity: Int
     public let configuration: AffineKVCacheConfiguration
     public let attentionMode: AffineKVAttentionMode
@@ -596,6 +618,58 @@ public final class AffineKVCache: AttentionKVCacheProtocol, Updatable {
     }
 
     public var maxSize: Int? { nil }
+
+    /// Snapshot initialized packed arrays for an actor-confined membership transition.
+    /// The authoritative logical position is read from graph state, not the host mirror.
+    func packedBatchState() -> PackedBatchState? {
+        guard let kPayload, let kScales, let kBiases,
+            let vPayload, let vScales, let vBiases,
+            let keyDimension, let valueDimension,
+            let keyOutputDType, let valueOutputDType
+        else { return nil }
+        return PackedBatchState(
+            capacity: capacity,
+            configuration: configuration,
+            attentionMode: attentionMode,
+            logicalOffset: Int(offsetArr.item(Int32.self)),
+            kPayload: kPayload,
+            kScales: kScales,
+            kBiases: kBiases,
+            vPayload: vPayload,
+            vScales: vScales,
+            vBiases: vBiases,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            keyOutputDType: keyOutputDType,
+            valueOutputDType: valueOutputDType,
+            materializationWorkspaceBytes: materializationWorkspaceBytes,
+            attentionWorkspaceBytes: attentionWorkspaceBytes,
+            attentionOperation: attentionOperation)
+    }
+
+    /// Restore one independent scalar cache from a validated packed batch row.
+    static func restoringPackedBatchState(_ state: PackedBatchState) -> AffineKVCache {
+        let cache = AffineKVCache(
+            capacity: state.capacity,
+            configuration: state.configuration,
+            attentionMode: state.attentionMode)
+        cache.kPayload = state.kPayload
+        cache.kScales = state.kScales
+        cache.kBiases = state.kBiases
+        cache.vPayload = state.vPayload
+        cache.vScales = state.vScales
+        cache.vBiases = state.vBiases
+        cache.offsetArr = MLXArray([Int32(state.logicalOffset)])
+        cache.keyDimension = state.keyDimension
+        cache.valueDimension = state.valueDimension
+        cache.keyOutputDType = state.keyOutputDType
+        cache.valueOutputDType = state.valueOutputDType
+        cache.materializationWorkspaceBytes = state.materializationWorkspaceBytes
+        cache.attentionWorkspaceBytes = state.attentionWorkspaceBytes
+        cache.attentionOperation = state.attentionOperation
+        cache.offset = state.logicalOffset
+        return cache
+    }
 
     public func innerState() -> [MLXArray] {
         [kPayload, kScales, kBiases, vPayload, vScales, vBiases].compactMap { $0 }

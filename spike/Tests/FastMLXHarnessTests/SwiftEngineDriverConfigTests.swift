@@ -103,6 +103,17 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
                 $0 as? CompressedKVAttentionRuntimeAdmissionError,
                 .checkpointContentIdentityMismatch)
         }
+
+        let materializedConfig = RunConfig(
+            kvQuant: selection.cellID,
+            kvtunerSelection: selection)
+        XCTAssertThrowsError(try resolveSwiftEngineCacheSelection(
+            config: materializedConfig,
+            compressedKVAttentionAdmission: wrongContent)) {
+            XCTAssertEqual(
+                $0 as? CompressedKVAttentionRuntimeAdmissionError,
+                .scheduleIdentityMismatch)
+        }
     }
 
     private func makeAdmission(
@@ -131,12 +142,15 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
     ) throws -> KVTunerRuntimeSelection {
         let average = String(Double(14) / 3)
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: "kvarn-qwen3-32b-v2",
             cellID: "kvtuner-g128-b\(average)",
             modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
             checkpointManifestHash:
                 admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256,
             tokenizerSHA256: admission.tokenizerSHA256,
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
@@ -168,8 +182,11 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
             expectedMatrixID: schedule.matrixID,
             expectedCellID: schedule.cellID,
             expectedModelConfigHash: admission.modelConfigHash,
+            expectedModelConfigSHA256: admission.modelConfigSHA256,
             expectedCheckpointManifestHash:
                 admission.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                admission.checkpointContentSHA256,
             evaluationCorpora: [
                 try KVTunerEvaluationCorpusIdentity(
                     id: "measurement-corpus-v2",

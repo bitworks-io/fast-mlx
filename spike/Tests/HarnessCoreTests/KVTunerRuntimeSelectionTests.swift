@@ -6,15 +6,19 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
     private let matrixID = "kvarn-qwen3-32b-v1"
     private let cellID = "kvtuner-g128-b4.5"
     private let configHash = "0123456789abcdef"
+    private let configSHA256 = String(repeating: "d", count: 64)
     private let checkpointHash = "fedcba9876543210"
+    private let checkpointContentSHA256 = String(repeating: "e", count: 64)
 
     private func validSchedule() -> KVTunerSchedule {
         KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: cellID,
             modelConfigHash: configHash,
+            modelConfigSHA256: configSHA256,
             checkpointManifestHash: checkpointHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
@@ -76,7 +80,9 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         expectedMatrixID: String? = nil,
         expectedCellID: String? = nil,
         expectedModelConfigHash: String? = nil,
+        expectedModelConfigSHA256: String? = nil,
         expectedCheckpointManifestHash: String? = nil,
+        expectedCheckpointContentSHA256: String? = nil,
         evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
     ) throws -> KVTunerRuntimeSelection {
         let artifact: Data
@@ -91,8 +97,13 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
             expectedMatrixID: expectedMatrixID ?? matrixID,
             expectedCellID: expectedCellID ?? cellID,
             expectedModelConfigHash: expectedModelConfigHash ?? configHash,
+            expectedModelConfigSHA256:
+                expectedModelConfigSHA256 ?? configSHA256,
             expectedCheckpointManifestHash:
                 expectedCheckpointManifestHash ?? checkpointHash,
+            expectedCheckpointContentSHA256:
+                expectedCheckpointContentSHA256
+                    ?? checkpointContentSHA256,
             evaluationCorpora:
                 evaluationCorpora ?? (try self.evaluationCorpora()))
     }
@@ -128,9 +139,13 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         XCTAssertEqual(selection.matrixID, matrixID)
         XCTAssertEqual(selection.cellID, cellID)
         XCTAssertEqual(selection.modelConfigHash, configHash)
+        XCTAssertEqual(selection.modelConfigSHA256, configSHA256)
         XCTAssertEqual(selection.checkpointManifestHash, checkpointHash)
+        XCTAssertEqual(
+            selection.checkpointContentSHA256,
+            checkpointContentSHA256)
         XCTAssertEqual(selection.groupSize, 128)
-        XCTAssertEqual(selection.schemaVersion, 3)
+        XCTAssertEqual(selection.schemaVersion, 4)
         XCTAssertEqual(selection.seed, 1234)
         XCTAssertEqual(
             selection.objective,
@@ -205,6 +220,17 @@ final class KVTunerRuntimeSelectionTests: XCTestCase {
         ) {
             _ = try load(
                 expectedCheckpointManifestHash: "bbbbbbbbbbbbbbbb")
+        }
+        assertSelectionError(
+            .qualificationArtifactMismatch("strong-model-identity")
+        ) {
+            _ = try load(expectedModelConfigSHA256: "not-a-digest")
+        }
+        assertSelectionError(
+            .qualificationArtifactMismatch("strong-model-identity")
+        ) {
+            _ = try load(
+                expectedCheckpointContentSHA256: "not-a-digest")
         }
     }
 

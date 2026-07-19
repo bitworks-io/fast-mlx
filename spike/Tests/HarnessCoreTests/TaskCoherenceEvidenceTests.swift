@@ -74,6 +74,83 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         }
     }
 
+    func testReferenceModelIdentityRequiresExactContentWhenCandidateDeclaresIt() {
+        let contentSHA256 = String(repeating: "d", count: 64)
+        let contentlessReference = TaskCoherenceRunIdentity(
+            corpusID: "kvarn-task-coherence-v2",
+            corpusContentHash: "1740d0d07f586def",
+            modelConfigHash: modelConfigHash,
+            modelCheckpointManifestHash: checkpointManifestHash,
+            modelCheckpointContentSHA256: nil,
+            kvQuantTier: "fp16")
+        let exactReference = TaskCoherenceRunIdentity(
+            corpusID: contentlessReference.corpusID,
+            corpusContentHash: contentlessReference.corpusContentHash,
+            modelConfigHash: contentlessReference.modelConfigHash,
+            modelCheckpointManifestHash:
+                contentlessReference.modelCheckpointManifestHash,
+            modelCheckpointContentSHA256: contentSHA256,
+            kvQuantTier: "fp16")
+        let historicalCandidate = KVModelEvidenceIdentity(
+            configHash: modelConfigHash,
+            checkpointManifestHash: checkpointManifestHash)
+        let exactCandidate = KVModelEvidenceIdentity(
+            configHash: modelConfigHash,
+            checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: contentSHA256)
+
+        XCTAssertTrue(TaskCoherenceArtifact.referenceModelIdentityMatches(
+            reference: contentlessReference,
+            candidate: historicalCandidate))
+        XCTAssertFalse(TaskCoherenceArtifact.referenceModelIdentityMatches(
+            reference: contentlessReference,
+            candidate: exactCandidate))
+        XCTAssertTrue(TaskCoherenceArtifact.referenceModelIdentityMatches(
+            reference: exactReference,
+            candidate: exactCandidate))
+
+        let substitutedCandidate = KVModelEvidenceIdentity(
+            configHash: modelConfigHash,
+            checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: String(repeating: "e", count: 64))
+        XCTAssertFalse(TaskCoherenceArtifact.referenceModelIdentityMatches(
+            reference: exactReference,
+            candidate: substitutedCandidate))
+    }
+
+    func testSchemaThreeFP16CarriesExactCheckpointWithoutAttentionBinding() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let contentSHA256 = String(repeating: "d", count: 64)
+        let rows = try makeRows(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceArtifactSHA256: nil,
+            modelCheckpointContentSHA256Override: contentSHA256,
+            schemaVersion:
+                TaskCoherenceArtifact.compressedAttentionSchemaVersion)
+
+        let summary = try TaskCoherenceArtifact.summarize(
+            artifactData(rows), corpus: corpus)
+        XCTAssertEqual(
+            summary.identity.modelCheckpointContentSHA256,
+            contentSHA256)
+
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "fp16",
+                cellID: "fp16",
+                referenceArtifactSHA256: nil,
+                modelCheckpointContentSHA256Override: contentSHA256,
+                schemaVersion: TaskCoherenceArtifact.schemaVersion)),
+            corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .invalidRuntimeEvidence("compressed-attention-schema"))
+            }
+    }
+
     func testTaskCompressedAttentionBindingAuthenticatesModelTokenizerAndOperation() throws {
         let admission = try compressedAttentionAdmission()
         let identity = TaskCoherenceRunIdentity(
@@ -154,9 +231,13 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
 
     func testTaskCompressedAttentionSchemaThreeIsRequiredForAffineBindings() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
         let reference = try summary(
             corpus: corpus, tier: "fp16", cellID: "fp16",
-            referenceDigest: nil)
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash)
         let binding = try compressedAttentionBinding()
 
         XCTAssertNoThrow(try TaskCoherenceArtifact.summarize(
@@ -205,6 +286,8 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             artifactData(try makeRows(
                 corpus: corpus, tier: "fp16", cellID: "fp16",
                 referenceArtifactSHA256: nil,
+                modelCheckpointContentSHA256Override:
+                    String(repeating: "d", count: 64),
                 schemaVersion:
                     TaskCoherenceArtifact.compressedAttentionSchemaVersion,
                 compressedKVAttention: nil)),
@@ -233,7 +316,10 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         let schedule = try kvtunerBinding(
             corpus: corpus,
             modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
             checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256,
             tokenizerSHA256: admission.tokenizerSHA256,
             layerCount: admission.layerCount)
         let binding = try CompressedKVAttentionRuntimeBinding(
@@ -264,7 +350,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             corpus: corpus)) {
                 XCTAssertEqual(
                     $0 as? TaskCoherenceEvidenceError,
-                    .invalidRuntimeEvidence("compressed-attention-schema"))
+                    .invalidRuntimeEvidence("kvtuner-schedule"))
             }
     }
 
@@ -494,11 +580,17 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             corpus: corpus, tier: "fp16", cellID: "fp16",
             referenceDigest: nil)
         let binding = try kvtunerBinding(corpus: corpus)
+        let compressedBinding = try compressedAttentionBinding(
+            request: .materialize,
+            observedOperation: .materializedKV)
         let rows = try makeRows(
             corpus: corpus, tier: kvtunerCellID,
             cellID: kvtunerCellID,
             referenceArtifactSHA256: reference.artifactSHA256,
-            kvtunerSchedule: binding)
+            kvtunerSchedule: binding,
+            schemaVersion:
+                TaskCoherenceArtifact.compressedAttentionSchemaVersion,
+            compressedKVAttention: compressedBinding)
 
         let candidate = try TaskCoherenceArtifact.summarize(
             artifactData(rows), corpus: corpus)
@@ -627,6 +719,81 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             corpus: corpus))
     }
 
+    func testContentBoundPromotionRejectsContentlessOrSubstitutedFP16Reference() throws {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
+        let taskBinding = try kvtunerBinding(corpus: corpus)
+        let contentlessReference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash)
+        let contentlessCandidate = try summary(
+            corpus: corpus,
+            tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceDigest: contentlessReference.artifactSHA256,
+            kvtunerSchedule: taskBinding)
+
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: contentlessCandidate,
+            reference: contentlessReference,
+            corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .referenceArtifactMismatch)
+            }
+
+        let substitutedReference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                String(repeating: "e", count: 64))
+        let substitutedCandidate = try summary(
+            corpus: corpus,
+            tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceDigest: substitutedReference.artifactSHA256,
+            kvtunerSchedule: taskBinding)
+        XCTAssertThrowsError(try TaskCoherencePromotionEvidence.derive(
+            candidate: substitutedCandidate,
+            reference: substitutedReference,
+            corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .referenceArtifactMismatch)
+            }
+
+        let exactReference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                admission.checkpointContentSHA256)
+        let exactCandidate = try summary(
+            corpus: corpus,
+            tier: kvtunerCellID,
+            cellID: kvtunerCellID,
+            referenceDigest: exactReference.artifactSHA256,
+            kvtunerSchedule: taskBinding)
+        XCTAssertNoThrow(try TaskCoherencePromotionEvidence.derive(
+            candidate: exactCandidate,
+            reference: exactReference,
+            corpus: corpus))
+    }
+
     func testPromotionBindsTaskArtifactToKLMatrixCellAndCleanRuntime() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
         let reference = try summary(
@@ -650,9 +817,15 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
 
     func testKVTunerPromotionPairsTheExactTaskAndKLSchedule() throws {
         let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
         let reference = try summary(
             corpus: corpus, tier: "fp16", cellID: "fp16",
-            referenceDigest: nil)
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                admission.checkpointContentSHA256)
         let taskBinding = try kvtunerBinding(corpus: corpus)
         let candidate = try summary(
             corpus: corpus, tier: kvtunerCellID,
@@ -1141,14 +1314,34 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         cellID: String,
         referenceDigest: String?,
         nonce: String? = nil,
-        kvtunerSchedule: KVTunerScheduleBinding? = nil
+        kvtunerSchedule: KVTunerScheduleBinding? = nil,
+        modelConfigHashOverride: String? = nil,
+        modelCheckpointManifestHashOverride: String? = nil,
+        modelCheckpointContentSHA256Override: String? = nil
     ) throws -> TaskCoherenceArtifactSummary {
-        try TaskCoherenceArtifact.summarize(
+        let compressedBinding = try tier.hasPrefix("kvtuner-")
+            && kvtunerSchedule != nil
+            ? compressedAttentionBinding(
+                request: .materialize,
+                observedOperation: .materializedKV)
+            : nil
+        return try TaskCoherenceArtifact.summarize(
             artifactData(try makeRows(
                 corpus: corpus, tier: tier, cellID: cellID,
                 referenceArtifactSHA256: referenceDigest,
                 nonce: nonce,
-                kvtunerSchedule: kvtunerSchedule)),
+                kvtunerSchedule: kvtunerSchedule,
+                modelConfigHashOverride: modelConfigHashOverride,
+                modelCheckpointManifestHashOverride:
+                    modelCheckpointManifestHashOverride,
+                modelCheckpointContentSHA256Override:
+                    modelCheckpointContentSHA256Override,
+                schemaVersion: compressedBinding == nil
+                    && modelCheckpointContentSHA256Override == nil
+                    ? TaskCoherenceArtifact.schemaVersion
+                    : TaskCoherenceArtifact
+                        .compressedAttentionSchemaVersion,
+                compressedKVAttention: compressedBinding)),
             corpus: corpus)
     }
 
@@ -1166,17 +1359,22 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         referenceArtifactSHA256: String?,
         nonce: String? = nil,
         kvtunerSchedule: KVTunerScheduleBinding? = nil,
+        modelConfigHashOverride: String? = nil,
+        modelCheckpointManifestHashOverride: String? = nil,
+        modelCheckpointContentSHA256Override: String? = nil,
         schemaVersion: Int = TaskCoherenceArtifact.schemaVersion,
         compressedKVAttention:
             CompressedKVAttentionRuntimeBinding? = nil
     ) throws -> [ResultRecord<TaskCoherenceCasePayload>] {
         let runModelConfigHash = compressedKVAttention?.admission.modelConfigHash
             ?? kvtunerSchedule?.modelConfigHash
-            ?? modelConfigHash
+            ?? modelConfigHashOverride
+            ?? self.modelConfigHash
         let runCheckpointManifestHash = compressedKVAttention?
             .admission.checkpointManifestHash
             ?? kvtunerSchedule?.checkpointManifestHash
-            ?? checkpointManifestHash
+            ?? modelCheckpointManifestHashOverride
+            ?? self.checkpointManifestHash
         let runTokenizerSHA256 = compressedKVAttention?.admission.tokenizerSHA256
             ?? kvtunerSchedule?.tokenizerSHA256
             ?? String(repeating: "b", count: 64)
@@ -1185,8 +1383,9 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             corpusContentHash: corpus.contentHash,
             modelConfigHash: runModelConfigHash,
             modelCheckpointManifestHash: runCheckpointManifestHash,
-            modelCheckpointContentSHA256: compressedKVAttention?
-                .admission.checkpointContentSHA256,
+            modelCheckpointContentSHA256:
+                modelCheckpointContentSHA256Override
+                ?? compressedKVAttention?.admission.checkpointContentSHA256,
             kvQuantTier: tier,
             kvtunerSchedule: kvtunerSchedule)
         let runProvenance = provenance(
@@ -1358,24 +1557,35 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
     private func kvtunerBinding(
         corpus: TaskCoherenceCorpus,
         modelConfigHash: String? = nil,
+        modelConfigSHA256: String? = nil,
         checkpointManifestHash: String? = nil,
+        checkpointContentSHA256: String? = nil,
         tokenizerSHA256: String? = nil,
-        layerCount: Int = 2,
+        layerCount: Int = 64,
         searchArtifactSHA256: String = String(repeating: "d", count: 64),
         evaluationCorpora: [KVTunerEvaluationCorpusIdentity]? = nil
     ) throws -> KVTunerScheduleBinding {
         let evaluation = try kvtunerEvaluationCorpus(corpus)
-        let scheduleModelConfigHash = modelConfigHash ?? self.modelConfigHash
+        let admission = try compressedAttentionAdmission()
+        let scheduleModelConfigHash = modelConfigHash
+            ?? admission.modelConfigHash
+        let scheduleModelConfigSHA256 = modelConfigSHA256
+            ?? admission.modelConfigSHA256
         let scheduleCheckpointHash = checkpointManifestHash
-            ?? self.checkpointManifestHash
+            ?? admission.checkpointManifestHash
+        let scheduleCheckpointContentSHA256 = checkpointContentSHA256
+            ?? admission.checkpointContentSHA256
         let scheduleTokenizerSHA256 = tokenizerSHA256
-            ?? String(repeating: "b", count: 64)
+            ?? admission.tokenizerSHA256
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: kvtunerCellID,
             modelConfigHash: scheduleModelConfigHash,
+            modelConfigSHA256: scheduleModelConfigSHA256,
             checkpointManifestHash: scheduleCheckpointHash,
+            checkpointContentSHA256:
+                scheduleCheckpointContentSHA256,
             tokenizerSHA256: scheduleTokenizerSHA256,
             groupSize: 128,
             calibrationCorpusID: "calibration-v1",
@@ -1407,7 +1617,10 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             expectedMatrixID: matrixID,
             expectedCellID: kvtunerCellID,
             expectedModelConfigHash: scheduleModelConfigHash,
+            expectedModelConfigSHA256: scheduleModelConfigSHA256,
             expectedCheckpointManifestHash: scheduleCheckpointHash,
+            expectedCheckpointContentSHA256:
+                scheduleCheckpointContentSHA256,
             evaluationCorpora: evaluationCorpora ?? [evaluation])
         return KVTunerScheduleBinding(selection: selection)
     }
@@ -1591,9 +1804,15 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             kvtunerSchedule: binding)
         let model = KVModelEvidenceIdentity(
             configHash: binding.modelConfigHash,
-            checkpointManifestHash: binding.checkpointManifestHash)
+            checkpointManifestHash: binding.checkpointManifestHash,
+            checkpointContentSHA256:
+                binding.checkpointContentSHA256)
+        let compressedBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .materialize,
+            observedOperation: .materializedKV,
+            admission: compressedAttentionAdmission())
         let frontier = KVFrontierEvidence(
-            schemaVersion: 1,
+            schemaVersion: 2,
             matrixID: binding.matrixID,
             cellID: binding.cellID,
             sameWeights: true,
@@ -1607,7 +1826,11 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             candidateExecutionMode: nil,
             candidateCodecIterations: nil,
             candidateMemoryGate: nil,
-            candidateKVTunerSchedule: binding)
+            candidateKVTunerSchedule: binding,
+            candidateCompressedKVAttention: compressedBinding,
+            candidateMaterializationWorkspaceBytes:
+                allocation.workspaceBytes,
+            candidateAttentionWorkspaceBytes: 0)
         let template = try validKLRecord().payload
         let payload = KLPayload(
             kvQuantTier: binding.cellID,

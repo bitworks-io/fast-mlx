@@ -4,6 +4,22 @@ import XCTest
 @testable import HarnessCore
 
 final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
+    func testKVTunerDefaultsToMaterializedAttentionWithoutChangingOtherDefaults() {
+        XCTAssertEqual(
+            CompressedKVAttentionRequest.effective(
+                explicit: nil,
+                hasAuthenticatedKVTunerSchedule: true),
+            .materialize)
+        XCTAssertEqual(
+            CompressedKVAttentionRequest.effective(
+                explicit: .splitAffineQuantizedMM,
+                hasAuthenticatedKVTunerSchedule: true),
+            .splitAffineQuantizedMM)
+        XCTAssertNil(CompressedKVAttentionRequest.effective(
+            explicit: nil,
+            hasAuthenticatedKVTunerSchedule: false))
+    }
+
     func testExplicitCompressedAttentionKLRequiresTheSameResolvedReferenceModel() throws {
         XCTAssertNoThrow(
             try CompressedKVAttentionRuntimeAdmission
@@ -155,25 +171,70 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
         let admission = try admission(for: qwenConfig())
         XCTAssertNoThrow(try admission.validateScheduleIdentity(
             modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: admission.checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             layerCount: 64,
             groupSize: 128))
 
-        let mutations: [(String, String, String, Int, Int)] = [
-            ("ffffffffffffffff", checkpointManifestHash, tokenizerSHA256, 64, 128),
-            (admission.modelConfigHash, "ffffffffffffffff", tokenizerSHA256, 64, 128),
-            (admission.modelConfigHash, checkpointManifestHash, String(repeating: "b", count: 64), 64, 128),
-            (admission.modelConfigHash, checkpointManifestHash, tokenizerSHA256, 63, 128),
-            (admission.modelConfigHash, checkpointManifestHash, tokenizerSHA256, 64, 96),
+        let mutations: [(
+            modelConfigHash: String,
+            modelConfigSHA256: String,
+            checkpointManifestHash: String,
+            checkpointContentSHA256: String,
+            tokenizerSHA256: String,
+            layerCount: Int,
+            groupSize: Int
+        )] = [
+            (
+                "ffffffffffffffff", admission.modelConfigSHA256,
+                checkpointManifestHash,
+                admission.checkpointContentSHA256,
+                tokenizerSHA256, 64, 128),
+            (
+                admission.modelConfigHash,
+                String(repeating: "e", count: 64),
+                checkpointManifestHash,
+                admission.checkpointContentSHA256,
+                tokenizerSHA256, 64, 128),
+            (
+                admission.modelConfigHash, admission.modelConfigSHA256,
+                "ffffffffffffffff",
+                admission.checkpointContentSHA256,
+                tokenizerSHA256, 64, 128),
+            (
+                admission.modelConfigHash, admission.modelConfigSHA256,
+                checkpointManifestHash,
+                String(repeating: "e", count: 64),
+                tokenizerSHA256, 64, 128),
+            (
+                admission.modelConfigHash, admission.modelConfigSHA256,
+                checkpointManifestHash,
+                admission.checkpointContentSHA256,
+                String(repeating: "b", count: 64), 64, 128),
+            (
+                admission.modelConfigHash, admission.modelConfigSHA256,
+                checkpointManifestHash,
+                admission.checkpointContentSHA256,
+                tokenizerSHA256, 63, 128),
+            (
+                admission.modelConfigHash, admission.modelConfigSHA256,
+                checkpointManifestHash,
+                admission.checkpointContentSHA256,
+                tokenizerSHA256, 64, 96),
         ]
         for mutation in mutations {
             XCTAssertThrowsError(try admission.validateScheduleIdentity(
-                modelConfigHash: mutation.0,
-                checkpointManifestHash: mutation.1,
-                tokenizerSHA256: mutation.2,
-                layerCount: mutation.3,
-                groupSize: mutation.4
+                modelConfigHash: mutation.modelConfigHash,
+                modelConfigSHA256: mutation.modelConfigSHA256,
+                checkpointManifestHash:
+                    mutation.checkpointManifestHash,
+                checkpointContentSHA256:
+                    mutation.checkpointContentSHA256,
+                tokenizerSHA256: mutation.tokenizerSHA256,
+                layerCount: mutation.layerCount,
+                groupSize: mutation.groupSize
             )) { error in
                 XCTAssertEqual(
                     error as? CompressedKVAttentionRuntimeAdmissionError,
