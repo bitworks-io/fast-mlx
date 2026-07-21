@@ -5,8 +5,30 @@
 # Usage: run_loaded_bench_qualification.sh <manifest.json> <fresh-output-root>
 set -euo pipefail
 
+# Git repository discovery is part of the evidence identity, so caller-controlled Git
+# environment cannot be allowed to redirect either the preflight or the harness child.
+clear_caller_git_environment() {
+    local variable
+    for variable in "${!GIT_@}"; do
+        unset "$variable"
+    done
+}
+clear_caller_git_environment
+unset HARNESS_GIT_SHA
+
 MANIFEST="${1:?usage: run_loaded_bench_qualification.sh <manifest.json> <fresh-output-root>}"
 OUTPUT="${2:?usage: run_loaded_bench_qualification.sh <manifest.json> <fresh-output-root>}"
+CALLER_DIR="$(pwd -P)"
+absolute_from_caller() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$CALLER_DIR" "$1" ;;
+    esac
+}
+case "$OUTPUT" in
+    /*) ;;
+    *) OUTPUT="$CALLER_DIR/$OUTPUT" ;;
+esac
 RUNNER_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$RUNNER_PATH")"
 BIN="${BIN:-}"
@@ -37,6 +59,11 @@ done
 [[ -n "$BIN" && -x "$BIN" ]] || fail "BIN must name an executable fastmlx-harness"
 [[ -f "$HARNESS_SHA_FILE" && ! -L "$HARNESS_SHA_FILE" ]] \
     || fail "HARNESS_SHA_FILE must name a regular source-stamp file"
+[[ "$(basename "$HARNESS_SHA_FILE")" == ".harness-sha" ]] \
+    || fail "HARNESS_SHA_FILE must be named .harness-sha so the harness reads the authenticated stamp"
+BIN="$(cd "$(dirname "$BIN")" && pwd -P)/$(basename "$BIN")"
+HARNESS_SOURCE_DIR="$(cd "$(dirname "$HARNESS_SHA_FILE")" && pwd -P)"
+HARNESS_SHA_FILE="$HARNESS_SOURCE_DIR/$(basename "$HARNESS_SHA_FILE")"
 [[ "$POLL_SECONDS" =~ ^[0-9]{1,4}$ && "$WATCHDOG_SECONDS" =~ ^[0-9]{1,6}$ \
     && "$KILL_GRACE_SECONDS" =~ ^[0-9]{1,3}$ ]] \
     || fail "poll, watchdog, and kill-grace settings must be decimal integers"
@@ -51,6 +78,31 @@ KILL_GRACE_SECONDS=$((10#$KILL_GRACE_SECONDS))
 HARNESS_SHA="$(tr -d '[:space:]' < "$HARNESS_SHA_FILE")"
 [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]] \
     || fail "source stamp must be one clean lowercase 40-character git SHA"
+HARNESS_STAMP_SHA256="$(shasum -a 256 "$HARNESS_SHA_FILE" | awk '{print $1}')"
+
+source_provenance_is_current() {
+    local live_git_root live_git_sha live_git_status
+    [[ -f "$HARNESS_SHA_FILE" && ! -L "$HARNESS_SHA_FILE" ]] || return 1
+    [[ "$(shasum -a 256 "$HARNESS_SHA_FILE" | awk '{print $1}')" \
+        == "$HARNESS_STAMP_SHA256" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "$HARNESS_SHA_FILE")" == "$HARNESS_SHA" ]] || return 1
+    if command -v git >/dev/null 2>&1; then
+        live_git_root="$(git -C "$HARNESS_SOURCE_DIR" rev-parse --show-toplevel \
+            2>/dev/null || true)"
+        if [[ -n "$live_git_root" ]]; then
+            live_git_sha="$(git -C "$live_git_root" rev-parse HEAD 2>/dev/null)" \
+                || return 1
+            live_git_status="$(git -C "$live_git_root" status --porcelain \
+                --untracked-files=normal -- spike experiments 2>/dev/null)" \
+                || return 1
+            [[ "$live_git_sha" =~ ^[0-9a-f]{40}$ \
+                && -z "$live_git_status" && "$live_git_sha" == "$HARNESS_SHA" ]] \
+                || return 1
+        fi
+    fi
+}
+source_provenance_is_current \
+    || fail "source stamp and live Git provenance must be immutable, clean, and identical"
 MANIFEST_SHA="$(shasum -a 256 "$MANIFEST" | awk '{print $1}')"
 BINARY_SHA="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 RUNNER_SHA="$(shasum -a 256 "$RUNNER_PATH" | awk '{print $1}')"
@@ -129,7 +181,7 @@ CELL_COUNT="$(jq -r '.cells | length' "$MANIFEST")"
 BLOCK_COUNT="$(jq -r '.blocks | length' "$MANIFEST")"
 MATRIX_ID="$(jq -r '.matrixID' "$MANIFEST")"
 WORKLOAD_NONCE="$(jq -r '.workloadNonce' "$MANIFEST")"
-MODEL_PATH="$(jq -r '.modelPath' "$MANIFEST")"
+MODEL_PATH="$(absolute_from_caller "$(jq -r '.modelPath' "$MANIFEST")")"
 MODEL_CONFIG_HASH="$(jq -r '.modelConfigHash' "$MANIFEST")"
 MODEL_MANIFEST_HASH="$(jq -r '.modelCheckpointManifestHash' "$MANIFEST")"
 MODEL_TOKENIZER_SHA="$(jq -r '.modelTokenizerSHA256' "$MANIFEST")"
@@ -145,7 +197,8 @@ TOTAL_ROWS=$((BLOCK_COUNT * CELL_COUNT))
 for ((cell_index = 0; cell_index < CELL_COUNT; cell_index++)); do
     kv_quant="$(jq -r ".cells[$cell_index].kvQuant" "$MANIFEST")"
     if [[ "$kv_quant" == kvtuner-* ]]; then
-        schedule="$(jq -r ".cells[$cell_index].kvtunerSchedule" "$MANIFEST")"
+        schedule="$(absolute_from_caller \
+            "$(jq -r ".cells[$cell_index].kvtunerSchedule" "$MANIFEST")")"
         schedule_sha="$(jq -r ".cells[$cell_index].kvtunerBundleSHA256" "$MANIFEST")"
         [[ -f "$schedule" && ! -L "$schedule" ]] \
             || fail "KVTuner schedule must be a regular, non-symbolic-link file"
@@ -282,6 +335,10 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
     block_receipts="$OUTPUT/blocks/block-$(printf '%03d' "$block_index").receipts.jsonl"
     : > "$block_receipts"
     for ((position = 0; position < CELL_COUNT; position++)); do
+        if ! source_provenance_is_current; then
+            printf 'INPUT_CHANGED\n' > "$STATUS"
+            fail "source stamp changed or live Git provenance drifted during qualification"
+        fi
         if [[ "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')" != "$MANIFEST_SHA" \
             || "$(shasum -a 256 "$RUNNER_PATH" | awk '{print $1}')" != "$RUNNER_SHA" \
             || "$(shasum -a 256 "$BIN" | awk '{print $1}')" != "$BINARY_SHA" ]]; then
@@ -294,6 +351,9 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         attention="$(jq -r '.attention? // empty' <<< "$cell_json")"
         checkpoint_sha="$(jq -r '.checkpointContentSHA256? // empty' <<< "$cell_json")"
         schedule="$(jq -r '.kvtunerSchedule? // empty' <<< "$cell_json")"
+        if [[ -n "$schedule" ]]; then
+            schedule="$(absolute_from_caller "$schedule")"
+        fi
         schedule_bundle_sha="$(jq -r '.kvtunerBundleSHA256? // empty' <<< "$cell_json")"
         schedule_artifact_sha="$(jq -r '.kvtunerScheduleArtifactSHA256? // empty' <<< "$cell_json")"
         run_dir="$OUTPUT/runs/block-$(printf '%03d' "$block_index")/position-$(printf '%03d' "$position")-$cell_id"
@@ -342,7 +402,12 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         printf '[%s] launch block=%s position=%s cell=%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$block_index" "$position" "$cell_id" \
             >> "$RUNNER_LOG"
-        "$BIN" "${args[@]}" > "$run_log" 2>&1 &
+        (
+            clear_caller_git_environment
+            unset HARNESS_GIT_SHA
+            cd "$HARNESS_SOURCE_DIR"
+            exec "$BIN" "${args[@]}"
+        ) > "$run_log" 2>&1 &
         active_child=$!
         printf '%s\n' "$active_child" > "$run_dir/harness.pid"
         max_rss_bytes=0
@@ -520,8 +585,9 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                  .payload.kvtunerSchedule.checkpointContentSHA256 == $checkpointSHA and
                  .payload.kvtunerSchedule.tokenizerSHA256 == $modelTokenizerSHA and
                  .payload.kvtunerSchedule.groupSize > 0 and
-                 (.payload.kvtunerSchedule.layers | type == "array" and length ==
-                   .payload.compressedKVAttention.admission.layerCount) end)
+                 (.payload.kvtunerSchedule.layers | type == "array") and
+                 (.payload.kvtunerSchedule.layers | length) ==
+                   .payload.compressedKVAttention.admission.layerCount end)
             ' "$evidence" >/dev/null; then
             printf 'INVALID_EVIDENCE\n' > "$STATUS"
             fail "harness row failed exact identity or qualification authentication"

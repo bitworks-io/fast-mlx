@@ -52,6 +52,100 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         "runner.watchdog.json").path))
   }
 
+  func testRunnerLaunchesHarnessFromAuthenticatedStampDirectory() throws {
+    let fixture = try makeFixture(readHarnessSHAFromCurrentDirectory: true)
+    let unrelatedDirectory = fixture.root.appendingPathComponent(
+      "unrelated-launch-directory", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: unrelatedDirectory, withIntermediateDirectories: true)
+
+    let result = try runRunner(
+      fixture: fixture, workingDirectory: unrelatedDirectory)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    let firstEvidence = try XCTUnwrap(
+      FileManager.default.subpathsOfDirectory(
+        atPath: fixture.output.appendingPathComponent("runs").path)
+        .filter { $0.hasSuffix("/bench.jsonl") }
+        .sorted()
+        .first)
+    let record = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf:
+        fixture.output.appendingPathComponent("runs/\(firstEvidence)")))
+        as? [String: Any])
+    let provenance = try XCTUnwrap(record["provenance"] as? [String: Any])
+    XCTAssertEqual(
+      provenance["harnessGitSHA"] as? String,
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+  }
+
+  func testRunnerIgnoresHarnessSHAEnvironmentOverride() throws {
+    let fixture = try makeFixture(
+      readHarnessSHAFromCurrentDirectory: true,
+      spoofHarnessSHAEnvironment: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+  }
+
+  func testRunnerScrubsGitEnvironmentBeforeLaunchingHarness() throws {
+    let fixture = try makeFixture(
+      readHarnessSHAFromCurrentDirectory: true,
+      spoofGitEnvironment: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+  }
+
+  func testRunnerRejectsStampMutationBeforeLaunchingTheNextRow() throws {
+    let fixture = try makeFixture(
+      readHarnessSHAFromCurrentDirectory: true,
+      mutateHarnessStampAfterFirstRun: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("source stamp changed"))
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INPUT_CHANGED\n")
+    let launches = try String(
+      contentsOf: fixture.launches, encoding: .utf8)
+      .split(separator: "\n")
+    XCTAssertEqual(launches.count, 1)
+  }
+
+  func testRunnerPreservesCallerRelativeModelAndSchedulePaths() throws {
+    let fixture = try makeFixture(
+      includeKVTuner: true,
+      runtimePathsRelativeToCaller: true,
+      requireResolvedRuntimePaths: true,
+      harnessStampInSubdirectory: true)
+
+    let result = try runRunner(
+      fixture: fixture, workingDirectory: fixture.root)
+
+    XCTAssertEqual(result.status, 0, result.output)
+  }
+
+  func testRunnerRejectsAStampNameTheHarnessCannotReadBeforeLaunching()
+    throws
+  {
+    let fixture = try makeFixture(
+      readHarnessSHAFromCurrentDirectory: true,
+      harnessStampFilename: "source-sha.txt")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains(".harness-sha"))
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: fixture.launches.path))
+  }
+
   func testRunnerRefusesOutputReuseAndDoesNotLaunchADuplicate() throws {
     let fixture = try makeFixture()
     XCTAssertEqual(try runRunner(fixture: fixture).status, 0)
@@ -191,6 +285,14 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       "INVALID_EVIDENCE\n")
   }
 
+  func testRunnerAcceptsKVTunerEvidenceMatchingTheFrozenBundle() throws {
+    let fixture = try makeFixture(includeKVTuner: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+  }
+
   func testRunnerWritesATerminalStatusWhenHarnessOmitsEvidence() throws {
     let fixture = try makeFixture(omitEvidence: true)
 
@@ -301,6 +403,11 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let truncateAdmissionEvidence: Bool
     let truncateKVTunerEvidence: Bool
     let stallHarness: Bool
+    let readHarnessSHAFromCurrentDirectory: Bool
+    let spoofHarnessSHAEnvironment: Bool
+    let spoofGitEnvironment: Bool
+    let mutateHarnessStampAfterFirstRun: Bool
+    let requireResolvedRuntimePaths: Bool
     let kvtunerArtifactSHA256: String
     let kvtunerBundleSHA256: String
   }
@@ -321,7 +428,15 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     truncateAdmissionEvidence: Bool = false,
     truncateKVTunerEvidence: Bool = false,
     mismatchBinaryIdentity: Bool = false,
-    stallHarness: Bool = false
+    stallHarness: Bool = false,
+    readHarnessSHAFromCurrentDirectory: Bool = false,
+    spoofHarnessSHAEnvironment: Bool = false,
+    spoofGitEnvironment: Bool = false,
+    mutateHarnessStampAfterFirstRun: Bool = false,
+    runtimePathsRelativeToCaller: Bool = false,
+    requireResolvedRuntimePaths: Bool = false,
+    harnessStampInSubdirectory: Bool = false,
+    harnessStampFilename: String = ".harness-sha"
   ) throws -> Fixture {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(
       "loaded-bench-runner-\(UUID().uuidString)", isDirectory: true)
@@ -330,7 +445,13 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let manifest = root.appendingPathComponent("manifest.json")
     let output = root.appendingPathComponent("output", isDirectory: true)
     let binary = root.appendingPathComponent("fake-harness.sh")
-    let harnessSHA = root.appendingPathComponent(".harness-sha")
+    let harnessStampDirectory = harnessStampInSubdirectory
+      ? root.appendingPathComponent("deploy", isDirectory: true)
+      : root
+    try FileManager.default.createDirectory(
+      at: harnessStampDirectory, withIntermediateDirectories: true)
+    let harnessSHA = harnessStampDirectory.appendingPathComponent(
+      harnessStampFilename)
     let launches = root.appendingPathComponent("launches.txt")
     let model = root.appendingPathComponent("models/test", isDirectory: true)
     try FileManager.default.createDirectory(
@@ -361,7 +482,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         "kvQuant": "kvtuner-g128-b3.046875",
         "attention": "split-affine-quantized-mm",
         "checkpointContentSHA256": String(repeating: "b", count: 64),
-        "kvtunerSchedule": schedule.path,
+        "kvtunerSchedule": runtimePathsRelativeToCaller
+          ? schedule.lastPathComponent : schedule.path,
         "kvtunerBundleSHA256": kvtunerBundleSHA256,
         "kvtunerScheduleArtifactSHA256": kvtunerArtifactSHA256,
       ],
@@ -432,6 +554,10 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         esac
       done
       printf '%s:%s:%s\n' "$block" "$position" "$label" >> "$FAKE_LAUNCHES"
+      if [[ "$FAKE_REQUIRE_RESOLVED_RUNTIME_PATHS" == "true" ]]; then
+        [[ -d "$model" ]] || exit 41
+        [[ -z "$schedule" || -f "$schedule" ]] || exit 42
+      fi
       if [[ "$FAKE_STALL_HARNESS" == "true" ]]; then sleep 60; fi
       if [[ "$FAKE_OMIT_EVIDENCE" == "true" ]]; then exit 0; fi
       thermal="nominal"
@@ -459,8 +585,21 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       if [[ "$FAKE_MISMATCH_TOKENIZER" == "true" ]]; then
         tokenizer_sha="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
       fi
+      harness_sha="$FAKE_HARNESS_SHA"
+      if [[ "$FAKE_READ_HARNESS_SHA_FROM_CWD" == "true" ]]; then
+        if [[ -n "${GIT_DIR:-}" || -n "${GIT_WORK_TREE:-}" ||
+              -n "${GIT_CEILING_DIRECTORIES:-}" ]]; then
+          harness_sha="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        elif [[ -n "${HARNESS_GIT_SHA:-}" ]]; then
+          harness_sha="$HARNESS_GIT_SHA"
+        elif [[ -f .harness-sha ]]; then
+          harness_sha="$(tr -d '[:space:]' < .harness-sha)"
+        else
+          harness_sha="unknown"
+        fi
+      fi
       jq -cn \
-        --arg harness "$FAKE_HARNESS_SHA" --arg label "$label" \
+        --arg harness "$harness_sha" --arg label "$label" \
         --arg matrix "$matrix" --arg nonce "$nonce" --arg tier "$tier" \
         --arg manifest "$manifest_sha" --arg thermal "$thermal" \
         --arg attention "$attention" --arg observed "$observed" \
@@ -544,6 +683,11 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           after:{monotonicTimestampSeconds:11,residentSizeBytes:21000,
           physicalFootprintBytes:19000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:$thermal}}]}}}' > "$evidence"
+      if [[ "$FAKE_MUTATE_HARNESS_STAMP" == "true" &&
+            "$block" == "0" && "$position" == "0" ]]; then
+        printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+          > "$FAKE_HARNESS_SHA_FILE"
+      fi
       """
     try fakeHarness.write(
       to: binary, atomically: true, encoding: .utf8)
@@ -560,7 +704,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         ? String(repeating: "f", count: 64) : actualBinarySHA256,
       "matrixID": "qualification-test-v1",
       "workloadNonce": "qualification-test-v1",
-      "modelPath": model.path,
+      "modelPath": runtimePathsRelativeToCaller
+        ? "models/test" : model.path,
       "modelConfigHash": String(repeating: "1", count: 16),
       "modelCheckpointManifestHash": String(repeating: "2", count: 16),
       "modelTokenizerSHA256": String(repeating: "4", count: 64),
@@ -587,13 +732,19 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       truncateAdmissionEvidence: truncateAdmissionEvidence,
       truncateKVTunerEvidence: truncateKVTunerEvidence,
       stallHarness: stallHarness,
+      readHarnessSHAFromCurrentDirectory: readHarnessSHAFromCurrentDirectory,
+      spoofHarnessSHAEnvironment: spoofHarnessSHAEnvironment,
+      spoofGitEnvironment: spoofGitEnvironment,
+      mutateHarnessStampAfterFirstRun: mutateHarnessStampAfterFirstRun,
+      requireResolvedRuntimePaths: requireResolvedRuntimePaths,
       kvtunerArtifactSHA256: kvtunerArtifactSHA256,
       kvtunerBundleSHA256: kvtunerBundleSHA256)
   }
 
   private func runRunner(
     fixture: Fixture,
-    watchdogSeconds: String = "30"
+    watchdogSeconds: String = "30",
+    workingDirectory: URL? = nil
   ) throws -> (
     status: Int32, output: String
   ) {
@@ -602,6 +753,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     process.arguments = [
       runnerScriptURL.path, fixture.manifest.path, fixture.output.path,
     ]
+    process.currentDirectoryURL = workingDirectory
     var environment = ProcessInfo.processInfo.environment
     environment["BIN"] = fixture.binary.path
     environment["HARNESS_SHA_FILE"] = fixture.harnessSHA.path
@@ -626,6 +778,22 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       fixture.truncateKVTunerEvidence ? "true" : "false"
     environment["FAKE_STALL_HARNESS"] =
       fixture.stallHarness ? "true" : "false"
+    environment["FAKE_READ_HARNESS_SHA_FROM_CWD"] =
+      fixture.readHarnessSHAFromCurrentDirectory ? "true" : "false"
+    environment["FAKE_REQUIRE_RESOLVED_RUNTIME_PATHS"] =
+      fixture.requireResolvedRuntimePaths ? "true" : "false"
+    environment["FAKE_MUTATE_HARNESS_STAMP"] =
+      fixture.mutateHarnessStampAfterFirstRun ? "true" : "false"
+    environment["FAKE_HARNESS_SHA_FILE"] = fixture.harnessSHA.path
+    if fixture.spoofHarnessSHAEnvironment {
+      environment["HARNESS_GIT_SHA"] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+    if fixture.spoofGitEnvironment {
+      environment["GIT_DIR"] = "caller-controlled-git-directory"
+      environment["GIT_WORK_TREE"] = "caller-controlled-git-work-tree"
+      environment["GIT_CEILING_DIRECTORIES"] = fixture.root.path
+    }
     environment["FAKE_MODEL_CONFIG_HASH"] = String(repeating: "1", count: 16)
     environment["FAKE_MODEL_MANIFEST_HASH"] = String(repeating: "2", count: 16)
     environment["FAKE_KVTUNER_ARTIFACT_SHA"] =
