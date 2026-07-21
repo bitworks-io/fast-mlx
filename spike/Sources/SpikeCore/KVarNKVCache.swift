@@ -539,7 +539,7 @@ public enum KVarNMLXCodec {
         let bias: MLXArray
     }
 
-    private static func normalizedHadamard(dimension: Int) -> MLXArray {
+    fileprivate static func normalizedHadamard(dimension: Int) -> MLXArray {
         var matrix: [Float] = [1]
         var size = 1
         while size < dimension {
@@ -1602,6 +1602,162 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
     /// record, the one live fp16 tail, or negative infinity. This prevents both double counting
     /// and inactive zero slots from stealing softmax mass.
     private func packedAttention(
+        queries: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        guard headDimension == 128 else {
+            return packedAttentionBySlot(
+                queries: queries, scale: scale, mask: mask)
+        }
+
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let queryTokens = queries.dim(2)
+        let dimension = queries.dim(3)
+        let kvHeads = headCount!
+        let repeats = queryHeads / kvHeads
+        let slots = packedTileSlots(for: capacity)
+        let groupSize = tier.groupSize
+        let scaledQueries = queries * MLXArray(scale).asType(queries.dtype)
+        let sinkScores = groupedDenseScores(
+            queries: scaledQueries,
+            keys: sinkKeys!)
+        let tailScores = groupedDenseScores(
+            queries: scaledQueries,
+            keys: tailKeys!)
+
+        let rotatedQueries = matmul(
+            scaledQueries.asType(.float32),
+            KVarNMLXCodec.normalizedHadamard(dimension: dimension)
+        ).asType(scaledQueries.dtype).reshaped([
+            batch, kvHeads, repeats, 1, queryTokens, dimension,
+        ])
+        let keyPayload = kPayload!.view(dtype: .uint32).reshaped([
+            batch, kvHeads, slots, dimension,
+            groupSize * tier.keyBits / 32,
+        ]).expandedDimensions(axis: 2)
+        let keyScales = kAbsorbedScales!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: -1)
+        let keyBiases = kAbsorbedBiases!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: -1)
+        let keyTokenScales = kTokenScales!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: 4)
+        var packedScores = quantizedMM(
+            rotatedQueries,
+            keyPayload,
+            scales: keyScales,
+            biases: keyBiases,
+            transpose: false,
+            groupSize: groupSize,
+            bits: tier.keyBits,
+            mode: .affine)
+        packedScores = packedScores
+            * keyTokenScales.asType(packedScores.dtype)
+
+        let postSink = maximum(
+            offsetArr - MLXArray(Int32(tier.sinkTokens)),
+            MLXArray(Int32(0)))
+        let completed = floorDivide(
+            postSink, MLXArray(Int32(tier.groupSize)))
+        let liveTailCount = remainder(
+            postSink, MLXArray(Int32(tier.groupSize)))
+        let negativeInfinity = MLXArray(-Float.infinity).asType(queries.dtype)
+        let slotIndices = MLXArray(Int32(0) ..< Int32(slots))
+            .reshaped([1, 1, 1, slots, 1, 1])
+        let isPacked = slotIndices .< completed
+        let isLiveTail = (slotIndices .== completed)
+            & (liveTailCount .> MLXArray(Int32(0)))
+        let groupedTailScores = tailScores.reshaped([
+            batch, kvHeads, repeats, queryTokens, groupSize,
+        ]).expandedDimensions(axis: 3)
+        let selectedScores = MLX.where(
+            isPacked,
+            packedScores,
+            MLX.where(isLiveTail, groupedTailScores, negativeInfinity))
+        let postSinkScores = selectedScores
+            .transposed(0, 1, 2, 4, 3, 5)
+            .reshaped([
+                batch, queryHeads, queryTokens, slots * groupSize,
+            ])
+        var scores = concatenated([sinkScores, postSinkScores], axis: -1)
+        scores = scores[0..., 0..., 0..., 0 ..< capacity]
+        scores = apply(mask: mask, to: scores)
+        let weights = softmax(scores, axis: -1, precise: true)
+        let workspace = checkedSum([scores.nbytes, weights.nbytes])
+        attentionWorkspaceBytes = Swift.max(
+            attentionWorkspaceBytes ?? 0,
+            workspace)
+
+        let sinkWidth = Swift.min(tier.sinkTokens, capacity)
+        var output = groupedDenseValueProduct(
+            weights: paddedWeights(
+                weights, start: 0, count: sinkWidth,
+                targetCount: tier.sinkTokens),
+            values: sinkValues!)
+        let postSinkCount = capacity - sinkWidth
+        let groupedWeights = paddedWeights(
+            weights,
+            start: sinkWidth,
+            count: postSinkCount,
+            targetCount: slots * groupSize
+        ).reshaped([
+            batch, kvHeads, repeats, queryTokens, slots, groupSize,
+        ]).transposed(0, 1, 2, 4, 3, 5)
+        let valuePayload = vPayload!.view(dtype: .uint32).reshaped([
+            batch, kvHeads, slots, groupSize,
+            dimension * tier.valueBits / 32,
+        ]).expandedDimensions(axis: 2)
+        let valueScales = vAbsorbedScales!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: -1)
+        let valueBiases = vAbsorbedBiases!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: -1)
+        var packedOutput = quantizedMM(
+            groupedWeights,
+            valuePayload,
+            scales: valueScales,
+            biases: valueBiases,
+            transpose: false,
+            groupSize: dimension,
+            bits: tier.valueBits,
+            mode: .affine)
+        let valueChannelScales = vChannelScales!
+            .expandedDimensions(axis: 2)
+            .expandedDimensions(axis: 4)
+        packedOutput = packedOutput
+            * valueChannelScales.asType(packedOutput.dtype)
+        packedOutput = matmul(
+            packedOutput.asType(.float32),
+            KVarNMLXCodec.normalizedHadamard(dimension: dimension)
+        ).asType(valueOutputDType!)
+
+        let tailOutput = matmul(
+            groupedWeights,
+            tailValues!
+                .expandedDimensions(axis: 2)
+                .expandedDimensions(axis: 3))
+        let selectedOutput = MLX.where(
+            isPacked,
+            packedOutput,
+            MLX.where(
+                isLiveTail,
+                tailOutput,
+                MLXArray.zeros(packedOutput.shape, dtype: packedOutput.dtype)))
+        output = output + selectedOutput.sum(axis: 3).reshaped([
+            batch, queryHeads, queryTokens, dimension,
+        ])
+        return output
+    }
+
+    /// Compatibility route for the math-level D=256/512 fixtures. The loaded model path is
+    /// D=128 and uses the slot-vectorized graph above so compiled graph width does not grow with
+    /// cache capacity.
+    private func packedAttentionBySlot(
         queries: MLXArray,
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode

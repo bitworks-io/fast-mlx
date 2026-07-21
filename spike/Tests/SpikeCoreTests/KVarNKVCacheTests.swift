@@ -1117,6 +1117,67 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
     }
 
+    func testCompiledDirectKVarNReplaySupportsLoadedQwenEightKCapacity() throws {
+        let capacity = 8_448
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: capacity,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+
+        func inputs() -> [MLXArray] {
+            let keys = MLXArray.zeros(
+                [1, 8, 1, dimension], dtype: .float16)
+            return [
+                MLXArray.zeros(
+                    [1, 64, 1, dimension], dtype: .float16),
+                keys,
+                keys,
+            ]
+        }
+
+        let prefill = inputs()
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: prefill[0],
+            keys: prefill[1],
+            values: prefill[2],
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(prefillOutput, cache.innerState())
+        let stateBeforeReplay = cache.innerState()
+
+        let step = compile(inputs: [cache], outputs: [cache]) { arguments in
+            [attentionWithCacheUpdate(
+                queries: arguments[0],
+                keys: arguments[1],
+                values: arguments[2],
+                cache: cache,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: 1, windowSize: nil, returnArray: true))]
+        }
+        let output = step(inputs())[0]
+        eval(output, cache.innerState())
+
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+        XCTAssertTrue(
+            (output .== MLXArray(Float16(0))).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 2)
+        XCTAssertTrue(
+            zip(stateBeforeReplay, cache.innerState()).allSatisfy { $0 === $1 },
+            "loaded-capacity replay must preserve every compiled state handle")
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.capacityTokens, capacity)
+        XCTAssertEqual(storage.packedTileSlots, 65)
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
     func testDirectRouterRejectsInvalidRequestBeforeCacheMutation() throws {
         let dimension = 128
         let cache = KVarNKVCache(
