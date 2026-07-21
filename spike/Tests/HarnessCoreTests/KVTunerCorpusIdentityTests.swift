@@ -309,6 +309,66 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
             identity)
     }
 
+    func testBenchWorkloadIdentityAcceptsExactRepeatedAuditedPrompt() throws {
+        let repeatedPrompt = Array(
+            repeating: defaultBenchPrompt,
+            count: 3
+        ).joined(separator: "\n")
+        let workload = try BenchWorkloadIdentity(
+            basePrompt: repeatedPrompt,
+            nonce: "kvarn-frontier-20260718",
+            iterations: 2)
+
+        let identity = try KVTunerEvaluationCorpusIdentity.benchWorkload(
+            workload)
+
+        XCTAssertEqual(
+            identity.canonicalEntryDigests,
+            workload.prompts.map(KVTunerPromptDigest.exactText).sorted())
+        XCTAssertFalse(identity.canonicalSourceItemDigests.isEmpty)
+    }
+
+    func testBenchWorkloadIdentityRejectsAlteredRepeatedAuditedPrompt() throws {
+        let unauditedPrompts = [
+            defaultBenchPrompt + "\n" + defaultBenchPrompt + " altered",
+            defaultBenchPrompt + "\n",
+            defaultBenchPrompt + "\n\n" + defaultBenchPrompt,
+        ]
+
+        for basePrompt in unauditedPrompts {
+            let workload = try BenchWorkloadIdentity(
+                basePrompt: basePrompt,
+                nonce: "kvarn-frontier-20260718",
+                iterations: 2)
+
+            XCTAssertThrowsError(
+                try KVTunerEvaluationCorpusIdentity.benchWorkload(workload)
+            ) { error in
+                XCTAssertEqual(
+                    error as? KVTunerEvaluationCorpusIdentityError,
+                    .canonicalSourceItemsRequired)
+            }
+        }
+    }
+
+    func testBenchWorkloadIdentityRejectsRepeatAboveCLIBound() throws {
+        let workload = try BenchWorkloadIdentity(
+            basePrompt: Array(
+                repeating: defaultBenchPrompt,
+                count: 4_097
+            ).joined(separator: "\n"),
+            nonce: "kvarn-frontier-20260718",
+            iterations: 2)
+
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.benchWorkload(workload)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerEvaluationCorpusIdentityError,
+                .canonicalSourceItemsRequired)
+        }
+    }
+
     func testBenchWorkloadIdentityRejectsAnUnauditedCustomPrompt() throws {
         let workload = try BenchWorkloadIdentity(
             basePrompt: "A custom benchmark prompt",

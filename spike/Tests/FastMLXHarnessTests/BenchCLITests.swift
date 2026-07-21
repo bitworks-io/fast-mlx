@@ -62,6 +62,21 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNil(plan.compressedKVAttention)
     }
 
+    func testKVTunerBenchPlanKeepsRepeatedDefaultPromptAudited() throws {
+        let plan = try parseBenchPlan(Flags(
+            kvtunerArguments + ["--prompt-repeat", "3"]
+        ))
+
+        XCTAssertEqual(plan.promptRepeat, 3)
+        XCTAssertEqual(
+            plan.workload.basePrompt,
+            Array(repeating: defaultBenchPrompt, count: 3)
+                .joined(separator: "\n"))
+        XCTAssertNoThrow(
+            try KVTunerEvaluationCorpusIdentity.benchWorkload(
+                plan.workload))
+    }
+
     func testQualificationBenchPlanRequiresAndPreservesOneIsolatedMatrixPosition()
         throws
     {

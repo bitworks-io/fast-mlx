@@ -311,8 +311,19 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
     ) throws -> KVTunerEvaluationCorpusIdentity {
         let expectedPromptSHA256 =
             "aaa70310381eb25ba917e680397c141e494ae62e174dc42de3e5f0b2a4a261a4"
-        guard workload.basePrompt == defaultBenchPrompt,
-            sha256Hex(Data(workload.basePrompt.utf8)) == expectedPromptSHA256
+        guard sha256Hex(Data(defaultBenchPrompt.utf8)) == expectedPromptSHA256
+        else {
+            throw KVTunerEvaluationCorpusIdentityError
+                .canonicalSourceItemsRequired
+        }
+        // Bench expands long-context workloads by joining exact copies of the audited prompt.
+        // Authenticate every component so prompt-repeat remains eligible without allowing a
+        // custom or partially mutated prompt to borrow the first-party source assertion.
+        let promptComponents = workload.basePrompt.components(
+            separatedBy: "\n")
+        guard !promptComponents.isEmpty,
+            promptComponents.count <= 4_096,
+            promptComponents.allSatisfy({ $0 == defaultBenchPrompt })
         else {
             throw KVTunerEvaluationCorpusIdentityError
                 .canonicalSourceItemsRequired
