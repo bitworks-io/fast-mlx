@@ -72,8 +72,146 @@ final class BenchQualificationEvidenceTests: XCTestCase {
     XCTAssertEqual(
       try JSONDecoder().decode(
         BenchQualificationEvidence.self,
+      from: JSONEncoder().encode(evidence)),
+      evidence)
+  }
+
+  func testLegacyThermalPolicyAndAdmissionDecodeWithoutStabilityFields()
+    throws
+  {
+    let policyData = Data("""
+      {"target":"nominal","timeoutSeconds":600,"pollIntervalMilliseconds":1000}
+      """.utf8)
+    let policy = try JSONDecoder().decode(
+      BenchQualificationThermalPolicy.self, from: policyData)
+    XCTAssertEqual(policy.stabilitySeconds, 0)
+
+    let evidenceData = Data("""
+      {"schemaVersion":3,
+       "context":{"runnerManifestSHA256":"\(manifestSHA256)",
+        "matrixBlockIndex":2,"matrixRunPosition":3,"matrixCellCount":7,
+        "memoryLimitBytes":9000,"cacheLimitBytes":8000,"wiredLimitBytes":10000,
+        "tokenizerSHA256":"\(String(repeating: "b", count: 64))",
+        "cacheResetPolicy":"in-place-before-every-generation",
+        "modelResidencyPolicy":"load-once-per-process",
+        "processIsolationPolicy":"fresh-process-per-matrix-position",
+        "postWarmupThermalPolicy":{"target":"nominal","timeoutSeconds":600,
+        "pollIntervalMilliseconds":1000}},
+       "warmup":{"before":{"monotonicTimestampSeconds":10,"residentSizeBytes":1,
+        "physicalFootprintBytes":1,"lowPowerModeEnabled":false,
+        "powerSource":"ac-power","thermalState":"nominal"},
+        "after":{"monotonicTimestampSeconds":11,"residentSizeBytes":1,
+        "physicalFootprintBytes":1,"lowPowerModeEnabled":false,
+        "powerSource":"ac-power","thermalState":"fair"}},
+       "postWarmupThermalAdmission":{"snapshot":{"monotonicTimestampSeconds":12,
+        "residentSizeBytes":1,"physicalFootprintBytes":1,"lowPowerModeEnabled":false,
+        "powerSource":"ac-power","thermalState":"nominal"}},
+       "runs":[{"before":{"monotonicTimestampSeconds":13,"residentSizeBytes":1,
+        "physicalFootprintBytes":1,"lowPowerModeEnabled":false,
+        "powerSource":"ac-power","thermalState":"nominal"},
+        "after":{"monotonicTimestampSeconds":14,"residentSizeBytes":1,
+        "physicalFootprintBytes":1,"lowPowerModeEnabled":false,
+        "powerSource":"ac-power","thermalState":"nominal"}}]}
+      """.utf8)
+    let evidence = try JSONDecoder().decode(
+      BenchQualificationEvidence.self, from: evidenceData)
+    XCTAssertEqual(evidence.schemaVersion, 3)
+    XCTAssertEqual(evidence.postWarmupThermalAdmission?.stabilityObservations, [
+      try XCTUnwrap(evidence.postWarmupThermalAdmission?.snapshot),
+    ])
+  }
+
+  func testStablePostWarmupThermalTargetRoundTripsSampledNominalDwell()
+    throws
+  {
+    let policy = try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 600,
+      pollIntervalMilliseconds: 1_000,
+      stabilitySeconds: 60)
+    let context = try qualificationContext(
+      postWarmupThermalPolicy: policy)
+    let warmup = try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+    let observations = [
+      hostSnapshot(monotonicTimestampSeconds: 12),
+      hostSnapshot(monotonicTimestampSeconds: 42),
+      hostSnapshot(monotonicTimestampSeconds: 72),
+    ]
+    let admission = try BenchQualificationThermalAdmission(
+      stabilityObservations: observations)
+    let retained = try environmentRun(
+      before: hostSnapshot(monotonicTimestampSeconds: 73),
+      after: hostSnapshot(monotonicTimestampSeconds: 74))
+
+    let evidence = try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission: admission,
+      runs: [retained])
+
+    XCTAssertEqual(evidence.schemaVersion, 4)
+    XCTAssertEqual(
+      evidence.postWarmupThermalAdmission?.stabilityObservations,
+      observations)
+    XCTAssertEqual(
+      evidence.postWarmupThermalAdmission?.snapshot,
+      observations.last)
+    XCTAssertEqual(
+      try JSONDecoder().decode(
+        BenchQualificationEvidence.self,
         from: JSONEncoder().encode(evidence)),
       evidence)
+  }
+
+  func testStablePostWarmupThermalTargetRejectsShortOrInterruptedDwell()
+    throws
+  {
+    let policy = try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 600,
+      pollIntervalMilliseconds: 1_000,
+      stabilitySeconds: 60)
+    let context = try qualificationContext(
+      postWarmupThermalPolicy: policy)
+    let warmup = try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+
+    XCTAssertThrowsError(try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission:
+        try BenchQualificationThermalAdmission(
+          stabilityObservations: [
+            hostSnapshot(monotonicTimestampSeconds: 12),
+            hostSnapshot(monotonicTimestampSeconds: 71.999),
+          ]),
+      runs: [try environmentRun(
+        before: hostSnapshot(monotonicTimestampSeconds: 73),
+        after: hostSnapshot(monotonicTimestampSeconds: 74))])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalAdmission)
+    }
+
+    XCTAssertThrowsError(try BenchQualificationThermalAdmission(
+      stabilityObservations: [
+        hostSnapshot(monotonicTimestampSeconds: 12),
+        hostSnapshot(
+          monotonicTimestampSeconds: 42,
+          thermalState: .fair),
+        hostSnapshot(monotonicTimestampSeconds: 72),
+      ])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalAdmission)
+    }
   }
 
   func testPostWarmupThermalTargetFailsClosedForPartialOrUnsafeEvidence()

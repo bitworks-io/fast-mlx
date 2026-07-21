@@ -51,6 +51,39 @@ struct BenchQualificationModelIdentity: Equatable {
     let tokenizerSHA256: String
 }
 
+struct BenchQualificationRetainedEnvironmentDiagnostic:
+    Codable, Equatable
+{
+    let schemaVersion: Int
+    let before: BenchQualificationHostSnapshot
+    let after: BenchQualificationHostSnapshot
+
+    init(
+        before: BenchQualificationHostSnapshot,
+        after: BenchQualificationHostSnapshot
+    ) {
+        schemaVersion = 1
+        self.before = before
+        self.after = after
+    }
+}
+
+func benchQualificationRetainedEnvironmentDiagnosticLine(
+    before: BenchQualificationHostSnapshot,
+    after: BenchQualificationHostSnapshot
+) throws -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    let data = try encoder.encode(
+        BenchQualificationRetainedEnvironmentDiagnostic(
+            before: before, after: after))
+    guard let json = String(data: data, encoding: .utf8) else {
+        throw BenchQualificationRuntimeError
+            .invalidPostWarmupThermalSnapshot
+    }
+    return "# qualification retained environment: \(json)"
+}
+
 func benchQualificationModelIdentity(
     modelPath: String
 ) throws -> BenchQualificationModelIdentity {
@@ -130,6 +163,7 @@ func waitForBenchQualificationThermalAdmission(
     var current = initialSnapshot
     var previousTimestamp: Double?
     var elapsedMilliseconds = 0
+    var stabilityObservations: [BenchQualificationHostSnapshot] = []
 
     while true {
         guard current.monotonicTimestampSeconds.isFinite,
@@ -154,10 +188,17 @@ func waitForBenchQualificationThermalAdmission(
         }
         switch current.thermalState {
         case .nominal:
-            return try BenchQualificationThermalAdmission(
-                snapshot: current)
+            stabilityObservations.append(current)
+            if let first = stabilityObservations.first,
+                current.monotonicTimestampSeconds
+                    - first.monotonicTimestampSeconds
+                    >= Double(policy.stabilitySeconds)
+            {
+                return try BenchQualificationThermalAdmission(
+                    stabilityObservations: stabilityObservations)
+            }
         case .fair:
-            break
+            stabilityObservations.removeAll(keepingCapacity: true)
         case .serious, .critical, .unknown:
             throw BenchQualificationRuntimeError
                 .unsafePostWarmupThermalState(current.thermalState)
@@ -166,9 +207,21 @@ func waitForBenchQualificationThermalAdmission(
             throw BenchQualificationRuntimeError
                 .postWarmupThermalTargetTimeout
         }
-        let sleepMilliseconds = min(
+        var sleepMilliseconds = min(
             policy.pollIntervalMilliseconds,
             timeoutMilliseconds - elapsedMilliseconds)
+        if let first = stabilityObservations.first {
+            let remainingStabilityMilliseconds = Int(ceil(max(
+                0,
+                Double(policy.stabilitySeconds) * 1_000
+                    - (current.monotonicTimestampSeconds
+                        - first.monotonicTimestampSeconds) * 1_000)))
+            if remainingStabilityMilliseconds > 0 {
+                sleepMilliseconds = min(
+                    sleepMilliseconds,
+                    remainingStabilityMilliseconds)
+            }
+        }
         previousTimestamp = current.monotonicTimestampSeconds
         try await sleep(sleepMilliseconds)
         elapsedMilliseconds += sleepMilliseconds

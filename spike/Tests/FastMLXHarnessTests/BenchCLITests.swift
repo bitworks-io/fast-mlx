@@ -97,6 +97,7 @@ final class BenchCLITests: XCTestCase {
             "--post-warmup-thermal-target", "nominal",
             "--post-warmup-thermal-timeout-seconds", "600",
             "--post-warmup-thermal-poll-milliseconds", "1000",
+            "--post-warmup-thermal-stability-seconds", "60",
         ]))
 
         XCTAssertEqual(
@@ -117,7 +118,8 @@ final class BenchCLITests: XCTestCase {
                     try BenchQualificationThermalPolicy(
                         target: .nominal,
                         timeoutSeconds: 600,
-                        pollIntervalMilliseconds: 1_000)))
+                        pollIntervalMilliseconds: 1_000,
+                        stabilitySeconds: 60)))
         XCTAssertEqual(plan.workload.iterations, 2)
     }
 
@@ -149,10 +151,31 @@ final class BenchCLITests: XCTestCase {
             "--post-warmup-thermal-target", "fair",
             "--post-warmup-thermal-timeout-seconds", "600",
             "--post-warmup-thermal-poll-milliseconds", "1000",
+            "--post-warmup-thermal-stability-seconds", "60",
         ]))) {
             XCTAssertEqual(
                 $0 as? BenchCLIError,
                 .invalidPostWarmupThermalTarget("fair"))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--post-warmup-thermal-target", "nominal",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .missingQualificationFlag(
+                    "post-warmup-thermal-stability-seconds"))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--post-warmup-thermal-target", "nominal",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
+            "--post-warmup-thermal-stability-seconds", "0",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidPostWarmupThermalPolicy)
         }
     }
 
@@ -180,6 +203,58 @@ final class BenchCLITests: XCTestCase {
         XCTAssertEqual(admission.snapshot.thermalState, .nominal)
         XCTAssertEqual(admission.snapshot.monotonicTimestampSeconds, 13)
         XCTAssertEqual(sequence.remainingCount, 0)
+    }
+
+    func testPostWarmupThermalWaitRequiresContinuousNominalStabilityAndResetsOnFair()
+        async throws
+    {
+        let sequence = ThermalSnapshotSequence([
+            qualificationHostSnapshot(timestamp: 12),
+            qualificationHostSnapshot(
+                timestamp: 13, thermalState: .fair),
+            qualificationHostSnapshot(timestamp: 14),
+            qualificationHostSnapshot(timestamp: 44),
+            qualificationHostSnapshot(timestamp: 74),
+        ])
+        let policy = try BenchQualificationThermalPolicy(
+            target: .nominal,
+            timeoutSeconds: 120,
+            pollIntervalMilliseconds: 1_000,
+            stabilitySeconds: 60)
+
+        let admission = try await waitForBenchQualificationThermalAdmission(
+            policy: policy,
+            initialSnapshot: qualificationHostSnapshot(timestamp: 11),
+            snapshot: { try sequence.next() },
+            sleep: { sequence.recordSleep($0) })
+
+        XCTAssertEqual(
+            admission.stabilityObservations.map(
+                \.monotonicTimestampSeconds),
+            [14, 44, 74])
+        XCTAssertEqual(admission.snapshot.monotonicTimestampSeconds, 74)
+        XCTAssertEqual(sequence.remainingCount, 0)
+        XCTAssertEqual(sequence.sleepDurations, [1_000, 1_000, 1_000, 1_000, 1_000])
+    }
+
+    func testRetainedEnvironmentDiagnosticPreservesThermalMismatchBeforeValidation()
+        throws
+    {
+        let line = try benchQualificationRetainedEnvironmentDiagnosticLine(
+            before: qualificationHostSnapshot(timestamp: 20),
+            after: qualificationHostSnapshot(
+                timestamp: 40, thermalState: .fair))
+        let prefix = "# qualification retained environment: "
+        XCTAssertTrue(line.hasPrefix(prefix))
+        let data = try XCTUnwrap(
+            String(line.dropFirst(prefix.count)).data(using: .utf8))
+        let diagnostic = try JSONDecoder().decode(
+            BenchQualificationRetainedEnvironmentDiagnostic.self,
+            from: data)
+
+        XCTAssertEqual(diagnostic.schemaVersion, 1)
+        XCTAssertEqual(diagnostic.before.thermalState, .nominal)
+        XCTAssertEqual(diagnostic.after.thermalState, .fair)
     }
 
     func testPostWarmupThermalWaitFailsClosedForUnsafeStateOrTimeout()
@@ -273,6 +348,7 @@ final class BenchCLITests: XCTestCase {
             "--post-warmup-thermal-target", "nominal",
             "--post-warmup-thermal-timeout-seconds", "600",
             "--post-warmup-thermal-poll-milliseconds", "1000",
+            "--post-warmup-thermal-stability-seconds", "60",
         ]
 
         XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
@@ -321,6 +397,7 @@ final class BenchCLITests: XCTestCase {
             "--post-warmup-thermal-target", "nominal",
             "--post-warmup-thermal-timeout-seconds", "600",
             "--post-warmup-thermal-poll-milliseconds", "1000",
+            "--post-warmup-thermal-stability-seconds", "60",
         ]
         XCTAssertThrowsError(try parseBenchPlan(Flags(settings))) {
             XCTAssertEqual($0 as? BenchCLIError, .missingMatrixID)

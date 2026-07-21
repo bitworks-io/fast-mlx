@@ -874,6 +874,10 @@ func runBench(_ flags: Flags) async {
                         + "\(qualificationAfter.thermalState.rawValue), "
                         + "admitted="
                         + "\(admitted.thermalState.rawValue), "
+                        + "stability_seconds="
+                        + "\(thermalPolicy.stabilitySeconds), "
+                        + "stability_observations="
+                        + "\(thermalAdmission.stabilityObservations.count), "
                         + "wait_seconds="
                         + fmt(
                             admitted.monotonicTimestampSeconds
@@ -889,6 +893,10 @@ func runBench(_ flags: Flags) async {
                 generatedTokenCounts.append(metrics.generatedTokenCount)
                 memoryRuns.append(memoryEvidence)
                 if let qualificationBefore, let qualificationAfter {
+                    print(try
+                        benchQualificationRetainedEnvironmentDiagnosticLine(
+                            before: qualificationBefore,
+                            after: qualificationAfter))
                     qualificationRuns.append(
                         try BenchQualificationRunEnvironment(
                             before: qualificationBefore,
@@ -1825,8 +1833,9 @@ struct Harness {
                  --post-warmup-thermal-target nominal
                  --post-warmup-thermal-timeout-seconds <N>
                  --post-warmup-thermal-poll-milliseconds <N>
+                 --post-warmup-thermal-stability-seconds <N>
                                                record the dropped warmup and admit the retained
-                                               row only from the frozen nominal/AC cohort
+                                               row only after a sampled stable nominal/AC window
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled

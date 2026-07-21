@@ -48,7 +48,7 @@ fail() {
     exit 2
 }
 
-for command_name in jq shasum ps stat; do
+for command_name in jq mktemp shasum ps stat; do
     command -v "$command_name" >/dev/null 2>&1 \
         || fail "$command_name is required"
 done
@@ -115,7 +115,7 @@ jq -e '
   def ident: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
   def sha256: type == "string" and test("^[0-9a-f]{64}$");
   def identity: type == "string" and test("^([0-9a-f]{16}|[0-9a-f]{64})$");
-  .schemaVersion == 2 and
+  .schemaVersion == 3 and
   (.harnessGitSHA | type == "string" and test("^[0-9a-f]{40}$")) and
   (.harnessBinarySHA256 | sha256) and
   (.matrixID | ident) and (.workloadNonce | ident) and
@@ -133,6 +133,9 @@ jq -e '
   (.postWarmupThermalPollMilliseconds | integer and . >= 100 and . <= 60000) and
   .postWarmupThermalPollMilliseconds <=
     (.postWarmupThermalTimeoutSeconds * 1000) and
+  (.postWarmupThermalStabilitySeconds | integer and . >= 1) and
+  .postWarmupThermalStabilitySeconds <=
+    .postWarmupThermalTimeoutSeconds and
   .cacheLimitBytes <= .memoryLimitBytes and
   .memoryLimitBytes <= .wiredLimitBytes and
   (.cells | type == "array" and length >= 1 and length <= 32) and
@@ -198,6 +201,7 @@ WIRED_LIMIT="$(jq -r '.wiredLimitBytes' "$MANIFEST")"
 POST_WARMUP_THERMAL_TARGET="$(jq -r '.postWarmupThermalTarget' "$MANIFEST")"
 POST_WARMUP_THERMAL_TIMEOUT_SECONDS="$(jq -r '.postWarmupThermalTimeoutSeconds' "$MANIFEST")"
 POST_WARMUP_THERMAL_POLL_MILLISECONDS="$(jq -r '.postWarmupThermalPollMilliseconds' "$MANIFEST")"
+POST_WARMUP_THERMAL_STABILITY_SECONDS="$(jq -r '.postWarmupThermalStabilitySeconds' "$MANIFEST")"
 TOTAL_ROWS=$((BLOCK_COUNT * CELL_COUNT))
 
 # Authenticate immutable schedule inputs before output reservation. The same digest is checked
@@ -256,16 +260,69 @@ active_child_running() {
     return 1
 }
 
+file_mtime() {
+    local path="$1"
+    if stat -f %m "$path" >/dev/null 2>&1; then
+        stat -f %m "$path"
+    else
+        stat -c %Y "$path"
+    fi
+}
+
+file_identity() {
+    local path="$1"
+    if stat -f '%d:%i' "$path" >/dev/null 2>&1; then
+        stat -f '%d:%i' "$path"
+    else
+        stat -c '%d:%i' "$path"
+    fi
+}
+
+original_regular_file() {
+    local path="$1" expected_identity="$2"
+    [[ -f "$path" && ! -L "$path" ]] \
+        && [[ "$(file_identity "$path")" == "$expected_identity" ]]
+}
+
+original_directory() {
+    local path="$1" expected_identity="$2"
+    [[ -d "$path" && ! -L "$path" ]] \
+        && [[ "$(file_identity "$path")" == "$expected_identity" ]]
+}
+
+# Status and progress are monitor-facing parent artifacts. Publish by rename so a child-created
+# symlink can only be replaced, never followed to an unrelated file outside the fresh boundary.
+write_status() {
+    local value="$1" tmp
+    if [[ -n "${OUTPUT_DIRECTORY_IDENTITY:-}" ]] \
+        && ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY"; then
+        return 1
+    fi
+    tmp="$(mktemp "$OUTPUT/.runner-status.XXXXXX")"
+    printf '%s\n' "$value" > "$tmp"
+    if [[ -d "$STATUS" ]]; then
+        chmod 0444 "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$STATUS"
+}
+
 cleanup() {
     cleanup_rc=$?
     terminate_active_child
+    exec 8>&- 2>/dev/null || true
+    exec 9<&- 2>/dev/null || true
     if [[ -n "$caffeinate_pid" ]] && kill -0 "$caffeinate_pid" 2>/dev/null; then
         kill "$caffeinate_pid" 2>/dev/null || true
         wait "$caffeinate_pid" 2>/dev/null || true
     fi
     if (( cleanup_rc != 0 )) && [[ -f "${STATUS:-}" ]] \
         && [[ "$(tr -d '[:space:]' < "$STATUS")" == "RUNNING" ]]; then
-        printf 'ABORTED\n' > "$STATUS"
+        if declare -F write_status >/dev/null 2>&1; then
+            write_status "ABORTED" || true
+        else
+            printf 'ABORTED\n' > "$STATUS"
+        fi
     fi
     if [[ "${lock_owned:-false}" == "true" ]]; then
         rmdir "$LOCK" 2>/dev/null || true
@@ -273,13 +330,16 @@ cleanup() {
     return "$cleanup_rc"
 }
 trap cleanup EXIT
-trap '[[ -f "${STATUS:-}" ]] && printf "INTERRUPTED\n" > "$STATUS"; exit 130' INT
-trap '[[ -f "${STATUS:-}" ]] && printf "INTERRUPTED\n" > "$STATUS"; exit 143' TERM
+trap '[[ -f "${STATUS:-}" ]] && write_status "INTERRUPTED"; exit 130' INT
+trap '[[ -f "${STATUS:-}" ]] && write_status "INTERRUPTED"; exit 143' TERM
 
 if ! mkdir "$OUTPUT" 2>/dev/null; then
     fail "qualification requires a fresh output directory"
 fi
+OUTPUT_DIRECTORY_IDENTITY="$(file_identity "$OUTPUT")"
 mkdir "$OUTPUT/runs" "$OUTPUT/blocks"
+RUNS_DIRECTORY_IDENTITY="$(file_identity "$OUTPUT/runs")"
+BLOCKS_DIRECTORY_IDENTITY="$(file_identity "$OUTPUT/blocks")"
 RUNNER_LOG="$OUTPUT/runner.log"
 STATUS="$OUTPUT/runner.status"
 PROGRESS="$OUTPUT/runner.progress.json"
@@ -290,10 +350,12 @@ date +%s > "$OUTPUT/runner.started-epoch"
 printf 'RUNNING\n' > "$STATUS"
 : > "$RUNNER_LOG"
 : > "$RECEIPT_SET"
+RUNNER_LOG_IDENTITY="$(file_identity "$RUNNER_LOG")"
+RECEIPT_SET_IDENTITY="$(file_identity "$RECEIPT_SET")"
 cp "$MANIFEST" "$MANIFEST_COPY"
 chmod 0444 "$MANIFEST_COPY"
 if [[ "$(shasum -a 256 "$MANIFEST_COPY" | awk '{print $1}')" != "$MANIFEST_SHA" ]]; then
-    printf 'INPUT_CHANGED\n' > "$STATUS"
+    write_status "INPUT_CHANGED"
     fail "runner manifest changed while reserving the qualification boundary"
 fi
 MANIFEST="$MANIFEST_COPY"
@@ -305,20 +367,112 @@ if [[ "${DISABLE_CAFFEINATE:-false}" != "true" ]]; then
     caffeinate_pid=$!
 fi
 
-file_mtime() {
-    local path="$1"
-    if stat -f %m "$path" >/dev/null 2>&1; then
-        stat -f %m "$path"
-    else
-        stat -c %Y "$path"
+# A failed child cannot contribute a promotable row, but its exact launch identity, log, optional
+# partial evidence, and retained-environment diagnostic must remain independently auditable. The
+# receipt intentionally stays outside runner.receipts.sha256 and the block receipt stream.
+write_harness_failure_receipt() {
+    local child_exit_code="$1" run_directory="$2" evidence_path="$3" log_path="$4"
+    local failure_reason="${5:-harness-exit}"
+    local failure_receipt="$run_directory/runner-failure.json"
+    local failure_receipt_tmp
+    local log_sha evidence_present=false evidence_sha="" diagnostic_json="null"
+    local diagnostic_candidate="" diagnostic_match_count=0
+
+    log_sha="$(shasum -a 256 "$log_path" | awk '{print $1}')"
+    if [[ -f "$evidence_path" && ! -L "$evidence_path" ]]; then
+        evidence_present=true
+        evidence_sha="$(shasum -a 256 "$evidence_path" | awk '{print $1}')"
     fi
+    diagnostic_match_count="$(awk '
+        index($0, "# qualification retained environment: ") == 1 { count += 1 }
+        END { print count + 0 }
+      ' "$log_path")"
+    if [[ "$diagnostic_match_count" == "1" ]]; then
+        diagnostic_candidate="$(awk '
+        index($0, "# qualification retained environment: ") == 1 {
+            print substr($0, length("# qualification retained environment: ") + 1)
+        }
+      ' "$log_path")"
+    fi
+    if [[ -n "$diagnostic_candidate" ]] && jq -e '
+        def snapshot:
+          type == "object" and
+          (.monotonicTimestampSeconds | type == "number") and
+          (.residentSizeBytes | type == "number" and . > 0) and
+          (.physicalFootprintBytes | type == "number" and . > 0) and
+          (.lowPowerModeEnabled | type == "boolean") and
+          (.powerSource == "ac-power" or .powerSource == "battery" or
+            .powerSource == "unknown") and
+          (.thermalState == "nominal" or .thermalState == "fair" or
+            .thermalState == "serious" or .thermalState == "critical" or
+            .thermalState == "unknown");
+        .schemaVersion == 1 and (.before | snapshot) and (.after | snapshot) and
+        .before.monotonicTimestampSeconds < .after.monotonicTimestampSeconds
+      ' <<< "$diagnostic_candidate" >/dev/null 2>&1; then
+        diagnostic_json="$diagnostic_candidate"
+    fi
+
+    failure_receipt_tmp="$(mktemp "$run_directory/.runner-failure.XXXXXX")"
+    jq -cn \
+        --arg reason "$failure_reason" --arg matrixID "$MATRIX_ID" \
+        --arg workloadNonce "$WORKLOAD_NONCE" --arg cellID "$cell_id" \
+        --arg kvQuantTier "$kv_quant" --arg requestedAttention "$attention" \
+        --arg harnessGitSHA "$HARNESS_SHA" --arg harnessBinarySHA256 "$BINARY_SHA" \
+        --arg runnerScriptSHA256 "$RUNNER_SHA" \
+        --arg runnerManifestSHA256 "$MANIFEST_SHA" \
+        --arg modelConfigHash "$MODEL_CONFIG_HASH" \
+        --arg modelCheckpointManifestHash "$MODEL_MANIFEST_HASH" \
+        --arg modelTokenizerSHA256 "$MODEL_TOKENIZER_SHA" \
+        --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
+        --arg logSHA256 "$log_sha" --arg logArtifact "${log_path#"$run_directory"/}" \
+        --arg evidenceSHA256 "$evidence_sha" \
+        --argjson childExitCode "$child_exit_code" \
+        --argjson blockIndex "$block_index" --argjson runPosition "$position" \
+        --argjson postWarmupThermalTimeoutSeconds \
+            "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS" \
+        --argjson postWarmupThermalPollMilliseconds \
+            "$POST_WARMUP_THERMAL_POLL_MILLISECONDS" \
+        --argjson postWarmupThermalStabilitySeconds \
+            "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
+        --argjson maxProcessRSSBytes "$max_rss_bytes" \
+        --argjson evidencePresent "$evidence_present" \
+        --argjson thermalEnvironment "$diagnostic_json" \
+        '{schemaVersion:1,status:"FAILED",promotable:false,reason:$reason,
+          childExitCode:$childExitCode,matrixID:$matrixID,
+          workloadNonce:$workloadNonce,cellID:$cellID,kvQuantTier:$kvQuantTier,
+          requestedAttention:(if $requestedAttention == "" then null
+            else $requestedAttention end),blockIndex:$blockIndex,
+          runPosition:$runPosition,harnessGitSHA:$harnessGitSHA,
+          harnessBinarySHA256:$harnessBinarySHA256,
+          runnerScriptSHA256:$runnerScriptSHA256,
+          runnerManifestSHA256:$runnerManifestSHA256,
+          modelConfigHash:$modelConfigHash,
+          modelCheckpointManifestHash:$modelCheckpointManifestHash,
+          modelTokenizerSHA256:$modelTokenizerSHA256,
+          postWarmupThermalPolicy:{target:$postWarmupThermalTarget,
+            timeoutSeconds:$postWarmupThermalTimeoutSeconds,
+            pollIntervalMilliseconds:$postWarmupThermalPollMilliseconds,
+            stabilitySeconds:$postWarmupThermalStabilitySeconds},
+          logSHA256:$logSHA256,logArtifact:$logArtifact,
+          evidencePresent:$evidencePresent,
+          evidenceSHA256:(if $evidenceSHA256 == "" then null
+            else $evidenceSHA256 end),thermalEnvironment:$thermalEnvironment,
+          maxProcessRSSBytes:$maxProcessRSSBytes}' > "$failure_receipt_tmp"
+    if [[ -d "$failure_receipt" ]]; then
+        chmod 0444 "$failure_receipt_tmp"
+        fail "runner failure receipt boundary is a directory"
+    fi
+    mv -f "$failure_receipt_tmp" "$failure_receipt"
+    chmod 0444 "$failure_receipt"
 }
 
 write_progress() {
     local state="$1" completed="$2" block="$3" position="$4" cell="$5"
     local child="${6:-}" max_rss="${7:-0}" now tmp
+    original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+        || return 1
     now="$(date +%s)"
-    tmp="${PROGRESS}.tmp.$$"
+    tmp="$(mktemp "$OUTPUT/.runner-progress.XXXXXX")"
     jq -cn \
         --arg state "$state" --arg matrixID "$MATRIX_ID" \
         --arg cellID "$cell" --arg harnessGitSHA "$HARNESS_SHA" \
@@ -327,32 +481,59 @@ write_progress() {
         --argjson completedRows "$completed" --argjson totalRows "$TOTAL_ROWS" \
         --argjson blockIndex "$block" --argjson runPosition "$position" \
         --argjson heartbeatEpoch "$now" --argjson maxProcessRSSBytes "$max_rss" \
+        --argjson postWarmupThermalStabilitySeconds \
+            "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
         '{schemaVersion:1,state:$state,matrixID:$matrixID,cellID:$cellID,
           completedRows:$completedRows,totalRows:$totalRows,blockIndex:$blockIndex,
           runPosition:$runPosition,heartbeatEpoch:$heartbeatEpoch,
           childPID:(if $childPID == "" then null else ($childPID | tonumber) end),
           maxProcessRSSBytes:$maxProcessRSSBytes,harnessGitSHA:$harnessGitSHA,
           postWarmupThermalTarget:$postWarmupThermalTarget,
+          postWarmupThermalStabilitySeconds:$postWarmupThermalStabilitySeconds,
           runnerManifestSHA256:$manifestSHA256}' > "$tmp"
-    mv "$tmp" "$PROGRESS"
+    if [[ -d "$PROGRESS" ]]; then
+        chmod 0444 "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$PROGRESS"
 }
 
 write_progress "starting" 0 0 0 "" "" 0
 completed_rows=0
 
 for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
+    if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+        || ! original_directory "$OUTPUT/runs" "$RUNS_DIRECTORY_IDENTITY" \
+        || ! original_directory "$OUTPUT/blocks" "$BLOCKS_DIRECTORY_IDENTITY"; then
+        write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+        fail "runner aggregate directory boundary changed"
+    fi
     block_environment=""
+    block_runs_directory="$OUTPUT/runs/block-$(printf '%03d' "$block_index")"
+    if [[ -e "$block_runs_directory" || -L "$block_runs_directory" ]]; then
+        write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+        fail "matrix block run directory already exists"
+    fi
+    mkdir "$block_runs_directory"
+    block_runs_directory_identity="$(file_identity "$block_runs_directory")"
     block_receipts="$OUTPUT/blocks/block-$(printf '%03d' "$block_index").receipts.jsonl"
-    : > "$block_receipts"
+    block_receipts_tmp="$(mktemp "$OUTPUT/blocks/.block-receipts.XXXXXX")"
+    if [[ -d "$block_receipts" ]]; then
+        chmod 0444 "$block_receipts_tmp"
+        write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+        fail "block receipt aggregate boundary is a directory"
+    fi
+    mv -f "$block_receipts_tmp" "$block_receipts"
+    block_receipts_identity="$(file_identity "$block_receipts")"
     for ((position = 0; position < CELL_COUNT; position++)); do
         if ! source_provenance_is_current; then
-            printf 'INPUT_CHANGED\n' > "$STATUS"
+            write_status "INPUT_CHANGED"
             fail "source stamp changed or live Git provenance drifted during qualification"
         fi
         if [[ "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')" != "$MANIFEST_SHA" \
             || "$(shasum -a 256 "$RUNNER_PATH" | awk '{print $1}')" != "$RUNNER_SHA" \
             || "$(shasum -a 256 "$BIN" | awk '{print $1}')" != "$BINARY_SHA" ]]; then
-            printf 'INPUT_CHANGED\n' > "$STATUS"
+            write_status "INPUT_CHANGED"
             fail "runner manifest, runner script, or harness binary changed during qualification"
         fi
         cell_id="$(jq -r ".blocks[$block_index][$position]" "$MANIFEST")"
@@ -366,12 +547,29 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         fi
         schedule_bundle_sha="$(jq -r '.kvtunerBundleSHA256? // empty' <<< "$cell_json")"
         schedule_artifact_sha="$(jq -r '.kvtunerScheduleArtifactSHA256? // empty' <<< "$cell_json")"
-        run_dir="$OUTPUT/runs/block-$(printf '%03d' "$block_index")/position-$(printf '%03d' "$position")-$cell_id"
-        mkdir -p "$run_dir"
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_directory "$OUTPUT/runs" "$RUNS_DIRECTORY_IDENTITY" \
+            || ! original_directory "$block_runs_directory" \
+                "$block_runs_directory_identity" \
+            || ! original_directory "$OUTPUT/blocks" \
+                "$BLOCKS_DIRECTORY_IDENTITY"; then
+            write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+            fail "matrix block run directory boundary changed"
+        fi
+        run_dir="$block_runs_directory/position-$(printf '%03d' "$position")-$cell_id"
+        if [[ -e "$run_dir" || -L "$run_dir" ]]; then
+            write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+            fail "matrix position run directory already exists"
+        fi
+        mkdir "$run_dir"
+        run_dir_identity="$(file_identity "$run_dir")"
         evidence="$run_dir/bench.jsonl"
         run_log="$run_dir/bench.log"
         receipt="$run_dir/runner-receipt.json"
         : > "$run_log"
+        run_log_identity="$(file_identity "$run_log")"
+        exec 9< "$run_log"
+        run_log_monitor="/dev/fd/9"
 
         args=(
             bench
@@ -400,6 +598,8 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS"
             --post-warmup-thermal-poll-milliseconds \
                 "$POST_WARMUP_THERMAL_POLL_MILLISECONDS"
+            --post-warmup-thermal-stability-seconds \
+                "$POST_WARMUP_THERMAL_STABILITY_SECONDS"
             --evidence "$evidence"
         )
         if [[ -n "$attention" ]]; then
@@ -408,27 +608,55 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         fi
         if [[ -n "$schedule" ]]; then
             if [[ "$(shasum -a 256 "$schedule" | awk '{print $1}')" != "$schedule_bundle_sha" ]]; then
-                printf 'INPUT_CHANGED\n' > "$STATUS"
+                write_status "INPUT_CHANGED"
                 fail "KVTuner qualification bundle changed after manifest authentication"
             fi
             args+=(--kvtuner-schedule "$schedule")
         fi
 
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_regular_file "$RUNNER_LOG" "$RUNNER_LOG_IDENTITY"; then
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            fail "runner log boundary changed before harness launch"
+        fi
+        harness_pid="$run_dir/harness.pid"
+        harness_pid_tmp="$(mktemp "$run_dir/.harness-pid.XXXXXX")"
+        exec 8> "$harness_pid_tmp"
         printf '[%s] launch block=%s position=%s cell=%s\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$block_index" "$position" "$cell_id" \
             >> "$RUNNER_LOG"
         (
+            exec 8>&-
+            exec 9<&-
             clear_caller_git_environment
             unset HARNESS_GIT_SHA
             cd "$HARNESS_SOURCE_DIR"
             exec "$BIN" "${args[@]}"
         ) > "$run_log" 2>&1 &
         active_child=$!
-        printf '%s\n' "$active_child" > "$run_dir/harness.pid"
+        printf '%s\n' "$active_child" >&8
+        exec 8>&-
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_directory "$OUTPUT/runs" "$RUNS_DIRECTORY_IDENTITY" \
+            || ! original_directory "$block_runs_directory" \
+                "$block_runs_directory_identity" \
+            || ! original_directory "$run_dir" "$run_dir_identity"; then
+            write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+            terminate_active_child
+            fail "run directory boundary changed during harness launch"
+        fi
+        if [[ -d "$harness_pid" ]]; then
+            chmod 0444 "$harness_pid_tmp"
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            terminate_active_child
+            fail "harness PID boundary is a directory"
+        fi
+        mv -f "$harness_pid_tmp" "$harness_pid"
+        chmod 0444 "$harness_pid"
         max_rss_bytes=0
         write_progress "running" "$completed_rows" "$block_index" "$position" \
             "$cell_id" "$active_child" "$max_rss_bytes"
-        last_log_mtime="$(file_mtime "$run_log")"
+        last_log_mtime="$(file_mtime "$run_log_monitor")"
         while active_child_running; do
             rss_kb="$(ps -o rss= -p "$active_child" 2>/dev/null | tr -d '[:space:]' || true)"
             if [[ "$rss_kb" =~ ^[0-9]+$ ]]; then
@@ -436,17 +664,31 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 (( rss_bytes > max_rss_bytes )) && max_rss_bytes=$rss_bytes
             fi
             now="$(date +%s)"
-            current_mtime="$(file_mtime "$run_log")"
+            current_mtime="$(file_mtime "$run_log_monitor")"
             (( current_mtime > last_log_mtime )) && last_log_mtime=$current_mtime
             if (( now - last_log_mtime > WATCHDOG_SECONDS )); then
+                if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY"; then
+                    terminate_active_child
+                    fail "output root boundary changed during harness execution"
+                fi
+                watchdog="$OUTPUT/runner.watchdog.json"
+                watchdog_tmp="$(mktemp "$OUTPUT/.runner-watchdog.XXXXXX")"
                 jq -cn --arg cellID "$cell_id" --argjson blockIndex "$block_index" \
                     --argjson runPosition "$position" --argjson childPID "$active_child" \
                     --argjson detectedEpoch "$now" --argjson lastLogMtime "$last_log_mtime" \
                     '{schemaVersion:1,reason:"log-stalled",cellID:$cellID,
                       blockIndex:$blockIndex,runPosition:$runPosition,childPID:$childPID,
                       detectedEpoch:$detectedEpoch,lastLogMtime:$lastLogMtime}' \
-                    > "$OUTPUT/runner.watchdog.json"
-                printf 'WATCHDOG\n' > "$STATUS"
+                    > "$watchdog_tmp"
+                if [[ -d "$watchdog" ]]; then
+                    chmod 0444 "$watchdog_tmp"
+                    write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+                    terminate_active_child
+                    fail "watchdog artifact boundary is a directory"
+                fi
+                mv -f "$watchdog_tmp" "$watchdog"
+                chmod 0444 "$watchdog"
+                write_status "WATCHDOG"
                 write_progress "watchdog" "$completed_rows" "$block_index" "$position" \
                     "$cell_id" "$active_child" "$max_rss_bytes"
                 terminate_active_child
@@ -461,9 +703,71 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         child_rc=$?
         set -e
         active_child=""
-        cat "$run_log" >> "$RUNNER_LOG"
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY"; then
+            exec 9<&-
+            fail "output root boundary changed during harness execution"
+        fi
+        if ! original_directory "$OUTPUT/runs" "$RUNS_DIRECTORY_IDENTITY" \
+            || ! original_directory "$block_runs_directory" \
+                "$block_runs_directory_identity" \
+            || ! original_directory "$run_dir" "$run_dir_identity" \
+            || ! original_directory "$OUTPUT/blocks" \
+                "$BLOCKS_DIRECTORY_IDENTITY"; then
+            captured_log_tmp="$(mktemp "$OUTPUT/.runner-captured-log.XXXXXX")"
+            cat <&9 > "$captured_log_tmp"
+            exec 9<&-
+            chmod 0444 "$captured_log_tmp"
+            write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+            write_progress "invalid-run-directory-boundary" "$completed_rows" \
+                "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
+            fail "run directory boundary changed during harness execution"
+        fi
+        captured_log_tmp="$(mktemp "$run_dir/.runner-captured-log.XXXXXX")"
+        cat <&9 > "$captured_log_tmp"
+        exec 9<&-
+        captured_log_sha="$(shasum -a 256 "$captured_log_tmp" | awk '{print $1}')"
+        authenticated_run_log="$run_log"
+        log_boundary_valid=false
+        if [[ -f "$run_log" && ! -L "$run_log" ]] \
+            && [[ "$(file_identity "$run_log")" == "$run_log_identity" ]] \
+            && [[ "$(shasum -a 256 "$run_log" | awk '{print $1}')" \
+                == "$captured_log_sha" ]]; then
+            log_boundary_valid=true
+            rm -f "$captured_log_tmp"
+        else
+            recovered_log="$run_dir/runner-captured.log"
+            if [[ ! -e "$recovered_log" && ! -L "$recovered_log" ]]; then
+                mv "$captured_log_tmp" "$recovered_log"
+                authenticated_run_log="$recovered_log"
+            else
+                authenticated_run_log="$captured_log_tmp"
+            fi
+            chmod 0444 "$authenticated_run_log"
+        fi
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_regular_file "$RUNNER_LOG" "$RUNNER_LOG_IDENTITY"; then
+            write_harness_failure_receipt \
+                "$child_rc" "$run_dir" "$evidence" "$authenticated_run_log" \
+                "parent-artifact-boundary-changed"
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            write_progress "invalid-parent-artifact-boundary" "$completed_rows" \
+                "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
+            fail "runner log boundary changed after harness execution"
+        fi
+        cat "$authenticated_run_log" >> "$RUNNER_LOG"
+        if [[ "$log_boundary_valid" != "true" ]]; then
+            write_harness_failure_receipt \
+                "$child_rc" "$run_dir" "$evidence" "$authenticated_run_log" \
+                "log-boundary-changed"
+            write_status "INVALID_LOG_BOUNDARY"
+            write_progress "invalid-log-boundary" "$completed_rows" \
+                "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
+            fail "harness log boundary changed for block=$block_index position=$position cell=$cell_id"
+        fi
         if (( child_rc != 0 )); then
-            printf 'FAILED\n' > "$STATUS"
+            write_harness_failure_receipt \
+                "$child_rc" "$run_dir" "$evidence" "$authenticated_run_log"
+            write_status "FAILED"
             write_progress "failed" "$completed_rows" "$block_index" "$position" \
                 "$cell_id" "" "$max_rss_bytes"
             fail "harness failed for block=$block_index position=$position cell=$cell_id"
@@ -471,7 +775,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
 
         if [[ ! -f "$evidence" || -L "$evidence" ]] \
             || [[ "$(wc -l < "$evidence" 2>/dev/null | tr -d '[:space:]')" != "1" ]]; then
-            printf 'INVALID_EVIDENCE\n' > "$STATUS"
+            write_status "INVALID_EVIDENCE"
             fail "harness evidence must be one regular file containing exactly one row"
         fi
         expected_observed=""
@@ -497,6 +801,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --argjson cache "$CACHE_LIMIT" --argjson wired "$WIRED_LIMIT" \
             --argjson thermalTimeout "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS" \
             --argjson thermalPoll "$POST_WARMUP_THERMAL_POLL_MILLISECONDS" \
+            --argjson thermalStability "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
             --argjson promptRepeat "$PROMPT_REPEAT" --argjson maxTokens "$MAX_TOKENS" '
               .subcommand == "bench" and
               .provenance.harnessGitSHA == $harness and
@@ -534,7 +839,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 .payload.memoryRuns[0].summary.maxMLXCacheBytes and
               .payload.maxMLXPeakBytes ==
                 .payload.memoryRuns[0].summary.maxMLXPeakBytes and
-              .payload.qualification.schemaVersion == 3 and
+              .payload.qualification.schemaVersion == 4 and
               .payload.qualification.context.runnerManifestSHA256 == $manifest and
               .payload.qualification.context.matrixBlockIndex == $block and
               .payload.qualification.context.matrixRunPosition == $position and
@@ -552,6 +857,8 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 $thermalTimeout and
               .payload.qualification.context.postWarmupThermalPolicy.pollIntervalMilliseconds ==
                 $thermalPoll and
+              .payload.qualification.context.postWarmupThermalPolicy.stabilitySeconds ==
+                $thermalStability and
               .payload.qualification.warmup.before.monotonicTimestampSeconds <
                 .payload.qualification.warmup.after.monotonicTimestampSeconds and
               .payload.qualification.warmup.before.residentSizeBytes > 0 and
@@ -566,17 +873,31 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 .payload.qualification.warmup.before.thermalState == "fair") and
               (.payload.qualification.warmup.after.thermalState == "nominal" or
                 .payload.qualification.warmup.after.thermalState == "fair") and
-              .payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds >=
-                .payload.qualification.warmup.after.monotonicTimestampSeconds and
-              (.payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds -
-                .payload.qualification.warmup.after.monotonicTimestampSeconds) <=
-                $thermalTimeout and
-              .payload.qualification.postWarmupThermalAdmission.snapshot.residentSizeBytes > 0 and
-              .payload.qualification.postWarmupThermalAdmission.snapshot.physicalFootprintBytes > 0 and
-              .payload.qualification.postWarmupThermalAdmission.snapshot.powerSource == "ac-power" and
-              (.payload.qualification.postWarmupThermalAdmission.snapshot.lowPowerModeEnabled | not) and
-              .payload.qualification.postWarmupThermalAdmission.snapshot.thermalState ==
-                $thermalTarget and
+              (.payload.qualification.postWarmupThermalAdmission as $admission |
+                ($admission.stabilityObservations | type == "array" and length >= 2) and
+                (all($admission.stabilityObservations[];
+                  .residentSizeBytes > 0 and .physicalFootprintBytes > 0 and
+                  .powerSource == "ac-power" and
+                  (.lowPowerModeEnabled | not) and
+                  .thermalState == $thermalTarget)) and
+                ([$admission.stabilityObservations[].monotonicTimestampSeconds]
+                  as $timestamps |
+                  all(range(1; ($timestamps | length));
+                    $timestamps[.] > $timestamps[. - 1])) and
+                $admission.stabilityObservations[0].monotonicTimestampSeconds >=
+                  .payload.qualification.warmup.after.monotonicTimestampSeconds and
+                $admission.stabilityObservations[-1] == $admission.snapshot and
+                ($admission.snapshot.monotonicTimestampSeconds -
+                  $admission.stabilityObservations[0].monotonicTimestampSeconds) >=
+                  $thermalStability and
+                ($admission.snapshot.monotonicTimestampSeconds -
+                  .payload.qualification.warmup.after.monotonicTimestampSeconds) <=
+                  $thermalTimeout and
+                $admission.snapshot.residentSizeBytes > 0 and
+                $admission.snapshot.physicalFootprintBytes > 0 and
+                $admission.snapshot.powerSource == "ac-power" and
+                ($admission.snapshot.lowPowerModeEnabled | not) and
+                $admission.snapshot.thermalState == $thermalTarget) and
               (.payload.qualification.runs | type == "array" and length == 1) and
               .payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds <=
                 .payload.qualification.runs[0].before.monotonicTimestampSeconds and
@@ -642,14 +963,48 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                  (.payload.kvtunerSchedule.layers | length) ==
                    .payload.compressedKVAttention.admission.layerCount end)
             ' "$evidence" >/dev/null; then
-            printf 'INVALID_EVIDENCE\n' > "$STATUS"
+            write_status "INVALID_EVIDENCE"
             fail "harness row failed exact identity or qualification authentication"
         fi
         typed_validation_log="$run_dir/typed-validation.log"
-        if ! "$BIN" validate-bench-qualification --evidence "$evidence" \
-            > "$typed_validation_log" 2>&1; then
+        typed_validation_tmp="$(mktemp "$run_dir/.typed-validation.XXXXXX")"
+        set +e
+        "$BIN" validate-bench-qualification --evidence "$evidence" \
+            > "$typed_validation_tmp" 2>&1
+        typed_validation_rc=$?
+        set -e
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_directory "$OUTPUT/runs" "$RUNS_DIRECTORY_IDENTITY" \
+            || ! original_directory "$block_runs_directory" \
+                "$block_runs_directory_identity" \
+            || ! original_directory "$run_dir" "$run_dir_identity" \
+            || ! original_directory "$OUTPUT/blocks" \
+                "$BLOCKS_DIRECTORY_IDENTITY"; then
+            write_status "INVALID_RUN_DIRECTORY_BOUNDARY"
+            write_progress "invalid-run-directory-boundary" "$completed_rows" \
+                "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
+            fail "run directory boundary changed during typed validation"
+        fi
+        if [[ -d "$typed_validation_log" ]]; then
+            chmod 0444 "$typed_validation_tmp"
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            fail "typed validation log boundary is a directory"
+        fi
+        mv -f "$typed_validation_tmp" "$typed_validation_log"
+        chmod 0444 "$typed_validation_log"
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_regular_file "$RUNNER_LOG" "$RUNNER_LOG_IDENTITY"; then
+            write_harness_failure_receipt \
+                "$typed_validation_rc" "$run_dir" "$evidence" "$authenticated_run_log" \
+                "parent-artifact-boundary-changed"
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            write_progress "invalid-parent-artifact-boundary" "$completed_rows" \
+                "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
+            fail "runner log boundary changed during typed validation"
+        fi
+        if (( typed_validation_rc != 0 )); then
             cat "$typed_validation_log" >> "$RUNNER_LOG"
-            printf 'INVALID_EVIDENCE\n' > "$STATUS"
+            write_status "INVALID_EVIDENCE"
             fail "harness row failed typed qualification validation"
         fi
 
@@ -671,6 +1026,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             block_environment="$environment_key"
         elif [[ "$environment_key" != "$block_environment" ]]; then
             invalid="$OUTPUT/blocks/block-$(printf '%03d' "$block_index").invalid.json"
+            invalid_tmp="$(mktemp "$OUTPUT/blocks/.block-invalid.XXXXXX")"
             jq -cn --arg reason "block environment changed" \
                 --arg baseline "$block_environment" --arg observed "$environment_key" \
                 --arg evidenceSHA256 "$(shasum -a 256 "$evidence" | awk '{print $1}')" \
@@ -680,8 +1036,15 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                   runPosition:$runPosition,cellID:$cellID,
                   baselineEnvironment:($baseline | fromjson),
                   observedEnvironment:($observed | fromjson),
-                  evidenceSHA256:$evidenceSHA256}' > "$invalid"
-            printf 'INVALID_BLOCK_ENVIRONMENT\n' > "$STATUS"
+                  evidenceSHA256:$evidenceSHA256}' > "$invalid_tmp"
+            if [[ -d "$invalid" ]]; then
+                chmod 0444 "$invalid_tmp"
+                write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+                fail "invalid-block artifact boundary is a directory"
+            fi
+            mv -f "$invalid_tmp" "$invalid"
+            chmod 0444 "$invalid"
+            write_status "INVALID_BLOCK_ENVIRONMENT"
             write_progress "invalid-block-environment" "$completed_rows" \
                 "$block_index" "$position" "$cell_id" "" "$max_rss_bytes"
             fail "block environment changed across matrix rows"
@@ -689,6 +1052,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
 
         evidence_sha="$(shasum -a 256 "$evidence" | awk '{print $1}')"
         log_sha="$(shasum -a 256 "$run_log" | awk '{print $1}')"
+        receipt_tmp="$(mktemp "$run_dir/.runner-receipt.XXXXXX")"
         jq -cn \
             --arg matrixID "$MATRIX_ID" --arg cellID "$cell_id" \
             --arg harnessGitSHA "$HARNESS_SHA" --arg harnessBinarySHA256 "$BINARY_SHA" \
@@ -700,6 +1064,8 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS" \
             --argjson postWarmupThermalPollMilliseconds \
                 "$POST_WARMUP_THERMAL_POLL_MILLISECONDS" \
+            --argjson postWarmupThermalStabilitySeconds \
+                "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
             --argjson runPosition "$position" --argjson maxProcessRSSBytes "$max_rss_bytes" \
             '{schemaVersion:1,matrixID:$matrixID,cellID:$cellID,blockIndex:$blockIndex,
               runPosition:$runPosition,harnessGitSHA:$harnessGitSHA,
@@ -709,8 +1075,23 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
               postWarmupThermalTarget:$postWarmupThermalTarget,
               postWarmupThermalTimeoutSeconds:$postWarmupThermalTimeoutSeconds,
               postWarmupThermalPollMilliseconds:$postWarmupThermalPollMilliseconds,
+              postWarmupThermalStabilitySeconds:$postWarmupThermalStabilitySeconds,
               evidenceSHA256:$evidenceSHA256,logSHA256:$logSHA256,
-              maxProcessRSSBytes:$maxProcessRSSBytes}' > "$receipt"
+              maxProcessRSSBytes:$maxProcessRSSBytes}' > "$receipt_tmp"
+        if [[ -d "$receipt" ]]; then
+            chmod 0444 "$receipt_tmp"
+            write_status "INVALID_RECEIPT_BOUNDARY"
+            fail "runner receipt boundary is a directory"
+        fi
+        mv -f "$receipt_tmp" "$receipt"
+        chmod 0444 "$receipt"
+        if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+            || ! original_directory "$OUTPUT/blocks" "$BLOCKS_DIRECTORY_IDENTITY" \
+            || ! original_regular_file "$block_receipts" "$block_receipts_identity" \
+            || ! original_regular_file "$RECEIPT_SET" "$RECEIPT_SET_IDENTITY"; then
+            write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+            fail "parent receipt aggregate boundary changed"
+        fi
         jq -c . "$receipt" >> "$block_receipts"
         receipt_sha="$(shasum -a 256 "$receipt" | awk '{print $1}')"
         printf '%s  %s\n' "$receipt_sha" \
@@ -719,39 +1100,73 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
         write_progress "row-complete" "$completed_rows" "$block_index" "$position" \
             "$cell_id" "" "$max_rss_bytes"
     done
+    if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+        || ! original_directory "$OUTPUT/blocks" "$BLOCKS_DIRECTORY_IDENTITY" \
+        || ! original_regular_file "$block_receipts" "$block_receipts_identity"; then
+        write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+        fail "block receipt aggregate boundary changed before completion"
+    fi
+    block_completion="$OUTPUT/blocks/block-$(printf '%03d' "$block_index").complete.json"
+    block_completion_tmp="$(mktemp "$OUTPUT/blocks/.block-complete.XXXXXX")"
     jq -s --arg matrixID "$MATRIX_ID" --arg environment "$block_environment" \
         --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
+        --argjson postWarmupThermalStabilitySeconds \
+            "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
         --argjson blockIndex "$block_index" \
         '{schemaVersion:1,matrixID:$matrixID,blockIndex:$blockIndex,
           postWarmupThermalTarget:$postWarmupThermalTarget,
+          postWarmupThermalStabilitySeconds:$postWarmupThermalStabilitySeconds,
           environment:($environment | fromjson),receipts:.}' \
-        "$block_receipts" > "$OUTPUT/blocks/block-$(printf '%03d' "$block_index").complete.json"
+        "$block_receipts" > "$block_completion_tmp"
+    if [[ -d "$block_completion" ]]; then
+        chmod 0444 "$block_completion_tmp"
+        write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+        fail "block completion boundary is a directory"
+    fi
+    mv -f "$block_completion_tmp" "$block_completion"
+    chmod 0444 "$block_completion"
 done
 
 if [[ "$(shasum -a 256 "$MANIFEST" | awk '{print $1}')" != "$MANIFEST_SHA" \
     || "$(shasum -a 256 "$RUNNER_PATH" | awk '{print $1}')" != "$RUNNER_SHA" \
     || "$(shasum -a 256 "$BIN" | awk '{print $1}')" != "$BINARY_SHA" ]]; then
-    printf 'INPUT_CHANGED\n' > "$STATUS"
+    write_status "INPUT_CHANGED"
     fail "qualification inputs changed before finalization"
 fi
+if ! original_directory "$OUTPUT" "$OUTPUT_DIRECTORY_IDENTITY" \
+    || ! original_regular_file "$RUNNER_LOG" "$RUNNER_LOG_IDENTITY" \
+    || ! original_regular_file "$RECEIPT_SET" "$RECEIPT_SET_IDENTITY"; then
+    write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+    fail "parent aggregate boundary changed before finalization"
+fi
+printf '[%s] complete rows=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$completed_rows" >> "$RUNNER_LOG"
 RECEIPT_SET_SHA="$(shasum -a 256 "$RECEIPT_SET" | awk '{print $1}')"
-completion_tmp="$OUTPUT/runner.completion.json.tmp.$$"
+completion="$OUTPUT/runner.completion.json"
+completion_tmp="$(mktemp "$OUTPUT/.runner-completion.XXXXXX")"
 jq -cn --arg matrixID "$MATRIX_ID" --arg harnessGitSHA "$HARNESS_SHA" \
     --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
     --arg runnerManifestSHA256 "$MANIFEST_SHA" \
     --arg harnessBinarySHA256 "$BINARY_SHA" --arg runnerScriptSHA256 "$RUNNER_SHA" \
     --arg receiptSetSHA256 "$RECEIPT_SET_SHA" --argjson blockCount "$BLOCK_COUNT" \
     --argjson cellCount "$CELL_COUNT" --argjson completedRows "$completed_rows" \
+    --argjson postWarmupThermalStabilitySeconds \
+        "$POST_WARMUP_THERMAL_STABILITY_SECONDS" \
     '{schemaVersion:1,status:"COMPLETE",matrixID:$matrixID,blockCount:$blockCount,
       cellCount:$cellCount,completedRows:$completedRows,harnessGitSHA:$harnessGitSHA,
       harnessBinarySHA256:$harnessBinarySHA256,
       runnerScriptSHA256:$runnerScriptSHA256,
       runnerManifestSHA256:$runnerManifestSHA256,
       postWarmupThermalTarget:$postWarmupThermalTarget,
+      postWarmupThermalStabilitySeconds:$postWarmupThermalStabilitySeconds,
       receiptSetSHA256:$receiptSetSHA256}' > "$completion_tmp"
-mv "$completion_tmp" "$OUTPUT/runner.completion.json"
+if [[ -d "$completion" ]]; then
+    chmod 0444 "$completion_tmp"
+    write_status "INVALID_PARENT_ARTIFACT_BOUNDARY"
+    fail "runner completion boundary is a directory"
+fi
+mv -f "$completion_tmp" "$completion"
+chmod 0444 "$completion"
 write_progress "complete" "$completed_rows" "$((BLOCK_COUNT - 1))" \
     "$((CELL_COUNT - 1))" "" "" 0
-printf 'COMPLETE\n' > "$STATUS"
-printf '[%s] complete rows=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "$completed_rows" >> "$RUNNER_LOG"
+write_status "COMPLETE"

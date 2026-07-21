@@ -375,6 +375,8 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         "post-warmup-thermal-timeout-seconds")
     let postWarmupThermalPollMilliseconds = try flags.optionalStrictInt(
         "post-warmup-thermal-poll-milliseconds")
+    let postWarmupThermalStabilitySeconds = try flags.optionalStrictInt(
+        "post-warmup-thermal-stability-seconds")
     let qualificationFlagsSupplied = !runnerManifestSHA256.isEmpty
         || matrixBlockIndex != nil || matrixRunPosition != nil
         || matrixCellCount != nil || memoryLimitBytes != nil
@@ -383,6 +385,7 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         || !postWarmupThermalTargetText.isEmpty
         || postWarmupThermalTimeoutSeconds != nil
         || postWarmupThermalPollMilliseconds != nil
+        || postWarmupThermalStabilitySeconds != nil
     guard qualificationEvidence || !qualificationFlagsSupplied else {
         throw BenchCLIError.qualificationFlagsWithoutQualification
     }
@@ -424,6 +427,12 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
             throw BenchCLIError.invalidPostWarmupThermalTarget(
                 postWarmupThermalTargetText)
         }
+        let stabilitySeconds = try required(
+            postWarmupThermalStabilitySeconds,
+            flag: "post-warmup-thermal-stability-seconds")
+        guard stabilitySeconds > 0 else {
+            throw BenchCLIError.invalidPostWarmupThermalPolicy
+        }
         let postWarmupThermalPolicy: BenchQualificationThermalPolicy
         do {
             postWarmupThermalPolicy = try BenchQualificationThermalPolicy(
@@ -433,7 +442,8 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
                     flag: "post-warmup-thermal-timeout-seconds"),
                 pollIntervalMilliseconds: try required(
                     postWarmupThermalPollMilliseconds,
-                    flag: "post-warmup-thermal-poll-milliseconds"))
+                    flag: "post-warmup-thermal-poll-milliseconds"),
+                stabilitySeconds: stabilitySeconds)
         } catch let error as BenchCLIError {
             throw error
         } catch {

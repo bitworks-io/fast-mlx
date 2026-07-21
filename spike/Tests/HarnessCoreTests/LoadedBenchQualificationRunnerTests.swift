@@ -30,6 +30,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     XCTAssertEqual(completion?["completedRows"] as? Int, 6)
     XCTAssertEqual(completion?["blockCount"] as? Int, 3)
     XCTAssertEqual(completion?["cellCount"] as? Int, 2)
+    XCTAssertEqual(
+      completion?["postWarmupThermalStabilitySeconds"] as? Int,
+      60)
     XCTAssertTrue(
       (completion?["runnerScriptSHA256"] as? String)?.count == 64)
     let receiptSet = fixture.output.appendingPathComponent(
@@ -256,6 +259,26 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       atPath: fixture.launches.path))
   }
 
+  func testRunnerRequiresPostWarmupThermalStabilityBeforeLaunching()
+    throws
+  {
+    let fixture = try makeFixture()
+    var manifest = try XCTUnwrap(
+      JSONSerialization.jsonObject(
+        with: Data(contentsOf: fixture.manifest)) as? [String: Any])
+    manifest.removeValue(forKey: "postWarmupThermalStabilitySeconds")
+    try JSONSerialization.data(
+      withJSONObject: manifest, options: [.sortedKeys])
+      .write(to: fixture.manifest)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("manifest schema"))
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: fixture.launches.path))
+  }
+
   func testRunnerPassesTheFrozenPostWarmupThermalPolicyToEveryHarnessRow()
     throws
   {
@@ -345,6 +368,249 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       try String(contentsOf: fixture.output.appendingPathComponent(
         "runner.status"), encoding: .utf8),
       "INVALID_EVIDENCE\n")
+  }
+
+  func testRunnerWritesAHashBoundFailureReceiptForAThermalHarnessExit()
+    throws
+  {
+    let fixture = try makeFixture(failHarnessWithThermalDiagnostic: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "FAILED\n")
+    let runDirectory = fixture.output.appendingPathComponent(
+      "runs/block-000/position-000-fp16", isDirectory: true)
+    let failureReceiptURL = runDirectory.appendingPathComponent(
+      "runner-failure.json")
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: failureReceiptURL.path),
+      result.output)
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: runDirectory.appendingPathComponent("runner-receipt.json").path))
+    let failureReceipt = try XCTUnwrap(JSONSerialization.jsonObject(
+      with: Data(contentsOf: failureReceiptURL)) as? [String: Any])
+    XCTAssertEqual(failureReceipt["schemaVersion"] as? Int, 1)
+    XCTAssertEqual(failureReceipt["status"] as? String, "FAILED")
+    XCTAssertEqual(failureReceipt["promotable"] as? Bool, false)
+    XCTAssertEqual(failureReceipt["reason"] as? String, "harness-exit")
+    XCTAssertEqual(failureReceipt["childExitCode"] as? Int, 46)
+    XCTAssertEqual(failureReceipt["matrixID"] as? String, "qualification-test-v1")
+    XCTAssertEqual(failureReceipt["cellID"] as? String, "fp16")
+    XCTAssertEqual(failureReceipt["kvQuantTier"] as? String, "fp16")
+    XCTAssertEqual(failureReceipt["blockIndex"] as? Int, 0)
+    XCTAssertEqual(failureReceipt["runPosition"] as? Int, 0)
+    XCTAssertEqual(
+      failureReceipt["harnessGitSHA"] as? String,
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    XCTAssertEqual(
+      failureReceipt["runnerManifestSHA256"] as? String,
+      sha256Hex(try Data(contentsOf: fixture.manifest)))
+    XCTAssertEqual(
+      failureReceipt["harnessBinarySHA256"] as? String,
+      sha256Hex(try Data(contentsOf: fixture.binary)))
+    XCTAssertTrue(
+      (failureReceipt["runnerScriptSHA256"] as? String)?.count == 64)
+    XCTAssertEqual(failureReceipt["evidencePresent"] as? Bool, false)
+    XCTAssertNil(failureReceipt["evidenceSHA256"] as? String)
+    XCTAssertEqual(
+      failureReceipt["logSHA256"] as? String,
+      sha256Hex(try Data(contentsOf: runDirectory.appendingPathComponent(
+        "bench.log"))))
+    let policy = try XCTUnwrap(
+      failureReceipt["postWarmupThermalPolicy"] as? [String: Any])
+    XCTAssertEqual(policy["target"] as? String, "nominal")
+    XCTAssertEqual(policy["timeoutSeconds"] as? Int, 600)
+    XCTAssertEqual(policy["pollIntervalMilliseconds"] as? Int, 1_000)
+    XCTAssertEqual(policy["stabilitySeconds"] as? Int, 60)
+    let thermalEnvironment = try XCTUnwrap(
+      failureReceipt["thermalEnvironment"] as? [String: Any])
+    XCTAssertEqual(thermalEnvironment["schemaVersion"] as? Int, 1)
+    let before = try XCTUnwrap(
+      thermalEnvironment["before"] as? [String: Any])
+    let after = try XCTUnwrap(
+      thermalEnvironment["after"] as? [String: Any])
+    XCTAssertEqual(before["thermalState"] as? String, "nominal")
+    XCTAssertEqual(after["thermalState"] as? String, "fair")
+    let receiptSet = try String(
+      contentsOf: fixture.output.appendingPathComponent(
+        "runner.receipts.sha256"), encoding: .utf8)
+    XCTAssertTrue(receiptSet.isEmpty)
+  }
+
+  func testRunnerRecoversTheOriginalLogWhenAFailedChildUnlinksItsPath()
+    throws
+  {
+    let fixture = try makeFixture(unlinkLogBeforeFailure: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_LOG_BOUNDARY\n")
+    let runDirectory = fixture.output.appendingPathComponent(
+      "runs/block-000/position-000-fp16", isDirectory: true)
+    let recoveredLog = runDirectory.appendingPathComponent(
+      "runner-captured.log")
+    let failureReceipt = try XCTUnwrap(JSONSerialization.jsonObject(
+      with: Data(contentsOf: runDirectory.appendingPathComponent(
+        "runner-failure.json"))) as? [String: Any])
+    XCTAssertEqual(
+      failureReceipt["reason"] as? String,
+      "log-boundary-changed")
+    XCTAssertEqual(failureReceipt["childExitCode"] as? Int, 48)
+    XCTAssertEqual(
+      failureReceipt["logArtifact"] as? String,
+      "runner-captured.log")
+    XCTAssertEqual(
+      failureReceipt["logSHA256"] as? String,
+      sha256Hex(try Data(contentsOf: recoveredLog)))
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: runDirectory.appendingPathComponent("runner-receipt.json").path))
+  }
+
+  func testRunnerDoesNotTrustDuplicateThermalDiagnostics() throws {
+    let fixture = try makeFixture(duplicateThermalDiagnostics: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    let failureReceipt = try XCTUnwrap(JSONSerialization.jsonObject(
+      with: Data(contentsOf: fixture.output.appendingPathComponent(
+        "runs/block-000/position-000-fp16/runner-failure.json")))
+      as? [String: Any])
+    XCTAssertEqual(failureReceipt["reason"] as? String, "harness-exit")
+    XCTAssertEqual(failureReceipt["childExitCode"] as? Int, 49)
+    XCTAssertTrue(failureReceipt["thermalEnvironment"] is NSNull)
+  }
+
+  func testFailureReceiptTempCannotClobberAChildSuppliedSymlink() throws {
+    let fixture = try makeFixture(
+      failHarnessWithThermalDiagnostic: true,
+      precreateFailureTempSymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.root.appendingPathComponent(
+        "sentinel.txt"), encoding: .utf8),
+      "sentinel\n")
+    XCTAssertTrue(FileManager.default.fileExists(
+      atPath: fixture.output.appendingPathComponent(
+        "runs/block-000/position-000-fp16/runner-failure.json").path))
+  }
+
+  func testPromotableReceiptReplacesSymlinkWithoutClobberingItsTarget()
+    throws
+  {
+    let fixture = try makeFixture(precreateReceiptSymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.root.appendingPathComponent(
+        "sentinel.txt"), encoding: .utf8),
+      "sentinel\n")
+    let receipts = try FileManager.default.subpathsOfDirectory(
+      atPath: fixture.output.appendingPathComponent("runs").path)
+      .filter { $0.hasSuffix("/runner-receipt.json") }
+    XCTAssertEqual(receipts.count, 6)
+    for receipt in receipts {
+      let values = try fixture.output.appendingPathComponent(
+        "runs/\(receipt)").resourceValues(forKeys: [.isSymbolicLinkKey])
+      XCTAssertEqual(values.isSymbolicLink, false)
+    }
+  }
+
+  func testBlockCompletionReplacesSymlinkWithoutClobberingItsTarget()
+    throws
+  {
+    let fixture = try makeFixture(precreateBlockCompletionSymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.root.appendingPathComponent(
+        "sentinel.txt"), encoding: .utf8),
+      "sentinel\n")
+    let completion = fixture.output.appendingPathComponent(
+      "blocks/block-000.complete.json")
+    let values = try completion.resourceValues(forKeys: [.isSymbolicLinkKey])
+    XCTAssertEqual(values.isSymbolicLink, false)
+    let body = try XCTUnwrap(JSONSerialization.jsonObject(
+      with: Data(contentsOf: completion)) as? [String: Any])
+    XCTAssertEqual(body["blockIndex"] as? Int, 0)
+  }
+
+  func testRunnerCompletionIgnoresPredictableChildSuppliedTempSymlink()
+    throws
+  {
+    let fixture = try makeFixture(precreateCompletionTempSymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.root.appendingPathComponent(
+        "sentinel.txt"), encoding: .utf8),
+      "sentinel\n")
+    let completion = fixture.output.appendingPathComponent(
+      "runner.completion.json")
+    let values = try completion.resourceValues(forKeys: [.isSymbolicLinkKey])
+    XCTAssertEqual(values.isSymbolicLink, false)
+    let body = try XCTUnwrap(JSONSerialization.jsonObject(
+      with: Data(contentsOf: completion)) as? [String: Any])
+    XCTAssertEqual(body["status"] as? String, "COMPLETE")
+  }
+
+  func testRunnerRejectsAChildSuppliedFutureRunDirectorySymlink()
+    throws
+  {
+    let fixture = try makeFixture(precreateFutureRunDirectorySymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_RUN_DIRECTORY_BOUNDARY\n")
+    XCTAssertTrue(result.output.contains("run directory already exists"))
+    XCTAssertEqual(
+      try FileManager.default.contentsOfDirectory(
+        atPath: fixture.root.appendingPathComponent("external-row").path),
+      [])
+  }
+
+  func testFutureBlockReceiptAggregateReplacesSymlinkWithoutClobberingTarget()
+    throws
+  {
+    let fixture = try makeFixture(precreateFutureBlockReceiptSymlink: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.root.appendingPathComponent(
+        "sentinel.txt"), encoding: .utf8),
+      "sentinel\n")
+    let receiptAggregate = fixture.output.appendingPathComponent(
+      "blocks/block-001.receipts.jsonl")
+    let values = try receiptAggregate.resourceValues(
+      forKeys: [.isSymbolicLinkKey])
+    XCTAssertEqual(values.isSymbolicLink, false)
+    XCTAssertEqual(
+      try String(contentsOf: receiptAggregate, encoding: .utf8)
+        .split(separator: "\n").count,
+      2)
   }
 
   func testRunnerRejectsEvidenceFromTheWrongModelIdentity() throws {
@@ -444,6 +710,15 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let mismatchTokenizerIdentity: Bool
     let truncateAdmissionEvidence: Bool
     let truncateKVTunerEvidence: Bool
+    let failHarnessWithThermalDiagnostic: Bool
+    let unlinkLogBeforeFailure: Bool
+    let duplicateThermalDiagnostics: Bool
+    let precreateFailureTempSymlink: Bool
+    let precreateReceiptSymlink: Bool
+    let precreateBlockCompletionSymlink: Bool
+    let precreateCompletionTempSymlink: Bool
+    let precreateFutureRunDirectorySymlink: Bool
+    let precreateFutureBlockReceiptSymlink: Bool
     let stallHarness: Bool
     let readHarnessSHAFromCurrentDirectory: Bool
     let spoofHarnessSHAEnvironment: Bool
@@ -472,6 +747,15 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     truncateAdmissionEvidence: Bool = false,
     truncateKVTunerEvidence: Bool = false,
     mismatchBinaryIdentity: Bool = false,
+    failHarnessWithThermalDiagnostic: Bool = false,
+    unlinkLogBeforeFailure: Bool = false,
+    duplicateThermalDiagnostics: Bool = false,
+    precreateFailureTempSymlink: Bool = false,
+    precreateReceiptSymlink: Bool = false,
+    precreateBlockCompletionSymlink: Bool = false,
+    precreateCompletionTempSymlink: Bool = false,
+    precreateFutureRunDirectorySymlink: Bool = false,
+    precreateFutureBlockReceiptSymlink: Bool = false,
     stallHarness: Bool = false,
     readHarnessSHAFromCurrentDirectory: Bool = false,
     spoofHarnessSHAEnvironment: Bool = false,
@@ -499,6 +783,12 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let harnessSHA = harnessStampDirectory.appendingPathComponent(
       harnessStampFilename)
     let launches = root.appendingPathComponent("launches.txt")
+    let sentinel = root.appendingPathComponent("sentinel.txt")
+    try "sentinel\n".write(
+      to: sentinel, atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(
+      at: root.appendingPathComponent("external-row", isDirectory: true),
+      withIntermediateDirectories: true)
     let model = root.appendingPathComponent("models/test", isDirectory: true)
     try FileManager.default.createDirectory(
       at: model, withIntermediateDirectories: true)
@@ -546,12 +836,20 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         evidence_path="${3:-}"
         jq -e '
           .subcommand == "bench" and
-          .payload.qualification.schemaVersion == 3 and
+          .payload.qualification.schemaVersion == 4 and
           .payload.qualification.context.postWarmupThermalPolicy.target ==
             "nominal" and
+          .payload.qualification.context.postWarmupThermalPolicy.stabilitySeconds ==
+            60 and
           .payload.qualification.warmup.before.thermalState == "nominal" and
           .payload.qualification.postWarmupThermalAdmission.snapshot.thermalState ==
             "nominal" and
+          (.payload.qualification.postWarmupThermalAdmission.stabilityObservations |
+            type == "array" and length == 2 and
+            .[0].thermalState == "nominal" and
+            .[1].thermalState == "nominal" and
+            (.[1].monotonicTimestampSeconds -
+              .[0].monotonicTimestampSeconds) == 60) and
           (.payload.qualification.context.tokenizerSHA256 |
             type == "string" and test("^[0-9a-f]{64}$")) and
           (if .payload.compressedKVAttention == null then true else
@@ -579,6 +877,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       cache=""; wired=""; prompt_repeat=""; max_tokens=""; attention=""
       checkpoint=""; model=""; schedule=""; expected_tokenizer=""
       thermal_target=""; thermal_timeout=""; thermal_poll=""
+      thermal_stability=""
       while (($#)); do
         key="$1"; shift
         if [[ "$key" == "bench" ]]; then continue; fi
@@ -600,6 +899,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           --post-warmup-thermal-target) thermal_target="$value" ;;
           --post-warmup-thermal-timeout-seconds) thermal_timeout="$value" ;;
           --post-warmup-thermal-poll-milliseconds) thermal_poll="$value" ;;
+          --post-warmup-thermal-stability-seconds) thermal_stability="$value" ;;
           --prompt-repeat) prompt_repeat="$value" ;;
           --max-tokens) max_tokens="$value" ;;
           --kv-attention) attention="$value" ;;
@@ -617,6 +917,26 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         [[ "$thermal_target" == "nominal" ]] || exit 43
         [[ "$thermal_timeout" == "600" ]] || exit 44
         [[ "$thermal_poll" == "1000" ]] || exit 45
+        [[ "$thermal_stability" == "60" ]] || exit 47
+      fi
+      if [[ "$FAKE_FAIL_HARNESS_WITH_THERMAL_DIAGNOSTIC" == "true" ]]; then
+        if [[ "$FAKE_PRECREATE_FAILURE_TEMP_SYMLINK" == "true" ]]; then
+          parent_pid="$(tr -d '[:space:]' < "$FAKE_OUTPUT_ROOT/runner.pid")"
+          ln -s "$FAKE_SENTINEL" \
+            "$(dirname "$evidence")/runner-failure.json.tmp.$parent_pid"
+        fi
+        printf '%s\n' '# qualification retained environment: {"schemaVersion":1,"before":{"monotonicTimestampSeconds":70,"residentSizeBytes":20000,"physicalFootprintBytes":18000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"nominal"},"after":{"monotonicTimestampSeconds":71,"residentSizeBytes":21000,"physicalFootprintBytes":19000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"fair"}}'
+        exit 46
+      fi
+      if [[ "$FAKE_UNLINK_LOG_BEFORE_FAILURE" == "true" ]]; then
+        rm -f "$(dirname "$evidence")/bench.log"
+        printf '%s\n' '# qualification retained environment: {"schemaVersion":1,"before":{"monotonicTimestampSeconds":70,"residentSizeBytes":20000,"physicalFootprintBytes":18000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"nominal"},"after":{"monotonicTimestampSeconds":71,"residentSizeBytes":21000,"physicalFootprintBytes":19000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"fair"}}'
+        exit 48
+      fi
+      if [[ "$FAKE_DUPLICATE_THERMAL_DIAGNOSTICS" == "true" ]]; then
+        printf '%s\n' '# qualification retained environment: {"schemaVersion":1,"before":{"monotonicTimestampSeconds":70,"residentSizeBytes":20000,"physicalFootprintBytes":18000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"nominal"},"after":{"monotonicTimestampSeconds":71,"residentSizeBytes":21000,"physicalFootprintBytes":19000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"fair"}}'
+        printf '%s\n' '# qualification retained environment: {"schemaVersion":1,"before":{"monotonicTimestampSeconds":72,"residentSizeBytes":20000,"physicalFootprintBytes":18000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"nominal"},"after":{"monotonicTimestampSeconds":73,"residentSizeBytes":21000,"physicalFootprintBytes":19000,"lowPowerModeEnabled":false,"powerSource":"ac-power","thermalState":"critical"}}'
+        exit 49
       fi
       if [[ "$FAKE_STALL_HARNESS" == "true" ]]; then sleep 60; fi
       if [[ "$FAKE_OMIT_EVIDENCE" == "true" ]]; then exit 0; fi
@@ -680,6 +1000,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         --argjson cache "$cache" --argjson wired "$wired" \
         --argjson thermalTimeout "$thermal_timeout" \
         --argjson thermalPoll "$thermal_poll" \
+        --argjson thermalStability "$thermal_stability" \
         --argjson promptRepeat "$prompt_repeat" --argjson maxTokens "$max_tokens" \
         '{subcommand:"bench",provenance:{date:"2026-07-20T00:00:00Z",
           hardwareChip:"test",hardwareRAMBytes:100000,hardwareOS:"test",
@@ -733,7 +1054,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
             if $truncateKVTuner then
               del(.modelConfigHash,.checkpointManifestHash,.tokenizerSHA256,
                 .groupSize,.layers)
-            else . end end),qualification:{schemaVersion:3,
+            else . end end),qualification:{schemaVersion:4,
           context:{runnerManifestSHA256:$manifest,matrixBlockIndex:$block,
           matrixRunPosition:$position,matrixCellCount:$count,
           memoryLimitBytes:$memory,cacheLimitBytes:$cache,wiredLimitBytes:$wired,
@@ -743,7 +1064,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           processIsolationPolicy:"fresh-process-per-matrix-position",
           postWarmupThermalPolicy:{target:$thermalTarget,
           timeoutSeconds:$thermalTimeout,
-          pollIntervalMilliseconds:$thermalPoll}},
+          pollIntervalMilliseconds:$thermalPoll,
+          stabilitySeconds:$thermalStability}},
           warmup:{before:{monotonicTimestampSeconds:8,residentSizeBytes:19000,
           physicalFootprintBytes:17000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:"nominal"},
@@ -751,18 +1073,60 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           physicalFootprintBytes:18000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:"nominal"}},
           postWarmupThermalAdmission:{snapshot:{monotonicTimestampSeconds:
+          (if $lateThermalAdmission then 670 else 69.5 end),
+          residentSizeBytes:20000,physicalFootprintBytes:18000,
+          lowPowerModeEnabled:false,powerSource:"ac-power",
+          thermalState:$thermalTarget},stabilityObservations:[
+          {monotonicTimestampSeconds:
           (if $lateThermalAdmission then 610 else 9.5 end),
           residentSizeBytes:20000,physicalFootprintBytes:18000,
           lowPowerModeEnabled:false,powerSource:"ac-power",
-          thermalState:$thermalTarget}},runs:[{
+          thermalState:$thermalTarget},
+          {monotonicTimestampSeconds:
+          (if $lateThermalAdmission then 670 else 69.5 end),
+          residentSizeBytes:20000,physicalFootprintBytes:18000,
+          lowPowerModeEnabled:false,powerSource:"ac-power",
+          thermalState:$thermalTarget}]},runs:[{
           before:{monotonicTimestampSeconds:
-          (if $lateThermalAdmission then 611 else 10 end),residentSizeBytes:20000,
+          (if $lateThermalAdmission then 671 else 70 end),residentSizeBytes:20000,
           physicalFootprintBytes:18000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:$thermal},
           after:{monotonicTimestampSeconds:
-          (if $lateThermalAdmission then 612 else 11 end),residentSizeBytes:21000,
+          (if $lateThermalAdmission then 672 else 71 end),residentSizeBytes:21000,
           physicalFootprintBytes:19000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:$thermal}}]}}}' > "$evidence"
+      if [[ "$FAKE_PRECREATE_RECEIPT_SYMLINK" == "true" ]]; then
+        ln -s "$FAKE_SENTINEL" "$(dirname "$evidence")/runner-receipt.json"
+      fi
+      if [[ "$FAKE_PRECREATE_BLOCK_COMPLETION_SYMLINK" == "true" &&
+            "$block" == "0" && "$position" == "0" ]]; then
+        destination="$FAKE_OUTPUT_ROOT/blocks/block-000.complete.json"
+        if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+          ln -s "$FAKE_SENTINEL" "$destination"
+        fi
+      fi
+      if [[ "$FAKE_PRECREATE_COMPLETION_TEMP_SYMLINK" == "true" &&
+            "$block" == "0" && "$position" == "0" ]]; then
+        parent_pid="$(tr -d '[:space:]' < "$FAKE_OUTPUT_ROOT/runner.pid")"
+        destination="$FAKE_OUTPUT_ROOT/runner.completion.json.tmp.$parent_pid"
+        if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+          ln -s "$FAKE_SENTINEL" "$destination"
+        fi
+      fi
+      if [[ "$FAKE_PRECREATE_FUTURE_RUN_DIRECTORY_SYMLINK" == "true" &&
+            "$block" == "0" && "$position" == "0" ]]; then
+        destination="$FAKE_OUTPUT_ROOT/runs/block-000/position-001-affine-direct"
+        if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+          ln -s "$FAKE_EXTERNAL_ROW" "$destination"
+        fi
+      fi
+      if [[ "$FAKE_PRECREATE_FUTURE_BLOCK_RECEIPT_SYMLINK" == "true" &&
+            "$block" == "0" && "$position" == "0" ]]; then
+        destination="$FAKE_OUTPUT_ROOT/blocks/block-001.receipts.jsonl"
+        if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+          ln -s "$FAKE_SENTINEL" "$destination"
+        fi
+      fi
       if [[ "$FAKE_MUTATE_HARNESS_STAMP" == "true" &&
             "$block" == "0" && "$position" == "0" ]]; then
         printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
@@ -778,7 +1142,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         String(format: "%02x", $0)
       }.joined()
     let manifestObject: [String: Any] = [
-      "schemaVersion": 2,
+      "schemaVersion": 3,
       "harnessGitSHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "harnessBinarySHA256": mismatchBinaryIdentity
         ? String(repeating: "f", count: 64) : actualBinarySHA256,
@@ -797,6 +1161,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       "postWarmupThermalTarget": "nominal",
       "postWarmupThermalTimeoutSeconds": 600,
       "postWarmupThermalPollMilliseconds": 1_000,
+      "postWarmupThermalStabilitySeconds": 60,
       "cells": includeKVTuner ? kvtunerCells : defaultCells,
       "blocks": selectedBlocks,
     ]
@@ -814,6 +1179,15 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       mismatchTokenizerIdentity: mismatchTokenizerIdentity,
       truncateAdmissionEvidence: truncateAdmissionEvidence,
       truncateKVTunerEvidence: truncateKVTunerEvidence,
+      failHarnessWithThermalDiagnostic: failHarnessWithThermalDiagnostic,
+      unlinkLogBeforeFailure: unlinkLogBeforeFailure,
+      duplicateThermalDiagnostics: duplicateThermalDiagnostics,
+      precreateFailureTempSymlink: precreateFailureTempSymlink,
+      precreateReceiptSymlink: precreateReceiptSymlink,
+      precreateBlockCompletionSymlink: precreateBlockCompletionSymlink,
+      precreateCompletionTempSymlink: precreateCompletionTempSymlink,
+      precreateFutureRunDirectorySymlink: precreateFutureRunDirectorySymlink,
+      precreateFutureBlockReceiptSymlink: precreateFutureBlockReceiptSymlink,
       stallHarness: stallHarness,
       readHarnessSHAFromCurrentDirectory: readHarnessSHAFromCurrentDirectory,
       spoofHarnessSHAEnvironment: spoofHarnessSHAEnvironment,
@@ -861,6 +1235,29 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       fixture.truncateAdmissionEvidence ? "true" : "false"
     environment["FAKE_TRUNCATE_KVTUNER"] =
       fixture.truncateKVTunerEvidence ? "true" : "false"
+    environment["FAKE_FAIL_HARNESS_WITH_THERMAL_DIAGNOSTIC"] =
+      fixture.failHarnessWithThermalDiagnostic ? "true" : "false"
+    environment["FAKE_UNLINK_LOG_BEFORE_FAILURE"] =
+      fixture.unlinkLogBeforeFailure ? "true" : "false"
+    environment["FAKE_DUPLICATE_THERMAL_DIAGNOSTICS"] =
+      fixture.duplicateThermalDiagnostics ? "true" : "false"
+    environment["FAKE_PRECREATE_FAILURE_TEMP_SYMLINK"] =
+      fixture.precreateFailureTempSymlink ? "true" : "false"
+    environment["FAKE_PRECREATE_RECEIPT_SYMLINK"] =
+      fixture.precreateReceiptSymlink ? "true" : "false"
+    environment["FAKE_PRECREATE_BLOCK_COMPLETION_SYMLINK"] =
+      fixture.precreateBlockCompletionSymlink ? "true" : "false"
+    environment["FAKE_PRECREATE_COMPLETION_TEMP_SYMLINK"] =
+      fixture.precreateCompletionTempSymlink ? "true" : "false"
+    environment["FAKE_PRECREATE_FUTURE_RUN_DIRECTORY_SYMLINK"] =
+      fixture.precreateFutureRunDirectorySymlink ? "true" : "false"
+    environment["FAKE_PRECREATE_FUTURE_BLOCK_RECEIPT_SYMLINK"] =
+      fixture.precreateFutureBlockReceiptSymlink ? "true" : "false"
+    environment["FAKE_OUTPUT_ROOT"] = fixture.output.path
+    environment["FAKE_SENTINEL"] = fixture.root.appendingPathComponent(
+      "sentinel.txt").path
+    environment["FAKE_EXTERNAL_ROW"] = fixture.root.appendingPathComponent(
+      "external-row").path
     environment["FAKE_STALL_HARNESS"] =
       fixture.stallHarness ? "true" : "false"
     environment["FAKE_READ_HARNESS_SHA_FROM_CWD"] =
@@ -902,6 +1299,10 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       decoding: pipe.fileHandleForReading.readDataToEndOfFile(),
       as: UTF8.self)
     return (process.terminationStatus, output)
+  }
+
+  private func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
   }
 
   private var runnerScriptURL: URL {

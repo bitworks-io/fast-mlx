@@ -230,22 +230,59 @@ public struct BenchQualificationThermalPolicy:
     public let target: BenchQualificationThermalTarget
     public let timeoutSeconds: Int
     public let pollIntervalMilliseconds: Int
+    public let stabilitySeconds: Int
 
     public init(
         target: BenchQualificationThermalTarget,
         timeoutSeconds: Int,
-        pollIntervalMilliseconds: Int
+        pollIntervalMilliseconds: Int,
+        stabilitySeconds: Int = 0
     ) throws {
         self.target = target
         self.timeoutSeconds = timeoutSeconds
         self.pollIntervalMilliseconds = pollIntervalMilliseconds
+        self.stabilitySeconds = stabilitySeconds
         try validate()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case target
+        case timeoutSeconds
+        case pollIntervalMilliseconds
+        case stabilitySeconds
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        target = try container.decode(
+            BenchQualificationThermalTarget.self, forKey: .target)
+        timeoutSeconds = try container.decode(
+            Int.self, forKey: .timeoutSeconds)
+        pollIntervalMilliseconds = try container.decode(
+            Int.self, forKey: .pollIntervalMilliseconds)
+        stabilitySeconds = try container.decodeIfPresent(
+            Int.self, forKey: .stabilitySeconds) ?? 0
+        try validate()
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(target, forKey: .target)
+        try container.encode(timeoutSeconds, forKey: .timeoutSeconds)
+        try container.encode(
+            pollIntervalMilliseconds,
+            forKey: .pollIntervalMilliseconds)
+        if stabilitySeconds > 0 {
+            try container.encode(
+                stabilitySeconds, forKey: .stabilitySeconds)
+        }
     }
 
     fileprivate func validate() throws {
         guard (1 ... 3_600).contains(timeoutSeconds),
             (100 ... 60_000).contains(pollIntervalMilliseconds),
-            pollIntervalMilliseconds <= timeoutSeconds * 1_000
+            pollIntervalMilliseconds <= timeoutSeconds * 1_000,
+            (0 ... timeoutSeconds).contains(stabilitySeconds)
         else {
             throw BenchQualificationEvidenceError.invalidThermalPolicy
         }
@@ -444,26 +481,79 @@ public struct BenchQualificationWarmupEnvironment:
     }
 }
 
-/// Exact host snapshot at which the bounded post-warmup wait admitted the retained generation.
+/// Sampled terminal nominal interval and exact host snapshot at which the bounded post-warmup
+/// wait admitted the retained generation. Historical schema-v3 evidence contains only `snapshot`;
+/// current evidence also retains every sample used to prove the manifest-bound stability window.
 public struct BenchQualificationThermalAdmission:
     Codable, Sendable, Equatable
 {
     public let snapshot: BenchQualificationHostSnapshot
+    public let stabilityObservations: [BenchQualificationHostSnapshot]
 
     public init(snapshot: BenchQualificationHostSnapshot) throws {
         self.snapshot = snapshot
+        stabilityObservations = [snapshot]
         try validate()
     }
 
+    public init(
+        stabilityObservations: [BenchQualificationHostSnapshot]
+    ) throws {
+        guard let snapshot = stabilityObservations.last else {
+            throw BenchQualificationEvidenceError.invalidThermalAdmission
+        }
+        self.snapshot = snapshot
+        self.stabilityObservations = stabilityObservations
+        try validate()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case snapshot
+        case stabilityObservations
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        snapshot = try container.decode(
+            BenchQualificationHostSnapshot.self, forKey: .snapshot)
+        stabilityObservations = try container.decodeIfPresent(
+            [BenchQualificationHostSnapshot].self,
+            forKey: .stabilityObservations) ?? [snapshot]
+        try validate()
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(snapshot, forKey: .snapshot)
+        if stabilityObservations.count > 1 {
+            try container.encode(
+                stabilityObservations,
+                forKey: .stabilityObservations)
+        }
+    }
+
     fileprivate func validate() throws {
-        guard snapshot.monotonicTimestampSeconds.isFinite,
-            snapshot.residentSizeBytes > 0,
-            snapshot.physicalFootprintBytes > 0,
-            snapshot.powerSource == .acPower,
-            !snapshot.lowPowerModeEnabled,
-            snapshot.thermalState == .nominal
+        guard !stabilityObservations.isEmpty,
+            stabilityObservations.last == snapshot
         else {
             throw BenchQualificationEvidenceError.invalidThermalAdmission
+        }
+        var previousTimestamp: Double?
+        for observation in stabilityObservations {
+            guard observation.monotonicTimestampSeconds.isFinite,
+                observation.residentSizeBytes > 0,
+                observation.physicalFootprintBytes > 0,
+                observation.powerSource == .acPower,
+                !observation.lowPowerModeEnabled,
+                observation.thermalState == .nominal,
+                previousTimestamp.map({
+                    observation.monotonicTimestampSeconds > $0
+                }) ?? true
+            else {
+                throw BenchQualificationEvidenceError
+                    .invalidThermalAdmission
+            }
+            previousTimestamp = observation.monotonicTimestampSeconds
         }
     }
 }
@@ -472,7 +562,8 @@ public struct BenchQualificationThermalAdmission:
 /// is allowed per process: cross-cell counterbalancing and the required three-or-more repetitions
 /// happen at the isolated matrix-runner boundary, preventing allocator history from being shared.
 public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
+    public static let instantaneousAdmissionSchemaVersion = 3
     public static let legacySchemaVersion = 2
 
     public let schemaVersion: Int
@@ -500,7 +591,10 @@ public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
         postWarmupThermalAdmission: BenchQualificationThermalAdmission?,
         runs: [BenchQualificationRunEnvironment]
     ) throws {
-        schemaVersion = Self.currentSchemaVersion
+        schemaVersion = (context.postWarmupThermalPolicy?
+            .stabilitySeconds ?? 0) > 0
+            ? Self.currentSchemaVersion
+            : Self.instantaneousAdmissionSchemaVersion
         self.context = context
         self.warmup = warmup
         self.postWarmupThermalAdmission =
@@ -522,6 +616,7 @@ public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
         let schemaVersion = try container.decode(
             Int.self, forKey: .schemaVersion)
         guard schemaVersion == Self.currentSchemaVersion
+            || schemaVersion == Self.instantaneousAdmissionSchemaVersion
             || schemaVersion == Self.legacySchemaVersion
         else {
             throw BenchQualificationEvidenceError
@@ -569,7 +664,8 @@ public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
                 throw BenchQualificationEvidenceError
                     .invalidThermalTargetContract
             }
-        case Self.currentSchemaVersion:
+        case Self.instantaneousAdmissionSchemaVersion,
+            Self.currentSchemaVersion:
             guard let policy = context.postWarmupThermalPolicy,
                 let warmup,
                 let admission = postWarmupThermalAdmission,
@@ -581,6 +677,28 @@ public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
             try policy.validate()
             try warmup.validate()
             try admission.validate()
+            if schemaVersion == Self.instantaneousAdmissionSchemaVersion {
+                guard policy.stabilitySeconds == 0,
+                    admission.stabilityObservations.count == 1
+                else {
+                    throw BenchQualificationEvidenceError
+                        .invalidThermalTargetContract
+                }
+            } else {
+                guard policy.stabilitySeconds > 0,
+                    let firstObservation =
+                        admission.stabilityObservations.first,
+                    admission.stabilityObservations.count >= 2,
+                    firstObservation.monotonicTimestampSeconds
+                        >= warmup.after.monotonicTimestampSeconds,
+                    admission.snapshot.monotonicTimestampSeconds
+                        - firstObservation.monotonicTimestampSeconds
+                        >= Double(policy.stabilitySeconds)
+                else {
+                    throw BenchQualificationEvidenceError
+                        .invalidThermalAdmission
+                }
+            }
             guard warmup.after.monotonicTimestampSeconds
                     <= admission.snapshot.monotonicTimestampSeconds,
                 admission.snapshot.monotonicTimestampSeconds
