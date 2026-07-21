@@ -466,11 +466,77 @@ prefill gates. Otherwise SHELVE KVarN's speed role and retain its capacity-only 
 launch another preflight or a reduced/full promotion matrix until that decision and any matrix
 scope amendment receive focused review.
 
+### Loaded direct-KVarN disposition and matrix amendment — 2026-07-21
+
+The bounded diagnostic ran on clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5` with Release
+binary SHA-256 `cfe029ad2138013a5904e6afd2475a881081a37bcf89db25bfbb91abf8484397`.
+The operator had already selected High Power Mode; before and after the run, `pmset` reported
+`powermode 2`, Foundation reported Low Power Mode false and thermal nominal, and the host remained
+on a 140 W AC adapter. `system_profiler` reported contradictory High/Low Power labels on this host;
+the harness does not use those labels as its readiness authority.
+
+The diagnostic boundary is preserved unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-profile-d4102e6/qwen-8k-kvarn-direct-metal-v1`.
+Its launch receipt binds the clean source, binary, model config, v11 qualification reference,
+Xcode/xctrace version, and non-promotable status. `xctrace` reached the 240-second Metal System
+Trace limit, produced a 16,441,155,536-byte Apple Trace File, then remained live beyond the
+launcher's bounded save interval. The watchdog terminated the recorder and target at 307 seconds.
+Peak recorder RSS
+was 107,315,600 KiB. The raw trace SHA-256 is
+`12073b786fb06d5569269500129bee3f9b1926319f9a34a9de97c5cdf24853ea`; terminal status SHA-256 is
+`982b2e8659cd53abb2c403c15e949cd6268fffa94f48c06cb85837141c2958b2`.
+Both the trace bundle and its raw `.atrc` payload fail `xctrace export --toc` with
+`Document Missing Template Error`. The artifact is diagnostic failure evidence only; it cannot
+attribute a kernel, promote a cell, or be repaired in place.
+
+The retained v11 diagnostic and source map are nevertheless sufficient for the engineering
+scope decision:
+
+| Qwen3-32B 8K diagnostic cell | Prefill tok/s | Decode tok/s | Status |
+| --- | ---: | ---: | --- |
+| fp16 | 533.73 | 23.48 | authenticated v11 row |
+| KVarN materialize | 236.92 | 0.46 | authenticated v11 row |
+| KVarN direct | 63.26 | 7.18 | hash-bound failed-row diagnostic; non-promotable |
+
+Direct KVarN is about 15.61x faster than its same-storage materialize control in decode, so the
+compressed-domain route removes a real materialization penalty. It is still only 30.6% of fp16
+decode. The unchanged gate requires at least 24.65 decode tok/s, about 3.43x the observed direct
+rate. The prefill gate requires at least 507.04 tok/s, about 8.02x the observed direct rate. The
+loaded source path also contains independent costs rather than one isolated toggle: 512-token
+prefill graph/eval boundaries, host tile packing plus eight-iteration KVarN normalization, and
+capacity-wide packed key/value attention work at every layer. A single test-first,
+actor-confined recovery has no credible route to both required multipliers.
+
+**Decision:** SHELVE KVarN's speed role for this Qwen3-32B cycle. Retain the previously qualified
+KVarN i8 capacity-only Max-fit role, exact lifecycle/correctness tests, and direct implementation as
+research evidence. Do not expose, imply, or benchmark-promote a KVarN speed tier. A future revival
+requires a materially new kernel/algorithm design and a new task, not another parameter, thermal,
+or trace retry inside this gate.
+
+**Reviewed remaining-cell amendment:** replace the abandoned seven-cell speed matrix with a fresh
+five-cell 5x5 cyclic matrix containing exactly:
+
+1. fp16;
+2. affine K4V2-g64 materialize;
+3. affine K4V2-g64 `split-affine-quantized-mm`;
+4. frozen Qwen KVTuner materialize; and
+5. frozen Qwen KVTuner `split-affine-quantized-mm`.
+
+The matrix keeps the frozen workload/model/checkpoint/tokenizer/KVTuner identities, one fresh
+process per position, explicit memory/cache/wired limits, schema-v3 manifest, schema-v4 evidence,
+60-second continuous nominal/AC/non-low-power dwell, exact retained equality, and the original 5%
+decode/prefill gates. It must use a fresh output and new clean source/build identity after this
+amendment is reviewed. KVarN is measured separately as capacity-only at Qwen 32K and is excluded
+from speed aggregation. Any incomplete row or environment drift still invalidates its paired
+block; no old row is imported into the new matrix.
+
 ### Phase 4 — end-to-end Qwen frontier
 
 - [ ] Run 8K as the bounded smoke, then 32K only from the clean verified SHA; record the
   authenticated 128K refusal because Qwen3-32B max context is 40,960.
-- [ ] Compare fp16, same-storage materialize, packed affine K4V2-g64, frozen KVTuner, and KVarN i8.
+- [ ] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
+  KVTuner materialize/direct pairs. At 32K, retain that speed scope and collect KVarN i8 only as a
+  separate authenticated capacity/runtime-context row with no speed aggregation or label.
 - [ ] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
 
 ### Phase 5 — second family and adjudication

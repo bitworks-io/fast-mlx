@@ -89,26 +89,47 @@ block-receipt SHA-256 values are
 SHA-256 is `02ade4793feafc228a22c5a99afc8fe8ce4ab14252abaece25805dc8eb0bc291`.
 Preserve v11 unchanged; its two rows and failed-row timings are diagnostic only.
 
-No replacement matrix is active. The next safe gate is a bounded loaded-path profile of direct
-KVarN, whose failed-row diagnostic was also dominated by fp16 in both prefill and decode. Keep the
-thermal contract unchanged, optimize only from a measured bottleneck, and rerun a fresh preflight
-only from a new clean SHA with a credible path to staying nominal. If no such path exists, SHELVE
-the KVarN speed disposition while retaining its already-qualified capacity-only role; any smaller
-remaining-cell promotion matrix requires an explicit reviewed plan amendment first.
+The bounded loaded-path trace is now terminal `FAILED` and preserved unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-profile-d4102e6/qwen-8k-kvarn-direct-metal-v1`.
+High Power Mode was active (`pmset powermode 2`), Foundation reported Low Power Mode false and
+thermal nominal, and the host remained on 140 W AC before and after. `xctrace` reached its
+240-second limit but did not publish a complete exportable trace before the launcher's bounded
+save watchdog. The
+preserved raw Apple Trace File is 16,441,155,536 bytes with SHA-256
+`12073b786fb06d5569269500129bee3f9b1926319f9a34a9de97c5cdf24853ea`; peak recorder RSS was
+107,315,600 KiB. The terminal status SHA-256 is
+`982b2e8659cd53abb2c403c15e949cd6268fffa94f48c06cb85837141c2958b2`. `xctrace export --toc`
+fails `Document Missing Template Error`, so the trace cannot support kernel attribution or any
+promotion claim. No target, recorder, runner, watchdog, or lock remains active.
 
-**Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
+The engineering disposition is now **SHELVE KVarN's speed role and retain its already-qualified
+capacity-only role**. V11's hash-bound diagnostic was 7.18 decode tok/s versus 0.46 for the same
+storage materialize control, proving the direct path removes a real hot-path penalty, but fp16 was
+23.48 tok/s. Clearing the frozen speed gate would require about 3.43x the observed direct decode
+throughput. Prefill was 63.26 tok/s versus 533.73 for fp16, requiring about 8.02x to reach the
+allowed 5% envelope. Those partial timings remain non-promotable; their magnitude plus the mapped
+independent prefill/packed-attention costs rules out one credible actor-confined recovery. Do not
+spend another cycle on a KVarN speed retry.
+
+The reviewed scope amendment keeps the original thermal, provenance, and 5% gates and narrows the
+next Qwen 8K speed matrix to exactly five cells: fp16, affine K4V2-g64 materialize/direct, and the
+frozen Qwen KVTuner materialize/direct. Use a fresh 5x5 cyclic order, schema-v3 manifest,
+schema-v4 evidence, 60-second continuous nominal dwell, fresh output, and a new clean source/build
+identity. KVarN remains a separately authenticated capacity-only cell at Qwen 32K; it cannot earn
+or imply a speed label. Preserve every v7-v11 and trace-v1 boundary unchanged.
+
+**Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v11; never
-   resume, overwrite, or promote their partial evidence. V11 proves the 60-second admission
-   implementation but fails the retained KVarN-direct cohort, so do not launch another thermal
-   retry or the 49-row matrix. Profile the loaded direct KVarN hot path, then either implement one
-   measured performance recovery behind the existing experimental route or SHELVE its speed role
-   and retain KVarN as capacity-only. Any later direct path must beat both same-storage materialize
-   and fp16 decode by at least 5%, with prefill regression within 5%; preserve dominated and failed
-   cells. Then run Qwen 32K, record the authenticated 128K refusal
+1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v11 and the
+   failed trace; never resume, overwrite, or promote partial evidence. KVarN's direct speed role is
+   SHELVED and its capacity-only role remains. From a fresh reviewed clean build, qualify the exact
+   five-cell Qwen 8K scope: fp16 plus affine K4V2-g64 and frozen KVTuner materialize/direct pairs.
+   A direct path must beat both same-storage materialize and fp16 decode by at least 5%, with
+   prefill regression within 5%; preserve dominated and failed cells. Then run Qwen 32K, including
+   a separately authenticated KVarN capacity-only row, and record the authenticated 128K refusal
    (maximum context 40,960), and qualify source-locked Llama-3.3-70B at 8K/32K/near-128K without the
    Qwen-specific KVTuner schedule unless independently calibrated. Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support

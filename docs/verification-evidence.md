@@ -405,17 +405,19 @@ must not be mistaken for a loaded-model speed or dial-promotion result.
 
 **2026-07-21 supersession:** exact-source KVTuner requalification subsequently completed, and
 the loaded-Qwen direct-KVarN smoke completed 3/3 with all 64 layers engaged and zero
-materialization. The table above remains the immutable dated 2026-07-19 acceptance packet rather
-than being rewritten after the fact.
+materialization. Later loaded diagnostics established that direct KVarN has no credible route to
+the frozen speed gate in this cycle, so its speed role is now SHELVED while its capacity-only role
+remains. The table above remains the immutable dated 2026-07-19 acceptance packet rather than being
+rewritten after the fact.
 
 **Fresh requalification boundary:** schema-v2 KVTuner manifest SHA-256
 `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f` binds checkpoint-content
 SHA-256 `636f358d4f51c9394400fa46ef684b918e45c14d369d95df0399c80abc8a09d9`.
 Schema-v3 g128 sensitivity SHA-256
 `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc` authenticates 64 layers and
-3,840 samples at the same clean SHA. The canonical 64 candidates, search, and a new qualification
-bundle remain pending. No old bundle is rewritten, and no PROMOTE/SHELVE verdict is issued by this
-implementation packet.
+3,840 samples at the same clean SHA. At this dated packet boundary, the canonical 64 candidates,
+search, and a new qualification bundle remained pending. No old bundle was rewritten, and this
+implementation packet itself issued no PROMOTE/SHELVE verdict.
 
 **Coverage boundary:** the full acceptance suites above were rerun without coverage instrumentation.
 The prior Phase 0 coverage packet remains historical evidence; this packet does not claim a new
@@ -436,7 +438,8 @@ thermal transition or weakening per-run and cross-row equality.
 | Clean-SHA automated proof | **PASS** | Off-box `swift test --package-path spike --filter HarnessCoreTests` passes 519 XCTest plus 17 Swift Testing tests; pure log SHA-256 is `d9712cf2183166f392a7bfda6c669f4d09b3db8a5103166b0acfe3bc96ae7139`. On synced clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5`, Xcode with `-skipPackagePluginValidation` passes 95/95 `FastMLXHarnessTests` and 155/155 `SpikeCoreTests`; the Release build succeeds. Binary SHA-256 is `cfe029ad2138013a5904e6afd2475a881081a37bcf89db25bfbb91abf8484397`, runner SHA-256 is `e2f6e55bb0aeae6b1ec585f6d0d3c85b13c00879e13ed2a0fa3826ee074f8c0f`, Xcode log SHA-256 is `090534e0ae5f3c9f36a6b4917079defb757f0d6cc8bfba270a659d88578b0376`, and Release log SHA-256 is `fd1d87c09187f2c3187a5bc02d91e82997d1b7f9e9da573ad9d027f8e28d1876`. |
 | Review and repository safety | **PASS** | Two independent final reviews report no issues after output-root and parent-artifact hardening. Shell syntax, ShellCheck, diff checks, the 36-test loaded-runner suite, and staged gitleaks pass. The code commit carries the required co-author trailer. |
 | Continuous-dwell loaded preflight | **FAIL (preserved)** | V11 is terminal after 2/9 authenticated rows and zero completed blocks. The fp16 row carried 59 nominal observations spanning 60.0088 seconds and retained nominal/nominal; KVarN materialize carried 59 observations spanning 60.0282 seconds and retained nominal/nominal. The direct KVarN row reacquired nominal after its fair warmup but changed nominal -> fair during retained work, emitted no evidence, and produced non-promotable failure SHA-256 `02893f30229f79861f95e8d037536ae6d0bca7855539bbc88ab2f82dd788293b`. Partial receipt-list SHA-256 `ae9dcb7e0ef082aff6cd6509c13a9e41f85fe8937d0a203867d762559c259a56` contains only the two promotion receipts and excludes the failure; partial block-receipt SHA-256 is `2780c3a9b4880236082feb3dcca26613f69220c854d68dc0db39f67ea0e7ac90`; complete runner-log SHA-256 is `02ade4793feafc228a22c5a99afc8fe8ce4ab14252abaece25805dc8eb0bc291`. |
-| Loaded Qwen 8K speed adjudication | **PENDING** | V10 and v11 are partial diagnostic evidence only; neither promotes or supports a complete speed conclusion. V11's failed-row log reported roughly 63.26 prefill tok/s and 7.18 decode tok/s versus its fp16 diagnostic row's 533.73 and 23.48, so another unchanged thermal retry has no credible promotion path. No replacement matrix is active. The next boundary is measured loaded-path profiling and an optimization-or-SHELVE decision under the unchanged thermal and speed gates. |
+| Loaded direct-KVarN speed disposition | **SHELVE SPEED / RETAIN CAPACITY** | The bounded clean-`d4102e6` Metal diagnostic is terminal non-promotable failure at `/Users/llmbench/perf-work/results/fused-compressed-kv-profile-d4102e6/qwen-8k-kvarn-direct-metal-v1`. High Power/AC/Foundation nominal readiness passed. `xctrace` reached 240 seconds but exceeded the save watchdog after producing a 16,441,155,536-byte raw Apple Trace File; peak recorder RSS was 107,315,600 KiB. Raw trace SHA-256 is `12073b786fb06d5569269500129bee3f9b1926319f9a34a9de97c5cdf24853ea`; status SHA-256 is `982b2e8659cd53abb2c403c15e949cd6268fffa94f48c06cb85837141c2958b2`; `xctrace export --toc` fails `Document Missing Template Error`. V11's hash-bound direct diagnostic (63.26 prefill / 7.18 decode tok/s) needs about 8.02x prefill and 3.43x decode to clear the unchanged fp16 envelope. That rules out one credible recovery; no promotion result is inferred from the partial row. KVarN remains its already-qualified capacity-only Max-fit cell. |
+| Remaining Qwen 8K speed scope | **REVIEWED AMENDMENT / PENDING RUN** | The replacement scope is a fresh five-cell 5x5 cyclic matrix: fp16; affine K4V2-g64 materialize/direct; frozen Qwen KVTuner materialize/direct. It retains schema-v3/schema-v4 continuous nominal admission, exact model/checkpoint/tokenizer/schedule/workload/memory bindings, fresh-process/fresh-output contracts, and the original 5% decode/prefill gate. A new clean source/build identity is required before launch. KVarN is excluded from speed aggregation and remains separately measurable at 32K for capacity only. |
 
 **Verification artifact note:** the Xcode tests and Release build succeeded. Their first evidence
 wrapper assumed a SwiftPM product path after the Xcode build; a second receipt command then left a
@@ -450,7 +453,8 @@ recovery commits carry the correctly parsed trailer and record the exception rat
 old evidence.
 
 **Overall verdict:** continuous post-warmup nominal admission passes implementation, review, pure
-verification, MLX-coupled Xcode verification, and Release build. V11 then proved the contract
-fails closed on an actual retained transition; it did not authorize a matrix. Loaded Qwen
-promotion remains pending a measured direct-KVarN recovery or an explicit speed-path SHELVE
-decision followed by a reviewed matrix-scope amendment.
+verification, MLX-coupled Xcode verification, and Release build. V11 proved the contract fails
+closed on an actual retained transition. The follow-up trace failed safely and produced no usable
+kernel attribution. KVarN's speed role is now SHELVED while its qualified capacity-only role is
+retained. Loaded Qwen speed promotion remains pending fresh proof from the reviewed five-cell
+affine/KVTuner scope under a new clean source/build identity.
