@@ -122,6 +122,26 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       atPath: fixture.launches.path))
   }
 
+  func testRunnerRequiresAFrozenTokenizerIdentityBeforeLaunching()
+    throws
+  {
+    let fixture = try makeFixture()
+    var manifest = try XCTUnwrap(
+      JSONSerialization.jsonObject(
+        with: Data(contentsOf: fixture.manifest)) as? [String: Any])
+    manifest.removeValue(forKey: "modelTokenizerSHA256")
+    try JSONSerialization.data(
+      withJSONObject: manifest, options: [.sortedKeys])
+      .write(to: fixture.manifest)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("manifest schema"))
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: fixture.launches.path))
+  }
+
   func testRunnerInvalidatesTheWholeBlockWhenEnvironmentChangesAcrossRows()
     throws
   {
@@ -185,6 +205,19 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
 
   func testRunnerRejectsEvidenceFromTheWrongModelIdentity() throws {
     let fixture = try makeFixture(mismatchModelIdentity: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("identity or qualification"))
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_EVIDENCE\n")
+  }
+
+  func testRunnerRejectsEvidenceFromTheWrongTokenizerIdentity() throws {
+    let fixture = try makeFixture(mismatchTokenizerIdentity: true)
 
     let result = try runRunner(fixture: fixture)
 
@@ -264,6 +297,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let mismatchKVTunerBinding: Bool
     let omitEvidence: Bool
     let mismatchModelIdentity: Bool
+    let mismatchTokenizerIdentity: Bool
     let truncateAdmissionEvidence: Bool
     let truncateKVTunerEvidence: Bool
     let stallHarness: Bool
@@ -283,6 +317,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     mismatchKVTunerBinding: Bool = false,
     omitEvidence: Bool = false,
     mismatchModelIdentity: Bool = false,
+    mismatchTokenizerIdentity: Bool = false,
     truncateAdmissionEvidence: Bool = false,
     truncateKVTunerEvidence: Bool = false,
     mismatchBinaryIdentity: Bool = false,
@@ -343,7 +378,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         evidence_path="${3:-}"
         jq -e '
           .subcommand == "bench" and
-          .payload.qualification.schemaVersion == 1 and
+          .payload.qualification.schemaVersion == 2 and
+          (.payload.qualification.context.tokenizerSHA256 |
+            type == "string" and test("^[0-9a-f]{64}$")) and
           (if .payload.compressedKVAttention == null then true else
              (.payload.compressedKVAttention.admission |
                has("family") and has("modelType") and has("architecture") and
@@ -367,7 +404,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       evidence=""; label=""; matrix=""; nonce=""; tier="fp16"
       manifest_sha=""; block=""; position=""; count=""; memory=""
       cache=""; wired=""; prompt_repeat=""; max_tokens=""; attention=""
-      checkpoint=""; model=""; schedule=""
+      checkpoint=""; model=""; schedule=""; expected_tokenizer=""
       while (($#)); do
         key="$1"; shift
         if [[ "$key" == "bench" ]]; then continue; fi
@@ -385,6 +422,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           --memory-limit-bytes) memory="$value" ;;
           --cache-limit-bytes) cache="$value" ;;
           --wired-limit-bytes) wired="$value" ;;
+          --model-tokenizer-sha256) expected_tokenizer="$value" ;;
           --prompt-repeat) prompt_repeat="$value" ;;
           --max-tokens) max_tokens="$value" ;;
           --kv-attention) attention="$value" ;;
@@ -417,6 +455,10 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       if [[ "$FAKE_MISMATCH_MODEL" == "true" ]]; then
         config_hash="9999999999999999"
       fi
+      tokenizer_sha="$expected_tokenizer"
+      if [[ "$FAKE_MISMATCH_TOKENIZER" == "true" ]]; then
+        tokenizer_sha="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      fi
       jq -cn \
         --arg harness "$FAKE_HARNESS_SHA" --arg label "$label" \
         --arg matrix "$matrix" --arg nonce "$nonce" --arg tier "$tier" \
@@ -429,8 +471,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         --arg scheduleBundle "$FAKE_KVTUNER_BUNDLE_SHA" \
         --arg modelConfigSHA256 \
           "3333333333333333333333333333333333333333333333333333333333333333" \
-        --arg tokenizerSHA256 \
-          "4444444444444444444444444444444444444444444444444444444444444444" \
+        --arg tokenizerSHA256 "$tokenizer_sha" \
         --argjson truncateAdmission "$FAKE_TRUNCATE_ADMISSION" \
         --argjson truncateKVTuner "$FAKE_TRUNCATE_KVTUNER" \
         --argjson block "$block" --argjson position "$position" \
@@ -489,10 +530,11 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
             if $truncateKVTuner then
               del(.modelConfigHash,.checkpointManifestHash,.tokenizerSHA256,
                 .groupSize,.layers)
-            else . end end),qualification:{schemaVersion:1,
+            else . end end),qualification:{schemaVersion:2,
           context:{runnerManifestSHA256:$manifest,matrixBlockIndex:$block,
           matrixRunPosition:$position,matrixCellCount:$count,
           memoryLimitBytes:$memory,cacheLimitBytes:$cache,wiredLimitBytes:$wired,
+          tokenizerSHA256:$tokenizerSHA256,
           cacheResetPolicy:"in-place-before-every-generation",
           modelResidencyPolicy:"load-once-per-process",
           processIsolationPolicy:"fresh-process-per-matrix-position"},runs:[{
@@ -521,6 +563,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       "modelPath": model.path,
       "modelConfigHash": String(repeating: "1", count: 16),
       "modelCheckpointManifestHash": String(repeating: "2", count: 16),
+      "modelTokenizerSHA256": String(repeating: "4", count: 64),
       "promptRepeat": 2,
       "maxTokens": 8,
       "memoryLimitBytes": 9_000,
@@ -540,6 +583,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       mismatchKVTunerBinding: mismatchKVTunerBinding,
       omitEvidence: omitEvidence,
       mismatchModelIdentity: mismatchModelIdentity,
+      mismatchTokenizerIdentity: mismatchTokenizerIdentity,
       truncateAdmissionEvidence: truncateAdmissionEvidence,
       truncateKVTunerEvidence: truncateKVTunerEvidence,
       stallHarness: stallHarness,
@@ -574,6 +618,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       fixture.omitEvidence ? "true" : "false"
     environment["FAKE_MISMATCH_MODEL"] =
       fixture.mismatchModelIdentity ? "true" : "false"
+    environment["FAKE_MISMATCH_TOKENIZER"] =
+      fixture.mismatchTokenizerIdentity ? "true" : "false"
     environment["FAKE_TRUNCATE_ADMISSION"] =
       fixture.truncateAdmissionEvidence ? "true" : "false"
     environment["FAKE_TRUNCATE_KVTUNER"] =

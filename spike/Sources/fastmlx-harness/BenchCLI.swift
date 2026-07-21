@@ -104,6 +104,7 @@ enum BenchQualificationEvidenceValidationError:
     case unexpectedKVTunerSchedule
     case missingKVTunerSchedule
     case missingKVTunerAdmission
+    case tokenizerIdentityMismatch
     case kvtunerIdentityMismatch
 }
 
@@ -118,7 +119,7 @@ func validateBenchQualificationEvidenceData(_ data: Data) throws {
         throw BenchQualificationEvidenceValidationError.wrongSubcommand(
             record.subcommand)
     }
-    guard record.payload.qualification != nil else {
+    guard let qualification = record.payload.qualification else {
         throw BenchQualificationEvidenceValidationError
             .missingQualificationEvidence
     }
@@ -133,6 +134,12 @@ func validateBenchQualificationEvidenceData(_ data: Data) throws {
         else {
             throw BenchQualificationEvidenceValidationError
                 .modelIdentityMismatch
+        }
+        guard runtimeBinding.admission.tokenizerSHA256
+                == qualification.context.tokenizerSHA256
+        else {
+            throw BenchQualificationEvidenceValidationError
+                .tokenizerIdentityMismatch
         }
     }
 
@@ -337,10 +344,13 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         "cache-limit-bytes")
     let wiredLimitBytes = try flags.optionalStrictInt(
         "wired-limit-bytes")
+    let modelTokenizerSHA256 = try flags.strictString(
+        "model-tokenizer-sha256", default: "")
     let qualificationFlagsSupplied = !runnerManifestSHA256.isEmpty
         || matrixBlockIndex != nil || matrixRunPosition != nil
         || matrixCellCount != nil || memoryLimitBytes != nil
         || cacheLimitBytes != nil || wiredLimitBytes != nil
+        || !modelTokenizerSHA256.isEmpty
     guard qualificationEvidence || !qualificationFlagsSupplied else {
         throw BenchCLIError.qualificationFlagsWithoutQualification
     }
@@ -367,6 +377,10 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
             throw BenchCLIError.missingQualificationFlag(
                 "runner-manifest-sha256")
         }
+        guard !modelTokenizerSHA256.isEmpty else {
+            throw BenchCLIError.missingQualificationFlag(
+                "model-tokenizer-sha256")
+        }
         qualificationContext = try BenchQualificationContext(
             runnerManifestSHA256: runnerManifestSHA256,
             matrixBlockIndex: try required(
@@ -381,6 +395,7 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
                 cacheLimitBytes, flag: "cache-limit-bytes"),
             wiredLimitBytes: try required(
                 wiredLimitBytes, flag: "wired-limit-bytes"),
+            tokenizerSHA256: modelTokenizerSHA256,
             cacheResetPolicy: .inPlaceBeforeEveryGeneration,
             modelResidencyPolicy: .loadOncePerProcess,
             processIsolationPolicy: .freshProcessPerMatrixPosition)

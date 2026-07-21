@@ -11,11 +11,14 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       context: qualificationContext(),
       runs: [try environmentRun()])
 
-    XCTAssertEqual(evidence.schemaVersion, 1)
+    XCTAssertEqual(evidence.schemaVersion, 2)
     XCTAssertEqual(evidence.context.matrixBlockIndex, 2)
     XCTAssertEqual(evidence.context.matrixRunPosition, 3)
     XCTAssertEqual(evidence.context.matrixCellCount, 7)
     XCTAssertEqual(evidence.context.runnerManifestSHA256, manifestSHA256)
+    XCTAssertEqual(
+      evidence.context.tokenizerSHA256,
+      String(repeating: "b", count: 64))
     XCTAssertEqual(
       evidence.context.cacheResetPolicy,
       .inPlaceBeforeEveryGeneration)
@@ -54,6 +57,13 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       XCTAssertEqual(
         $0 as? BenchQualificationEvidenceError,
         .invalidRunnerManifestSHA256)
+    }
+    XCTAssertThrowsError(
+      try qualificationContext(tokenizerSHA256: "not-a-digest")
+    ) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidTokenizerSHA256)
     }
     XCTAssertThrowsError(
       try qualificationContext(
@@ -168,7 +178,8 @@ final class BenchQualificationEvidenceTests: XCTestCase {
     matrixCellCount: Int = 7,
     memoryLimitBytes: Int = 9_000,
     cacheLimitBytes: Int = 8_000,
-    wiredLimitBytes: Int = 10_000
+    wiredLimitBytes: Int = 10_000,
+    tokenizerSHA256: String = String(repeating: "b", count: 64)
   ) throws -> BenchQualificationContext {
     try BenchQualificationContext(
       runnerManifestSHA256: runnerManifestSHA256 ?? manifestSHA256,
@@ -178,6 +189,7 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       memoryLimitBytes: memoryLimitBytes,
       cacheLimitBytes: cacheLimitBytes,
       wiredLimitBytes: wiredLimitBytes,
+      tokenizerSHA256: tokenizerSHA256,
       cacheResetPolicy: .inPlaceBeforeEveryGeneration,
       modelResidencyPolicy: .loadOncePerProcess,
       processIsolationPolicy: .freshProcessPerMatrixPosition)

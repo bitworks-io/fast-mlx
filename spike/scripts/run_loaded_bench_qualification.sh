@@ -70,6 +70,7 @@ jq -e '
   (.modelPath | type == "string" and length > 0) and
   (.modelConfigHash | type == "string" and test("^[0-9a-f]{16}$")) and
   (.modelCheckpointManifestHash | identity) and
+  (.modelTokenizerSHA256 | sha256) and
   (.promptRepeat | integer and . >= 1 and . <= 4096) and
   (.maxTokens | integer and . >= 1 and . <= 1048576) and
   (.memoryLimitBytes | integer and . >= 1) and
@@ -131,6 +132,7 @@ WORKLOAD_NONCE="$(jq -r '.workloadNonce' "$MANIFEST")"
 MODEL_PATH="$(jq -r '.modelPath' "$MANIFEST")"
 MODEL_CONFIG_HASH="$(jq -r '.modelConfigHash' "$MANIFEST")"
 MODEL_MANIFEST_HASH="$(jq -r '.modelCheckpointManifestHash' "$MANIFEST")"
+MODEL_TOKENIZER_SHA="$(jq -r '.modelTokenizerSHA256' "$MANIFEST")"
 PROMPT_REPEAT="$(jq -r '.promptRepeat' "$MANIFEST")"
 MAX_TOKENS="$(jq -r '.maxTokens' "$MANIFEST")"
 MEMORY_LIMIT="$(jq -r '.memoryLimitBytes' "$MANIFEST")"
@@ -322,6 +324,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --memory-limit-bytes "$MEMORY_LIMIT"
             --cache-limit-bytes "$CACHE_LIMIT"
             --wired-limit-bytes "$WIRED_LIMIT"
+            --model-tokenizer-sha256 "$MODEL_TOKENIZER_SHA"
             --evidence "$evidence"
         )
         if [[ -n "$attention" ]]; then
@@ -403,6 +406,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --arg tier "$kv_quant" --arg manifest "$MANIFEST_SHA" \
             --arg modelPath "$MODEL_PATH" --arg modelConfigHash "$MODEL_CONFIG_HASH" \
             --arg modelManifestHash "$MODEL_MANIFEST_HASH" \
+            --arg modelTokenizerSHA "$MODEL_TOKENIZER_SHA" \
             --arg attention "$attention" --arg expectedObserved "$expected_observed" \
             --arg checkpointSHA "$checkpoint_sha" \
             --arg scheduleBundleSHA "$schedule_bundle_sha" \
@@ -447,7 +451,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 .payload.memoryRuns[0].summary.maxMLXCacheBytes and
               .payload.maxMLXPeakBytes ==
                 .payload.memoryRuns[0].summary.maxMLXPeakBytes and
-              .payload.qualification.schemaVersion == 1 and
+              .payload.qualification.schemaVersion == 2 and
               .payload.qualification.context.runnerManifestSHA256 == $manifest and
               .payload.qualification.context.matrixBlockIndex == $block and
               .payload.qualification.context.matrixRunPosition == $position and
@@ -455,6 +459,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
               .payload.qualification.context.memoryLimitBytes == $memory and
               .payload.qualification.context.cacheLimitBytes == $cache and
               .payload.qualification.context.wiredLimitBytes == $wired and
+              .payload.qualification.context.tokenizerSHA256 == $modelTokenizerSHA and
               .payload.qualification.context.cacheResetPolicy == "in-place-before-every-generation" and
               .payload.qualification.context.modelResidencyPolicy == "load-once-per-process" and
               .payload.qualification.context.processIsolationPolicy == "fresh-process-per-matrix-position" and
@@ -495,8 +500,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                    type == "string" and test("^[0-9a-f]{64}$")) and
                  .payload.compressedKVAttention.admission.checkpointManifestHash == $modelManifestHash and
                  .payload.compressedKVAttention.admission.checkpointContentSHA256 == $checkpointSHA and
-                 (.payload.compressedKVAttention.admission.tokenizerSHA256 |
-                   type == "string" and test("^[0-9a-f]{64}$")) and
+                 .payload.compressedKVAttention.admission.tokenizerSHA256 == $modelTokenizerSHA and
                  .payload.compressedKVAttention.admission.layerCount > 0 and
                  .payload.compressedKVAttention.admission.queryHeadCount > 0 and
                  .payload.compressedKVAttention.admission.kvHeadCount > 0 and
@@ -514,8 +518,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                    .payload.compressedKVAttention.admission.modelConfigSHA256 and
                  .payload.kvtunerSchedule.checkpointManifestHash == $modelManifestHash and
                  .payload.kvtunerSchedule.checkpointContentSHA256 == $checkpointSHA and
-                 .payload.kvtunerSchedule.tokenizerSHA256 ==
-                   .payload.compressedKVAttention.admission.tokenizerSHA256 and
+                 .payload.kvtunerSchedule.tokenizerSHA256 == $modelTokenizerSHA and
                  .payload.kvtunerSchedule.groupSize > 0 and
                  (.payload.kvtunerSchedule.layers | type == "array" and length ==
                    .payload.compressedKVAttention.admission.layerCount) end)

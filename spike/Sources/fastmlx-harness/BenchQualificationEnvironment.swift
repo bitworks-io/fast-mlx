@@ -35,6 +35,7 @@ enum BenchQualificationRuntimeError:
 struct BenchQualificationModelIdentity: Equatable {
     let configHash: String
     let checkpointManifestHash: String
+    let tokenizerSHA256: String
 }
 
 func benchQualificationModelIdentity(
@@ -47,7 +48,18 @@ func benchQualificationModelIdentity(
     return try BenchQualificationModelIdentity(
         configHash: configHash,
         checkpointManifestHash:
-            ProvenanceCLI.checkpointManifestHash(at: modelPath))
+            ProvenanceCLI.checkpointManifestHash(at: modelPath),
+        tokenizerSHA256:
+            ProvenanceCLI.tokenizerManifestSHA256(at: modelPath))
+}
+
+func validateBenchQualificationModelIdentity(
+    _ identity: BenchQualificationModelIdentity,
+    context: BenchQualificationContext
+) throws {
+    guard identity.tokenizerSHA256 == context.tokenizerSHA256 else {
+        throw BenchQualificationRuntimeError.modelIdentityChanged
+    }
 }
 
 /// Apply and read back the fixed MLX limits before tokenizer/model allocation. The wired limit is

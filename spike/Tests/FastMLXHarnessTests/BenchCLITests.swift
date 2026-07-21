@@ -6,6 +6,7 @@ import XCTest
 final class BenchCLITests: XCTestCase {
     private let checkpointContentSHA256 = String(repeating: "d", count: 64)
     private let runnerManifestSHA256 = String(repeating: "e", count: 64)
+    private let modelTokenizerSHA256 = String(repeating: "f", count: 64)
     private let kvtunerArguments = [
         "--model", "/models/Qwen3-32B-4bit",
         "--kv-quant", "kvtuner-g128-b3.046875",
@@ -77,6 +78,7 @@ final class BenchCLITests: XCTestCase {
             "--memory-limit-bytes", "9000",
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
         ]))
 
         XCTAssertEqual(
@@ -89,6 +91,7 @@ final class BenchCLITests: XCTestCase {
                 memoryLimitBytes: 9_000,
                 cacheLimitBytes: 8_000,
                 wiredLimitBytes: 10_000,
+                tokenizerSHA256: modelTokenizerSHA256,
                 cacheResetPolicy: .inPlaceBeforeEveryGeneration,
                 modelResidencyPolicy: .loadOncePerProcess,
                 processIsolationPolicy: .freshProcessPerMatrixPosition))
@@ -108,6 +111,7 @@ final class BenchCLITests: XCTestCase {
             "--memory-limit-bytes", "9000",
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
         ]
 
         XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
@@ -118,6 +122,18 @@ final class BenchCLITests: XCTestCase {
         XCTAssertThrowsError(try parseBenchPlan(Flags(
             base + ["--runs", "1", "--wired-limit-bytes", ""]
         )))
+        let tokenizerFlagIndex = base.firstIndex(
+            of: "--model-tokenizer-sha256")!
+        var missingTokenizer = base
+        missingTokenizer.removeSubrange(
+            tokenizerFlagIndex ... tokenizerFlagIndex + 1)
+        XCTAssertThrowsError(try parseBenchPlan(Flags(
+            missingTokenizer + ["--runs", "1"]
+        ))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .missingQualificationFlag("model-tokenizer-sha256"))
+        }
         XCTAssertThrowsError(try parseBenchPlan(Flags([
             "--model", "/models/Qwen3-32B-4bit",
             "--runner-manifest-sha256", runnerManifestSHA256,
@@ -140,6 +156,7 @@ final class BenchCLITests: XCTestCase {
             "--memory-limit-bytes", "9000",
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
         ]
         XCTAssertThrowsError(try parseBenchPlan(Flags(settings))) {
             XCTAssertEqual($0 as? BenchCLIError, .missingMatrixID)
@@ -765,6 +782,29 @@ final class BenchCLITests: XCTestCase {
                 JSONSerialization.data(withJSONObject: row)))
     }
 
+    func testTypedQualificationValidatorRejectsTokenizerIdentityMismatch()
+        throws
+    {
+        var row = try qualificationValidationRow()
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        var qualification = try XCTUnwrap(
+            payload["qualification"] as? [String: Any])
+        var context = try XCTUnwrap(
+            qualification["context"] as? [String: Any])
+        context["tokenizerSHA256"] = String(repeating: "f", count: 64)
+        qualification["context"] = context
+        payload["qualification"] = qualification
+        row["payload"] = payload
+
+        XCTAssertThrowsError(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .tokenizerIdentityMismatch)
+        }
+    }
+
     private func qualificationValidationRow(
         kvQuantTier: String = "affine-k4v2-g64"
     ) throws -> [String: Any] {
@@ -790,6 +830,7 @@ final class BenchCLITests: XCTestCase {
                 memoryLimitBytes: 9_000,
                 cacheLimitBytes: 8_000,
                 wiredLimitBytes: 10_000,
+                tokenizerSHA256: admission.tokenizerSHA256,
                 cacheResetPolicy: .inPlaceBeforeEveryGeneration,
                 modelResidencyPolicy: .loadOncePerProcess,
                 processIsolationPolicy: .freshProcessPerMatrixPosition),

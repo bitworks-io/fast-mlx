@@ -662,7 +662,11 @@ func runBench(_ flags: Flags) async {
             _ in try benchQualificationModelIdentity(
                 modelPath: plan.modelPath)
         }
-        if let qualificationContext = plan.qualificationContext {
+        if let qualificationContext = plan.qualificationContext,
+            let qualificationModelIdentity
+        {
+            try validateBenchQualificationModelIdentity(
+                qualificationModelIdentity, context: qualificationContext)
             try configureBenchQualificationMemory(qualificationContext)
         }
         let preparedKVTuner: PreparedKVTunerRun?
@@ -1754,6 +1758,7 @@ struct Harness {
                  [--matrix-cell-count <N>]          plus explicit MLX/wired
                  [--memory-limit-bytes <N>]          limits; intended for the checked-in runner
                  [--cache-limit-bytes <N>] [--wired-limit-bytes <N>]
+                 [--model-tokenizer-sha256 <SHA256>] frozen tokenizer file-manifest identity
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled

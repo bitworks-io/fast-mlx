@@ -170,6 +170,7 @@ public struct BenchMemoryAggregate: Sendable, Equatable {
 
 public enum BenchQualificationEvidenceError: Error, Sendable, Equatable {
     case invalidRunnerManifestSHA256
+    case invalidTokenizerSHA256
     case invalidMatrixPosition
     case invalidMemorySettings
     case invalidMonotonicTiming
@@ -214,6 +215,7 @@ public struct BenchQualificationContext: Codable, Sendable, Equatable {
     public let memoryLimitBytes: Int
     public let cacheLimitBytes: Int
     public let wiredLimitBytes: Int
+    public let tokenizerSHA256: String
     public let cacheResetPolicy: BenchQualificationCacheResetPolicy
     public let modelResidencyPolicy: BenchQualificationModelResidencyPolicy
     public let processIsolationPolicy: BenchQualificationProcessIsolationPolicy
@@ -226,6 +228,7 @@ public struct BenchQualificationContext: Codable, Sendable, Equatable {
         memoryLimitBytes: Int,
         cacheLimitBytes: Int,
         wiredLimitBytes: Int,
+        tokenizerSHA256: String,
         cacheResetPolicy: BenchQualificationCacheResetPolicy,
         modelResidencyPolicy: BenchQualificationModelResidencyPolicy,
         processIsolationPolicy: BenchQualificationProcessIsolationPolicy
@@ -237,6 +240,7 @@ public struct BenchQualificationContext: Codable, Sendable, Equatable {
         self.memoryLimitBytes = memoryLimitBytes
         self.cacheLimitBytes = cacheLimitBytes
         self.wiredLimitBytes = wiredLimitBytes
+        self.tokenizerSHA256 = tokenizerSHA256
         self.cacheResetPolicy = cacheResetPolicy
         self.modelResidencyPolicy = modelResidencyPolicy
         self.processIsolationPolicy = processIsolationPolicy
@@ -247,6 +251,9 @@ public struct BenchQualificationContext: Codable, Sendable, Equatable {
         guard Self.isLowercaseSHA256(runnerManifestSHA256) else {
             throw BenchQualificationEvidenceError
                 .invalidRunnerManifestSHA256
+        }
+        guard Self.isLowercaseSHA256(tokenizerSHA256) else {
+            throw BenchQualificationEvidenceError.invalidTokenizerSHA256
         }
         guard matrixBlockIndex >= 0, matrixCellCount > 0,
             (0 ..< matrixCellCount).contains(matrixRunPosition)
@@ -344,7 +351,7 @@ public struct BenchQualificationRunEnvironment:
 /// is allowed per process: cross-cell counterbalancing and the required three-or-more repetitions
 /// happen at the isolated matrix-runner boundary, preventing allocator history from being shared.
 public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     public let context: BenchQualificationContext
