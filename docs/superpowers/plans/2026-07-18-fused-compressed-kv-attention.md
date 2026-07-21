@@ -371,15 +371,50 @@ held-lock wrapper has SHA-256
 failed closed before starting a harness because the crashed wrapper had removed the empty lock
 artifact; that attempt is preserved at SHA-256
 `81deb8fe369e4d575cf4b9663cc072a946c3a3bf02c7505e6ba42ddf51703efc`. Attempt 2 recreated the lock
-artifact, acquired it, and started ordinal 5. Promotion remains blocked until all 64 candidates and
-the final exact-set/search/bundle validation pass.
-
-A permanent runner fix must be TDD'd after this source-locked cohort completes. It should make the
-process-lifetime boundary explicit rather than treating decoder reset as proof that process memory
-cannot accumulate.
+artifact, acquired it, and completed the remaining ordinals through one fresh harness process per
+candidate. The final exact-set/search/bundle validation passed for all 64 candidates and froze the
+schedule and qualification-bundle hashes above. Subsequent loaded qualification keeps the
+process-lifetime boundary explicit with one fresh harness process per matrix position; decoder or
+cache reset is never treated as proof that process-level MLX allocations were released.
 
 The historical KVarN-cycle bundle remains immutable evidence for its dated verdict. It is not
 rewritten or silently upgraded and cannot authorize the new runtime path.
+
+### Loaded-Qwen thermal admission recovery — 2026-07-21
+
+Loaded Qwen exposed a benchmark-cohort problem rather than a kernel correctness failure. The first
+7-cell matrix, v7, stopped after three authenticated rows when its block crossed from nominal to
+fair at direct KVarN. The v8 materialize-only and v9 direct-only workload preconditions each
+completed three authenticated rows but remained stable nominal, so their fair-only launchers
+correctly refused to admit a matrix. These terminal boundaries are preserved unchanged and are not
+promotion evidence. Workload-only preheating is closed; per-run or cross-row thermal equality was
+not weakened.
+
+Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` implements the narrower causal contract:
+
+- qualification manifests require post-warmup target `nominal`, a bounded timeout, and poll
+  interval; the current Qwen matrix freezes 600 seconds and 1,000 ms;
+- the dropped warmup now has an authenticated before/after receipt and may move only between safe
+  nominal/fair states on AC power with Low Power Mode off;
+- after warmup, the harness waits for an exact nominal admission snapshot before retained work;
+  serious, critical, unknown, power drift, malformed timestamps, timeout, or retained drift fail
+  closed;
+- evidence schema v3 binds policy, warmup, admission, retained timestamps, and the manifest
+  timeout, while historical schema-v2 rows remain readable and cannot claim the new contract;
+- the loaded runner passes the frozen policy to every child and reauthenticates it in row, receipt,
+  progress, block, and completion artifacts.
+
+Fresh proof passes 506 HarnessCore XCTest plus 17 Swift Testing tests off-box, 93
+FastMLXHarnessTests and 155 SpikeCoreTests through Xcode on the bench, the Xcode Release build,
+focused re-review, shellcheck, diff/banned-pattern checks, and gitleaks. The clean Xcode binary
+SHA-256 is `19f66d67d689fc3e6dc8e8a158b97224a4f76fe890cefb63cedc08c7b1450ec4`; runner SHA-256 is
+`ff429bdc4fefd380c1dbcbbef936701879b91e43abb90af7966dc6c1b005d4b3`.
+
+The fresh v10 Qwen 8K matrix uses the unchanged 7-cell and 7-block cyclic Latin square under
+manifest SHA-256 `353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`.
+It is the only active loaded-Qwen qualification boundary. Completion still requires all 49 exact
+rows and receipts, seven stable blocks, independently rederived hashes, and the original direct
+decode/prefill gates; this thermal repair itself makes no speed claim.
 
 ### Phase 4 — end-to-end Qwen frontier
 

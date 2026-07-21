@@ -415,3 +415,31 @@ implementation packet.
 **Coverage boundary:** the full acceptance suites above were rerun without coverage instrumentation.
 The prior Phase 0 coverage packet remains historical evidence; this packet does not claim a new
 line-coverage percentage.
+
+## Loaded qualification post-warmup thermal admission — 2026-07-21
+
+**Story:** a bench operator can compare loaded-model cells only when every retained row begins
+from the same manifest-bound unthrottled host cohort, without discarding the warmup that caused the
+thermal transition or weakening per-run and cross-row equality.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Failed preheat boundaries remain immutable | **PASS** | Qwen v7 is terminal `INVALID_BLOCK_ENVIRONMENT`; v8 materialize and v9 direct are terminal `PRECONDITION_NOT_FAIR`. The v9 runner completed three authenticated direct-KVarN rows with completion SHA-256 `db82657686a438d1d63836acdd79c12cea5f4b03bcf750ab275143919d03336a` and receipt-set SHA-256 `fb9703b8155b294ccced6d8719c0038e0a858e5c36985a8b35a34f07c2881a41`; all three environments were identical nominal/AC/non-low-power. No v9 matrix or admission artifact exists. |
+| Warmup and admission are explicit | **PASS** | Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` records warmup before/after and the exact post-warmup admission snapshot. Qualification accepts retained work only at manifest-bound nominal/AC/non-low-power; unsafe/unknown thermal state, power drift, invalid timestamps, missing evidence, and timeout fail closed. |
+| Policy and timing are authenticated end to end | **PASS** | Manifest schema v2 requires target, timeout, and poll. Evidence schema v3 binds policy, warmup, admission, retained order, and admission delay within timeout. CLI, runner row validation, progress, receipts, block completion, and matrix completion carry the same policy. Historical evidence schema v2 remains readable but cannot claim the new contract. |
+| Clean-SHA automated proof | **PASS** | Off-box `swift test --package-path spike --filter HarnessCoreTests` passes 506 XCTest plus 17 Swift Testing tests. On the synced clean SHA, Xcode with `-skipPackagePluginValidation` passes 93/93 `FastMLXHarnessTests` and 155/155 `SpikeCoreTests`; the Release build succeeds. The pure log SHA-256 is `5915906266f1c2c7a08ec3a9e8e6c36d0d0b85c88affcc5a15cd2e6d8177399a`. The Xcode binary SHA-256 is `19f66d67d689fc3e6dc8e8a158b97224a4f76fe890cefb63cedc08c7b1450ec4`; runner SHA-256 is `ff429bdc4fefd380c1dbcbbef936701879b91e43abb90af7966dc6c1b005d4b3`. |
+| Review and repository safety | **PASS** | Failing-first tests caught missing schema/CLI plumbing, unbounded admission delay, runner timeout mismatch, and non-divisible polling overshoot. Focused re-review reports no issue. Shell syntax, shellcheck, diff checks, banned concurrency/machine-path scans, and commit-scoped gitleaks pass. |
+| Loaded Qwen 8K speed adjudication | **PENDING** | The fresh 49-row v10 matrix is running under manifest SHA-256 `353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`, unchanged cells SHA-256 `7db3e38b473bcfa746c2b8bc801f121b51b74eba895a793e6a2f1d2f232863c7`, and blocks SHA-256 `4870adbcfc2bb8f97aa8a124ea530f3f3ca94c185745bf23a8638d8af0df77fd`. No speed tier is promoted until all rows, receipts, blocks, environments, and direct-vs-materialize/fp16 gates pass. |
+
+**Verification artifact note:** the Xcode tests and Release build succeeded. Their first evidence
+wrapper assumed a SwiftPM product path after the Xcode build; a second receipt command then left a
+zero-byte placeholder when its shell envelope failed. Both failures are preserved. The final
+`COMPLETE_WITH_ARTIFACT_FINALIZATION_RECOVERY` record only hashes the already-built Xcode product
+and reruns no test or build; recovery-record SHA-256 is
+`696c9793ad7848fb70ef7bc70755c8ff2533121d83a236232b5f5ba2e090f37d`.
+The code commit's intended co-author line was written with literal escaped separators, so Git does
+not parse it as a trailer. That evidence-bound SHA is deliberately not rewritten while v10 runs;
+this documentation commit carries the correctly parsed trailer and records the exception.
+
+**Overall verdict:** the post-warmup nominal admission contract passes implementation and clean-SHA
+verification. Loaded Qwen performance promotion remains pending the complete v10 matrix.

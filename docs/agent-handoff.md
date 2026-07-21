@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-19
+Last reviewed: 2026-07-21
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -47,61 +47,41 @@ Shelved/rejected cells remain model-specific controls. This is Qwen3-32B-4bit ev
 frozen KVTuner schedule is Qwen-only unless independently calibrated and authenticated for another
 family.
 
-**Compressed-attention implementation Phases 1-3 — VERIFIED, NOT PROMOTED (2026-07-19):**
-clean `5e6abb6ebf13ea8641b26638278680e99884adea` now contains the portable packed-affine
-attention router, actor-confined affine/frozen-KVTuner scalar runtime, exact storage/workspace
-telemetry, and hostile-compaction-safe compressed continuous batching. The batch implementation
-tracks physical written end independently from surviving logical offsets and covers unequal-row
-merge, longest/zero-padding-boundary removal, append, mask width, survivor packed bytes/logits,
-and dense-control parity. The same change binds KVTuner config, checkpoint content, tokenizer,
-calibration, sensitivity, candidates, search, schedule, runtime, task, and KL evidence by exact
-content. Consequently, the historical KVarN-cycle bundle remains valid only for that dated verdict
-and cannot authorize the new runtime; a fresh qualification bundle is required. KVarN i8 direct
-packed attention and loaded-model Qwen/Llama frontiers remain open, so there is no new speed tier.
-Clean `3bb0a2a43fba9690dfaab86cb302a746c9556ef9` adds only the durable direct-KVarN
-request/receipt and promotion-evidence contract: exact K4V2/G128/i8 evidence can describe zero
-materialization plus positive attention workspace, while task/KL promotion fails closed until task
-evidence can authenticate the same route. The CLI/MLX runtime remains deliberately unimplemented
-and its pending red tests must run through Xcode on an available bench before production code.
+**Compressed-attention loaded qualification — ACTIVE, NOT PROMOTED (2026-07-21):** the portable
+affine/KVTuner router, direct KVarN K4V2/G128/i8 runtime, and hostile-compaction-safe continuous
+batching are implemented and verified. Clean `cf3248b594da4bfced428347c89b833d928b243b` repaired
+mixed bf16/fp32 KVarN ingress telemetry; its loaded-Qwen smoke completed 3/3 with 64 engaged layers,
+zero materialization, and authenticated receipts. Qwen 8K v7 is terminal
+`INVALID_BLOCK_ENVIRONMENT`; v8 materialize and v9 direct preconditions are terminal
+`PRECONDITION_NOT_FAIR`. Preserve all three boundaries: they proved workload-only preheating could
+not create a stable fair cohort and must not be resumed or promoted.
+
+Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` now records the dropped warmup and requires a
+bounded post-warmup nominal/AC/non-low-power admission before every retained qualification row.
+The schema-v2 runner manifest binds a 600-second timeout and 1,000-ms poll; evidence schema v3
+binds warmup, admission, retained timestamps, and the unchanged cross-row environment contract,
+while historical evidence schema v2 remains readable. The fresh 7-cell x 7-block Qwen 8K v10
+matrix is active under manifest SHA-256
+`353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`. It is the only active
+loaded qualification boundary. No speed tier exists until all 49 rows authenticate and pass the
+same-storage/fp16 speed and prefill gates.
 
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Carry forward KVarN i8 plus
-   shared affine/KVTuner storage primitives. The current probe is checkpoint-authenticated,
-   config-constrained synthetic geometry evidence: it streams checkpoint bytes for content
-   authentication but does not instantiate or execute them as MLX model tensors, so it cannot prove
-   model-specific runtime/dial performance. Qualify Qwen3-32B at 8K smoke/32K only and record an
-   authenticated 128K refusal because its max context is 40,960. Qualify the staged
-   Llama-3.3-70B-Instruct-4bit checkpoint at 8K smoke/32K/near-128K only when prompt+output <=
-   131,072. Phase 0 should use Llama only for the near-128K synthetic geometry (plus an optional
-   identity canary), because repeating the full Q64/KV8/D128 synthetic matrix under both IDs is not
-   independent family evidence.
-   Both selected models share Q64/KV8/D128, so they do not prove cross-geometry generality. Prove
-   valid end-to-end behavior and the batch-compaction poison case before any speed claim. Add
-   another popular model with materially different attention geometry before broad/default support.
-   Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`; implementation
-   Phases 1-3 are clean and verified at `5e6abb6ebf13ea8641b26638278680e99884adea` for the
-   packed-affine/KVTuner route. The active gates are (a) fresh exact-content KVTuner qualification,
-   because legacy schedule evidence now fails closed, (b) KVarN i8 direct packed attention, and
-   then (c) loaded-model Qwen/Llama end-to-end qualification. The new qualification run is rooted
-   by artifact ID `fused-compressed-kv-qwen3-32b-v1-5e6abb6`; its schema-v2 manifest SHA-256 is
-   `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f`; its schema-v3 g128
-   sensitivity SHA-256 is `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc`.
-   The original same-process candidate runner published and authenticated ordinals 0...4 before
-   macOS killed it for `no paging space` at 153,803 MB compressed memory. Failure artifact SHA-256:
-   `48ce0f5f76748e08711dc571084f2eec1aaf2f6884a038ab42f7bcbb4f1fe655`; kernel excerpt SHA-256:
-   `0d12fa549850e3ab2d30df8426a4d088ef8e7e80cfcc009e9af848f83e888abe`. This is an infrastructure
-   lifetime failure, not a quality verdict. The exact source-locked recovery runs each remaining
-   ordinal in a fresh process under held lock, reusing the same Release binary, manifest,
-   sensitivity, model, and exact-byte/idempotent artifact validation. Wrapper SHA-256:
-   `427b7c3a0378ec6e878348be5fde15956f7891037b9ffeaaf2981c3bfc134765`. Attempt 2 is active from
-   ordinal 5; do not rebuild, resync, duplicate, search, bundle, or promote until all 64 candidates
-   pass the exact-set gate. The permanent runner fix must make the process-lifetime boundary
-   explicit after this cohort. Neither the Phase 0 synthetic timings nor the implementation tests
-   are model, prefill, end-to-end, family-generalization, or dial results.
+1. **Fused compressed-domain KV attention** — current top engine gate. Monitor only the fresh Qwen
+   8K v10 matrix described above; never duplicate it. On completion independently authenticate 49
+   rows/receipts, seven blocks, exact source/binary/runner/model/tokenizer/checkpoint/KVTuner/policy
+   bindings, and a nominal/AC/non-low-power retained environment for every row. A direct path must
+   beat both same-storage materialize and fp16 decode by at least 5%, with prefill regression within
+   5%; preserve dominated and failed cells. Then run Qwen 32K, record the authenticated 128K refusal
+   (maximum context 40,960), and qualify source-locked Llama-3.3-70B at 8K/32K/near-128K without the
+   Qwen-specific KVTuner schedule unless independently calibrated. Both first families share
+   Q64/KV8/D128; add a popular materially different geometry before any broad/default support
+   claim. Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial
+   tier.
    [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
