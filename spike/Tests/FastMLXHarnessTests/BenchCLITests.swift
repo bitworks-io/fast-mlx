@@ -570,6 +570,63 @@ final class BenchCLITests: XCTestCase {
             requestedCompressedKVAttention: .splitKVarNQuantizedMM))
     }
 
+    func testBenchEngagementAuthenticatesKVarNIngressNormalization() throws {
+        let normalized = EngagementCounters([
+            "kvarn_tokens": 256,
+            "kvarn_completed_tiles": 1,
+            "kvarn_compressed_tokens": 128,
+            "kvarn_codec_iterations": 8,
+            "kvarn_layers": 64,
+            "kvarn_capacity_tokens": 512,
+            "kvarn_payload_bytes": 1_000,
+            "kvarn_metadata_bytes": 100,
+            "kvarn_control_bytes": 256,
+            "kvarn_workspace_bytes": 328,
+            "kvarn_materialization_bytes": 0,
+            "kvarn_normalization_workspace_bytes": 128,
+            "kvarn_attention_workspace_bytes": 200,
+            "kvarn_attention_split": 1,
+            "kvarn_attention_materialized": 0,
+            "kvarn_source_key_float16": 0,
+            "kvarn_source_key_bfloat16": 0,
+            "kvarn_source_key_float32": 1,
+            "kvarn_source_value_float16": 0,
+            "kvarn_source_value_bfloat16": 0,
+            "kvarn_source_value_float32": 1,
+            "kvarn_storage_key_float16": 0,
+            "kvarn_storage_key_bfloat16": 1,
+            "kvarn_storage_key_float32": 0,
+            "kvarn_storage_value_float16": 0,
+            "kvarn_storage_value_bfloat16": 1,
+            "kvarn_storage_value_float32": 0,
+            "kvarn_ingress_normalized": 1,
+        ])
+
+        XCTAssertNoThrow(try validateBenchRuntimeEngagement(
+            tier: "kvarn-k4v2-g128",
+            engagement: normalized,
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitKVarNQuantizedMM,
+            expectedKVarNStorageDType: .bfloat16))
+
+        for mutation in [
+            ("kvarn_storage_key_bfloat16", 0),
+            ("kvarn_storage_value_float16", 1),
+            ("kvarn_ingress_normalized", 0),
+            ("kvarn_normalization_workspace_bytes", 0),
+            ("kvarn_workspace_bytes", 200),
+        ] {
+            var invalid = normalized.counts
+            invalid[mutation.0] = mutation.1
+            XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+                tier: "kvarn-k4v2-g128",
+                engagement: .init(invalid),
+                expectedKVTunerLayerCount: nil,
+                requestedCompressedKVAttention: .splitKVarNQuantizedMM,
+                expectedKVarNStorageDType: .bfloat16))
+        }
+    }
+
     func testBenchCompressedAttentionWorkspaceMustFitRawMLXPeakReceipt() throws {
         let splitCounts = EngagementCounters([
             "affine_workspace_bytes": 256,
@@ -820,11 +877,51 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
+    func testTypedQualificationValidatorReauthenticatesKVarNDTypeReceipt()
+        throws
+    {
+        let valid = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        XCTAssertNoThrow(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: valid)))
+
+        var forged = valid
+        var payload = try XCTUnwrap(forged["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement.removeValue(forKey: "kvarn_storage_key_bfloat16")
+        payload["engagementMax"] = engagement
+        forged["payload"] = payload
+
+        XCTAssertThrowsError(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: forged)))
+
+        var impossibleTransition = valid
+        payload = try XCTUnwrap(
+            impossibleTransition["payload"] as? [String: Any])
+        engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        for role in ["key", "value"] {
+            engagement["kvarn_source_\(role)_float16"] = 1
+            engagement["kvarn_source_\(role)_float32"] = 0
+        }
+        payload["engagementMax"] = engagement
+        impossibleTransition["payload"] = payload
+
+        XCTAssertThrowsError(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: impossibleTransition)))
+    }
+
     private func qualificationValidationRow(
         kvQuantTier: String = "affine-k4v2-g64"
     ) throws -> [String: Any] {
+        let isKVarN = kvQuantTier == "kvarn-k4v2-g128"
+        let nativeDTypeField = isKVarN
+            ? ",\"torch_dtype\":\"bfloat16\"" : ""
         let config = Data(
-            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":256,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+            """
+            {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":256,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false\(nativeDTypeField)}
+            """.utf8)
         let admission = try CompressedKVAttentionRuntimeAdmission.load(
             sourceSnapshot: .load(
                 exactModelConfigData: config,
@@ -833,8 +930,10 @@ final class BenchCLITests: XCTestCase {
                     repeating: "d", count: 64),
                 tokenizerSHA256: String(repeating: "4", count: 64)))
         let binding = try CompressedKVAttentionRuntimeBinding(
-            request: .splitAffineQuantizedMM,
-            observedOperation: .splitQuantizedMM,
+            request: isKVarN
+                ? .splitKVarNQuantizedMM : .splitAffineQuantizedMM,
+            observedOperation: isKVarN
+                ? .splitKVarNQuantizedMM : .splitQuantizedMM,
             admission: admission)
         let qualification = try BenchQualificationEvidence(
             context: BenchQualificationContext(
@@ -873,6 +972,52 @@ final class BenchCLITests: XCTestCase {
         let qualificationObject = try XCTUnwrap(
             JSONSerialization.jsonObject(
                 with: encoder.encode(qualification)) as? [String: Any])
+        var payload: [String: Any] = [
+            "label": "direct",
+            "workload": "decode",
+            "mode": "none",
+            "decodeTokS": 10.0,
+            "ttftMs": 1_000.0,
+            "quant": "int4",
+            "kvQuantTier": kvQuantTier,
+            "concurrency": 1,
+            "matrixID": "qualification-test-v1",
+            "cellID": kvQuantTier,
+            "compressedKVAttention": bindingObject,
+            "qualification": qualificationObject,
+        ]
+        if isKVarN {
+            payload["engagementMax"] = [
+                "kvarn_tokens": 256,
+                "kvarn_completed_tiles": 1,
+                "kvarn_compressed_tokens": 128,
+                "kvarn_codec_iterations": 8,
+                "kvarn_layers": 2,
+                "kvarn_capacity_tokens": 512,
+                "kvarn_payload_bytes": 1_000,
+                "kvarn_metadata_bytes": 100,
+                "kvarn_control_bytes": 256,
+                "kvarn_workspace_bytes": 328,
+                "kvarn_materialization_bytes": 0,
+                "kvarn_normalization_workspace_bytes": 128,
+                "kvarn_attention_workspace_bytes": 200,
+                "kvarn_attention_split": 1,
+                "kvarn_attention_materialized": 0,
+                "kvarn_source_key_float16": 0,
+                "kvarn_source_key_bfloat16": 0,
+                "kvarn_source_key_float32": 1,
+                "kvarn_source_value_float16": 0,
+                "kvarn_source_value_bfloat16": 0,
+                "kvarn_source_value_float32": 1,
+                "kvarn_storage_key_float16": 0,
+                "kvarn_storage_key_bfloat16": 1,
+                "kvarn_storage_key_float32": 0,
+                "kvarn_storage_value_float16": 0,
+                "kvarn_storage_value_bfloat16": 1,
+                "kvarn_storage_value_float32": 0,
+                "kvarn_ingress_normalized": 1,
+            ]
+        }
         return [
             "subcommand": "bench",
             "provenance": [
@@ -893,20 +1038,7 @@ final class BenchCLITests: XCTestCase {
                 "corpusContentHash": NSNull(),
                 "nonce": "qualification-test-v1",
             ],
-            "payload": [
-                "label": "direct",
-                "workload": "decode",
-                "mode": "none",
-                "decodeTokS": 10.0,
-                "ttftMs": 1_000.0,
-                "quant": "int4",
-                "kvQuantTier": kvQuantTier,
-                "concurrency": 1,
-                "matrixID": "qualification-test-v1",
-                "cellID": kvQuantTier,
-                "compressedKVAttention": bindingObject,
-                "qualification": qualificationObject,
-            ],
+            "payload": payload,
         ]
     }
 

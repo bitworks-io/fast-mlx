@@ -67,6 +67,20 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
 
         XCTAssertEqual(selection.kind, .kvarn(.k4v2G128I8))
         XCTAssertEqual(selection.kvarnAttentionMode, .splitQuantizedMM)
+        XCTAssertEqual(selection.kvarnStorageDType, .bfloat16)
+    }
+
+    func testKVarNRejectsMissingOrNon16BitAuthenticatedStorageDType() throws {
+        for nativeDType in [nil, "float32", "float8_e4m3fn"] {
+            let admission = try makeAdmission(modelNativeDType: nativeDType)
+            XCTAssertThrowsError(try resolveSwiftEngineCacheSelection(
+                config: RunConfig(
+                    kvQuant: "kvarn-k4v2-g128",
+                    compressedKVAttention: .splitKVarNQuantizedMM,
+                    compressedKVAttentionExpectedCheckpointContentSHA256:
+                        admission.checkpointContentSHA256),
+                compressedKVAttentionAdmission: admission))
+        }
     }
 
     func testKVTunerAlwaysBindsFrozenScheduleToLoadedSourceIdentity() throws {
@@ -136,13 +150,17 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
         layerCount: Int = 64,
         checkpointManifestHash: String = "0123456789abcdef",
         checkpointContentSHA256: String = String(repeating: "d", count: 64),
-        tokenizerSHA256: String = String(repeating: "a", count: 64)
+        tokenizerSHA256: String = String(repeating: "a", count: 64),
+        modelNativeDType: String? = "bfloat16"
     ) throws
         -> CompressedKVAttentionRuntimeAdmission
     {
+        let modelNativeDTypeField = modelNativeDType.map {
+            ",\"torch_dtype\":\"\($0)\""
+        } ?? ""
         let config = Data(
             """
-            {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":\(layerCount),"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}
+            {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":\(layerCount),"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false\(modelNativeDTypeField)}
             """.utf8)
         let snapshot = try CompressedKVAttentionRuntimeSourceSnapshot.load(
             exactModelConfigData: config,

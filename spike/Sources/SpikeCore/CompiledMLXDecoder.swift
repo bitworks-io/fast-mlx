@@ -24,6 +24,7 @@ public struct CompiledMLXDecoder: Decoder {
     private let kvCacheKind: KVCacheKind
     private let affineAttentionMode: AffineKVAttentionMode
     private let kvarnAttentionMode: KVarNKVAttentionMode
+    private let kvarnStorageDType: KVarNKVScalarDType?
     /// Escape hatch for cache implementations whose update ops fail to trace under
     /// `MLX.compile`: `false` runs the same step closure uncompiled (correctness path;
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
@@ -55,6 +56,7 @@ public struct CompiledMLXDecoder: Decoder {
         kvCache: KVCacheKind = .fp16,
         affineAttentionMode: AffineKVAttentionMode = .materialize,
         kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil,
         compileStep: Bool = true
     ) {
         let executionMode = kvCache.executionMode(
@@ -65,6 +67,7 @@ public struct CompiledMLXDecoder: Decoder {
         self.kvCacheKind = kvCache
         self.affineAttentionMode = affineAttentionMode
         self.kvarnAttentionMode = kvarnAttentionMode
+        self.kvarnStorageDType = kvarnStorageDType
         self.compileStepEnabled = executionMode == .compiled
         self.executionMode = executionMode
     }
@@ -96,7 +99,8 @@ public struct CompiledMLXDecoder: Decoder {
                     layerCount: layerCount,
                     capacity: cap,
                     affineAttentionMode: affineAttentionMode,
-                    kvarnAttentionMode: kvarnAttentionMode)
+                    kvarnAttentionMode: kvarnAttentionMode,
+                    kvarnStorageDType: kvarnStorageDType)
             } catch {
                 preconditionFailure(
                     "KV-cache policy does not match the loaded model: \(error)")
@@ -486,6 +490,11 @@ private extension KVarNKVCacheTelemetry {
             sequences: sequences,
             kvHeadCount: kvHeadCount,
             headDimension: headDimension,
+            sourceKeyDType: sourceKeyDType,
+            sourceValueDType: sourceValueDType,
+            storageKeyDType: storageKeyDType,
+            storageValueDType: storageValueDType,
+            ingressNormalizationApplied: ingressNormalizationApplied,
             metadataScalarBytes: metadataScalarBytes,
             payloadBytes: payloadBytes,
             metadataBytes: metadataBytes,
@@ -494,6 +503,7 @@ private extension KVarNKVCacheTelemetry {
             fp16TailBytes: fp16TailBytes,
             controlBytes: controlBytes,
             materializationWorkspaceBytes: materializationWorkspaceBytes,
+            normalizationWorkspaceBytes: normalizationWorkspaceBytes,
             attentionWorkspaceBytes: attentionWorkspaceBytes,
             workspaceBytes: workspaceBytes,
             attentionOperation: attentionOperation)

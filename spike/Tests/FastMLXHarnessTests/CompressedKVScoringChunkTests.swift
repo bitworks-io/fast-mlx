@@ -3,6 +3,7 @@ import MLXLMCommon
 import MLXNN
 import XCTest
 
+@testable import HarnessCore
 @testable import SpikeCore
 @testable import fastmlx_harness
 
@@ -11,6 +12,11 @@ private final class TinyScoringRouterModel:
 {
     let kvHeads = [1]
     private let vocabularySize = 32
+    private let kvDType: DType
+
+    init(kvDType: DType = .float16) {
+        self.kvDType = kvDType
+    }
 
     func prepare(
         _ input: LMInput, cache: [KVCache], windowSize: Int?
@@ -24,7 +30,7 @@ private final class TinyScoringRouterModel:
         guard let layerCache = cache?.first, cache?.count == 1 else {
             preconditionFailure("tiny scoring model requires one cache")
         }
-        let scalar = inputs.asType(.float16).reshaped([
+        let scalar = inputs.asType(kvDType).reshaped([
             inputs.dim(0), 1, inputs.dim(1), 1,
         ])
         let keys = broadcast(
@@ -118,6 +124,96 @@ final class CompressedKVScoringChunkTests: XCTestCase {
         XCTAssertEqual(direct?.attentionOperation, .splitQuantizedMM)
     }
 
+    func testKVarNScoringCarriesAuthenticatedBFloat16IngressReceipt()
+        async throws
+    {
+        let actor = HarnessEngineActor(
+            model: TinyScoringRouterModel(kvDType: .float32))
+        let prompt = (0..<256).map { ($0 % 31) + 1 }
+
+        let task = await actor.taskChoiceLogits(
+            prompt: prompt,
+            kvCache: .kvarn(.k4v2G128I8),
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .splitQuantizedMM,
+            kvarnStorageDType: .bfloat16)
+
+        XCTAssertEqual(
+            task.engagement.counts["scoring_kvarn_source_key_float32"], 1)
+        XCTAssertEqual(
+            task.engagement.counts["scoring_kvarn_source_value_float32"], 1)
+        XCTAssertEqual(
+            task.engagement.counts["scoring_kvarn_storage_key_bfloat16"], 1)
+        XCTAssertEqual(
+            task.engagement.counts["scoring_kvarn_storage_value_bfloat16"], 1)
+        XCTAssertEqual(
+            task.engagement.counts["scoring_kvarn_ingress_normalized"], 1)
+        XCTAssertGreaterThan(
+            task.engagement.counts[
+                "scoring_kvarn_normalization_workspace_bytes"] ?? 0,
+            0)
+    }
+
+    func testKVarNGenerateCarriesAuthenticatedBFloat16IngressReceipt()
+        async throws
+    {
+        let actor = HarnessEngineActor(
+            model: TinyScoringRouterModel(kvDType: .float32))
+        let admission = try makeKVarNAdmission(modelNativeDType: "bfloat16")
+        let driver = SwiftEngineDriver(
+            engine: actor,
+            eos: -1,
+            compressedKVAttentionAdmission: admission)
+        let prompt = (0..<256).map { ($0 % 31) + 1 }
+
+        let result = try await driver.generate(
+            prompt: prompt,
+            config: RunConfig(
+                maxTokens: 2,
+                kvQuant: "kvarn-k4v2-g128",
+                compressedKVAttention: .splitKVarNQuantizedMM,
+                compressedKVAttentionExpectedCheckpointContentSHA256:
+                    admission.checkpointContentSHA256))
+
+        XCTAssertEqual(result.tokens.count, 2)
+        XCTAssertEqual(result.engagement.counts["decode"], 2)
+        XCTAssertEqual(result.engagement.counts["kvarn_attention_split"], 1)
+        XCTAssertEqual(
+            result.engagement.counts["kvarn_attention_materialized"], 0)
+        XCTAssertEqual(
+            result.engagement.counts["kvarn_uncompiled_correctness"], 0)
+        XCTAssertEqual(result.engagement.counts["kvarn_compiled"], 1)
+        XCTAssertEqual(result.engagement.counts["kvarn_source_key_float32"], 1)
+        XCTAssertEqual(
+            result.engagement.counts["kvarn_source_value_float32"], 1)
+        assertKVarNDTypeOneHot(
+            result.engagement.counts,
+            prefix: "kvarn",
+            role: "source_key",
+            selected: "float32")
+        assertKVarNDTypeOneHot(
+            result.engagement.counts,
+            prefix: "kvarn",
+            role: "source_value",
+            selected: "float32")
+        assertKVarNDTypeOneHot(
+            result.engagement.counts,
+            prefix: "kvarn",
+            role: "storage_key",
+            selected: "bfloat16")
+        assertKVarNDTypeOneHot(
+            result.engagement.counts,
+            prefix: "kvarn",
+            role: "storage_value",
+            selected: "bfloat16")
+        XCTAssertEqual(
+            result.engagement.counts["kvarn_ingress_normalized"], 1)
+        XCTAssertGreaterThan(
+            result.engagement.counts[
+                "kvarn_normalization_workspace_bytes"] ?? 0,
+            0)
+    }
+
     func testSplitTaskAndFreeRunningScoringUseBoundedPrefill() async throws {
         let actor = HarnessEngineActor(model: TinyScoringRouterModel())
         let prompt = (0..<513).map { ($0 % 31) + 1 }
@@ -160,5 +256,39 @@ final class CompressedKVScoringChunkTests: XCTestCase {
 
     private func argmax(_ values: [Float]) -> Int? {
         values.enumerated().max { $0.element < $1.element }?.offset
+    }
+
+    private func assertKVarNDTypeOneHot(
+        _ counts: [String: Int],
+        prefix: String,
+        role: String,
+        selected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        for dtype in ["float16", "bfloat16", "float32"] {
+            XCTAssertEqual(
+                counts["\(prefix)_\(role)_\(dtype)"],
+                dtype == selected ? 1 : 0,
+                "\(prefix)_\(role)_\(dtype)",
+                file: file,
+                line: line)
+        }
+    }
+
+    private func makeKVarNAdmission(
+        modelNativeDType: String
+    ) throws -> CompressedKVAttentionRuntimeAdmission {
+        let config = Data(
+            """
+            {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false,"torch_dtype":"\(modelNativeDType)"}
+            """.utf8)
+        let snapshot = try CompressedKVAttentionRuntimeSourceSnapshot.load(
+            exactModelConfigData: config,
+            checkpointManifestHash: "0123456789abcdef",
+            checkpointContentSHA256: String(repeating: "d", count: 64),
+            tokenizerSHA256: String(repeating: "a", count: 64))
+        return try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: snapshot)
     }
 }

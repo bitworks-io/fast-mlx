@@ -783,9 +783,12 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     public let candidateCompressedKVAttention:
         CompressedKVAttentionRuntimeBinding?
     /// Route-specific logical workspace components retained separately so a split row cannot
-    /// relabel "no dense K/V reconstruction" as "no temporary attention workspace." Schema 2
-    /// requires both for affine/KVTuner rows; schema 1 keeps them absent for historical decode.
+    /// relabel "no dense K/V reconstruction" as "no temporary attention workspace." The
+    /// normalization component is optional for backward-compatible schema-2 record decoding.
+    /// New direct-KVarN promotion evidence uses schema 3 and must persist the component even when
+    /// it is zero, so a producer cannot hide normalization cost inside attention workspace.
     public let candidateMaterializationWorkspaceBytes: Int?
+    public let candidateNormalizationWorkspaceBytes: Int?
     public let candidateAttentionWorkspaceBytes: Int?
 
     public init(
@@ -806,6 +809,7 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         candidateCompressedKVAttention:
             CompressedKVAttentionRuntimeBinding? = nil,
         candidateMaterializationWorkspaceBytes: Int? = nil,
+        candidateNormalizationWorkspaceBytes: Int? = nil,
         candidateAttentionWorkspaceBytes: Int? = nil
     ) {
         self.schemaVersion = schemaVersion
@@ -836,6 +840,8 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
             candidateCompressedKVAttention
         self.candidateMaterializationWorkspaceBytes =
             candidateMaterializationWorkspaceBytes
+        self.candidateNormalizationWorkspaceBytes =
+            candidateNormalizationWorkspaceBytes
         self.candidateAttentionWorkspaceBytes =
             candidateAttentionWorkspaceBytes
     }
@@ -1320,7 +1326,7 @@ public extension KVarNMemoryGateEvidence {
 
 private extension KVFrontierEvidence {
     func validateForRecord(candidateTier: String) throws {
-        guard [1, 2].contains(schemaVersion) else {
+        guard [1, 2, 3].contains(schemaVersion) else {
             throw KVFrontierEvidenceError.unsupportedSchema(schemaVersion)
         }
         guard KLPayload.isIdentifier(matrixID), KLPayload.isIdentifier(cellID) else {
@@ -1508,6 +1514,7 @@ private extension KVFrontierEvidence {
         if schemaVersion == 1 {
             guard candidateCompressedKVAttention == nil,
                 candidateMaterializationWorkspaceBytes == nil,
+                candidateNormalizationWorkspaceBytes == nil,
                 candidateAttentionWorkspaceBytes == nil,
                 candidateModel.checkpointContentSHA256 == nil,
                 referenceModel.checkpointContentSHA256 == nil
@@ -1516,12 +1523,20 @@ private extension KVFrontierEvidence {
             }
             return
         }
+        if schemaVersion == 3 {
+            guard requestsDirectKVarN,
+                candidateNormalizationWorkspaceBytes != nil
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        }
         guard requiresBinding == (candidateCompressedKVAttention != nil),
             requiresBinding == (candidateModel.checkpointContentSHA256 != nil),
             requiresBinding == (referenceModel.checkpointContentSHA256 != nil),
             requiresBinding
                 == (candidateMaterializationWorkspaceBytes != nil),
-            requiresBinding == (candidateAttentionWorkspaceBytes != nil)
+            requiresBinding == (candidateAttentionWorkspaceBytes != nil),
+            requiresBinding || candidateNormalizationWorkspaceBytes == nil
         else {
             throw KVFrontierEvidenceError.invalidRuntimeEvidence
         }
@@ -1582,13 +1597,19 @@ private extension KVFrontierEvidence {
         guard let materializationWorkspace =
                 candidateMaterializationWorkspaceBytes,
             let attentionWorkspace = candidateAttentionWorkspaceBytes,
-            materializationWorkspace >= 0, attentionWorkspace >= 0
+            materializationWorkspace >= 0, attentionWorkspace >= 0,
+            (candidateNormalizationWorkspaceBytes ?? 0) >= 0
         else {
             throw KVFrontierEvidenceError.invalidRuntimeEvidence
         }
-        let (workspaceTotal, workspaceOverflow) = materializationWorkspace
+        let normalizationWorkspace =
+            candidateNormalizationWorkspaceBytes ?? 0
+        let (partialWorkspaceTotal, partialWorkspaceOverflow) =
+            materializationWorkspace.addingReportingOverflow(
+                normalizationWorkspace)
+        let (workspaceTotal, workspaceOverflow) = partialWorkspaceTotal
             .addingReportingOverflow(attentionWorkspace)
-        guard !workspaceOverflow,
+        guard !partialWorkspaceOverflow, !workspaceOverflow,
             storage.actual.workspaceBytes == workspaceTotal
         else {
             throw KVFrontierEvidenceError.invalidRuntimeEvidence
@@ -1597,6 +1618,7 @@ private extension KVFrontierEvidence {
         case .splitAffineQuantizedMM:
             guard format.kind == .affine || format.kind == .kvtuner,
                 materializationWorkspace == 0,
+                normalizationWorkspace == 0,
                 attentionWorkspace > 0
             else {
                 throw KVFrontierEvidenceError.invalidRuntimeEvidence
@@ -1614,6 +1636,7 @@ private extension KVFrontierEvidence {
         case .materialize:
             guard format.kind == .affine || format.kind == .kvtuner,
                 materializationWorkspace > 0,
+                normalizationWorkspace == 0,
                 attentionWorkspace == 0
             else {
                 throw KVFrontierEvidenceError.invalidRuntimeEvidence
@@ -1623,6 +1646,13 @@ private extension KVFrontierEvidence {
 
     func validateForPromotion(candidateTier: String) throws {
         try validateForRecord(candidateTier: candidateTier)
+        if candidateFormat?.kind == .kvarn,
+            candidateCompressedKVAttention?.request
+                == .splitKVarNQuantizedMM,
+            schemaVersion != 3
+        {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
         guard sameWeights, comparisonBaseline == .sameWeightsFP16KV else {
             throw KVFrontierEvidenceError.promotionRequiresSameWeights
         }

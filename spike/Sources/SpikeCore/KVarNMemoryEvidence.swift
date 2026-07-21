@@ -362,6 +362,11 @@ public enum KVarNMemoryEvidence {
                 return MLXArray(array.asArray(UInt8.self)).reshaped(array.shape)
             case .float16:
                 return MLXArray(array.asArray(Float16.self)).reshaped(array.shape)
+            case .bfloat16:
+                return MLXArray(
+                    array.asData(access: .copy).data,
+                    array.shape,
+                    dtype: .bfloat16)
             case .int32:
                 return MLXArray(array.asArray(Int32.self)).reshaped(array.shape)
             default:

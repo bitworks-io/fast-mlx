@@ -809,7 +809,12 @@ func runBench(_ flags: Flags) async {
                 expectedKVTunerLayerCount:
                     preparedKVTuner?.selection.layers.count,
                 requestedCompressedKVAttention:
-                    plan.compressedKVAttention)
+                    plan.compressedKVAttention,
+                expectedKVarNStorageDType:
+                    plan.compressedKVAttention == nil
+                        ? nil
+                        : driver.compressedKVAttentionAdmission?
+                            .modelNativeDType)
             let metrics = DecodeMetrics(submitTime: result.submitTime, tokenTimes: result.tokenTimes)
             guard let decodeRate = metrics.decodeTokensPerSecond else {
                 print("# run \(i): produced one token -> skipped")
@@ -1325,6 +1330,7 @@ func runKL(_ flags: Flags) async {
         let candidateCompressedKVAttentionObserved:
             CompressedKVAttentionObservedOperation?
         let candidateMaterializationWorkspaceBytes: Int?
+        let candidateNormalizationWorkspaceBytes: Int?
         let candidateAttentionWorkspaceBytes: Int?
         switch requestedCacheKind {
         case .affine(let tier):
@@ -1372,6 +1378,7 @@ func runKL(_ flags: Flags) async {
                     ? .splitQuantizedMM : .materializedKV
             candidateMaterializationWorkspaceBytes =
                 telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes = 0
             candidateAttentionWorkspaceBytes =
                 telemetry.attentionWorkspaceBytes
             print(
@@ -1452,6 +1459,7 @@ func runKL(_ flags: Flags) async {
                     ? .splitQuantizedMM : .materializedKV
             candidateMaterializationWorkspaceBytes =
                 telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes = 0
             candidateAttentionWorkspaceBytes =
                 telemetry.attentionWorkspaceBytes
             print(
@@ -1539,6 +1547,8 @@ func runKL(_ flags: Flags) async {
                     ? .splitKVarNQuantizedMM : .materializedKV
             candidateMaterializationWorkspaceBytes =
                 telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes =
+                telemetry.normalizationWorkspaceBytes
             candidateAttentionWorkspaceBytes =
                 telemetry.attentionWorkspaceBytes
             print(
@@ -1549,6 +1559,7 @@ func runKL(_ flags: Flags) async {
                     + "fp16_tail=\(telemetry.fp16TailBytes), "
                     + "control=\(telemetry.controlBytes), "
                     + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "normalization_workspace=\(telemetry.normalizationWorkspaceBytes), "
                     + "attention_workspace=\(telemetry.attentionWorkspaceBytes), "
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), "
@@ -1571,6 +1582,7 @@ func runKL(_ flags: Flags) async {
             candidateKVTunerSchedule = nil
             candidateCompressedKVAttentionObserved = nil
             candidateMaterializationWorkspaceBytes = nil
+            candidateNormalizationWorkspaceBytes = nil
             candidateAttentionWorkspaceBytes = nil
         }
 
@@ -1591,8 +1603,17 @@ func runKL(_ flags: Flags) async {
             candidateCompressedKVAttention = nil
         }
 
+        let frontierSchemaVersion: Int
+        switch candidateCompressedKVAttention?.request {
+        case nil:
+            frontierSchemaVersion = 1
+        case .splitKVarNQuantizedMM:
+            frontierSchemaVersion = 3
+        case .materialize, .splitAffineQuantizedMM:
+            frontierSchemaVersion = 2
+        }
         let frontier = KVFrontierEvidence(
-            schemaVersion: candidateCompressedKVAttention == nil ? 1 : 2,
+            schemaVersion: frontierSchemaVersion,
             matrixID: matrixID, cellID: cellID,
             sameWeights: sameWeights,
             comparisonBaseline: sameWeights
@@ -1611,6 +1632,9 @@ func runKL(_ flags: Flags) async {
             candidateMaterializationWorkspaceBytes:
                 candidateCompressedKVAttention == nil
                     ? nil : candidateMaterializationWorkspaceBytes,
+            candidateNormalizationWorkspaceBytes:
+                candidateCompressedKVAttention == nil
+                    ? nil : candidateNormalizationWorkspaceBytes,
             candidateAttentionWorkspaceBytes:
                 candidateCompressedKVAttention == nil
                     ? nil : candidateAttentionWorkspaceBytes)

@@ -152,6 +152,23 @@ func validateBenchQualificationEvidenceData(_ data: Data) throws {
         throw BenchQualificationEvidenceValidationError
             .missingKVTunerSchedule
     }
+    if KVarNKVRuntimeCell(rawValue: record.payload.kvQuantTier) != nil,
+        let runtimeBinding
+    {
+        guard let engagementMax = record.payload.engagementMax,
+            let expectedStorageDType =
+                runtimeBinding.admission.modelNativeDType
+        else {
+            throw BenchCLIError.missingLossyEngagement(
+                record.payload.kvQuantTier)
+        }
+        try validateBenchRuntimeEngagement(
+            tier: record.payload.kvQuantTier,
+            engagement: EngagementCounters(engagementMax),
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: runtimeBinding.request,
+            expectedKVarNStorageDType: expectedStorageDType)
+    }
     guard let schedule = record.payload.kvtunerSchedule else { return }
     guard let runtimeBinding else {
         throw BenchQualificationEvidenceValidationError
@@ -514,7 +531,8 @@ func validateBenchRuntimeEngagement(
     tier: String,
     engagement: EngagementCounters,
     expectedKVTunerLayerCount: Int?,
-    requestedCompressedKVAttention: CompressedKVAttentionRequest? = nil
+    requestedCompressedKVAttention: CompressedKVAttentionRequest? = nil,
+    expectedKVarNStorageDType: CompressedKVModelNativeDType? = nil
 ) throws {
     let counts = engagement.counts
     func hasStorageReceipt(
@@ -533,8 +551,11 @@ func validateBenchRuntimeEngagement(
         let workspace = counts["\(prefix)_workspace_bytes"] ?? -1
         let materialization =
             counts["\(prefix)_materialization_bytes"] ?? -1
+        let normalization =
+            counts["\(prefix)_normalization_workspace_bytes"] ?? 0
         let attentionWorkspace =
             counts["\(prefix)_attention_workspace_bytes"] ?? -1
+        guard normalization >= 0 else { return false }
         switch attentionRequest {
         case nil:
             // Historical/default rows are materialize-then-attend and retain the old receipt.
@@ -543,14 +564,14 @@ func validateBenchRuntimeEngagement(
             return workspace > 0
                 && materialization > 0
                 && attentionWorkspace == 0
-                && workspace == materialization
+                && workspace == materialization + normalization
                 && counts["\(prefix)_attention_materialized"] == 1
                 && counts["\(prefix)_attention_split"] == 0
         case .splitAffineQuantizedMM, .splitKVarNQuantizedMM:
             return workspace > 0
                 && materialization == 0
                 && attentionWorkspace > 0
-                && workspace == attentionWorkspace
+                && workspace == attentionWorkspace + normalization
                 && counts["\(prefix)_attention_split"] == 1
                 && counts["\(prefix)_attention_materialized"] == 0
         }
@@ -591,6 +612,43 @@ func validateBenchRuntimeEngagement(
             (counts["kvarn_layers"] ?? 0) > 0,
             counts["kvarn_codec_iterations"] == cell.iterations
         else { throw BenchCLIError.missingLossyEngagement(tier) }
+        if let expectedKVarNStorageDType {
+            func oneHotDType(_ role: String)
+                -> CompressedKVModelNativeDType?
+            {
+                let dtypes: [CompressedKVModelNativeDType] = [
+                    .float16, .bfloat16, .float32,
+                ]
+                let markers = dtypes.map {
+                    counts["kvarn_\(role)_\($0.rawValue)"]
+                }
+                guard markers.allSatisfy({ $0 == 0 || $0 == 1 }),
+                    markers.compactMap({ $0 }).reduce(0, +) == 1,
+                    let index = markers.firstIndex(of: 1)
+                else { return nil }
+                return dtypes[index]
+            }
+            let sourceKey = oneHotDType("source_key")
+            let sourceValue = oneHotDType("source_value")
+            let storageKey = oneHotDType("storage_key")
+            let storageValue = oneHotDType("storage_value")
+            let normalized = counts["kvarn_ingress_normalized"]
+            let normalizationWorkspace =
+                counts["kvarn_normalization_workspace_bytes"]
+            guard expectedKVarNStorageDType != .float32,
+                sourceKey != nil,
+                sourceKey == sourceValue,
+                sourceKey == expectedKVarNStorageDType
+                    || sourceKey == .float32,
+                storageKey == expectedKVarNStorageDType,
+                storageValue == expectedKVarNStorageDType,
+                normalized == (sourceKey == storageKey ? 0 : 1),
+                normalizationWorkspace != nil,
+                (normalized == 1
+                    ? normalizationWorkspace! > 0
+                    : normalizationWorkspace == 0)
+            else { throw BenchCLIError.missingLossyEngagement(tier) }
+        }
         return
     }
     if TurboQuantTier.allCases.contains(where: {

@@ -66,6 +66,7 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.kvHeadCount, 8)
         XCTAssertEqual(admission.headDimension, 128)
         XCTAssertEqual(admission.maxPositionEmbeddings, 40_960)
+        XCTAssertEqual(admission.modelNativeDType, .bfloat16)
         XCTAssertEqual(admission.modelConfigHash, fnv1a64(data))
         XCTAssertEqual(admission.modelConfigSHA256, sha256Hex(data))
         XCTAssertEqual(admission.checkpointManifestHash, checkpointManifestHash)
@@ -101,6 +102,37 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
                 error as? CompressedKVAttentionRuntimeAdmissionError,
                 .checkpointContentIdentityMismatch)
         }
+    }
+
+    func testAdmissionCarriesOnlyDeclaredModelNativeScalarDTypes() throws {
+        XCTAssertEqual(
+            try admission(for: config(modelNativeDType: "float16"))
+                .modelNativeDType,
+            .float16)
+        XCTAssertEqual(
+            try admission(for: config(modelNativeDType: "bfloat16"))
+                .modelNativeDType,
+            .bfloat16)
+        XCTAssertEqual(
+            try admission(for: config(modelNativeDType: "float32"))
+                .modelNativeDType,
+            .float32)
+        XCTAssertNil(
+            try admission(for: config(modelNativeDType: nil))
+                .modelNativeDType,
+            "legacy evidence remains decodable, but a KVarN runtime must reject the absent policy")
+        XCTAssertNil(
+            try admission(for: config(modelNativeDType: "float8_e4m3fn"))
+                .modelNativeDType,
+            "unsupported config dtypes must never be guessed as fp16")
+    }
+
+    func testAdmissionUsesDTypeWhenTorchDTypeIsAbsent() throws {
+        let admission = try admission(for: config(
+            modelNativeDType: nil,
+            extra: "\"dtype\":\"float16\""))
+
+        XCTAssertEqual(admission.modelNativeDType, .float16)
     }
 
     func testAdmissionRejectsUnknownOrMismatchedArchitectures() throws {
@@ -420,6 +452,7 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
         kvHeads: Int = 8,
         headDimension: Int? = 128,
         maxPositionEmbeddings: Int = 40_960,
+        modelNativeDType: String? = "bfloat16",
         extra: String? = nil
     ) -> Data {
         let extraField = extra.map { ",\($0)" } ?? ""
@@ -427,6 +460,9 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
             ? "" : ",\"use_sliding_window\":false"
         let headDimensionField = headDimension.map {
             ",\"head_dim\":\($0)"
+        } ?? ""
+        let modelNativeDTypeField = modelNativeDType.map {
+            ",\"torch_dtype\":\"\($0)\""
         } ?? ""
         return Data("""
         {
@@ -438,6 +474,7 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
           "num_key_value_heads":\(kvHeads),
           "max_position_embeddings":\(maxPositionEmbeddings)
           \(headDimensionField)
+          \(modelNativeDTypeField)
           \(windowField)
           \(extraField)
         }

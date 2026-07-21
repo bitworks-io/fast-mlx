@@ -77,7 +77,8 @@ public enum KVCacheKind: Sendable, Hashable {
     public func makeCache(
         capacity: Int,
         affineAttentionMode: AffineKVAttentionMode = .materialize,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) -> any CompiledCache {
         switch self {
         case .fp16:
@@ -96,7 +97,8 @@ public enum KVCacheKind: Sendable, Hashable {
             KVarNKVCache(
                 capacity: capacity, tier: cell.tier,
                 iterations: cell.iterations,
-                attentionMode: kvarnAttentionMode)
+                attentionMode: kvarnAttentionMode,
+                storageDType: kvarnStorageDType)
         }
     }
 
@@ -107,7 +109,8 @@ public enum KVCacheKind: Sendable, Hashable {
         layerCount: Int,
         capacity: Int,
         affineAttentionMode: AffineKVAttentionMode = .materialize,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) throws -> [any CompiledCache] {
         switch self {
         case .kvtuner(let selection):
@@ -129,7 +132,8 @@ public enum KVCacheKind: Sendable, Hashable {
                 makeCache(
                     capacity: capacity,
                     affineAttentionMode: affineAttentionMode,
-                    kvarnAttentionMode: kvarnAttentionMode)
+                    kvarnAttentionMode: kvarnAttentionMode,
+                    kvarnStorageDType: kvarnStorageDType)
             }
         }
     }

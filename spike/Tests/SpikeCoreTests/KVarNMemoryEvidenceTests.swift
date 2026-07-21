@@ -277,6 +277,38 @@ final class KVarNMemoryEvidenceTests: XCTestCase {
         XCTAssertEqual(cache.offset, 383)
     }
 
+    func testCacheStorageDetachmentPreservesBFloat16StateBytes() throws {
+        let cache = KVarNKVCache(
+            capacity: 257,
+            tier: .k4v2G128,
+            iterations: 8,
+            storageDType: .bfloat16)
+        let keys = MLXArray((0 ..< (129 * 128)).map {
+            Float(sin(Double($0) * 0.013))
+        }).reshaped([1, 1, 129, 128])
+        _ = cache.update(keys: keys, values: keys * Float(-0.25))
+        eval(cache.innerState())
+        let before = cache.innerState()
+        let beforeBytes = before.map { $0.asData(access: .copy).data }
+        let snapshot = try XCTUnwrap(cache.storageSnapshot())
+
+        try KVarNMemoryEvidence.detachCacheStorage(cache)
+
+        let after = cache.innerState()
+        XCTAssertTrue(before.contains { $0.dtype == .bfloat16 })
+        XCTAssertEqual(after.count, before.count)
+        XCTAssertTrue(zip(before, after).allSatisfy { $0 !== $1 })
+        for (index, detached) in after.enumerated() {
+            XCTAssertEqual(detached.shape, before[index].shape)
+            XCTAssertEqual(detached.dtype, before[index].dtype)
+            XCTAssertEqual(
+                detached.asData(access: .copy).data,
+                beforeBytes[index])
+        }
+        XCTAssertEqual(cache.storageSnapshot(), snapshot)
+        XCTAssertEqual(cache.offset, 129)
+    }
+
     func testProbeFinitenessMeasuresFloatingOutputsAndAcceptsStorageScalars() {
         let finite = MLXArray([Float16(1), Float16(-2)])
         let payload = MLXArray([UInt8(0), UInt8.max])

@@ -53,6 +53,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
         compressedKVAttention:
             CompressedKVAttentionRuntimeBinding? = nil,
         materializationWorkspaceBytes: Int? = nil,
+        normalizationWorkspaceBytes: Int? = nil,
         attentionWorkspaceBytes: Int? = nil,
         autoBindKVTuner: Bool = true
     ) -> KVFrontierEvidence {
@@ -111,6 +112,8 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 materializationWorkspaceBytes
                     ?? (automaticBinding == nil
                         ? nil : resolvedStorage.actual.workspaceBytes),
+            candidateNormalizationWorkspaceBytes:
+                normalizationWorkspaceBytes,
             candidateAttentionWorkspaceBytes:
                 attentionWorkspaceBytes
                     ?? (automaticBinding == nil ? nil : 0))
@@ -1225,6 +1228,33 @@ final class KVFrontierEvidenceTests: XCTestCase {
         let (format, storage) = try kvarnFormatAndStorage(
             layerCount: admission.layerCount)
         let direct = frontier(
+            schemaVersion: 3,
+            candidate: model,
+            reference: model,
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format,
+            storage: storage,
+            controlBytes: admission.layerCount * MemoryLayout<Int32>.size,
+            executionMode: "uncompiled-correctness",
+            codecIterations: 8,
+            memoryGate: kvarnMemoryGate(),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            normalizationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: storage.actual.workspaceBytes)
+
+        XCTAssertNoThrow(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: direct).validatedForPromotion())
+
+        let roundTripped = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONEncoder().encode(payload(
+                kvQuantTier: "kvarn-k4v2-g128",
+                frontier: direct)))
+        XCTAssertNoThrow(try roundTripped.validatedForPromotion())
+
+        let legacySchemaTwo = frontier(
             schemaVersion: 2,
             candidate: model,
             reference: model,
@@ -1238,17 +1268,16 @@ final class KVFrontierEvidenceTests: XCTestCase {
             compressedKVAttention: binding,
             materializationWorkspaceBytes: 0,
             attentionWorkspaceBytes: storage.actual.workspaceBytes)
-
         XCTAssertNoThrow(try payload(
             kvQuantTier: "kvarn-k4v2-g128",
-            frontier: direct).validatedForPromotion())
-
-        let roundTripped = try JSONDecoder().decode(
-            KLPayload.self,
-            from: JSONEncoder().encode(payload(
-                kvQuantTier: "kvarn-k4v2-g128",
-                frontier: direct)))
-        XCTAssertNoThrow(try roundTripped.validatedForPromotion())
+            frontier: legacySchemaTwo).validatedForRecord())
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: legacySchemaTwo).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
 
         let (i16Format, i16Storage) = try kvarnFormatAndStorage(
             tier: "kvarn-k4v2-g128-i16",
@@ -1273,6 +1302,74 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 attentionWorkspaceBytes:
                     i16Storage.actual.workspaceBytes)
         ).validatedForPromotion()) {
+            XCTAssertEqual(
+                $0 as? KVFrontierEvidenceError,
+                .invalidRuntimeEvidence)
+        }
+    }
+
+    func testKVarNDirectAttentionReconcilesNormalizationWorkspace() throws {
+        let admission = try compressedAttentionAdmission()
+        let model = KVModelEvidenceIdentity(
+            configHash: admission.modelConfigHash,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256)
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+        let (format, storage) = try kvarnFormatAndStorage(
+            layerCount: admission.layerCount)
+        let normalizationWorkspace = 1_024
+        let attentionWorkspace = storage.actual.workspaceBytes
+            - normalizationWorkspace
+        let normalized = frontier(
+            schemaVersion: 3,
+            candidate: model,
+            reference: model,
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format,
+            storage: storage,
+            controlBytes: admission.layerCount * MemoryLayout<Int32>.size,
+            executionMode: "uncompiled-correctness",
+            codecIterations: 8,
+            memoryGate: kvarnMemoryGate(),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            normalizationWorkspaceBytes: normalizationWorkspace,
+            attentionWorkspaceBytes: attentionWorkspace)
+
+        XCTAssertNoThrow(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: normalized).validatedForPromotion())
+        let roundTripped = try JSONDecoder().decode(
+            KLPayload.self,
+            from: JSONEncoder().encode(payload(
+                kvQuantTier: "kvarn-k4v2-g128",
+                frontier: normalized)))
+        XCTAssertEqual(
+            roundTripped.frontier?.candidateNormalizationWorkspaceBytes,
+            normalizationWorkspace)
+        XCTAssertNoThrow(try roundTripped.validatedForPromotion())
+
+        let missingNormalization = frontier(
+            schemaVersion: 3,
+            candidate: model,
+            reference: model,
+            cellID: "kvarn-k4v2-g128-i8",
+            format: format,
+            storage: storage,
+            controlBytes: admission.layerCount * MemoryLayout<Int32>.size,
+            executionMode: "uncompiled-correctness",
+            codecIterations: 8,
+            memoryGate: kvarnMemoryGate(),
+            compressedKVAttention: binding,
+            materializationWorkspaceBytes: 0,
+            attentionWorkspaceBytes: storage.actual.workspaceBytes)
+        XCTAssertThrowsError(try payload(
+            kvQuantTier: "kvarn-k4v2-g128",
+            frontier: missingNormalization).validatedForPromotion()) {
             XCTAssertEqual(
                 $0 as? KVFrontierEvidenceError,
                 .invalidRuntimeEvidence)
@@ -1308,7 +1405,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
             attentionWorkspaceBytes: Int? = nil
         ) -> KVFrontierEvidence {
             frontier(
-                schemaVersion: 2,
+                schemaVersion: 3,
                 candidate: model,
                 reference: model,
                 cellID: "kvarn-k4v2-g128-i8",
@@ -1321,6 +1418,7 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 compressedKVAttention: binding,
                 materializationWorkspaceBytes:
                     materializationWorkspaceBytes,
+                normalizationWorkspaceBytes: 0,
                 attentionWorkspaceBytes: attentionWorkspaceBytes
                     ?? storage.actual.workspaceBytes)
         }

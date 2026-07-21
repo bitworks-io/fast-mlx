@@ -1178,6 +1178,421 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
     }
 
+    func testLoadedQwenFloat32PrefillUsesAuthenticatedBFloat16KVarNStorage()
+        throws
+    {
+        let capacity = 8_448
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: capacity,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM,
+            storageDType: .bfloat16)
+        let keys = deterministicFloat32KVTensor(
+            heads: 8, tokens: 512, dimension: dimension, seed: 10)
+        let values = deterministicFloat32KVTensor(
+            heads: 8, tokens: 512, dimension: dimension, seed: 20)
+        let queries = deterministicFloat32KVTensor(
+            heads: 64, tokens: 512, dimension: dimension, seed: 30)
+        let expectedKeys = keys.asType(.bfloat16)
+        let expectedValues = values.asType(.bfloat16)
+
+        let prefillOutput = try cache.checkedUpdateAndAttend(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 512, windowSize: nil, returnArray: true))
+        eval(
+            prefillOutput, cache.sinkKeys!, cache.sinkValues!,
+            expectedKeys, expectedValues)
+
+        XCTAssertEqual(prefillOutput.dtype, .float32)
+        XCTAssertTrue(isFinite(prefillOutput).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 512)
+        XCTAssertEqual(cache.sinkKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.sinkValues?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailValues?.dtype, .bfloat16)
+        assertStorageBytes(
+            cache.sinkKeys!,
+            equal: expectedKeys[0..., 0..., 0 ..< 128, 0...],
+            "authenticated float32 K ingress must persist exact bf16 sink bytes")
+        assertStorageBytes(
+            cache.sinkValues!,
+            equal: expectedValues[0..., 0..., 0 ..< 128, 0...],
+            "authenticated float32 V ingress must persist exact bf16 sink bytes")
+
+        let prefillStorage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(prefillStorage.sourceKeyDType, .float32)
+        XCTAssertEqual(prefillStorage.sourceValueDType, .float32)
+        XCTAssertEqual(prefillStorage.storageKeyDType, .bfloat16)
+        XCTAssertEqual(prefillStorage.storageValueDType, .bfloat16)
+        XCTAssertTrue(prefillStorage.ingressNormalizationApplied)
+        XCTAssertEqual(
+            prefillStorage.normalizationWorkspaceBytes,
+            2 * 8 * 512 * dimension * MemoryLayout<UInt16>.size)
+        XCTAssertEqual(prefillStorage.fp16SinkBytes, 524_288)
+        XCTAssertEqual(prefillStorage.fp16TailBytes, 524_288)
+        XCTAssertEqual(
+            prefillStorage.workspaceBytes,
+            prefillStorage.normalizationWorkspaceBytes
+                + prefillStorage.attentionWorkspaceBytes)
+
+        let stateBeforeReplay = cache.innerState()
+        let step = compile(inputs: [cache], outputs: [cache]) { arguments in
+            [attentionWithCacheUpdate(
+                queries: arguments[0],
+                keys: arguments[1],
+                values: arguments[2],
+                cache: cache,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: 1, windowSize: nil, returnArray: true))]
+        }
+        let replayKeys = deterministicFloat32KVTensor(
+            heads: 8, tokens: 1, dimension: dimension, seed: 40)
+        let replayValues = deterministicFloat32KVTensor(
+            heads: 8, tokens: 1, dimension: dimension, seed: 50)
+        let replayQueries = deterministicFloat32KVTensor(
+            heads: 64, tokens: 1, dimension: dimension, seed: 60)
+        let expectedReplayKeys = replayKeys.asType(.bfloat16)
+        let expectedReplayValues = replayValues.asType(.bfloat16)
+        let replayOutput = step([
+            replayQueries, replayKeys, replayValues,
+        ])[0]
+        eval(
+            replayOutput, cache.tailKeys!, cache.tailValues!,
+            expectedReplayKeys, expectedReplayValues)
+
+        XCTAssertEqual(replayOutput.dtype, .float32)
+        XCTAssertTrue(isFinite(replayOutput).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 513)
+        XCTAssertTrue(
+            zip(stateBeforeReplay, cache.innerState()).allSatisfy { $0 === $1 },
+            "model-native ingress normalization must preserve compiled cache handles")
+        assertStorageBytes(
+            cache.tailKeys![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedReplayKeys,
+            "authenticated float32 K replay must persist exact bf16 live-tail bytes")
+        assertStorageBytes(
+            cache.tailValues![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedReplayValues,
+            "authenticated float32 V replay must persist exact bf16 live-tail bytes")
+        let replayStorage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(replayStorage.sourceKeyDType, .float32)
+        XCTAssertEqual(replayStorage.sourceValueDType, .float32)
+        XCTAssertEqual(replayStorage.storageKeyDType, .bfloat16)
+        XCTAssertEqual(replayStorage.storageValueDType, .bfloat16)
+        XCTAssertTrue(replayStorage.ingressNormalizationApplied)
+    }
+
+    func testAuthenticatedFloat32IngressStoresExactFloat16SinkAndLiveTailBytes()
+        throws
+    {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 257,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM,
+            storageDType: .float16)
+        let keys = deterministicFloat32KVTensor(
+            heads: 1, tokens: 129, dimension: dimension, seed: 70)
+        let values = deterministicFloat32KVTensor(
+            heads: 1, tokens: 129, dimension: dimension, seed: 80)
+        let queries = deterministicFloat32KVTensor(
+            heads: 2, tokens: 129, dimension: dimension, seed: 90)
+        let expectedKeys = keys.asType(.float16)
+        let expectedValues = values.asType(.float16)
+
+        let output = try cache.checkedUpdateAndAttend(
+            queries: queries,
+            keys: keys,
+            values: values,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 129, windowSize: nil, returnArray: true))
+        eval(
+            output, cache.sinkKeys!, cache.sinkValues!,
+            cache.tailKeys!, cache.tailValues!, expectedKeys, expectedValues)
+
+        XCTAssertEqual(output.dtype, .float32)
+        XCTAssertTrue(isFinite(output).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 129)
+        XCTAssertEqual(cache.completedTileCount, 0)
+        XCTAssertEqual(cache.sinkKeys?.dtype, .float16)
+        XCTAssertEqual(cache.sinkValues?.dtype, .float16)
+        XCTAssertEqual(cache.tailKeys?.dtype, .float16)
+        XCTAssertEqual(cache.tailValues?.dtype, .float16)
+        assertStorageBytes(
+            cache.sinkKeys!,
+            equal: expectedKeys[0..., 0..., 0 ..< 128, 0...],
+            "authenticated float32 K ingress must persist exact fp16 sink bytes")
+        assertStorageBytes(
+            cache.sinkValues!,
+            equal: expectedValues[0..., 0..., 0 ..< 128, 0...],
+            "authenticated float32 V ingress must persist exact fp16 sink bytes")
+        assertStorageBytes(
+            cache.tailKeys![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedKeys[0..., 0..., 128 ..< 129, 0...],
+            "authenticated float32 K ingress must persist exact fp16 live-tail bytes")
+        assertStorageBytes(
+            cache.tailValues![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedValues[0..., 0..., 128 ..< 129, 0...],
+            "authenticated float32 V ingress must persist exact fp16 live-tail bytes")
+
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.sourceKeyDType, .float32)
+        XCTAssertEqual(storage.sourceValueDType, .float32)
+        XCTAssertEqual(storage.storageKeyDType, .float16)
+        XCTAssertEqual(storage.storageValueDType, .float16)
+        XCTAssertTrue(storage.ingressNormalizationApplied)
+        XCTAssertEqual(
+            storage.normalizationWorkspaceBytes,
+            2 * 129 * dimension * MemoryLayout<UInt16>.size)
+        XCTAssertEqual(storage.fp16SinkBytes, 65_536)
+        XCTAssertEqual(storage.fp16TailBytes, 65_536)
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testMaterializedAuthenticatedBFloat16IngressPreservesStorageBytes()
+        throws
+    {
+        let dimension = 128
+        let cache = KVarNKVCache(
+            capacity: 257,
+            tier: .k4v2G128,
+            iterations: 8,
+            storageDType: .bfloat16)
+        let keys = deterministicFloat32KVTensor(
+            heads: 1, tokens: 129, dimension: dimension, seed: 100)
+        let values = deterministicFloat32KVTensor(
+            heads: 1, tokens: 129, dimension: dimension, seed: 110)
+        let expectedKeys = keys.asType(.bfloat16)
+        let expectedValues = values.asType(.bfloat16)
+
+        let (materializedKeys, materializedValues) = cache.update(
+            keys: keys, values: values)
+        eval(
+            materializedKeys, materializedValues,
+            cache.sinkKeys!, cache.sinkValues!, cache.tailKeys!, cache.tailValues!,
+            expectedKeys, expectedValues)
+
+        XCTAssertEqual(materializedKeys.dtype, .bfloat16)
+        XCTAssertEqual(materializedValues.dtype, .bfloat16)
+        XCTAssertEqual(cache.sinkKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.sinkValues?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailKeys?.dtype, .bfloat16)
+        XCTAssertEqual(cache.tailValues?.dtype, .bfloat16)
+        assertStorageBytes(
+            cache.sinkKeys!,
+            equal: expectedKeys[0..., 0..., 0 ..< 128, 0...],
+            "materialized authenticated float32 K ingress must persist exact bf16 sink bytes")
+        assertStorageBytes(
+            cache.sinkValues!,
+            equal: expectedValues[0..., 0..., 0 ..< 128, 0...],
+            "materialized authenticated float32 V ingress must persist exact bf16 sink bytes")
+        assertStorageBytes(
+            cache.tailKeys![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedKeys[0..., 0..., 128 ..< 129, 0...],
+            "materialized authenticated float32 K ingress must persist exact bf16 live-tail bytes")
+        assertStorageBytes(
+            cache.tailValues![0..., 0..., 0 ..< 1, 0...],
+            equal: expectedValues[0..., 0..., 128 ..< 129, 0...],
+            "materialized authenticated float32 V ingress must persist exact bf16 live-tail bytes")
+        assertStorageBytes(
+            materializedKeys[0..., 0..., 0 ..< 129, 0...],
+            equal: expectedKeys,
+            "materialized authenticated float32 K ingress must expose bf16 materialized bytes")
+        assertStorageBytes(
+            materializedValues[0..., 0..., 0 ..< 129, 0...],
+            equal: expectedValues,
+            "materialized authenticated float32 V ingress must expose bf16 materialized bytes")
+
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.sourceKeyDType, .float32)
+        XCTAssertEqual(storage.sourceValueDType, .float32)
+        XCTAssertEqual(storage.storageKeyDType, .bfloat16)
+        XCTAssertEqual(storage.storageValueDType, .bfloat16)
+        XCTAssertTrue(storage.ingressNormalizationApplied)
+        XCTAssertEqual(
+            storage.normalizationWorkspaceBytes,
+            2 * 129 * dimension * MemoryLayout<UInt16>.size)
+        XCTAssertEqual(storage.fp16SinkBytes, 65_536)
+        XCTAssertEqual(storage.fp16TailBytes, 65_536)
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 131_584)
+        XCTAssertEqual(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .materializedKV)
+    }
+
+    func testAuthenticatedKVarNIngressDTypeFailuresPrecedeCacheMutation()
+        throws
+    {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let query = deterministicFloat32KVTensor(
+            heads: 2, tokens: 1, dimension: dimension, seed: 120)
+
+        func assertInitialFailure(
+            cache: KVarNKVCache,
+            keys: MLXArray,
+            values: MLXArray? = nil,
+            expected: KVarNMLXError,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            let initialState = cache.innerState()
+            XCTAssertThrowsError(try cache.checkedUpdateAndAttend(
+                queries: query,
+                keys: keys,
+                values: values ?? keys,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: 1, windowSize: nil, returnArray: true)
+            ), file: file, line: line) {
+                XCTAssertEqual($0 as? KVarNMLXError, expected)
+            }
+            XCTAssertEqual(cache.offsetArr.item(Int32.self), 0)
+            XCTAssertNil(cache.storageSnapshot())
+            XCTAssertTrue(zip(initialState, cache.innerState()).allSatisfy {
+                $0 === $1
+            })
+        }
+
+        assertInitialFailure(
+            cache: KVarNKVCache(
+                capacity: 256,
+                tier: .k4v2G128,
+                iterations: 8,
+                attentionMode: .splitQuantizedMM,
+                storageDType: .bfloat16),
+            keys: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float16),
+            expected: .inputDTypeMismatch)
+        assertInitialFailure(
+            cache: KVarNKVCache(
+                capacity: 256,
+                tier: .k4v2G128,
+                iterations: 8,
+                attentionMode: .splitQuantizedMM,
+                storageDType: .bfloat16),
+            keys: deterministicFloat32KVTensor(
+                heads: 1, tokens: 1, dimension: dimension, seed: 130),
+            values: deterministicFloat32KVTensor(
+                heads: 1, tokens: 1, dimension: dimension, seed: 140)
+                .asType(.bfloat16),
+            expected: .inputDTypeMismatch)
+        assertInitialFailure(
+            cache: KVarNKVCache(
+                capacity: 256,
+                tier: .k4v2G128,
+                iterations: 8,
+                attentionMode: .splitQuantizedMM),
+            keys: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float32),
+            expected: .unsupportedInputDType)
+        assertInitialFailure(
+            cache: KVarNKVCache(
+                capacity: 256,
+                tier: .k4v2G128,
+                iterations: 8,
+                attentionMode: .splitQuantizedMM,
+                storageDType: .bfloat16),
+            keys: MLXArray.full(
+                [1, 1, 1, dimension], values: MLXArray(Float.nan)),
+            expected: .nonFiniteInput)
+        assertInitialFailure(
+            cache: KVarNKVCache(
+                capacity: 256,
+                tier: .k4v2G128,
+                iterations: 8,
+                attentionMode: .splitQuantizedMM,
+                storageDType: .float16),
+            keys: MLXArray.full(
+                [1, 1, 1, dimension], values: MLXArray(Float(70_000))),
+            expected: .nonFiniteInput)
+
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM,
+            storageDType: .bfloat16)
+        let initialFloat32 = deterministicFloat32KVTensor(
+            heads: 1, tokens: 1, dimension: dimension, seed: 150)
+        let output = try cache.checkedUpdateAndAttend(
+            queries: query,
+            keys: initialFloat32,
+            values: initialFloat32,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(output, cache.innerState())
+        let offsetBefore = cache.offsetArr.item(Int32.self)
+        let bytesBefore = cache.innerState().map {
+            $0.asData(access: .copy).data
+        }
+        let storageBefore = try XCTUnwrap(cache.storageSnapshot())
+        let changed = deterministicFloat32KVTensor(
+            heads: 1, tokens: 1, dimension: dimension, seed: 160)
+            .asType(.bfloat16)
+
+        XCTAssertThrowsError(try cache.checkedUpdateAndAttend(
+            queries: query,
+            keys: changed,
+            values: changed,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true)
+        )) {
+            XCTAssertEqual($0 as? KVarNMLXError, .inputDTypeChanged)
+        }
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), offsetBefore)
+        XCTAssertEqual(
+            cache.innerState().map { $0.asData(access: .copy).data },
+            bytesBefore)
+        XCTAssertEqual(cache.storageSnapshot(), storageBefore)
+    }
+
+    func testAuthenticatedFloat32ToFloat16OverflowFailsBeforeGraphMutation() {
+        let dimension = 128
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM,
+            storageDType: .float16)
+        let initialState = cache.innerState()
+        let queries = MLXArray.zeros(
+            [1, 2, 1, dimension], dtype: .float32)
+        let overflowingKV = MLXArray.full(
+            [1, 1, 1, dimension], values: MLXArray(Float(70_000)))
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: overflowingKV,
+            values: overflowingKV,
+            cache: cache,
+            scale: Float(1 / sqrt(Double(dimension))),
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(output, cache.innerState())
+
+        XCTAssertFalse(isFinite(output).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 0)
+        XCTAssertNil(cache.storageSnapshot())
+        XCTAssertTrue(zip(initialState, cache.innerState()).allSatisfy {
+            $0 === $1
+        })
+    }
+
     func testDirectRouterRejectsInvalidRequestBeforeCacheMutation() throws {
         let dimension = 128
         let cache = KVarNKVCache(
@@ -2053,6 +2468,34 @@ final class KVarNKVCacheTests: XCTestCase {
             XCTAssertEqual(actual.dtype, expected.dtype, file: file, line: line)
             XCTAssertTrue((actual .== expected).all().item(Bool.self), file: file, line: line)
         }
+    }
+
+    private func deterministicFloat32KVTensor(
+        heads: Int, tokens: Int, dimension: Int, seed: Int
+    ) -> MLXArray {
+        MLXArray((0 ..< heads * tokens * dimension).map { index in
+            Float(
+                0.45 * sin(Double(index + seed) * 0.017)
+                    + 0.20 * cos(Double(index + seed) * 0.031)
+                    + 0.01 * Double(((index + seed) % 7) - 3))
+        }).reshaped([1, heads, tokens, dimension]).asType(.float32)
+    }
+
+    private func assertStorageBytes(
+        _ actual: MLXArray,
+        equal expected: MLXArray,
+        _ message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.shape, expected.shape, file: file, line: line)
+        XCTAssertEqual(actual.dtype, expected.dtype, file: file, line: line)
+        XCTAssertEqual(
+            actual.asData(access: .copy).data,
+            expected.asData(access: .copy).data,
+            message,
+            file: file,
+            line: line)
     }
 
     private func maximumDistance(_ lhs: [Int], _ rhs: [Int]) -> Int {

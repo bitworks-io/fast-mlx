@@ -2073,7 +2073,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             observedOperation: .splitKVarNQuantizedMM,
             admission: admission)
         let frontier = KVFrontierEvidence(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             cellID: "kvarn-k4v2-g128-i8",
             sameWeights: true,
@@ -2090,6 +2090,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             candidateMemoryGate: memoryGate,
             candidateCompressedKVAttention: compressedBinding,
             candidateMaterializationWorkspaceBytes: 0,
+            candidateNormalizationWorkspaceBytes: 0,
             candidateAttentionWorkspaceBytes: workspaceBytes)
         let template = try validKLRecord().payload
         let payload = KLPayload(

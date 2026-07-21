@@ -36,6 +36,18 @@ public enum CompressedKVAttentionModelFamily:
     case llama
 }
 
+/// Native floating-point dtype declared by the exact authenticated model configuration. This is
+/// distinct from the model's weight-quantization format and from a KV-cache storage tier. The
+/// field is optional on durable admissions so historical evidence remains decodable; a runtime
+/// that needs a model-native dtype must still reject an absent or unsupported value explicitly.
+public enum CompressedKVModelNativeDType:
+    String, Codable, Equatable, Hashable, Sendable
+{
+    case float16
+    case bfloat16
+    case float32
+}
+
 public enum CompressedKVAttentionRuntimeAdmissionError:
     Error, Equatable, Sendable
 {
@@ -146,6 +158,7 @@ public struct CompressedKVAttentionRuntimeAdmission:
     public let kvHeadCount: Int
     public let headDimension: Int
     public let maxPositionEmbeddings: Int
+    public let modelNativeDType: CompressedKVModelNativeDType?
 
     private struct ModelConfiguration: Decodable {
         let modelType: String
@@ -157,6 +170,8 @@ public struct CompressedKVAttentionRuntimeAdmission:
         let headDimension: Int?
         let maxPositionEmbeddings: Int
         let useSlidingWindow: Bool?
+        let torchDType: String?
+        let dtype: String?
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -168,6 +183,8 @@ public struct CompressedKVAttentionRuntimeAdmission:
             case headDimension = "head_dim"
             case maxPositionEmbeddings = "max_position_embeddings"
             case useSlidingWindow = "use_sliding_window"
+            case torchDType = "torch_dtype"
+            case dtype
         }
     }
 
@@ -297,7 +314,9 @@ public struct CompressedKVAttentionRuntimeAdmission:
             queryHeadCount: configuration.queryHeadCount,
             kvHeadCount: configuration.kvHeadCount,
             headDimension: headDimension,
-            maxPositionEmbeddings: configuration.maxPositionEmbeddings)
+            maxPositionEmbeddings: configuration.maxPositionEmbeddings,
+            modelNativeDType: (configuration.torchDType ?? configuration.dtype)
+                .flatMap(CompressedKVModelNativeDType.init(rawValue:)))
     }
 
     public func validateAffineGeometry(

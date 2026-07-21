@@ -9,6 +9,38 @@ public enum KVarNMLXError: Error, Equatable, Sendable {
     case invalidRecord
     case nonFiniteOutput
     case directAttentionUnavailable
+    case unsupportedInputDType
+    case inputDTypeMismatch
+    case inputDTypeChanged
+}
+
+/// Closed scalar dtype identity used by KVarN ingress and evidence. Keeping MLX's `DType` behind
+/// this actor-safe enum makes the authenticated model policy and post-run receipts explicit.
+public enum KVarNKVScalarDType:
+    String, Codable, Equatable, Hashable, Sendable
+{
+    case float16
+    case bfloat16
+    case float32
+
+    var mlxDType: DType {
+        switch self {
+        case .float16: .float16
+        case .bfloat16: .bfloat16
+        case .float32: .float32
+        }
+    }
+
+    init?(mlxDType: DType) {
+        switch mlxDType {
+        case .float16: self = .float16
+        case .bfloat16: self = .bfloat16
+        case .float32: self = .float32
+        default: return nil
+        }
+    }
+
+    var isNative16Bit: Bool { self == .float16 || self == .bfloat16 }
 }
 
 /// MLX-side form of the pinned KVarN tile contract. Runtime tiers remain narrower than this
@@ -728,6 +760,11 @@ public struct KVarNKVCacheStorageSnapshot: Equatable, Sendable {
     public let sequences: Int
     public let kvHeadCount: Int
     public let headDimension: Int
+    public let sourceKeyDType: KVarNKVScalarDType
+    public let sourceValueDType: KVarNKVScalarDType
+    public let storageKeyDType: KVarNKVScalarDType
+    public let storageValueDType: KVarNKVScalarDType
+    public let ingressNormalizationApplied: Bool
     public let metadataScalarBytes: Int
     public let payloadBytes: Int
     public let metadataBytes: Int
@@ -736,6 +773,7 @@ public struct KVarNKVCacheStorageSnapshot: Equatable, Sendable {
     public let fp16TailBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let normalizationWorkspaceBytes: Int
     public let attentionWorkspaceBytes: Int
     public let workspaceBytes: Int
     public let attentionOperation: KVarNKVAttentionOperation
@@ -773,6 +811,11 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
     public let sequences: Int
     public let kvHeadCount: Int
     public let headDimension: Int
+    public let sourceKeyDType: KVarNKVScalarDType
+    public let sourceValueDType: KVarNKVScalarDType
+    public let storageKeyDType: KVarNKVScalarDType
+    public let storageValueDType: KVarNKVScalarDType
+    public let ingressNormalizationApplied: Bool
     public let metadataScalarBytes: Int
     public let payloadBytes: Int
     public let metadataBytes: Int
@@ -781,6 +824,7 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
     public let fp16TailBytes: Int
     public let controlBytes: Int
     public let materializationWorkspaceBytes: Int
+    public let normalizationWorkspaceBytes: Int
     public let attentionWorkspaceBytes: Int
     public let workspaceBytes: Int
     public let attentionOperation: KVarNKVAttentionOperation
@@ -817,9 +861,17 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
                     && $0.sequences == first.sequences
                     && $0.kvHeadCount == first.kvHeadCount
                     && $0.headDimension == first.headDimension
+                    && $0.sourceKeyDType == first.sourceKeyDType
+                    && $0.sourceValueDType == first.sourceValueDType
+                    && $0.storageKeyDType == first.storageKeyDType
+                    && $0.storageValueDType == first.storageValueDType
+                    && $0.ingressNormalizationApplied
+                        == first.ingressNormalizationApplied
                     && $0.metadataScalarBytes == first.metadataScalarBytes
                     && $0.materializationWorkspaceBytes
                         == first.materializationWorkspaceBytes
+                    && $0.normalizationWorkspaceBytes
+                        == first.normalizationWorkspaceBytes
                     && $0.attentionWorkspaceBytes
                         == first.attentionWorkspaceBytes
                     && $0.workspaceBytes == first.workspaceBytes
@@ -861,6 +913,12 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
             packedTileSlots: first.packedTileSlots,
             sequences: first.sequences, kvHeadCount: first.kvHeadCount,
             headDimension: first.headDimension,
+            sourceKeyDType: first.sourceKeyDType,
+            sourceValueDType: first.sourceValueDType,
+            storageKeyDType: first.storageKeyDType,
+            storageValueDType: first.storageValueDType,
+            ingressNormalizationApplied:
+                first.ingressNormalizationApplied,
             metadataScalarBytes: first.metadataScalarBytes,
             payloadBytes: sum(snapshots.map(\.payloadBytes)),
             metadataBytes: sum(snapshots.map(\.metadataBytes)),
@@ -869,6 +927,7 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
             fp16TailBytes: sum(snapshots.map(\.fp16TailBytes)),
             controlBytes: sum(snapshots.map(\.controlBytes)),
             materializationWorkspaceBytes: first.materializationWorkspaceBytes,
+            normalizationWorkspaceBytes: first.normalizationWorkspaceBytes,
             attentionWorkspaceBytes: first.attentionWorkspaceBytes,
             workspaceBytes: first.workspaceBytes,
             attentionOperation: first.attentionOperation)
@@ -890,6 +949,10 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
     public let tier: KVarNKVTier
     public let iterations: Int
     public let attentionMode: KVarNKVAttentionMode
+    /// Authenticated model-native dtype required when runtime projections arrive in float32.
+    /// `nil` preserves the legacy exact-native contract for direct cache/unit construction: only
+    /// already-fp16/bf16 K/V are accepted and no dtype is guessed.
+    public let storageDType: KVarNKVScalarDType?
 
     // Packed records are flattened inside each [B, H, slot, bytes] row. The codec fixes K's
     // [D,G] and V's [G,D] orientations before flattening; metadata keeps each axis separate.
@@ -912,7 +975,10 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
     private var headDimension: Int?
     private var keyOutputDType: DType?
     private var valueOutputDType: DType?
+    private var sourceKeyDType: KVarNKVScalarDType?
+    private var sourceValueDType: KVarNKVScalarDType?
     private var materializationWorkspaceBytes: Int?
+    private var normalizationWorkspaceBytes: Int?
     private var attentionWorkspaceBytes: Int?
     private var attentionOperation: KVarNKVAttentionOperation?
 
@@ -945,7 +1011,8 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
 
     public init(
         capacity: Int, tier: KVarNKVTier, iterations: Int,
-        attentionMode: KVarNKVAttentionMode = .materialize
+        attentionMode: KVarNKVAttentionMode = .materialize,
+        storageDType: KVarNKVScalarDType? = nil
     ) {
         precondition(capacity > 0, "capacity must be positive")
         precondition(
@@ -956,10 +1023,14 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             keyBits: tier.keyBits, valueBits: tier.valueBits,
             iterations: iterations)) != nil
         else { preconditionFailure("named KVarN tier has invalid codec geometry") }
+        precondition(
+            storageDType == nil || storageDType!.isNative16Bit,
+            "KVarN persistent sink/tail storage must remain fp16 or bfloat16")
         self.capacity = capacity
         self.tier = tier
         self.iterations = iterations
         self.attentionMode = attentionMode
+        self.storageDType = storageDType
     }
 
     public var maxSize: Int? { nil }
@@ -975,12 +1046,15 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
     public var ropeOffset: RoPEOffset { .batch(offsetArr) }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        validateInput(keys: keys, values: values)
+        let prepared = requirePreparedStorageInputs(
+            keys: keys, values: values)
+        validateInput(keys: prepared.keys, values: prepared.values)
+        recordIngress(prepared)
         if kPayload == nil {
-            allocate(keys: keys, values: values)
+            allocate(keys: prepared.keys, values: prepared.values)
         }
 
-        storeHost(keys: keys, values: values)
+        storeHost(keys: prepared.keys, values: prepared.values)
         let materialized = materialize()
         materializationWorkspaceBytes = checkedSum([
             materialized.0.nbytes, materialized.1.nbytes,
@@ -1000,21 +1074,34 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         switch attentionMode {
         case .materialize:
             let (cachedKeys, cachedValues) = update(keys: keys, values: values)
+            let attentionKeys = cachedKeys.dtype == queries.dtype
+                ? cachedKeys : cachedKeys.asType(queries.dtype)
+            let attentionValues = cachedValues.dtype == queries.dtype
+                ? cachedValues : cachedValues.asType(queries.dtype)
+            materializationWorkspaceBytes = checkedSum([
+                cachedKeys.nbytes, cachedValues.nbytes,
+                attentionKeys === cachedKeys ? 0 : attentionKeys.nbytes,
+                attentionValues === cachedValues ? 0 : attentionValues.nbytes,
+            ])
             return MLXFast.scaledDotProductAttention(
                 queries: queries,
-                keys: cachedKeys,
-                values: cachedValues,
+                keys: attentionKeys,
+                values: attentionValues,
                 scale: scale,
                 mask: mask)
         case .splitQuantizedMM:
+            let prepared = requirePreparedStorageInputs(
+                keys: keys, values: values)
             precondition(
                 directGeometryIsValid(
-                    queries: queries, keys: keys, values: values,
+                    queries: queries,
+                    keys: prepared.keys,
+                    values: prepared.values,
                     scale: scale, mask: mask),
                 "invalid direct KVarN attention geometry")
             let inputsFinite = isFinite(queries).all()
-                & isFinite(keys).all()
-                & isFinite(values).all()
+                & isFinite(prepared.keys).all()
+                & isFinite(prepared.values).all()
             let hasCapacity = offsetArr + MLXArray(Int32(keys.dim(2)))
                 .<= MLXArray(Int32(capacity))
             let inputsValid = inputsFinite & hasCapacity
@@ -1031,18 +1118,19 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             {
                 return invalidDirectAttentionOutput(like: queries)
             }
+            recordIngress(prepared)
             if kPayload == nil {
-                allocate(keys: keys, values: values)
+                allocate(keys: prepared.keys, values: prepared.values)
             }
             if keys.dim(2) == 1 {
                 storeSingleGraph(
-                    keys: keys, values: values,
+                    keys: prepared.keys, values: prepared.values,
                     when: inputsValid)
             } else {
                 // Long prefill is deliberately uncompiled and chunked by the decoder. The host
                 // loop finalizes each complete tile before the direct attention graph consumes it.
-                validateInput(keys: keys, values: values)
-                storeHost(keys: keys, values: values)
+                validateInput(keys: prepared.keys, values: prepared.values)
+                storeHost(keys: prepared.keys, values: prepared.values)
             }
             materializationWorkspaceBytes = 0
             attentionOperation = .splitQuantizedMM
@@ -1068,13 +1156,16 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         guard attentionMode == .splitQuantizedMM else {
             throw KVarNMLXError.directAttentionUnavailable
         }
+        let prepared = try preparedStorageInputs(keys: keys, values: values)
         guard directGeometryIsValid(
-            queries: queries, keys: keys, values: values,
+            queries: queries,
+            keys: prepared.keys,
+            values: prepared.values,
             scale: scale, mask: mask)
         else { throw KVarNMLXError.invalidTileShape }
         guard isFinite(queries).all().item(Bool.self),
-            isFinite(keys).all().item(Bool.self),
-            isFinite(values).all().item(Bool.self)
+            isFinite(prepared.keys).all().item(Bool.self),
+            isFinite(prepared.values).all().item(Bool.self)
         else { throw KVarNMLXError.nonFiniteInput }
         guard offset + keys.dim(2) <= capacity else {
             throw KVarNMLXError.invalidTileShape
@@ -1082,6 +1173,92 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         return updateAndAttend(
             queries: queries, keys: keys, values: values,
             scale: scale, mask: mask)
+    }
+
+    private struct PreparedStorageInputs {
+        let keys: MLXArray
+        let values: MLXArray
+        let sourceKeyDType: KVarNKVScalarDType
+        let sourceValueDType: KVarNKVScalarDType
+        let storageKeyDType: KVarNKVScalarDType
+        let storageValueDType: KVarNKVScalarDType
+        let normalizationWorkspaceBytes: Int
+
+        var normalizationApplied: Bool {
+            sourceKeyDType != storageKeyDType
+                || sourceValueDType != storageValueDType
+        }
+    }
+
+    private func requirePreparedStorageInputs(
+        keys: MLXArray, values: MLXArray
+    ) -> PreparedStorageInputs {
+        do {
+            return try preparedStorageInputs(keys: keys, values: values)
+        } catch {
+            preconditionFailure("invalid KVarN K/V ingress dtype: \(error)")
+        }
+    }
+
+    /// Resolve the exact storage arrays without mutating cache or telemetry state. Float32 K/V
+    /// are admitted only when an authenticated model-native 16-bit target was supplied at cache
+    /// construction; already-native legacy inputs retain their exact dtype.
+    private func preparedStorageInputs(
+        keys: MLXArray, values: MLXArray
+    ) throws -> PreparedStorageInputs {
+        guard let sourceKey = KVarNKVScalarDType(mlxDType: keys.dtype),
+            let sourceValue = KVarNKVScalarDType(mlxDType: values.dtype)
+        else { throw KVarNMLXError.unsupportedInputDType }
+        if let established = sourceKeyDType, established != sourceKey {
+            throw KVarNMLXError.inputDTypeChanged
+        }
+        if let established = sourceValueDType, established != sourceValue {
+            throw KVarNMLXError.inputDTypeChanged
+        }
+
+        let storageKey: KVarNKVScalarDType
+        let storageValue: KVarNKVScalarDType
+        if let storageDType {
+            guard sourceKey == sourceValue else {
+                throw KVarNMLXError.inputDTypeMismatch
+            }
+            guard sourceKey == storageDType || sourceKey == .float32 else {
+                throw KVarNMLXError.inputDTypeMismatch
+            }
+            storageKey = storageDType
+            storageValue = storageDType
+        } else {
+            guard sourceKey.isNative16Bit, sourceValue.isNative16Bit else {
+                throw KVarNMLXError.unsupportedInputDType
+            }
+            storageKey = sourceKey
+            storageValue = sourceValue
+        }
+
+        let preparedKeys = sourceKey == storageKey
+            ? keys : keys.asType(storageKey.mlxDType)
+        let preparedValues = sourceValue == storageValue
+            ? values : values.asType(storageValue.mlxDType)
+        let workspace = checkedSum([
+            preparedKeys === keys ? 0 : preparedKeys.nbytes,
+            preparedValues === values ? 0 : preparedValues.nbytes,
+        ])
+        return PreparedStorageInputs(
+            keys: preparedKeys,
+            values: preparedValues,
+            sourceKeyDType: sourceKey,
+            sourceValueDType: sourceValue,
+            storageKeyDType: storageKey,
+            storageValueDType: storageValue,
+            normalizationWorkspaceBytes: workspace)
+    }
+
+    private func recordIngress(_ prepared: PreparedStorageInputs) {
+        sourceKeyDType = prepared.sourceKeyDType
+        sourceValueDType = prepared.sourceValueDType
+        normalizationWorkspaceBytes = Swift.max(
+            normalizationWorkspaceBytes ?? 0,
+            prepared.normalizationWorkspaceBytes)
     }
 
     private func storeHost(keys: MLXArray, values: MLXArray) {
@@ -1282,6 +1459,7 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         }
         offsetArr._updateInternal(MLXArray([Int32(0)]))
         materializationWorkspaceBytes = 0
+        normalizationWorkspaceBytes = 0
         attentionWorkspaceBytes = 0
     }
 
@@ -1291,7 +1469,14 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             let vAbsorbedScales, let vAbsorbedBiases,
             let sinkKeys, let sinkValues, let tailKeys, let tailValues,
             let batchSize, let headCount, let headDimension,
-            let materializationWorkspaceBytes, let attentionWorkspaceBytes,
+            let sourceKeyDType, let sourceValueDType,
+            let storageKeyDType = KVarNKVScalarDType(
+                mlxDType: sinkKeys.dtype),
+            let storageValueDType = KVarNKVScalarDType(
+                mlxDType: sinkValues.dtype),
+            let materializationWorkspaceBytes,
+            let normalizationWorkspaceBytes,
+            let attentionWorkspaceBytes,
             let attentionOperation
         else { return nil }
 
@@ -1309,6 +1494,7 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         if Int(offsetArr.item(Int32.self)) == 0 {
             precondition(
                 materializationWorkspaceBytes == 0
+                    && normalizationWorkspaceBytes == 0
                     && attentionWorkspaceBytes == 0,
                 "reset KVarN cache must clear workspace high-water marks")
         } else {
@@ -1330,7 +1516,9 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             }
         }
         let workspaceBytes = checkedSum([
-            materializationWorkspaceBytes, attentionWorkspaceBytes,
+            materializationWorkspaceBytes,
+            normalizationWorkspaceBytes,
+            attentionWorkspaceBytes,
         ])
         let slots = packedTileSlots(for: capacity)
         let headSequences = checkedProduct([batchSize, headCount])
@@ -1347,12 +1535,21 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             tier: tier, iterations: iterations,
             capacityTokens: capacity, packedTileSlots: slots,
             sequences: batchSize, kvHeadCount: headCount,
-            headDimension: headDimension, metadataScalarBytes: 2,
+            headDimension: headDimension,
+            sourceKeyDType: sourceKeyDType,
+            sourceValueDType: sourceValueDType,
+            storageKeyDType: storageKeyDType,
+            storageValueDType: storageValueDType,
+            ingressNormalizationApplied:
+                sourceKeyDType != storageKeyDType
+                    || sourceValueDType != storageValueDType,
+            metadataScalarBytes: 2,
             payloadBytes: payloadBytes, metadataBytes: metadataBytes,
             alignmentPaddingBytes: alignmentPaddingBytes,
             fp16SinkBytes: sinkBytes, fp16TailBytes: tailBytes,
             controlBytes: offsetArr.nbytes,
             materializationWorkspaceBytes: materializationWorkspaceBytes,
+            normalizationWorkspaceBytes: normalizationWorkspaceBytes,
             attentionWorkspaceBytes: attentionWorkspaceBytes,
             workspaceBytes: workspaceBytes,
             attentionOperation: attentionOperation)
@@ -1687,7 +1884,11 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         scores = scores[0..., 0..., 0..., 0 ..< capacity]
         scores = apply(mask: mask, to: scores)
         let weights = softmax(scores, axis: -1, precise: true)
-        let workspace = checkedSum([scores.nbytes, weights.nbytes])
+        let workspace = checkedSum([
+            scores.nbytes,
+            weights.nbytes,
+            denseReadConversionWorkspaceBytes(to: queries.dtype),
+        ])
         attentionWorkspaceBytes = Swift.max(
             attentionWorkspaceBytes ?? 0,
             workspace)
@@ -1734,11 +1935,12 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         packedOutput = matmul(
             packedOutput.asType(.float32),
             KVarNMLXCodec.normalizedHadamard(dimension: dimension)
-        ).asType(valueOutputDType!)
+        ).asType(groupedWeights.dtype)
 
         let tailOutput = matmul(
             groupedWeights,
             tailValues!
+                .asType(groupedWeights.dtype)
                 .expandedDimensions(axis: 2)
                 .expandedDimensions(axis: 3))
         let selectedOutput = MLX.where(
@@ -1798,7 +2000,11 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         scores = scores[0..., 0..., 0..., 0 ..< capacity]
         scores = apply(mask: mask, to: scores)
         let weights = softmax(scores, axis: -1, precise: true)
-        let workspace = checkedSum([scores.nbytes, weights.nbytes])
+        let workspace = checkedSum([
+            scores.nbytes,
+            weights.nbytes,
+            denseReadConversionWorkspaceBytes(to: queries.dtype),
+        ])
         attentionWorkspaceBytes = Swift.max(
             attentionWorkspaceBytes ?? 0,
             workspace)
@@ -1819,7 +2025,7 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
             let record = storedRecord(at: slot)
             let packedOutput = KVarNMLXCodec.directValueProductUnchecked(
                 weights: segmentWeights,
-                value: record.valueOperand)
+                value: record.valueOperand).asType(output.dtype)
             let tailOutput = groupedDenseValueProduct(
                 weights: segmentWeights,
                 values: tailValues!)
@@ -1846,18 +2052,23 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         let queryHeads = queries.dim(1)
         let queryTokens = queries.dim(2)
         let dimension = queries.dim(3)
-        let kvHeads = keys.dim(1)
+        let typedKeys = keys.dtype == queries.dtype
+            ? keys : keys.asType(queries.dtype)
+        let kvHeads = typedKeys.dim(1)
         let repeats = queryHeads / kvHeads
         guard repeats > 1 else {
-            return matmul(queries, keys.transposed(0, 1, 3, 2))
+            return matmul(
+                queries, typedKeys.transposed(0, 1, 3, 2))
         }
         return matmul(
             queries.reshaped([
                 batch, kvHeads, repeats, queryTokens, dimension,
             ]),
-            keys.expandedDimensions(axis: 2)
+            typedKeys.expandedDimensions(axis: 2)
                 .transposed(0, 1, 2, 4, 3)
-        ).reshaped([batch, queryHeads, queryTokens, keys.dim(2)])
+        ).reshaped([
+            batch, queryHeads, queryTokens, typedKeys.dim(2),
+        ])
     }
 
     private func groupedDenseValueProduct(
@@ -1867,16 +2078,31 @@ public final class KVarNKVCache: AttentionKVCacheProtocol, Updatable {
         let batch = weights.dim(0)
         let queryHeads = weights.dim(1)
         let queryTokens = weights.dim(2)
-        let kvHeads = values.dim(1)
-        let dimension = values.dim(3)
+        let typedValues = values.dtype == weights.dtype
+            ? values : values.asType(weights.dtype)
+        let kvHeads = typedValues.dim(1)
+        let dimension = typedValues.dim(3)
         let repeats = queryHeads / kvHeads
-        guard repeats > 1 else { return matmul(weights, values) }
+        guard repeats > 1 else { return matmul(weights, typedValues) }
         return matmul(
             weights.reshaped([
                 batch, kvHeads, repeats, queryTokens, weights.dim(3),
             ]),
-            values.expandedDimensions(axis: 2)
+            typedValues.expandedDimensions(axis: 2)
         ).reshaped([batch, queryHeads, queryTokens, dimension])
+    }
+
+    private func denseReadConversionWorkspaceBytes(to dtype: DType) -> Int {
+        [sinkKeys, tailKeys, sinkValues, tailValues].compactMap { $0 }
+            .reduce(into: 0) { total, array in
+                guard array.dtype != dtype else { return }
+                let bytes = checkedProduct([array.size, dtype.size])
+                let (next, overflow) = total.addingReportingOverflow(bytes)
+                precondition(
+                    !overflow,
+                    "KVarN dense-read conversion workspace overflow")
+                total = next
+            }
     }
 
     private func paddedWeights(

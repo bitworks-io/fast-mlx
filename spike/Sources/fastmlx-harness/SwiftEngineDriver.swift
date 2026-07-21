@@ -25,6 +25,7 @@ struct SwiftEngineCacheSelection: Equatable, Sendable {
     let kind: KVCacheKind
     let affineAttentionMode: AffineKVAttentionMode
     let kvarnAttentionMode: KVarNKVAttentionMode
+    let kvarnStorageDType: KVarNKVScalarDType?
 }
 
 /// Resolve and authenticate a runtime request without allocating MLX cache state. A frozen
@@ -90,7 +91,8 @@ func resolveSwiftEngineCacheSelection(
         return SwiftEngineCacheSelection(
             kind: .kvtuner(selection),
             affineAttentionMode: affineMode,
-            kvarnAttentionMode: .materialize)
+            kvarnAttentionMode: .materialize,
+            kvarnStorageDType: nil)
     }
     if config.kvQuant?.hasPrefix("kvtuner-") == true {
         throw SwiftEngineDriverError.unsupportedConfig(
@@ -99,6 +101,21 @@ func resolveSwiftEngineCacheSelection(
     guard let kind = KVCacheKind(kvQuant: config.kvQuant) else {
         throw SwiftEngineDriverError.unsupportedConfig(
             "kvQuant=\(config.kvQuant ?? "fp16") (unknown tier)")
+    }
+
+    let kvarnStorageDType: KVarNKVScalarDType?
+    if case .kvarn = kind, let admission {
+        switch admission.modelNativeDType {
+        case .float16:
+            kvarnStorageDType = .float16
+        case .bfloat16:
+            kvarnStorageDType = .bfloat16
+        case .float32, nil:
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "KVarN requires an authenticated fp16 or bfloat16 model-native storage dtype")
+        }
+    } else {
+        kvarnStorageDType = nil
     }
 
     if let request = config.compressedKVAttention {
@@ -148,7 +165,8 @@ func resolveSwiftEngineCacheSelection(
     return SwiftEngineCacheSelection(
         kind: kind,
         affineAttentionMode: affineMode,
-        kvarnAttentionMode: kvarnMode)
+        kvarnAttentionMode: kvarnMode,
+        kvarnStorageDType: kvarnStorageDType)
 }
 
 /// Exact result of one restricted-choice scoring forward. Only actor-safe CPU values cross the
@@ -169,6 +187,37 @@ struct KVTunerCandidateRunResult: Sendable {
     let telemetry: KVTunerCandidateKVCacheTelemetry
 }
 
+/// Integer-only dtype receipt carried through existing engagement artifacts. One-hot markers make
+/// missing/partial evidence distinguishable from every valid dtype without changing historical
+/// CSV columns; the authenticated admission remains the source of the expected storage dtype.
+private func kvarnIngressEngagement(
+    _ telemetry: KVarNKVCacheTelemetry,
+    prefix: String = "kvarn"
+) -> [String: Int] {
+    let dtypes: [KVarNKVScalarDType] = [
+        .float16, .bfloat16, .float32,
+    ]
+    var counts: [String: Int] = [:]
+    func record(
+        _ role: String,
+        _ selected: KVarNKVScalarDType
+    ) {
+        for dtype in dtypes {
+            counts["\(prefix)_\(role)_\(dtype.rawValue)"] =
+                dtype == selected ? 1 : 0
+        }
+    }
+    record("source_key", telemetry.sourceKeyDType)
+    record("source_value", telemetry.sourceValueDType)
+    record("storage_key", telemetry.storageKeyDType)
+    record("storage_value", telemetry.storageValueDType)
+    counts["\(prefix)_ingress_normalized"] =
+        telemetry.ingressNormalizationApplied ? 1 : 0
+    counts["\(prefix)_normalization_workspace_bytes"] =
+        telemetry.normalizationWorkspaceBytes
+    return counts
+}
+
 /// Single-owner actor over the spike's compiled decode core. Owns BOTH the model and the
 /// `CompiledMLXDecoder` (one isolation region) because `logprobs` needs direct forward access
 /// to full-vocab logits, which the token-only `Decoder` protocol deliberately doesn't expose.
@@ -181,11 +230,13 @@ actor HarnessEngineActor {
         let kind: KVCacheKind
         let affineAttentionMode: AffineKVAttentionMode
         let kvarnAttentionMode: KVarNKVAttentionMode
+        let kvarnStorageDType: KVarNKVScalarDType?
     }
 
     private struct KVarNScoringTelemetryKey: Hashable {
         let cell: KVarNKVRuntimeCell
         let attentionMode: KVarNKVAttentionMode
+        let storageDType: KVarNKVScalarDType?
     }
 
     private let model: any LanguageModel
@@ -232,7 +283,8 @@ actor HarnessEngineActor {
         prompt: [Int], maxTokens: Int, eos: Int,
         kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     )
         -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
@@ -249,13 +301,15 @@ actor HarnessEngineActor {
         let decoderKey = DecoderKey(
             kind: kind,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         if decoders[decoderKey] == nil {
             decoders[decoderKey] = CompiledMLXDecoder(
                 model: model,
                 kvCache: kind,
                 affineAttentionMode: affineAttentionMode,
-                kvarnAttentionMode: kvarnAttentionMode)
+                kvarnAttentionMode: kvarnAttentionMode,
+                kvarnStorageDType: kvarnStorageDType)
         }
         var decoder = decoders[decoderKey]!
         defer { decoders[decoderKey] = decoder }
@@ -307,7 +361,13 @@ actor HarnessEngineActor {
                     && kvarnTelemetry?.iterations == cell.iterations
                     && kvarnTelemetry?.executionMode == expectedExecutionMode
                     && kvarnTelemetry?.attentionOperation
-                        == expectedKVarNAttentionOperation(kvarnAttentionMode),
+                        == expectedKVarNAttentionOperation(kvarnAttentionMode)
+                    && (kvarnStorageDType == nil
+                        || kvarnTelemetry?.storageKeyDType
+                            == kvarnStorageDType)
+                    && (kvarnStorageDType == nil
+                        || kvarnTelemetry?.storageValueDType
+                            == kvarnStorageDType),
                 "KVarN tier requested but matching KVarN telemetry did not engage")
         }
         return (
@@ -417,7 +477,8 @@ actor HarnessEngineActor {
         let decoderKey = DecoderKey(
             kind: kind,
             affineAttentionMode: .materialize,
-            kvarnAttentionMode: .materialize)
+            kvarnAttentionMode: .materialize,
+            kvarnStorageDType: nil)
         if decoders[decoderKey] == nil {
             decoders[decoderKey] = CompiledMLXDecoder(model: model, kvCache: kind)
         }
@@ -437,13 +498,15 @@ actor HarnessEngineActor {
         prompt: [Int], maxTokens: Int, eos: Int,
         kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) -> [[Float]] {
         let cache = makeScoringCache(
             kind: kind,
             capacity: prompt.count + max(maxTokens, 0),
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         var rows: [[Float]] = []
         let generationCount = max(maxTokens, 0)
         guard generationCount > 0 else { return rows }
@@ -464,7 +527,8 @@ actor HarnessEngineActor {
         captureQuantizedScoringTelemetry(
             kind, cache: cache, minTokens: prompt.count,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         return rows
     }
 
@@ -475,13 +539,15 @@ actor HarnessEngineActor {
     func taskChoiceLogits(
         prompt: [Int], kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) -> TaskChoiceLogitsResult {
         precondition(!prompt.isEmpty, "task scoring requires a nonempty prompt")
         let cache = makeScoringCache(
             kind: kind, capacity: prompt.count,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         let logits = prefillScoringLogits(
             prompt: prompt,
             cache: cache,
@@ -546,6 +612,10 @@ actor HarnessEngineActor {
                     && telemetry.executionMode == .uncompiledCorrectness
                     && telemetry.attentionOperation
                         == expectedKVarNAttentionOperation(kvarnAttentionMode)
+                    && (kvarnStorageDType == nil
+                        || telemetry.storageKeyDType == kvarnStorageDType)
+                    && (kvarnStorageDType == nil
+                        || telemetry.storageValueDType == kvarnStorageDType)
                     && telemetry.cachedTokens == prompt.count,
                 "KVarN task-scoring telemetry does not match its runtime cell")
             counts["scoring_cached_tokens"] = telemetry.cachedTokens
@@ -557,6 +627,10 @@ actor HarnessEngineActor {
                 telemetry.attentionOperation == .splitQuantizedMM ? 1 : 0
             counts["scoring_kvarn_attention_materialized"] =
                 telemetry.attentionOperation == .materializedKV ? 1 : 0
+            counts.merge(
+                kvarnIngressEngagement(
+                    telemetry, prefix: "scoring_kvarn"),
+                uniquingKeysWith: { _, new in new })
         case .turboQuant:
             preconditionFailure(
                 "TurboQuant is outside the authenticated task-coherence tier map")
@@ -618,12 +692,14 @@ actor HarnessEngineActor {
     func teacherForcedLogprobs(
         prompt: [Int], forced: [Int], kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) -> [[Float]] {
         scoreForced(
             prompt: prompt, forced: forced, wanted: nil, kind: kind,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
     }
 
     /// Sampled variant: same chunked forward over the full forced continuation (causal decoding
@@ -634,12 +710,14 @@ actor HarnessEngineActor {
     func teacherForcedLogprobsAtPositions(
         prompt: [Int], forced: [Int], positions: [Int], kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) -> [[Float]] {
         scoreForced(
             prompt: prompt, forced: forced, wanted: positions, kind: kind,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
     }
 
     /// CHUNKED teacher-forced scoring (`forcedScoringPlan` in HarnessCore holds the pure
@@ -664,13 +742,15 @@ actor HarnessEngineActor {
         prompt: [Int], forced: [Int], wanted: [Int]?,
         kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode
+        kvarnAttentionMode: KVarNKVAttentionMode,
+        kvarnStorageDType: KVarNKVScalarDType?
     ) -> [[Float]] {
         let input = prompt + forced.dropLast()
         let cache = makeScoringCache(
             kind: kind, capacity: input.count,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         let plan = forcedScoringPlan(
             promptCount: prompt.count, forcedCount: forced.count,
             wantedPositions: wanted, chunkSize: Self.scoringChunkSize)
@@ -686,7 +766,8 @@ actor HarnessEngineActor {
         captureQuantizedScoringTelemetry(
             kind, cache: cache, minTokens: input.count,
             affineAttentionMode: affineAttentionMode,
-            kvarnAttentionMode: kvarnAttentionMode)
+            kvarnAttentionMode: kvarnAttentionMode,
+            kvarnStorageDType: kvarnStorageDType)
         return rows
     }
 
@@ -698,7 +779,8 @@ actor HarnessEngineActor {
     private func makeScoringCache(
         kind: KVCacheKind, capacity: Int,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode
+        kvarnAttentionMode: KVarNKVAttentionMode,
+        kvarnStorageDType: KVarNKVScalarDType?
     ) -> [any KVCache] {
         switch kind {
         case .fp16:
@@ -713,7 +795,8 @@ actor HarnessEngineActor {
                         kind: kind,
                         kvarnAttentionMode: kvarnAttentionMode),
                     affineAttentionMode: affineAttentionMode,
-                    kvarnAttentionMode: kvarnAttentionMode)
+                    kvarnAttentionMode: kvarnAttentionMode,
+                    kvarnStorageDType: kvarnStorageDType)
             } catch {
                 preconditionFailure(
                     "scoring KV-cache policy does not match the loaded model: \(error)")
@@ -744,7 +827,8 @@ actor HarnessEngineActor {
     private func captureQuantizedScoringTelemetry(
         _ kind: KVCacheKind, cache: [any KVCache], minTokens: Int,
         affineAttentionMode: AffineKVAttentionMode,
-        kvarnAttentionMode: KVarNKVAttentionMode
+        kvarnAttentionMode: KVarNKVAttentionMode,
+        kvarnStorageDType: KVarNKVScalarDType?
     ) {
         switch kind {
         case .fp16:
@@ -818,14 +902,19 @@ actor HarnessEngineActor {
             precondition(
                 telemetry.tier == cell.tier
                     && telemetry.iterations == cell.iterations
-                    && telemetry.executionMode == .uncompiledCorrectness,
+                    && telemetry.executionMode == .uncompiledCorrectness
+                    && (kvarnStorageDType == nil
+                        || telemetry.storageKeyDType == kvarnStorageDType)
+                    && (kvarnStorageDType == nil
+                        || telemetry.storageValueDType == kvarnStorageDType),
                 "KVarN scoring telemetry does not match its requested runtime cell")
             precondition(
                 telemetry.attentionOperation
                     == expectedKVarNAttentionOperation(kvarnAttentionMode),
                 "KVarN scoring cache executed a different attention operation")
             let key = KVarNScoringTelemetryKey(
-                cell: cell, attentionMode: kvarnAttentionMode)
+                cell: cell, attentionMode: kvarnAttentionMode,
+                storageDType: kvarnStorageDType)
             if maximumKVarNScoringTelemetry[key].map({
                 telemetry.capacityTokens > $0.capacityTokens
             }) ?? true {
@@ -864,10 +953,12 @@ actor HarnessEngineActor {
 
     func kvarnScoringTelemetry(
         for cell: KVarNKVRuntimeCell,
-        attentionMode: KVarNKVAttentionMode
+        attentionMode: KVarNKVAttentionMode,
+        storageDType: KVarNKVScalarDType? = nil
     ) -> KVarNKVCacheTelemetry? {
         maximumKVarNScoringTelemetry[KVarNScoringTelemetryKey(
-            cell: cell, attentionMode: attentionMode)]
+            cell: cell, attentionMode: attentionMode,
+            storageDType: storageDType)]
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -923,7 +1014,8 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, maxTokens: config.maxTokens, eos: eos,
             kvCache: kind,
             affineAttentionMode: selection.affineAttentionMode,
-            kvarnAttentionMode: selection.kvarnAttentionMode)
+            kvarnAttentionMode: selection.kvarnAttentionMode,
+            kvarnStorageDType: selection.kvarnStorageDType)
         var counts = ["decode": out.tokens.count]
         if let tq = out.turboQuantTokens {
             // In-graph cached-token count from the quantized cache — the lossy triad's
@@ -990,6 +1082,9 @@ struct SwiftEngineDriver: EngineDriver {
                 kvarn.executionMode == .uncompiledCorrectness ? 1 : 0
             counts["kvarn_compiled"] =
                 kvarn.executionMode == .compiled ? 1 : 0
+            counts.merge(
+                kvarnIngressEngagement(kvarn),
+                uniquingKeysWith: { _, new in new })
         }
         return RunResult(
             tokens: out.tokens,
@@ -1006,7 +1101,8 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, maxTokens: config.maxTokens, eos: eos,
             kvCache: selection.kind,
             affineAttentionMode: selection.affineAttentionMode,
-            kvarnAttentionMode: selection.kvarnAttentionMode)
+            kvarnAttentionMode: selection.kvarnAttentionMode,
+            kvarnStorageDType: selection.kvarnStorageDType)
     }
 
     func taskChoiceLogits(
@@ -1029,7 +1125,8 @@ struct SwiftEngineDriver: EngineDriver {
         return await engine.taskChoiceLogits(
             prompt: prompt, kvCache: kind,
             affineAttentionMode: selection.affineAttentionMode,
-            kvarnAttentionMode: selection.kvarnAttentionMode)
+            kvarnAttentionMode: selection.kvarnAttentionMode,
+            kvarnStorageDType: selection.kvarnStorageDType)
     }
 
     /// Private, policy-typed qualification seam. Unlike `generate(config:)`, there is no string
@@ -1089,7 +1186,8 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, forced: forcedContinuation,
             kvCache: selection.kind,
             affineAttentionMode: selection.affineAttentionMode,
-            kvarnAttentionMode: selection.kvarnAttentionMode)
+            kvarnAttentionMode: selection.kvarnAttentionMode,
+            kvarnStorageDType: selection.kvarnStorageDType)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
@@ -1098,7 +1196,8 @@ struct SwiftEngineDriver: EngineDriver {
             prompt: prompt, forced: forcedContinuation, positions: positions,
             kvCache: selection.kind,
             affineAttentionMode: selection.affineAttentionMode,
-            kvarnAttentionMode: selection.kvarnAttentionMode)
+            kvarnAttentionMode: selection.kvarnAttentionMode,
+            kvarnStorageDType: selection.kvarnStorageDType)
     }
 
     func affineScoringTelemetry() async -> AffineKVCacheTelemetry? {
@@ -1116,7 +1215,16 @@ struct SwiftEngineDriver: EngineDriver {
         attentionMode: KVarNKVAttentionMode
     ) async -> KVarNKVCacheTelemetry? {
         await engine.kvarnScoringTelemetry(
-            for: cell, attentionMode: attentionMode)
+            for: cell, attentionMode: attentionMode,
+            storageDType: resolvedKVarNStorageDType())
+    }
+
+    private func resolvedKVarNStorageDType() -> KVarNKVScalarDType? {
+        switch compressedKVAttentionAdmission?.modelNativeDType {
+        case .float16: .float16
+        case .bfloat16: .bfloat16
+        case .float32, nil: nil
+        }
     }
 
     /// Validates the whole config and maps `kvQuant` through `KVCacheKind`'s closed affine /
