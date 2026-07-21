@@ -86,6 +86,17 @@ The 8K affine/KVTuner speed gate is now closed negative. The next evidence bound
 long-context runtime and capacity scaling are separate questions. KVarN will be measured there as
 capacity/runtime context only, with no speed label implied.
 
+That 32K boundary failed even earlier: the fp16 control itself could not remain in the declared
+unthrottled cohort. After a full 32K warmup and 60 seconds of continuous nominal thermal state, the
+retained prefill moved the machine from nominal to fair. The harness correctly discarded the row
+and the matrix stopped with no admissible evidence. Its diagnostic timing is not a benchmark
+result.
+
+We will not turn that failure into a claim by accepting a thermal transition, selecting a cooler
+retry, or silently changing the warmup. On this machine, under this contract, 32K speed remains
+unclaimed. Capacity evidence and over-context refusal are different questions and stay in separate
+evidence lanes.
+
 The general lesson is less obvious than “optimize the bottleneck.” Relative speedups are only as
 useful as the baseline they beat. A new path can be fifteen times faster than the implementation it
 replaces and still be three times too slow for the product. Freeze the product gate first, preserve

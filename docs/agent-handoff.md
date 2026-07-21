@@ -133,18 +133,38 @@ negative/dominated evidence: no 8K speed tier or default changes. Continue Qwen 
 runtime/capacity behavior, with KVarN measured separately as capacity-only, then record Qwen's
 authenticated near-128K refusal. Preserve every v7-v12 and trace-v1 boundary unchanged.
 
+The first real loaded Qwen 32K speed boundary is also terminal and must remain unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-a2af840/qwen-32k-v13-five-cell`.
+Manifest SHA-256 `07c6bbb16a6b1e2a636e39692f84fbf4ba3621638f7d25f09a1582210e09930c`
+bound 32,628 prompt tokens plus 128 output tokens, the exact v12 five cells, clean source/binary/
+runner identities, current KVTuner bundle/schedule, and the unchanged 60-second nominal contract.
+The very first fp16 row warmed up at 255.22 prefill tok/s, completed 60.051 seconds of continuous
+nominal admission, then ran at 254.91 prefill and 15.69 decode tok/s while the host changed
+nominal -> fair. The runner correctly emitted zero evidence and zero receipts. Runner-failure,
+bench-log, and runner-log SHA-256 values are
+`5c6798d5f2299c145672d0ac8b053d9cc7db78dff267ad4a86738e2f33bce948`,
+`fb0aac111797ea05122ac26e6b2464f2e63ee0f091bd2ef4fef55c1979f2d9b4`, and
+`2db7afb333e3a1d54081928454c6ea8e6979901c2acb87886e80c6f3f79ba534`.
+Those timings are diagnostic only. Do not retry the full matrix, accept a transition signature, or
+silently change to a fair-state cohort: this bench cannot currently produce promotable Qwen 32K
+speed evidence under the frozen unthrottled contract. Continue with separately authenticated
+capacity-only evidence that cannot imply speed, then the near-128K preallocation refusal and the
+source-locked second family. Preserve every v7-v13 and trace-v1 boundary unchanged.
+
 **Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v12 and the
+1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v13 and the
    failed trace; never resume, overwrite, or promote partial evidence. KVarN's direct speed role is
    SHELVED and its capacity-only role remains. The exact five-cell Qwen 8K matrix completed and
    failed the unchanged all-block speed gate; retain both affine and KVTuner direct cells as
-   negative/dominated 8K evidence. Next run Qwen 32K with the same authenticated speed controls,
-   include a separately authenticated KVarN capacity-only row, and record the authenticated 128K
-   refusal (maximum context 40,960). Then qualify source-locked Llama-3.3-70B at
+   negative/dominated 8K evidence. The first 32K fp16 control failed closed on a retained
+   nominal -> fair transition, so no full 32K speed retry or claim is authorized on this bench
+   under the current unthrottled contract. Collect separately authenticated 32K KVarN
+   capacity-only context that cannot feed a speed label, and record the authenticated 128K refusal
+   (maximum context 40,960). Then qualify source-locked Llama-3.3-70B at
    8K/32K/near-128K without the Qwen-specific KVTuner schedule unless independently calibrated.
    Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support

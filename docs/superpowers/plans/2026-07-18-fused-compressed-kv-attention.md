@@ -563,16 +563,48 @@ evidence. It changes no default and earns no 8K speed tier. Qwen 32K remains req
 long-context scaling is a separate runtime/capacity question; KVarN remains separate capacity-only
 context and cannot enter the speed aggregate.
 
+### Qwen 32K v13 terminal control failure — 2026-07-21
+
+The first current-path loaded 32K matrix is terminal `FAILED` and preserved at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-a2af840/qwen-32k-v13-five-cell`.
+Manifest SHA-256 `07c6bbb16a6b1e2a636e39692f84fbf4ba3621638f7d25f09a1582210e09930c`
+bound clean source `a2af840d6f02c3a9097e4df0372e969d18bd7bc8`, the exact v12 cells and
+5x5 cyclic order, current KVTuner identities, explicit memory/cache/wired limits, and a 32,628-token
+prompt plus 128-token output budget. Launch receipt SHA-256 is
+`aaf1a1743984e3669a802ac000b08a8f6ae36448824aa3df331a4640a16c4404`.
+
+The first fp16 row's dropped warmup completed at 255.22 prefill tok/s and ended nominal. After
+60.051 seconds of continuous nominal admission, the retained 127.999-second prefill ran at
+254.91 tok/s and changed nominal -> fair before the row could authenticate. The runner emitted
+zero evidence and zero receipts; the empty receipt-set digest is
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Runner-failure, bench-log, runner-log, status, and progress SHA-256 values are
+`5c6798d5f2299c145672d0ac8b053d9cc7db78dff267ad4a86738e2f33bce948`,
+`fb0aac111797ea05122ac26e6b2464f2e63ee0f091bd2ef4fef55c1979f2d9b4`,
+`2db7afb333e3a1d54081928454c6ea8e6979901c2acb87886e80c6f3f79ba534`,
+`03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f`, and
+`254346128f679477511dc341f37679e809216b0ed16f8e321589f03f2fbed2fe`.
+
+This failure closes a full 32K speed retry on the current bench under the frozen nominal cohort.
+Longer-cooldown retries risk selection by retry; a fair-state or transition-signature cohort would
+be a different methodology; a shorter warmup would change the measured lifecycle. Preserve v13 as
+non-promotable proof that this hardware cannot currently hold even the fp16 32K control in the
+required unthrottled retained state. Capacity-only bytes/runtime context may proceed through a
+separate evidence lane that cannot enter speed aggregation. The near-128K preallocation refusal
+and second-family gates remain required.
+
 ### Phase 4 — end-to-end Qwen frontier
 
 - [x] Run 8K as the bounded smoke. It completed 25/25 under clean `a2af840`; both direct candidates
   are negative/dominated under the unchanged all-block speed gate.
-- [ ] Run 32K only from the clean verified SHA; record the
-  authenticated 128K refusal because Qwen3-32B max context is 40,960.
+- [x] Attempt 32K only from the clean verified SHA. V13 failed closed on the first fp16 retained
+  nominal -> fair transition with zero evidence/receipts; no speed result or full retry is valid on
+  this bench under the current contract.
+- [ ] Record the authenticated 128K refusal because Qwen3-32B max context is 40,960.
 - [x] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
   KVTuner materialize/direct pairs.
-- [ ] At 32K, retain that speed scope and collect KVarN i8 only as a
-  separate authenticated capacity/runtime-context row with no speed aggregation or label.
+- [ ] At 32K, collect KVarN i8 only as separate authenticated capacity/runtime context with no
+  speed aggregation or label. Do not relaunch the five-cell speed matrix.
 - [ ] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
 
 ### Phase 5 — second family and adjudication
