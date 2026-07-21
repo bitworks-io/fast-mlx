@@ -187,9 +187,10 @@ struct KVTunerCandidateRunResult: Sendable {
     let telemetry: KVTunerCandidateKVCacheTelemetry
 }
 
-/// Integer-only dtype receipt carried through existing engagement artifacts. One-hot markers make
-/// missing/partial evidence distinguishable from every valid dtype without changing historical
-/// CSV columns; the authenticated admission remains the source of the expected storage dtype.
+/// Integer-only dtype receipt carried through existing engagement artifacts. Source markers are
+/// presence bits because legitimate model layers can enter the same authenticated storage path at
+/// different dtypes; storage remains one-hot. Missing/partial evidence stays distinguishable from
+/// every valid receipt without changing historical CSV columns.
 private func kvarnIngressEngagement(
     _ telemetry: KVarNKVCacheTelemetry,
     prefix: String = "kvarn"
@@ -200,17 +201,17 @@ private func kvarnIngressEngagement(
     var counts: [String: Int] = [:]
     func record(
         _ role: String,
-        _ selected: KVarNKVScalarDType
+        _ selected: Set<KVarNKVScalarDType>
     ) {
         for dtype in dtypes {
             counts["\(prefix)_\(role)_\(dtype.rawValue)"] =
-                dtype == selected ? 1 : 0
+                selected.contains(dtype) ? 1 : 0
         }
     }
-    record("source_key", telemetry.sourceKeyDType)
-    record("source_value", telemetry.sourceValueDType)
-    record("storage_key", telemetry.storageKeyDType)
-    record("storage_value", telemetry.storageValueDType)
+    record("source_key", telemetry.sourceKeyDTypes)
+    record("source_value", telemetry.sourceValueDTypes)
+    record("storage_key", [telemetry.storageKeyDType])
+    record("storage_value", [telemetry.storageValueDType])
     counts["\(prefix)_ingress_normalized"] =
         telemetry.ingressNormalizationApplied ? 1 : 0
     counts["\(prefix)_normalization_workspace_bytes"] =

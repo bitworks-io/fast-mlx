@@ -2411,6 +2411,88 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(resetTelemetry.compressedTokens, 0)
     }
 
+    func testTelemetryAggregatesMixedLayerIngressAgainstOneNativeStorageDType()
+        throws
+    {
+        let native = KVarNKVCache(
+            capacity: 257, tier: .k4v2G128, iterations: 8,
+            storageDType: .bfloat16)
+        let promoted = KVarNKVCache(
+            capacity: 257, tier: .k4v2G128, iterations: 8,
+            storageDType: .bfloat16)
+        _ = native.update(
+            keys: MLXArray.zeros([1, 1, 1, 128], dtype: .bfloat16),
+            values: MLXArray.zeros([1, 1, 1, 128], dtype: .bfloat16))
+        _ = promoted.update(
+            keys: MLXArray.zeros([1, 1, 1, 128], dtype: .float32),
+            values: MLXArray.zeros([1, 1, 1, 128], dtype: .float32))
+
+        let nativeSnapshot = try XCTUnwrap(native.storageSnapshot())
+        let promotedSnapshot = try XCTUnwrap(promoted.storageSnapshot())
+        let telemetry = KVarNKVCacheTelemetry.capture(
+            caches: [native, promoted])
+
+        XCTAssertEqual(
+            telemetry.sourceKeyDTypes, [.bfloat16, .float32])
+        XCTAssertEqual(
+            telemetry.sourceValueDTypes, [.bfloat16, .float32])
+        XCTAssertEqual(telemetry.storageKeyDType, .bfloat16)
+        XCTAssertEqual(telemetry.storageValueDType, .bfloat16)
+        XCTAssertTrue(telemetry.ingressNormalizationApplied)
+        XCTAssertEqual(
+            telemetry.payloadBytes,
+            nativeSnapshot.payloadBytes + promotedSnapshot.payloadBytes)
+        XCTAssertEqual(
+            telemetry.totalPersistentBytes,
+            nativeSnapshot.totalPersistentBytes
+                + promotedSnapshot.totalPersistentBytes)
+
+        let highWater = promotedSnapshot.workspaceBytes
+            > nativeSnapshot.workspaceBytes
+            ? promotedSnapshot : nativeSnapshot
+        XCTAssertEqual(
+            telemetry.materializationWorkspaceBytes,
+            highWater.materializationWorkspaceBytes)
+        XCTAssertEqual(
+            telemetry.normalizationWorkspaceBytes,
+            highWater.normalizationWorkspaceBytes)
+        XCTAssertEqual(
+            telemetry.attentionWorkspaceBytes,
+            highWater.attentionWorkspaceBytes)
+        XCTAssertEqual(telemetry.workspaceBytes, highWater.workspaceBytes)
+        XCTAssertEqual(
+            telemetry.workspaceBytes,
+            telemetry.materializationWorkspaceBytes
+                + telemetry.normalizationWorkspaceBytes
+                + telemetry.attentionWorkspaceBytes)
+    }
+
+    func testTelemetryAggregationRejectsMixedPersistentStorageDTypes() throws {
+        let float16 = KVarNKVCache(
+            capacity: 257, tier: .k4v2G128, iterations: 8,
+            storageDType: .float16)
+        let bfloat16 = KVarNKVCache(
+            capacity: 257, tier: .k4v2G128, iterations: 8,
+            storageDType: .bfloat16)
+        _ = float16.update(
+            keys: MLXArray.zeros([1, 1, 1, 128], dtype: .float16),
+            values: MLXArray.zeros([1, 1, 1, 128], dtype: .float16))
+        _ = bfloat16.update(
+            keys: MLXArray.zeros([1, 1, 1, 128], dtype: .bfloat16),
+            values: MLXArray.zeros([1, 1, 1, 128], dtype: .bfloat16))
+        let snapshots = try [float16, bfloat16].map {
+            try XCTUnwrap($0.storageSnapshot())
+        }
+
+        XCTAssertThrowsError(try KVarNKVCacheTelemetry.aggregate(
+            snapshots: snapshots, cachedTokens: 1,
+            completedTileCount: 0)) { error in
+                XCTAssertEqual(
+                    error as? KVarNKVCacheTelemetryError,
+                    .inconsistentStorageDType(layerIndex: 1))
+            }
+    }
+
     func testDecoderExportsOnlyScalarTelemetryForSelectedKVarNRuntimeCell() throws {
         var decoder = CompiledMLXDecoder(
             model: TinyKVarNTelemetryModel(), reserve: 1,

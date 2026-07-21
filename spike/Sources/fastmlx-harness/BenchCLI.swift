@@ -613,8 +613,8 @@ func validateBenchRuntimeEngagement(
             counts["kvarn_codec_iterations"] == cell.iterations
         else { throw BenchCLIError.missingLossyEngagement(tier) }
         if let expectedKVarNStorageDType {
-            func oneHotDType(_ role: String)
-                -> CompressedKVModelNativeDType?
+            func dtypeSet(_ role: String, oneHot: Bool)
+                -> Set<CompressedKVModelNativeDType>?
             {
                 let dtypes: [CompressedKVModelNativeDType] = [
                     .float16, .bfloat16, .float32,
@@ -623,26 +623,33 @@ func validateBenchRuntimeEngagement(
                     counts["kvarn_\(role)_\($0.rawValue)"]
                 }
                 guard markers.allSatisfy({ $0 == 0 || $0 == 1 }),
-                    markers.compactMap({ $0 }).reduce(0, +) == 1,
-                    let index = markers.firstIndex(of: 1)
+                    markers.compactMap({ $0 }).count == dtypes.count
                 else { return nil }
-                return dtypes[index]
+                let selected = Set(zip(dtypes, markers).compactMap {
+                    dtype, marker in marker == 1 ? dtype : nil
+                })
+                guard !selected.isEmpty, !oneHot || selected.count == 1 else {
+                    return nil
+                }
+                return selected
             }
-            let sourceKey = oneHotDType("source_key")
-            let sourceValue = oneHotDType("source_value")
-            let storageKey = oneHotDType("storage_key")
-            let storageValue = oneHotDType("storage_value")
+            let sourceKey = dtypeSet("source_key", oneHot: false)
+            let sourceValue = dtypeSet("source_value", oneHot: false)
+            let storageKey = dtypeSet("storage_key", oneHot: true)
+            let storageValue = dtypeSet("storage_value", oneHot: true)
+            let expectedStorage = Set([expectedKVarNStorageDType])
             let normalized = counts["kvarn_ingress_normalized"]
             let normalizationWorkspace =
                 counts["kvarn_normalization_workspace_bytes"]
             guard expectedKVarNStorageDType != .float32,
-                sourceKey != nil,
+                let sourceKey,
                 sourceKey == sourceValue,
-                sourceKey == expectedKVarNStorageDType
-                    || sourceKey == .float32,
-                storageKey == expectedKVarNStorageDType,
-                storageValue == expectedKVarNStorageDType,
-                normalized == (sourceKey == storageKey ? 0 : 1),
+                sourceKey.allSatisfy({
+                    $0 == expectedKVarNStorageDType || $0 == .float32
+                }),
+                storageKey == expectedStorage,
+                storageValue == expectedStorage,
+                normalized == (sourceKey == expectedStorage ? 0 : 1),
                 normalizationWorkspace != nil,
                 (normalized == 1
                     ? normalizationWorkspace! > 0

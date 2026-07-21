@@ -793,9 +793,22 @@ public struct KVarNKVCacheStorageSnapshot: Equatable, Sendable {
     }
 }
 
+enum KVarNKVCacheTelemetryError: Error, Equatable, Sendable {
+    case emptySnapshots
+    case inconsistentLayerGeometry(layerIndex: Int)
+    case inconsistentStorageDType(layerIndex: Int)
+    case inconsistentAttentionOperation(layerIndex: Int)
+    case invalidIngressDType(layerIndex: Int)
+    case inconsistentWorkspace(layerIndex: Int)
+    case invalidCompressionState
+    case byteCountOverflow
+}
+
 /// Actor-safe scalar telemetry aggregated from every KVarN layer cache after a run. Persistent
-/// terms sum all layers; materialization is one layer's sequential K/V output pair. Transient
-/// float32 codec scratch remains a separately measured promotion prerequisite.
+/// terms sum all layers; source dtype sets preserve legitimate layer-to-layer ingress variation,
+/// while storage dtype remains one authenticated model-native contract. Workspace components are
+/// copied from the same highest-workspace layer because layers execute sequentially. Transient
+/// codec scratch remains a separately measured promotion prerequisite.
 public struct KVarNKVCacheTelemetry: Equatable, Sendable {
     public let tier: KVarNKVTier
     public let iterations: Int
@@ -811,8 +824,8 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
     public let sequences: Int
     public let kvHeadCount: Int
     public let headDimension: Int
-    public let sourceKeyDType: KVarNKVScalarDType
-    public let sourceValueDType: KVarNKVScalarDType
+    public let sourceKeyDTypes: Set<KVarNKVScalarDType>
+    public let sourceValueDTypes: Set<KVarNKVScalarDType>
     public let storageKeyDType: KVarNKVScalarDType
     public let storageValueDType: KVarNKVScalarDType
     public let ingressNormalizationApplied: Bool
@@ -851,33 +864,6 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
             }
             return snapshot
         }
-        let first = snapshots[0]
-        precondition(
-            snapshots.dropFirst().allSatisfy {
-                $0.tier == first.tier
-                    && $0.iterations == first.iterations
-                    && $0.capacityTokens == first.capacityTokens
-                    && $0.packedTileSlots == first.packedTileSlots
-                    && $0.sequences == first.sequences
-                    && $0.kvHeadCount == first.kvHeadCount
-                    && $0.headDimension == first.headDimension
-                    && $0.sourceKeyDType == first.sourceKeyDType
-                    && $0.sourceValueDType == first.sourceValueDType
-                    && $0.storageKeyDType == first.storageKeyDType
-                    && $0.storageValueDType == first.storageValueDType
-                    && $0.ingressNormalizationApplied
-                        == first.ingressNormalizationApplied
-                    && $0.metadataScalarBytes == first.metadataScalarBytes
-                    && $0.materializationWorkspaceBytes
-                        == first.materializationWorkspaceBytes
-                    && $0.normalizationWorkspaceBytes
-                        == first.normalizationWorkspaceBytes
-                    && $0.attentionWorkspaceBytes
-                        == first.attentionWorkspaceBytes
-                    && $0.workspaceBytes == first.workspaceBytes
-                    && $0.attentionOperation == first.attentionOperation
-            },
-            "KVarN layer-cache geometry is inconsistent")
         let cachedTokens = Int(caches[0].offsetArr.item(Int32.self))
         let completedTileCount = caches[0].completedTileCount
         precondition(
@@ -886,19 +872,116 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
                     && $0.completedTileCount == completedTileCount
             },
             "KVarN layer-cache compression state is inconsistent")
+        do {
+            return try aggregate(
+                snapshots: snapshots, cachedTokens: cachedTokens,
+                completedTileCount: completedTileCount)
+        } catch {
+            preconditionFailure("KVarN telemetry is inconsistent: \(error)")
+        }
+    }
+
+    static func aggregate(
+        snapshots: [KVarNKVCacheStorageSnapshot], cachedTokens: Int,
+        completedTileCount: Int
+    ) throws -> KVarNKVCacheTelemetry {
+        guard let first = snapshots.first else {
+            throw KVarNKVCacheTelemetryError.emptySnapshots
+        }
+        guard cachedTokens >= 0, completedTileCount >= 0 else {
+            throw KVarNKVCacheTelemetryError.invalidCompressionState
+        }
+
+        for (layerIndex, snapshot) in snapshots.enumerated() {
+            guard snapshot.tier == first.tier,
+                snapshot.iterations == first.iterations,
+                snapshot.capacityTokens == first.capacityTokens,
+                snapshot.packedTileSlots == first.packedTileSlots,
+                snapshot.sequences == first.sequences,
+                snapshot.kvHeadCount == first.kvHeadCount,
+                snapshot.headDimension == first.headDimension,
+                snapshot.metadataScalarBytes == first.metadataScalarBytes
+            else {
+                throw KVarNKVCacheTelemetryError.inconsistentLayerGeometry(
+                    layerIndex: layerIndex)
+            }
+            guard snapshot.storageKeyDType == first.storageKeyDType,
+                snapshot.storageValueDType == first.storageValueDType,
+                snapshot.storageKeyDType == snapshot.storageValueDType,
+                snapshot.storageKeyDType.isNative16Bit
+            else {
+                throw KVarNKVCacheTelemetryError.inconsistentStorageDType(
+                    layerIndex: layerIndex)
+            }
+            guard snapshot.attentionOperation == first.attentionOperation else {
+                throw KVarNKVCacheTelemetryError.inconsistentAttentionOperation(
+                    layerIndex: layerIndex)
+            }
+            let normalized = snapshot.sourceKeyDType != snapshot.storageKeyDType
+                || snapshot.sourceValueDType != snapshot.storageValueDType
+            guard snapshot.sourceKeyDType == snapshot.sourceValueDType,
+                snapshot.sourceKeyDType == snapshot.storageKeyDType
+                    || snapshot.sourceKeyDType == .float32,
+                snapshot.ingressNormalizationApplied == normalized,
+                normalized
+                    ? snapshot.normalizationWorkspaceBytes > 0
+                    : snapshot.normalizationWorkspaceBytes == 0
+            else {
+                throw KVarNKVCacheTelemetryError.invalidIngressDType(
+                    layerIndex: layerIndex)
+            }
+            let workspaceComponents = [
+                snapshot.materializationWorkspaceBytes,
+                snapshot.normalizationWorkspaceBytes,
+                snapshot.attentionWorkspaceBytes,
+            ]
+            guard workspaceComponents.allSatisfy({ $0 >= 0 }) else {
+                throw KVarNKVCacheTelemetryError.inconsistentWorkspace(
+                    layerIndex: layerIndex)
+            }
+            var workspaceTotal = 0
+            for component in workspaceComponents {
+                let (next, overflow) = workspaceTotal.addingReportingOverflow(
+                    component)
+                guard !overflow else {
+                    throw KVarNKVCacheTelemetryError.byteCountOverflow
+                }
+                workspaceTotal = next
+            }
+            guard workspaceTotal == snapshot.workspaceBytes else {
+                throw KVarNKVCacheTelemetryError.inconsistentWorkspace(
+                    layerIndex: layerIndex)
+            }
+        }
+
+        let highWater = snapshots.dropFirst().reduce(first) { current, candidate in
+            candidate.workspaceBytes > current.workspaceBytes ? candidate : current
+        }
+        let normalizationObserved = snapshots.contains(
+            where: \.ingressNormalizationApplied)
+        guard highWater.ingressNormalizationApplied == normalizationObserved else {
+            throw KVarNKVCacheTelemetryError.inconsistentWorkspace(
+                layerIndex: snapshots.firstIndex(of: highWater) ?? 0)
+        }
         let (compressedTokens, compressedTokensOverflow) = completedTileCount
             .multipliedReportingOverflow(by: first.tier.groupSize)
-        precondition(
-            !compressedTokensOverflow,
-            "KVarN compressed-token telemetry overflow")
+        guard !compressedTokensOverflow else {
+            throw KVarNKVCacheTelemetryError.byteCountOverflow
+        }
 
-        func sum(_ values: [Int]) -> Int {
-            values.reduce(into: 0) { result, value in
+        func sum(_ values: [Int]) throws -> Int {
+            try values.reduce(into: 0) { result, value in
+                guard value >= 0 else {
+                    throw KVarNKVCacheTelemetryError.byteCountOverflow
+                }
                 let (next, overflow) = result.addingReportingOverflow(value)
-                precondition(!overflow, "KVarN telemetry byte count overflow")
+                guard !overflow else {
+                    throw KVarNKVCacheTelemetryError.byteCountOverflow
+                }
                 result = next
             }
         }
+
         return KVarNKVCacheTelemetry(
             tier: first.tier, iterations: first.iterations,
             // A bare cache has no authority to claim its caller compiled the model step. The
@@ -908,28 +991,31 @@ public struct KVarNKVCacheTelemetry: Equatable, Sendable {
             cachedTokens: cachedTokens,
             completedTileCount: completedTileCount,
             compressedTokens: compressedTokens,
-            layerCount: caches.count,
+            layerCount: snapshots.count,
             capacityTokens: first.capacityTokens,
             packedTileSlots: first.packedTileSlots,
             sequences: first.sequences, kvHeadCount: first.kvHeadCount,
             headDimension: first.headDimension,
-            sourceKeyDType: first.sourceKeyDType,
-            sourceValueDType: first.sourceValueDType,
+            sourceKeyDTypes: Set(snapshots.map(\.sourceKeyDType)),
+            sourceValueDTypes: Set(snapshots.map(\.sourceValueDType)),
             storageKeyDType: first.storageKeyDType,
             storageValueDType: first.storageValueDType,
             ingressNormalizationApplied:
-                first.ingressNormalizationApplied,
+                highWater.ingressNormalizationApplied,
             metadataScalarBytes: first.metadataScalarBytes,
-            payloadBytes: sum(snapshots.map(\.payloadBytes)),
-            metadataBytes: sum(snapshots.map(\.metadataBytes)),
-            alignmentPaddingBytes: sum(snapshots.map(\.alignmentPaddingBytes)),
-            fp16SinkBytes: sum(snapshots.map(\.fp16SinkBytes)),
-            fp16TailBytes: sum(snapshots.map(\.fp16TailBytes)),
-            controlBytes: sum(snapshots.map(\.controlBytes)),
-            materializationWorkspaceBytes: first.materializationWorkspaceBytes,
-            normalizationWorkspaceBytes: first.normalizationWorkspaceBytes,
-            attentionWorkspaceBytes: first.attentionWorkspaceBytes,
-            workspaceBytes: first.workspaceBytes,
+            payloadBytes: try sum(snapshots.map(\.payloadBytes)),
+            metadataBytes: try sum(snapshots.map(\.metadataBytes)),
+            alignmentPaddingBytes: try sum(
+                snapshots.map(\.alignmentPaddingBytes)),
+            fp16SinkBytes: try sum(snapshots.map(\.fp16SinkBytes)),
+            fp16TailBytes: try sum(snapshots.map(\.fp16TailBytes)),
+            controlBytes: try sum(snapshots.map(\.controlBytes)),
+            materializationWorkspaceBytes:
+                highWater.materializationWorkspaceBytes,
+            normalizationWorkspaceBytes:
+                highWater.normalizationWorkspaceBytes,
+            attentionWorkspaceBytes: highWater.attentionWorkspaceBytes,
+            workspaceBytes: highWater.workspaceBytes,
             attentionOperation: first.attentionOperation)
     }
 }

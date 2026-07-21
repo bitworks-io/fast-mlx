@@ -912,6 +912,78 @@ final class BenchCLITests: XCTestCase {
             JSONSerialization.data(withJSONObject: impossibleTransition)))
     }
 
+    func testTypedQualificationValidatorAcceptsKVarNMultiHotSourceDTypes()
+        throws
+    {
+        var row = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        for role in ["key", "value"] {
+            engagement["kvarn_source_\(role)_float16"] = 0
+            engagement["kvarn_source_\(role)_bfloat16"] = 1
+            engagement["kvarn_source_\(role)_float32"] = 1
+        }
+        payload["engagementMax"] = engagement
+        row["payload"] = payload
+
+        XCTAssertNoThrow(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: row)))
+    }
+
+    func testTypedQualificationValidatorRejectsImpossibleKVarNMultiHotSourceTransition()
+        throws
+    {
+        var row = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        for role in ["key", "value"] {
+            engagement["kvarn_source_\(role)_float16"] = 1
+            engagement["kvarn_source_\(role)_bfloat16"] = 0
+            engagement["kvarn_source_\(role)_float32"] = 1
+        }
+        payload["engagementMax"] = engagement
+        row["payload"] = payload
+
+        XCTAssertThrowsError(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: row)))
+    }
+
+    func testTypedQualificationValidatorRejectsMissingKVarNSourceDTypeMarkers()
+        throws
+    {
+        var missing = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        var payload = try XCTUnwrap(missing["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement.removeValue(forKey: "kvarn_source_key_bfloat16")
+        payload["engagementMax"] = engagement
+        missing["payload"] = payload
+
+        XCTAssertThrowsError(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: missing)))
+
+        var zeroSelected = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        payload = try XCTUnwrap(zeroSelected["payload"] as? [String: Any])
+        engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        for role in ["key", "value"] {
+            engagement["kvarn_source_\(role)_float16"] = 0
+            engagement["kvarn_source_\(role)_bfloat16"] = 0
+            engagement["kvarn_source_\(role)_float32"] = 0
+        }
+        payload["engagementMax"] = engagement
+        zeroSelected["payload"] = payload
+
+        XCTAssertThrowsError(try validateBenchQualificationEvidenceData(
+            JSONSerialization.data(withJSONObject: zeroSelected)))
+    }
+
     private func qualificationValidationRow(
         kvQuantTier: String = "affine-k4v2-g64"
     ) throws -> [String: Any] {
