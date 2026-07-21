@@ -390,10 +390,10 @@ correctly refused to admit a matrix. These terminal boundaries are preserved unc
 promotion evidence. Workload-only preheating is closed; per-run or cross-row thermal equality was
 not weakened.
 
-Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` implements the narrower causal contract:
+Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` implemented the first narrower causal contract:
 
 - qualification manifests require post-warmup target `nominal`, a bounded timeout, and poll
-  interval; the current Qwen matrix freezes 600 seconds and 1,000 ms;
+  interval; v10 froze 600 seconds and 1,000 ms;
 - the dropped warmup now has an authenticated before/after receipt and may move only between safe
   nominal/fair states on AC power with Low Power Mode off;
 - after warmup, the harness waits for an exact nominal admission snapshot before retained work;
@@ -410,11 +410,41 @@ focused re-review, shellcheck, diff/banned-pattern checks, and gitleaks. The cle
 SHA-256 is `19f66d67d689fc3e6dc8e8a158b97224a4f76fe890cefb63cedc08c7b1450ec4`; runner SHA-256 is
 `ff429bdc4fefd380c1dbcbbef936701879b91e43abb90af7966dc6c1b005d4b3`.
 
-The fresh v10 Qwen 8K matrix uses the unchanged 7-cell and 7-block cyclic Latin square under
-manifest SHA-256 `353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`.
-It is the only active loaded-Qwen qualification boundary. Completion still requires all 49 exact
-rows and receipts, seven stable blocks, independently rederived hashes, and the original direct
-decode/prefill gates; this thermal repair itself makes no speed claim.
+V10 is the fourth immutable failed thermal boundary. It used the unchanged 7-cell and 7-block
+cyclic Latin square under manifest SHA-256
+`353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1` and stopped after 5/49
+authenticated rows at block 0, position 5, `affine-k4v2-g64-materialize`. The admitted snapshot
+was nominal, but the thermal state changed during retained measurement. A point-in-time nominal
+snapshot was therefore insufficient to establish a stable retained cohort. Preserve v10 unchanged; its terminal
+status SHA-256 is `03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f` and its rejected partial
+receipt-set SHA-256 is `2c8c9b1e2b7dc24f70bdb9935f9bcbdb9ad73efd06a249809dbb5906fa6f2889`.
+
+Clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5` implements the recovery contract:
+
+- fresh runner manifests use schema v3 and bind a positive continuous stability duration in
+  addition to target, timeout, and poll; the next smoke freezes 60 seconds;
+- evidence schema v4 authenticates at least two strictly monotonic nominal/AC/non-low-power
+  observations, resets the dwell on safe non-target state, requires the last observation to equal
+  admission, and proves the sampled interval meets the frozen duration;
+- serious, critical, unknown, power drift, malformed timing, and timeout still fail closed, and
+  retained before/after equality remains exact;
+- hash-bound runner-failure schema v1 records the source/binary/runner/manifest/model/row/policy,
+  log/evidence, and retained before/after diagnostic with `promotable:false`; it never enters the
+  promotion receipt set;
+- parent artifacts are published atomically through authenticated boundaries so hostile child
+  unlink, symlink, future-directory, aggregate, PID, or output-root replacement cannot create
+  promotable or out-of-boundary evidence.
+
+Fresh recovery proof passes 519 HarnessCore XCTest plus 17 Swift Testing tests off-box, 95/95
+FastMLXHarnessTests and 155/155 SpikeCoreTests through Xcode with
+`-skipPackagePluginValidation` on the bench, the Release build, two final no-issue reviews,
+ShellCheck, diff checks, and staged gitleaks. The clean binary SHA-256 is
+`cfe029ad2138013a5904e6afd2475a881081a37bcf89db25bfbb91abf8484397`; runner SHA-256 is
+`e2f6e55bb0aeae6b1ec585f6d0d3c85b13c00879e13ed2a0fa3826ee074f8c0f`.
+
+There is no active replacement matrix. First run a fresh clean-SHA 60-second-dwell
+preflight/smoke. Only an independently authenticated preflight can authorize a new fresh-output
+49-row matrix; the original direct decode and prefill gates remain unchanged.
 
 ### Phase 4 — end-to-end Qwen frontier
 

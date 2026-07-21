@@ -403,6 +403,11 @@ must not be mistaken for a loaded-model speed or dial-promotion result.
 | Review and repository safety | **PASS** | Two focused reviews report no remaining High/Medium findings after exact-reference fixes. `git diff --check`, banned isolation/machine-path/key-marker scans, and commit-scoped gitleaks pass; the commit retains the required co-author trailer. |
 | Loaded-model speed, quality, and cross-family promotion | **PENDING** | KVarN i8 still materializes and needs its own direct packed-attention proof. Exact-source KVTuner requalification is in progress. Qwen 8K/32K plus 128K refusal, Llama 8K/32K/near-128K, TTFT/TPOT, task floor, teacher-forced loss, capacity, and same-workload speed remain unmeasured for this implementation. |
 
+**2026-07-21 supersession:** exact-source KVTuner requalification subsequently completed, and
+the loaded-Qwen direct-KVarN smoke completed 3/3 with all 64 layers engaged and zero
+materialization. The table above remains the immutable dated 2026-07-19 acceptance packet rather
+than being rewritten after the fact.
+
 **Fresh requalification boundary:** schema-v2 KVTuner manifest SHA-256
 `e8b069cafb697a332325def638effdaf8f56b9bc62d2139b2c7dc2aba1719a5f` binds checkpoint-content
 SHA-256 `636f358d4f51c9394400fa46ef684b918e45c14d369d95df0399c80abc8a09d9`.
@@ -424,12 +429,13 @@ thermal transition or weakening per-run and cross-row equality.
 
 | Acceptance criterion | Verdict | Fresh evidence |
 | --- | --- | --- |
-| Failed preheat boundaries remain immutable | **PASS** | Qwen v7 is terminal `INVALID_BLOCK_ENVIRONMENT`; v8 materialize and v9 direct are terminal `PRECONDITION_NOT_FAIR`. The v9 runner completed three authenticated direct-KVarN rows with completion SHA-256 `db82657686a438d1d63836acdd79c12cea5f4b03bcf750ab275143919d03336a` and receipt-set SHA-256 `fb9703b8155b294ccced6d8719c0038e0a858e5c36985a8b35a34f07c2881a41`; all three environments were identical nominal/AC/non-low-power. No v9 matrix or admission artifact exists. |
-| Warmup and admission are explicit | **PASS** | Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` records warmup before/after and the exact post-warmup admission snapshot. Qualification accepts retained work only at manifest-bound nominal/AC/non-low-power; unsafe/unknown thermal state, power drift, invalid timestamps, missing evidence, and timeout fail closed. |
-| Policy and timing are authenticated end to end | **PASS** | Manifest schema v2 requires target, timeout, and poll. Evidence schema v3 binds policy, warmup, admission, retained order, and admission delay within timeout. CLI, runner row validation, progress, receipts, block completion, and matrix completion carry the same policy. Historical evidence schema v2 remains readable but cannot claim the new contract. |
-| Clean-SHA automated proof | **PASS** | Off-box `swift test --package-path spike --filter HarnessCoreTests` passes 506 XCTest plus 17 Swift Testing tests. On the synced clean SHA, Xcode with `-skipPackagePluginValidation` passes 93/93 `FastMLXHarnessTests` and 155/155 `SpikeCoreTests`; the Release build succeeds. The pure log SHA-256 is `5915906266f1c2c7a08ec3a9e8e6c36d0d0b85c88affcc5a15cd2e6d8177399a`. The Xcode binary SHA-256 is `19f66d67d689fc3e6dc8e8a158b97224a4f76fe890cefb63cedc08c7b1450ec4`; runner SHA-256 is `ff429bdc4fefd380c1dbcbbef936701879b91e43abb90af7966dc6c1b005d4b3`. |
-| Review and repository safety | **PASS** | Failing-first tests caught missing schema/CLI plumbing, unbounded admission delay, runner timeout mismatch, and non-divisible polling overshoot. Focused re-review reports no issue. Shell syntax, shellcheck, diff checks, banned concurrency/machine-path scans, and commit-scoped gitleaks pass. |
-| Loaded Qwen 8K speed adjudication | **PENDING** | The fresh 49-row v10 matrix is running under manifest SHA-256 `353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`, unchanged cells SHA-256 `7db3e38b473bcfa746c2b8bc801f121b51b74eba895a793e6a2f1d2f232863c7`, and blocks SHA-256 `4870adbcfc2bb8f97aa8a124ea530f3f3ca94c185745bf23a8638d8af0df77fd`. No speed tier is promoted until all rows, receipts, blocks, environments, and direct-vs-materialize/fp16 gates pass. |
+| Failed thermal boundaries remain immutable | **PASS** | Qwen v7 is terminal `INVALID_BLOCK_ENVIRONMENT`; v8 materialize and v9 direct are terminal `PRECONDITION_NOT_FAIR`. V10 is terminal `FAILED` after 5/49 authenticated rows at block 0, position 5, `affine-k4v2-g64-materialize`, when point-in-time nominal admission did not survive retained measurement. V10 manifest SHA-256 is `353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`, status SHA-256 is `03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f`, and rejected partial receipt-set SHA-256 is `2c8c9b1e2b7dc24f70bdb9935f9bcbdb9ad73efd06a249809dbb5906fa6f2889`. None may be resumed, overwritten, or promoted. |
+| Warmup and continuous admission are explicit | **PASS** | Clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5` retains the authenticated warmup and requires a positive manifest-bound continuous nominal/AC/non-low-power dwell before retained work. Safe non-target state resets the dwell; serious, critical, unknown, power drift, malformed timestamps, and timeout fail closed. Retained before/after equality is unchanged. |
+| Policy and timing are authenticated end to end | **PASS** | Fresh runner manifest schema v3 requires target, timeout, poll, and positive stability duration. Evidence schema v4 requires at least two strictly monotonic target-state observations, binds the first observation after warmup, proves the interval meets the frozen dwell, and requires the last observation to equal the admission snapshot. Evidence v3 remains readable as instantaneous-admission compatibility and v2 remains legacy-readable only. CLI, row validation, progress, receipts, block completion, and matrix completion bind the same policy. |
+| Failure evidence is explicit and non-promotable | **PASS** | Runner-failure schema v1 binds exact source, binary, runner, manifest, model, row, policy, log and optional-evidence hashes, and embeds the validated retained before/after diagnostic with `promotable:false`. It is never appended to the promotion receipt set. Parent-owned artifacts use randomized atomic publication and authenticated directory/file identities; adversarial child symlink, unlink, duplicate-diagnostic, future-run, aggregate, PID, and output-root replacement paths fail closed. |
+| Clean-SHA automated proof | **PASS** | Off-box `swift test --package-path spike --filter HarnessCoreTests` passes 519 XCTest plus 17 Swift Testing tests; pure log SHA-256 is `d9712cf2183166f392a7bfda6c669f4d09b3db8a5103166b0acfe3bc96ae7139`. On synced clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5`, Xcode with `-skipPackagePluginValidation` passes 95/95 `FastMLXHarnessTests` and 155/155 `SpikeCoreTests`; the Release build succeeds. Binary SHA-256 is `cfe029ad2138013a5904e6afd2475a881081a37bcf89db25bfbb91abf8484397`, runner SHA-256 is `e2f6e55bb0aeae6b1ec585f6d0d3c85b13c00879e13ed2a0fa3826ee074f8c0f`, Xcode log SHA-256 is `090534e0ae5f3c9f36a6b4917079defb757f0d6cc8bfba270a659d88578b0376`, and Release log SHA-256 is `fd1d87c09187f2c3187a5bc02d91e82997d1b7f9e9da573ad9d027f8e28d1876`. |
+| Review and repository safety | **PASS** | Two independent final reviews report no issues after output-root and parent-artifact hardening. Shell syntax, ShellCheck, diff checks, the 36-test loaded-runner suite, and staged gitleaks pass. The code commit carries the required co-author trailer. |
+| Loaded Qwen 8K speed adjudication | **PENDING** | V10's five authenticated rows are partial diagnostic evidence only. No replacement matrix is active and no speed tier is promoted. The next boundary is a fresh clean-SHA preflight/smoke with a frozen 60-second continuous nominal dwell; a new 49-row matrix may launch only if the preflight independently authenticates. |
 
 **Verification artifact note:** the Xcode tests and Release build succeeded. Their first evidence
 wrapper assumed a SwiftPM product path after the Xcode build; a second receipt command then left a
@@ -437,9 +443,11 @@ zero-byte placeholder when its shell envelope failed. Both failures are preserve
 `COMPLETE_WITH_ARTIFACT_FINALIZATION_RECOVERY` record only hashes the already-built Xcode product
 and reruns no test or build; recovery-record SHA-256 is
 `696c9793ad7848fb70ef7bc70755c8ff2533121d83a236232b5f5ba2e090f37d`.
-The code commit's intended co-author line was written with literal escaped separators, so Git does
-not parse it as a trailer. That evidence-bound SHA is deliberately not rewritten while v10 runs;
-this documentation commit carries the correctly parsed trailer and records the exception.
+The earlier code commit's intended co-author line was written with literal escaped separators, so
+Git does not parse it as a trailer. That historical evidence-bound SHA remains unchanged; later
+recovery commits carry the correctly parsed trailer and record the exception rather than rewriting
+old evidence.
 
-**Overall verdict:** the post-warmup nominal admission contract passes implementation and clean-SHA
-verification. Loaded Qwen performance promotion remains pending the complete v10 matrix.
+**Overall verdict:** continuous post-warmup nominal admission passes implementation, review, pure
+verification, MLX-coupled Xcode verification, and Release build. Loaded Qwen performance promotion
+remains pending a fresh authenticated preflight and subsequent complete matrix.

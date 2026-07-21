@@ -58,23 +58,37 @@ not create a stable fair cohort and must not be resumed or promoted.
 
 Clean `b1289b783c1e156355a24c5db5f0e9b150a1cb3b` now records the dropped warmup and requires a
 bounded post-warmup nominal/AC/non-low-power admission before every retained qualification row.
-The schema-v2 runner manifest binds a 600-second timeout and 1,000-ms poll; evidence schema v3
-binds warmup, admission, retained timestamps, and the unchanged cross-row environment contract,
-while historical evidence schema v2 remains readable. The fresh 7-cell x 7-block Qwen 8K v10
-matrix is active under manifest SHA-256
-`353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`. It is the only active
-loaded qualification boundary. No speed tier exists until all 49 rows authenticate and pass the
-same-storage/fp16 speed and prefill gates.
+The resulting v10 matrix is terminal `FAILED` and preserved unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-cf3248b/qwen-8k-v10-nominal`.
+It stopped after 5/49 authenticated rows at block 0, position 5,
+`affine-k4v2-g64-materialize`, because point-in-time nominal admission did not survive the
+retained measurement. Its immutable manifest SHA-256 is
+`353820692294f408ddae91e7f3b7d1522604ea77e40646c6a45d812af44434e1`, terminal status SHA-256 is
+`03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f`, and rejected partial
+receipt-set SHA-256 is `2c8c9b1e2b7dc24f70bdb9935f9bcbdb9ad73efd06a249809dbb5906fa6f2889`.
+Those five rows are diagnostic only and cannot promote a cell or speed tier.
+
+Clean `d4102e6a3029b161d99ee27aceabbad8d5696fb5` adds a manifest-bound continuous stability dwell
+and hash-bound, non-promotable failure receipts. Fresh runner manifests use schema v3 and require a
+positive dwell no longer than the timeout. Evidence schema v4 authenticates the ordered
+nominal/AC/non-low-power observation window, while evidence v3 remains readable as
+instantaneous-admission compatibility and v2 remains legacy-readable only. It passes 519
+HarnessCore XCTest plus 17 Swift Testing tests off-box, 95/95 FastMLXHarnessTests and 155/155
+SpikeCoreTests through Xcode on llmbench, Release build, two final no-issue reviews, ShellCheck,
+and staged gitleaks. The next Qwen boundary is a fresh clean-SHA preflight/smoke with a frozen
+60-second continuous nominal dwell. No loaded 49-row matrix is active, and a replacement may
+launch only after that preflight authenticates.
 
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Monitor only the fresh Qwen
-   8K v10 matrix described above; never duplicate it. On completion independently authenticate 49
-   rows/receipts, seven blocks, exact source/binary/runner/model/tokenizer/checkpoint/KVTuner/policy
-   bindings, and a nominal/AC/non-low-power retained environment for every row. A direct path must
+1. **Fused compressed-domain KV attention** — current top engine gate. Run only the fresh
+   clean-`d4102e6` 60-second continuous-nominal preflight/smoke. Never resume or overwrite v7-v10.
+   If and only if the preflight independently
+   authenticates its exact source/binary/runner/model/tokenizer/checkpoint/policy and retained
+   environment bindings, launch a fresh-output 7-cell x 7-block Qwen 8K matrix. A direct path must
    beat both same-storage materialize and fp16 decode by at least 5%, with prefill regression within
    5%; preserve dominated and failed cells. Then run Qwen 32K, record the authenticated 128K refusal
    (maximum context 40,960), and qualify source-locked Llama-3.3-70B at 8K/32K/near-128K without the
