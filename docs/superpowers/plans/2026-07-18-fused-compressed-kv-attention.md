@@ -593,6 +593,25 @@ required unthrottled retained state. Capacity-only bytes/runtime context may pro
 separate evidence lane that cannot enter speed aggregation. The near-128K preallocation refusal
 and second-family gates remain required.
 
+### Qwen near-128K v15/v16 authenticated refusal — 2026-07-21
+
+Preserve v15 as a fresh-output launcher-contract failure. Its mismatched affine `cell-id` failed
+before tokenization and emitted no evidence; failure/log/time SHA-256 values are
+`9d8d1df8cf2749fca445367fa3950fd6b80ed8d77079d3c0e78b76bf8da45451`,
+`5aac09ba9d95e38088a5cb6ef14d82616e0bc241ed882ddc97f78700557af934`, and
+`4a7662abf9776ff93d33370c64b372b9936abbb94bba2595d67c4fd4c21d7276`.
+
+V16 changed only the tier identity under a new nonce/output. Manifest SHA-256
+`ecbfc323b1cd13537968f854fa18c9cff02f90f24af53623500ffe53a500587d` and launcher SHA-256
+`a7a844a77b29493cae452d82af53adf7e59752a9d62b929966a5a21b945e2d27` produced independently
+authenticated `EXPECTED_REFUSAL` status SHA-256
+`847f316fd0a906cfb8bd637cf86355670d68fa63e82d34c864f7566d48ca442f`.
+The compressed preflight counted 130,911 input tokens, bound a 128-token output budget, and refused
+the 131,039-token request against the checkpoint-authenticated 40,960-token context limit before
+driver/model/KV allocation. Exit was 1, maximum RSS was 18,584,862,720 bytes, no warmup/retained
+forward or evidence occurred, and no process/lock remains. This is a context-safety acceptance
+result, not performance evidence.
+
 ### Phase 4 — end-to-end Qwen frontier
 
 - [x] Run 8K as the bounded smoke. It completed 25/25 under clean `a2af840`; both direct candidates
@@ -600,7 +619,8 @@ and second-family gates remain required.
 - [x] Attempt 32K only from the clean verified SHA. V13 failed closed on the first fp16 retained
   nominal -> fair transition with zero evidence/receipts; no speed result or full retry is valid on
   this bench under the current contract.
-- [ ] Record the authenticated 128K refusal because Qwen3-32B max context is 40,960.
+- [x] Record the authenticated near-128K refusal because Qwen3-32B max context is 40,960. V16
+  refused 130,911+128 before driver/model/KV allocation; v15 remains preserved fail-closed evidence.
 - [x] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
   KVTuner materialize/direct pairs.
 - [ ] At 32K, collect KVarN i8 only as separate authenticated capacity/runtime context with no

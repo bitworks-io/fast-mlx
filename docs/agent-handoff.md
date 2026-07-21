@@ -148,8 +148,32 @@ bench-log, and runner-log SHA-256 values are
 Those timings are diagnostic only. Do not retry the full matrix, accept a transition signature, or
 silently change to a fair-state cohort: this bench cannot currently produce promotable Qwen 32K
 speed evidence under the frozen unthrottled contract. Continue with separately authenticated
-capacity-only evidence that cannot imply speed, then the near-128K preallocation refusal and the
-source-locked second family. Preserve every v7-v13 and trace-v1 boundary unchanged.
+capacity-only evidence that cannot imply speed and then the source-locked second family. Preserve
+every v7-v13 and trace-v1 boundary unchanged.
+
+The Qwen near-128K refusal is now authenticated. Preserve the first fresh boundary,
+`qwen-near128k-v15-refusal`, as terminal non-promotable launcher-contract evidence: it exited before
+tokenization because `cell-id` did not match the executed affine tier. Its failure, refusal-log, and
+time-log SHA-256 values are
+`9d8d1df8cf2749fca445367fa3950fd6b80ed8d77079d3c0e78b76bf8da45451`,
+`5aac09ba9d95e38088a5cb6ef14d82616e0bc241ed882ddc97f78700557af934`, and
+`4a7662abf9776ff93d33370c64b372b9936abbb94bba2595d67c4fd4c21d7276`; it emitted no evidence.
+The one-hypothesis fresh v16 packet corrected only that identity. Manifest SHA-256
+`ecbfc323b1cd13537968f854fa18c9cff02f90f24af53623500ffe53a500587d` produced terminal
+`EXPECTED_REFUSAL` status SHA-256
+`847f316fd0a906cfb8bd637cf86355670d68fa63e82d34c864f7566d48ca442f`. The compressed preflight
+authenticated 130,911 prompt tokens plus a 128-token output budget and rejected the 131,039-token
+request against the checkpoint-bound 40,960-token limit before driver/model/KV allocation. Child
+exit was 1, maximum RSS was 18,584,862,720 bytes, no warmup/retained forward or evidence occurred,
+and no process/lock remains. Refusal-log, time-log, and launcher SHA-256 values are
+`71167f7a1d97a0f08cfb3b210c306ca0e127c382753901c231b6534e751d84cb`,
+`16e9da974d49cbf07035ae4aa0405083628cf9993c801ba619ea8e70f49afd90`, and
+`a7a844a77b29493cae452d82af53adf7e59752a9d62b929966a5a21b945e2d27`.
+
+The source-locked Llama-3.3-70B-Instruct-4bit cache currently contains only its revision ref,
+`de2dfaf56839b7d0e834157d2401dee02726874d`; the model/tokenizer snapshot is absent. Advancing that
+family requires operator approval to download roughly 40 GiB. The Swift harness does not require a
+Python MLX runtime install for this gate.
 
 **Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
@@ -163,8 +187,9 @@ notable spike, including negative results.
    negative/dominated 8K evidence. The first 32K fp16 control failed closed on a retained
    nominal -> fair transition, so no full 32K speed retry or claim is authorized on this bench
    under the current unthrottled contract. Collect separately authenticated 32K KVarN
-   capacity-only context that cannot feed a speed label, and record the authenticated 128K refusal
-   (maximum context 40,960). Then qualify source-locked Llama-3.3-70B at
+   capacity-only context that cannot feed a speed label. The authenticated near-128K refusal is
+   complete at a 131,039-token request against maximum context 40,960. Then download, hash, and
+   qualify source-locked Llama-3.3-70B at
    8K/32K/near-128K without the Qwen-specific KVTuner schedule unless independently calibrated.
    Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support

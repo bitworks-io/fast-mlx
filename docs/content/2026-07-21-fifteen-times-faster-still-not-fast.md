@@ -97,6 +97,11 @@ retry, or silently changing the warmup. On this machine, under this contract, 32
 unclaimed. Capacity evidence and over-context refusal are different questions and stay in separate
 evidence lanes.
 
+The over-context lane has now closed cleanly. fast-mlx counted 130,911 Qwen input tokens, included
+the requested 128-token output budget, and refused the resulting 131,039-token window against the
+checkpoint-authenticated 40,960-token limit before loading the model driver or allocating KV state.
+That is not a speed result; it is proof that an impossible request fails early and explicitly.
+
 The general lesson is less obvious than “optimize the bottleneck.” Relative speedups are only as
 useful as the baseline they beat. A new path can be fifteen times faster than the implementation it
 replaces and still be three times too slow for the product. Freeze the product gate first, preserve
