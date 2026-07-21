@@ -53,6 +53,71 @@ private final class TinyScoringRouterModel:
 }
 
 final class CompressedKVScoringChunkTests: XCTestCase {
+    func testDirectKVarNScoringCapacityReservesOnePostSinkToken() {
+        XCTAssertEqual(
+            HarnessEngineActor.scoringCacheCapacity(
+                requested: 4,
+                kind: .kvarn(.k4v2G128I8),
+                kvarnAttentionMode: .splitQuantizedMM),
+            KVarNKVTier.k4v2G128.sinkTokens + 1)
+        XCTAssertEqual(
+            HarnessEngineActor.scoringCacheCapacity(
+                requested: KVarNKVTier.k4v2G128.sinkTokens,
+                kind: .kvarn(.k4v2G128I8),
+                kvarnAttentionMode: .splitQuantizedMM),
+            KVarNKVTier.k4v2G128.sinkTokens + 1)
+        XCTAssertEqual(
+            HarnessEngineActor.scoringCacheCapacity(
+                requested: KVarNKVTier.k4v2G128.sinkTokens + 1,
+                kind: .kvarn(.k4v2G128I8),
+                kvarnAttentionMode: .splitQuantizedMM),
+            KVarNKVTier.k4v2G128.sinkTokens + 1)
+        XCTAssertEqual(
+            HarnessEngineActor.scoringCacheCapacity(
+                requested: 4,
+                kind: .kvarn(.k4v2G128I8),
+                kvarnAttentionMode: .materialize),
+            4)
+        XCTAssertEqual(
+            HarnessEngineActor.scoringCacheCapacity(
+                requested: 4,
+                kind: .affine(.k4v2G64),
+                kvarnAttentionMode: .splitQuantizedMM),
+            4)
+    }
+
+    func testKVarNScoringTelemetryIsRetainedPerAttentionMode() async throws {
+        let actor = HarnessEngineActor(model: TinyScoringRouterModel())
+        let materializedPrompt = (0..<256).map { ($0 % 31) + 1 }
+        let directPrompt = (0..<129).map { ($0 % 31) + 1 }
+
+        _ = await actor.logprobs(
+            prompt: materializedPrompt,
+            maxTokens: 1,
+            eos: -1,
+            kvCache: .kvarn(.k4v2G128I8),
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .materialize)
+        _ = await actor.logprobs(
+            prompt: directPrompt,
+            maxTokens: 1,
+            eos: -1,
+            kvCache: .kvarn(.k4v2G128I8),
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .splitQuantizedMM)
+
+        let materialized = await actor.kvarnScoringTelemetry(
+            for: .k4v2G128I8,
+            attentionMode: .materialize)
+        let direct = await actor.kvarnScoringTelemetry(
+            for: .k4v2G128I8,
+            attentionMode: .splitQuantizedMM)
+        XCTAssertEqual(materialized?.capacityTokens, 257)
+        XCTAssertEqual(materialized?.attentionOperation, .materializedKV)
+        XCTAssertEqual(direct?.capacityTokens, 130)
+        XCTAssertEqual(direct?.attentionOperation, .splitQuantizedMM)
+    }
+
     func testSplitTaskAndFreeRunningScoringUseBoundedPrefill() async throws {
         let actor = HarnessEngineActor(model: TinyScoringRouterModel())
         let prompt = (0..<513).map { ($0 % 31) + 1 }

@@ -58,9 +58,9 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
         case .unmeasuredSpecKV(let tier):
             return "specDecode=pld with kvQuant=\(tier) is an unmeasured combination; use fp16"
         case .unknownAttentionOperation(let operation):
-            return "unknown --kv-attention operation \(operation) (known: materialize, split-affine-quantized-mm)"
+            return "unknown --kv-attention operation \(operation) (known: materialize, split-affine-quantized-mm, split-kvarn-quantized-mm)"
         case .unsupportedAttentionTier(let tier):
-            return "--kv-attention is valid only for an affine-backed KV tier, not \(tier)"
+            return "--kv-attention is valid only for a matching affine-, KVTuner-, or KVarN-backed KV tier, not \(tier)"
         case .invalidCheckpointContentSHA256(let value):
             return "--checkpoint-content-sha256 must be one lowercase 64-character digest exactly when --kv-attention is requested; actual=\(value)"
         case .missingPrefillTiming:
@@ -119,10 +119,25 @@ func requestedCompressedKVAttention(
     else {
         throw BenchCLIError.unknownAttentionOperation(attentionText)
     }
-    guard AffineKVTier(rawValue: tier) != nil || isKVTunerTier(tier) else {
-        throw BenchCLIError.unsupportedAttentionTier(tier)
+    if isKVTunerTier(tier) {
+        guard request != .splitKVarNQuantizedMM else {
+            throw BenchCLIError.unsupportedAttentionTier(tier)
+        }
+        return request
     }
-    return request
+    if AffineKVTier(rawValue: tier) != nil {
+        guard request != .splitKVarNQuantizedMM else {
+            throw BenchCLIError.unsupportedAttentionTier(tier)
+        }
+        return request
+    }
+    if KVarNKVRuntimeCell(rawValue: tier) != nil {
+        guard request != .splitAffineQuantizedMM else {
+            throw BenchCLIError.unsupportedAttentionTier(tier)
+        }
+        return request
+    }
+    throw BenchCLIError.unsupportedAttentionTier(tier)
 }
 
 func requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
@@ -359,7 +374,7 @@ func validateBenchRuntimeEngagement(
                 && workspace == materialization
                 && counts["\(prefix)_attention_materialized"] == 1
                 && counts["\(prefix)_attention_split"] == 0
-        case .splitAffineQuantizedMM:
+        case .splitAffineQuantizedMM, .splitKVarNQuantizedMM:
             return workspace > 0
                 && materialization == 0
                 && attentionWorkspace > 0
@@ -370,6 +385,9 @@ func validateBenchRuntimeEngagement(
     }
     if tier == "fp16" { return }
     if isKVTunerTier(tier) {
+        guard requestedCompressedKVAttention != .splitKVarNQuantizedMM else {
+            throw BenchCLIError.missingKVTunerEngagement
+        }
         guard let expectedKVTunerLayerCount,
             hasStorageReceipt(
                 "kvtuner",
@@ -379,6 +397,9 @@ func validateBenchRuntimeEngagement(
         return
     }
     if AffineKVTier(rawValue: tier) != nil {
+        guard requestedCompressedKVAttention != .splitKVarNQuantizedMM else {
+            throw BenchCLIError.missingLossyEngagement(tier)
+        }
         guard hasStorageReceipt(
             "affine",
             attentionRequest: requestedCompressedKVAttention),
@@ -389,7 +410,10 @@ func validateBenchRuntimeEngagement(
         return
     }
     if let cell = KVarNKVRuntimeCell(rawValue: tier) {
-        guard hasStorageReceipt("kvarn"),
+        guard requestedCompressedKVAttention != .splitAffineQuantizedMM,
+            hasStorageReceipt(
+                "kvarn",
+                attentionRequest: requestedCompressedKVAttention),
             (counts["kvarn_completed_tiles"] ?? 0) > 0,
             (counts["kvarn_compressed_tokens"] ?? 0) > 0,
             (counts["kvarn_layers"] ?? 0) > 0,
@@ -416,7 +440,16 @@ func validateBenchCompressedAttentionMemoryReceipt(
     maxMLXPeakBytes: Int
 ) throws {
     guard request != nil else { return }
-    let prefix = isKVTunerTier(tier) ? "kvtuner" : "affine"
+    let prefix: String
+    if isKVTunerTier(tier) {
+        prefix = "kvtuner"
+    } else if AffineKVTier(rawValue: tier) != nil {
+        prefix = "affine"
+    } else if KVarNKVRuntimeCell(rawValue: tier) != nil {
+        prefix = "kvarn"
+    } else {
+        throw BenchCLIError.unsupportedAttentionTier(tier)
+    }
     guard let workspaceBytes =
             engagement.counts["\(prefix)_workspace_bytes"],
         workspaceBytes > 0,
@@ -446,6 +479,8 @@ func makeBenchCompressedKVAttentionRuntimeBinding(
         prefix = "kvtuner"
     } else if AffineKVTier(rawValue: tier) != nil {
         prefix = "affine"
+    } else if KVarNKVRuntimeCell(rawValue: tier) != nil {
+        prefix = "kvarn"
     } else {
         throw BenchCLIError.unsupportedAttentionTier(tier)
     }
@@ -456,7 +491,9 @@ func makeBenchCompressedKVAttentionRuntimeBinding(
         counts["\(prefix)_attention_materialized"]
     ) {
     case (1, 0):
-        observed = .splitQuantizedMM
+        observed = prefix == "kvarn"
+            ? .splitKVarNQuantizedMM
+            : .splitQuantizedMM
     case (0, 1):
         observed = .materializedKV
     default:

@@ -461,10 +461,10 @@ public enum TaskCoherenceArtifact {
     /// runnable task CLI. Schema 2 is the first qualification-capable artifact and rejects any
     /// partial legacy rows rather than guessing missing evidence.
     public static let schemaVersion = 2
-    /// Schema 3 carries exact checkpoint-content identity. Affine and KVTuner rows additionally
-    /// require an authenticated request/observed-operation binding; an fp16 reference carries
-    /// the exact content identity without claiming a compressed-attention operation. Schema 2
-    /// remains readable for the frozen pre-compressed-attention corpus.
+    /// Schema 3 carries exact checkpoint-content identity. Affine, KVTuner, and direct KVarN rows
+    /// additionally require an authenticated request/observed-operation binding; an fp16
+    /// reference carries the exact content identity without claiming a compressed-attention
+    /// operation. Schema 2 remains readable for the frozen pre-compressed-attention corpus.
     public static let compressedAttentionSchemaVersion = 3
 
     private static let affineTiers: Set<String> = [
@@ -526,10 +526,6 @@ public enum TaskCoherenceArtifact {
         guard let binding else { return }
         do {
             try binding.validated()
-            guard binding.request != .splitKVarNQuantizedMM else {
-                throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
-                    "compressed-attention")
-            }
             guard binding.admission.modelConfigHash
                     == identity.modelConfigHash,
                 binding.admission.checkpointManifestHash
@@ -543,6 +539,12 @@ public enum TaskCoherenceArtifact {
                     "compressed-attention")
             }
             if affineTiers.contains(identity.kvQuantTier) {
+                guard binding.request == .materialize
+                    || binding.request == .splitAffineQuantizedMM
+                else {
+                    throw TaskCoherenceEvidenceError
+                        .invalidRuntimeEvidence("compressed-attention")
+                }
                 let groupSize: Int
                 if identity.kvQuantTier.hasSuffix("-g64") {
                     groupSize = 64
@@ -558,7 +560,10 @@ public enum TaskCoherenceArtifact {
             } else if isCanonicalKVTunerCellID(
                 identity.kvQuantTier)
             {
-                guard let schedule = identity.kvtunerSchedule else {
+                guard binding.request == .materialize
+                    || binding.request == .splitAffineQuantizedMM,
+                    let schedule = identity.kvtunerSchedule
+                else {
                     throw TaskCoherenceEvidenceError
                         .invalidRuntimeEvidence("compressed-attention")
                 }
@@ -572,6 +577,14 @@ public enum TaskCoherenceArtifact {
                     tokenizerSHA256: schedule.tokenizerSHA256,
                     layerCount: schedule.layers.count,
                     groupSize: schedule.groupSize)
+            } else if identity.kvQuantTier == "kvarn-k4v2-g128" {
+                guard binding.request == .splitKVarNQuantizedMM else {
+                    throw TaskCoherenceEvidenceError
+                        .invalidRuntimeEvidence("compressed-attention")
+                }
+                try binding.admission.validateAffineGeometry(
+                    keyGroupSize: 128,
+                    valueGroupSize: 128)
             } else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
                     "compressed-attention")
@@ -811,6 +824,7 @@ public enum TaskCoherenceArtifact {
         let requiresCompressedBinding = affineTiers.contains(
             payload.identity.kvQuantTier)
             || isCanonicalKVTunerCellID(payload.identity.kvQuantTier)
+            || payload.identity.kvQuantTier == "kvarn-k4v2-g128"
         switch payload.schemaVersion {
         case schemaVersion:
             guard payload.compressedKVAttention == nil,
@@ -889,6 +903,7 @@ public enum TaskCoherenceArtifact {
         try validateEngagement(
             payload.engagement, tier: payload.identity.kvQuantTier,
             kvtunerSchedule: payload.identity.kvtunerSchedule,
+            compressedKVAttention: payload.compressedKVAttention,
             layout: payload.layout,
             generatedTokenCount: payload.generatedTokenCount,
             scoringMode: item.scoringMode)
@@ -911,6 +926,7 @@ public enum TaskCoherenceArtifact {
         _ engagement: TaskCoherenceCacheEngagementEvidence,
         tier: String,
         kvtunerSchedule: KVTunerScheduleBinding?,
+        compressedKVAttention: CompressedKVAttentionRuntimeBinding?,
         layout: TaskCoherencePromptLayoutEvidence,
         generatedTokenCount: Int,
         scoringMode: TaskCoherenceScoringMode
@@ -1016,6 +1032,9 @@ public enum TaskCoherenceArtifact {
             return
         }
         if let expectedIterations = kvarnIterations[tier] {
+            let expectedExecutionMode = compressedKVAttention?.request
+                == .splitKVarNQuantizedMM
+                ? "compiled" : "uncompiled-correctness"
             let validScoringEngagement: Bool
             switch scoringMode {
             case .restrictedChoice:
@@ -1058,7 +1077,7 @@ public enum TaskCoherenceArtifact {
                     compressedTokens: compressed),
                 completed >= layout.minimumCompletedTileCount,
                 iterations == expectedIterations,
-                engagement.kvarnExecutionMode == "uncompiled-correctness",
+                engagement.kvarnExecutionMode == expectedExecutionMode,
                 validScoringEngagement
             else {
                 throw TaskCoherenceEvidenceError.invalidRuntimeEvidence(
@@ -1301,13 +1320,18 @@ public struct TaskCoherencePromotionEvidence:
             throw TaskCoherenceEvidenceError.invalidPromotionProvenance(
                 "runtime")
         }
-        // The current task-coherence schema can authenticate materialized affine/KVTuner
-        // execution, but it cannot yet prove that a KVarN task run used the direct packed
-        // attention route. Keep otherwise valid direct-route KL evidence non-promotable until
-        // the task artifact carries and validates the same route receipt.
-        if frontier.candidateCompressedKVAttention?.request
+        let taskCompressedKVAttention =
+            candidate.cases.first?.compressedKVAttention
+        let taskRequestsDirectKVarN = taskCompressedKVAttention?.request
             == .splitKVarNQuantizedMM
-        {
+        let klRequestsDirectKVarN =
+            frontier.candidateCompressedKVAttention?.request
+            == .splitKVarNQuantizedMM
+        guard taskRequestsDirectKVarN == klRequestsDirectKVarN,
+            !taskRequestsDirectKVarN
+                || taskCompressedKVAttention
+                    == frontier.candidateCompressedKVAttention
+        else {
             throw TaskCoherenceEvidenceError.klEvidenceMismatch(
                 "compressed-attention")
         }

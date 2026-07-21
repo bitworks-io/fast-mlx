@@ -76,7 +76,8 @@ public enum KVCacheKind: Sendable, Hashable {
     /// derives the identical global Π/S/codebook (the paper's "global parameters").
     public func makeCache(
         capacity: Int,
-        affineAttentionMode: AffineKVAttentionMode = .materialize
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) -> any CompiledCache {
         switch self {
         case .fp16:
@@ -94,7 +95,8 @@ public enum KVCacheKind: Sendable, Hashable {
         case .kvarn(let cell):
             KVarNKVCache(
                 capacity: capacity, tier: cell.tier,
-                iterations: cell.iterations)
+                iterations: cell.iterations,
+                attentionMode: kvarnAttentionMode)
         }
     }
 
@@ -104,7 +106,8 @@ public enum KVCacheKind: Sendable, Hashable {
     public func makeCaches(
         layerCount: Int,
         capacity: Int,
-        affineAttentionMode: AffineKVAttentionMode = .materialize
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) throws -> [any CompiledCache] {
         switch self {
         case .kvtuner(let selection):
@@ -125,19 +128,25 @@ public enum KVCacheKind: Sendable, Hashable {
             return (0 ..< layerCount).map { _ in
                 makeCache(
                     capacity: capacity,
-                    affineAttentionMode: affineAttentionMode)
+                    affineAttentionMode: affineAttentionMode,
+                    kvarnAttentionMode: kvarnAttentionMode)
             }
         }
     }
 
-    /// Resolve the actual step mode once, before the decoder builds its closure. KVarN's host
-    /// tile-boundary mutation is not compile-capturable, so a caller cannot accidentally turn it
-    /// into a stale compiled trace by requesting compilation.
-    public func executionMode(requestingCompilation: Bool) -> KVCacheExecutionMode {
+    /// Resolve the actual step mode once, before the decoder builds its closure. KVarN's
+    /// materialized path has host tile-boundary mutation that is not compile-capturable; the
+    /// direct attention path keeps execution in graph state and may compile when requested.
+    public func executionMode(
+        requestingCompilation: Bool,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+    ) -> KVCacheExecutionMode {
         guard requestingCompilation else { return .uncompiledCorrectness }
         switch self {
         case .kvarn:
-            return .uncompiledCorrectness
+            return kvarnAttentionMode == .splitQuantizedMM
+                ? .compiled
+                : .uncompiledCorrectness
         case .fp16, .affine, .kvtuner, .kvtunerCandidate, .turboQuant:
             return .compiled
         }

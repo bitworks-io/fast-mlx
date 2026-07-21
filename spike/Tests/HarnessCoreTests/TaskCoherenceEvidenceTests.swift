@@ -229,7 +229,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
         }
     }
 
-    func testTaskCompressedAttentionRejectsKVarNReceiptUntilItsSchemaExists()
+    func testTaskCompressedAttentionSchemaThreeCoversDirectKVarNBindings()
         throws
     {
         let admission = try compressedAttentionAdmission()
@@ -241,7 +241,7 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 admission.checkpointManifestHash,
             modelCheckpointContentSHA256:
                 admission.checkpointContentSHA256,
-            kvQuantTier: "affine-k4v2-g128")
+            kvQuantTier: "kvarn-k4v2-g128")
         let tokenization = TaskCoherenceTokenizationEvidence(
             tokenizerManifestSHA256: admission.tokenizerSHA256,
             promptTokenIDsSHA256: String(repeating: "c", count: 64),
@@ -251,15 +251,159 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             observedOperation: .splitKVarNQuantizedMM,
             admission: admission)
 
+        XCTAssertNoThrow(try TaskCoherenceArtifact
+            .validateCompressedKVAttention(
+                binding, identity: identity, tokenization: tokenization))
+
+        let wrongTier = TaskCoherenceRunIdentity(
+            corpusID: identity.corpusID,
+            corpusContentHash: identity.corpusContentHash,
+            modelConfigHash: identity.modelConfigHash,
+            modelCheckpointManifestHash:
+                identity.modelCheckpointManifestHash,
+            modelCheckpointContentSHA256:
+                identity.modelCheckpointContentSHA256,
+            kvQuantTier: "kvarn-k4v2-g128-i16")
         XCTAssertThrowsError(try TaskCoherenceArtifact
             .validateCompressedKVAttention(
-                binding,
-                identity: identity,
+                binding, identity: wrongTier, tokenization: tokenization))
+    }
+
+    func testTaskCompressedAttentionRejectsDirectKVarNRouteForAffineAndKVTuner()
+        throws
+    {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
+        let tokenization = TaskCoherenceTokenizationEvidence(
+            tokenizerManifestSHA256: admission.tokenizerSHA256,
+            promptTokenIDsSHA256: String(repeating: "c", count: 64),
+            restrictedChoiceLabelTokenIDs: nil)
+        let directBinding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM,
+            admission: admission)
+
+        let affineIdentity = TaskCoherenceRunIdentity(
+            corpusID: corpus.id,
+            corpusContentHash: corpus.contentHash,
+            modelConfigHash: admission.modelConfigHash,
+            modelCheckpointManifestHash:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256:
+                admission.checkpointContentSHA256,
+            kvQuantTier: candidateCellID)
+        XCTAssertThrowsError(try TaskCoherenceArtifact
+            .validateCompressedKVAttention(
+                directBinding,
+                identity: affineIdentity,
                 tokenization: tokenization)) {
             XCTAssertEqual(
                 $0 as? TaskCoherenceEvidenceError,
                 .invalidRuntimeEvidence("compressed-attention"))
         }
+
+        let schedule = try kvtunerBinding(
+            corpus: corpus,
+            modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
+            layerCount: admission.layerCount)
+        let kvtunerIdentity = TaskCoherenceRunIdentity(
+            corpusID: corpus.id,
+            corpusContentHash: corpus.contentHash,
+            modelConfigHash: admission.modelConfigHash,
+            modelCheckpointManifestHash:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256:
+                admission.checkpointContentSHA256,
+            kvQuantTier: kvtunerCellID,
+            kvtunerSchedule: schedule)
+        XCTAssertThrowsError(try TaskCoherenceArtifact
+            .validateCompressedKVAttention(
+                directBinding,
+                identity: kvtunerIdentity,
+                tokenization: tokenization)) {
+            XCTAssertEqual(
+                $0 as? TaskCoherenceEvidenceError,
+                .invalidRuntimeEvidence("compressed-attention"))
+        }
+    }
+
+    func testTaskCompressedAttentionSchemaThreeRequiresDirectKVarNRouteEvidence()
+        throws
+    {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
+        let reference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                admission.checkpointContentSHA256)
+        let directBinding = try compressedAttentionBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM)
+
+        XCTAssertNoThrow(try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "kvarn-k4v2-g128",
+                cellID: "kvarn-k4v2-g128-i8",
+                referenceArtifactSHA256: reference.artifactSHA256,
+                schemaVersion:
+                    TaskCoherenceArtifact.compressedAttentionSchemaVersion,
+                compressedKVAttention: directBinding)),
+            corpus: corpus))
+
+        XCTAssertNoThrow(try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "kvarn-k4v2-g128",
+                cellID: "kvarn-k4v2-g128-i8",
+                referenceArtifactSHA256: reference.artifactSHA256)),
+            corpus: corpus))
+
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "kvarn-k4v2-g128",
+                cellID: "kvarn-k4v2-g128-i8",
+                referenceArtifactSHA256: reference.artifactSHA256,
+                modelCheckpointContentSHA256Override:
+                    admission.checkpointContentSHA256,
+                schemaVersion:
+                    TaskCoherenceArtifact.compressedAttentionSchemaVersion,
+                compressedKVAttention: nil)),
+            corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .invalidRuntimeEvidence("compressed-attention-schema"))
+            }
+
+        let forgedBinding = try compressedAttentionBinding(
+            request: .materialize,
+            observedOperation: .materializedKV)
+        XCTAssertThrowsError(try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "kvarn-k4v2-g128",
+                cellID: "kvarn-k4v2-g128-i8",
+                referenceArtifactSHA256: reference.artifactSHA256,
+                schemaVersion:
+                    TaskCoherenceArtifact.compressedAttentionSchemaVersion,
+                compressedKVAttention: forgedBinding)),
+            corpus: corpus)) {
+                XCTAssertEqual(
+                    $0 as? TaskCoherenceEvidenceError,
+                    .invalidRuntimeEvidence("compressed-attention"))
+            }
     }
 
     func testTaskCompressedAttentionSchemaThreeIsRequiredForAffineBindings() throws {
@@ -848,7 +992,44 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
             with: wrongCell, corpus: corpus))
     }
 
-    func testPromotionRejectsDirectKVarNKLUntilTaskRouteEvidenceExists()
+    func testPromotionAcceptsDirectKVarNKLWhenTaskRouteEvidenceMatches()
+        throws
+    {
+        let corpus = try TaskCoherenceCorpusV1.make()
+        let admission = try compressedAttentionAdmission()
+        let reference = try summary(
+            corpus: corpus,
+            tier: "fp16",
+            cellID: "fp16",
+            referenceDigest: nil,
+            modelConfigHashOverride: admission.modelConfigHash,
+            modelCheckpointManifestHashOverride:
+                admission.checkpointManifestHash,
+            modelCheckpointContentSHA256Override:
+                admission.checkpointContentSHA256)
+        let directBinding = try compressedAttentionBinding(
+            request: .splitKVarNQuantizedMM,
+            observedOperation: .splitKVarNQuantizedMM)
+        let candidate = try TaskCoherenceArtifact.summarize(
+            artifactData(try makeRows(
+                corpus: corpus,
+                tier: "kvarn-k4v2-g128",
+                cellID: "kvarn-k4v2-g128-i8",
+                referenceArtifactSHA256: reference.artifactSHA256,
+                schemaVersion:
+                    TaskCoherenceArtifact.compressedAttentionSchemaVersion,
+                compressedKVAttention: directBinding)),
+            corpus: corpus)
+        let promotion = try TaskCoherencePromotionEvidence.derive(
+            candidate: candidate, reference: reference, corpus: corpus)
+        let directKL = try validKVarNDirectKLRecord()
+
+        XCTAssertNoThrow(try directKL.validatedForPromotionEvidence())
+        XCTAssertNoThrow(try promotion.validated(
+            with: directKL, corpus: corpus))
+    }
+
+    func testPromotionRejectsDirectKVarNKLWithoutMatchingTaskRouteEvidence()
         throws
     {
         let corpus = try TaskCoherenceCorpusV1.make()
@@ -873,15 +1054,13 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                 admission.checkpointManifestHash)
         let promotion = try TaskCoherencePromotionEvidence.derive(
             candidate: candidate, reference: reference, corpus: corpus)
-        let directKL = try validKVarNDirectKLRecord()
 
-        XCTAssertNoThrow(try directKL.validatedForPromotionEvidence())
         XCTAssertThrowsError(try promotion.validated(
-            with: directKL, corpus: corpus)) {
-                XCTAssertEqual(
-                    $0 as? TaskCoherenceEvidenceError,
-                    .klEvidenceMismatch("compressed-attention"))
-            }
+            with: validKVarNDirectKLRecord(), corpus: corpus)) {
+            XCTAssertEqual(
+                $0 as? TaskCoherenceEvidenceError,
+                .klEvidenceMismatch("compressed-attention"))
+        }
     }
 
     func testKVTunerPromotionPairsTheExactTaskAndKLSchedule() throws {
@@ -1495,7 +1674,9 @@ final class TaskCoherenceEvidenceTests: XCTestCase {
                     kvarnCompressedTokens: 384,
                     kvarnCodecIterations:
                         tier.hasSuffix("-i16") ? 16 : 8,
-                    kvarnExecutionMode: "uncompiled-correctness",
+                    kvarnExecutionMode: compressedKVAttention?.request
+                        == .splitKVarNQuantizedMM
+                        ? "compiled" : "uncompiled-correctness",
                     scoringCachedTokens: restricted ? 512 : nil,
                     scoringKVarNCompletedTileCount: restricted ? 3 : nil,
                     scoringKVarNCompressedTokens: restricted ? 384 : nil)

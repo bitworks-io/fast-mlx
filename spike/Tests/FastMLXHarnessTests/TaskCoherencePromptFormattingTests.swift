@@ -168,6 +168,63 @@ final class TaskCoherencePromptFormattingTests: XCTestCase {
         XCTAssertEqual(binding?.admission, admission)
     }
 
+    func testTaskCompressedAttentionBindingAuthenticatesDirectKVarNGenerationAndScoring() throws {
+        let admission = try compressedAttentionAdmission()
+        let generated = EngagementCounters([
+            "kvarn_attention_split": 1,
+            "kvarn_attention_materialized": 0,
+        ])
+        let scoring = EngagementCounters([
+            "scoring_kvarn_attention_split": 1,
+            "scoring_kvarn_attention_materialized": 0,
+        ])
+
+        let binding = try taskCompressedKVAttentionBinding(
+            tier: "kvarn-k4v2-g128",
+            request: .splitKVarNQuantizedMM,
+            admission: admission,
+            generated: generated,
+            scoring: scoring)
+
+        XCTAssertEqual(binding?.request, .splitKVarNQuantizedMM)
+        XCTAssertEqual(
+            binding?.observedOperation, .splitKVarNQuantizedMM)
+        XCTAssertEqual(binding?.admission, admission)
+    }
+
+    func testTaskEngagementRecordsCompiledGenerationAndUncompiledDirectScoring() throws {
+        let generated = EngagementCounters([
+            "kvarn_tokens": 513,
+            "kvarn_completed_tiles": 3,
+            "kvarn_compressed_tokens": 384,
+            "kvarn_codec_iterations": 8,
+            "kvarn_compiled": 1,
+            "kvarn_uncompiled_correctness": 0,
+        ])
+        let scoring = EngagementCounters([
+            "scoring_cached_tokens": 512,
+            "scoring_kvarn_completed_tiles": 3,
+            "scoring_kvarn_compressed_tokens": 384,
+            "scoring_kvarn_attention_split": 1,
+            "scoring_kvarn_attention_materialized": 0,
+        ])
+
+        let evidence = try taskEngagement(
+            tier: "kvarn-k4v2-g128",
+            kvtunerSchedule: nil,
+            compressedKVAttentionRequest: .splitKVarNQuantizedMM,
+            generated: generated,
+            scoring: scoring)
+
+        XCTAssertEqual(evidence.cachedTokens, 513)
+        XCTAssertEqual(evidence.kvarnCompletedTileCount, 3)
+        XCTAssertEqual(evidence.kvarnCompressedTokens, 384)
+        XCTAssertEqual(evidence.kvarnExecutionMode, "compiled")
+        XCTAssertEqual(evidence.scoringCachedTokens, 512)
+        XCTAssertEqual(evidence.scoringKVarNCompletedTileCount, 3)
+        XCTAssertEqual(evidence.scoringKVarNCompressedTokens, 384)
+    }
+
     func testTaskCompressedAttentionBindingRejectsTelemetryOrScoringDisagreement() throws {
         let admission = try compressedAttentionAdmission()
         let split = EngagementCounters([

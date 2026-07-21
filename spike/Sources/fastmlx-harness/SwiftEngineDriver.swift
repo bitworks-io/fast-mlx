@@ -24,6 +24,7 @@ enum SwiftEngineDriverError: Error, Equatable, CustomStringConvertible {
 struct SwiftEngineCacheSelection: Equatable, Sendable {
     let kind: KVCacheKind
     let affineAttentionMode: AffineKVAttentionMode
+    let kvarnAttentionMode: KVarNKVAttentionMode
 }
 
 /// Resolve and authenticate a runtime request without allocating MLX cache state. A frozen
@@ -50,15 +51,25 @@ func resolveSwiftEngineCacheSelection(
         throw CompressedKVAttentionRuntimeAdmissionError
             .invalidSourceIdentity
     }
-    let mode: AffineKVAttentionMode
+    let affineMode: AffineKVAttentionMode
+    let kvarnMode: KVarNKVAttentionMode
     switch config.compressedKVAttention {
     case nil, .materialize:
-        mode = .materialize
+        affineMode = .materialize
+        kvarnMode = .materialize
     case .splitAffineQuantizedMM:
-        mode = .splitQuantizedMM
+        affineMode = .splitQuantizedMM
+        kvarnMode = .materialize
+    case .splitKVarNQuantizedMM:
+        affineMode = .materialize
+        kvarnMode = .splitQuantizedMM
     }
 
     if let selection = config.kvtunerSelection {
+        if config.compressedKVAttention == .splitKVarNQuantizedMM {
+            throw SwiftEngineDriverError.unsupportedConfig(
+                "split KVarN attention requires a KVarN KV tier")
+        }
         guard config.kvQuant == selection.cellID else {
             throw SwiftEngineDriverError.unsupportedConfig(
                 "KVTuner selection cell \(selection.cellID) != kvQuant=\(config.kvQuant ?? "nil")")
@@ -77,7 +88,9 @@ func resolveSwiftEngineCacheSelection(
             layerCount: selection.layers.count,
             groupSize: selection.groupSize)
         return SwiftEngineCacheSelection(
-            kind: .kvtuner(selection), affineAttentionMode: mode)
+            kind: .kvtuner(selection),
+            affineAttentionMode: affineMode,
+            kvarnAttentionMode: .materialize)
     }
     if config.kvQuant?.hasPrefix("kvtuner-") == true {
         throw SwiftEngineDriverError.unsupportedConfig(
@@ -88,21 +101,54 @@ func resolveSwiftEngineCacheSelection(
             "kvQuant=\(config.kvQuant ?? "fp16") (unknown tier)")
     }
 
-    if config.compressedKVAttention != nil {
+    if let request = config.compressedKVAttention {
         guard let admission else {
             throw CompressedKVAttentionRuntimeAdmissionError
                 .invalidSourceIdentity
         }
-        guard case .affine(let tier) = kind else {
-            throw SwiftEngineDriverError.unsupportedConfig(
-                "compressedKVAttention requires an affine-backed KV tier")
+        switch request {
+        case .materialize:
+            switch kind {
+            case .affine(let tier):
+                try admission.validateAffineGeometry(
+                    keyGroupSize: tier.configuration.keyGroupSize,
+                    valueGroupSize: tier.configuration.valueGroupSize)
+            case .kvarn(let cell):
+                _ = try KVarNMLXConfiguration(
+                    headDimension: admission.headDimension,
+                    groupSize: cell.tier.groupSize,
+                    keyBits: cell.tier.keyBits,
+                    valueBits: cell.tier.valueBits,
+                    iterations: cell.iterations)
+            case .fp16, .turboQuant, .kvtuner, .kvtunerCandidate:
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "compressedKVAttention requires an affine- or KVarN-backed KV tier")
+            }
+        case .splitAffineQuantizedMM:
+            guard case .affine(let tier) = kind else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "split affine attention requires an affine-backed KV tier")
+            }
+            try admission.validateAffineGeometry(
+                keyGroupSize: tier.configuration.keyGroupSize,
+                valueGroupSize: tier.configuration.valueGroupSize)
+        case .splitKVarNQuantizedMM:
+            guard case .kvarn(let cell) = kind else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "split KVarN attention requires a KVarN KV tier")
+            }
+            _ = try KVarNMLXConfiguration(
+                headDimension: admission.headDimension,
+                groupSize: cell.tier.groupSize,
+                keyBits: cell.tier.keyBits,
+                valueBits: cell.tier.valueBits,
+                iterations: cell.iterations)
         }
-        try admission.validateAffineGeometry(
-            keyGroupSize: tier.configuration.keyGroupSize,
-            valueGroupSize: tier.configuration.valueGroupSize)
     }
     return SwiftEngineCacheSelection(
-        kind: kind, affineAttentionMode: mode)
+        kind: kind,
+        affineAttentionMode: affineMode,
+        kvarnAttentionMode: kvarnMode)
 }
 
 /// Exact result of one restricted-choice scoring forward. Only actor-safe CPU values cross the
@@ -134,6 +180,12 @@ actor HarnessEngineActor {
     private struct DecoderKey: Hashable {
         let kind: KVCacheKind
         let affineAttentionMode: AffineKVAttentionMode
+        let kvarnAttentionMode: KVarNKVAttentionMode
+    }
+
+    private struct KVarNScoringTelemetryKey: Hashable {
+        let cell: KVarNKVRuntimeCell
+        let attentionMode: KVarNKVAttentionMode
     }
 
     private let model: any LanguageModel
@@ -152,10 +204,11 @@ actor HarnessEngineActor {
     private var maximumKVTunerScoringTelemetry: [
         KVTunerRuntimeSelection: KVTunerKVCacheTelemetry
     ] = [:]
-    /// KVarN cells share packed geometry but not codec work. Key retained scalar evidence by
-    /// runtime cell so an i8 scoring pass can never be mislabeled as i16 (or vice versa).
+    /// KVarN cells share packed geometry but not codec work or attention workspace. Key retained
+    /// scalar evidence by both runtime cell and route so a larger materialized pass cannot be
+    /// returned as evidence for a later direct pass (or vice versa).
     private var maximumKVarNScoringTelemetry: [
-        KVarNKVRuntimeCell: KVarNKVCacheTelemetry
+        KVarNScoringTelemetryKey: KVarNKVCacheTelemetry
     ] = [:]
     /// Exact token widths submitted during the latest scoring-prefill operation. This contains
     /// only CPU scalars and is retained so qualification tests can prove every scoring entry
@@ -178,7 +231,8 @@ actor HarnessEngineActor {
     func generate(
         prompt: [Int], maxTokens: Int, eos: Int,
         kvCache kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     )
         -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
@@ -193,12 +247,15 @@ actor HarnessEngineActor {
                 "KVTuner candidates require the private qualification path")
         }
         let decoderKey = DecoderKey(
-            kind: kind, affineAttentionMode: affineAttentionMode)
+            kind: kind,
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         if decoders[decoderKey] == nil {
             decoders[decoderKey] = CompiledMLXDecoder(
                 model: model,
                 kvCache: kind,
-                affineAttentionMode: affineAttentionMode)
+                affineAttentionMode: affineAttentionMode,
+                kvarnAttentionMode: kvarnAttentionMode)
         }
         var decoder = decoders[decoderKey]!
         defer { decoders[decoderKey] = decoder }
@@ -242,10 +299,15 @@ actor HarnessEngineActor {
                 "KVTuner tier requested but matching schedule telemetry did not engage")
         }
         if case .kvarn(let cell) = kind {
+            let expectedExecutionMode = kind.executionMode(
+                requestingCompilation: true,
+                kvarnAttentionMode: kvarnAttentionMode)
             precondition(
                 kvarnTelemetry?.tier == cell.tier
                     && kvarnTelemetry?.iterations == cell.iterations
-                    && kvarnTelemetry?.executionMode == .uncompiledCorrectness,
+                    && kvarnTelemetry?.executionMode == expectedExecutionMode
+                    && kvarnTelemetry?.attentionOperation
+                        == expectedKVarNAttentionOperation(kvarnAttentionMode),
                 "KVarN tier requested but matching KVarN telemetry did not engage")
         }
         return (
@@ -353,7 +415,9 @@ actor HarnessEngineActor {
         )
     {
         let decoderKey = DecoderKey(
-            kind: kind, affineAttentionMode: .materialize)
+            kind: kind,
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .materialize)
         if decoders[decoderKey] == nil {
             decoders[decoderKey] = CompiledMLXDecoder(model: model, kvCache: kind)
         }
@@ -372,19 +436,22 @@ actor HarnessEngineActor {
     func logprobs(
         prompt: [Int], maxTokens: Int, eos: Int,
         kvCache kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) -> [[Float]] {
         let cache = makeScoringCache(
             kind: kind,
             capacity: prompt.count + max(maxTokens, 0),
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         var rows: [[Float]] = []
         let generationCount = max(maxTokens, 0)
         guard generationCount > 0 else { return rows }
         var logits = prefillScoringLogits(
             prompt: prompt,
             cache: cache,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         for index in 0..<generationCount {
             let last = logits[0..., -1, 0...] // [1, vocab] raw logits
             rows.append(last.asType(.float32).asArray(Float.self))
@@ -396,7 +463,8 @@ actor HarnessEngineActor {
         }
         captureQuantizedScoringTelemetry(
             kind, cache: cache, minTokens: prompt.count,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         return rows
     }
 
@@ -406,16 +474,19 @@ actor HarnessEngineActor {
     /// a silently unengaged task row appear valid.
     func taskChoiceLogits(
         prompt: [Int], kvCache kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) -> TaskChoiceLogitsResult {
         precondition(!prompt.isEmpty, "task scoring requires a nonempty prompt")
         let cache = makeScoringCache(
             kind: kind, capacity: prompt.count,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         let logits = prefillScoringLogits(
             prompt: prompt,
             cache: cache,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         let last = logits[0..., -1, 0...]
         let row = last.asType(.float32).asArray(Float.self)
         var counts: [String: Int] = [:]
@@ -473,6 +544,8 @@ actor HarnessEngineActor {
                 telemetry.tier == cell.tier
                     && telemetry.iterations == cell.iterations
                     && telemetry.executionMode == .uncompiledCorrectness
+                    && telemetry.attentionOperation
+                        == expectedKVarNAttentionOperation(kvarnAttentionMode)
                     && telemetry.cachedTokens == prompt.count,
                 "KVarN task-scoring telemetry does not match its runtime cell")
             counts["scoring_cached_tokens"] = telemetry.cachedTokens
@@ -480,6 +553,10 @@ actor HarnessEngineActor {
                 telemetry.completedTileCount
             counts["scoring_kvarn_compressed_tokens"] =
                 telemetry.compressedTokens
+            counts["scoring_kvarn_attention_split"] =
+                telemetry.attentionOperation == .splitQuantizedMM ? 1 : 0
+            counts["scoring_kvarn_attention_materialized"] =
+                telemetry.attentionOperation == .materializedKV ? 1 : 0
         case .turboQuant:
             preconditionFailure(
                 "TurboQuant is outside the authenticated task-coherence tier map")
@@ -495,11 +572,13 @@ actor HarnessEngineActor {
     private func prefillScoringLogits(
         prompt: [Int],
         cache: [any KVCache],
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode
     ) -> MLXArray {
         precondition(!prompt.isEmpty, "scoring prefill requires a nonempty prompt")
         latestScoringPrefillTokenCounts.removeAll(keepingCapacity: true)
         if affineAttentionMode != .splitQuantizedMM
+            && kvarnAttentionMode != .splitQuantizedMM
             || prompt.count <= Self.scoringChunkSize
         {
             latestScoringPrefillTokenCounts.append(prompt.count)
@@ -538,11 +617,13 @@ actor HarnessEngineActor {
     /// no-sync-readback design lives untouched in `generate`.
     func teacherForcedLogprobs(
         prompt: [Int], forced: [Int], kvCache kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) -> [[Float]] {
         scoreForced(
             prompt: prompt, forced: forced, wanted: nil, kind: kind,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
     }
 
     /// Sampled variant: same chunked forward over the full forced continuation (causal decoding
@@ -552,11 +633,13 @@ actor HarnessEngineActor {
     /// ascending (evenlySpacedPositions's contract); rows are returned in that order.
     func teacherForcedLogprobsAtPositions(
         prompt: [Int], forced: [Int], positions: [Int], kvCache kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
     ) -> [[Float]] {
         scoreForced(
             prompt: prompt, forced: forced, wanted: positions, kind: kind,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
     }
 
     /// CHUNKED teacher-forced scoring (`forcedScoringPlan` in HarnessCore holds the pure
@@ -580,12 +663,14 @@ actor HarnessEngineActor {
     private func scoreForced(
         prompt: [Int], forced: [Int], wanted: [Int]?,
         kind: KVCacheKind,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode
     ) -> [[Float]] {
         let input = prompt + forced.dropLast()
         let cache = makeScoringCache(
             kind: kind, capacity: input.count,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         let plan = forcedScoringPlan(
             promptCount: prompt.count, forcedCount: forced.count,
             wantedPositions: wanted, chunkSize: Self.scoringChunkSize)
@@ -600,7 +685,8 @@ actor HarnessEngineActor {
         }
         captureQuantizedScoringTelemetry(
             kind, cache: cache, minTokens: input.count,
-            affineAttentionMode: affineAttentionMode)
+            affineAttentionMode: affineAttentionMode,
+            kvarnAttentionMode: kvarnAttentionMode)
         return rows
     }
 
@@ -611,7 +697,8 @@ actor HarnessEngineActor {
     /// whole pass up front (scoring knows its total length; no chunked growth needed).
     private func makeScoringCache(
         kind: KVCacheKind, capacity: Int,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode
     ) -> [any KVCache] {
         switch kind {
         case .fp16:
@@ -621,8 +708,12 @@ actor HarnessEngineActor {
             do {
                 return try kind.makeCaches(
                     layerCount: layerCount,
-                    capacity: max(capacity, 1),
-                    affineAttentionMode: affineAttentionMode)
+                    capacity: Self.scoringCacheCapacity(
+                        requested: capacity,
+                        kind: kind,
+                        kvarnAttentionMode: kvarnAttentionMode),
+                    affineAttentionMode: affineAttentionMode,
+                    kvarnAttentionMode: kvarnAttentionMode)
             } catch {
                 preconditionFailure(
                     "scoring KV-cache policy does not match the loaded model: \(error)")
@@ -633,12 +724,27 @@ actor HarnessEngineActor {
         }
     }
 
+    static func scoringCacheCapacity(
+        requested: Int,
+        kind: KVCacheKind,
+        kvarnAttentionMode: KVarNKVAttentionMode
+    ) -> Int {
+        let requested = max(requested, 1)
+        guard case .kvarn(let cell) = kind,
+            kvarnAttentionMode == .splitQuantizedMM
+        else { return requested }
+        // Direct KVarN requires at least one position beyond the exact fp16 sink so its packed
+        // route has a valid post-sink geometry even for very short scoring prompts.
+        return max(requested, cell.tier.sinkTokens + 1)
+    }
+
     /// Engagement backstop for the scoring paths: a requested lossy cache must have the
     /// matching concrete type and must have cached every scored position. A silent fp16
     /// fallback here would make the quality evidence measure the wrong thing.
     private func captureQuantizedScoringTelemetry(
         _ kind: KVCacheKind, cache: [any KVCache], minTokens: Int,
-        affineAttentionMode: AffineKVAttentionMode
+        affineAttentionMode: AffineKVAttentionMode,
+        kvarnAttentionMode: KVarNKVAttentionMode
     ) {
         switch kind {
         case .fp16:
@@ -698,9 +804,7 @@ actor HarnessEngineActor {
                 preconditionFailure("TurboQuant tier requested but the quantized scoring cache did not engage")
             }
         case .kvarn(let cell):
-            guard let kvarn = cache.first as? KVarNKVCache,
-                kvarn.offset >= minTokens
-            else {
+            guard cache.first is KVarNKVCache else {
                 preconditionFailure("KVarN tier requested but the KVarN scoring cache did not engage")
             }
             let kvarnCaches = cache.compactMap { $0 as? KVarNKVCache }
@@ -709,14 +813,23 @@ actor HarnessEngineActor {
                 "KVarN scoring cache contains a different cache type")
             let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
             precondition(
+                telemetry.cachedTokens >= minTokens,
+                "KVarN tier requested but the KVarN scoring cache did not engage")
+            precondition(
                 telemetry.tier == cell.tier
                     && telemetry.iterations == cell.iterations
                     && telemetry.executionMode == .uncompiledCorrectness,
                 "KVarN scoring telemetry does not match its requested runtime cell")
-            if maximumKVarNScoringTelemetry[cell].map({
+            precondition(
+                telemetry.attentionOperation
+                    == expectedKVarNAttentionOperation(kvarnAttentionMode),
+                "KVarN scoring cache executed a different attention operation")
+            let key = KVarNScoringTelemetryKey(
+                cell: cell, attentionMode: kvarnAttentionMode)
+            if maximumKVarNScoringTelemetry[key].map({
                 telemetry.capacityTokens > $0.capacityTokens
             }) ?? true {
-                maximumKVarNScoringTelemetry[cell] = telemetry
+                maximumKVarNScoringTelemetry[key] = telemetry
             }
         }
     }
@@ -724,6 +837,15 @@ actor HarnessEngineActor {
     private func expectedAttentionOperation(
         _ mode: AffineKVAttentionMode
     ) -> AffineKVAttentionOperation {
+        switch mode {
+        case .materialize: .materializedKV
+        case .splitQuantizedMM: .splitQuantizedMM
+        }
+    }
+
+    private func expectedKVarNAttentionOperation(
+        _ mode: KVarNKVAttentionMode
+    ) -> KVarNKVAttentionOperation {
         switch mode {
         case .materialize: .materializedKV
         case .splitQuantizedMM: .splitQuantizedMM
@@ -741,9 +863,11 @@ actor HarnessEngineActor {
     }
 
     func kvarnScoringTelemetry(
-        for cell: KVarNKVRuntimeCell
+        for cell: KVarNKVRuntimeCell,
+        attentionMode: KVarNKVAttentionMode
     ) -> KVarNKVCacheTelemetry? {
-        maximumKVarNScoringTelemetry[cell]
+        maximumKVarNScoringTelemetry[KVarNScoringTelemetryKey(
+            cell: cell, attentionMode: attentionMode)]
     }
 
     /// 512 balances per-chunk transient size (a [1, 512, vocab] fp16 logits buffer ~150MB)
@@ -798,7 +922,8 @@ struct SwiftEngineDriver: EngineDriver {
         let out = await engine.generate(
             prompt: prompt, maxTokens: config.maxTokens, eos: eos,
             kvCache: kind,
-            affineAttentionMode: selection.affineAttentionMode)
+            affineAttentionMode: selection.affineAttentionMode,
+            kvarnAttentionMode: selection.kvarnAttentionMode)
         var counts = ["decode": out.tokens.count]
         if let tq = out.turboQuantTokens {
             // In-graph cached-token count from the quantized cache — the lossy triad's
@@ -851,10 +976,20 @@ struct SwiftEngineDriver: EngineDriver {
             counts["kvarn_fp16_sink_bytes"] = kvarn.fp16SinkBytes
             counts["kvarn_fp16_tail_bytes"] = kvarn.fp16TailBytes
             counts["kvarn_control_bytes"] = kvarn.controlBytes
-            counts["kvarn_workspace_bytes"] = kvarn.materializationWorkspaceBytes
+            counts["kvarn_workspace_bytes"] = kvarn.workspaceBytes
+            counts["kvarn_materialization_bytes"] =
+                kvarn.materializationWorkspaceBytes
+            counts["kvarn_attention_workspace_bytes"] =
+                kvarn.attentionWorkspaceBytes
+            counts["kvarn_attention_split"] =
+                kvarn.attentionOperation == .splitQuantizedMM ? 1 : 0
+            counts["kvarn_attention_materialized"] =
+                kvarn.attentionOperation == .materializedKV ? 1 : 0
             counts["kvarn_codec_iterations"] = kvarn.iterations
             counts["kvarn_uncompiled_correctness"] =
                 kvarn.executionMode == .uncompiledCorrectness ? 1 : 0
+            counts["kvarn_compiled"] =
+                kvarn.executionMode == .compiled ? 1 : 0
         }
         return RunResult(
             tokens: out.tokens,
@@ -870,7 +1005,8 @@ struct SwiftEngineDriver: EngineDriver {
         return await engine.logprobs(
             prompt: prompt, maxTokens: config.maxTokens, eos: eos,
             kvCache: selection.kind,
-            affineAttentionMode: selection.affineAttentionMode)
+            affineAttentionMode: selection.affineAttentionMode,
+            kvarnAttentionMode: selection.kvarnAttentionMode)
     }
 
     func taskChoiceLogits(
@@ -892,7 +1028,8 @@ struct SwiftEngineDriver: EngineDriver {
         }
         return await engine.taskChoiceLogits(
             prompt: prompt, kvCache: kind,
-            affineAttentionMode: selection.affineAttentionMode)
+            affineAttentionMode: selection.affineAttentionMode,
+            kvarnAttentionMode: selection.kvarnAttentionMode)
     }
 
     /// Private, policy-typed qualification seam. Unlike `generate(config:)`, there is no string
@@ -951,7 +1088,8 @@ struct SwiftEngineDriver: EngineDriver {
         return await engine.teacherForcedLogprobs(
             prompt: prompt, forced: forcedContinuation,
             kvCache: selection.kind,
-            affineAttentionMode: selection.affineAttentionMode)
+            affineAttentionMode: selection.affineAttentionMode,
+            kvarnAttentionMode: selection.kvarnAttentionMode)
     }
 
     func logprobs(prompt: [Int], forcedContinuation: [Int], atPositions positions: [Int], config: RunConfig) async throws -> [[Float]] {
@@ -959,7 +1097,8 @@ struct SwiftEngineDriver: EngineDriver {
         return await engine.teacherForcedLogprobsAtPositions(
             prompt: prompt, forced: forcedContinuation, positions: positions,
             kvCache: selection.kind,
-            affineAttentionMode: selection.affineAttentionMode)
+            affineAttentionMode: selection.affineAttentionMode,
+            kvarnAttentionMode: selection.kvarnAttentionMode)
     }
 
     func affineScoringTelemetry() async -> AffineKVCacheTelemetry? {
@@ -973,9 +1112,11 @@ struct SwiftEngineDriver: EngineDriver {
     }
 
     func kvarnScoringTelemetry(
-        for cell: KVarNKVRuntimeCell
+        for cell: KVarNKVRuntimeCell,
+        attentionMode: KVarNKVAttentionMode
     ) async -> KVarNKVCacheTelemetry? {
-        await engine.kvarnScoringTelemetry(for: cell)
+        await engine.kvarnScoringTelemetry(
+            for: cell, attentionMode: attentionMode)
     }
 
     /// Validates the whole config and maps `kvQuant` through `KVCacheKind`'s closed affine /

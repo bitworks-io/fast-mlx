@@ -123,6 +123,45 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
+    func testKVarNBenchPlanAcceptsOnlyItsAuthenticatedDirectOrMaterializedRoute()
+        throws
+    {
+        let common = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "kvarn-k4v2-g128",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]
+        let split = try parseBenchPlan(Flags(common + [
+            "--kv-attention", "split-kvarn-quantized-mm",
+        ]))
+        XCTAssertEqual(
+            split.compressedKVAttention,
+            .splitKVarNQuantizedMM)
+
+        let materialized = try parseBenchPlan(Flags(common + [
+            "--kv-attention", "materialize",
+        ]))
+        XCTAssertEqual(materialized.compressedKVAttention, .materialize)
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(common + [
+            "--kv-attention", "split-affine-quantized-mm",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .unsupportedAttentionTier("kvarn-k4v2-g128"))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "split-kvarn-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .unsupportedAttentionTier("affine-k4v2-g64"))
+        }
+    }
+
     func testKVTunerBenchPlanRejectsTierCellMismatchAndCustomPrompt() throws {
         let common = [
             "--model", "/models/Qwen3-32B-4bit",
@@ -358,6 +397,54 @@ final class BenchCLITests: XCTestCase {
             engagement: .init(falseZero),
             expectedKVTunerLayerCount: nil,
             requestedCompressedKVAttention: .splitAffineQuantizedMM))
+
+        XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+            tier: "kvarn-k4v2-g128",
+            engagement: .init([
+                "kvarn_tokens": 256,
+                "kvarn_completed_tiles": 1,
+                "kvarn_compressed_tokens": 128,
+                "kvarn_codec_iterations": 8,
+                "kvarn_layers": 64,
+                "kvarn_capacity_tokens": 512,
+                "kvarn_payload_bytes": 1_000,
+                "kvarn_metadata_bytes": 100,
+                "kvarn_control_bytes": 256,
+                "kvarn_workspace_bytes": 200,
+            ]),
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitKVarNQuantizedMM))
+
+        let kvarnSplit = EngagementCounters([
+            "kvarn_tokens": 256,
+            "kvarn_completed_tiles": 1,
+            "kvarn_compressed_tokens": 128,
+            "kvarn_codec_iterations": 8,
+            "kvarn_layers": 64,
+            "kvarn_capacity_tokens": 512,
+            "kvarn_payload_bytes": 1_000,
+            "kvarn_metadata_bytes": 100,
+            "kvarn_control_bytes": 256,
+            "kvarn_workspace_bytes": 200,
+            "kvarn_materialization_bytes": 0,
+            "kvarn_attention_workspace_bytes": 200,
+            "kvarn_attention_split": 1,
+            "kvarn_attention_materialized": 0,
+        ])
+        XCTAssertNoThrow(try validateBenchRuntimeEngagement(
+            tier: "kvarn-k4v2-g128",
+            engagement: kvarnSplit,
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitKVarNQuantizedMM))
+
+        var falseKVarNMaterialization = kvarnSplit.counts
+        falseKVarNMaterialization["kvarn_materialization_bytes"] = 200
+        falseKVarNMaterialization["kvarn_attention_workspace_bytes"] = 0
+        XCTAssertThrowsError(try validateBenchRuntimeEngagement(
+            tier: "kvarn-k4v2-g128",
+            engagement: .init(falseKVarNMaterialization),
+            expectedKVTunerLayerCount: nil,
+            requestedCompressedKVAttention: .splitKVarNQuantizedMM))
     }
 
     func testBenchCompressedAttentionWorkspaceMustFitRawMLXPeakReceipt() throws {
@@ -390,6 +477,24 @@ final class BenchCLITests: XCTestCase {
             request: nil,
             engagement: .init(),
             maxMLXPeakBytes: 0))
+
+        let kvarnSplit = EngagementCounters([
+            "kvarn_workspace_bytes": 512,
+            "kvarn_materialization_bytes": 0,
+            "kvarn_attention_workspace_bytes": 512,
+            "kvarn_attention_split": 1,
+            "kvarn_attention_materialized": 0,
+        ])
+        XCTAssertNoThrow(try validateBenchCompressedAttentionMemoryReceipt(
+            tier: "kvarn-k4v2-g128",
+            request: .splitKVarNQuantizedMM,
+            engagement: kvarnSplit,
+            maxMLXPeakBytes: 512))
+        XCTAssertThrowsError(try validateBenchCompressedAttentionMemoryReceipt(
+            tier: "kvarn-k4v2-g128",
+            request: .splitKVarNQuantizedMM,
+            engagement: kvarnSplit,
+            maxMLXPeakBytes: 511))
     }
 
     func testBenchBindingUsesObservedCountersRatherThanRequestedMode() throws {
@@ -427,6 +532,31 @@ final class BenchCLITests: XCTestCase {
                 $0 as? BenchCLIError,
                 .missingCompressedAttentionEvidence)
         }
+    }
+
+    func testBenchBindingUsesObservedKVarNCounters() throws {
+        let config = Data(
+            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+        let admission = try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: config,
+                checkpointManifestHash: "0123456789abcdef",
+                checkpointContentSHA256:
+                    String(repeating: "d", count: 64),
+                tokenizerSHA256:
+                    String(repeating: "a", count: 64)))
+        let split = EngagementCounters([
+            "kvarn_attention_split": 1,
+            "kvarn_attention_materialized": 0,
+        ])
+
+        let binding = try makeBenchCompressedKVAttentionRuntimeBinding(
+            tier: "kvarn-k4v2-g128",
+            request: .splitKVarNQuantizedMM,
+            admission: admission,
+            engagement: split)
+        XCTAssertEqual(
+            binding?.observedOperation, .splitKVarNQuantizedMM)
     }
 
     func testNonKVTunerBenchKeepsCustomPromptAndRejectsSchedule() throws {

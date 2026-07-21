@@ -381,9 +381,10 @@ private func prepareTaskCoherenceCases(
     }
 }
 
-private func taskEngagement(
+func taskEngagement(
     tier: String,
     kvtunerSchedule: KVTunerScheduleBinding?,
+    compressedKVAttentionRequest: CompressedKVAttentionRequest?,
     generated: EngagementCounters,
     scoring: EngagementCounters?
 ) throws -> TaskCoherenceCacheEngagementEvidence {
@@ -442,11 +443,18 @@ private func taskEngagement(
             scoringKVTunerLayerCount:
                 scoring?.counts["scoring_kvtuner_layers"])
     }
+    let directKVarN = compressedKVAttentionRequest
+        == .splitKVarNQuantizedMM
+    let generationModeMatches = directKVarN
+        ? generated.counts["kvarn_compiled"] == 1
+            && generated.counts["kvarn_uncompiled_correctness"] == 0
+        : generated.counts["kvarn_compiled"] == 0
+            && generated.counts["kvarn_uncompiled_correctness"] == 1
     guard let cached = generated.counts["kvarn_tokens"],
         let completed = generated.counts["kvarn_completed_tiles"],
         let compressed = generated.counts["kvarn_compressed_tokens"],
         let iterations = generated.counts["kvarn_codec_iterations"],
-        generated.counts["kvarn_uncompiled_correctness"] == 1
+        generationModeMatches
     else {
         throw TaskCoherenceCLIError.missingEngagement("kvarn generation")
     }
@@ -463,7 +471,8 @@ private func taskEngagement(
         kvarnCompletedTileCount: completed,
         kvarnCompressedTokens: compressed,
         kvarnCodecIterations: iterations,
-        kvarnExecutionMode: "uncompiled-correctness",
+        kvarnExecutionMode: directKVarN
+            ? "compiled" : "uncompiled-correctness",
         scoringCachedTokens: scoring?.counts["scoring_cached_tokens"],
         scoringKVarNCompletedTileCount:
             scoring?.counts["scoring_kvarn_completed_tiles"],
@@ -481,7 +490,9 @@ func taskCompressedKVAttentionBinding(
     guard let request else { return nil }
     let affineBacked = AffineKVTier(rawValue: tier) != nil
         || isKVTunerTier(tier)
-    guard affineBacked else {
+    let directKVarN = tier == KVarNKVTier.k4v2G128.rawValue
+        && request == .splitKVarNQuantizedMM
+    guard affineBacked || directKVarN else {
         throw TaskCoherenceCLIError.missingEngagement(
             "compressed-attention unsupported tier")
     }
@@ -489,14 +500,20 @@ func taskCompressedKVAttentionBinding(
         throw TaskCoherenceCLIError.missingEngagement(
             "compressed-attention admission")
     }
-    let prefix = isKVTunerTier(tier) ? "kvtuner" : "affine"
+    let prefix: String
+    if directKVarN {
+        prefix = "kvarn"
+    } else {
+        prefix = isKVTunerTier(tier) ? "kvtuner" : "affine"
+    }
     func observed(
         _ counts: [String: Int],
         splitKey: String,
-        materializedKey: String
+        materializedKey: String,
+        splitOperation: CompressedKVAttentionObservedOperation
     ) throws -> CompressedKVAttentionObservedOperation {
         switch (counts[splitKey], counts[materializedKey]) {
-        case (1, 0): return .splitQuantizedMM
+        case (1, 0): return splitOperation
         case (0, 1): return .materializedKV
         default:
             throw TaskCoherenceCLIError.missingEngagement(
@@ -506,12 +523,20 @@ func taskCompressedKVAttentionBinding(
     let generationOperation = try observed(
         generated.counts,
         splitKey: "\(prefix)_attention_split",
-        materializedKey: "\(prefix)_attention_materialized")
+        materializedKey: "\(prefix)_attention_materialized",
+        splitOperation: directKVarN
+            ? .splitKVarNQuantizedMM : .splitQuantizedMM)
     if let scoring {
         let scoringOperation = try observed(
             scoring.counts,
-            splitKey: "scoring_attention_split",
-            materializedKey: "scoring_attention_materialized")
+            splitKey: directKVarN
+                ? "scoring_kvarn_attention_split"
+                : "scoring_attention_split",
+            materializedKey: directKVarN
+                ? "scoring_kvarn_attention_materialized"
+                : "scoring_attention_materialized",
+            splitOperation: directKVarN
+                ? .splitKVarNQuantizedMM : .splitQuantizedMM)
         guard scoringOperation == generationOperation else {
             throw TaskCoherenceCLIError.missingEngagement(
                 "compressed-attention scoring agreement")
@@ -757,6 +782,8 @@ func runTaskCoherence(_ flags: Flags) async {
             let engagement = try taskEngagement(
                 tier: plan.tier,
                 kvtunerSchedule: preparedKVTuner?.binding,
+                compressedKVAttentionRequest:
+                    effectiveCompressedKVAttention,
                 generated: generation.engagement,
                 scoring: scoringEngagement)
             let compressedKVAttention = try taskCompressedKVAttentionBinding(

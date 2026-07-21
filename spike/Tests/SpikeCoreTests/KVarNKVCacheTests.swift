@@ -299,6 +299,1234 @@ final class KVarNKVCacheTests: XCTestCase {
         }
     }
 
+    func testDirectPackedPrimitivesMatchMaterializedAlgebraAndConsumeExactBytes()
+        throws
+    {
+        let dimension = 128
+        let kvHeads = 2
+        let queryHeads = 4
+        let queryLength = 3
+        let elementCount = kvHeads * dimension * dimension
+        let keys = MLXArray((0 ..< elementCount).map { index in
+            Float16(
+                sin(Double(index) * 0.017)
+                    + 0.35 * cos(Double(index) * 0.031))
+        }).reshaped([1, kvHeads, dimension, dimension])
+        let values = MLXArray((0 ..< elementCount).map { index in
+            Float16(
+                cos(Double(index) * 0.013)
+                    - 0.2 * sin(Double(index) * 0.029))
+        }).reshaped([1, kvHeads, dimension, dimension])
+        let configuration = try KVarNMLXConfiguration(
+            headDimension: dimension,
+            groupSize: dimension,
+            keyBits: 4,
+            valueBits: 2,
+            iterations: 8)
+        let record = try KVarNMLXCodec.detachedStorageCopy(of:
+            KVarNMLXCodec.quantize(
+                keys: keys,
+                values: values,
+                configuration: configuration))
+        let reconstruction = try KVarNMLXCodec.dequantize(record)
+        let queries = MLXArray((0 ..< queryHeads * queryLength * dimension).map { index in
+            Float16(
+                0.5 * sin(Double(index) * 0.041)
+                    - 0.25 * cos(Double(index) * 0.023))
+        }).reshaped([1, queryHeads, queryLength, dimension])
+        let valueWeights = softmax(
+            MLXArray((0 ..< queryHeads * queryLength * dimension).map { index in
+                Float16(sin(Double(index) * 0.007))
+            }).reshaped([1, queryHeads, queryLength, dimension]),
+            axis: -1,
+            precise: true)
+
+        let directScores = try KVarNMLXCodec.directKeyScores(
+            queries: queries,
+            key: record.keyOperand)
+        let repeats = queryHeads / kvHeads
+        let controlScores = matmul(
+            queries.reshaped([
+                1, kvHeads, repeats, queryLength, dimension,
+            ]),
+            reconstruction.keys
+                .expandedDimensions(axis: 2)
+                .transposed(0, 1, 2, 4, 3)
+        ).reshaped([1, queryHeads, queryLength, dimension])
+        let directValues = try KVarNMLXCodec.directValueProduct(
+            weights: valueWeights,
+            value: record.valueOperand)
+        let controlValues = matmul(
+            valueWeights.reshaped([
+                1, kvHeads, repeats, queryLength, dimension,
+            ]),
+            reconstruction.values.expandedDimensions(axis: 2)
+        ).reshaped([1, queryHeads, queryLength, dimension])
+        eval([directScores, controlScores, directValues, controlValues])
+
+        XCTAssertEqual(directScores.shape, controlScores.shape)
+        XCTAssertEqual(directValues.shape, controlValues.shape)
+        XCTAssertEqual(directScores.dtype, controlScores.dtype)
+        XCTAssertEqual(directValues.dtype, controlValues.dtype)
+        XCTAssertEqual(
+            argMax(directScores, axis: -1).asArray(Int32.self),
+            argMax(controlScores, axis: -1).asArray(Int32.self))
+        for (actual, expected) in zip(
+            directScores.asType(.float32).asArray(Float.self),
+            controlScores.asType(.float32).asArray(Float.self))
+        {
+            XCTAssertEqual(actual, expected, accuracy: 8e-2)
+        }
+        for (actual, expected) in zip(
+            directValues.asType(.float32).asArray(Float.self),
+            controlValues.asType(.float32).asArray(Float.self))
+        {
+            XCTAssertEqual(actual, expected, accuracy: 8e-3)
+        }
+
+        // Match the production attention composition. Softmax over unscaled dot products
+        // exaggerates small quantized-MM rounding differences that the real decoder divides by
+        // sqrt(headDimension) before normalization.
+        let attentionScale = MLXArray(
+            Float(1 / sqrt(Double(dimension)))
+        ).asType(directScores.dtype)
+        let directAttention = try KVarNMLXCodec.directValueProduct(
+            weights: softmax(
+                directScores * attentionScale, axis: -1, precise: true),
+            value: record.valueOperand)
+        let controlAttention = matmul(
+            softmax(
+                controlScores * attentionScale, axis: -1, precise: true
+            ).reshaped([
+                1, kvHeads, repeats, queryLength, dimension,
+            ]),
+            reconstruction.values.expandedDimensions(axis: 2)
+        ).reshaped([1, queryHeads, queryLength, dimension])
+        eval([directAttention, controlAttention])
+
+        XCTAssertEqual(directAttention.shape, controlAttention.shape)
+        XCTAssertEqual(directAttention.dtype, controlAttention.dtype)
+        XCTAssertEqual(
+            argMax(directAttention, axis: -1).asArray(Int32.self),
+            argMax(controlAttention, axis: -1).asArray(Int32.self))
+        for (actual, expected) in zip(
+            directAttention.asType(.float32).asArray(Float.self),
+            controlAttention.asType(.float32).asArray(Float.self))
+        {
+            XCTAssertLessThanOrEqual(
+                abs(actual - expected),
+                2e-3 + 2e-3 * abs(expected))
+        }
+
+        let key = record.keyOperand
+        var changedKeyBytes = key.payload.asArray(UInt8.self)
+        changedKeyBytes[0] ^= 0x0F
+        let changedKeys: [(String, KVarNMLXPackedKeyOperand)] = [
+            (
+                "payload",
+                KVarNMLXPackedKeyOperand(
+                    configuration: key.configuration,
+                    batchSize: key.batchSize,
+                    headCount: key.headCount,
+                    outputDType: key.outputDType,
+                    payload: MLXArray(changedKeyBytes).reshaped(key.payload.shape),
+                    absorbedScale: key.absorbedScale,
+                    absorbedBias: key.absorbedBias,
+                    tokenScale: key.tokenScale)
+            ),
+            (
+                "absorbed scale",
+                KVarNMLXPackedKeyOperand(
+                    configuration: key.configuration,
+                    batchSize: key.batchSize,
+                    headCount: key.headCount,
+                    outputDType: key.outputDType,
+                    payload: key.payload,
+                    absorbedScale: key.absorbedScale + Float16(0.125),
+                    absorbedBias: key.absorbedBias,
+                    tokenScale: key.tokenScale)
+            ),
+            (
+                "absorbed bias",
+                KVarNMLXPackedKeyOperand(
+                    configuration: key.configuration,
+                    batchSize: key.batchSize,
+                    headCount: key.headCount,
+                    outputDType: key.outputDType,
+                    payload: key.payload,
+                    absorbedScale: key.absorbedScale,
+                    absorbedBias: key.absorbedBias + Float16(0.125),
+                    tokenScale: key.tokenScale)
+            ),
+            (
+                "token scale",
+                KVarNMLXPackedKeyOperand(
+                    configuration: key.configuration,
+                    batchSize: key.batchSize,
+                    headCount: key.headCount,
+                    outputDType: key.outputDType,
+                    payload: key.payload,
+                    absorbedScale: key.absorbedScale,
+                    absorbedBias: key.absorbedBias,
+                    tokenScale: key.tokenScale * Float16(1.25))
+            ),
+        ]
+
+        let value = record.valueOperand
+        var changedValueBytes = value.payload.asArray(UInt8.self)
+        changedValueBytes[0] ^= 0x03
+        let changedValues: [(String, KVarNMLXPackedValueOperand)] = [
+            (
+                "payload",
+                KVarNMLXPackedValueOperand(
+                    configuration: value.configuration,
+                    batchSize: value.batchSize,
+                    headCount: value.headCount,
+                    outputDType: value.outputDType,
+                    payload: MLXArray(changedValueBytes).reshaped(value.payload.shape),
+                    channelScale: value.channelScale,
+                    absorbedScale: value.absorbedScale,
+                    absorbedBias: value.absorbedBias)
+            ),
+            (
+                "channel scale",
+                KVarNMLXPackedValueOperand(
+                    configuration: value.configuration,
+                    batchSize: value.batchSize,
+                    headCount: value.headCount,
+                    outputDType: value.outputDType,
+                    payload: value.payload,
+                    channelScale: value.channelScale * Float16(1.25),
+                    absorbedScale: value.absorbedScale,
+                    absorbedBias: value.absorbedBias)
+            ),
+            (
+                "absorbed scale",
+                KVarNMLXPackedValueOperand(
+                    configuration: value.configuration,
+                    batchSize: value.batchSize,
+                    headCount: value.headCount,
+                    outputDType: value.outputDType,
+                    payload: value.payload,
+                    channelScale: value.channelScale,
+                    absorbedScale: value.absorbedScale + Float16(0.125),
+                    absorbedBias: value.absorbedBias)
+            ),
+            (
+                "absorbed bias",
+                KVarNMLXPackedValueOperand(
+                    configuration: value.configuration,
+                    batchSize: value.batchSize,
+                    headCount: value.headCount,
+                    outputDType: value.outputDType,
+                    payload: value.payload,
+                    channelScale: value.channelScale,
+                    absorbedScale: value.absorbedScale,
+                    absorbedBias: value.absorbedBias + Float16(0.125))
+            ),
+        ]
+
+        for (label, changedKey) in changedKeys {
+            let changedScores = try KVarNMLXCodec.directKeyScores(
+                queries: queries, key: changedKey)
+            eval(changedScores)
+            XCTAssertGreaterThan(
+                (changedScores - directScores).abs().max().item(Float.self),
+                1e-6,
+                "direct key scores must consume the exact \(label) bytes")
+        }
+        for (label, changedValue) in changedValues {
+            let changedProduct = try KVarNMLXCodec.directValueProduct(
+                weights: valueWeights, value: changedValue)
+            eval(changedProduct)
+            XCTAssertGreaterThan(
+                (changedProduct - directValues).abs().max().item(Float.self),
+                1e-6,
+                "direct value products must consume the exact \(label) bytes")
+        }
+    }
+
+    func testDirectPackedPrimitivesPreserveBFloat16AndFloat32OutputDTypes() throws {
+        let dimension = 128
+        let configuration = try KVarNMLXConfiguration(
+            headDimension: dimension,
+            groupSize: dimension,
+            keyBits: 4,
+            valueBits: 2,
+            iterations: 8)
+
+        for dtype: DType in [.bfloat16, .float32] {
+            let source = MLXArray((0 ..< dimension * dimension).map { index in
+                Float(sin(Double(index) * 0.019))
+            }).reshaped([1, 1, dimension, dimension]).asType(dtype)
+            let record = try KVarNMLXCodec.detachedStorageCopy(of:
+                KVarNMLXCodec.quantize(
+                    keys: source,
+                    values: source * Float(0.75),
+                    configuration: configuration))
+            let reconstruction = try KVarNMLXCodec.dequantize(record)
+            let queries = MLXArray((0 ..< 2 * dimension).map { index in
+                Float(cos(Double(index) * 0.023))
+            }).reshaped([1, 1, 2, dimension]).asType(dtype)
+            let weights = softmax(queries, axis: -1, precise: true)
+
+            let scores = try KVarNMLXCodec.directKeyScores(
+                queries: queries, key: record.keyOperand)
+            let products = try KVarNMLXCodec.directValueProduct(
+                weights: weights, value: record.valueOperand)
+            let controlScores = matmul(
+                queries, reconstruction.keys.transposed(0, 1, 3, 2))
+            let controlProducts = matmul(weights, reconstruction.values)
+            eval([scores, products, controlScores, controlProducts])
+
+            XCTAssertEqual(scores.dtype, dtype)
+            XCTAssertEqual(products.dtype, dtype)
+            XCTAssertTrue(
+                scores.allClose(controlScores, rtol: 3e-2, atol: 3e-2)
+                    .item(Bool.self))
+            XCTAssertTrue(
+                products.allClose(controlProducts, rtol: 3e-2, atol: 3e-2)
+                    .item(Bool.self))
+        }
+    }
+
+    func testDirectPackedPrimitivesKeepGroupAndHeadDimensionsDistinct() throws {
+        let dimension = 256
+        let groupSize = 128
+        let configuration = try KVarNMLXConfiguration(
+            headDimension: dimension,
+            groupSize: groupSize,
+            keyBits: 4,
+            valueBits: 2,
+            iterations: 8)
+        let keys = MLXArray((0 ..< groupSize * dimension).map { index in
+            Float16(
+                0.5 * sin(Double(index) * 0.013)
+                    + 0.2 * cos(Double(index) * 0.019))
+        }).reshaped([1, 1, groupSize, dimension])
+        let values = MLXArray((0 ..< groupSize * dimension).map { index in
+            Float16(
+                0.4 * cos(Double(index) * 0.017)
+                    - 0.1 * sin(Double(index) * 0.023))
+        }).reshaped([1, 1, groupSize, dimension])
+        let record = try KVarNMLXCodec.detachedStorageCopy(of:
+            KVarNMLXCodec.quantize(
+                keys: keys,
+                values: values,
+                configuration: configuration))
+        let reconstruction = try KVarNMLXCodec.dequantize(record)
+        let queries = MLXArray((0 ..< 2 * dimension).map { index in
+            Float16(cos(Double(index) * 0.029))
+        }).reshaped([1, 1, 2, dimension])
+        let weights = softmax(
+            MLXArray((0 ..< 2 * groupSize).map { index in
+                Float16(sin(Double(index) * 0.031))
+            }).reshaped([1, 1, 2, groupSize]),
+            axis: -1,
+            precise: true)
+
+        let scores = try KVarNMLXCodec.directKeyScores(
+            queries: queries,
+            key: record.keyOperand)
+        let products = try KVarNMLXCodec.directValueProduct(
+            weights: weights,
+            value: record.valueOperand)
+        let controlScores = matmul(
+            queries,
+            reconstruction.keys.transposed(0, 1, 3, 2))
+        let controlProducts = matmul(weights, reconstruction.values)
+        eval([scores, products, controlScores, controlProducts])
+
+        XCTAssertEqual(scores.shape, [1, 1, 2, groupSize])
+        XCTAssertEqual(products.shape, [1, 1, 2, dimension])
+        XCTAssertEqual(scores.dtype, .float16)
+        XCTAssertEqual(products.dtype, .float16)
+        XCTAssertTrue(
+            scores.allClose(controlScores, rtol: 3e-2, atol: 3e-2)
+                .item(Bool.self))
+        XCTAssertTrue(
+            products.allClose(controlProducts, rtol: 3e-2, atol: 3e-2)
+                .item(Bool.self))
+    }
+
+    func testSharedAttentionRouterDirectKVarNUsesPackedGQAWithoutMaterialization()
+        throws
+    {
+        let dimension = 128
+        let tokens = 256
+        let cache = KVarNKVCache(
+            capacity: tokens,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = KVarNKVCache(
+            capacity: tokens,
+            tier: .k4v2G128,
+            iterations: 8)
+        let kvHeads = 2
+        let queryHeads = 4
+        let keys = MLXArray((0 ..< kvHeads * tokens * dimension).map { index in
+            Float16(
+                0.5 * sin(Double(index) * 0.011)
+                    + 0.2 * cos(Double(index) * 0.017))
+        }).reshaped([1, kvHeads, tokens, dimension])
+        let values = MLXArray((0 ..< kvHeads * tokens * dimension).map { index in
+            Float16(
+                0.4 * cos(Double(index) * 0.013)
+                    - 0.3 * sin(Double(index) * 0.019))
+        }).reshaped([1, kvHeads, tokens, dimension])
+        let queries = MLXArray((0 ..< queryHeads * tokens * dimension).map { index in
+            Float16(
+                0.25 * sin(Double(index) * 0.023)
+                    + 0.1 * cos(Double(index) * 0.029))
+        }).reshaped([1, queryHeads, tokens, dimension])
+        let mask = cache.makeMask(
+            n: tokens, windowSize: nil, returnArray: true)
+        let scale = Float(1 / sqrt(Double(dimension)))
+
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask)
+        let oracle = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: oracleCache,
+            scale: scale,
+            mask: mask)
+        eval(output, oracle)
+
+        XCTAssertTrue(cache is any AttentionKVCacheProtocol)
+        XCTAssertEqual(output.shape, oracle.shape)
+        XCTAssertEqual(output.dtype, oracle.dtype)
+        XCTAssertTrue(
+            output.allClose(oracle, rtol: 2e-3, atol: 2e-3)
+                .item(Bool.self))
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(
+            storage.materializationWorkspaceBytes, 0,
+            "the shared router must not reconstruct the packed KVarN tile")
+        XCTAssertGreaterThan(
+            storage.attentionWorkspaceBytes, 0,
+            "the direct route must report its score/weight workspace")
+        XCTAssertEqual(
+            storage.workspaceBytes, storage.attentionWorkspaceBytes)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+        XCTAssertEqual(cache.completedTileCount, 1)
+    }
+
+    func testDirectKVarNRouterPreservesGrowRollbackResetAndReuseLifecycle()
+        throws
+    {
+        let dimension = 128
+        let kvHeads = 2
+        let queryHeads = 4
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 257,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = KVarNKVCache(
+            capacity: 257,
+            tier: .k4v2G128,
+            iterations: 8)
+
+        func tensor(
+            seed: Int, heads: Int, tokens: Int, phase: Double
+        ) -> MLXArray {
+            MLXArray((0 ..< heads * tokens * dimension).map { index in
+                Float16(
+                    0.4 * sin(Double(index + seed) * phase)
+                        + 0.2 * cos(Double(index + seed) * (phase + 0.011)))
+            }).reshaped([1, heads, tokens, dimension])
+        }
+
+        func runStep(seed: Int, tokens: Int) -> (MLXArray, MLXArray) {
+            let queries = tensor(
+                seed: seed, heads: queryHeads, tokens: tokens, phase: 0.017)
+            let keys = tensor(
+                seed: seed + 1, heads: kvHeads, tokens: tokens, phase: 0.019)
+            let values = tensor(
+                seed: seed + 2, heads: kvHeads, tokens: tokens, phase: 0.023)
+            let output = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: tokens, windowSize: nil, returnArray: true))
+            let oracle = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: oracleCache,
+                scale: scale,
+                mask: oracleCache.makeMask(
+                    n: tokens, windowSize: nil, returnArray: true))
+            eval(output, oracle)
+            return (output, oracle)
+        }
+
+        func assertParity(
+            _ pair: (MLXArray, MLXArray),
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertEqual(pair.0.shape, pair.1.shape, file: file, line: line)
+            XCTAssertEqual(pair.0.dtype, pair.1.dtype, file: file, line: line)
+            XCTAssertTrue(
+                pair.0.allClose(pair.1, rtol: 2e-3, atol: 2e-3)
+                    .item(Bool.self),
+                file: file,
+                line: line)
+        }
+
+        assertParity(runStep(seed: 10, tokens: 129))
+        XCTAssertEqual(cache.offset, 129)
+        XCTAssertEqual(cache.completedTileCount, 0)
+
+        cache.grow(by: 128)
+        oracleCache.grow(by: 128)
+        XCTAssertEqual(cache.capacity, 385)
+        XCTAssertEqual(oracleCache.capacity, 385)
+        cache.truncate(to: 128)
+        oracleCache.truncate(to: 128)
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 128)
+
+        assertParity(runStep(seed: 20, tokens: 128))
+        XCTAssertEqual(cache.offset, 256)
+        XCTAssertEqual(cache.completedTileCount, 1)
+        let beforeReset = cache.innerState()
+
+        cache.resetInPlace()
+        oracleCache.resetInPlace()
+        XCTAssertTrue(zip(beforeReset, cache.innerState()).allSatisfy { $0 === $1 })
+        XCTAssertEqual(cache.offset, 0)
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 0)
+        XCTAssertEqual(cache.completedTileCount, 0)
+        let resetStorage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(resetStorage.materializationWorkspaceBytes, 0)
+        XCTAssertEqual(resetStorage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(resetStorage.workspaceBytes, 0)
+        XCTAssertEqual(resetStorage.attentionOperation, .splitQuantizedMM)
+
+        assertParity(runStep(seed: 30, tokens: 256))
+        XCTAssertEqual(cache.offset, 256)
+        XCTAssertEqual(cache.completedTileCount, 1)
+        let reusedStorage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(reusedStorage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(reusedStorage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(
+            reusedStorage.workspaceBytes,
+            reusedStorage.attentionWorkspaceBytes)
+        XCTAssertEqual(reusedStorage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testDirectKVarNRouterConsumesMultiplePackedTilesAndTheLiveTail() throws {
+        let dimension = 128
+        let tokens = 385
+        let kvHeads = 1
+        let queryHeads = 2
+        let cache = KVarNKVCache(
+            capacity: tokens,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = KVarNKVCache(
+            capacity: tokens,
+            tier: .k4v2G128,
+            iterations: 8)
+
+        func tensor(heads: Int, phase: Double, offset: Double) -> MLXArray {
+            MLXArray((0 ..< heads * tokens * dimension).map { index in
+                Float16(
+                    0.45 * sin((Double(index) + offset) * phase)
+                        + 0.15 * cos((Double(index) + offset) * (phase + 0.007)))
+            }).reshaped([1, heads, tokens, dimension])
+        }
+
+        let queries = tensor(heads: queryHeads, phase: 0.011, offset: 3)
+        let keys = tensor(heads: kvHeads, phase: 0.017, offset: 5)
+        let values = tensor(heads: kvHeads, phase: 0.023, offset: 7)
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let output = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: tokens, windowSize: nil, returnArray: true))
+        let oracle = attentionWithCacheUpdate(
+            queries: queries,
+            keys: keys,
+            values: values,
+            cache: oracleCache,
+            scale: scale,
+            mask: oracleCache.makeMask(
+                n: tokens, windowSize: nil, returnArray: true))
+        eval(output, oracle)
+
+        XCTAssertEqual(cache.completedTileCount, 2)
+        XCTAssertEqual(cache.offset, tokens)
+        XCTAssertEqual(output.shape, oracle.shape)
+        XCTAssertEqual(output.dtype, oracle.dtype)
+        XCTAssertTrue(
+            output.allClose(oracle, rtol: 2e-3, atol: 2e-3)
+                .item(Bool.self))
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testDirectKVarNRouterMasksUnusedPackedSlotsWhenLiveTailScoresAreNegative()
+        throws
+    {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 512,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = KVarNKVCache(
+            capacity: 512,
+            tier: .k4v2G128,
+            iterations: 8)
+
+        func tensor(
+            heads: Int, tokens: Int, transform: (Int) -> Float16
+        ) -> MLXArray {
+            MLXArray((0 ..< heads * tokens * dimension).map(transform))
+                .reshaped([1, heads, tokens, dimension])
+        }
+
+        func update(
+            queries: MLXArray, keys: MLXArray, values: MLXArray
+        ) -> (MLXArray, MLXArray) {
+            let directMask = cache.makeMask(
+                n: queries.dim(2), windowSize: nil, returnArray: true)
+            let oracleMask = oracleCache.makeMask(
+                n: queries.dim(2), windowSize: nil, returnArray: true)
+            let direct = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: directMask)
+            let oracle = attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: oracleCache,
+                scale: scale,
+                mask: oracleMask)
+            eval(direct, oracle)
+            return (direct, oracle)
+        }
+
+        let prefill = update(
+            queries: tensor(heads: 2, tokens: 256) { _ in 1 },
+            keys: tensor(heads: 1, tokens: 256) { index in
+                Float16(-0.45 - 0.05 * sin(Double(index) * 0.017))
+            },
+            values: tensor(heads: 1, tokens: 256) { index in
+                Float16(0.4 + 0.1 * cos(Double(index) * 0.013))
+            })
+        XCTAssertTrue(
+            prefill.0.allClose(prefill.1, rtol: 2e-3, atol: 2e-3)
+                .item(Bool.self))
+
+        let liveTail = update(
+            queries: tensor(heads: 2, tokens: 1) { _ in 1 },
+            keys: tensor(heads: 1, tokens: 1) { index in
+                Float16(-0.7 - 0.05 * cos(Double(index) * 0.019))
+            },
+            values: tensor(heads: 1, tokens: 1) { index in
+                Float16(0.8 + 0.05 * sin(Double(index) * 0.023))
+            })
+
+        XCTAssertEqual(cache.offset, 257)
+        XCTAssertEqual(cache.completedTileCount, 1)
+        XCTAssertTrue(
+            liveTail.0.allClose(liveTail.1, rtol: 2e-3, atol: 2e-3)
+                .item(Bool.self),
+            "zero-filled inactive packed slots must not compete with the live tail")
+        XCTAssertGreaterThan(
+            liveTail.1.abs().max().item(Float.self), 0.1,
+            "the oracle must expose any softmax mass stolen by inactive zero slots")
+        XCTAssertTrue(cache is any AttentionKVCacheProtocol)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.attentionWorkspaceBytes)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testCompiledDirectKVarNReplayAdvancesPackedStateWithoutMaterialization()
+        throws
+    {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 384,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let oracleCache = KVarNKVCache(
+            capacity: 384,
+            tier: .k4v2G128,
+            iterations: 8)
+
+        func inputs(seed: Int, tokens: Int) -> [MLXArray] {
+            func tensor(heads: Int, phase: Double) -> MLXArray {
+                MLXArray((0 ..< heads * tokens * dimension).map { index in
+                    Float16(
+                        0.4 * sin(Double(index + seed) * phase)
+                            + 0.2 * cos(
+                                Double(index + seed) * (phase + 0.013)))
+                }).reshaped([1, heads, tokens, dimension])
+            }
+            return [
+                tensor(heads: 2, phase: 0.017),
+                tensor(heads: 1, phase: 0.019),
+                tensor(heads: 1, phase: 0.023),
+            ]
+        }
+
+        let prefill = inputs(seed: 100, tokens: 255)
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: prefill[0],
+            keys: prefill[1],
+            values: prefill[2],
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 255, windowSize: nil, returnArray: true))
+        let oraclePrefillMask = oracleCache.makeMask(
+            n: 255, windowSize: nil, returnArray: true)
+        let (oraclePrefillKeys, oraclePrefillValues) = oracleCache.update(
+            keys: prefill[1], values: prefill[2])
+        let oraclePrefill = MLXFast.scaledDotProductAttention(
+            queries: prefill[0],
+            keys: oraclePrefillKeys,
+            values: oraclePrefillValues,
+            scale: scale,
+            mask: oraclePrefillMask)
+        eval(prefillOutput, oraclePrefill)
+        XCTAssertTrue(
+            prefillOutput.allClose(
+                oraclePrefill, rtol: 2e-3, atol: 2e-3
+            ).item(Bool.self))
+        XCTAssertEqual(cache.completedTileCount, 0)
+        let stateBeforeBoundary = cache.innerState()
+
+        let step = compile(inputs: [cache], outputs: [cache]) { arguments in
+            [attentionWithCacheUpdate(
+                queries: arguments[0],
+                keys: arguments[1],
+                values: arguments[2],
+                cache: cache,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: 1, windowSize: nil, returnArray: true))]
+        }
+
+        var firstTailKey: MLXArray?
+        var firstTailValue: MLXArray?
+        for (replayIndex, seed) in [200, 300, 400].enumerated() {
+            let next = inputs(seed: seed, tokens: 1)
+            let output = step(next)[0]
+            let oracleMask = oracleCache.makeMask(
+                n: 1, windowSize: nil, returnArray: true)
+            let (oracleKeys, oracleValues) = oracleCache.update(
+                keys: next[1], values: next[2])
+            let oracle = MLXFast.scaledDotProductAttention(
+                queries: next[0],
+                keys: oracleKeys,
+                values: oracleValues,
+                scale: scale,
+                mask: oracleMask)
+            eval(output, oracle)
+            XCTAssertTrue(isFinite(output).all().item(Bool.self))
+            XCTAssertTrue(
+                output.allClose(oracle, rtol: 2e-3, atol: 2e-3)
+                    .item(Bool.self))
+
+            XCTAssertEqual(
+                cache.offsetArr.item(Int32.self), Int32(256 + replayIndex))
+            if replayIndex == 0 {
+                XCTAssertEqual(cache.completedTileCount, 1)
+                XCTAssertTrue(
+                    zip(stateBeforeBoundary, cache.innerState()).allSatisfy {
+                        $0 === $1
+                    },
+                    "tile finalization must preserve every compiled-state handle")
+                let clearedTailKey = cache.tailKeys![0, 0, 0, 0...]
+                let clearedTailValue = cache.tailValues![0, 0, 0, 0...]
+                eval(clearedTailKey, clearedTailValue)
+                XCTAssertTrue(
+                    (clearedTailKey .== MLXArray(Float16(0)))
+                        .all().item(Bool.self))
+                XCTAssertTrue(
+                    (clearedTailValue .== MLXArray(Float16(0)))
+                        .all().item(Bool.self))
+            } else if replayIndex == 1 {
+                firstTailKey = cache.tailKeys![0, 0, 0, 0...] + 0
+                firstTailValue = cache.tailValues![0, 0, 0, 0...] + 0
+                eval(firstTailKey!, firstTailValue!)
+            } else {
+                let retainedKey = cache.tailKeys![0, 0, 0, 0...]
+                let retainedValue = cache.tailValues![0, 0, 0, 0...]
+                let secondKey = cache.tailKeys![0, 0, 1, 0...]
+                let secondValue = cache.tailValues![0, 0, 1, 0...]
+                eval(retainedKey, retainedValue, secondKey, secondValue)
+                XCTAssertTrue(
+                    retainedKey.allClose(firstTailKey!, rtol: 0, atol: 0)
+                        .item(Bool.self),
+                    "compiled replay must preserve the first key row")
+                XCTAssertTrue(
+                    retainedValue.allClose(firstTailValue!, rtol: 0, atol: 0)
+                        .item(Bool.self),
+                    "compiled replay must preserve the first value row")
+                XCTAssertGreaterThan(
+                    (retainedKey - secondKey).abs().max().item(Float.self),
+                    1e-3,
+                    "compiled replay must write keys to distinct tail rows")
+                XCTAssertGreaterThan(
+                    (retainedValue - secondValue).abs().max().item(Float.self),
+                    1e-3,
+                    "compiled replay must write values to distinct tail rows")
+            }
+        }
+
+        XCTAssertTrue(cache is any AttentionKVCacheProtocol)
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 258)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertGreaterThan(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, storage.attentionWorkspaceBytes)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testDirectRouterRejectsInvalidRequestBeforeCacheMutation() throws {
+        let dimension = 128
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let initialState = cache.innerState()
+        let validKeys = MLXArray.zeros(
+            [1, 2, 1, dimension], dtype: .float16)
+        let validValues = MLXArray.zeros(
+            [1, 2, 1, dimension], dtype: .float16)
+
+        func assertRejectedWithoutMutation(
+            queries: MLXArray,
+            keys: MLXArray? = nil,
+            values: MLXArray? = nil,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+            expectedError: KVarNMLXError,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertThrowsError(try cache.checkedUpdateAndAttend(
+                queries: queries,
+                keys: keys ?? validKeys,
+                values: values ?? validValues,
+                scale: Float(1 / sqrt(Double(dimension))),
+                mask: mask
+            ), file: file, line: line) {
+                XCTAssertEqual(
+                    $0 as? KVarNMLXError,
+                    expectedError,
+                    file: file,
+                    line: line)
+            }
+            XCTAssertEqual(cache.offset, 0, file: file, line: line)
+            XCTAssertEqual(
+                cache.offsetArr.item(Int32.self), 0, file: file, line: line)
+            XCTAssertNil(cache.storageSnapshot(), file: file, line: line)
+            XCTAssertTrue(
+                zip(initialState, cache.innerState()).allSatisfy { $0 === $1 },
+                file: file,
+                line: line)
+        }
+
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 3, 1, dimension], dtype: .float16),
+            expectedError: .invalidTileShape)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 4, 1, dimension], dtype: .float16),
+            mask: .array(MLXArray.zeros(
+                [1, 1, 256], dtype: .float16)),
+            expectedError: .invalidTileShape)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 4, 1, dimension], dtype: .float16),
+            mask: .array(MLXArray.zeros(
+                [2, 256], dtype: .float16)),
+            expectedError: .invalidTileShape)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 4, 1, dimension], dtype: .float16),
+            mask: .array(MLXArray.zeros(
+                [2, 1, 1, 256], dtype: .float16)),
+            expectedError: .invalidTileShape)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 4, 1, dimension], dtype: .float16),
+            mask: .array(MLXArray.zeros(
+                [1, 3, 1, 256], dtype: .float16)),
+            expectedError: .invalidTileShape)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.full(
+                [1, 4, 1, dimension],
+                values: MLXArray(Float16.nan)),
+            expectedError: .nonFiniteInput)
+        assertRejectedWithoutMutation(
+            queries: MLXArray.zeros(
+                [1, 4, 1, dimension], dtype: .float16),
+            keys: MLXArray.zeros(
+                [2, 2, 1, dimension], dtype: .float16),
+            values: MLXArray.zeros(
+                [2, 2, 1, dimension], dtype: .float16),
+            expectedError: .invalidTileShape)
+    }
+
+    func testCompiledDirectRouterRejectsNonFiniteReplayWithoutMutatingArrayState() {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let prefill = MLXArray.zeros(
+            [1, 1, 128, dimension], dtype: .float16)
+        let prefillQueries = broadcast(
+            prefill, to: [1, 2, 128, dimension])
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: prefillQueries,
+            keys: prefill,
+            values: prefill,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 128, windowSize: nil, returnArray: true))
+        eval(prefillOutput, cache.innerState())
+
+        let stateBefore = cache.innerState().map {
+            view($0, dtype: .uint8).asArray(UInt8.self)
+        }
+        let offsetBefore = cache.offsetArr.item(Int32.self)
+        let step = compile(inputs: [cache], outputs: [cache]) { arguments in
+            [attentionWithCacheUpdate(
+                queries: arguments[0],
+                keys: arguments[1],
+                values: arguments[2],
+                cache: cache,
+                scale: scale,
+                mask: cache.makeMask(
+                    n: 1, windowSize: nil, returnArray: true))]
+        }
+        let nonFiniteQueries = MLXArray.full(
+            [1, 2, 1, dimension],
+            values: MLXArray(Float16.nan))
+        let nonFiniteKV = MLXArray.full(
+            [1, 1, 1, dimension],
+            values: MLXArray(Float16.nan))
+
+        let output = step([
+            nonFiniteQueries, nonFiniteKV, nonFiniteKV,
+        ])[0]
+        eval(output, cache.innerState())
+
+        XCTAssertFalse(isFinite(output).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), offsetBefore)
+        XCTAssertEqual(
+            cache.offset, Int(offsetBefore),
+            "compiled tracing and a rejected replay cannot advance the host mirror")
+        XCTAssertEqual(
+            cache.innerState().map {
+                view($0, dtype: .uint8).asArray(UInt8.self)
+            },
+            stateBefore,
+            "non-finite replay must leave every compiled cache-state byte unchanged")
+    }
+
+    func testDirectRouterRejectAfterResetKeepsWorkspaceReceiptClear() throws {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let prefill = MLXArray.zeros(
+            [1, 1, 128, dimension], dtype: .float16)
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: broadcast(prefill, to: [1, 2, 128, dimension]),
+            keys: prefill,
+            values: prefill,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 128, windowSize: nil, returnArray: true))
+        eval(prefillOutput, cache.innerState())
+
+        cache.resetInPlace()
+        let nonFiniteQueries = MLXArray.full(
+            [1, 2, 1, dimension],
+            values: MLXArray(Float16.nan))
+        let nonFiniteKV = MLXArray.full(
+            [1, 1, 1, dimension],
+            values: MLXArray(Float16.nan))
+        let output = attentionWithCacheUpdate(
+            queries: nonFiniteQueries,
+            keys: nonFiniteKV,
+            values: nonFiniteKV,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(output, cache.innerState())
+
+        XCTAssertFalse(isFinite(output).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 0)
+        let storage = try XCTUnwrap(cache.storageSnapshot())
+        XCTAssertEqual(storage.materializationWorkspaceBytes, 0)
+        XCTAssertEqual(storage.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(storage.workspaceBytes, 0)
+        XCTAssertEqual(storage.attentionOperation, .splitQuantizedMM)
+    }
+
+    func testDirectSingleTokenOverflowFailsInGraphWithoutMutatingState() {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 256,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let prefill = MLXArray.zeros(
+            [1, 1, 255, dimension], dtype: .float16)
+        let prefillOutput = attentionWithCacheUpdate(
+            queries: broadcast(prefill, to: [1, 2, 255, dimension]),
+            keys: prefill,
+            values: prefill,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 255, windowSize: nil, returnArray: true))
+        eval(prefillOutput, cache.innerState())
+
+        let token = MLXArray.zeros(
+            [1, 1, 1, dimension], dtype: .float16)
+        let query = broadcast(token, to: [1, 2, 1, dimension])
+        let admitted = attentionWithCacheUpdate(
+            queries: query,
+            keys: token,
+            values: token,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(admitted, cache.innerState())
+        XCTAssertTrue(isFinite(admitted).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 256)
+
+        let stateBeforeOverflow = cache.innerState().map {
+            view($0, dtype: .uint8).asArray(UInt8.self)
+        }
+        let rejected = attentionWithCacheUpdate(
+            queries: query,
+            keys: token,
+            values: token,
+            cache: cache,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true))
+        eval(rejected, cache.innerState())
+
+        XCTAssertFalse(isFinite(rejected).all().item(Bool.self))
+        XCTAssertEqual(cache.offsetArr.item(Int32.self), 256)
+        XCTAssertEqual(cache.offset, 256)
+        XCTAssertEqual(
+            cache.innerState().map {
+                view($0, dtype: .uint8).asArray(UInt8.self)
+            },
+            stateBeforeOverflow,
+            "a full direct cache must reject the next token without changing any state byte")
+    }
+
+    func testDirectSinkOnlyCapacityFailsPreflightWithoutAllocation() {
+        let dimension = 128
+        let scale = Float(1 / sqrt(Double(dimension)))
+        let cache = KVarNKVCache(
+            capacity: 128,
+            tier: .k4v2G128,
+            iterations: 8,
+            attentionMode: .splitQuantizedMM)
+        let token = MLXArray.zeros(
+            [1, 1, 1, dimension], dtype: .float16)
+        XCTAssertThrowsError(try cache.checkedUpdateAndAttend(
+            queries: broadcast(token, to: [1, 2, 1, dimension]),
+            keys: token,
+            values: token,
+            scale: scale,
+            mask: cache.makeMask(
+                n: 1, windowSize: nil, returnArray: true)
+        )) { error in
+            XCTAssertEqual(error as? KVarNMLXError, .invalidTileShape)
+        }
+        XCTAssertEqual(cache.offset, 0)
+        XCTAssertNil(cache.storageSnapshot())
+        XCTAssertEqual(cache.innerState().count, 1)
+    }
+
+    func testDirectPackedPrimitivesRejectInvalidGeometryRecordsAndNonFiniteInput()
+        throws
+    {
+        let dimension = 128
+        let configuration = try KVarNMLXConfiguration(
+            headDimension: dimension,
+            groupSize: dimension,
+            keyBits: 4,
+            valueBits: 2,
+            iterations: 8)
+        let source = MLXArray((0 ..< dimension * dimension).map { index in
+            Float16(sin(Double(index) * 0.019))
+        }).reshaped([1, 1, dimension, dimension])
+        let record = try KVarNMLXCodec.detachedStorageCopy(of:
+            KVarNMLXCodec.quantize(
+                keys: source,
+                values: source * Float16(-0.5),
+                configuration: configuration))
+
+        let twoHeadSource = concatenated([
+            source,
+            source * Float16(0.75),
+        ], axis: 1)
+        let twoHeadRecord = try KVarNMLXCodec.detachedStorageCopy(of:
+            KVarNMLXCodec.quantize(
+                keys: twoHeadSource,
+                values: twoHeadSource * Float16(-0.5),
+                configuration: configuration))
+        let wrongQueryGeometry = MLXArray.zeros(
+            [1, 3, 1, dimension], dtype: .float16)
+        XCTAssertThrowsError(try KVarNMLXCodec.directKeyScores(
+            queries: wrongQueryGeometry,
+            key: twoHeadRecord.keyOperand)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidTileShape)
+        }
+
+        let nonFiniteQueries = MLXArray.full(
+            [1, 1, 1, dimension],
+            values: MLXArray(Float16.nan))
+        XCTAssertThrowsError(try KVarNMLXCodec.directKeyScores(
+            queries: nonFiniteQueries,
+            key: record.keyOperand)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .nonFiniteInput)
+        }
+
+        let key = record.keyOperand
+        let wrongPayload = KVarNMLXPackedKeyOperand(
+            configuration: key.configuration,
+            batchSize: key.batchSize,
+            headCount: key.headCount,
+            outputDType: key.outputDType,
+            payload: key.payload.asType(.uint32),
+            absorbedScale: key.absorbedScale,
+            absorbedBias: key.absorbedBias,
+            tokenScale: key.tokenScale)
+        XCTAssertThrowsError(try KVarNMLXCodec.directKeyScores(
+            queries: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float16),
+            key: wrongPayload)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
+        }
+
+        let nonFiniteMetadata = KVarNMLXPackedKeyOperand(
+            configuration: key.configuration,
+            batchSize: key.batchSize,
+            headCount: key.headCount,
+            outputDType: key.outputDType,
+            payload: key.payload,
+            absorbedScale: MLXArray.full(
+                key.absorbedScale.shape,
+                values: MLXArray(Float16.nan)),
+            absorbedBias: key.absorbedBias,
+            tokenScale: key.tokenScale)
+        XCTAssertThrowsError(try KVarNMLXCodec.directKeyScores(
+            queries: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float16),
+            key: nonFiniteMetadata)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
+        }
+
+        XCTAssertThrowsError(try KVarNMLXCodec.directValueProduct(
+            weights: MLXArray.zeros(
+                [1, 1, 1, dimension - 1], dtype: .float16),
+            value: record.valueOperand)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidTileShape)
+        }
+
+        XCTAssertThrowsError(try KVarNMLXCodec.directValueProduct(
+            weights: MLXArray.full(
+                [1, 1, 1, dimension],
+                values: MLXArray(Float16.infinity)),
+            value: record.valueOperand)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .nonFiniteInput)
+        }
+
+        let value = record.valueOperand
+        let wrongValuePayload = KVarNMLXPackedValueOperand(
+            configuration: value.configuration,
+            batchSize: value.batchSize,
+            headCount: value.headCount,
+            outputDType: value.outputDType,
+            payload: value.payload.asType(.uint32),
+            channelScale: value.channelScale,
+            absorbedScale: value.absorbedScale,
+            absorbedBias: value.absorbedBias)
+        XCTAssertThrowsError(try KVarNMLXCodec.directValueProduct(
+            weights: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float16),
+            value: wrongValuePayload)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
+        }
+
+        let nonFiniteValueMetadata = KVarNMLXPackedValueOperand(
+            configuration: value.configuration,
+            batchSize: value.batchSize,
+            headCount: value.headCount,
+            outputDType: value.outputDType,
+            payload: value.payload,
+            channelScale: MLXArray.full(
+                value.channelScale.shape,
+                values: MLXArray(Float16.nan)),
+            absorbedScale: value.absorbedScale,
+            absorbedBias: value.absorbedBias)
+        XCTAssertThrowsError(try KVarNMLXCodec.directValueProduct(
+            weights: MLXArray.zeros(
+                [1, 1, 1, dimension], dtype: .float16),
+            value: nonFiniteValueMetadata)) {
+            XCTAssertEqual($0 as? KVarNMLXError, .invalidRecord)
+        }
+    }
+
     func testDetachedStorageCopyPreservesEveryRecordByteAndReconstruction() throws {
         let configuration = try KVarNMLXConfiguration(
             headDimension: 4, groupSize: 4,
@@ -540,7 +1768,11 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(snapshot.fp16TailBytes, 65_536)
         XCTAssertEqual(snapshot.formatPersistentBytes, 158_720)
         XCTAssertEqual(snapshot.materializationWorkspaceBytes, 131_584)
+        XCTAssertEqual(snapshot.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(snapshot.workspaceBytes, 131_584)
+        XCTAssertEqual(snapshot.attentionOperation, .materializedKV)
         XCTAssertEqual(snapshot.storageAndMaterializationBytes, 290_304)
+        XCTAssertEqual(snapshot.storageAndWorkspaceBytes, 290_304)
         XCTAssertEqual(snapshot.controlBytes, 4)
         XCTAssertEqual(snapshot.totalPersistentBytes, 158_724)
 
@@ -678,9 +1910,13 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.fp16TailBytes, 131_072)
         XCTAssertEqual(telemetry.controlBytes, 8)
         XCTAssertEqual(telemetry.materializationWorkspaceBytes, 131_584)
+        XCTAssertEqual(telemetry.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(telemetry.workspaceBytes, 131_584)
+        XCTAssertEqual(telemetry.attentionOperation, .materializedKV)
         XCTAssertEqual(telemetry.formatPersistentBytes, 317_440)
         XCTAssertEqual(telemetry.totalPersistentBytes, 317_448)
         XCTAssertEqual(telemetry.storageAndMaterializationBytes, 449_024)
+        XCTAssertEqual(telemetry.storageAndWorkspaceBytes, 449_024)
 
         for cache in caches {
             _ = cache.update(
@@ -717,7 +1953,9 @@ final class KVarNKVCacheTests: XCTestCase {
         XCTAssertEqual(telemetry.capacityTokens, 256)
         XCTAssertEqual(telemetry.kvHeadCount, 1)
         XCTAssertEqual(telemetry.headDimension, 128)
-        XCTAssertGreaterThan(telemetry.storageAndMaterializationBytes, 0)
+        XCTAssertEqual(telemetry.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(telemetry.attentionOperation, .materializedKV)
+        XCTAssertGreaterThan(telemetry.storageAndWorkspaceBytes, 0)
     }
 
     private func mismatchCount<T: Equatable>(_ lhs: [T], _ rhs: [T]) -> Int {

@@ -53,6 +53,22 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
             compressedKVAttentionAdmission: try makeAdmission()))
     }
 
+    func testKVarNDirectRequestSelectsAuthenticatedKVarNCacheAndAttentionMode()
+        throws
+    {
+        let admission = try makeAdmission()
+        let selection = try resolveSwiftEngineCacheSelection(
+            config: RunConfig(
+                kvQuant: "kvarn-k4v2-g128",
+                compressedKVAttention: .splitKVarNQuantizedMM,
+                compressedKVAttentionExpectedCheckpointContentSHA256:
+                    admission.checkpointContentSHA256),
+            compressedKVAttentionAdmission: admission)
+
+        XCTAssertEqual(selection.kind, .kvarn(.k4v2G128I8))
+        XCTAssertEqual(selection.kvarnAttentionMode, .splitQuantizedMM)
+    }
+
     func testKVTunerAlwaysBindsFrozenScheduleToLoadedSourceIdentity() throws {
         let admission = try makeAdmission(
             layerCount: 3,

@@ -942,7 +942,7 @@ func runBench(_ flags: Flags) async {
 
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--kv-attention materialize|split-affine-quantized-mm --checkpoint-content-sha256 <SHA256>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--kv-attention materialize|split-affine-quantized-mm|split-kvarn-quantized-mm --checkpoint-content-sha256 <SHA256>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -1403,7 +1403,10 @@ func runKL(_ flags: Flags) async {
                 "KVTuner candidates are unavailable to the KL tier route")
         case .kvarn(let cell):
             guard let telemetry = await driver.kvarnScoringTelemetry(
-                for: cell)
+                for: cell,
+                attentionMode: compressedKVAttention
+                    == .splitKVarNQuantizedMM
+                    ? .splitQuantizedMM : .materialize)
             else {
                 throw SwiftEngineDriverError.unsupportedConfig(
                     "KVarN KL run completed without KVarN allocation telemetry")
@@ -1437,7 +1440,7 @@ func runKL(_ flags: Flags) async {
                 telemetry.alignmentPaddingBytes,
                 telemetry.fp16SinkBytes,
                 telemetry.fp16TailBytes,
-                telemetry.materializationWorkspaceBytes,
+                telemetry.workspaceBytes,
             ]
             let evidenceTotalBytes = try evidenceTerms.reduce(0) {
                 partial, value in
@@ -1453,7 +1456,7 @@ func runKL(_ flags: Flags) async {
                 alignmentPaddingBytes: telemetry.alignmentPaddingBytes,
                 fp16SinkBytes: telemetry.fp16SinkBytes,
                 fp16TailBytes: telemetry.fp16TailBytes,
-                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                workspaceBytes: telemetry.workspaceBytes,
                 totalBytes: evidenceTotalBytes)
             candidateFormat = format
             storage = try format.storageEvidence(actual: actual)
@@ -1462,9 +1465,13 @@ func runKL(_ flags: Flags) async {
             candidateCodecIterations = telemetry.iterations
             candidateMemoryGate = requestedKVarNMemoryGate
             candidateKVTunerSchedule = nil
-            candidateCompressedKVAttentionObserved = nil
-            candidateMaterializationWorkspaceBytes = nil
-            candidateAttentionWorkspaceBytes = nil
+            candidateCompressedKVAttentionObserved =
+                telemetry.attentionOperation == .splitQuantizedMM
+                    ? .splitKVarNQuantizedMM : .materializedKV
+            candidateMaterializationWorkspaceBytes =
+                telemetry.materializationWorkspaceBytes
+            candidateAttentionWorkspaceBytes =
+                telemetry.attentionWorkspaceBytes
             print(
                 "# KVarN storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), "
@@ -1473,6 +1480,7 @@ func runKL(_ flags: Flags) async {
                     + "fp16_tail=\(telemetry.fp16TailBytes), "
                     + "control=\(telemetry.controlBytes), "
                     + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "attention_workspace=\(telemetry.attentionWorkspaceBytes), "
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), "
                     + "layers=\(telemetry.layerCount), "
@@ -1666,8 +1674,9 @@ struct Harness {
                  [--kv-quant <TIER>]          KV tier for timed decode (\(kvQuantUsageTiers))
                  [--matrix-id <ID>] [--cell-id <ID>]  explicit frontier identity
                  [--kvtuner-schedule <BUNDLE>] frozen schedule (required for kvtuner-* tier)
-                 [--kv-attention <OP>]         explicit affine route: materialize or
-                                               split-affine-quantized-mm (qualified configs only)
+                 [--kv-attention <OP>]         explicit compressed route: materialize,
+                                               split-affine-quantized-mm, or
+                                               split-kvarn-quantized-mm (matching tiers only)
                  [--checkpoint-content-sha256 <SHA256>] frozen source-lock digest for --kv-attention
                  [--workload-nonce <ID>]      replay identical salted prompts across KV cells
                  [--prompt-repeat 1]          deterministic long-context prompt construction
@@ -1698,14 +1707,14 @@ struct Harness {
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
-                 [--kv-attention <OP>]       explicit authenticated affine attention route
+                 [--kv-attention <OP>]       explicit authenticated compressed-attention route
                  [--checkpoint-content-sha256 <SHA256>] required source lock for --kv-attention
                  [--promotion-evidence false] require full storage + clean-SHA coherence gate
           task-coherence --model <PATH>       frozen 80-case secondary coherence/task gate
                  --matrix-id <ID> --cell-id <ID> --evidence <NEW-OR-EMPTY-FILE>
                  [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN/KVTuner runtime tier
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
-                 [--kv-attention <OP>]       explicit authenticated affine attention route
+                 [--kv-attention <OP>]       explicit authenticated compressed-attention route
                  [--checkpoint-content-sha256 <SHA256>] required source lock for --kv-attention
                  [--reference-task-evidence <FP16-JSONL>]
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]
