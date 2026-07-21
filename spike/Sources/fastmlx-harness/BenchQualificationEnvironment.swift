@@ -13,6 +13,11 @@ enum BenchQualificationRuntimeError:
     case memorySettingsNotApplied
     case processMemoryUnavailable
     case modelIdentityChanged
+    case invalidPostWarmupThermalSnapshot
+    case postWarmupThermalPowerState
+    case unsafePostWarmupThermalState(
+        CompressedAttentionProbeThermalState)
+    case postWarmupThermalTargetTimeout
 
     var description: String {
         switch self {
@@ -28,6 +33,14 @@ enum BenchQualificationRuntimeError:
             "qualification bench could not capture process memory receipts"
         case .modelIdentityChanged:
             "qualification bench model config or checkpoint manifest changed during the isolated run"
+        case .invalidPostWarmupThermalSnapshot:
+            "qualification bench captured an invalid post-warmup host snapshot"
+        case .postWarmupThermalPowerState:
+            "qualification bench post-warmup admission requires AC power with low-power mode disabled"
+        case .unsafePostWarmupThermalState(let state):
+            "qualification bench refuses unsafe post-warmup thermal state \(state.rawValue)"
+        case .postWarmupThermalTargetTimeout:
+            "qualification bench did not reach the declared post-warmup thermal target before timeout"
         }
     }
 }
@@ -95,6 +108,72 @@ func benchQualificationHostSnapshot()
         powerSource: benchQualificationPowerSource(),
         thermalState: benchQualificationThermalState(
             process.thermalState))
+}
+
+/// Wait only after the dropped warmup. Retained generation starts from a manifest-bound nominal
+/// cohort or fails without emitting an admissible row. The injected seams keep polling behavior
+/// deterministic in MLX-coupled CLI tests without weakening the production snapshot source.
+func waitForBenchQualificationThermalAdmission(
+    policy: BenchQualificationThermalPolicy,
+    initialSnapshot: BenchQualificationHostSnapshot,
+    snapshot: () throws -> BenchQualificationHostSnapshot = {
+        try benchQualificationHostSnapshot()
+    },
+    sleep: (Int) async throws -> Void = { milliseconds in
+        try await Task.sleep(
+            nanoseconds: UInt64(milliseconds) * 1_000_000)
+    }
+) async throws -> BenchQualificationThermalAdmission {
+    let timeoutMilliseconds = policy.timeoutSeconds * 1_000
+    let deadlineTimestamp = initialSnapshot.monotonicTimestampSeconds
+        + Double(policy.timeoutSeconds)
+    var current = initialSnapshot
+    var previousTimestamp: Double?
+    var elapsedMilliseconds = 0
+
+    while true {
+        guard current.monotonicTimestampSeconds.isFinite,
+            current.residentSizeBytes > 0,
+            current.physicalFootprintBytes > 0,
+            previousTimestamp.map({
+                current.monotonicTimestampSeconds > $0
+            }) ?? true
+        else {
+            throw BenchQualificationRuntimeError
+                .invalidPostWarmupThermalSnapshot
+        }
+        guard current.powerSource == .acPower,
+            !current.lowPowerModeEnabled
+        else {
+            throw BenchQualificationRuntimeError
+                .postWarmupThermalPowerState
+        }
+        guard current.monotonicTimestampSeconds <= deadlineTimestamp else {
+            throw BenchQualificationRuntimeError
+                .postWarmupThermalTargetTimeout
+        }
+        switch current.thermalState {
+        case .nominal:
+            return try BenchQualificationThermalAdmission(
+                snapshot: current)
+        case .fair:
+            break
+        case .serious, .critical, .unknown:
+            throw BenchQualificationRuntimeError
+                .unsafePostWarmupThermalState(current.thermalState)
+        }
+        guard elapsedMilliseconds < timeoutMilliseconds else {
+            throw BenchQualificationRuntimeError
+                .postWarmupThermalTargetTimeout
+        }
+        let sleepMilliseconds = min(
+            policy.pollIntervalMilliseconds,
+            timeoutMilliseconds - elapsedMilliseconds)
+        previousTimestamp = current.monotonicTimestampSeconds
+        try await sleep(sleepMilliseconds)
+        elapsedMilliseconds += sleepMilliseconds
+        current = try snapshot()
+    }
 }
 
 private func benchQualificationWiredLimitBytes() throws -> Int {

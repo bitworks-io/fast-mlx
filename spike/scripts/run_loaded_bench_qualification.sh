@@ -115,7 +115,7 @@ jq -e '
   def ident: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
   def sha256: type == "string" and test("^[0-9a-f]{64}$");
   def identity: type == "string" and test("^([0-9a-f]{16}|[0-9a-f]{64})$");
-  .schemaVersion == 1 and
+  .schemaVersion == 2 and
   (.harnessGitSHA | type == "string" and test("^[0-9a-f]{40}$")) and
   (.harnessBinarySHA256 | sha256) and
   (.matrixID | ident) and (.workloadNonce | ident) and
@@ -128,6 +128,11 @@ jq -e '
   (.memoryLimitBytes | integer and . >= 1) and
   (.cacheLimitBytes | integer and . >= 1) and
   (.wiredLimitBytes | integer and . >= 1) and
+  .postWarmupThermalTarget == "nominal" and
+  (.postWarmupThermalTimeoutSeconds | integer and . >= 1 and . <= 3600) and
+  (.postWarmupThermalPollMilliseconds | integer and . >= 100 and . <= 60000) and
+  .postWarmupThermalPollMilliseconds <=
+    (.postWarmupThermalTimeoutSeconds * 1000) and
   .cacheLimitBytes <= .memoryLimitBytes and
   .memoryLimitBytes <= .wiredLimitBytes and
   (.cells | type == "array" and length >= 1 and length <= 32) and
@@ -190,6 +195,9 @@ MAX_TOKENS="$(jq -r '.maxTokens' "$MANIFEST")"
 MEMORY_LIMIT="$(jq -r '.memoryLimitBytes' "$MANIFEST")"
 CACHE_LIMIT="$(jq -r '.cacheLimitBytes' "$MANIFEST")"
 WIRED_LIMIT="$(jq -r '.wiredLimitBytes' "$MANIFEST")"
+POST_WARMUP_THERMAL_TARGET="$(jq -r '.postWarmupThermalTarget' "$MANIFEST")"
+POST_WARMUP_THERMAL_TIMEOUT_SECONDS="$(jq -r '.postWarmupThermalTimeoutSeconds' "$MANIFEST")"
+POST_WARMUP_THERMAL_POLL_MILLISECONDS="$(jq -r '.postWarmupThermalPollMilliseconds' "$MANIFEST")"
 TOTAL_ROWS=$((BLOCK_COUNT * CELL_COUNT))
 
 # Authenticate immutable schedule inputs before output reservation. The same digest is checked
@@ -314,6 +322,7 @@ write_progress() {
     jq -cn \
         --arg state "$state" --arg matrixID "$MATRIX_ID" \
         --arg cellID "$cell" --arg harnessGitSHA "$HARNESS_SHA" \
+        --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
         --arg manifestSHA256 "$MANIFEST_SHA" --arg childPID "$child" \
         --argjson completedRows "$completed" --argjson totalRows "$TOTAL_ROWS" \
         --argjson blockIndex "$block" --argjson runPosition "$position" \
@@ -323,6 +332,7 @@ write_progress() {
           runPosition:$runPosition,heartbeatEpoch:$heartbeatEpoch,
           childPID:(if $childPID == "" then null else ($childPID | tonumber) end),
           maxProcessRSSBytes:$maxProcessRSSBytes,harnessGitSHA:$harnessGitSHA,
+          postWarmupThermalTarget:$postWarmupThermalTarget,
           runnerManifestSHA256:$manifestSHA256}' > "$tmp"
     mv "$tmp" "$PROGRESS"
 }
@@ -385,6 +395,11 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --cache-limit-bytes "$CACHE_LIMIT"
             --wired-limit-bytes "$WIRED_LIMIT"
             --model-tokenizer-sha256 "$MODEL_TOKENIZER_SHA"
+            --post-warmup-thermal-target "$POST_WARMUP_THERMAL_TARGET"
+            --post-warmup-thermal-timeout-seconds \
+                "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS"
+            --post-warmup-thermal-poll-milliseconds \
+                "$POST_WARMUP_THERMAL_POLL_MILLISECONDS"
             --evidence "$evidence"
         )
         if [[ -n "$attention" ]]; then
@@ -476,9 +491,12 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --arg checkpointSHA "$checkpoint_sha" \
             --arg scheduleBundleSHA "$schedule_bundle_sha" \
             --arg scheduleArtifactSHA "$schedule_artifact_sha" \
+            --arg thermalTarget "$POST_WARMUP_THERMAL_TARGET" \
             --argjson block "$block_index" --argjson position "$position" \
             --argjson count "$CELL_COUNT" --argjson memory "$MEMORY_LIMIT" \
             --argjson cache "$CACHE_LIMIT" --argjson wired "$WIRED_LIMIT" \
+            --argjson thermalTimeout "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS" \
+            --argjson thermalPoll "$POST_WARMUP_THERMAL_POLL_MILLISECONDS" \
             --argjson promptRepeat "$PROMPT_REPEAT" --argjson maxTokens "$MAX_TOKENS" '
               .subcommand == "bench" and
               .provenance.harnessGitSHA == $harness and
@@ -516,7 +534,7 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 .payload.memoryRuns[0].summary.maxMLXCacheBytes and
               .payload.maxMLXPeakBytes ==
                 .payload.memoryRuns[0].summary.maxMLXPeakBytes and
-              .payload.qualification.schemaVersion == 2 and
+              .payload.qualification.schemaVersion == 3 and
               .payload.qualification.context.runnerManifestSHA256 == $manifest and
               .payload.qualification.context.matrixBlockIndex == $block and
               .payload.qualification.context.matrixRunPosition == $position and
@@ -528,7 +546,40 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
               .payload.qualification.context.cacheResetPolicy == "in-place-before-every-generation" and
               .payload.qualification.context.modelResidencyPolicy == "load-once-per-process" and
               .payload.qualification.context.processIsolationPolicy == "fresh-process-per-matrix-position" and
+              .payload.qualification.context.postWarmupThermalPolicy.target ==
+                $thermalTarget and
+              .payload.qualification.context.postWarmupThermalPolicy.timeoutSeconds ==
+                $thermalTimeout and
+              .payload.qualification.context.postWarmupThermalPolicy.pollIntervalMilliseconds ==
+                $thermalPoll and
+              .payload.qualification.warmup.before.monotonicTimestampSeconds <
+                .payload.qualification.warmup.after.monotonicTimestampSeconds and
+              .payload.qualification.warmup.before.residentSizeBytes > 0 and
+              .payload.qualification.warmup.after.residentSizeBytes > 0 and
+              .payload.qualification.warmup.before.physicalFootprintBytes > 0 and
+              .payload.qualification.warmup.after.physicalFootprintBytes > 0 and
+              .payload.qualification.warmup.before.powerSource == "ac-power" and
+              .payload.qualification.warmup.after.powerSource == "ac-power" and
+              (.payload.qualification.warmup.before.lowPowerModeEnabled | not) and
+              (.payload.qualification.warmup.after.lowPowerModeEnabled | not) and
+              (.payload.qualification.warmup.before.thermalState == "nominal" or
+                .payload.qualification.warmup.before.thermalState == "fair") and
+              (.payload.qualification.warmup.after.thermalState == "nominal" or
+                .payload.qualification.warmup.after.thermalState == "fair") and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds >=
+                .payload.qualification.warmup.after.monotonicTimestampSeconds and
+              (.payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds -
+                .payload.qualification.warmup.after.monotonicTimestampSeconds) <=
+                $thermalTimeout and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.residentSizeBytes > 0 and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.physicalFootprintBytes > 0 and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.powerSource == "ac-power" and
+              (.payload.qualification.postWarmupThermalAdmission.snapshot.lowPowerModeEnabled | not) and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.thermalState ==
+                $thermalTarget and
               (.payload.qualification.runs | type == "array" and length == 1) and
+              .payload.qualification.postWarmupThermalAdmission.snapshot.monotonicTimestampSeconds <=
+                .payload.qualification.runs[0].before.monotonicTimestampSeconds and
               .payload.qualification.runs[0].before.monotonicTimestampSeconds <
                 .payload.qualification.runs[0].after.monotonicTimestampSeconds and
               .payload.qualification.runs[0].before.residentSizeBytes > 0 and
@@ -539,10 +590,12 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
                 .payload.qualification.runs[0].after.lowPowerModeEnabled and
               .payload.qualification.runs[0].before.powerSource ==
                 .payload.qualification.runs[0].after.powerSource and
-              .payload.qualification.runs[0].before.powerSource != "unavailable" and
+              .payload.qualification.runs[0].before.powerSource == "ac-power" and
+              (.payload.qualification.runs[0].before.lowPowerModeEnabled | not) and
+              (.payload.qualification.runs[0].after.lowPowerModeEnabled | not) and
               .payload.qualification.runs[0].before.thermalState ==
                 .payload.qualification.runs[0].after.thermalState and
-              .payload.qualification.runs[0].before.thermalState != "unknown" and
+              .payload.qualification.runs[0].before.thermalState == $thermalTarget and
               (.payload.workloadPromptSHA256 | type == "array" and length == 2 and
                 all(.[]; type == "string" and test("^[0-9a-f]{64}$"))) and
               (.payload.promptTokenCountsByRun | type == "array" and length == 1 and .[0] > 0) and
@@ -600,7 +653,11 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             fail "harness row failed typed qualification validation"
         fi
 
-        internal_rss="$(jq -r '[.payload.qualification.runs[0].before.residentSizeBytes,
+        internal_rss="$(jq -r '[
+            .payload.qualification.warmup.before.residentSizeBytes,
+            .payload.qualification.warmup.after.residentSizeBytes,
+            .payload.qualification.postWarmupThermalAdmission.snapshot.residentSizeBytes,
+            .payload.qualification.runs[0].before.residentSizeBytes,
             .payload.qualification.runs[0].after.residentSizeBytes] | max' "$evidence")"
         (( internal_rss > max_rss_bytes )) && max_rss_bytes=$internal_rss
         environment_key="$(jq -c '[
@@ -638,12 +695,20 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             --arg runnerScriptSHA256 "$RUNNER_SHA" \
             --arg runnerManifestSHA256 "$MANIFEST_SHA" --arg evidenceSHA256 "$evidence_sha" \
             --arg logSHA256 "$log_sha" --argjson blockIndex "$block_index" \
+            --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
+            --argjson postWarmupThermalTimeoutSeconds \
+                "$POST_WARMUP_THERMAL_TIMEOUT_SECONDS" \
+            --argjson postWarmupThermalPollMilliseconds \
+                "$POST_WARMUP_THERMAL_POLL_MILLISECONDS" \
             --argjson runPosition "$position" --argjson maxProcessRSSBytes "$max_rss_bytes" \
             '{schemaVersion:1,matrixID:$matrixID,cellID:$cellID,blockIndex:$blockIndex,
               runPosition:$runPosition,harnessGitSHA:$harnessGitSHA,
               harnessBinarySHA256:$harnessBinarySHA256,
               runnerScriptSHA256:$runnerScriptSHA256,
               runnerManifestSHA256:$runnerManifestSHA256,
+              postWarmupThermalTarget:$postWarmupThermalTarget,
+              postWarmupThermalTimeoutSeconds:$postWarmupThermalTimeoutSeconds,
+              postWarmupThermalPollMilliseconds:$postWarmupThermalPollMilliseconds,
               evidenceSHA256:$evidenceSHA256,logSHA256:$logSHA256,
               maxProcessRSSBytes:$maxProcessRSSBytes}' > "$receipt"
         jq -c . "$receipt" >> "$block_receipts"
@@ -655,8 +720,10 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
             "$cell_id" "" "$max_rss_bytes"
     done
     jq -s --arg matrixID "$MATRIX_ID" --arg environment "$block_environment" \
+        --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
         --argjson blockIndex "$block_index" \
         '{schemaVersion:1,matrixID:$matrixID,blockIndex:$blockIndex,
+          postWarmupThermalTarget:$postWarmupThermalTarget,
           environment:($environment | fromjson),receipts:.}' \
         "$block_receipts" > "$OUTPUT/blocks/block-$(printf '%03d' "$block_index").complete.json"
 done
@@ -670,6 +737,7 @@ fi
 RECEIPT_SET_SHA="$(shasum -a 256 "$RECEIPT_SET" | awk '{print $1}')"
 completion_tmp="$OUTPUT/runner.completion.json.tmp.$$"
 jq -cn --arg matrixID "$MATRIX_ID" --arg harnessGitSHA "$HARNESS_SHA" \
+    --arg postWarmupThermalTarget "$POST_WARMUP_THERMAL_TARGET" \
     --arg runnerManifestSHA256 "$MANIFEST_SHA" \
     --arg harnessBinarySHA256 "$BINARY_SHA" --arg runnerScriptSHA256 "$RUNNER_SHA" \
     --arg receiptSetSHA256 "$RECEIPT_SET_SHA" --argjson blockCount "$BLOCK_COUNT" \
@@ -679,6 +747,7 @@ jq -cn --arg matrixID "$MATRIX_ID" --arg harnessGitSHA "$HARNESS_SHA" \
       harnessBinarySHA256:$harnessBinarySHA256,
       runnerScriptSHA256:$runnerScriptSHA256,
       runnerManifestSHA256:$runnerManifestSHA256,
+      postWarmupThermalTarget:$postWarmupThermalTarget,
       receiptSetSHA256:$receiptSetSHA256}' > "$completion_tmp"
 mv "$completion_tmp" "$OUTPUT/runner.completion.json"
 write_progress "complete" "$completed_rows" "$((BLOCK_COUNT - 1))" \

@@ -236,7 +236,37 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       atPath: fixture.launches.path))
   }
 
-  func testRunnerInvalidatesTheWholeBlockWhenEnvironmentChangesAcrossRows()
+  func testRunnerRequiresAnExplicitPostWarmupThermalPolicyBeforeLaunching()
+    throws
+  {
+    let fixture = try makeFixture()
+    var manifest = try XCTUnwrap(
+      JSONSerialization.jsonObject(
+        with: Data(contentsOf: fixture.manifest)) as? [String: Any])
+    manifest.removeValue(forKey: "postWarmupThermalTarget")
+    try JSONSerialization.data(
+      withJSONObject: manifest, options: [.sortedKeys])
+      .write(to: fixture.manifest)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("manifest schema"))
+    XCTAssertFalse(FileManager.default.fileExists(
+      atPath: fixture.launches.path))
+  }
+
+  func testRunnerPassesTheFrozenPostWarmupThermalPolicyToEveryHarnessRow()
+    throws
+  {
+    let fixture = try makeFixture(requireThermalPolicyArguments: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+  }
+
+  func testRunnerRejectsARetainedThermalStateOutsideTheFrozenTarget()
     throws
   {
     let fixture = try makeFixture(changeSecondRowThermal: true)
@@ -244,14 +274,26 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let result = try runRunner(fixture: fixture)
 
     XCTAssertNotEqual(result.status, 0)
-    XCTAssertTrue(result.output.contains("block environment changed"))
+    XCTAssertTrue(result.output.contains("identity or qualification"))
     XCTAssertEqual(
       try String(contentsOf: fixture.output.appendingPathComponent(
         "runner.status"), encoding: .utf8),
-      "INVALID_BLOCK_ENVIRONMENT\n")
-    XCTAssertTrue(FileManager.default.fileExists(
-      atPath: fixture.output.appendingPathComponent(
-        "blocks/block-000.invalid.json").path))
+      "INVALID_EVIDENCE\n")
+  }
+
+  func testRunnerRejectsPostWarmupAdmissionBeyondTheFrozenTimeout()
+    throws
+  {
+    let fixture = try makeFixture(lateThermalAdmission: true)
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.contains("identity or qualification"))
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_EVIDENCE\n")
   }
 
   func testRunnerRejectsARequestedDirectRouteWithoutMatchingObservedOperation()
@@ -408,6 +450,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let spoofGitEnvironment: Bool
     let mutateHarnessStampAfterFirstRun: Bool
     let requireResolvedRuntimePaths: Bool
+    let requireThermalPolicyArguments: Bool
+    let lateThermalAdmission: Bool
     let kvtunerArtifactSHA256: String
     let kvtunerBundleSHA256: String
   }
@@ -435,6 +479,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     mutateHarnessStampAfterFirstRun: Bool = false,
     runtimePathsRelativeToCaller: Bool = false,
     requireResolvedRuntimePaths: Bool = false,
+    requireThermalPolicyArguments: Bool = false,
+    lateThermalAdmission: Bool = false,
     harnessStampInSubdirectory: Bool = false,
     harnessStampFilename: String = ".harness-sha"
   ) throws -> Fixture {
@@ -500,7 +546,12 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         evidence_path="${3:-}"
         jq -e '
           .subcommand == "bench" and
-          .payload.qualification.schemaVersion == 2 and
+          .payload.qualification.schemaVersion == 3 and
+          .payload.qualification.context.postWarmupThermalPolicy.target ==
+            "nominal" and
+          .payload.qualification.warmup.before.thermalState == "nominal" and
+          .payload.qualification.postWarmupThermalAdmission.snapshot.thermalState ==
+            "nominal" and
           (.payload.qualification.context.tokenizerSHA256 |
             type == "string" and test("^[0-9a-f]{64}$")) and
           (if .payload.compressedKVAttention == null then true else
@@ -527,6 +578,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       manifest_sha=""; block=""; position=""; count=""; memory=""
       cache=""; wired=""; prompt_repeat=""; max_tokens=""; attention=""
       checkpoint=""; model=""; schedule=""; expected_tokenizer=""
+      thermal_target=""; thermal_timeout=""; thermal_poll=""
       while (($#)); do
         key="$1"; shift
         if [[ "$key" == "bench" ]]; then continue; fi
@@ -545,6 +597,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           --cache-limit-bytes) cache="$value" ;;
           --wired-limit-bytes) wired="$value" ;;
           --model-tokenizer-sha256) expected_tokenizer="$value" ;;
+          --post-warmup-thermal-target) thermal_target="$value" ;;
+          --post-warmup-thermal-timeout-seconds) thermal_timeout="$value" ;;
+          --post-warmup-thermal-poll-milliseconds) thermal_poll="$value" ;;
           --prompt-repeat) prompt_repeat="$value" ;;
           --max-tokens) max_tokens="$value" ;;
           --kv-attention) attention="$value" ;;
@@ -557,6 +612,11 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       if [[ "$FAKE_REQUIRE_RESOLVED_RUNTIME_PATHS" == "true" ]]; then
         [[ -d "$model" ]] || exit 41
         [[ -z "$schedule" || -f "$schedule" ]] || exit 42
+      fi
+      if [[ "$FAKE_REQUIRE_THERMAL_POLICY" == "true" ]]; then
+        [[ "$thermal_target" == "nominal" ]] || exit 43
+        [[ "$thermal_timeout" == "600" ]] || exit 44
+        [[ "$thermal_poll" == "1000" ]] || exit 45
       fi
       if [[ "$FAKE_STALL_HARNESS" == "true" ]]; then sleep 60; fi
       if [[ "$FAKE_OMIT_EVIDENCE" == "true" ]]; then exit 0; fi
@@ -602,6 +662,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         --arg harness "$harness_sha" --arg label "$label" \
         --arg matrix "$matrix" --arg nonce "$nonce" --arg tier "$tier" \
         --arg manifest "$manifest_sha" --arg thermal "$thermal" \
+        --arg thermalTarget "$thermal_target" \
         --arg attention "$attention" --arg observed "$observed" \
         --arg checkpoint "$checkpoint" --arg model "$model" \
         --arg configHash "$config_hash" \
@@ -613,9 +674,12 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         --arg tokenizerSHA256 "$tokenizer_sha" \
         --argjson truncateAdmission "$FAKE_TRUNCATE_ADMISSION" \
         --argjson truncateKVTuner "$FAKE_TRUNCATE_KVTUNER" \
+        --argjson lateThermalAdmission "$FAKE_LATE_THERMAL_ADMISSION" \
         --argjson block "$block" --argjson position "$position" \
         --argjson count "$count" --argjson memory "$memory" \
         --argjson cache "$cache" --argjson wired "$wired" \
+        --argjson thermalTimeout "$thermal_timeout" \
+        --argjson thermalPoll "$thermal_poll" \
         --argjson promptRepeat "$prompt_repeat" --argjson maxTokens "$max_tokens" \
         '{subcommand:"bench",provenance:{date:"2026-07-20T00:00:00Z",
           hardwareChip:"test",hardwareRAMBytes:100000,hardwareOS:"test",
@@ -669,18 +733,34 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
             if $truncateKVTuner then
               del(.modelConfigHash,.checkpointManifestHash,.tokenizerSHA256,
                 .groupSize,.layers)
-            else . end end),qualification:{schemaVersion:2,
+            else . end end),qualification:{schemaVersion:3,
           context:{runnerManifestSHA256:$manifest,matrixBlockIndex:$block,
           matrixRunPosition:$position,matrixCellCount:$count,
           memoryLimitBytes:$memory,cacheLimitBytes:$cache,wiredLimitBytes:$wired,
           tokenizerSHA256:$tokenizerSHA256,
           cacheResetPolicy:"in-place-before-every-generation",
           modelResidencyPolicy:"load-once-per-process",
-          processIsolationPolicy:"fresh-process-per-matrix-position"},runs:[{
-          before:{monotonicTimestampSeconds:10,residentSizeBytes:20000,
+          processIsolationPolicy:"fresh-process-per-matrix-position",
+          postWarmupThermalPolicy:{target:$thermalTarget,
+          timeoutSeconds:$thermalTimeout,
+          pollIntervalMilliseconds:$thermalPoll}},
+          warmup:{before:{monotonicTimestampSeconds:8,residentSizeBytes:19000,
+          physicalFootprintBytes:17000,lowPowerModeEnabled:false,
+          powerSource:"ac-power",thermalState:"nominal"},
+          after:{monotonicTimestampSeconds:9,residentSizeBytes:20000,
+          physicalFootprintBytes:18000,lowPowerModeEnabled:false,
+          powerSource:"ac-power",thermalState:"nominal"}},
+          postWarmupThermalAdmission:{snapshot:{monotonicTimestampSeconds:
+          (if $lateThermalAdmission then 610 else 9.5 end),
+          residentSizeBytes:20000,physicalFootprintBytes:18000,
+          lowPowerModeEnabled:false,powerSource:"ac-power",
+          thermalState:$thermalTarget}},runs:[{
+          before:{monotonicTimestampSeconds:
+          (if $lateThermalAdmission then 611 else 10 end),residentSizeBytes:20000,
           physicalFootprintBytes:18000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:$thermal},
-          after:{monotonicTimestampSeconds:11,residentSizeBytes:21000,
+          after:{monotonicTimestampSeconds:
+          (if $lateThermalAdmission then 612 else 11 end),residentSizeBytes:21000,
           physicalFootprintBytes:19000,lowPowerModeEnabled:false,
           powerSource:"ac-power",thermalState:$thermal}}]}}}' > "$evidence"
       if [[ "$FAKE_MUTATE_HARNESS_STAMP" == "true" &&
@@ -698,7 +778,7 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         String(format: "%02x", $0)
       }.joined()
     let manifestObject: [String: Any] = [
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "harnessGitSHA": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "harnessBinarySHA256": mismatchBinaryIdentity
         ? String(repeating: "f", count: 64) : actualBinarySHA256,
@@ -714,6 +794,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       "memoryLimitBytes": 9_000,
       "cacheLimitBytes": 8_000,
       "wiredLimitBytes": 10_000,
+      "postWarmupThermalTarget": "nominal",
+      "postWarmupThermalTimeoutSeconds": 600,
+      "postWarmupThermalPollMilliseconds": 1_000,
       "cells": includeKVTuner ? kvtunerCells : defaultCells,
       "blocks": selectedBlocks,
     ]
@@ -737,6 +820,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       spoofGitEnvironment: spoofGitEnvironment,
       mutateHarnessStampAfterFirstRun: mutateHarnessStampAfterFirstRun,
       requireResolvedRuntimePaths: requireResolvedRuntimePaths,
+      requireThermalPolicyArguments: requireThermalPolicyArguments,
+      lateThermalAdmission: lateThermalAdmission,
       kvtunerArtifactSHA256: kvtunerArtifactSHA256,
       kvtunerBundleSHA256: kvtunerBundleSHA256)
   }
@@ -782,6 +867,10 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       fixture.readHarnessSHAFromCurrentDirectory ? "true" : "false"
     environment["FAKE_REQUIRE_RESOLVED_RUNTIME_PATHS"] =
       fixture.requireResolvedRuntimePaths ? "true" : "false"
+    environment["FAKE_REQUIRE_THERMAL_POLICY"] =
+      fixture.requireThermalPolicyArguments ? "true" : "false"
+    environment["FAKE_LATE_THERMAL_ADMISSION"] =
+      fixture.lateThermalAdmission ? "true" : "false"
     environment["FAKE_MUTATE_HARNESS_STAMP"] =
       fixture.mutateHarnessStampAfterFirstRun ? "true" : "false"
     environment["FAKE_HARNESS_SHA_FILE"] = fixture.harnessSHA.path

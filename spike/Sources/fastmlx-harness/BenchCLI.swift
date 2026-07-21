@@ -16,6 +16,8 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     case invalidQualificationRuns(Int)
     case qualificationFlagsWithoutQualification
     case missingQualificationFlag(String)
+    case invalidPostWarmupThermalTarget(String)
+    case invalidPostWarmupThermalPolicy
     case invalidMaxTokens(Int)
     case unknownSpec(String)
     case unmeasuredSpecKV(String)
@@ -60,6 +62,10 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "qualification-only bench flags require --qualification-evidence true"
         case .missingQualificationFlag(let flag):
             return "qualification bench requires --\(flag) <VALUE>"
+        case .invalidPostWarmupThermalTarget(let value):
+            return "qualification bench --post-warmup-thermal-target must be nominal; actual=\(value)"
+        case .invalidPostWarmupThermalPolicy:
+            return "qualification bench post-warmup thermal timeout/poll policy is invalid"
         case .invalidMaxTokens(let value):
             return "bench --max-tokens must be positive; actual=\(value)"
         case .unknownSpec(let spec):
@@ -363,11 +369,20 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         "wired-limit-bytes")
     let modelTokenizerSHA256 = try flags.strictString(
         "model-tokenizer-sha256", default: "")
+    let postWarmupThermalTargetText = try flags.strictString(
+        "post-warmup-thermal-target", default: "")
+    let postWarmupThermalTimeoutSeconds = try flags.optionalStrictInt(
+        "post-warmup-thermal-timeout-seconds")
+    let postWarmupThermalPollMilliseconds = try flags.optionalStrictInt(
+        "post-warmup-thermal-poll-milliseconds")
     let qualificationFlagsSupplied = !runnerManifestSHA256.isEmpty
         || matrixBlockIndex != nil || matrixRunPosition != nil
         || matrixCellCount != nil || memoryLimitBytes != nil
         || cacheLimitBytes != nil || wiredLimitBytes != nil
         || !modelTokenizerSHA256.isEmpty
+        || !postWarmupThermalTargetText.isEmpty
+        || postWarmupThermalTimeoutSeconds != nil
+        || postWarmupThermalPollMilliseconds != nil
     guard qualificationEvidence || !qualificationFlagsSupplied else {
         throw BenchCLIError.qualificationFlagsWithoutQualification
     }
@@ -398,6 +413,32 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
             throw BenchCLIError.missingQualificationFlag(
                 "model-tokenizer-sha256")
         }
+        guard !postWarmupThermalTargetText.isEmpty else {
+            throw BenchCLIError.missingQualificationFlag(
+                "post-warmup-thermal-target")
+        }
+        guard let postWarmupThermalTarget =
+            BenchQualificationThermalTarget(
+                rawValue: postWarmupThermalTargetText)
+        else {
+            throw BenchCLIError.invalidPostWarmupThermalTarget(
+                postWarmupThermalTargetText)
+        }
+        let postWarmupThermalPolicy: BenchQualificationThermalPolicy
+        do {
+            postWarmupThermalPolicy = try BenchQualificationThermalPolicy(
+                target: postWarmupThermalTarget,
+                timeoutSeconds: try required(
+                    postWarmupThermalTimeoutSeconds,
+                    flag: "post-warmup-thermal-timeout-seconds"),
+                pollIntervalMilliseconds: try required(
+                    postWarmupThermalPollMilliseconds,
+                    flag: "post-warmup-thermal-poll-milliseconds"))
+        } catch let error as BenchCLIError {
+            throw error
+        } catch {
+            throw BenchCLIError.invalidPostWarmupThermalPolicy
+        }
         qualificationContext = try BenchQualificationContext(
             runnerManifestSHA256: runnerManifestSHA256,
             matrixBlockIndex: try required(
@@ -415,7 +456,8 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
             tokenizerSHA256: modelTokenizerSHA256,
             cacheResetPolicy: .inPlaceBeforeEveryGeneration,
             modelResidencyPolicy: .loadOncePerProcess,
-            processIsolationPolicy: .freshProcessPerMatrixPosition)
+            processIsolationPolicy: .freshProcessPerMatrixPosition,
+            postWarmupThermalPolicy: postWarmupThermalPolicy)
     } else {
         qualificationContext = nil
     }

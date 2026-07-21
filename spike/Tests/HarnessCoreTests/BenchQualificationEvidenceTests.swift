@@ -35,6 +35,177 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       evidence)
   }
 
+  func testPostWarmupThermalTargetRoundTripsWarmupAdmissionAndRetainedRun()
+    throws
+  {
+    let policy = try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 600,
+      pollIntervalMilliseconds: 1_000)
+    let context = try qualificationContext(
+      postWarmupThermalPolicy: policy)
+    let warmup = try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+    let admission = try BenchQualificationThermalAdmission(
+      snapshot: hostSnapshot(monotonicTimestampSeconds: 12))
+    let retained = try environmentRun(
+      before: hostSnapshot(monotonicTimestampSeconds: 13),
+      after: hostSnapshot(monotonicTimestampSeconds: 14))
+
+    let evidence = try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission: admission,
+      runs: [retained])
+
+    XCTAssertEqual(evidence.schemaVersion, 3)
+    XCTAssertEqual(
+      evidence.context.postWarmupThermalPolicy,
+      policy)
+    XCTAssertEqual(evidence.warmup, warmup)
+    XCTAssertEqual(
+      evidence.postWarmupThermalAdmission,
+      admission)
+    XCTAssertEqual(
+      try JSONDecoder().decode(
+        BenchQualificationEvidence.self,
+        from: JSONEncoder().encode(evidence)),
+      evidence)
+  }
+
+  func testPostWarmupThermalTargetFailsClosedForPartialOrUnsafeEvidence()
+    throws
+  {
+    XCTAssertThrowsError(try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 0,
+      pollIntervalMilliseconds: 1_000)) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalPolicy)
+    }
+    XCTAssertThrowsError(try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 60,
+      pollIntervalMilliseconds: 60_001)) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalPolicy)
+    }
+
+    let policy = try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 600,
+      pollIntervalMilliseconds: 1_000)
+    let context = try qualificationContext(
+      postWarmupThermalPolicy: policy)
+    let warmup = try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+    let admission = try BenchQualificationThermalAdmission(
+      snapshot: hostSnapshot(monotonicTimestampSeconds: 12))
+
+    XCTAssertThrowsError(try BenchQualificationEvidence(
+      context: context,
+      warmup: nil,
+      postWarmupThermalAdmission: admission,
+      runs: [try environmentRun(
+        before: hostSnapshot(monotonicTimestampSeconds: 13),
+        after: hostSnapshot(monotonicTimestampSeconds: 14))])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalTargetContract)
+    }
+    XCTAssertThrowsError(try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission:
+        try BenchQualificationThermalAdmission(snapshot: hostSnapshot(
+          monotonicTimestampSeconds: 12,
+          thermalState: .fair)),
+      runs: [try environmentRun(
+        before: hostSnapshot(monotonicTimestampSeconds: 13),
+        after: hostSnapshot(monotonicTimestampSeconds: 14))])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalAdmission)
+    }
+    XCTAssertThrowsError(try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission: admission,
+      runs: [try environmentRun(
+        before: hostSnapshot(monotonicTimestampSeconds: 11.5),
+        after: hostSnapshot(monotonicTimestampSeconds: 14))])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalAdmission)
+    }
+  }
+
+  func testPostWarmupThermalAdmissionCannotExceedManifestTimeout()
+    throws
+  {
+    let policy = try BenchQualificationThermalPolicy(
+      target: .nominal,
+      timeoutSeconds: 600,
+      pollIntervalMilliseconds: 1_000)
+    let context = try qualificationContext(
+      postWarmupThermalPolicy: policy)
+    let warmup = try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+
+    XCTAssertThrowsError(try BenchQualificationEvidence(
+      context: context,
+      warmup: warmup,
+      postWarmupThermalAdmission:
+        try BenchQualificationThermalAdmission(snapshot: hostSnapshot(
+          monotonicTimestampSeconds: 611.001)),
+      runs: [try environmentRun(
+        before: hostSnapshot(monotonicTimestampSeconds: 612),
+        after: hostSnapshot(monotonicTimestampSeconds: 613))])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidThermalAdmission)
+    }
+  }
+
+  func testWarmupEvidenceAllowsNominalToFairButRejectsUnknownOrPowerDrift()
+    throws
+  {
+    XCTAssertNoThrow(try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair)))
+    XCTAssertThrowsError(try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(
+        monotonicTimestampSeconds: 10,
+        thermalState: .unknown),
+      after: hostSnapshot(monotonicTimestampSeconds: 11))) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidWarmupEvidence)
+    }
+    XCTAssertThrowsError(try BenchQualificationWarmupEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        powerSource: .battery))) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidWarmupEvidence)
+    }
+  }
+
   func testQualificationContextRejectsPartialOrInconsistentOrderAndMemoryIdentity() {
     XCTAssertThrowsError(try qualificationContext(matrixBlockIndex: -1)) {
       XCTAssertEqual(
@@ -179,7 +350,8 @@ final class BenchQualificationEvidenceTests: XCTestCase {
     memoryLimitBytes: Int = 9_000,
     cacheLimitBytes: Int = 8_000,
     wiredLimitBytes: Int = 10_000,
-    tokenizerSHA256: String = String(repeating: "b", count: 64)
+    tokenizerSHA256: String = String(repeating: "b", count: 64),
+    postWarmupThermalPolicy: BenchQualificationThermalPolicy? = nil
   ) throws -> BenchQualificationContext {
     try BenchQualificationContext(
       runnerManifestSHA256: runnerManifestSHA256 ?? manifestSHA256,
@@ -192,7 +364,8 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       tokenizerSHA256: tokenizerSHA256,
       cacheResetPolicy: .inPlaceBeforeEveryGeneration,
       modelResidencyPolicy: .loadOncePerProcess,
-      processIsolationPolicy: .freshProcessPerMatrixPosition)
+      processIsolationPolicy: .freshProcessPerMatrixPosition,
+      postWarmupThermalPolicy: postWarmupThermalPolicy)
   }
 
   private func environmentRun(

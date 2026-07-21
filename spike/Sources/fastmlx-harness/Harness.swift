@@ -747,6 +747,10 @@ func runBench(_ flags: Flags) async {
         var generatedTokenCounts: [Int] = []
         var memoryRuns: [BenchRunMemoryEvidence] = []
         var qualificationRuns: [BenchQualificationRunEnvironment] = []
+        var qualificationWarmup:
+            BenchQualificationWarmupEnvironment?
+        var qualificationThermalAdmission:
+            BenchQualificationThermalAdmission?
         var engagementMax: [String: Int] = [:]
         var draftedTotal = 0, acceptedTotal = 0
         var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
@@ -843,7 +847,39 @@ func runBench(_ flags: Flags) async {
                     + "prefill_tok_s=\(fmt(prefillRate, 2)), "
                     + "ttft=\(fmt(metrics.ttftSeconds))s, "
                     + "decode_tok_s=\(fmt(decodeRate, 2))\(specNote)")
-            if i > 0 {
+            if i == 0, let qualificationBefore,
+                let qualificationAfter,
+                let qualificationContext = plan.qualificationContext
+            {
+                guard let thermalPolicy =
+                    qualificationContext.postWarmupThermalPolicy
+                else {
+                    throw BenchQualificationEvidenceError
+                        .invalidThermalTargetContract
+                }
+                qualificationWarmup = try
+                    BenchQualificationWarmupEnvironment(
+                        before: qualificationBefore,
+                        after: qualificationAfter)
+                let thermalAdmission = try await
+                    waitForBenchQualificationThermalAdmission(
+                        policy: thermalPolicy,
+                        initialSnapshot: qualificationAfter)
+                qualificationThermalAdmission = thermalAdmission
+                let admitted = thermalAdmission.snapshot
+                print(
+                    "# warmup thermal admission: target="
+                        + "\(thermalPolicy.target.rawValue), "
+                        + "warmup_after="
+                        + "\(qualificationAfter.thermalState.rawValue), "
+                        + "admitted="
+                        + "\(admitted.thermalState.rawValue), "
+                        + "wait_seconds="
+                        + fmt(
+                            admitted.monotonicTimestampSeconds
+                                - qualificationAfter
+                                    .monotonicTimestampSeconds))
+            } else if i > 0 {
                 ttfts.append(metrics.ttftSeconds)
                 prefillRates.append(prefillRate)
                 prefillDurations.append(prefillDuration)
@@ -994,6 +1030,9 @@ func runBench(_ flags: Flags) async {
             qualification: try plan.qualificationContext.map {
                 try BenchQualificationEvidence(
                     context: $0,
+                    warmup: qualificationWarmup,
+                    postWarmupThermalAdmission:
+                        qualificationThermalAdmission,
                     runs: qualificationRuns)
             })
         try appendRequiredJSONLRecord(
@@ -1783,6 +1822,11 @@ struct Harness {
                  [--memory-limit-bytes <N>]          limits; intended for the checked-in runner
                  [--cache-limit-bytes <N>] [--wired-limit-bytes <N>]
                  [--model-tokenizer-sha256 <SHA256>] frozen tokenizer file-manifest identity
+                 --post-warmup-thermal-target nominal
+                 --post-warmup-thermal-timeout-seconds <N>
+                 --post-warmup-thermal-poll-milliseconds <N>
+                                               record the dropped warmup and admit the retained
+                                               row only from the frozen nominal/AC cohort
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled

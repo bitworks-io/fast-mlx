@@ -94,6 +94,9 @@ final class BenchCLITests: XCTestCase {
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
             "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--post-warmup-thermal-target", "nominal",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
         ]))
 
         XCTAssertEqual(
@@ -109,8 +112,148 @@ final class BenchCLITests: XCTestCase {
                 tokenizerSHA256: modelTokenizerSHA256,
                 cacheResetPolicy: .inPlaceBeforeEveryGeneration,
                 modelResidencyPolicy: .loadOncePerProcess,
-                processIsolationPolicy: .freshProcessPerMatrixPosition))
+                processIsolationPolicy: .freshProcessPerMatrixPosition,
+                postWarmupThermalPolicy:
+                    try BenchQualificationThermalPolicy(
+                        target: .nominal,
+                        timeoutSeconds: 600,
+                        pollIntervalMilliseconds: 1_000)))
         XCTAssertEqual(plan.workload.iterations, 2)
+    }
+
+    func testQualificationBenchPlanRequiresAnExplicitSafePostWarmupThermalTarget()
+    {
+        let base = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "fused-kv-qwen3-32b-v1",
+            "--runs", "1",
+            "--qualification-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--matrix-block-index", "0",
+            "--matrix-run-position", "0",
+            "--matrix-cell-count", "3",
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
+        ]
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .missingQualificationFlag(
+                    "post-warmup-thermal-target"))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--post-warmup-thermal-target", "fair",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidPostWarmupThermalTarget("fair"))
+        }
+    }
+
+    func testPostWarmupThermalWaitAdmitsNominalAfterARecordedFairWarmup()
+        async throws
+    {
+        let sequence = ThermalSnapshotSequence([
+            qualificationHostSnapshot(
+                timestamp: 12, thermalState: .fair),
+            qualificationHostSnapshot(
+                timestamp: 13, thermalState: .nominal),
+        ])
+        let policy = try BenchQualificationThermalPolicy(
+            target: .nominal,
+            timeoutSeconds: 2,
+            pollIntervalMilliseconds: 1_000)
+
+        let admission = try await waitForBenchQualificationThermalAdmission(
+            policy: policy,
+            initialSnapshot: qualificationHostSnapshot(
+                timestamp: 11, thermalState: .fair),
+            snapshot: { try sequence.next() },
+            sleep: { _ in })
+
+        XCTAssertEqual(admission.snapshot.thermalState, .nominal)
+        XCTAssertEqual(admission.snapshot.monotonicTimestampSeconds, 13)
+        XCTAssertEqual(sequence.remainingCount, 0)
+    }
+
+    func testPostWarmupThermalWaitFailsClosedForUnsafeStateOrTimeout()
+        async throws
+    {
+        let policy = try BenchQualificationThermalPolicy(
+            target: .nominal,
+            timeoutSeconds: 1,
+            pollIntervalMilliseconds: 500)
+
+        do {
+            _ = try await waitForBenchQualificationThermalAdmission(
+                policy: policy,
+                initialSnapshot: qualificationHostSnapshot(
+                    timestamp: 11, thermalState: .serious),
+                snapshot: { XCTFail("unsafe state must not poll"); return
+                    self.qualificationHostSnapshot(timestamp: 12) },
+                sleep: { _ in XCTFail("unsafe state must not sleep") })
+            XCTFail("serious thermal state must fail closed")
+        } catch {
+            XCTAssertEqual(
+                error as? BenchQualificationRuntimeError,
+                .unsafePostWarmupThermalState(.serious))
+        }
+
+        let sequence = ThermalSnapshotSequence([
+            qualificationHostSnapshot(
+                timestamp: 12, thermalState: .fair),
+            qualificationHostSnapshot(
+                timestamp: 13, thermalState: .fair),
+        ])
+        do {
+            _ = try await waitForBenchQualificationThermalAdmission(
+                policy: policy,
+                initialSnapshot: qualificationHostSnapshot(
+                    timestamp: 11, thermalState: .fair),
+                snapshot: { try sequence.next() },
+                sleep: { _ in })
+            XCTFail("unreached thermal target must time out")
+        } catch {
+            XCTAssertEqual(
+                error as? BenchQualificationRuntimeError,
+                .postWarmupThermalTargetTimeout)
+        }
+    }
+
+    func testPostWarmupThermalWaitHonorsANonDivisibleDeadline()
+        async throws
+    {
+        let policy = try BenchQualificationThermalPolicy(
+            target: .nominal,
+            timeoutSeconds: 1,
+            pollIntervalMilliseconds: 600)
+        let sequence = ThermalSnapshotSequence([
+            qualificationHostSnapshot(
+                timestamp: 11.6, thermalState: .fair),
+            qualificationHostSnapshot(
+                timestamp: 12.2, thermalState: .nominal),
+        ])
+
+        do {
+            _ = try await waitForBenchQualificationThermalAdmission(
+                policy: policy,
+                initialSnapshot: qualificationHostSnapshot(
+                    timestamp: 11, thermalState: .fair),
+                snapshot: { try sequence.next() },
+                sleep: { sequence.recordSleep($0) })
+            XCTFail("a snapshot beyond the declared deadline must not admit")
+        } catch {
+            XCTAssertEqual(
+                error as? BenchQualificationRuntimeError,
+                .postWarmupThermalTargetTimeout)
+        }
+        XCTAssertEqual(sequence.sleepDurations, [600, 400])
     }
 
     func testQualificationBenchPlanFailsClosedForPartialOrMultiRunConfiguration() {
@@ -127,6 +270,9 @@ final class BenchCLITests: XCTestCase {
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
             "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--post-warmup-thermal-target", "nominal",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
         ]
 
         XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
@@ -172,6 +318,9 @@ final class BenchCLITests: XCTestCase {
             "--cache-limit-bytes", "8000",
             "--wired-limit-bytes", "10000",
             "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--post-warmup-thermal-target", "nominal",
+            "--post-warmup-thermal-timeout-seconds", "600",
+            "--post-warmup-thermal-poll-milliseconds", "1000",
         ]
         XCTAssertThrowsError(try parseBenchPlan(Flags(settings))) {
             XCTAssertEqual($0 as? BenchCLIError, .missingMatrixID)
@@ -812,6 +961,22 @@ final class BenchCLITests: XCTestCase {
                 JSONSerialization.data(withJSONObject: row)))
     }
 
+    func testTypedQualificationValidatorRejectsSchema3WithoutWarmupEvidence()
+        throws
+    {
+        var row = try qualificationValidationRow()
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        var qualification = try XCTUnwrap(
+            payload["qualification"] as? [String: Any])
+        qualification.removeValue(forKey: "warmup")
+        payload["qualification"] = qualification
+        row["payload"] = payload
+
+        XCTAssertThrowsError(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+    }
+
     func testTypedQualificationValidatorRejectsATruncatedDirectAdmission()
         throws
     {
@@ -1019,7 +1184,18 @@ final class BenchCLITests: XCTestCase {
                 tokenizerSHA256: admission.tokenizerSHA256,
                 cacheResetPolicy: .inPlaceBeforeEveryGeneration,
                 modelResidencyPolicy: .loadOncePerProcess,
-                processIsolationPolicy: .freshProcessPerMatrixPosition),
+                processIsolationPolicy: .freshProcessPerMatrixPosition,
+                postWarmupThermalPolicy:
+                    try BenchQualificationThermalPolicy(
+                        target: .nominal,
+                        timeoutSeconds: 600,
+                        pollIntervalMilliseconds: 1_000)),
+            warmup: try BenchQualificationWarmupEnvironment(
+                before: qualificationHostSnapshot(timestamp: 8),
+                after: qualificationHostSnapshot(timestamp: 9)),
+            postWarmupThermalAdmission:
+                try BenchQualificationThermalAdmission(
+                    snapshot: qualificationHostSnapshot(timestamp: 9.5)),
             runs: [
                 try BenchQualificationRunEnvironment(
                     before: BenchQualificationHostSnapshot(
@@ -1127,5 +1303,50 @@ final class BenchCLITests: XCTestCase {
             quant: "int4", concurrency: 1, hardware: "M3 Ultra")
         XCTAssertThrowsError(
             try appendBenchCSVRow(row, to: directory.path))
+    }
+
+    private func qualificationHostSnapshot(
+        timestamp: Double,
+        thermalState: CompressedAttentionProbeThermalState = .nominal
+    ) -> BenchQualificationHostSnapshot {
+        BenchQualificationHostSnapshot(
+            monotonicTimestampSeconds: timestamp,
+            residentSizeBytes: 20_000,
+            physicalFootprintBytes: 18_000,
+            lowPowerModeEnabled: false,
+            powerSource: .acPower,
+            thermalState: thermalState)
+    }
+}
+
+private final class ThermalSnapshotSequence {
+    private let lock = NSLock()
+    private var snapshots: [BenchQualificationHostSnapshot]
+    private var recordedSleepDurations: [Int] = []
+
+    init(_ snapshots: [BenchQualificationHostSnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    var remainingCount: Int {
+        lock.withLock { snapshots.count }
+    }
+
+    var sleepDurations: [Int] {
+        lock.withLock { recordedSleepDurations }
+    }
+
+    func next() throws -> BenchQualificationHostSnapshot {
+        try lock.withLock {
+            guard !snapshots.isEmpty else {
+                throw BenchQualificationRuntimeError
+                    .postWarmupThermalTargetTimeout
+            }
+            return snapshots.removeFirst()
+        }
+    }
+
+    func recordSleep(_ milliseconds: Int) {
+        lock.withLock { recordedSleepDurations.append(milliseconds) }
     }
 }
