@@ -1,7 +1,7 @@
 # Fused compressed-domain KV attention implementation plan
 
-**Status:** active — Phases 0-3 verified; exact-source requalification, KVarN direct attention,
-and loaded-model frontiers remain gated
+**Status:** active — Phases 0-3 verified; exact-source Qwen 8K is complete-negative, KVarN speed is
+shelved/capacity-only, and Qwen 32K/refusal plus cross-family loaded frontiers remain gated
 
 **Technique class:** `LOSSY_FRONTIER`
 
@@ -530,12 +530,48 @@ amendment is reviewed. KVarN is measured separately as capacity-only at Qwen 32K
 from speed aggregation. Any incomplete row or environment drift still invalidates its paired
 block; no old row is imported into the new matrix.
 
+### Qwen 8K five-cell terminal result — 2026-07-21
+
+Clean source `a2af840d6f02c3a9097e4df0372e969d18bd7bc8` completed the amended five-cell 5x5 cyclic
+matrix at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-a2af840/qwen-8k-v12-five-cell`.
+All 25 schema-v4 rows and promotable receipts, all five block completions, exact source/binary/
+runner/manifest/model/checkpoint/tokenizer/workload/current-KVTuner bindings, 60-second continuous
+nominal admission, retained AC/non-low-power equality, measured prefill, memory metrics, and direct
+engagement telemetry independently authenticated. Manifest SHA-256 is
+`551504e541b8e9a21786be536abc24b31ea68dea1dd71b5b0d0819a04ef92591`; completion, receipt-set,
+and runner-log SHA-256 values are
+`762c276456f33bab6927af6aa38297a9949b381de868b9b70f43b218b18e8b1d`,
+`bd716829efa223ffb46c25f304df81c40cbac07e29890b3f1590afd50d85bfa1`, and
+`71344817efd30bcf099f62cba814c7937599ee8c9b126aafdc293764761640c6`.
+
+| Qwen3-32B 8K cell | Median prefill tok/s | Median decode tok/s | Median TTFT ms | Disposition |
+| --- | ---: | ---: | ---: | --- |
+| fp16 | 531.19 | 23.32 | 15,036 | Transparent control |
+| affine K4V2-g64 materialize | 531.19 | 19.64 | 15,036 | same-storage control |
+| affine K4V2-g64 direct | 333.29 | 24.19 | 23,965 | dominated; no speed promotion |
+| KVTuner g128-b3.046875 materialize | 531.42 | 19.58 | 15,030 | same-storage control |
+| KVTuner g128-b3.046875 direct | 333.34 | 23.19 | 23,960 | dominated; no speed promotion |
+
+Both direct paths removed their materialize-control decode penalty in every block. Affine direct
+was 15.1-23.4% faster than affine materialize and KVTuner direct was 18.2-18.8% faster than its
+materialize control. That local win did not clear the product gate: affine direct's fp16 decode
+ratio was 1.032-1.110 and its fp16 prefill ratio was 0.626-0.781; KVTuner direct's corresponding
+ranges were 0.989-1.137 and 0.626-0.876. Each candidate failed at least one frozen condition in
+every block, so both all-block verdicts are `false`. Preserve this as clean negative/dominated
+evidence. It changes no default and earns no 8K speed tier. Qwen 32K remains required because
+long-context scaling is a separate runtime/capacity question; KVarN remains separate capacity-only
+context and cannot enter the speed aggregate.
+
 ### Phase 4 — end-to-end Qwen frontier
 
-- [ ] Run 8K as the bounded smoke, then 32K only from the clean verified SHA; record the
+- [x] Run 8K as the bounded smoke. It completed 25/25 under clean `a2af840`; both direct candidates
+  are negative/dominated under the unchanged all-block speed gate.
+- [ ] Run 32K only from the clean verified SHA; record the
   authenticated 128K refusal because Qwen3-32B max context is 40,960.
-- [ ] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
-  KVTuner materialize/direct pairs. At 32K, retain that speed scope and collect KVarN i8 only as a
+- [x] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
+  KVTuner materialize/direct pairs.
+- [ ] At 32K, retain that speed scope and collect KVarN i8 only as a
   separate authenticated capacity/runtime-context row with no speed aggregation or label.
 - [ ] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
 

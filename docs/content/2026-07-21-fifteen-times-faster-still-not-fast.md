@@ -53,15 +53,38 @@ from all conclusions about individual Metal kernels.
 This distinction matters. A failed profiler does not create permission to guess. The wall-time
 envelope and source map were enough to answer the engineering-scope question, so we stopped there.
 
+## The clean matrix closed the remaining escape hatch
+
+We still owed the affine and frozen KVTuner paths a proper test. A fresh five-cell matrix ran each
+direct path, its same-storage materialize control, and fp16 once in every position across five
+blocks. Every retained row proved a 60-second nominal admission window, AC power, Low Power Mode
+off, stable before/after state, exact model and workload identity, and the direct operation that
+actually engaged. All 25 rows authenticated.
+
+The direct paths again fixed a real local cost. Affine direct decoded at a median 24.19 tokens per
+second versus 19.64 for affine materialize. KVTuner direct reached 23.19 versus 19.58 for its
+materialize control. But fp16 decoded at 23.32, so affine's median advantage was only 3.7%, below
+the frozen 5% gate, while KVTuner was slightly slower. Position-by-position evidence was stricter:
+neither candidate beat fp16 by 5% in every block.
+
+Prefill made the verdict unambiguous. Both direct candidates prefilled at roughly 333 tokens per
+second versus 531 for fp16, a regression of about 37% at the median. The allowed regression was
+5%. Faster decode than a materialize control could not offset slower prompt processing and higher
+time to first token on the complete workload.
+
+The result is clean negative evidence, not a near miss promoted by averaging. Both direct paths
+remain useful implementation and capacity research, but neither earns an 8K speed label or a
+default change.
+
 ## Keep the capacity, drop the speed story
 
 KVarN remains useful. Its previously qualified i8 cell provides a model-scoped capacity-only
 Max-fit choice with measured quality and task warnings. The direct implementation and lifecycle
 tests remain valuable research infrastructure. What is shelved is the speed role for this cycle.
 
-The next speed gate keeps fp16 and the affine K4V2-g64 and frozen KVTuner materialize/direct pairs.
-Those paths still have a plausible envelope and will run in a fresh counterbalanced matrix. KVarN
-will be measured separately at 32K for capacity and runtime context, with no speed label implied.
+The 8K affine/KVTuner speed gate is now closed negative. The next evidence boundary is 32K, where
+long-context runtime and capacity scaling are separate questions. KVarN will be measured there as
+capacity/runtime context only, with no speed label implied.
 
 The general lesson is less obvious than “optimize the bottleneck.” Relative speedups are only as
 useful as the baseline they beat. A new path can be fifteen times faster than the implementation it

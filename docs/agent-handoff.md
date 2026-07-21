@@ -111,27 +111,42 @@ allowed 5% envelope. Those partial timings remain non-promotable; their magnitud
 independent prefill/packed-attention costs rules out one credible actor-confined recovery. Do not
 spend another cycle on a KVarN speed retry.
 
-The reviewed scope amendment keeps the original thermal, provenance, and 5% gates and narrows the
-next Qwen 8K speed matrix to exactly five cells: fp16, affine K4V2-g64 materialize/direct, and the
-frozen Qwen KVTuner materialize/direct. Use a fresh 5x5 cyclic order, schema-v3 manifest,
-schema-v4 evidence, 60-second continuous nominal dwell, fresh output, and a new clean source/build
-identity. KVarN remains a separately authenticated capacity-only cell at Qwen 32K; it cannot earn
-or imply a speed label. Preserve every v7-v11 and trace-v1 boundary unchanged.
+The amended Qwen 8K five-cell matrix is now terminal `COMPLETE` and independently authenticated,
+but **neither direct candidate promotes**. Preserve it unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-a2af840/qwen-8k-v12-five-cell`.
+Clean source `a2af840d6f02c3a9097e4df0372e969d18bd7bc8`, binary SHA-256
+`7f187d6986906eed8d90753170f8b7a91cdc720bb860ef366bb46ff64814d4a4`, runner SHA-256
+`e2f6e55bb0aeae6b1ec585f6d0d3c85b13c00879e13ed2a0fa3826ee074f8c0f`, and manifest SHA-256
+`551504e541b8e9a21786be536abc24b31ea68dea1dd71b5b0d0819a04ef92591` produced 25/25 schema-v4
+rows across five stable nominal/AC/non-low-power blocks. Completion, receipt-set, and runner-log
+SHA-256 values are `762c276456f33bab6927af6aa38297a9949b381de868b9b70f43b218b18e8b1d`,
+`bd716829efa223ffb46c25f304df81c40cbac07e29890b3f1590afd50d85bfa1`, and
+`71344817efd30bcf099f62cba814c7937599ee8c9b126aafdc293764761640c6`.
+
+Median decode/prefill tok/s were fp16 23.32/531.19, affine materialize 19.64/531.19, affine direct
+24.19/333.29, KVTuner materialize 19.58/531.42, and KVTuner direct 23.19/333.34. Affine direct beat
+its materialize control in all five blocks by 15.1-23.4%, but beat fp16 by at least 5% in only one
+block and retained just 62.6-78.1% of fp16 prefill. KVTuner direct beat its materialize control by
+18.2-18.8%, but its fp16 decode ratio ranged from 0.989 to 1.137 and its prefill ratio from 0.626
+to 0.876. The fail-closed reducer therefore reports both all-block gates `false`. This is clean
+negative/dominated evidence: no 8K speed tier or default changes. Continue Qwen 32K for long-context
+runtime/capacity behavior, with KVarN measured separately as capacity-only, then record Qwen's
+authenticated near-128K refusal. Preserve every v7-v12 and trace-v1 boundary unchanged.
 
 **Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v11 and the
+1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v12 and the
    failed trace; never resume, overwrite, or promote partial evidence. KVarN's direct speed role is
-   SHELVED and its capacity-only role remains. From a fresh reviewed clean build, qualify the exact
-   five-cell Qwen 8K scope: fp16 plus affine K4V2-g64 and frozen KVTuner materialize/direct pairs.
-   A direct path must beat both same-storage materialize and fp16 decode by at least 5%, with
-   prefill regression within 5%; preserve dominated and failed cells. Then run Qwen 32K, including
-   a separately authenticated KVarN capacity-only row, and record the authenticated 128K refusal
-   (maximum context 40,960), and qualify source-locked Llama-3.3-70B at 8K/32K/near-128K without the
-   Qwen-specific KVTuner schedule unless independently calibrated. Both first families share
+   SHELVED and its capacity-only role remains. The exact five-cell Qwen 8K matrix completed and
+   failed the unchanged all-block speed gate; retain both affine and KVTuner direct cells as
+   negative/dominated 8K evidence. Next run Qwen 32K with the same authenticated speed controls,
+   include a separately authenticated KVarN capacity-only row, and record the authenticated 128K
+   refusal (maximum context 40,960). Then qualify source-locked Llama-3.3-70B at
+   8K/32K/near-128K without the Qwen-specific KVTuner schedule unless independently calibrated.
+   Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support
    claim. Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial
    tier.
