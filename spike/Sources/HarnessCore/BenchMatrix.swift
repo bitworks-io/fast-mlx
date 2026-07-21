@@ -168,6 +168,239 @@ public struct BenchMemoryAggregate: Sendable, Equatable {
     }
 }
 
+public enum BenchQualificationEvidenceError: Error, Sendable, Equatable {
+    case invalidRunnerManifestSHA256
+    case invalidMatrixPosition
+    case invalidMemorySettings
+    case invalidMonotonicTiming
+    case invalidProcessMemory
+    case invalidPowerState
+    case invalidThermalState
+    case invalidRunCount(Int)
+    case invalidSchemaVersion(Int)
+}
+
+public enum BenchQualificationCacheResetPolicy:
+    String, Codable, Sendable, Equatable
+{
+    /// `CompiledMLXDecoder.reset()` preserves compiled array identity while clearing every
+    /// request's logical KV state before the warmup or retained generation begins.
+    case inPlaceBeforeEveryGeneration = "in-place-before-every-generation"
+}
+
+public enum BenchQualificationModelResidencyPolicy:
+    String, Codable, Sendable, Equatable
+{
+    /// One checkpoint load is retained for the warmup and measured generation in this process.
+    case loadOncePerProcess = "load-once-per-process"
+}
+
+public enum BenchQualificationProcessIsolationPolicy:
+    String, Codable, Sendable, Equatable
+{
+    /// The matrix runner starts a new harness process for every cell/block position. This keeps
+    /// allocator residue from one cache representation out of another cell's retained row.
+    case freshProcessPerMatrixPosition = "fresh-process-per-matrix-position"
+}
+
+/// Static identity for one isolated position in a loaded-model qualification matrix. The runner
+/// manifest digest binds the declared order outside this process; the remaining fields make every
+/// row independently reject partial order or memory-policy evidence.
+public struct BenchQualificationContext: Codable, Sendable, Equatable {
+    public let runnerManifestSHA256: String
+    public let matrixBlockIndex: Int
+    public let matrixRunPosition: Int
+    public let matrixCellCount: Int
+    public let memoryLimitBytes: Int
+    public let cacheLimitBytes: Int
+    public let wiredLimitBytes: Int
+    public let cacheResetPolicy: BenchQualificationCacheResetPolicy
+    public let modelResidencyPolicy: BenchQualificationModelResidencyPolicy
+    public let processIsolationPolicy: BenchQualificationProcessIsolationPolicy
+
+    public init(
+        runnerManifestSHA256: String,
+        matrixBlockIndex: Int,
+        matrixRunPosition: Int,
+        matrixCellCount: Int,
+        memoryLimitBytes: Int,
+        cacheLimitBytes: Int,
+        wiredLimitBytes: Int,
+        cacheResetPolicy: BenchQualificationCacheResetPolicy,
+        modelResidencyPolicy: BenchQualificationModelResidencyPolicy,
+        processIsolationPolicy: BenchQualificationProcessIsolationPolicy
+    ) throws {
+        self.runnerManifestSHA256 = runnerManifestSHA256
+        self.matrixBlockIndex = matrixBlockIndex
+        self.matrixRunPosition = matrixRunPosition
+        self.matrixCellCount = matrixCellCount
+        self.memoryLimitBytes = memoryLimitBytes
+        self.cacheLimitBytes = cacheLimitBytes
+        self.wiredLimitBytes = wiredLimitBytes
+        self.cacheResetPolicy = cacheResetPolicy
+        self.modelResidencyPolicy = modelResidencyPolicy
+        self.processIsolationPolicy = processIsolationPolicy
+        try validate()
+    }
+
+    fileprivate func validate() throws {
+        guard Self.isLowercaseSHA256(runnerManifestSHA256) else {
+            throw BenchQualificationEvidenceError
+                .invalidRunnerManifestSHA256
+        }
+        guard matrixBlockIndex >= 0, matrixCellCount > 0,
+            (0 ..< matrixCellCount).contains(matrixRunPosition)
+        else {
+            throw BenchQualificationEvidenceError.invalidMatrixPosition
+        }
+        guard cacheLimitBytes > 0, memoryLimitBytes >= cacheLimitBytes,
+            wiredLimitBytes >= memoryLimitBytes
+        else {
+            throw BenchQualificationEvidenceError.invalidMemorySettings
+        }
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
+        }
+    }
+}
+
+/// Host receipts captured immediately around one retained generation. MLX active/cache/peak and
+/// endpoint footprint remain in `BenchRunMemoryEvidence`; resident size is retained here because
+/// the isolated runner also records the process-wide maximum RSS independently.
+public struct BenchQualificationHostSnapshot:
+    Codable, Sendable, Equatable
+{
+    public let monotonicTimestampSeconds: Double
+    public let residentSizeBytes: Int
+    public let physicalFootprintBytes: Int
+    public let lowPowerModeEnabled: Bool
+    public let powerSource: CompressedAttentionProbePowerSource
+    public let thermalState: CompressedAttentionProbeThermalState
+
+    public init(
+        monotonicTimestampSeconds: Double,
+        residentSizeBytes: Int,
+        physicalFootprintBytes: Int,
+        lowPowerModeEnabled: Bool,
+        powerSource: CompressedAttentionProbePowerSource,
+        thermalState: CompressedAttentionProbeThermalState
+    ) {
+        self.monotonicTimestampSeconds = monotonicTimestampSeconds
+        self.residentSizeBytes = residentSizeBytes
+        self.physicalFootprintBytes = physicalFootprintBytes
+        self.lowPowerModeEnabled = lowPowerModeEnabled
+        self.powerSource = powerSource
+        self.thermalState = thermalState
+    }
+}
+
+public struct BenchQualificationRunEnvironment:
+    Codable, Sendable, Equatable
+{
+    public let before: BenchQualificationHostSnapshot
+    public let after: BenchQualificationHostSnapshot
+
+    public init(
+        before: BenchQualificationHostSnapshot,
+        after: BenchQualificationHostSnapshot
+    ) throws {
+        self.before = before
+        self.after = after
+        try validate()
+    }
+
+    fileprivate func validate() throws {
+        guard before.monotonicTimestampSeconds.isFinite,
+            after.monotonicTimestampSeconds.isFinite,
+            after.monotonicTimestampSeconds
+                > before.monotonicTimestampSeconds
+        else {
+            throw BenchQualificationEvidenceError.invalidMonotonicTiming
+        }
+        guard before.residentSizeBytes > 0, after.residentSizeBytes > 0,
+            before.physicalFootprintBytes > 0,
+            after.physicalFootprintBytes > 0
+        else {
+            throw BenchQualificationEvidenceError.invalidProcessMemory
+        }
+        guard before.lowPowerModeEnabled == after.lowPowerModeEnabled,
+            before.powerSource == after.powerSource,
+            before.powerSource != .unavailable
+        else {
+            throw BenchQualificationEvidenceError.invalidPowerState
+        }
+        guard before.thermalState == after.thermalState,
+            before.thermalState != .unknown
+        else {
+            throw BenchQualificationEvidenceError.invalidThermalState
+        }
+    }
+}
+
+/// Qualification-only payload nested inside a historical `bench` row. Exactly one retained run
+/// is allowed per process: cross-cell counterbalancing and the required three-or-more repetitions
+/// happen at the isolated matrix-runner boundary, preventing allocator history from being shared.
+public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+
+    public let schemaVersion: Int
+    public let context: BenchQualificationContext
+    public let runs: [BenchQualificationRunEnvironment]
+
+    public init(
+        context: BenchQualificationContext,
+        runs: [BenchQualificationRunEnvironment]
+    ) throws {
+        schemaVersion = Self.currentSchemaVersion
+        self.context = context
+        self.runs = runs
+        try validate()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case context
+        case runs
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let schemaVersion = try container.decode(
+            Int.self, forKey: .schemaVersion)
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw BenchQualificationEvidenceError
+                .invalidSchemaVersion(schemaVersion)
+        }
+        let context = try container.decode(
+            BenchQualificationContext.self, forKey: .context)
+        let runs = try container.decode(
+            [BenchQualificationRunEnvironment].self, forKey: .runs)
+        try self.init(context: context, runs: runs)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
+        try container.encode(context, forKey: .context)
+        try container.encode(runs, forKey: .runs)
+    }
+
+    private func validate() throws {
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw BenchQualificationEvidenceError
+                .invalidSchemaVersion(schemaVersion)
+        }
+        try context.validate()
+        guard runs.count == 1 else {
+            throw BenchQualificationEvidenceError.invalidRunCount(runs.count)
+        }
+        for run in runs { try run.validate() }
+    }
+}
+
 public enum ServiceWorkloadIdentityError: Error, Sendable, Equatable {
     case invalidNonce
 }

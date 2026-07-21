@@ -204,6 +204,24 @@ struct BenchPayload: Codable, Sendable {
     let maxMLXActiveBytes: Int?
     let maxMLXCacheBytes: Int?
     let maxMLXPeakBytes: Int?
+    /// Qualification-only counterbalance, fixed-memory, power/thermal, and process receipts.
+    /// Optional keeps historical and exploratory `bench` rows decodable.
+    let qualification: BenchQualificationEvidence?
+}
+
+func runBenchQualificationEvidenceValidation(_ flags: Flags) {
+    do {
+        let path = try flags.strictString("evidence", default: "")
+        guard !path.isEmpty else {
+            throw FlagValueError.missingValue(key: "evidence")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        try validateBenchQualificationEvidenceData(data)
+        print("bench qualification evidence: VALID")
+    } catch {
+        print("bench qualification evidence INVALID: \(error)")
+        exit(2)
+    }
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -640,6 +658,13 @@ func runBench(_ flags: Flags) async {
         // misspelled/missing flag cannot be reported as an unrelated environment failure.
         let plan = try parseBenchPlan(flags)
         try assertReleaseBuild()
+        let qualificationModelIdentity = try plan.qualificationContext.map {
+            _ in try benchQualificationModelIdentity(
+                modelPath: plan.modelPath)
+        }
+        if let qualificationContext = plan.qualificationContext {
+            try configureBenchQualificationMemory(qualificationContext)
+        }
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(plan.kvQuantTier ?? "fp16") {
             guard let matrixID = plan.matrixID else {
@@ -691,7 +716,16 @@ func runBench(_ flags: Flags) async {
             compressedKVAttention: plan.compressedKVAttention,
             compressedKVAttentionExpectedCheckpointContentSHA256:
                 plan
-                    .compressedKVAttentionExpectedCheckpointContentSHA256)
+                    .compressedKVAttentionExpectedCheckpointContentSHA256,
+            memoryLimitBytes:
+                plan.qualificationContext?.memoryLimitBytes,
+            memoryCacheLimitBytes:
+                plan.qualificationContext?.cacheLimitBytes
+                ?? KVTunerSensitivityCaptureEnvironment
+                    .requiredMemoryCacheLimitBytes)
+        if let qualificationContext = plan.qualificationContext {
+            try configureBenchQualificationMemory(qualificationContext)
+        }
 
         let modelName = URL(fileURLWithPath: plan.modelPath).lastPathComponent
         // Task 5: the model's OWN declared quantization (config.json), not a dirname-substring
@@ -708,6 +742,7 @@ func runBench(_ flags: Flags) async {
         var ttftMilliseconds: [Double] = []
         var generatedTokenCounts: [Int] = []
         var memoryRuns: [BenchRunMemoryEvidence] = []
+        var qualificationRuns: [BenchQualificationRunEnvironment] = []
         var engagementMax: [String: Int] = [:]
         var draftedTotal = 0, acceptedTotal = 0
         var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
@@ -726,6 +761,9 @@ func runBench(_ flags: Flags) async {
             // sampled on both sides of this exact batch-1 generation.
             Memory.peakMemory = 0
             let memoryStart = serviceMemorySample()
+            let qualificationBefore = try plan.qualificationContext.map {
+                _ in try benchQualificationHostSnapshot()
+            }
             let result = try await driver.generate(
                 prompt: promptTokens,
                 config: RunConfig(
@@ -742,6 +780,9 @@ func runBench(_ flags: Flags) async {
                     compressedKVAttentionExpectedCheckpointContentSHA256:
                         plan
                             .compressedKVAttentionExpectedCheckpointContentSHA256))
+            let qualificationAfter = try plan.qualificationContext.map {
+                _ in try benchQualificationHostSnapshot()
+            }
             let memoryEnd = serviceMemorySample()
             let memoryEvidence = try BenchRunMemoryEvidence(
                 samples: [memoryStart, memoryEnd])
@@ -802,6 +843,12 @@ func runBench(_ flags: Flags) async {
                 ttftMilliseconds.append(metrics.ttftSeconds * 1_000)
                 generatedTokenCounts.append(metrics.generatedTokenCount)
                 memoryRuns.append(memoryEvidence)
+                if let qualificationBefore, let qualificationAfter {
+                    qualificationRuns.append(
+                        try BenchQualificationRunEnvironment(
+                            before: qualificationBefore,
+                            after: qualificationAfter))
+                }
                 for (key, value) in result.engagement.counts {
                     engagementMax[key] = max(engagementMax[key] ?? value, value)
                 }
@@ -818,7 +865,10 @@ func runBench(_ flags: Flags) async {
             decodeRates.count == agg.runs,
             ttftMilliseconds.count == agg.runs,
             generatedTokenCounts.count == agg.runs,
-            memoryRuns.count == agg.runs
+            memoryRuns.count == agg.runs,
+            (plan.qualificationContext == nil
+                ? qualificationRuns.isEmpty
+                : qualificationRuns.count == agg.runs)
         else {
             throw BenchCLIError.invalidPrefillTiming
         }
@@ -865,16 +915,25 @@ func runBench(_ flags: Flags) async {
                 + "mlx_cache_max=\(memoryAggregate.maxMLXCacheBytes), "
                 + "mlx_peak_max=\(memoryAggregate.maxMLXPeakBytes), "
                 + "cache_limit="
-                + "\(KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
+                + "\(plan.qualificationContext?.cacheLimitBytes ?? KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
         if let csvPath = plan.csvPath {
             try appendBenchCSVRow(row, to: csvPath)
             print("# appended to \(csvPath)")
         }
 
+        if let qualificationModelIdentity {
+            guard try benchQualificationModelIdentity(
+                modelPath: plan.modelPath) == qualificationModelIdentity
+            else {
+                throw BenchQualificationRuntimeError.modelIdentityChanged
+            }
+        }
         let (provenance, _) = ProvenanceCLI.build(
             modelPath: plan.modelPath,
             referenceVersions: nil,
-            corpus: nil)
+            corpus: nil,
+            modelCheckpointManifestHash:
+                qualificationModelIdentity?.checkpointManifestHash)
         let payload = BenchPayload(
             label: plan.label, workload: Workload.decode.rawValue, mode: mode.rawValue,
             decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
@@ -914,14 +973,20 @@ func runBench(_ flags: Flags) async {
             ttftMsByRun: ttftMilliseconds,
             generatedTokenCountsByRun: generatedTokenCounts,
             memoryCacheLimitBytes:
-                KVTunerSensitivityCaptureEnvironment
+                plan.qualificationContext?.cacheLimitBytes
+                ?? KVTunerSensitivityCaptureEnvironment
                     .requiredMemoryCacheLimitBytes,
             memoryRuns: memoryRuns,
             maxSampledPhysicalFootprintBytes:
                 memoryAggregate.maxSampledPhysicalFootprintBytes,
             maxMLXActiveBytes: memoryAggregate.maxMLXActiveBytes,
             maxMLXCacheBytes: memoryAggregate.maxMLXCacheBytes,
-            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes)
+            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes,
+            qualification: try plan.qualificationContext.map {
+                try BenchQualificationEvidence(
+                    context: $0,
+                    runs: qualificationRuns)
+            })
         try appendRequiredJSONLRecord(
             ResultRecord(
                 subcommand: "bench",
@@ -1633,6 +1698,8 @@ struct Harness {
         case "corpus": runCorpus()
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
+        case "validate-bench-qualification":
+            runBenchQualificationEvidenceValidation(flags)
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
@@ -1682,9 +1749,16 @@ struct Harness {
                  [--prompt-repeat 1]          deterministic long-context prompt construction
                  [--runs 3] [--max-tokens 256] one warmup plus measured batch-1 runs
                  [--csv <FILE>] [--evidence <JSONL>] authenticated runtime artifacts
+                 [--qualification-evidence true] isolated matrix position; requires --runs 1,
+                 [--runner-manifest-sha256 <SHA256>] --matrix-block-index/--matrix-run-position/
+                 [--matrix-cell-count <N>]          plus explicit MLX/wired
+                 [--memory-limit-bytes <N>]          limits; intended for the checked-in runner
+                 [--cache-limit-bytes <N>] [--wired-limit-bytes <N>]
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
+          validate-bench-qualification --evidence <JSONL>
+                                               typed fail-closed validation for one runner row
           service-bench --model <PATH>        aggregate service frontier (Release builds only)
                  --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy
                  --scenario burst             simultaneous admission (initial measured scenario)

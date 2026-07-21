@@ -13,6 +13,9 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     case contextLimitExceeded(
         promptTokens: Int, maxTokens: Int, limit: Int)
     case invalidRuns(Int)
+    case invalidQualificationRuns(Int)
+    case qualificationFlagsWithoutQualification
+    case missingQualificationFlag(String)
     case invalidMaxTokens(Int)
     case unknownSpec(String)
     case unmeasuredSpecKV(String)
@@ -51,6 +54,12 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "bench prompt plus output budget exceeds the authenticated model context: prompt=\(promptTokens), max_tokens=\(maxTokens), limit=\(limit)"
         case .invalidRuns(let runs):
             return "bench --runs must be positive and bounded; actual=\(runs)"
+        case .invalidQualificationRuns(let runs):
+            return "qualification bench requires exactly one post-warmup run per isolated matrix position; actual=\(runs)"
+        case .qualificationFlagsWithoutQualification:
+            return "qualification-only bench flags require --qualification-evidence true"
+        case .missingQualificationFlag(let flag):
+            return "qualification bench requires --\(flag) <VALUE>"
         case .invalidMaxTokens(let value):
             return "bench --max-tokens must be positive; actual=\(value)"
         case .unknownSpec(let spec):
@@ -86,6 +95,86 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     }
 }
 
+enum BenchQualificationEvidenceValidationError:
+    Error, Equatable, Sendable
+{
+    case wrongSubcommand(String)
+    case missingQualificationEvidence
+    case modelIdentityMismatch
+    case unexpectedKVTunerSchedule
+    case missingKVTunerSchedule
+    case missingKVTunerAdmission
+    case kvtunerIdentityMismatch
+}
+
+/// Decode qualification evidence through the same durable Swift types that produced it, then
+/// re-run the post-decode admission invariants and cross-bind the KVTuner schedule to the exact
+/// model admission. The matrix runner performs additional experiment-specific scalar checks;
+/// this typed pass prevents a truncated nested object from satisfying those checks by accident.
+func validateBenchQualificationEvidenceData(_ data: Data) throws {
+    let record = try JSONDecoder().decode(
+        ResultRecord<BenchPayload>.self, from: data)
+    guard record.subcommand == "bench" else {
+        throw BenchQualificationEvidenceValidationError.wrongSubcommand(
+            record.subcommand)
+    }
+    guard record.payload.qualification != nil else {
+        throw BenchQualificationEvidenceValidationError
+            .missingQualificationEvidence
+    }
+
+    let runtimeBinding = record.payload.compressedKVAttention
+    if let runtimeBinding {
+        try runtimeBinding.validated()
+        guard runtimeBinding.admission.modelConfigHash
+                == record.provenance.modelConfigHash,
+            runtimeBinding.admission.checkpointManifestHash
+                == record.provenance.modelCheckpointManifestHash
+        else {
+            throw BenchQualificationEvidenceValidationError
+                .modelIdentityMismatch
+        }
+    }
+
+    let isKVTuner = isKVTunerTier(record.payload.kvQuantTier)
+    guard isKVTuner || record.payload.kvtunerSchedule == nil else {
+        throw BenchQualificationEvidenceValidationError
+            .unexpectedKVTunerSchedule
+    }
+    guard !isKVTuner || record.payload.kvtunerSchedule != nil else {
+        throw BenchQualificationEvidenceValidationError
+            .missingKVTunerSchedule
+    }
+    guard let schedule = record.payload.kvtunerSchedule else { return }
+    guard let runtimeBinding else {
+        throw BenchQualificationEvidenceValidationError
+            .missingKVTunerAdmission
+    }
+    guard schedule.matrixID == record.payload.matrixID,
+        schedule.cellID == record.payload.cellID,
+        schedule.modelConfigHash == runtimeBinding.admission.modelConfigHash,
+        schedule.modelConfigSHA256
+            == runtimeBinding.admission.modelConfigSHA256,
+        schedule.checkpointManifestHash
+            == runtimeBinding.admission.checkpointManifestHash,
+        schedule.checkpointContentSHA256
+            == runtimeBinding.admission.checkpointContentSHA256,
+        schedule.tokenizerSHA256 == runtimeBinding.admission.tokenizerSHA256,
+        schedule.layers.count == runtimeBinding.admission.layerCount
+    else {
+        throw BenchQualificationEvidenceValidationError
+            .kvtunerIdentityMismatch
+    }
+    try runtimeBinding.admission.validateScheduleIdentity(
+        modelConfigHash: schedule.modelConfigHash,
+        modelConfigSHA256: schedule.modelConfigSHA256,
+        checkpointManifestHash: schedule.checkpointManifestHash,
+        checkpointContentSHA256: schedule.checkpointContentSHA256,
+        tokenizerSHA256: schedule.tokenizerSHA256,
+        layerCount: schedule.layers.count,
+        groupSize: schedule.groupSize)
+}
+
 struct BenchPlan: Sendable {
     let modelPath: String
     let kvQuantTier: String?
@@ -96,6 +185,7 @@ struct BenchPlan: Sendable {
     let promptRepeat: Int
     let maxTokens: Int
     let runs: Int
+    let qualificationContext: BenchQualificationContext?
     let label: String
     let spec: String?
     let ngram: Int
@@ -231,6 +321,72 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
     guard (1 ... 100).contains(runs) else {
         throw BenchCLIError.invalidRuns(runs)
     }
+    let qualificationEvidence = try flags.strictBool(
+        "qualification-evidence", default: false)
+    let runnerManifestSHA256 = try flags.strictString(
+        "runner-manifest-sha256", default: "")
+    let matrixBlockIndex = try flags.optionalStrictInt(
+        "matrix-block-index")
+    let matrixRunPosition = try flags.optionalStrictInt(
+        "matrix-run-position")
+    let matrixCellCount = try flags.optionalStrictInt(
+        "matrix-cell-count")
+    let memoryLimitBytes = try flags.optionalStrictInt(
+        "memory-limit-bytes")
+    let cacheLimitBytes = try flags.optionalStrictInt(
+        "cache-limit-bytes")
+    let wiredLimitBytes = try flags.optionalStrictInt(
+        "wired-limit-bytes")
+    let qualificationFlagsSupplied = !runnerManifestSHA256.isEmpty
+        || matrixBlockIndex != nil || matrixRunPosition != nil
+        || matrixCellCount != nil || memoryLimitBytes != nil
+        || cacheLimitBytes != nil || wiredLimitBytes != nil
+    guard qualificationEvidence || !qualificationFlagsSupplied else {
+        throw BenchCLIError.qualificationFlagsWithoutQualification
+    }
+    let qualificationContext: BenchQualificationContext?
+    if qualificationEvidence {
+        guard !matrixText.isEmpty else {
+            throw BenchCLIError.missingMatrixID
+        }
+        guard !explicitNonce.isEmpty else {
+            throw BenchCLIError.missingWorkloadNonce
+        }
+        guard runs == 1 else {
+            throw BenchCLIError.invalidQualificationRuns(runs)
+        }
+        func required(
+            _ value: Int?, flag: String
+        ) throws -> Int {
+            guard let value else {
+                throw BenchCLIError.missingQualificationFlag(flag)
+            }
+            return value
+        }
+        guard !runnerManifestSHA256.isEmpty else {
+            throw BenchCLIError.missingQualificationFlag(
+                "runner-manifest-sha256")
+        }
+        qualificationContext = try BenchQualificationContext(
+            runnerManifestSHA256: runnerManifestSHA256,
+            matrixBlockIndex: try required(
+                matrixBlockIndex, flag: "matrix-block-index"),
+            matrixRunPosition: try required(
+                matrixRunPosition, flag: "matrix-run-position"),
+            matrixCellCount: try required(
+                matrixCellCount, flag: "matrix-cell-count"),
+            memoryLimitBytes: try required(
+                memoryLimitBytes, flag: "memory-limit-bytes"),
+            cacheLimitBytes: try required(
+                cacheLimitBytes, flag: "cache-limit-bytes"),
+            wiredLimitBytes: try required(
+                wiredLimitBytes, flag: "wired-limit-bytes"),
+            cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+            modelResidencyPolicy: .loadOncePerProcess,
+            processIsolationPolicy: .freshProcessPerMatrixPosition)
+    } else {
+        qualificationContext = nil
+    }
     let maxTokens = try flags.strictInt("max-tokens", default: 256)
     guard maxTokens > 0 else {
         throw BenchCLIError.invalidMaxTokens(maxTokens)
@@ -268,6 +424,7 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         promptRepeat: promptRepeat,
         maxTokens: maxTokens,
         runs: runs,
+        qualificationContext: qualificationContext,
         label: try flags.strictString("label", default: "harness"),
         spec: spec,
         ngram: try flags.strictInt("ngram", default: 3),

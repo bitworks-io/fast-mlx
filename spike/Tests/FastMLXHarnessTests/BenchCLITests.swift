@@ -5,6 +5,7 @@ import XCTest
 
 final class BenchCLITests: XCTestCase {
     private let checkpointContentSHA256 = String(repeating: "d", count: 64)
+    private let runnerManifestSHA256 = String(repeating: "e", count: 64)
     private let kvtunerArguments = [
         "--model", "/models/Qwen3-32B-4bit",
         "--kv-quant", "kvtuner-g128-b3.046875",
@@ -58,6 +59,96 @@ final class BenchCLITests: XCTestCase {
         XCTAssertEqual(plan.workload.nonce, "kvarn-frontier-20260718")
         XCTAssertEqual(plan.workload.basePrompt, defaultBenchPrompt)
         XCTAssertNil(plan.compressedKVAttention)
+    }
+
+    func testQualificationBenchPlanRequiresAndPreservesOneIsolatedMatrixPosition()
+        throws
+    {
+        let plan = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "fused-kv-qwen3-32b-v1",
+            "--runs", "1",
+            "--qualification-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--matrix-block-index", "2",
+            "--matrix-run-position", "3",
+            "--matrix-cell-count", "7",
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+        ]))
+
+        XCTAssertEqual(
+            plan.qualificationContext,
+            try BenchQualificationContext(
+                runnerManifestSHA256: runnerManifestSHA256,
+                matrixBlockIndex: 2,
+                matrixRunPosition: 3,
+                matrixCellCount: 7,
+                memoryLimitBytes: 9_000,
+                cacheLimitBytes: 8_000,
+                wiredLimitBytes: 10_000,
+                cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+                modelResidencyPolicy: .loadOncePerProcess,
+                processIsolationPolicy: .freshProcessPerMatrixPosition))
+        XCTAssertEqual(plan.workload.iterations, 2)
+    }
+
+    func testQualificationBenchPlanFailsClosedForPartialOrMultiRunConfiguration() {
+        let base = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "fused-kv-qwen3-32b-v1",
+            "--qualification-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--matrix-block-index", "0",
+            "--matrix-run-position", "0",
+            "--matrix-cell-count", "3",
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+        ]
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidQualificationRuns(3))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(
+            base + ["--runs", "1", "--wired-limit-bytes", ""]
+        )))
+        XCTAssertThrowsError(try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .qualificationFlagsWithoutQualification)
+        }
+    }
+
+    func testQualificationBenchPlanRequiresExplicitMatrixAndWorkloadIdentity() {
+        let settings = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--runs", "1",
+            "--qualification-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--matrix-block-index", "0",
+            "--matrix-run-position", "0",
+            "--matrix-cell-count", "3",
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+        ]
+        XCTAssertThrowsError(try parseBenchPlan(Flags(settings))) {
+            XCTAssertEqual($0 as? BenchCLIError, .missingMatrixID)
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(
+            settings + ["--matrix-id", "fused-kv-qwen3-32b-v1"]
+        ))) {
+            XCTAssertEqual($0 as? BenchCLIError, .missingWorkloadNonce)
+        }
     }
 
     func testBenchPlanRequiresExplicitKnownAttentionRouteOnAffineBackedTiers() throws {
@@ -620,6 +711,147 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNil(payload.maxMLXPeakBytes)
         XCTAssertNil(payload.compressedKVAttention)
         XCTAssertNil(payload.promptRepeat)
+    }
+
+    func testTypedQualificationValidatorAcceptsACompleteDirectAdmission()
+        throws
+    {
+        let row = try qualificationValidationRow()
+
+        XCTAssertNoThrow(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+    }
+
+    func testTypedQualificationValidatorRejectsATruncatedDirectAdmission()
+        throws
+    {
+        var row = try qualificationValidationRow()
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        var binding = try XCTUnwrap(
+            payload["compressedKVAttention"] as? [String: Any])
+        var admission = try XCTUnwrap(
+            binding["admission"] as? [String: Any])
+        admission.removeValue(forKey: "family")
+        binding["admission"] = admission
+        payload["compressedKVAttention"] = binding
+        row["payload"] = payload
+
+        XCTAssertThrowsError(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+    }
+
+    func testTypedQualificationValidatorRejectsATruncatedKVTunerBinding()
+        throws
+    {
+        var row = try qualificationValidationRow(
+            kvQuantTier: "kvtuner-g128-b3.046875")
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        payload["cellID"] = "kvtuner-g128-b3.046875"
+        payload["kvtunerSchedule"] = [
+            "schemaVersion": 4,
+            "scheduleSchemaVersion": 4,
+            "artifactSHA256": String(repeating: "a", count: 64),
+            "qualificationBundleSHA256": String(
+                repeating: "b", count: 64),
+            "matrixID": "qualification-test-v1",
+            "cellID": "kvtuner-g128-b3.046875",
+        ]
+        row["payload"] = payload
+
+        XCTAssertThrowsError(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+    }
+
+    private func qualificationValidationRow(
+        kvQuantTier: String = "affine-k4v2-g64"
+    ) throws -> [String: Any] {
+        let config = Data(
+            #"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":256,"num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false}"#.utf8)
+        let admission = try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: config,
+                checkpointManifestHash: String(repeating: "2", count: 16),
+                checkpointContentSHA256: String(
+                    repeating: "d", count: 64),
+                tokenizerSHA256: String(repeating: "4", count: 64)))
+        let binding = try CompressedKVAttentionRuntimeBinding(
+            request: .splitAffineQuantizedMM,
+            observedOperation: .splitQuantizedMM,
+            admission: admission)
+        let qualification = try BenchQualificationEvidence(
+            context: BenchQualificationContext(
+                runnerManifestSHA256: runnerManifestSHA256,
+                matrixBlockIndex: 0,
+                matrixRunPosition: 0,
+                matrixCellCount: 2,
+                memoryLimitBytes: 9_000,
+                cacheLimitBytes: 8_000,
+                wiredLimitBytes: 10_000,
+                cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+                modelResidencyPolicy: .loadOncePerProcess,
+                processIsolationPolicy: .freshProcessPerMatrixPosition),
+            runs: [
+                try BenchQualificationRunEnvironment(
+                    before: BenchQualificationHostSnapshot(
+                        monotonicTimestampSeconds: 10,
+                        residentSizeBytes: 20_000,
+                        physicalFootprintBytes: 18_000,
+                        lowPowerModeEnabled: false,
+                        powerSource: .acPower,
+                        thermalState: .nominal),
+                    after: BenchQualificationHostSnapshot(
+                        monotonicTimestampSeconds: 11,
+                        residentSizeBytes: 21_000,
+                        physicalFootprintBytes: 19_000,
+                        lowPowerModeEnabled: false,
+                        powerSource: .acPower,
+                        thermalState: .nominal)),
+            ])
+        let encoder = JSONEncoder()
+        let bindingObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(binding))
+                as? [String: Any])
+        let qualificationObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: encoder.encode(qualification)) as? [String: Any])
+        return [
+            "subcommand": "bench",
+            "provenance": [
+                "date": "2026-07-20T00:00:00Z",
+                "hardwareChip": "test",
+                "hardwareRAMBytes": 100_000,
+                "hardwareOS": "test",
+                "harnessGitSHA": String(repeating: "a", count: 40),
+                "mlxSwiftVersion": "test",
+                "referenceMLXVersion": NSNull(),
+                "referenceMLXLMVersion": NSNull(),
+                "modelPath": "/models/test",
+                "modelConfigHash": admission.modelConfigHash,
+                "modelCheckpointManifestHash":
+                    admission.checkpointManifestHash,
+                "modelQuant": ["bits": 4, "groupSize": 64],
+                "corpusId": NSNull(),
+                "corpusContentHash": NSNull(),
+                "nonce": "qualification-test-v1",
+            ],
+            "payload": [
+                "label": "direct",
+                "workload": "decode",
+                "mode": "none",
+                "decodeTokS": 10.0,
+                "ttftMs": 1_000.0,
+                "quant": "int4",
+                "kvQuantTier": kvQuantTier,
+                "concurrency": 1,
+                "matrixID": "qualification-test-v1",
+                "cellID": kvQuantTier,
+                "compressedKVAttention": bindingObject,
+                "qualification": qualificationObject,
+            ],
+        ]
     }
 
     func testBenchCSVReadFailureIsNotTreatedAsAnEmptyFile() throws {

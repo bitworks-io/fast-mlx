@@ -1206,7 +1206,10 @@ func loadSwiftDriver(
     kvtunerSelection: KVTunerRuntimeSelection? = nil,
     compressedKVAttention: CompressedKVAttentionRequest? = nil,
     compressedKVAttentionExpectedCheckpointContentSHA256:
-        String? = nil
+        String? = nil,
+    memoryLimitBytes: Int? = nil,
+    memoryCacheLimitBytes: Int =
+        KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes
 ) async throws -> (
     driver: SwiftEngineDriver,
     tokenizer: MLXLMCommon.Tokenizer,
@@ -1218,8 +1221,10 @@ func loadSwiftDriver(
     // same box. 8GB is far above any measurement path's steady-state reuse working set (decode
     // transients are MBs; a scoring chunk's logits are ~150MB) but keeps two co-resident
     // processes comfortably inside physical RAM. harness_reference.py sets the same bound.
-    Memory.cacheLimit =
-        KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes
+    if let memoryLimitBytes {
+        Memory.memoryLimit = memoryLimitBytes
+    }
+    Memory.cacheLimit = memoryCacheLimitBytes
     let sourceIdentityBeforeLoad = requireKVTunerQualificationIdentity
         ? try captureKVTunerQualificationRuntimeSourceSnapshot(
             modelPath: modelPath)
