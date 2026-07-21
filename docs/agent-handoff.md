@@ -75,22 +75,40 @@ nominal/AC/non-low-power observation window, while evidence v3 remains readable 
 instantaneous-admission compatibility and v2 remains legacy-readable only. It passes 519
 HarnessCore XCTest plus 17 Swift Testing tests off-box, 95/95 FastMLXHarnessTests and 155/155
 SpikeCoreTests through Xcode on llmbench, Release build, two final no-issue reviews, ShellCheck,
-and staged gitleaks. The next Qwen boundary is a fresh clean-SHA preflight/smoke with a frozen
-60-second continuous nominal dwell. No loaded 49-row matrix is active, and a replacement may
-launch only after that preflight authenticates.
+and staged gitleaks. Its first loaded-Qwen boundary froze a 60-second continuous nominal dwell.
+
+That v11 preflight is now terminal `FAILED` after 2/9 authenticated rows and no completed block.
+The fp16 and KVarN-materialize rows each proved a 60-second nominal dwell plus exact retained
+nominal/nominal equality. Block 0, position 2, `kvarn-k4v2-g128-direct` then reacquired nominal for
+60 seconds after a fair warmup but changed nominal -> fair during its roughly 144-second retained
+measurement. The non-promotable failure receipt SHA-256 is
+`02893f30229f79861f95e8d037536ae6d0bca7855539bbc88ab2f82dd788293b`; partial receipt-list and
+block-receipt SHA-256 values are
+`ae9dcb7e0ef082aff6cd6509c13a9e41f85fe8937d0a203867d762559c259a56` and
+`2780c3a9b4880236082feb3dcca26613f69220c854d68dc0db39f67ea0e7ac90`. The complete runner log
+SHA-256 is `02ade4793feafc228a22c5a99afc8fe8ce4ab14252abaece25805dc8eb0bc291`.
+Preserve v11 unchanged; its two rows and failed-row timings are diagnostic only.
+
+No replacement matrix is active. The next safe gate is a bounded loaded-path profile of direct
+KVarN, whose failed-row diagnostic was also dominated by fp16 in both prefill and decode. Keep the
+thermal contract unchanged, optimize only from a measured bottleneck, and rerun a fresh preflight
+only from a new clean SHA with a credible path to staying nominal. If no such path exists, SHELVE
+the KVarN speed disposition while retaining its already-qualified capacity-only role; any smaller
+remaining-cell promotion matrix requires an explicit reviewed plan amendment first.
 
 **Content practice:** `docs/content/` now has 11 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Run only the fresh
-   clean-`d4102e6` 60-second continuous-nominal preflight/smoke. Never resume or overwrite v7-v10.
-   If and only if the preflight independently
-   authenticates its exact source/binary/runner/model/tokenizer/checkpoint/policy and retained
-   environment bindings, launch a fresh-output 7-cell x 7-block Qwen 8K matrix. A direct path must
-   beat both same-storage materialize and fp16 decode by at least 5%, with prefill regression within
-   5%; preserve dominated and failed cells. Then run Qwen 32K, record the authenticated 128K refusal
+1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v11; never
+   resume, overwrite, or promote their partial evidence. V11 proves the 60-second admission
+   implementation but fails the retained KVarN-direct cohort, so do not launch another thermal
+   retry or the 49-row matrix. Profile the loaded direct KVarN hot path, then either implement one
+   measured performance recovery behind the existing experimental route or SHELVE its speed role
+   and retain KVarN as capacity-only. Any later direct path must beat both same-storage materialize
+   and fp16 decode by at least 5%, with prefill regression within 5%; preserve dominated and failed
+   cells. Then run Qwen 32K, record the authenticated 128K refusal
    (maximum context 40,960), and qualify source-locked Llama-3.3-70B at 8K/32K/near-128K without the
    Qwen-specific KVTuner schedule unless independently calibrated. Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support

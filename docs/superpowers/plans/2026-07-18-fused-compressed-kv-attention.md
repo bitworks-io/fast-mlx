@@ -442,9 +442,29 @@ ShellCheck, diff checks, and staged gitleaks. The clean binary SHA-256 is
 `cfe029ad2138013a5904e6afd2475a881081a37bcf89db25bfbb91abf8484397`; runner SHA-256 is
 `e2f6e55bb0aeae6b1ec585f6d0d3c85b13c00879e13ed2a0fa3826ee074f8c0f`.
 
-There is no active replacement matrix. First run a fresh clean-SHA 60-second-dwell
-preflight/smoke. Only an independently authenticated preflight can authorize a new fresh-output
-49-row matrix; the original direct decode and prefill gates remain unchanged.
+V11 is the fifth immutable failed loaded-Qwen boundary. Its clean-`d4102e6` 3-cell x 3-block
+preflight stopped after 2/9 authenticated rows and before any block completion. FP16 and KVarN
+materialize each satisfied the 60-second continuous admission and exact nominal/nominal retained
+equality. Block 0, position 2, direct KVarN reacquired nominal for 60 seconds after a fair warmup,
+then changed nominal -> fair during its roughly 144-second retained measurement. Failure-receipt
+SHA-256 is `02893f30229f79861f95e8d037536ae6d0bca7855539bbc88ab2f82dd788293b`;
+partial receipt-list SHA-256 is
+`ae9dcb7e0ef082aff6cd6509c13a9e41f85fe8937d0a203867d762559c259a56`; partial block-receipt
+SHA-256 is `2780c3a9b4880236082feb3dcca26613f69220c854d68dc0db39f67ea0e7ac90`; and runner-log SHA-256 is
+`02ade4793feafc228a22c5a99afc8fe8ce4ab14252abaece25805dc8eb0bc291`. The failure receipt is
+`promotable:false`, carries no evidence hash, and is absent from both partial promotable receipt
+artifacts. Preserve v11 unchanged.
+
+The recovery gate now moves from thermal admission to loaded direct-path performance diagnosis.
+V11 proves that another unchanged dwell or workload-only preheat cannot establish retained nominal
+equality for this heat-generating candidate. The diagnostic also reported direct KVarN at roughly
+63.26 prefill tok/s and 7.18 decode tok/s versus fp16 at
+533.73 and 23.48. Those partial numbers cannot support a public or promotion claim, but they close
+unchanged thermal retries as an engineering strategy. Profile the actual loaded direct KVarN path;
+implement one measured recovery only if it retains a credible route to the unchanged 5% decode and
+prefill gates. Otherwise SHELVE KVarN's speed role and retain its capacity-only disposition. Do not
+launch another preflight or a reduced/full promotion matrix until that decision and any matrix
+scope amendment receive focused review.
 
 ### Phase 4 — end-to-end Qwen frontier
 
