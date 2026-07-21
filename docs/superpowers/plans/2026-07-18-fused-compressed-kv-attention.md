@@ -278,19 +278,42 @@ model name. Unsupported/windowed/sink/non-finite paths fail closed.
 
 - [x] Integrate affine K4V2-g64 and frozen KVTuner first, because their packed affine data maps
   most directly to quantized matrix multiplies.
-- [ ] Add KVarN i8 only after its query/key transform and value/output reconstruction are proven
+- [x] Add KVarN i8 only after its query/key transform and value/output reconstruction are proven
   from the same packed bytes without materialization.
 - [x] Preserve exact engagement, persistent bytes, workspace, reset, growth, and rollback receipts
-  for the implemented affine/KVTuner formats. KVarN receipts remain part of its open item above.
+  for the implemented affine/KVTuner/KVarN formats.
 
 Clean implementation commit: `e2d719e` (`Add authenticated compressed KV attention runtime`).
 This is an implementation/correctness milestone, not a loaded-model speed result.
 
-Clean pure-contract commit `3bb0a2a43fba9690dfaab86cb302a746c9556ef9` adds a distinct
+Clean pure-contract commit `3bb0a2a43fba9690dfaab86cb302a746c9556ef9` added the distinct
 `split-kvarn-quantized-mm` request/receipt and fail-closed frontier/task-promotion rules for the
-exact K4V2/G128/i8 cell. It does not implement or prove the MLX route. The first packed K/V qMM
-and CLI tests remain pending Xcode red/green execution on a bench Mac; no direct-KVarN engagement
-or promotion row is valid yet.
+exact K4V2/G128/i8 cell. The subsequent direct runtime increment implements packed K/V qMM,
+normalized-Hadamard V reconstruction, compiled tile lifecycle, bounded prefill, and authenticated
+CLI/task evidence without materializing the full cache.
+
+The compile-lifecycle review further freezes these direct-KVarN implementation constraints before
+production work:
+
+- the packed V product must apply KVarN's final normalized Hadamard reconstruction after the
+  quantized matrix multiply and channel scale; a finite rotated-channel result is incorrect;
+- completed packed slots and the live fp16 tail need distinct source-liveness masks, driven by an
+  in-graph packed-tile count included in `innerState()`, so unused slots cannot enter softmax or
+  duplicate the live tail;
+- checked geometry, mask, dtype, and finiteness preflight must finish before any cache mutation;
+- tile finalization at compiled replay boundaries must encode the boundary token before that
+  step's attention reads the completed packed slot, clear the live tail for the next replay, and
+  update stable MLX array identities in place; host `offset` is not authoritative compiled state;
+- direct KVarN prefill uses the same bounded chunking discipline as the affine split route to cap
+  the explicit score tensor.
+
+The bench red/green suite covers negative-score inactive-slot leakage, direct packed-byte algebra,
+pre-mutation failure, compiled tile-boundary identity/order, reset/reuse, KVarN prefill bounds,
+full packed-capacity boundaries, hostile masks, scoring-cache capacity, and reset-time rejection.
+Dirty-tree implementation proof on 2026-07-20 passed 72 FastMLXHarness tests, 146 SpikeCore tests,
+the complete HarnessCore suite, and the Release build; focused review found no remaining issue.
+This is implementation proof only. Promotion remains blocked on repetition from the resulting clean
+SHA and the loaded-model frontier in Phases 4 and 5.
 
 ### Phase 3 — continuous-batch poison case
 
@@ -314,10 +337,15 @@ search, schedule, runtime, task, and KL evidence.
 - [x] Capture the clean-SHA g128 sensitivity artifact. Artifact SHA-256:
   `9426976a9215ce5276ac80ea165de3b084b239652ce138e670163bcbdf41d7fc`; 64 layers and 3,840
   authenticated samples under artifact ID `fused-compressed-kv-qwen3-32b-v1-5e6abb6`.
-- [ ] Evaluate the exact canonical 64-candidate set at target pair-bits 390 through the resumable,
-  exact-byte/idempotent runner path. This is the current long-running stage.
-- [ ] Authenticate search and schedule, then freeze a new qualification bundle before any KVTuner
+- [x] Evaluate the exact canonical 64-candidate set at target pair-bits 390 through the resumable,
+  exact-byte/idempotent runner path.
+- [x] Authenticate search and schedule, then freeze a new qualification bundle before any KVTuner
   runtime, task, KL, or end-to-end row.
+
+The completed clean-`5e6abb6` cohort contains all 64 exact candidates and 12,800 authenticated rows.
+The frozen schedule SHA-256 is
+`d76d2534939677711cf27123eea0cf15ad3512bd5fd04965abe85e36232f9260`; the qualification bundle
+SHA-256 is `8217bc37cd3d100c493fb6f76b15d7abe5c168baa2bc2fb6561ac9f12c9dc125`.
 
 #### Candidate-run recovery — 2026-07-19
 
