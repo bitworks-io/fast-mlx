@@ -179,6 +179,128 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
+    func testCapacityOnlyBenchPlanRequiresExplicitIdentityAndMemoryWithoutThermalQualification()
+        throws
+    {
+        let plan = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "kvarn-k4v2-g128",
+            "--cell-id", "kvarn-k4v2-g128",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "qwen3-32b-32k-capacity-v1",
+            "--runs", "1",
+            "--capacity-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--capacity-expected-prompt-tokens", "32628",
+            "--kv-attention", "split-kvarn-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))
+
+        XCTAssertNil(plan.qualificationContext)
+        XCTAssertEqual(
+            plan.capacityContext,
+            try BenchCapacityEvidenceContext(
+                evidenceManifestSHA256: runnerManifestSHA256,
+                memoryLimitBytes: 9_000,
+                cacheLimitBytes: 8_000,
+                wiredLimitBytes: 10_000,
+                expectedPromptTokens: 32_628,
+                tokenizerSHA256: modelTokenizerSHA256,
+                cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+                modelResidencyPolicy: .loadOncePerProcess,
+                processIsolationPolicy: .freshProcessPerMatrixPosition))
+        XCTAssertEqual(plan.workload.iterations, 2)
+        XCTAssertNil(plan.csvPath)
+    }
+
+    func testCapacityOnlyBenchCannotMixQualificationOrMultipleRetainedRuns() {
+        let base = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "qwen3-32b-32k-capacity-v1",
+            "--capacity-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--capacity-expected-prompt-tokens", "32628",
+        ]
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(
+            base + ["--runs", "2"]
+        ))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidCapacityRuns(2))
+        }
+        XCTAssertThrowsError(try parseBenchPlan(Flags(
+            base + [
+                "--runs", "1",
+                "--qualification-evidence", "true",
+                "--matrix-block-index", "0",
+                "--matrix-run-position", "0",
+                "--matrix-cell-count", "1",
+                "--post-warmup-thermal-target", "nominal",
+                "--post-warmup-thermal-timeout-seconds", "600",
+                "--post-warmup-thermal-poll-milliseconds", "1000",
+                "--post-warmup-thermal-stability-seconds", "60",
+            ]
+        ))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .conflictingEvidenceModes)
+        }
+    }
+
+    func testCapacityOnlyBenchRequiresDirectKVarNAndRejectsSpeedCSV() {
+        let base = [
+            "--model", "/models/Qwen3-32B-4bit",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "qwen3-32b-32k-capacity-v1",
+            "--runs", "1",
+            "--capacity-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--capacity-expected-prompt-tokens", "32628",
+        ]
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .capacityEvidenceRequiresKVarNDirect)
+        }
+
+        let kvarn = base + [
+            "--kv-quant", "kvarn-k4v2-g128",
+            "--kv-attention", "materialize",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]
+        XCTAssertThrowsError(try parseBenchPlan(Flags(kvarn))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .capacityEvidenceRequiresKVarNDirect)
+        }
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--kv-quant", "kvarn-k4v2-g128",
+            "--kv-attention", "split-kvarn-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+            "--csv", "/tmp/capacity-speed.csv",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .capacityEvidenceCannotWriteCSV)
+        }
+    }
+
     func testPostWarmupThermalWaitAdmitsNominalAfterARecordedFairWarmup()
         async throws
     {
@@ -1026,6 +1148,7 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNil(payload.maxMLXPeakBytes)
         XCTAssertNil(payload.compressedKVAttention)
         XCTAssertNil(payload.promptRepeat)
+        XCTAssertNil(payload.capacity)
     }
 
     func testTypedQualificationValidatorAcceptsACompleteDirectAdmission()
@@ -1036,6 +1159,74 @@ final class BenchCLITests: XCTestCase {
         XCTAssertNoThrow(
             try validateBenchQualificationEvidenceData(
                 JSONSerialization.data(withJSONObject: row)))
+    }
+
+    func testTypedCapacityValidatorAcceptsACompleteNonPromotableKVarNRow()
+        throws
+    {
+        let row = try capacityValidationRow()
+
+        XCTAssertNoThrow(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+        XCTAssertThrowsError(
+            try validateBenchQualificationEvidenceData(
+                JSONSerialization.data(withJSONObject: row))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .wrongSubcommand("bench-capacity"))
+        }
+    }
+
+    func testTypedCapacityValidatorRejectsForgedMemoryAggregateAndWorkloadIdentity()
+        throws
+    {
+        var forgedMemory = try capacityValidationRow()
+        var payload = try XCTUnwrap(
+            forgedMemory["payload"] as? [String: Any])
+        payload["maxMLXPeakBytes"] = 99_999
+        forgedMemory["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedMemory)))
+
+        var forgedWorkload = try capacityValidationRow()
+        payload = try XCTUnwrap(
+            forgedWorkload["payload"] as? [String: Any])
+        payload["workloadNonce"] = "contains spaces"
+        forgedWorkload["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedWorkload)))
+
+        var shortPrompt = try capacityValidationRow()
+        payload = try XCTUnwrap(
+            shortPrompt["payload"] as? [String: Any])
+        payload["promptTokenCountsByRun"] = [1_024]
+        payload["promptTokensMin"] = 1_024
+        payload["promptTokensMax"] = 1_024
+        payload["prefillDurationSecondsByRun"] = [10.0]
+        payload["prefillTokSByRun"] = [102.4]
+        shortPrompt["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: shortPrompt)))
+
+        var forgedRuntime = try capacityValidationRow()
+        payload = try XCTUnwrap(
+            forgedRuntime["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement["kvarn_tokens"] = 256
+        payload["engagementMax"] = engagement
+        forgedRuntime["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedRuntime))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .capacityRuntimeTelemetryMismatch)
+        }
     }
 
     func testTypedQualificationValidatorRejectsSchema3WithoutWarmupEvidence()
@@ -1365,6 +1556,92 @@ final class BenchCLITests: XCTestCase {
             ],
             "payload": payload,
         ]
+    }
+
+    private func capacityValidationRow() throws -> [String: Any] {
+        var row = try qualificationValidationRow(
+            kvQuantTier: "kvarn-k4v2-g128")
+        var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+        payload.removeValue(forKey: "qualification")
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement["kvarn_tokens"] = 32_756
+        engagement["kvarn_completed_tiles"] = 254
+        engagement["kvarn_compressed_tokens"] = 32_512
+        engagement["kvarn_capacity_tokens"] = 32_768
+        payload["engagementMax"] = engagement
+
+        let capacity = try BenchCapacityEvidence(
+            context: BenchCapacityEvidenceContext(
+                evidenceManifestSHA256: runnerManifestSHA256,
+                memoryLimitBytes: 9_000,
+                cacheLimitBytes: 8_000,
+                wiredLimitBytes: 10_000,
+                expectedPromptTokens: 32_628,
+                tokenizerSHA256: String(repeating: "4", count: 64),
+                cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+                modelResidencyPolicy: .loadOncePerProcess,
+                processIsolationPolicy: .freshProcessPerMatrixPosition),
+            warmup: BenchCapacityRunEnvironment(
+                before: qualificationHostSnapshot(timestamp: 8),
+                after: qualificationHostSnapshot(
+                    timestamp: 9, thermalState: .fair)),
+            runs: [
+                try BenchCapacityRunEnvironment(
+                    before: qualificationHostSnapshot(timestamp: 10),
+                    after: qualificationHostSnapshot(
+                        timestamp: 11, thermalState: .fair)),
+            ])
+        let memory = try BenchRunMemoryEvidence(samples: [
+            ServiceMemorySample(
+                timestamp: 10,
+                physicalFootprintBytes: 20_000,
+                mlxActiveBytes: 12_000,
+                mlxCacheBytes: 1_000,
+                mlxPeakBytes: 0),
+            ServiceMemorySample(
+                timestamp: 11,
+                physicalFootprintBytes: 24_000,
+                mlxActiveBytes: 14_000,
+                mlxCacheBytes: 2_000,
+                mlxPeakBytes: 18_000),
+        ])
+        let encoder = JSONEncoder()
+        payload["capacity"] = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(capacity))
+                as? [String: Any])
+        payload["workloadNonce"] = "qwen3-32b-32k-capacity-v1"
+        payload["workloadPromptSHA256"] = [
+            String(repeating: "5", count: 64),
+            String(repeating: "6", count: 64),
+        ]
+        payload["promptRepeat"] = 816
+        payload["prefillTokS"] = 3_262.8
+        payload["prefillMs"] = 10_000.0
+        payload["promptTokensMin"] = 32_628
+        payload["promptTokensMax"] = 32_628
+        payload["prefillTimingSource"] = "actor-decoder-prefill-wall-v1"
+        payload["maxTokens"] = 128
+        payload["measuredRuns"] = 1
+        payload["promptTokenCountsByRun"] = [32_628]
+        payload["prefillDurationSecondsByRun"] = [10.0]
+        payload["prefillTokSByRun"] = [3_262.8]
+        payload["decodeTokSByRun"] = [7.0]
+        payload["ttftMsByRun"] = [1_000.0]
+        payload["generatedTokenCountsByRun"] = [128]
+        payload["memoryCacheLimitBytes"] = 8_000
+        payload["memoryRuns"] = [
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoder.encode(memory))
+                    as? [String: Any]),
+        ]
+        payload["maxSampledPhysicalFootprintBytes"] = 24_000
+        payload["maxMLXActiveBytes"] = 14_000
+        payload["maxMLXCacheBytes"] = 2_000
+        payload["maxMLXPeakBytes"] = 18_000
+        row["subcommand"] = "bench-capacity"
+        row["payload"] = payload
+        return row
     }
 
     func testBenchCSVReadFailureIsNotTreatedAsAnEmptyFile() throws {

@@ -207,6 +207,9 @@ struct BenchPayload: Codable, Sendable {
     /// Qualification-only counterbalance, fixed-memory, power/thermal, and process receipts.
     /// Optional keeps historical and exploratory `bench` rows decodable.
     let qualification: BenchQualificationEvidence?
+    /// Loaded capacity-only receipts. These are explicitly non-promotable and tolerate only
+    /// safe nominal/fair thermal drift; qualification reducers reject rows carrying this lane.
+    let capacity: BenchCapacityEvidence?
 }
 
 func runBenchQualificationEvidenceValidation(_ flags: Flags) {
@@ -220,6 +223,21 @@ func runBenchQualificationEvidenceValidation(_ flags: Flags) {
         print("bench qualification evidence: VALID")
     } catch {
         print("bench qualification evidence INVALID: \(error)")
+        exit(2)
+    }
+}
+
+func runBenchCapacityEvidenceValidation(_ flags: Flags) {
+    do {
+        let path = try flags.strictString("evidence", default: "")
+        guard !path.isEmpty else {
+            throw FlagValueError.missingValue(key: "evidence")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        try validateBenchCapacityEvidenceData(data)
+        print("bench capacity evidence: VALID")
+    } catch {
+        print("bench capacity evidence INVALID: \(error)")
         exit(2)
     }
 }
@@ -658,16 +676,22 @@ func runBench(_ flags: Flags) async {
         // misspelled/missing flag cannot be reported as an unrelated environment failure.
         let plan = try parseBenchPlan(flags)
         try assertReleaseBuild()
-        let qualificationModelIdentity = try plan.qualificationContext.map {
-            _ in try benchQualificationModelIdentity(
-                modelPath: plan.modelPath)
-        }
+        let evidenceModelIdentity = try (
+            plan.qualificationContext != nil
+                || plan.capacityContext != nil
+        ) ? benchQualificationModelIdentity(modelPath: plan.modelPath) : nil
         if let qualificationContext = plan.qualificationContext,
-            let qualificationModelIdentity
+            let evidenceModelIdentity
         {
             try validateBenchQualificationModelIdentity(
-                qualificationModelIdentity, context: qualificationContext)
+                evidenceModelIdentity, context: qualificationContext)
             try configureBenchQualificationMemory(qualificationContext)
+        } else if let capacityContext = plan.capacityContext,
+            let evidenceModelIdentity
+        {
+            try validateBenchCapacityModelIdentity(
+                evidenceModelIdentity, context: capacityContext)
+            try configureBenchCapacityMemory(capacityContext)
         }
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(plan.kvQuantTier ?? "fp16") {
@@ -705,10 +729,19 @@ func runBench(_ flags: Flags) async {
                 compressedKVAttentionAdmission: admission)
             let preflightTokenizer = try await #huggingFaceTokenizerLoader()
                 .load(from: URL(fileURLWithPath: plan.modelPath))
+            let preflightPromptTokenCounts = plan.workload.prompts.map {
+                preflightTokenizer.encode(text: $0).count
+            }
+            if let capacityContext = plan.capacityContext {
+                guard Array(preflightPromptTokenCounts.dropFirst())
+                    == [capacityContext.expectedPromptTokens]
+                else {
+                    throw BenchQualificationEvidenceValidationError
+                        .invalidCapacityWorkloadEvidence
+                }
+            }
             try validateBenchContextWindow(
-                promptTokenCounts: plan.workload.prompts.map {
-                    preflightTokenizer.encode(text: $0).count
-                },
+                promptTokenCounts: preflightPromptTokenCounts,
                 maxTokens: plan.maxTokens,
                 maxPositionEmbeddings:
                     admission.maxPositionEmbeddings)
@@ -722,13 +755,17 @@ func runBench(_ flags: Flags) async {
                 plan
                     .compressedKVAttentionExpectedCheckpointContentSHA256,
             memoryLimitBytes:
-                plan.qualificationContext?.memoryLimitBytes,
+                plan.qualificationContext?.memoryLimitBytes
+                    ?? plan.capacityContext?.memoryLimitBytes,
             memoryCacheLimitBytes:
                 plan.qualificationContext?.cacheLimitBytes
+                ?? plan.capacityContext?.cacheLimitBytes
                 ?? KVTunerSensitivityCaptureEnvironment
                     .requiredMemoryCacheLimitBytes)
         if let qualificationContext = plan.qualificationContext {
             try configureBenchQualificationMemory(qualificationContext)
+        } else if let capacityContext = plan.capacityContext {
+            try configureBenchCapacityMemory(capacityContext)
         }
 
         let modelName = URL(fileURLWithPath: plan.modelPath).lastPathComponent
@@ -747,8 +784,10 @@ func runBench(_ flags: Flags) async {
         var generatedTokenCounts: [Int] = []
         var memoryRuns: [BenchRunMemoryEvidence] = []
         var qualificationRuns: [BenchQualificationRunEnvironment] = []
+        var capacityRuns: [BenchCapacityRunEnvironment] = []
         var qualificationWarmup:
             BenchQualificationWarmupEnvironment?
+        var capacityWarmup: BenchCapacityRunEnvironment?
         var qualificationThermalAdmission:
             BenchQualificationThermalAdmission?
         var engagementMax: [String: Int] = [:]
@@ -769,9 +808,11 @@ func runBench(_ flags: Flags) async {
             // sampled on both sides of this exact batch-1 generation.
             Memory.peakMemory = 0
             let memoryStart = serviceMemorySample()
-            let qualificationBefore = try plan.qualificationContext.map {
-                _ in try benchQualificationHostSnapshot()
-            }
+            let capturesEvidenceEnvironment =
+                plan.qualificationContext != nil
+                    || plan.capacityContext != nil
+            let qualificationBefore = try capturesEvidenceEnvironment
+                ? benchQualificationHostSnapshot() : nil
             let result = try await driver.generate(
                 prompt: promptTokens,
                 config: RunConfig(
@@ -788,9 +829,8 @@ func runBench(_ flags: Flags) async {
                     compressedKVAttentionExpectedCheckpointContentSHA256:
                         plan
                             .compressedKVAttentionExpectedCheckpointContentSHA256))
-            let qualificationAfter = try plan.qualificationContext.map {
-                _ in try benchQualificationHostSnapshot()
-            }
+            let qualificationAfter = try capturesEvidenceEnvironment
+                ? benchQualificationHostSnapshot() : nil
             let memoryEnd = serviceMemorySample()
             let memoryEvidence = try BenchRunMemoryEvidence(
                 samples: [memoryStart, memoryEnd])
@@ -848,41 +888,51 @@ func runBench(_ flags: Flags) async {
                     + "ttft=\(fmt(metrics.ttftSeconds))s, "
                     + "decode_tok_s=\(fmt(decodeRate, 2))\(specNote)")
             if i == 0, let qualificationBefore,
-                let qualificationAfter,
-                let qualificationContext = plan.qualificationContext
+                let qualificationAfter
             {
-                guard let thermalPolicy =
-                    qualificationContext.postWarmupThermalPolicy
-                else {
-                    throw BenchQualificationEvidenceError
-                        .invalidThermalTargetContract
-                }
-                qualificationWarmup = try
-                    BenchQualificationWarmupEnvironment(
+                if let qualificationContext = plan.qualificationContext {
+                    guard let thermalPolicy =
+                        qualificationContext.postWarmupThermalPolicy
+                    else {
+                        throw BenchQualificationEvidenceError
+                            .invalidThermalTargetContract
+                    }
+                    qualificationWarmup = try
+                        BenchQualificationWarmupEnvironment(
+                            before: qualificationBefore,
+                            after: qualificationAfter)
+                    let thermalAdmission = try await
+                        waitForBenchQualificationThermalAdmission(
+                            policy: thermalPolicy,
+                            initialSnapshot: qualificationAfter)
+                    qualificationThermalAdmission = thermalAdmission
+                    let admitted = thermalAdmission.snapshot
+                    print(
+                        "# warmup thermal admission: target="
+                            + "\(thermalPolicy.target.rawValue), "
+                            + "warmup_after="
+                            + "\(qualificationAfter.thermalState.rawValue), "
+                            + "admitted="
+                            + "\(admitted.thermalState.rawValue), "
+                            + "stability_seconds="
+                            + "\(thermalPolicy.stabilitySeconds), "
+                            + "stability_observations="
+                            + "\(thermalAdmission.stabilityObservations.count), "
+                            + "wait_seconds="
+                            + fmt(
+                                admitted.monotonicTimestampSeconds
+                                    - qualificationAfter
+                                        .monotonicTimestampSeconds))
+                } else if plan.capacityContext != nil {
+                    capacityWarmup = try BenchCapacityRunEnvironment(
                         before: qualificationBefore,
                         after: qualificationAfter)
-                let thermalAdmission = try await
-                    waitForBenchQualificationThermalAdmission(
-                        policy: thermalPolicy,
-                        initialSnapshot: qualificationAfter)
-                qualificationThermalAdmission = thermalAdmission
-                let admitted = thermalAdmission.snapshot
-                print(
-                    "# warmup thermal admission: target="
-                        + "\(thermalPolicy.target.rawValue), "
-                        + "warmup_after="
-                        + "\(qualificationAfter.thermalState.rawValue), "
-                        + "admitted="
-                        + "\(admitted.thermalState.rawValue), "
-                        + "stability_seconds="
-                        + "\(thermalPolicy.stabilitySeconds), "
-                        + "stability_observations="
-                        + "\(thermalAdmission.stabilityObservations.count), "
-                        + "wait_seconds="
-                        + fmt(
-                            admitted.monotonicTimestampSeconds
-                                - qualificationAfter
-                                    .monotonicTimestampSeconds))
+                    print(
+                        "# capacity warmup environment: before="
+                            + "\(qualificationBefore.thermalState.rawValue), "
+                            + "after="
+                            + "\(qualificationAfter.thermalState.rawValue)")
+                }
             } else if i > 0 {
                 ttfts.append(metrics.ttftSeconds)
                 prefillRates.append(prefillRate)
@@ -893,14 +943,26 @@ func runBench(_ flags: Flags) async {
                 generatedTokenCounts.append(metrics.generatedTokenCount)
                 memoryRuns.append(memoryEvidence)
                 if let qualificationBefore, let qualificationAfter {
-                    print(try
-                        benchQualificationRetainedEnvironmentDiagnosticLine(
-                            before: qualificationBefore,
-                            after: qualificationAfter))
-                    qualificationRuns.append(
-                        try BenchQualificationRunEnvironment(
-                            before: qualificationBefore,
-                            after: qualificationAfter))
+                    if plan.qualificationContext != nil {
+                        print(try
+                            benchQualificationRetainedEnvironmentDiagnosticLine(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                        qualificationRuns.append(
+                            try BenchQualificationRunEnvironment(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                    } else if plan.capacityContext != nil {
+                        capacityRuns.append(
+                            try BenchCapacityRunEnvironment(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                        print(
+                            "# capacity retained environment: before="
+                                + "\(qualificationBefore.thermalState.rawValue), "
+                                + "after="
+                                + "\(qualificationAfter.thermalState.rawValue)")
+                    }
                 }
                 for (key, value) in result.engagement.counts {
                     engagementMax[key] = max(engagementMax[key] ?? value, value)
@@ -921,7 +983,10 @@ func runBench(_ flags: Flags) async {
             memoryRuns.count == agg.runs,
             (plan.qualificationContext == nil
                 ? qualificationRuns.isEmpty
-                : qualificationRuns.count == agg.runs)
+                : qualificationRuns.count == agg.runs),
+            (plan.capacityContext == nil
+                ? capacityRuns.isEmpty
+                : capacityRuns.count == agg.runs)
         else {
             throw BenchCLIError.invalidPrefillTiming
         }
@@ -959,8 +1024,16 @@ func runBench(_ flags: Flags) async {
                 preparedKVTuner?.binding.artifactSHA256,
             kvtunerBundleSHA256:
                 preparedKVTuner?.binding.qualificationBundleSHA256)
-        print(BenchRow.csvHeader)
-        print(row.csvLine)
+        if plan.capacityContext == nil {
+            print(BenchRow.csvHeader)
+            print(row.csvLine)
+        } else {
+            print(
+                "# capacity-only diagnostic timing (non-promotable): "
+                    + "prefill_tok_s=\(fmt(row.prefillTokS ?? 0, 2)), "
+                    + "decode_tok_s=\(fmt(row.decodeTokS, 2)), "
+                    + "ttft_ms=\(fmt(row.ttftMs, 1))")
+        }
         print(
             "# memory: sampled_footprint_max="
                 + "\(memoryAggregate.maxSampledPhysicalFootprintBytes), "
@@ -968,15 +1041,15 @@ func runBench(_ flags: Flags) async {
                 + "mlx_cache_max=\(memoryAggregate.maxMLXCacheBytes), "
                 + "mlx_peak_max=\(memoryAggregate.maxMLXPeakBytes), "
                 + "cache_limit="
-                + "\(plan.qualificationContext?.cacheLimitBytes ?? KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
+                + "\(plan.qualificationContext?.cacheLimitBytes ?? plan.capacityContext?.cacheLimitBytes ?? KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
         if let csvPath = plan.csvPath {
             try appendBenchCSVRow(row, to: csvPath)
             print("# appended to \(csvPath)")
         }
 
-        if let qualificationModelIdentity {
+        if let evidenceModelIdentity {
             guard try benchQualificationModelIdentity(
-                modelPath: plan.modelPath) == qualificationModelIdentity
+                modelPath: plan.modelPath) == evidenceModelIdentity
             else {
                 throw BenchQualificationRuntimeError.modelIdentityChanged
             }
@@ -986,7 +1059,7 @@ func runBench(_ flags: Flags) async {
             referenceVersions: nil,
             corpus: nil,
             modelCheckpointManifestHash:
-                qualificationModelIdentity?.checkpointManifestHash)
+                evidenceModelIdentity?.checkpointManifestHash)
         let payload = BenchPayload(
             label: plan.label, workload: Workload.decode.rawValue, mode: mode.rawValue,
             decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
@@ -1027,6 +1100,7 @@ func runBench(_ flags: Flags) async {
             generatedTokenCountsByRun: generatedTokenCounts,
             memoryCacheLimitBytes:
                 plan.qualificationContext?.cacheLimitBytes
+                ?? plan.capacityContext?.cacheLimitBytes
                 ?? KVTunerSensitivityCaptureEnvironment
                     .requiredMemoryCacheLimitBytes,
             memoryRuns: memoryRuns,
@@ -1042,10 +1116,21 @@ func runBench(_ flags: Flags) async {
                     postWarmupThermalAdmission:
                         qualificationThermalAdmission,
                     runs: qualificationRuns)
+            },
+            capacity: try plan.capacityContext.map {
+                guard let capacityWarmup else {
+                    throw BenchQualificationEvidenceError
+                        .invalidCapacityEvidence
+                }
+                return try BenchCapacityEvidence(
+                    context: $0,
+                    warmup: capacityWarmup,
+                    runs: capacityRuns)
             })
         try appendRequiredJSONLRecord(
             ResultRecord(
-                subcommand: "bench",
+                subcommand: plan.capacityContext == nil
+                    ? "bench" : "bench-capacity",
                 provenance: provenance,
                 payload: payload),
             to: plan.evidencePath)
@@ -1775,6 +1860,8 @@ struct Harness {
         case "bench": await runBench(flags)
         case "validate-bench-qualification":
             runBenchQualificationEvidenceValidation(flags)
+        case "validate-bench-capacity":
+            runBenchCapacityEvidenceValidation(flags)
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
@@ -1836,10 +1923,17 @@ struct Harness {
                  --post-warmup-thermal-stability-seconds <N>
                                                record the dropped warmup and admit the retained
                                                row only after a sampled stable nominal/AC window
+                 [--capacity-evidence true]    mutually exclusive loaded KVarN capacity-only lane;
+                                               requires --runs 1, manifest/tokenizer identity and
+                 --capacity-expected-prompt-tokens <N>
+                                               exact retained prompt count plus explicit
+                                               MLX/cache/wired limits; nominal/fair only,
+                                               always non-promotable and excluded from speed gates
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
           validate-bench-qualification --evidence <JSONL>
+          validate-bench-capacity --evidence <JSONL>
                                                typed fail-closed validation for one runner row
           service-bench --model <PATH>        aggregate service frontier (Release builds only)
                  --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy

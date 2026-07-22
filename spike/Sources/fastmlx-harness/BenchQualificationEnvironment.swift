@@ -108,21 +108,50 @@ func validateBenchQualificationModelIdentity(
     }
 }
 
+func validateBenchCapacityModelIdentity(
+    _ identity: BenchQualificationModelIdentity,
+    context: BenchCapacityEvidenceContext
+) throws {
+    guard identity.tokenizerSHA256 == context.tokenizerSHA256 else {
+        throw BenchQualificationRuntimeError.modelIdentityChanged
+    }
+}
+
 /// Apply and read back the fixed MLX limits before tokenizer/model allocation. The wired limit is
 /// independently read from the kernel rather than trusting the runner's command-line value.
 func configureBenchQualificationMemory(
     _ context: BenchQualificationContext
 ) throws {
+    try configureBenchEvidenceMemory(
+        memoryLimitBytes: context.memoryLimitBytes,
+        cacheLimitBytes: context.cacheLimitBytes,
+        wiredLimitBytes: context.wiredLimitBytes)
+}
+
+func configureBenchCapacityMemory(
+    _ context: BenchCapacityEvidenceContext
+) throws {
+    try configureBenchEvidenceMemory(
+        memoryLimitBytes: context.memoryLimitBytes,
+        cacheLimitBytes: context.cacheLimitBytes,
+        wiredLimitBytes: context.wiredLimitBytes)
+}
+
+private func configureBenchEvidenceMemory(
+    memoryLimitBytes: Int,
+    cacheLimitBytes: Int,
+    wiredLimitBytes: Int
+) throws {
     let actualWiredLimit = try benchQualificationWiredLimitBytes()
-    guard actualWiredLimit == context.wiredLimitBytes else {
+    guard actualWiredLimit == wiredLimitBytes else {
         throw BenchQualificationRuntimeError.wiredLimitMismatch(
-            expected: context.wiredLimitBytes,
+            expected: wiredLimitBytes,
             actual: actualWiredLimit)
     }
-    Memory.memoryLimit = context.memoryLimitBytes
-    Memory.cacheLimit = context.cacheLimitBytes
-    guard Memory.memoryLimit == context.memoryLimitBytes,
-        Memory.cacheLimit == context.cacheLimitBytes
+    Memory.memoryLimit = memoryLimitBytes
+    Memory.cacheLimit = cacheLimitBytes
+    guard Memory.memoryLimit == memoryLimitBytes,
+        Memory.cacheLimit == cacheLimitBytes
     else {
         throw BenchQualificationRuntimeError.memorySettingsNotApplied
     }

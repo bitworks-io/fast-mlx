@@ -480,6 +480,64 @@ final class BenchQualificationEvidenceTests: XCTestCase {
     XCTAssertTrue(run.after.lowPowerModeEnabled)
   }
 
+  func testCapacityOnlyEvidenceRoundTripsNominalToFairWithoutBecomingPromotable()
+    throws
+  {
+    let warmup = try BenchCapacityRunEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 10),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .fair))
+    let retained = try BenchCapacityRunEnvironment(
+      before: hostSnapshot(monotonicTimestampSeconds: 12),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 13,
+        thermalState: .fair))
+    let evidence = try BenchCapacityEvidence(
+      context: capacityContext(),
+      warmup: warmup,
+      runs: [retained])
+
+    XCTAssertEqual(evidence.schemaVersion, 1)
+    XCTAssertEqual(evidence.purpose, .capacityOnly)
+    XCTAssertFalse(evidence.promotable)
+    XCTAssertEqual(evidence.warmup, warmup)
+    XCTAssertEqual(evidence.runs, [retained])
+    XCTAssertEqual(
+      try JSONDecoder().decode(
+        BenchCapacityEvidence.self,
+        from: JSONEncoder().encode(evidence)),
+      evidence)
+  }
+
+  func testCapacityOnlyEvidenceRejectsUnsafePowerThermalAndPartialRuns() throws {
+    XCTAssertThrowsError(try BenchCapacityRunEnvironment(
+      before: hostSnapshot(),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        powerSource: .battery)))
+    XCTAssertThrowsError(try BenchCapacityRunEnvironment(
+      before: hostSnapshot(),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        lowPowerModeEnabled: true)))
+    XCTAssertThrowsError(try BenchCapacityRunEnvironment(
+      before: hostSnapshot(),
+      after: hostSnapshot(
+        monotonicTimestampSeconds: 11,
+        thermalState: .serious)))
+    XCTAssertThrowsError(try BenchCapacityEvidence(
+      context: capacityContext(),
+      warmup: try BenchCapacityRunEnvironment(
+        before: hostSnapshot(),
+        after: hostSnapshot(monotonicTimestampSeconds: 11)),
+      runs: [])) {
+      XCTAssertEqual(
+        $0 as? BenchQualificationEvidenceError,
+        .invalidRunCount(0))
+    }
+  }
+
   private func qualificationContext(
     runnerManifestSHA256: String? = nil,
     matrixBlockIndex: Int = 2,
@@ -504,6 +562,19 @@ final class BenchQualificationEvidenceTests: XCTestCase {
       modelResidencyPolicy: .loadOncePerProcess,
       processIsolationPolicy: .freshProcessPerMatrixPosition,
       postWarmupThermalPolicy: postWarmupThermalPolicy)
+  }
+
+  private func capacityContext() throws -> BenchCapacityEvidenceContext {
+    try BenchCapacityEvidenceContext(
+      evidenceManifestSHA256: manifestSHA256,
+      memoryLimitBytes: 9_000,
+      cacheLimitBytes: 8_000,
+      wiredLimitBytes: 10_000,
+      expectedPromptTokens: 32_628,
+      tokenizerSHA256: String(repeating: "b", count: 64),
+      cacheResetPolicy: .inPlaceBeforeEveryGeneration,
+      modelResidencyPolicy: .loadOncePerProcess,
+      processIsolationPolicy: .freshProcessPerMatrixPosition)
   }
 
   private func environmentRun(

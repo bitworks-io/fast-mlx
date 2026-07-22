@@ -183,6 +183,7 @@ public enum BenchQualificationEvidenceError: Error, Sendable, Equatable {
     case invalidThermalTargetContract
     case invalidRunCount(Int)
     case invalidSchemaVersion(Int)
+    case invalidCapacityEvidence
 }
 
 public enum BenchQualificationCacheResetPolicy:
@@ -721,6 +722,194 @@ public struct BenchQualificationEvidence: Codable, Sendable, Equatable {
             throw BenchQualificationEvidenceError
                 .invalidSchemaVersion(schemaVersion)
         }
+    }
+}
+
+/// Capacity receipts are deliberately a separate evidence lane from speed qualification. They
+/// authenticate loaded cache/storage and process-memory behavior while permitting safe thermal
+/// drift between nominal and fair. The explicit non-promotable marker and distinct payload keep
+/// these rows out of qualification reducers.
+public enum BenchCapacityEvidencePurpose:
+    String, Codable, Sendable, Equatable
+{
+    case capacityOnly = "capacity-only"
+}
+
+public struct BenchCapacityEvidenceContext:
+    Codable, Sendable, Equatable
+{
+    public let evidenceManifestSHA256: String
+    public let memoryLimitBytes: Int
+    public let cacheLimitBytes: Int
+    public let wiredLimitBytes: Int
+    public let expectedPromptTokens: Int
+    public let tokenizerSHA256: String
+    public let cacheResetPolicy: BenchQualificationCacheResetPolicy
+    public let modelResidencyPolicy: BenchQualificationModelResidencyPolicy
+    public let processIsolationPolicy:
+        BenchQualificationProcessIsolationPolicy
+
+    public init(
+        evidenceManifestSHA256: String,
+        memoryLimitBytes: Int,
+        cacheLimitBytes: Int,
+        wiredLimitBytes: Int,
+        expectedPromptTokens: Int,
+        tokenizerSHA256: String,
+        cacheResetPolicy: BenchQualificationCacheResetPolicy,
+        modelResidencyPolicy: BenchQualificationModelResidencyPolicy,
+        processIsolationPolicy: BenchQualificationProcessIsolationPolicy
+    ) throws {
+        self.evidenceManifestSHA256 = evidenceManifestSHA256
+        self.memoryLimitBytes = memoryLimitBytes
+        self.cacheLimitBytes = cacheLimitBytes
+        self.wiredLimitBytes = wiredLimitBytes
+        self.expectedPromptTokens = expectedPromptTokens
+        self.tokenizerSHA256 = tokenizerSHA256
+        self.cacheResetPolicy = cacheResetPolicy
+        self.modelResidencyPolicy = modelResidencyPolicy
+        self.processIsolationPolicy = processIsolationPolicy
+        try validate()
+    }
+
+    fileprivate func validate() throws {
+        guard Self.isLowercaseSHA256(evidenceManifestSHA256) else {
+            throw BenchQualificationEvidenceError
+                .invalidRunnerManifestSHA256
+        }
+        guard Self.isLowercaseSHA256(tokenizerSHA256) else {
+            throw BenchQualificationEvidenceError.invalidTokenizerSHA256
+        }
+        guard cacheLimitBytes > 0,
+            memoryLimitBytes >= cacheLimitBytes,
+            wiredLimitBytes >= memoryLimitBytes,
+            expectedPromptTokens > 0
+        else {
+            throw BenchQualificationEvidenceError.invalidMemorySettings
+        }
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
+        }
+    }
+}
+
+public struct BenchCapacityRunEnvironment:
+    Codable, Sendable, Equatable
+{
+    public let before: BenchQualificationHostSnapshot
+    public let after: BenchQualificationHostSnapshot
+
+    public init(
+        before: BenchQualificationHostSnapshot,
+        after: BenchQualificationHostSnapshot
+    ) throws {
+        self.before = before
+        self.after = after
+        try validate()
+    }
+
+    fileprivate func validate() throws {
+        guard before.monotonicTimestampSeconds.isFinite,
+            after.monotonicTimestampSeconds.isFinite,
+            after.monotonicTimestampSeconds
+                > before.monotonicTimestampSeconds
+        else {
+            throw BenchQualificationEvidenceError.invalidMonotonicTiming
+        }
+        guard before.residentSizeBytes > 0,
+            after.residentSizeBytes > 0,
+            before.physicalFootprintBytes > 0,
+            after.physicalFootprintBytes > 0
+        else {
+            throw BenchQualificationEvidenceError.invalidProcessMemory
+        }
+        guard before.powerSource == .acPower,
+            after.powerSource == .acPower,
+            !before.lowPowerModeEnabled,
+            !after.lowPowerModeEnabled
+        else {
+            throw BenchQualificationEvidenceError.invalidPowerState
+        }
+        guard Self.isSafe(before.thermalState),
+            Self.isSafe(after.thermalState)
+        else {
+            throw BenchQualificationEvidenceError.invalidThermalState
+        }
+    }
+
+    private static func isSafe(
+        _ state: CompressedAttentionProbeThermalState
+    ) -> Bool {
+        state == .nominal || state == .fair
+    }
+}
+
+public struct BenchCapacityEvidence: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+
+    public let schemaVersion: Int
+    public let purpose: BenchCapacityEvidencePurpose
+    public let promotable: Bool
+    public let context: BenchCapacityEvidenceContext
+    public let warmup: BenchCapacityRunEnvironment
+    public let runs: [BenchCapacityRunEnvironment]
+
+    public init(
+        context: BenchCapacityEvidenceContext,
+        warmup: BenchCapacityRunEnvironment,
+        runs: [BenchCapacityRunEnvironment]
+    ) throws {
+        schemaVersion = Self.currentSchemaVersion
+        purpose = .capacityOnly
+        promotable = false
+        self.context = context
+        self.warmup = warmup
+        self.runs = runs
+        try validate()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case purpose
+        case promotable
+        case context
+        case warmup
+        case runs
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(
+            Int.self, forKey: .schemaVersion)
+        purpose = try container.decode(
+            BenchCapacityEvidencePurpose.self, forKey: .purpose)
+        promotable = try container.decode(Bool.self, forKey: .promotable)
+        context = try container.decode(
+            BenchCapacityEvidenceContext.self, forKey: .context)
+        warmup = try container.decode(
+            BenchCapacityRunEnvironment.self, forKey: .warmup)
+        runs = try container.decode(
+            [BenchCapacityRunEnvironment].self, forKey: .runs)
+        try validate()
+    }
+
+    private func validate() throws {
+        guard schemaVersion == Self.currentSchemaVersion else {
+            throw BenchQualificationEvidenceError
+                .invalidSchemaVersion(schemaVersion)
+        }
+        guard purpose == .capacityOnly, !promotable else {
+            throw BenchQualificationEvidenceError.invalidCapacityEvidence
+        }
+        try context.validate()
+        try warmup.validate()
+        guard runs.count == 1 else {
+            throw BenchQualificationEvidenceError.invalidRunCount(runs.count)
+        }
+        for run in runs { try run.validate() }
     }
 }
 
