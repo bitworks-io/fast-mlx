@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-21
+Last reviewed: 2026-07-22
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -170,6 +170,27 @@ and no process/lock remains. Refusal-log, time-log, and launcher SHA-256 values 
 `16e9da974d49cbf07035ae4aa0405083628cf9993c801ba619ea8e70f49afd90`, and
 `a7a844a77b29493cae452d82af53adf7e59752a9d62b929966a5a21b945e2d27`.
 
+The separate Qwen 32K KVarN i8 capacity-only boundary is now terminal `COMPLETE` and independently
+authenticated. Preserve it unchanged at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-8b45475/qwen-32k-kvarn-capacity-v20`.
+Clean source `8b454754ed9e631b05ce1164b9c30853b4e416f8`, binary SHA-256
+`5d72ea1b6ab98749421c059984fe1ff69294d2971d35ba6557bb44c7033675a6`, manifest SHA-256
+`f81a5d95dc2554d1ba749965bf49703fbe546ee14700147d4064d7cc9a980da2`, and launcher SHA-256
+`851a99f525be4c2d108d880dc636e3efad199cd81cf89f0d795b9c3b2aeda59c` produced exactly one
+authenticated row for 32,628 prompt plus 128 generated tokens. Evidence/completion/launch-receipt
+SHA-256 values are `99932d17ec7014b80eb8f50a0f1393e565444cad4dc6e7629c4888c467cad59c`,
+`d81308c2e233679e2693564e59e23d44757a7be5ca35b6edd26d23d117964b88`, and
+`b47aeb543d20b42d12e1737e9d24108fa69e757895bda64487f2693c2b9331bb`.
+The typed validator passed; focused-review-clean authenticator SHA-256
+`08221e1629da4e2b5abe010a8a422abf5844b61eabafb743ebe5489d1ee4de1f` passed twice. The run
+engaged all 64 KVarN layers with zero materialization, recorded 32,756 cached tokens in
+33,024-token physical capacity, and remained nominal -> nominal for both warmup and retained work.
+Its 10.38 prefill and 4.934 decode tok/s are non-promotable capacity context only:
+`promotable:false` and `speedAggregation:"forbidden"`. Verdict:
+[`2026-07-22-qwen3-32b-kvarn-capacity.md`](superpowers/verdicts/2026-07-22-qwen3-32b-kvarn-capacity.md).
+Durable terminal-verification receipt SHA-256 is
+`168da54a58ef6b1b0aede8beda2564f4da24c232c9c8dc563933e11a8f6b328f`.
+
 The source-locked Llama-3.3-70B-Instruct-4bit cache currently contains only its revision ref,
 `de2dfaf56839b7d0e834157d2401dee02726874d`; the model/tokenizer snapshot is absent. Advancing that
 family requires operator approval to download roughly 40 GiB. The Swift harness does not require a
@@ -186,10 +207,11 @@ notable spike, including negative results.
    failed the unchanged all-block speed gate; retain both affine and KVTuner direct cells as
    negative/dominated 8K evidence. The first 32K fp16 control failed closed on a retained
    nominal -> fair transition, so no full 32K speed retry or claim is authorized on this bench
-   under the current unthrottled contract. Collect separately authenticated 32K KVarN
-   capacity-only context that cannot feed a speed label. The authenticated near-128K refusal is
-   complete at a 131,039-token request against maximum context 40,960. Then download, hash, and
-   qualify source-locked Llama-3.3-70B at
+   under the current unthrottled contract. The separately authenticated 32K KVarN capacity-only
+   context is complete and cannot feed a speed label. The authenticated near-128K refusal is
+   complete at a 131,039-token request against maximum context 40,960. After explicit operator
+   approval for the roughly 40 GiB snapshot, download, hash, and qualify source-locked
+   Llama-3.3-70B at
    8K/32K/near-128K without the Qwen-specific KVTuner schedule unless independently calibrated.
    Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support
@@ -274,8 +296,9 @@ bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
 ```
 
-Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; staged
-Llama-3.3-70B-Instruct-4bit checkpoint; no Qwen3-32B BF16 target). Python: `~/harness-venv`
+Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; only the
+Llama-3.3-70B-Instruct-4bit revision ref is cached, not its model/tokenizer snapshot; no Qwen3-32B
+BF16 target). Python: `~/harness-venv`
 (`transformers<5`).
 
 ## Commit / Checkin

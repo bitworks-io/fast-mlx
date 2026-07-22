@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-22",
+  "purpose": "capacity-only-terminal-verification",
+  "promotable": false,
+  "speedAggregation": "forbidden",
+  "sourceSHA": "8b454754ed9e631b05ce1164b9c30853b4e416f8",
+  "binarySHA256": "5d72ea1b6ab98749421c059984fe1ff69294d2971d35ba6557bb44c7033675a6",
+  "outputPath": "/Users/llmbench/perf-work/results/fused-compressed-kv-qwen3-32b-loaded-8b45475/qwen-32k-kvarn-capacity-v20",
+  "commands": {
+    "typedValidator": "fastmlx-harness[sha256=5d72ea1b6ab98749421c059984fe1ff69294d2971d35ba6557bb44c7033675a6] validate-bench-capacity --evidence <outputPath>/capacity.raw.jsonl",
+    "authenticator": "qwen-32k-kvarn-capacity-v20.authenticate.sh[sha256=08221e1629da4e2b5abe010a8a422abf5844b61eabafb743ebe5489d1ee4de1f]",
+    "finalMonitor": "qwen-32k-kvarn-capacity-v20.monitor.sh[sha256=e62b8790070254044e94e149f374dc1d1bc0867ad822db5414c5670bcbc13ed5]"
+  },
+  "typedValidator": {
+    "runCount": 1,
+    "stdout": "bench capacity evidence: VALID"
+  },
+  "authenticator": {
+    "sha256": "08221e1629da4e2b5abe010a8a422abf5844b61eabafb743ebe5489d1ee4de1f",
+    "runCount": 2,
+    "results": [
+      {
+        "authentication": "PASS",
+        "promotable": false,
+        "speedAggregation": "forbidden",
+        "evidenceSHA256": "99932d17ec7014b80eb8f50a0f1393e565444cad4dc6e7629c4888c467cad59c",
+        "completionSHA256": "d81308c2e233679e2693564e59e23d44757a7be5ca35b6edd26d23d117964b88",
+        "launchReceiptSHA256": "b47aeb543d20b42d12e1737e9d24108fa69e757895bda64487f2693c2b9331bb",
+        "validatorLogSHA256": "4c1ac0ecc101469994d690fe5c9740773c906d7ade562c704d2fe30a3e6a24c9",
+        "maxRSSFromTime": 55875010560,
+        "result": {
+          "promptTokens": 32628,
+          "generatedTokens": 128,
+          "prefillTokS": 10.38,
+          "decodeTokS": 4.934092382038624,
+          "cachedTokens": 32756,
+          "capacityTokens": 33024,
+          "payloadBytes": 1616904192,
+          "metadataBytes": 202113024,
+          "attentionWorkspaceBytes": 8659140608,
+          "maxSampledPhysicalFootprintBytes": 64618487912,
+          "warmupThermalBefore": "nominal",
+          "warmupThermalAfter": "nominal",
+          "retainedThermalBefore": "nominal",
+          "retainedThermalAfter": "nominal"
+        }
+      },
+      {
+        "authentication": "PASS",
+        "promotable": false,
+        "speedAggregation": "forbidden",
+        "evidenceSHA256": "99932d17ec7014b80eb8f50a0f1393e565444cad4dc6e7629c4888c467cad59c",
+        "completionSHA256": "d81308c2e233679e2693564e59e23d44757a7be5ca35b6edd26d23d117964b88",
+        "launchReceiptSHA256": "b47aeb543d20b42d12e1737e9d24108fa69e757895bda64487f2693c2b9331bb",
+        "validatorLogSHA256": "4c1ac0ecc101469994d690fe5c9740773c906d7ade562c704d2fe30a3e6a24c9",
+        "maxRSSFromTime": 55875010560,
+        "result": {
+          "promptTokens": 32628,
+          "generatedTokens": 128,
+          "prefillTokS": 10.38,
+          "decodeTokS": 4.934092382038624,
+          "cachedTokens": 32756,
+          "capacityTokens": 33024,
+          "payloadBytes": 1616904192,
+          "metadataBytes": 202113024,
+          "attentionWorkspaceBytes": 8659140608,
+          "maxSampledPhysicalFootprintBytes": 64618487912,
+          "warmupThermalBefore": "nominal",
+          "warmupThermalAfter": "nominal",
+          "retainedThermalBefore": "nominal",
+          "retainedThermalAfter": "nominal"
+        }
+      }
+    ]
+  },
+  "finalMonitor": {
+    "sha256": "e62b8790070254044e94e149f374dc1d1bc0867ad822db5414c5670bcbc13ed5",
+    "launcher": {"pid": 65562, "live": false},
+    "wrapper": {"pid": 65677, "live": false},
+    "harness": {"pid": 65682, "live": false},
+    "identityBoundLockHeld": false,
+    "status": "COMPLETE",
+    "completedRows": 1,
+    "expectedRows": 1,
+    "elapsedSeconds": 6359,
+    "currentRSSBytes": 0,
+    "maxProcessRSSBytes": 55875010560,
+    "logMTimeEpoch": 1784732327,
+    "logBytes": 777,
+    "watchdogTripped": false,
+    "failureArtifactPresent": false,
+    "completionArtifactPresent": true,
+    "foundation": {"lowPowerModeEnabled": false, "thermalStateCode": 0}
+  },
+  "artifactAudit": {
+    "rowCount": 1,
+    "launchReceiptSidecar": "OK",
+    "completionSidecar": "OK",
+    "manifestSHA256": "f81a5d95dc2554d1ba749965bf49703fbe546ee14700147d4064d7cc9a980da2",
+    "launcherSHA256": "851a99f525be4c2d108d880dc636e3efad199cd81cf89f0d795b9c3b2aeda59c",
+    "evidenceSHA256": "99932d17ec7014b80eb8f50a0f1393e565444cad4dc6e7629c4888c467cad59c",
+    "completionSHA256": "d81308c2e233679e2693564e59e23d44757a7be5ca35b6edd26d23d117964b88",
+    "launchReceiptSHA256": "b47aeb543d20b42d12e1737e9d24108fa69e757895bda64487f2693c2b9331bb",
+    "finalProgressSHA256": "830874b2b57d757a06e6a96d0e851a2d47f4301d793f28f8c2a9b1227fbaf850",
+    "finalStatusSHA256": "a4bccf5c13ef5ff8311e59b34d492bc7072a55298723601a6a9c127053aee8fc",
+    "runnerLogSHA256": "b948f95e44a679fd3af7f7cb1d964a1cbfbd85457e9b0eae2d28ada17a512337",
+    "timeLogSHA256": "e0cb79933feb988677ae28ba98ef22d519791c9c144765b952a7ac4e37d0ba17",
+    "validatorLogSHA256": "4c1ac0ecc101469994d690fe5c9740773c906d7ade562c704d2fe30a3e6a24c9"
+  }
+}
