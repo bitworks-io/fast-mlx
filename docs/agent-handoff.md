@@ -330,6 +330,7 @@ swift run fastmlx-capacity --box m3Ultra512
 # On-box MLX/SpikeCore/engine checks:
 bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
+ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:ExactPrefixMLXTests'
 ```
 
 Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; the complete,

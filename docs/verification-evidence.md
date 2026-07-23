@@ -35,6 +35,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" \
   -skipPackagePluginValidation -only-testing:SpikeCoreTests
 
+# Run in a separate xcodebuild invocation to isolate pointer-keyed MLX compiled state.
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" \
+  -skipPackagePluginValidation -only-testing:ExactPrefixMLXTests
+
 <fastmlx-harness> verify --model <model> --spec pld --n 120
 <fastmlx-harness> verify --model <model> --spec pld --n 120 --compiled-verify true
 bash scripts/bench_pld_shapes.sh <model> 3 256

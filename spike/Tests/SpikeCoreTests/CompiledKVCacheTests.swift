@@ -234,6 +234,41 @@ final class CompiledKVCacheTests: XCTestCase {
         XCTAssertEqual(bytes(restored.valuesBuf!), bytes(control.valuesBuf!))
     }
 
+    func testPreparedGrowthDoesNotMutateLiveCapacityUntilAtomicApply() throws {
+        let source = CompiledKVCache(capacity: 4)
+        let (sourceKeys, sourceValues) = makeKV(2, n: 2, dtype: .float16)
+        _ = source.update(keys: sourceKeys, values: sourceValues)
+        let snapshot = try source.captureSnapshot(logicalTokenCount: 2)
+
+        let target = CompiledKVCache(capacity: 4)
+        let (targetKeys, targetValues) = makeKV(7, n: 2, dtype: .float16)
+        _ = target.update(keys: targetKeys, values: targetValues)
+        let originalKeys = try XCTUnwrap(target.keysBuf)
+        let originalValues = try XCTUnwrap(target.valuesBuf)
+        let originalKeyBytes = bytes(originalKeys)
+        let originalValueBytes = bytes(originalValues)
+
+        let plan = try target.prepareRestore(
+            from: snapshot, targetCapacity: 260)
+
+        XCTAssertEqual(target.capacity, 4)
+        XCTAssertTrue(target.keysBuf === originalKeys)
+        XCTAssertTrue(target.valuesBuf === originalValues)
+        XCTAssertEqual(bytes(target.keysBuf!), originalKeyBytes)
+        XCTAssertEqual(bytes(target.valuesBuf!), originalValueBytes)
+        XCTAssertEqual(target.offsetArr.item(Int32.self), 2)
+
+        target.applyPreparedRestore(plan)
+
+        XCTAssertEqual(target.capacity, 260)
+        XCTAssertEqual(target.keysBuf?.shape, [1, 2, 260, 4])
+        XCTAssertEqual(target.valuesBuf?.shape, [1, 2, 260, 4])
+        XCTAssertEqual(target.offsetArr.item(Int32.self), 2)
+        XCTAssertEqual(target.offset, 2)
+        XCTAssertEqual(target.keysBuf![0, 0, 1, 0].item(Float.self), 2)
+        XCTAssertEqual(target.keysBuf![0, 0, 259, 0].item(Float.self), 0)
+    }
+
     func testCaptureRejectsUninitializedInvalidLengthOffsetMismatchAndNonFinite() {
         let uninitialized = CompiledKVCache(capacity: 8)
         assertSnapshotError(.uninitializedCache) {

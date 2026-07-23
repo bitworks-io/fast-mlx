@@ -68,6 +68,22 @@ public struct CompiledKVCacheSnapshot {
     }
 }
 
+/// Fully validated, evaluated restore payload for one live dense cache.
+///
+/// Decoder-level restore prepares every layer before applying any of them, so a malformed
+/// later layer cannot leave an earlier layer partially restored. The owner identity prevents
+/// accidentally applying a plan to a different cache while keeping the actual mutation
+/// nonthrowing.
+struct CompiledKVCacheRestorePlan {
+    let owner: ObjectIdentifier
+    let liveKeys: MLXArray
+    let liveValues: MLXArray
+    let rebuiltKeys: MLXArray
+    let rebuiltValues: MLXArray
+    let tokenCount: Int
+    let targetCapacity: Int
+}
+
 /// KV cache that is legal *inside* `MLX.compile`.
 ///
 /// The stock `KVCacheSimple` bakes Swift `Int` offsets into every traced op (slice
@@ -257,6 +273,19 @@ public final class CompiledKVCache: KVCache, Updatable {
     public func restoreInPlace(
         from snapshot: CompiledKVCacheSnapshot
     ) throws {
+        let plan = try prepareRestore(
+            from: snapshot, targetCapacity: capacity)
+        applyPreparedRestore(plan)
+    }
+
+    /// Validate and rebuild a detached prefix without mutating live cache state.
+    ///
+    /// This is internal so `CompiledMLXDecoder` can prepare every layer first and then apply
+    /// the plans as one actor-confined state transition.
+    func prepareRestore(
+        from snapshot: CompiledKVCacheSnapshot,
+        targetCapacity: Int
+    ) throws -> CompiledKVCacheRestorePlan {
         guard let liveKeys = keysBuf, let liveValues = valuesBuf else {
             throw CompiledKVCacheSnapshotError.uninitializedCache
         }
@@ -266,6 +295,11 @@ public final class CompiledKVCache: KVCache, Updatable {
         try validateControlState()
         let liveGeometry = try Self.validateLiveBuffers(
             keys: liveKeys, values: liveValues, capacity: capacity)
+        guard targetCapacity >= capacity,
+            targetCapacity <= Int(Int32.max)
+        else {
+            throw CompiledKVCacheSnapshotError.invalidMetadata
+        }
         guard snapshot.rank == 4,
             snapshot.batchSize > 0,
             snapshot.kvHeadCount > 0,
@@ -278,7 +312,7 @@ public final class CompiledKVCache: KVCache, Updatable {
         else {
             throw CompiledKVCacheSnapshotError.invalidMetadata
         }
-        guard snapshot.tokenCount <= capacity else {
+        guard snapshot.tokenCount <= targetCapacity else {
             throw CompiledKVCacheSnapshotError.insufficientCapacity
         }
         guard snapshot.keyDType == .float16, snapshot.valueDType == .float16 else {
@@ -331,7 +365,7 @@ public final class CompiledKVCache: KVCache, Updatable {
             throw CompiledKVCacheSnapshotError.nonFiniteValues
         }
 
-        let tailCount = capacity - snapshot.tokenCount
+        let tailCount = targetCapacity - snapshot.tokenCount
         let rebuiltKeys: MLXArray
         let rebuiltValues: MLXArray
         if tailCount == 0 {
@@ -354,8 +388,14 @@ public final class CompiledKVCache: KVCache, Updatable {
             rebuiltValues = concatenated([snapshotValues, valueTail], axis: 2)
         }
         eval([rebuiltKeys, rebuiltValues])
-        guard rebuiltKeys.shape == liveKeys.shape,
-            rebuiltValues.shape == liveValues.shape,
+        let targetShape = [
+            liveGeometry.batchSize,
+            liveGeometry.kvHeadCount,
+            targetCapacity,
+            liveGeometry.headDimension,
+        ]
+        guard rebuiltKeys.shape == targetShape,
+            rebuiltValues.shape == targetShape,
             rebuiltKeys.dtype == liveKeys.dtype,
             rebuiltValues.dtype == liveValues.dtype,
             Self.arraysAreFinite([rebuiltKeys, rebuiltValues])
@@ -363,10 +403,37 @@ public final class CompiledKVCache: KVCache, Updatable {
             throw CompiledKVCacheSnapshotError.shapeMismatch
         }
 
-        liveKeys._updateInternal(rebuiltKeys)
-        liveValues._updateInternal(rebuiltValues)
-        offsetArr._updateInternal(MLXArray([Int32(snapshot.tokenCount)]))
-        offset = snapshot.tokenCount
+        return CompiledKVCacheRestorePlan(
+            owner: ObjectIdentifier(self),
+            liveKeys: liveKeys,
+            liveValues: liveValues,
+            rebuiltKeys: rebuiltKeys,
+            rebuiltValues: rebuiltValues,
+            tokenCount: snapshot.tokenCount,
+            targetCapacity: targetCapacity)
+    }
+
+    /// Apply a previously prepared restore while preserving the live MLXArray identities.
+    func applyPreparedRestore(_ plan: CompiledKVCacheRestorePlan) {
+        precondition(
+            plan.owner == ObjectIdentifier(self),
+            "dense KV restore plan belongs to a different cache")
+        precondition(
+            plan.targetCapacity >= capacity,
+            "dense KV restore plan cannot shrink live capacity")
+        if plan.targetCapacity == capacity {
+            plan.liveKeys._updateInternal(plan.rebuiltKeys)
+            plan.liveValues._updateInternal(plan.rebuiltValues)
+        } else {
+            precondition(
+                keysBuf === plan.liveKeys && valuesBuf === plan.liveValues,
+                "dense KV cache changed after restore preparation")
+            keysBuf = plan.rebuiltKeys
+            valuesBuf = plan.rebuiltValues
+            capacity = plan.targetCapacity
+        }
+        offsetArr._updateInternal(MLXArray([Int32(plan.tokenCount)]))
+        offset = plan.tokenCount
     }
 
     private struct DenseGeometry {

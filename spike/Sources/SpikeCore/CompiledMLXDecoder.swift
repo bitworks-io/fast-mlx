@@ -3,6 +3,78 @@ import HarnessCore
 import MLX
 import MLXLMCommon
 
+public enum CompiledMLXDecoderSnapshotError: Error, Equatable, Sendable {
+    case unsupportedCacheKind
+    case speculativeStateUnsupported
+    case decoderNotInitialized
+    case invalidPipelineState
+    case invalidPrompt
+    case invalidTailToken(position: Int)
+    case layerCountMismatch
+    case layerTokenCountMismatch(layer: Int)
+    case invalidNextToken
+    case invalidSnapshotMetadata
+    case byteCountOverflow
+}
+
+/// Exact request-start state for the dense scalar compiled decoder.
+///
+/// A snapshot contains the logical fp16 prefix for every layer plus the greedy token that the
+/// prefix predicts. Retaining that next-token pipeline state lets an exact hit skip prompt
+/// evaluation entirely while preserving the decoder's submit-first lookahead invariant.
+public struct CompiledMLXDecoderSnapshot {
+    public let logicalTokenCount: Int
+    public let nextTokenID: Int
+    public let layerCount: Int
+    public let arrayNBytes: Int
+    public let controlNBytes: Int
+    public let totalNBytes: Int
+
+    let layerSnapshots: [CompiledKVCacheSnapshot]
+
+    init(
+        logicalTokenCount: Int,
+        nextTokenID: Int,
+        layerSnapshots: [CompiledKVCacheSnapshot]
+    ) {
+        self.logicalTokenCount = logicalTokenCount
+        self.nextTokenID = nextTokenID
+        self.layerSnapshots = layerSnapshots
+        layerCount = layerSnapshots.count
+
+        var arrayBytes = 0
+        var byteCountOverflow = false
+        for snapshot in layerSnapshots {
+            let (next, overflow) = arrayBytes.addingReportingOverflow(
+                snapshot.totalNBytes)
+            if overflow || snapshot.totalNBytes < 0 {
+                byteCountOverflow = true
+                break
+            }
+            arrayBytes = next
+        }
+        let (layerControlBytes, controlMultiplyOverflow) =
+            layerSnapshots.count.multipliedReportingOverflow(
+                by: MemoryLayout<CompiledKVCacheSnapshot>.stride)
+        let (controlBytes, controlAddOverflow) =
+            layerControlBytes.addingReportingOverflow(
+                MemoryLayout<Int32>.stride)
+        let (allBytes, totalOverflow) =
+            arrayBytes.addingReportingOverflow(controlBytes)
+        if byteCountOverflow || controlMultiplyOverflow || controlAddOverflow
+            || totalOverflow
+        {
+            arrayNBytes = -1
+            controlNBytes = -1
+            totalNBytes = -1
+        } else {
+            arrayNBytes = arrayBytes
+            controlNBytes = controlBytes
+            totalNBytes = allBytes
+        }
+    }
+}
+
 /// Decoder whose single-token step is wrapped in `MLX.compile`.
 ///
 /// Why: Instruments showed the baseline `MLXDecoder`'s 6.7ms/step "submit" phase is
@@ -47,6 +119,10 @@ public struct CompiledMLXDecoder: Decoder {
     /// Separate fixed-K compiled verify forward for the spec-decode path (lazy; survives
     /// resets like `compiledStep` so bench runs don't retrace).
     private var compiledVerifyStep: (([MLXArray]) -> [MLXArray])?
+    /// Prefix snapshots are deliberately disjoint from a live speculative request. The compiled
+    /// verify closure may survive reset for reuse; this flag tracks request state, not closure
+    /// existence, and reset clears it.
+    private var snapshotSpeculativeStateActive = false
     private var pendingNext: MLXArray? // [1] token id for the current position (lazy)
     private var cachedTokens = 0 // host-side position; caches' host mirror goes stale
 
@@ -74,13 +150,153 @@ public struct CompiledMLXDecoder: Decoder {
 
     public mutating func prefill(_ promptTokens: [Int]) -> Int {
         let first = prefillCore(promptTokens)
-        // submit-first: the compiled forward for the position after `first` is in
-        // flight before we block reading `first` back to the CPU.
-        let next = compiledStep!([first])[0]
-        asyncEval(next)
-        pendingNext = next
-        cachedTokens += 1
-        return Self.requireValidGreedyToken(first)
+        return armLookahead(from: first)
+    }
+
+    /// Cold fp16 prefill that also captures the exact prompt-only state before the first
+    /// generated token is submitted to the compiled decode step.
+    ///
+    /// This is a consuming request-start transition, not a validation probe. Any thrown
+    /// validation or capture error resets the live decoder in place so the cache-enabled
+    /// request fails closed and a later request can take the ordinary cold path.
+    public mutating func prefillCapturingPromptSnapshot(
+        _ promptTokens: [Int]
+    ) throws -> (
+        firstToken: Int,
+        snapshot: CompiledMLXDecoderSnapshot
+    ) {
+        do {
+            try validateSnapshotRoute()
+            guard cachedTokens == 0, pendingNext == nil else {
+                throw CompiledMLXDecoderSnapshotError.invalidPipelineState
+            }
+            try Self.validatePromptTokens(promptTokens)
+
+            let first = prefillCore(promptTokens)
+            let firstToken = try Self.validatedTokenID(first)
+            let snapshot = try captureSnapshot(nextTokenID: firstToken)
+            let emitted = armLookahead(from: first)
+            precondition(
+                emitted == firstToken,
+                "captured prompt token changed while arming lookahead")
+            return (firstToken, snapshot)
+        } catch {
+            reset()
+            throw error
+        }
+    }
+
+    /// Capture the exact committed context plus its pending greedy token.
+    ///
+    /// Plain decode keeps every emitted token committed in KV and `pendingNext` as the next
+    /// model pick. Both parts are required to resume without re-evaluating the prefix.
+    public func captureContinuationSnapshot()
+        throws -> CompiledMLXDecoderSnapshot
+    {
+        try validateSnapshotRoute()
+        guard !caches.isEmpty, compiledStep != nil else {
+            throw CompiledMLXDecoderSnapshotError.decoderNotInitialized
+        }
+        guard cachedTokens > 0, let pendingNext else {
+            throw CompiledMLXDecoderSnapshotError.invalidPipelineState
+        }
+        let nextTokenID = try Self.validatedTokenID(pendingNext)
+        return try captureSnapshot(nextTokenID: nextTokenID)
+    }
+
+    /// Restore an exact dense prefix, evaluate only a new tail, and re-enter the ordinary
+    /// submit-first decode pipeline.
+    ///
+    /// This is a consuming request-start transition, not a validation probe. Any thrown
+    /// validation or restore error resets the live decoder in place; callers must fail the
+    /// current cache-enabled request rather than continue an earlier decode pipeline.
+    public mutating func prefillRestoredPrefix(
+        _ snapshot: CompiledMLXDecoderSnapshot,
+        tailTokens: [Int]
+    ) throws -> Int {
+        do {
+            try validateSnapshotRoute()
+            guard !caches.isEmpty, compiledStep != nil else {
+                throw CompiledMLXDecoderSnapshotError.decoderNotInitialized
+            }
+            guard cachedTokens == 0, pendingNext == nil else {
+                throw CompiledMLXDecoderSnapshotError.invalidPipelineState
+            }
+            try Self.validateTailTokens(tailTokens)
+            try Self.validate(
+                snapshot: snapshot, expectedLayerCount: caches.count)
+
+            let (prefixAndTail, prefixOverflow) =
+                snapshot.logicalTokenCount.addingReportingOverflow(
+                    tailTokens.count)
+            let (requiredCapacity, capacityOverflow) =
+                prefixAndTail.addingReportingOverflow(1)
+            guard !prefixOverflow, !capacityOverflow,
+                requiredCapacity > 0,
+                requiredCapacity <= Int(Int32.max)
+            else {
+                throw CompiledMLXDecoderSnapshotError.byteCountOverflow
+            }
+            var targetCapacity = caches[0].capacity
+            while requiredCapacity > targetCapacity {
+                let (grown, overflow) =
+                    targetCapacity.addingReportingOverflow(chunk)
+                guard !overflow, grown <= Int(Int32.max) else {
+                    throw CompiledMLXDecoderSnapshotError.byteCountOverflow
+                }
+                targetCapacity = grown
+            }
+
+            let denseCaches = try denseSnapshotCaches()
+            guard denseCaches.allSatisfy({
+                $0.capacity == denseCaches[0].capacity
+            }) else {
+                throw CompiledMLXDecoderSnapshotError
+                    .invalidSnapshotMetadata
+            }
+            var restorePlans: [CompiledKVCacheRestorePlan] = []
+            restorePlans.reserveCapacity(denseCaches.count)
+            for (layer, cache) in denseCaches.enumerated() {
+                guard snapshot.layerSnapshots[layer].tokenCount
+                    == snapshot.logicalTokenCount
+                else {
+                    throw CompiledMLXDecoderSnapshotError
+                        .layerTokenCountMismatch(layer: layer)
+                }
+                restorePlans.append(
+                    try cache.prepareRestore(
+                        from: snapshot.layerSnapshots[layer],
+                        targetCapacity: targetCapacity))
+            }
+            for (cache, plan) in zip(denseCaches, restorePlans) {
+                cache.applyPreparedRestore(plan)
+            }
+
+            cachedTokens = snapshot.logicalTokenCount
+            pendingNext = nil
+
+            let current: MLXArray
+            if tailTokens.isEmpty {
+                current = MLXArray([Int32(snapshot.nextTokenID)])
+            } else {
+                let ids = MLXArray(
+                    tailTokens.map { Int32($0) }
+                ).reshaped([1, tailTokens.count])
+                let logits = model(ids, cache: caches)
+                current = Self.greedyTokenOrInvalidSentinel(
+                    logits[0..., -1, 0...])
+                cachedTokens += tailTokens.count
+            }
+            let currentToken = try Self.validatedTokenID(current)
+            let emitted = armLookahead(from: current)
+            precondition(
+                emitted == currentToken,
+                "restored prefix token changed while arming lookahead")
+            return emitted
+        } catch {
+            reset()
+            throw error
+        }
     }
 
     /// Shared prefill: caches allocated/grown, uncompiled prompt forward, compiled step
@@ -169,6 +385,157 @@ public struct CompiledMLXDecoder: Decoder {
         return kvarnAttentionMode == .splitQuantizedMM
     }
 
+    private mutating func armLookahead(from current: MLXArray) -> Int {
+        guard let compiledStep else {
+            fatalError("CompiledMLXDecoder lookahead missing compiled step")
+        }
+        while cachedTokens + 1 > caches[0].capacity {
+            for cache in caches { cache.grow(by: chunk) }
+        }
+        // submit-first: the compiled forward for the position after `current` is in
+        // flight before we block reading `current` back to the CPU.
+        let next = compiledStep([current])[0]
+        asyncEval(next)
+        pendingNext = next
+        cachedTokens += 1
+        return Self.requireValidGreedyToken(current)
+    }
+
+    private func validateSnapshotRoute() throws {
+        guard kvCacheKind == .fp16 else {
+            throw CompiledMLXDecoderSnapshotError.unsupportedCacheKind
+        }
+        guard !snapshotSpeculativeStateActive else {
+            throw CompiledMLXDecoderSnapshotError
+                .speculativeStateUnsupported
+        }
+    }
+
+    private func denseSnapshotCaches() throws -> [CompiledKVCache] {
+        let denseCaches = caches.compactMap { $0 as? CompiledKVCache }
+        guard denseCaches.count == caches.count else {
+            throw CompiledMLXDecoderSnapshotError.unsupportedCacheKind
+        }
+        return denseCaches
+    }
+
+    private func captureSnapshot(
+        nextTokenID: Int
+    ) throws -> CompiledMLXDecoderSnapshot {
+        guard cachedTokens > 0, cachedTokens <= Int(Int32.max) else {
+            throw CompiledMLXDecoderSnapshotError.invalidPipelineState
+        }
+        guard nextTokenID >= 0, Int32(exactly: nextTokenID) != nil else {
+            throw CompiledMLXDecoderSnapshotError.invalidNextToken
+        }
+        let denseCaches = try denseSnapshotCaches()
+        guard !denseCaches.isEmpty else {
+            throw CompiledMLXDecoderSnapshotError.decoderNotInitialized
+        }
+        let layerSnapshots = try denseCaches.map {
+            try $0.captureSnapshot(logicalTokenCount: cachedTokens)
+        }
+        let snapshot = CompiledMLXDecoderSnapshot(
+            logicalTokenCount: cachedTokens,
+            nextTokenID: nextTokenID,
+            layerSnapshots: layerSnapshots)
+        try Self.validate(
+            snapshot: snapshot, expectedLayerCount: denseCaches.count)
+        return snapshot
+    }
+
+    private static func validate(
+        snapshot: CompiledMLXDecoderSnapshot,
+        expectedLayerCount: Int
+    ) throws {
+        guard snapshot.layerCount == expectedLayerCount,
+            snapshot.layerSnapshots.count == expectedLayerCount
+        else {
+            throw CompiledMLXDecoderSnapshotError.layerCountMismatch
+        }
+        guard snapshot.logicalTokenCount > 0,
+            snapshot.logicalTokenCount <= Int(Int32.max)
+        else {
+            throw CompiledMLXDecoderSnapshotError.invalidSnapshotMetadata
+        }
+        guard snapshot.nextTokenID >= 0,
+            Int32(exactly: snapshot.nextTokenID) != nil
+        else {
+            throw CompiledMLXDecoderSnapshotError.invalidNextToken
+        }
+        guard snapshot.arrayNBytes >= 0,
+            snapshot.controlNBytes > 0,
+            snapshot.totalNBytes > 0
+        else {
+            throw CompiledMLXDecoderSnapshotError.byteCountOverflow
+        }
+
+        var arrayBytes = 0
+        for (layer, layerSnapshot) in snapshot.layerSnapshots.enumerated() {
+            guard layerSnapshot.tokenCount == snapshot.logicalTokenCount else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerTokenCountMismatch(layer: layer)
+            }
+            let (next, overflow) = arrayBytes.addingReportingOverflow(
+                layerSnapshot.totalNBytes)
+            guard !overflow, layerSnapshot.totalNBytes > 0 else {
+                throw CompiledMLXDecoderSnapshotError.byteCountOverflow
+            }
+            arrayBytes = next
+        }
+        let (expectedControl, controlOverflow) =
+            snapshot.layerCount.multipliedReportingOverflow(
+                by: MemoryLayout<CompiledKVCacheSnapshot>.stride)
+        let (expectedControlWithToken, tokenOverflow) =
+            expectedControl.addingReportingOverflow(
+                MemoryLayout<Int32>.stride)
+        let (expectedTotal, totalOverflow) =
+            arrayBytes.addingReportingOverflow(expectedControlWithToken)
+        guard !controlOverflow, !tokenOverflow, !totalOverflow else {
+            throw CompiledMLXDecoderSnapshotError.byteCountOverflow
+        }
+        guard snapshot.arrayNBytes == arrayBytes,
+            snapshot.controlNBytes == expectedControlWithToken,
+            snapshot.totalNBytes == expectedTotal
+        else {
+            throw CompiledMLXDecoderSnapshotError.invalidSnapshotMetadata
+        }
+    }
+
+    private static func validatePromptTokens(
+        _ tokens: [Int]
+    ) throws {
+        guard !tokens.isEmpty,
+            tokens.allSatisfy({ $0 >= 0 && Int32(exactly: $0) != nil })
+        else {
+            throw CompiledMLXDecoderSnapshotError.invalidPrompt
+        }
+    }
+
+    private static func validateTailTokens(
+        _ tokens: [Int]
+    ) throws {
+        for (position, token) in tokens.enumerated() {
+            guard token >= 0, Int32(exactly: token) != nil else {
+                throw CompiledMLXDecoderSnapshotError
+                    .invalidTailToken(position: position)
+            }
+        }
+    }
+
+    private static func validatedTokenID(
+        _ token: MLXArray
+    ) throws -> Int {
+        guard token.shape == [1], token.dtype == .int32 else {
+            throw CompiledMLXDecoderSnapshotError.invalidNextToken
+        }
+        let value = Int(token.item(Int32.self))
+        guard value >= 0 else {
+            throw CompiledMLXDecoderSnapshotError.invalidNextToken
+        }
+        return value
+    }
+
     public mutating func step(last: Int) -> Int {
         guard let next = pendingNext, let compiledStep else {
             fatalError("CompiledMLXDecoder.step called before prefill")
@@ -212,6 +579,7 @@ public struct CompiledMLXDecoder: Decoder {
         precondition(
             kvCacheKind.supportsSpecDecode,
             "speculative decoding is not qualified for the selected KV-cache tier")
+        snapshotSpeculativeStateActive = true
         var stats = SpecDecodeStats()
         let submitTime = Date().timeIntervalSinceReferenceDate
         guard maxTokens > 0 else {
@@ -367,6 +735,7 @@ public struct CompiledMLXDecoder: Decoder {
     /// stays valid across bench runs — no rebuild, no retrace, no cross-actor resend.
     public mutating func reset() {
         for cache in caches { cache.resetInPlace() }
+        snapshotSpeculativeStateActive = false
         pendingNext = nil
         cachedTokens = 0
     }
