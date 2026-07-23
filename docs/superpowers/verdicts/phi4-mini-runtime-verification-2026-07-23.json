@@ -1,0 +1,250 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-23",
+  "purpose": "phi4-mini-model-scoped-runtime-verification",
+  "draft": false,
+  "promotable": false,
+  "speedAggregation": "forbidden",
+  "verificationMethod": {
+    "mode": "fresh-read-only-authentication-and-documentary-audit",
+    "basis": "Fresh read-only rehash and typed JSON audits of immutable Phi artifacts, including independent authentication of the invalid task-reference boundary. No fresh runtime rerun is claimed.",
+    "freshRuntimeCommandsRun": false,
+    "freshAuthenticationCommandsRun": true,
+    "repoFilesModified": true
+  },
+  "sourceDocuments": [
+    "docs/superpowers/verdicts/2026-07-23-phi4-mini-runtime.md",
+    "docs/superpowers/plans/2026-07-18-fused-compressed-kv-attention.md",
+    "docs/agent-handoff.md",
+    "docs/verification-evidence.md",
+    "docs/content/2026-07-23-the-third-geometry-said-no.md"
+  ],
+  "freshAudit": {
+    "performedAt": "2026-07-23",
+    "result": "PASS",
+    "method": "read-only SHA-256 rehash and typed JSON inspection of immutable bench artifacts",
+    "artifactCountRehashed": 18,
+    "typedBoundariesChecked": [
+      "source-lock",
+      "loaded-8k",
+      "capacity-32k",
+      "capacity-near-128k",
+      "sealed-teacher-and-replays",
+      "invalid-task-reference"
+    ],
+    "allPinnedHashesMatched": true,
+    "runtimeRerun": false
+  },
+  "modelBoundary": {
+    "model": "mlx-community/Phi-4-mini-instruct-4bit",
+    "modelFamily": "Phi-4-mini/Phi3",
+    "modelType": "phi3",
+    "modelRevision": "ac1c269cb4222a4e136a3d09edad301056c1f36a",
+    "checkpointSHA256": "c5ccdee8b3d37fd42c7e42e3e22c47c7549cdaa0b82904bdbfb1a52b31af5ec8",
+    "vocabularyManifestSHA256": "7d8143e8d1f217f392488bddfb4febf2a53b783a2a00bf698b29218865a3620a",
+    "geometry": {
+      "queryHeadCount": 24,
+      "kvHeadCount": 8,
+      "headDimension": 128,
+      "layerCount": 32,
+      "rope": "partial RoPE / longrope",
+      "slidingWindowDisposition": "source-locked inert-window geometry only"
+    },
+    "sourceSequence": {
+      "runtimeAdmissionEngineSHA": "850997e93e37575f4922bf213d558d63c80f1c40",
+      "loadedEvidenceEngineSHA": "9c542ef1d681ee1ea93d22958885ff6a41072a50",
+      "deepCorpusEngineSHA": "19cbb8e7363e0e37ff2cf095406f6876bf28215a",
+      "correctedLongRoPEReferenceEngineSHA": "e29ee4cac7894a10cc6dc532a41f8b5d27f7c034"
+    }
+  },
+  "artifactAudit": {
+    "sourceLockReceiptSHA256": "f5abbbfd3d6989488160c9e5cc775c52aa928881786a6bc8893c48e087d61c2f",
+    "sourceLockCompletionSHA256": "24c9afffd5b5b741e6845dded295eb36974dc6ee4575b73aae93a69796ab9ece",
+    "sourceLockAuthenticatorOutputSHA256": "bff714f37f70e75c8a39df3e34fccd24495b1abe6ee635d090f8481ce978ff05",
+    "speed8KReceiptSHA256": "ced79c0b3d8fc959ef1c83997817b5f02f58da8007584b67fe5b111b79533337",
+    "speed8KManifestSHA256": "c6ebf9eee6a8fa752021405a3259d4d6954509ad8987422bda0f96a48e98b61a",
+    "speed8KCompletionSHA256": "976051ffaf75b5cfdf19896c892b0bc0b2ff25fcd62b1dade52ff3488a5f2a38",
+    "speed8KReceiptSetSHA256": "f1f518288526ead47d86c37bd13e380e8275255748edf8532c8543aa34ab425d",
+    "capacity32KReceiptSHA256": "7251d261075fd14a32b26643d717c7f1a6ab3b246cea28c7b67beb47fe556140",
+    "near128KReceiptSHA256": "eb9ce27f21af30c00bce8cb1aefe8a8a876ecbfde645012ad9592420e5e4a72a",
+    "sealedTeacherManifestSHA256": "7d3263012f891d2eb84f4063efabd07189c44dcf916dae7b62246422191d773d",
+    "fp16QualityStatusSHA256": "bcd57248091f2b6bd1aeb0a7b5ffd889221f2beb960ac7bf8a9a21823372cbb9",
+    "fp16QualityEvidenceSHA256": "a55af6f14b65f4b41c74aee8c680b6dc3a2a20893a6b60ef7ebc99196e78b3e8",
+    "affineQualityStatusSHA256": "abaacaa096ac1b5b6a57d1606f8c92623f609a908f3fd58ad06f7262d0977b8b",
+    "affineQualityEvidenceSHA256": "99b0b19d0ad80030ce81793b357fbf998cce0b7d5049d47d24aa984672158050",
+    "taskBoundaryRawSHA256": "fcbd16fa8f24d05de6f50459394ac658d55cf2025a999b139b89ad9765e486c2",
+    "taskBoundarySummarySHA256": "b2599cee31fa0f76f3a474c41fa5d5375c4cf20b2e7bfa8964df238b3b2555e0",
+    "taskBoundaryStatusSHA256": "846b51dde0a0c8f5507f4d7e8ef5185bb465938c9374020da007e53162b64820",
+    "independentTaskReceiptSHA256": "a2e3f58cde07b760841866bfd1e362efe0a3665e3c8a1a4d1573d49d0d6f5ee7"
+  },
+  "criteria": [
+    {
+      "id": "source_lock_boundary",
+      "claim": "The Phi-4-mini model cycle is bound to an exact source-locked checkpoint and tokenizer, not a mutable cache alias.",
+      "verdict": "PASS",
+      "evidence": {
+        "modelRevision": "ac1c269cb4222a4e136a3d09edad301056c1f36a",
+        "checkpointSHA256": "c5ccdee8b3d37fd42c7e42e3e22c47c7549cdaa0b82904bdbfb1a52b31af5ec8",
+        "vocabularySHA256": "7d8143e8d1f217f392488bddfb4febf2a53b783a2a00bf698b29218865a3620a",
+        "receiptSHA256": "f5abbbfd3d6989488160c9e5cc775c52aa928881786a6bc8893c48e087d61c2f",
+        "completionSHA256": "24c9afffd5b5b741e6845dded295eb36974dc6ee4575b73aae93a69796ab9ece",
+        "authenticatorOutputSHA256": "bff714f37f70e75c8a39df3e34fccd24495b1abe6ee635d090f8481ce978ff05",
+        "configSHA256": "431eafdf55dc6d4a76dc3e9f22b0d06eac42d9ac6dc7cbd7ff8ca1e38f18cdb1",
+        "sourceSHA": "850997e93e37575f4922bf213d558d63c80f1c40",
+        "geometry": "Phi3 Q24/KV8/D128, 32 layers, partial RoPE"
+      }
+    },
+    {
+      "id": "source_registry_load_runtime_support",
+      "claim": "Source, registry/load, runtime, and failure-path support pass only for the exact source-locked inert-window Phi3 geometry.",
+      "verdict": "PASS",
+      "evidence": {
+        "runtimeAdmissionEngineSHA": "850997e93e37575f4922bf213d558d63c80f1c40",
+        "modelType": "phi3",
+        "inertWindowGeometryAccepted": true,
+        "genericSlidingWindowRejected": true,
+        "retainedInterpretation": "model-support closure for this source-locked snapshot only"
+      }
+    },
+    {
+      "id": "generic_sliding_window_support",
+      "claim": "Generic sliding-window configurations remain rejected outside the exact source-locked inert-window geometry.",
+      "verdict": "PASS",
+      "evidence": {
+        "genericSlidingWindowRejected": true,
+        "acceptedException": "source-locked sliding_window 262144 above max_position_embeddings 131072 with use_sliding_window absent",
+        "retainedInterpretation": "unsupported generic path remains fail-closed"
+      }
+    },
+    {
+      "id": "loaded_8k_speed_tier",
+      "claim": "An 8K affine direct speed tier requires the direct row to beat fp16 and its same-storage materialize control under the frozen speed gate.",
+      "verdict": "FAIL",
+      "evidence": {
+        "sourceSHA": "9c542ef1d681ee1ea93d22958885ff6a41072a50",
+        "receiptSHA256": "ced79c0b3d8fc959ef1c83997817b5f02f58da8007584b67fe5b111b79533337",
+        "manifestSHA256": "c6ebf9eee6a8fa752021405a3259d4d6954509ad8987422bda0f96a48e98b61a",
+        "completionSHA256": "976051ffaf75b5cfdf19896c892b0bc0b2ff25fcd62b1dade52ff3488a5f2a38",
+        "receiptSetSHA256": "f1f518288526ead47d86c37bd13e380e8275255748edf8532c8543aa34ab425d",
+        "fp16PrefillTokS": 3540.95,
+        "fp16DecodeTokS": 124.8,
+        "affineMaterializePrefillTokS": 3538.09,
+        "affineMaterializeDecodeTokS": 90.57,
+        "affineDirectPrefillTokS": 2011.61,
+        "affineDirectDecodeTokS": 148.54,
+        "directDecodeVsFP16Pct": 19.022,
+        "directDecodeVsMaterializePct": 64.006,
+        "directPrefillVsFP16Pct": -43.19,
+        "directPrefillVsMaterializePct": -43.144,
+        "retainedInterpretation": "negative/dominated; decode-positive but prefill-regressed, so no speed tier or default route"
+      }
+    },
+    {
+      "id": "loaded_32k_capacity_context",
+      "claim": "The 32K affine direct row may be retained only as non-promotable capacity/runtime context.",
+      "verdict": "NON-PROMOTABLE",
+      "evidence": {
+        "sourceSHA": "9c542ef1d681ee1ea93d22958885ff6a41072a50",
+        "receiptSHA256": "7251d261075fd14a32b26643d717c7f1a6ab3b246cea28c7b67beb47fe556140",
+        "promptTokens": 32628,
+        "generatedTokens": 128,
+        "prefillTokS": 665.969,
+        "decodeTokS": 106.341,
+        "directLayers": 32,
+        "materializationBytes": 0,
+        "promotable": false,
+        "speedAggregation": "forbidden"
+      }
+    },
+    {
+      "id": "near_128k_capacity_context",
+      "claim": "The near-128K affine direct row may be retained only as non-promotable capacity/runtime context.",
+      "verdict": "NON-PROMOTABLE",
+      "evidence": {
+        "sourceSHA": "9c542ef1d681ee1ea93d22958885ff6a41072a50",
+        "receiptSHA256": "eb9ce27f21af30c00bce8cb1aefe8a8a876ecbfde645012ad9592420e5e4a72a",
+        "promptTokens": 130944,
+        "generatedTokens": 128,
+        "totalTokens": 131072,
+        "prefillTokS": 178.917,
+        "decodeTokS": 45.028,
+        "directLayers": 32,
+        "materializationBytes": 0,
+        "promotable": false,
+        "speedAggregation": "forbidden"
+      }
+    },
+    {
+      "id": "sealed_kl_quality",
+      "claim": "Affine direct must clear the frozen teacher-forced non-garbage floor, while a user-selectable quality tier additionally requires the separate paired task gate.",
+      "verdict": "PASS",
+      "evidence": {
+        "sourceSHA": "e29ee4cac7894a10cc6dc532a41f8b5d27f7c034",
+        "teacherManifestSHA256": "7d3263012f891d2eb84f4063efabd07189c44dcf916dae7b62246422191d773d",
+        "fp16StatusSHA256": "bcd57248091f2b6bd1aeb0a7b5ffd889221f2beb960ac7bf8a9a21823372cbb9",
+        "fp16EvidenceSHA256": "a55af6f14b65f4b41c74aee8c680b6dc3a2a20893a6b60ef7ebc99196e78b3e8",
+        "affineStatusSHA256": "abaacaa096ac1b5b6a57d1606f8c92623f609a908f3fd58ad06f7262d0977b8b",
+        "affineEvidenceSHA256": "99b0b19d0ad80030ce81793b357fbf998cce0b7d5049d47d24aa984672158050",
+        "fp16MedianKL": 0.0000431722755329472,
+        "fp16LongContextTailP95": 0.0001386888078761478,
+        "fp16PooledP95": 0.00013062137410403349,
+        "fp16PPLDeltaPct": 0.012199,
+        "fp16CandidateReferencePerplexityRatio": 1.0001219901958758,
+        "fp16Top1": 0.9969512,
+        "affineMedianKL": 0.2148780525232595,
+        "affineLongContextTailP95": 1.6170815710727664,
+        "affinePooledP95": 1.4232502580311548,
+        "affinePPLDeltaPct": 33.1268966,
+        "affineCandidateReferencePerplexityRatio": 1.3312689655657752,
+        "affineTop1": 0.77439024,
+        "deepestScoredContextTokens": 27145,
+        "positionCount": 328,
+        "hardFloor": {
+          "minimumContextTokens": 24000,
+          "maximumCandidateReferencePerplexityRatio": 2.0,
+          "maximumLongContextTailP95Nats": 5.0,
+          "minimumTeacherForcedTop1Agreement": 0.5
+        },
+        "hardFloorPassed": true,
+        "promotable": false,
+        "retainedInterpretation": "teacher-forced non-garbage floor passes with material measured drift; no user-selectable quality tier is available because the paired task reference is inadmissible"
+      }
+    },
+    {
+      "id": "task_replay_boundary",
+      "claim": "The task replay may compare affine to an admissible fp16 reference before loading the model.",
+      "verdict": "FAIL",
+      "evidence": {
+        "sourceSHA": "e29ee4cac7894a10cc6dc532a41f8b5d27f7c034",
+        "rawSHA256": "fcbd16fa8f24d05de6f50459394ac658d55cf2025a999b139b89ad9765e486c2",
+        "summarySHA256": "b2599cee31fa0f76f3a474c41fa5d5375c4cf20b2e7bfa8964df238b3b2555e0",
+        "statusSHA256": "846b51dde0a0c8f5507f4d7e8ef5185bb465938c9374020da007e53162b64820",
+        "independentReceiptSHA256": "a2e3f58cde07b760841866bfd1e362efe0a3665e3c8a1a4d1573d49d0d6f5ee7",
+        "fp16ReferenceAdmissible": false,
+        "affineReplayRefusedBeforeModelLoad": true,
+        "scores": {
+          "math": "8/20",
+          "code": "1/20",
+          "structured": "15/20",
+          "long": "20/20",
+          "syntax": "15/20"
+        },
+        "retainedInterpretation": "authenticated refusal, not candidate promotion"
+      }
+    },
+    {
+      "id": "broad_claim_refusal",
+      "claim": "The model cycle must refuse broad Phi3-family, cross-family, speed-tier, default-setting, or generic sliding-window claims.",
+      "verdict": "PASS",
+      "evidence": {
+        "noSpeedTier": true,
+        "noDefaultRoute": true,
+        "noBroadFamilyClaim": true,
+        "genericSlidingWindowRejected": true,
+        "capacityContextOnly": true,
+        "reason": "8K speed is prefill-dominated, 32K and near-128K are non-promotable capacity rows, affine quality drifts materially, task replay refuses due an inadmissible fp16 reference, and support is limited to the source-locked inert-window geometry."
+      }
+    }
+  ],
+  "overallVerdict": "FINAL MODEL CLOSURE / NO TIER: exact Phi-4-mini/Phi3 source-locked inert-window support and the teacher-forced non-garbage floor pass; generic sliding-window admission, 8K speed promotion, paired task qualification, default routing, and broad claims remain unavailable. The 32K and near-128K affine runtime rows are retained only as non-promotable capacity context with speedAggregation forbidden."
+}

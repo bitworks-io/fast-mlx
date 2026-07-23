@@ -47,7 +47,7 @@ Shelved/rejected cells remain model-specific controls. This is Qwen3-32B-4bit ev
 frozen KVTuner schedule is Qwen-only unless independently calibrated and authenticated for another
 family.
 
-**Compressed-attention loaded qualification — ACTIVE, NOT PROMOTED (2026-07-21):** the portable
+**Compressed-attention loaded qualification — CLOSED, NO TIER (2026-07-23):** the portable
 affine/KVTuner router, direct KVarN K4V2/G128/i8 runtime, and hostile-compaction-safe continuous
 batching are implemented and verified. Clean `cf3248b594da4bfced428347c89b833d928b243b` repaired
 mixed bf16/fp32 KVarN ingress telemetry; its loaded-Qwen smoke completed 3/3 with 64 engaged layers,
@@ -233,44 +233,41 @@ sibling lock unchanged. Verdict:
 Machine-readable verification packet SHA-256 is
 `4dc2870d2f6872fd9a46d85993cf91c24ba0aaab506d0e88da460308b3e912a4`.
 
-**Content practice:** `docs/content/` now has 13 dated pieces. Keep writing one dated content piece per
+The materially different Phi-4-mini / Phi3 Q24/KV8/D128 cycle is also **CLOSED WITHOUT A SPEED OR
+QUALITY TIER**. Exact source-lock and generic sliding-window rejection pass; loaded 8K affine
+direct improved decode to 148.54 tok/s versus fp16 124.80, but regressed prefill 43.19%. Separate
+32K and 131,072-total-token affine runs are non-promotable capacity context only. Corrected
+teacher-forced replay reached 27,145 tokens; affine median KL `0.214878`, pooled p95 `1.423250`,
+perplexity delta `+33.1269%`, and top-1 `254/328` remain above the frozen non-garbage floor while
+making the material loss explicit. The fp16 task reference itself scored code 1/20 and structured
+validity 15/20; independent receipt
+`a2e3f58cde07b760841866bfd1e362efe0a3665e3c8a1a4d1573d49d0d6f5ee7` authenticates the invalid
+reference and `affineReplayRunnable:false`, so no unpaired candidate run is allowed. Verdict:
+[`2026-07-23-phi4-mini-runtime.md`](superpowers/verdicts/2026-07-23-phi4-mini-runtime.md).
+Machine-readable verification packet SHA-256 is
+`52d1865b27c78a69d7c2b4c371f1d8d8d3acf346aaafad4b4d329d2bfe238ef8`.
+This completes the fused compressed-attention engineering gate as model-scoped, explicit-only
+implementation plus negative evidence; it does not authorize a broad/default route.
+
+**Content practice:** `docs/content/` now has 14 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Fused compressed-domain KV attention** — current top engine gate. Preserve v7-v13 and the
-   failed trace; never resume, overwrite, or promote partial evidence. KVarN's direct speed role is
-   SHELVED and its capacity-only role remains. The exact five-cell Qwen 8K matrix completed and
-   failed the unchanged all-block speed gate; retain both affine and KVTuner direct cells as
-   negative/dominated 8K evidence. The first 32K fp16 control failed closed on a retained
-   nominal -> fair transition, so no full 32K speed retry or claim is authorized on this bench
-   under the current unthrottled contract. The separately authenticated 32K KVarN capacity-only
-   context is complete and cannot feed a speed label. The authenticated near-128K refusal is
-   complete at a 131,039-token request against maximum context 40,960. The existing full
-   Llama-3.3-70B source/runtime qualification is now model-scoped and closed: 8K affine direct is
-   negative/dominated, 32K speed is hardware-unavailable, 32K affine is capacity-only context,
-   near-128K is a reviewed memory no-go, and the sealed quality/task lane cannot promote because
-   the scored depth stops at 22,541 tokens and the affine task candidate failed structured
-   validity at 14/20. Keep the Qwen-specific KVTuner schedule unavailable.
-   Both first families share Q64/KV8/D128. The next engine gate is the source-locked Phi-4-mini
-   candidate (Phi3 Q24/KV8/D128 with partial RoPE); prove registry/load/runtime support and retain
-   generic sliding-window rejection except for the exact source-locked inert-window geometry.
-   Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial tier.
-   [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
-2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
+1. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
    [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
-3. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
+2. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
    propagation, dynamic policy boundaries. [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
-4. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
+3. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-5. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
+4. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
    porting the L1/L3/L1b/L3b stack. [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-6. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
+5. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
    MLX checkpoints for the Swift loop. [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-7. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
+6. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
    Metal watchdog. [Task](task-inbox/2026-07-14-long-context-metal-watchdog.md).
-8. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
+7. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
    baselines exist. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 
 **Public evidence/community platform — ROADMAP CAPTURED (2026-07-15).** The

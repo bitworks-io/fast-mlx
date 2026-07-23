@@ -1,7 +1,8 @@
 # Fused compressed-domain KV attention implementation plan
 
-**Status:** active — Phases 0-3 verified; exact-source Qwen 8K is complete-negative, KVarN speed is
-shelved/capacity-only, and Qwen 32K/refusal plus cross-family loaded frontiers remain gated
+**Status:** closed without a speed/default tier — implementation and model-scoped Qwen, Llama,
+and Phi qualification are complete; negative, non-promotable, refusal, and hardware-unavailable
+cells remain preserved exactly
 
 **Technique class:** `LOSSY_FRONTIER`
 
@@ -643,15 +644,21 @@ result, not performance evidence.
   projection exceeds physical RAM at near-128K, so the exact run is NO-GO / NOT RUN.
 - [x] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
   Llama.
-- [ ] Add a third popular, materially different attention geometry before broad/default product
+- [x] Add a third popular, materially different attention geometry before broad/default product
   support claims. The current first candidate is
   [`mlx-community/Phi-4-mini-instruct-4bit`](https://huggingface.co/mlx-community/Phi-4-mini-instruct-4bit/tree/ac1c269cb4222a4e136a3d09edad301056c1f36a)
   at revision `ac1c269cb4222a4e136a3d09edad301056c1f36a`, using its `phi3` registry identity
-  (Q24/KV8/D128, partial RoPE); prove registry/load/runtime support before accepting it. Gemma 3
-  remains the next rotating local/global-cache semantic boundary, not a substitute for that load
-  proof.
-- [ ] Quantify Transparent/Balanced/Max-fit speed/capacity/loss, write verdict/content, verify,
-  review, scan, commit, and merge only if every claimed gate has fresh proof.
+  (Q24/KV8/D128, partial RoPE). Exact source, registry/load, loaded runtime, and fail-closed
+  geometry support now authenticate for the source-locked inert-window checkpoint; generic
+  sliding-window configurations remain rejected. The model earns no speed/default tier because
+  loaded prefill fails the speed gate and the invalid fp16 task reference makes paired task
+  qualification unavailable. Gemma 3 remains the next rotating local/global-cache semantic
+  boundary, not a substitute for this completed load proof.
+- [x] Quantify the model-scoped Transparent/Balanced/Max-fit speed/capacity/loss frontier and
+  prepare the dated verdict/content/verification packet. The result is terminal no-tier evidence:
+  capacity contexts remain non-promotable, teacher-forced quality clears the non-garbage floor
+  with material loss but cannot become a tier without paired task evidence, and no broad/default
+  claim follows. Merge only after the final review, scan, and clean-diff proof below.
 
 ### Loaded-Llama 8K result and long-context scope amendment — 2026-07-23
 
@@ -779,6 +786,65 @@ against the frozen 18/20 floor. Raw/summary/status SHA-256 values are `a171b49d�
 `a50d9105…23fa` and `59183ca4…bbbc`. The strict re-derivation authenticated math 10/20, code 6/20,
 structured 14/20, long retrieval 20/20, `hardFloorPassed:false`, and
 `balancedTaskDeltaPassed:false`. This is terminal negative evidence and cannot promote.
+
+### Phi-4-mini third-geometry closure — 2026-07-23
+
+The third-geometry lane is complete for the exact source-locked
+`mlx-community/Phi-4-mini-instruct-4bit` snapshot at revision
+`ac1c269cb4222a4e136a3d09edad301056c1f36a`. Source-lock receipt
+`f5abbbfd3d6989488160c9e5cc775c52aa928881786a6bc8893c48e087d61c2f`
+binds the checkpoint, tokenizer, `phi3` registry identity, 32-layer Q24/KV8/D128 geometry,
+partial RoPE, and the checkpoint's exact inert `sliding_window == 262144` boundary above
+`max_position_embeddings == 131072`.
+Admission remains exact-source only: changed/active windows and generic sliding-window models
+still fail closed.
+
+The loaded 8K cyclic qualification authenticated 9/9 rows under clean source
+`9c542ef1d681ee1ea93d22958885ff6a41072a50`. fp16, affine materialize, and affine direct
+prefill/decode medians were 3,540.95/124.80, 3,538.09/90.57, and 2,011.61/148.54 tok/s.
+Direct decode improved 19.02% over fp16 and 64.01% over its same-storage control, but prefill
+regressed 43.19% and 43.14%. The unchanged joint speed gate therefore closes
+`NEGATIVE_DOMINATED_SPEED_GATE`; no speed tier or default follows. Independent authentication,
+manifest, completion, and receipt-set SHA-256 values are
+`ced79c0b3d8fc959ef1c83997817b5f02f58da8007584b67fe5b111b79533337`,
+`c6ebf9eee6a8fa752021405a3259d4d6954509ad8987422bda0f96a48e98b61a`,
+`976051ffaf75b5cfdf19896c892b0bc0b2ff25fcd62b1dade52ff3488a5f2a38`, and
+`f1f518288526ead47d86c37bd13e380e8275255748edf8532c8543aa34ab425d`.
+
+Separate affine-direct capacity rows retained 32,628+128 tokens at 665.97/106.34 tok/s and
+130,944+128 tokens at 178.92/45.03 tok/s. Both prove all 32 layers, zero materialization, exact
+storage/workspace telemetry, and explicit memory/cache/wired limits. Both remain
+`promotable:false` with `speedAggregation:"forbidden"`; authentication receipt SHA-256 values are
+`7251d261075fd14a32b26643d717c7f1a6ab3b246cea28c7b67beb47fe556140` and
+`eb9ce27f21af30c00bce8cb1aefe8a8a876ecbfde645012ad9592420e5e4a72a`.
+
+The corrected LongRoPE sealed replay under clean source
+`e29ee4cac7894a10cc6dc532a41f8b5d27f7c034` scored 328 positions through context token 27,145.
+fp16 replay stayed close to its teacher (median KL `0.0000431723`, pooled p95 `0.0001306214`,
+perplexity delta `+0.012199%`, top-1 `327/328`). Affine direct remained finite and above the
+frozen non-garbage hard floor, but its material drift must remain visible: median KL `0.2148781`,
+pooled p95 `1.4232503`, perplexity delta `+33.1269%`, and top-1 `254/328`.
+Teacher-manifest/fp16/affine evidence SHA-256 values are
+`7d3263012f891d2eb84f4063efabd07189c44dcf916dae7b62246422191d773d`,
+`a55af6f14b65f4b41c74aee8c680b6dc3a2a20893a6b60ef7ebc99196e78b3e8`, and
+`99b0b19d0ad80030ce81793b357fbf998cce0b7d5049d47d24aa984672158050`.
+
+The secondary task lane also failed closed before any affine comparison. The authenticated fp16
+baseline scored math 8/20, code 1/20, structured 15/20, long retrieval 20/20, and structured
+validity 15/20. Code is at or below the frozen 25% reference floor and structured validity is
+below 90%, so the core candidate admission would reject the reference before model load.
+Independent receipt
+`a2e3f58cde07b760841866bfd1e362efe0a3665e3c8a1a4d1573d49d0d6f5ee7`
+authenticates all 80 raw rows, the summary, terminal failure, owners, and preserved locks while
+recording `affineReplayRunnable:false`. Do not weaken the floor or run an unpaired affine task
+replay.
+
+This closes the third-geometry engineering gate without a model tier. It proves that the
+source-locked runtime and direct-attention contracts are portable to materially different head
+geometry while rejecting the measured speed frontier and refusing an unpaired task comparison.
+The teacher-forced row stays available as above-floor, explicitly lossy evidence; it cannot become
+a user-selectable tier without the paired task gate. Nothing here justifies a cross-family speed
+claim, a default, or a reusable KVTuner schedule.
 
 ## Security, maintenance, and rollback
 
