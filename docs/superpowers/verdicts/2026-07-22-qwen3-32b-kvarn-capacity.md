@@ -67,7 +67,9 @@ with PLD. Qwen's 8K speed result remains negative, its 32K speed evidence remain
 the frozen unthrottled contract, and its near-128K request remains an authenticated model-limit
 refusal.
 
-The next model-family gate is the source-locked Llama-3.3-70B-Instruct-4bit snapshot. Only its
-revision ref is cached. Downloading the roughly 40 GiB model/tokenizer snapshot requires explicit
-operator approval; the Qwen-specific KVTuner schedule cannot be reused without independent
-calibration.
+The next model-family gate is Llama-3.3-70B-Instruct-4bit. The complete local snapshot was
+subsequently source-admitted at exact revision
+`de2dfaf56839b7d0e834157d2401dee02726874d`; see
+[`2026-07-23-llama3-70b-source-lock.md`](2026-07-23-llama3-70b-source-lock.md).
+Proceed with loaded 8K/32K/near-128K evidence. The Qwen-specific KVTuner schedule cannot be reused
+without independent calibration.

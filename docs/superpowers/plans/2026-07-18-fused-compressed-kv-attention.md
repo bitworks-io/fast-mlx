@@ -623,14 +623,17 @@ result, not performance evidence.
   refused 130,911+128 before driver/model/KV allocation; v15 remains preserved fail-closed evidence.
 - [x] At 8K, run only the amended five-cell speed scope: fp16 plus affine K4V2-g64 and frozen
   KVTuner materialize/direct pairs.
-- [ ] At 32K, collect KVarN i8 only as separate authenticated capacity/runtime context with no
+- [x] At 32K, collect KVarN i8 only as separate authenticated capacity/runtime context with no
   speed aggregation or label. Do not relaunch the five-cell speed matrix.
-- [ ] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
+- [x] Preserve negative/dominated and hard-floor-failed rows rather than filtering the matrix.
 
 ### Phase 5 — second family and adjudication
 
-- [ ] Source-lock the selected Llama-3.3-70B-family checkpoint and repeat the applicable 8K
-  smoke/32K/near-128K gate with prompt+output <= 131,072.
+- [x] Source-lock the selected Llama-3.3-70B-family checkpoint. Clean `dcfbbe3` authenticated the
+  exact 15-file/eight-shard snapshot and tokenizer at revision
+  `de2dfaf56839b7d0e834157d2401dee02726874d`; receipt SHA-256 is
+  `145127546c6c9872e80512716494eed77905d6e3ddd398c47c8f34a5ec796a4f`.
+- [ ] Repeat the applicable loaded 8K smoke/32K/near-128K gate with prompt+output <= 131,072.
 - [ ] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
   Llama.
 - [ ] Add a third popular, materially different attention geometry before broad/default product

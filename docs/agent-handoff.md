@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-22
+Last reviewed: 2026-07-23
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -191,10 +191,20 @@ Its 10.38 prefill and 4.934 decode tok/s are non-promotable capacity context onl
 Durable terminal-verification receipt SHA-256 is
 `168da54a58ef6b1b0aede8beda2564f4da24c232c9c8dc563933e11a8f6b328f`.
 
-The source-locked Llama-3.3-70B-Instruct-4bit cache currently contains only its revision ref,
-`de2dfaf56839b7d0e834157d2401dee02726874d`; the model/tokenizer snapshot is absent. Advancing that
-family requires operator approval to download roughly 40 GiB. The Swift harness does not require a
-Python MLX runtime install for this gate.
+The source-locked Llama-3.3-70B-Instruct-4bit snapshot is now **ADMITTED, NOT RUNTIME-QUALIFIED**.
+No download was needed: the complete 39,706,010,909-byte flat snapshot already existed on
+`llmbench`. Clean `dcfbbe39c1ee3ee5e9119820ec67994e196968c0` added a fail-closed offline
+authenticator; its 11 focused tests, focused review, and staged gitleaks passed. The one-shot
+boundary at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-llama3-70b-source-dcfbbe3/source-lock-v1`
+authenticated exact public repo/revision, official API response, cached tree and per-file metadata,
+all 15 files/eight shards, tokenizer, checkpoint index, and Llama Q64/KV8/D128/80-layer/131,072
+geometry. Receipt/completion SHA-256 values are
+`145127546c6c9872e80512716494eed77905d6e3ddd398c47c8f34a5ec796a4f` and
+`f2e9082ac048f36157d1e5d05ca7c513fab9b8cad4dc1fe681e5d76b58eaf7af`.
+Checkpoint-content `5083c6af…be1400` and tokenizer `da67fb22…be58ab` match phase 0. This admits
+source only; it cannot promote runtime, loss, capacity, speed, or a tier. Verdict:
+[`2026-07-23-llama3-70b-source-lock.md`](superpowers/verdicts/2026-07-23-llama3-70b-source-lock.md).
 
 **Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
 notable spike, including negative results.
@@ -209,10 +219,11 @@ notable spike, including negative results.
    nominal -> fair transition, so no full 32K speed retry or claim is authorized on this bench
    under the current unthrottled contract. The separately authenticated 32K KVarN capacity-only
    context is complete and cannot feed a speed label. The authenticated near-128K refusal is
-   complete at a 131,039-token request against maximum context 40,960. After explicit operator
-   approval for the roughly 40 GiB snapshot, download, hash, and qualify source-locked
-   Llama-3.3-70B at
-   8K/32K/near-128K without the Qwen-specific KVTuner schedule unless independently calibrated.
+   complete at a 131,039-token request against maximum context 40,960. The existing full
+   Llama-3.3-70B snapshot is now source-admitted at exact revision
+   `de2dfaf56839b7d0e834157d2401dee02726874d`; proceed with fresh loaded
+   8K/32K/near-128K qualification without the Qwen-specific KVTuner schedule unless independently
+   calibrated.
    Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support
    claim. Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial
@@ -296,9 +307,9 @@ bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
 ```
 
-Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; only the
-Llama-3.3-70B-Instruct-4bit revision ref is cached, not its model/tokenizer snapshot; no Qwen3-32B
-BF16 target). Python: `~/harness-venv`
+Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; the complete,
+source-locked Llama-3.3-70B-Instruct-4bit model/tokenizer snapshot is admitted at revision
+`de2dfaf56839b7d0e834157d2401dee02726874d`; no Qwen3-32B BF16 target). Python: `~/harness-venv`
 (`transformers<5`).
 
 ## Commit / Checkin

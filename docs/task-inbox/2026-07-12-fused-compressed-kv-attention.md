@@ -72,8 +72,9 @@ plan. Phase 0 is complete at clean `07219679280abd2f7cefbeef86b71bbec018a1c2`; t
 router, actor-confined affine/KVTuner scalar runtime, and hostile-compaction-safe compressed batch
 path are clean and verified at `5e6abb6ebf13ea8641b26638278680e99884adea`. The exact-content
 provenance migration intentionally rejects the historical KVTuner bundle for new-runtime evidence.
-Finish its fresh manifest -> sensitivity -> 64-candidate -> search -> bundle chain, implement and
-prove KVarN i8 direct packed attention without materialization, then run the loaded-model Qwen
-8K/32K plus 128K refusal and Llama 8K/32K/near-128K frontiers. Preserve the same-workload
-speed/capacity/teacher-forced-loss/task-floor contract and do not promote from implementation tests
-or synthetic geometry.
+Qwen's loaded 8K/32K/refusal and separate KVarN capacity lanes are closed as model-scoped evidence.
+The existing full Llama-3.3-70B snapshot is source-admitted at exact revision
+`de2dfaf56839b7d0e834157d2401dee02726874d`. Run its loaded 8K/32K/near-128K frontier next, without
+the Qwen-specific KVTuner schedule absent independent Llama calibration. Preserve the same-workload
+speed/capacity/teacher-forced-loss/task-floor contract and do not promote from source admission,
+implementation tests, synthetic geometry, or partial runtime evidence.
