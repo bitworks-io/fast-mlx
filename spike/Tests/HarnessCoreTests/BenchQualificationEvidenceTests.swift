@@ -538,6 +538,44 @@ final class BenchQualificationEvidenceTests: XCTestCase {
     }
   }
 
+  func testDirectCompressedCapacityRouteAdmitsOnlyClosedRuntimeCells() throws {
+    let affine = try XCTUnwrap(BenchDirectCompressedCapacityRoute(
+      tier: "affine-k4v2-g64",
+      request: .splitAffineQuantizedMM))
+    XCTAssertEqual(affine.kind, .affine)
+    XCTAssertEqual(affine.counterPrefix, "affine")
+    XCTAssertEqual(affine.groupSize, 64)
+
+    let kvarn = try XCTUnwrap(BenchDirectCompressedCapacityRoute(
+      tier: "kvarn-k4v2-g128",
+      request: .splitKVarNQuantizedMM))
+    XCTAssertEqual(kvarn.kind, .kvarn)
+    XCTAssertEqual(kvarn.counterPrefix, "kvarn")
+    XCTAssertEqual(kvarn.groupSize, 128)
+    XCTAssertNotNil(BenchDirectCompressedCapacityRoute(
+      tier: "kvarn-k4v2-g128-i16",
+      request: .splitKVarNQuantizedMM))
+
+    for rejected in [
+      ("affine-k4v2-g128", CompressedKVAttentionRequest.splitAffineQuantizedMM),
+      ("affine-k8v2-g64", .splitAffineQuantizedMM),
+      ("affine-k4v2-g64", .materialize),
+      ("affine-k4v2-g64", .splitKVarNQuantizedMM),
+      ("kvarn-k4v2-g128", .materialize),
+      ("kvarn-k4v2-g128", .splitAffineQuantizedMM),
+      ("fp16", .splitAffineQuantizedMM),
+      ("kvtuner-g128-b3.046875", .splitAffineQuantizedMM),
+      ("unknown-kv", .splitAffineQuantizedMM),
+    ] {
+      XCTAssertNil(BenchDirectCompressedCapacityRoute(
+        tier: rejected.0,
+        request: rejected.1))
+    }
+    XCTAssertNil(BenchDirectCompressedCapacityRoute(
+      tier: "affine-k4v2-g64",
+      request: nil))
+  }
+
   private func qualificationContext(
     runnerManifestSHA256: String? = nil,
     matrixBlockIndex: Int = 2,

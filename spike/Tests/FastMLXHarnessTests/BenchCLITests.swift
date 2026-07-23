@@ -189,6 +189,7 @@ final class BenchCLITests: XCTestCase {
             "--matrix-id", "fused-kv-qwen3-32b-v1",
             "--workload-nonce", "qwen3-32b-32k-capacity-v1",
             "--runs", "1",
+            "--max-tokens", "128",
             "--capacity-evidence", "true",
             "--runner-manifest-sha256", runnerManifestSHA256,
             "--memory-limit-bytes", "9000",
@@ -214,6 +215,37 @@ final class BenchCLITests: XCTestCase {
                 modelResidencyPolicy: .loadOncePerProcess,
                 processIsolationPolicy: .freshProcessPerMatrixPosition))
         XCTAssertEqual(plan.workload.iterations, 2)
+        XCTAssertNil(plan.csvPath)
+    }
+
+    func testCapacityOnlyBenchPlanAcceptsAffineDirectCapacityLane()
+        throws
+    {
+        let plan = try parseBenchPlan(Flags([
+            "--model", "/models/Qwen3-32B-4bit",
+            "--kv-quant", "affine-k4v2-g64",
+            "--cell-id", "affine-k4v2-g64",
+            "--matrix-id", "fused-kv-qwen3-32b-v1",
+            "--workload-nonce", "qwen3-32b-32k-capacity-v1",
+            "--runs", "1",
+            "--max-tokens", "128",
+            "--capacity-evidence", "true",
+            "--runner-manifest-sha256", runnerManifestSHA256,
+            "--memory-limit-bytes", "9000",
+            "--cache-limit-bytes", "8000",
+            "--wired-limit-bytes", "10000",
+            "--model-tokenizer-sha256", modelTokenizerSHA256,
+            "--capacity-expected-prompt-tokens", "32628",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))
+
+        XCTAssertNil(plan.qualificationContext)
+        XCTAssertEqual(plan.kvQuantTier, "affine-k4v2-g64")
+        XCTAssertEqual(
+            plan.compressedKVAttention,
+            .splitAffineQuantizedMM)
+        XCTAssertEqual(plan.maxTokens, 128)
         XCTAssertNil(plan.csvPath)
     }
 
@@ -257,7 +289,7 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
-    func testCapacityOnlyBenchRequiresDirectKVarNAndRejectsSpeedCSV() {
+    func testCapacityOnlyBenchRequiresDirectCompressedKVAndRejectsSpeedCSV() {
         let base = [
             "--model", "/models/Qwen3-32B-4bit",
             "--matrix-id", "fused-kv-qwen3-32b-v1",
@@ -275,7 +307,7 @@ final class BenchCLITests: XCTestCase {
         XCTAssertThrowsError(try parseBenchPlan(Flags(base))) {
             XCTAssertEqual(
                 $0 as? BenchCLIError,
-                .capacityEvidenceRequiresKVarNDirect)
+                .capacityEvidenceRequiresDirectCompressedKV)
         }
 
         let kvarn = base + [
@@ -286,13 +318,47 @@ final class BenchCLITests: XCTestCase {
         XCTAssertThrowsError(try parseBenchPlan(Flags(kvarn))) {
             XCTAssertEqual(
                 $0 as? BenchCLIError,
-                .capacityEvidenceRequiresKVarNDirect)
+                .capacityEvidenceRequiresDirectCompressedKV)
+        }
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--kv-quant", "affine-k4v2-g128",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .capacityEvidenceRequiresDirectCompressedKV)
+        }
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+            "--max-tokens", "127",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .invalidCapacityMaxTokens(127))
+        }
+
+        XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
+            "--kv-quant", "affine-k4v2-g64",
+            "--kv-attention", "split-affine-quantized-mm",
+            "--checkpoint-content-sha256", checkpointContentSHA256,
+            "--max-tokens", "128",
+            "--prompt", "A custom capacity prompt",
+        ]))) {
+            XCTAssertEqual(
+                $0 as? BenchCLIError,
+                .unauditedCapacityPrompt)
         }
 
         XCTAssertThrowsError(try parseBenchPlan(Flags(base + [
             "--kv-quant", "kvarn-k4v2-g128",
             "--kv-attention", "split-kvarn-quantized-mm",
             "--checkpoint-content-sha256", checkpointContentSHA256,
+            "--max-tokens", "128",
             "--csv", "/tmp/capacity-speed.csv",
         ]))) {
             XCTAssertEqual(
@@ -1178,6 +1244,16 @@ final class BenchCLITests: XCTestCase {
         }
     }
 
+    func testTypedCapacityValidatorAcceptsACompleteAffineDirectRow()
+        throws
+    {
+        let row = try capacityValidationRow(kvQuantTier: "affine-k4v2-g64")
+
+        XCTAssertNoThrow(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: row)))
+    }
+
     func testTypedCapacityValidatorRejectsForgedMemoryAggregateAndWorkloadIdentity()
         throws
     {
@@ -1223,6 +1299,166 @@ final class BenchCLITests: XCTestCase {
         XCTAssertThrowsError(
             try validateBenchCapacityEvidenceData(
                 JSONSerialization.data(withJSONObject: forgedRuntime))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .capacityRuntimeTelemetryMismatch)
+        }
+    }
+
+    func testTypedCapacityValidatorRejectsAffineEarlyStopForgedTokensLayerAndWorkspace()
+        throws
+    {
+        var earlyStop = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        var payload = try XCTUnwrap(
+            earlyStop["payload"] as? [String: Any])
+        payload["generatedTokenCountsByRun"] = [127]
+        earlyStop["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: earlyStop))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .invalidCapacityMeasurementEvidence)
+        }
+
+        var forgedTokens = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        payload = try XCTUnwrap(
+            forgedTokens["payload"] as? [String: Any])
+        var engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement["affine_tokens"] = 32_755
+        payload["engagementMax"] = engagement
+        forgedTokens["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedTokens))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .capacityRuntimeTelemetryMismatch)
+        }
+
+        var forgedLayer = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        payload = try XCTUnwrap(
+            forgedLayer["payload"] as? [String: Any])
+        engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement["affine_layers"] = 1
+        payload["engagementMax"] = engagement
+        forgedLayer["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedLayer))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .capacityRuntimeTelemetryMismatch)
+        }
+
+        var forgedWorkspace = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        payload = try XCTUnwrap(
+            forgedWorkspace["payload"] as? [String: Any])
+        engagement = try XCTUnwrap(
+            payload["engagementMax"] as? [String: Any])
+        engagement["affine_attention_workspace_bytes"] = 0
+        engagement["affine_workspace_bytes"] = 0
+        payload["engagementMax"] = engagement
+        forgedWorkspace["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: forgedWorkspace)))
+    }
+
+    func testTypedCapacityValidatorRejectsUnsupportedDirectCapacityRoutes()
+        throws
+    {
+        for tier in [
+            "affine-k4v2-g128",
+            "fp16",
+            "kvtuner-g128-b3.046875",
+        ] {
+            var row = try capacityValidationRow(
+                kvQuantTier: "affine-k4v2-g64")
+            var payload = try XCTUnwrap(row["payload"] as? [String: Any])
+            payload["kvQuantTier"] = tier
+            payload["cellID"] = tier
+            row["payload"] = payload
+
+            XCTAssertThrowsError(
+                try validateBenchCapacityEvidenceData(
+                    JSONSerialization.data(withJSONObject: row))) {
+                XCTAssertEqual(
+                    $0 as? BenchQualificationEvidenceValidationError,
+                    .capacityEvidenceRequiresDirectCompressedKV)
+            }
+        }
+
+        var materialized = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        var payload = try XCTUnwrap(
+            materialized["payload"] as? [String: Any])
+        var binding = try XCTUnwrap(
+            payload["compressedKVAttention"] as? [String: Any])
+        binding["request"] = "materialize"
+        binding["observedOperation"] = "materialized-kv"
+        payload["compressedKVAttention"] = binding
+        materialized["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: materialized))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .capacityEvidenceRequiresDirectCompressedKV)
+        }
+
+        var withSchedule = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        payload = try XCTUnwrap(withSchedule["payload"] as? [String: Any])
+        payload["kvtunerSchedule"] = [
+            "schemaVersion": 4,
+            "scheduleSchemaVersion": 4,
+        ]
+        withSchedule["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: withSchedule)))
+    }
+
+    func testTypedCapacityValidatorBoundsPromptRepeatAndRevalidatesAffineGeometry()
+        throws
+    {
+        var oversizedPrompt = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        var payload = try XCTUnwrap(
+            oversizedPrompt["payload"] as? [String: Any])
+        payload["promptRepeat"] = 4_097
+        oversizedPrompt["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(withJSONObject: oversizedPrompt))) {
+            XCTAssertEqual(
+                $0 as? BenchQualificationEvidenceValidationError,
+                .invalidCapacityWorkloadEvidence)
+        }
+
+        var unsupportedGeometry = try capacityValidationRow(
+            kvQuantTier: "affine-k4v2-g64")
+        payload = try XCTUnwrap(
+            unsupportedGeometry["payload"] as? [String: Any])
+        var binding = try XCTUnwrap(
+            payload["compressedKVAttention"] as? [String: Any])
+        var admission = try XCTUnwrap(
+            binding["admission"] as? [String: Any])
+        admission["headDimension"] = 96
+        binding["admission"] = admission
+        payload["compressedKVAttention"] = binding
+        unsupportedGeometry["payload"] = payload
+        XCTAssertThrowsError(
+            try validateBenchCapacityEvidenceData(
+                JSONSerialization.data(
+                    withJSONObject: unsupportedGeometry))) {
             XCTAssertEqual(
                 $0 as? BenchQualificationEvidenceValidationError,
                 .capacityRuntimeTelemetryMismatch)
@@ -1558,18 +1794,36 @@ final class BenchCLITests: XCTestCase {
         ]
     }
 
-    private func capacityValidationRow() throws -> [String: Any] {
+    private func capacityValidationRow(
+        kvQuantTier: String = "kvarn-k4v2-g128"
+    ) throws -> [String: Any] {
         var row = try qualificationValidationRow(
-            kvQuantTier: "kvarn-k4v2-g128")
+            kvQuantTier: kvQuantTier)
         var payload = try XCTUnwrap(row["payload"] as? [String: Any])
         payload.removeValue(forKey: "qualification")
-        var engagement = try XCTUnwrap(
-            payload["engagementMax"] as? [String: Any])
-        engagement["kvarn_tokens"] = 32_756
-        engagement["kvarn_completed_tiles"] = 254
-        engagement["kvarn_compressed_tokens"] = 32_512
-        engagement["kvarn_capacity_tokens"] = 32_768
-        payload["engagementMax"] = engagement
+        if kvQuantTier == "affine-k4v2-g64" {
+            payload["engagementMax"] = [
+                "affine_tokens": 32_756,
+                "affine_layers": 2,
+                "affine_capacity_tokens": 32_768,
+                "affine_payload_bytes": 1_000,
+                "affine_metadata_bytes": 100,
+                "affine_control_bytes": 4,
+                "affine_workspace_bytes": 200,
+                "affine_materialization_bytes": 0,
+                "affine_attention_workspace_bytes": 200,
+                "affine_attention_split": 1,
+                "affine_attention_materialized": 0,
+            ]
+        } else {
+            var engagement = try XCTUnwrap(
+                payload["engagementMax"] as? [String: Any])
+            engagement["kvarn_tokens"] = 32_756
+            engagement["kvarn_completed_tiles"] = 254
+            engagement["kvarn_compressed_tokens"] = 32_512
+            engagement["kvarn_capacity_tokens"] = 32_768
+            payload["engagementMax"] = engagement
+        }
 
         let capacity = try BenchCapacityEvidence(
             context: BenchCapacityEvidenceContext(
@@ -1611,11 +1865,10 @@ final class BenchCLITests: XCTestCase {
             JSONSerialization.jsonObject(with: encoder.encode(capacity))
                 as? [String: Any])
         payload["workloadNonce"] = "qwen3-32b-32k-capacity-v1"
-        payload["workloadPromptSHA256"] = [
-            String(repeating: "5", count: 64),
-            String(repeating: "6", count: 64),
-        ]
         payload["promptRepeat"] = 816
+        payload["workloadPromptSHA256"] = try capacityPromptHashes(
+            promptRepeat: 816,
+            workloadNonce: "qwen3-32b-32k-capacity-v1")
         payload["prefillTokS"] = 3_262.8
         payload["prefillMs"] = 10_000.0
         payload["promptTokensMin"] = 32_628
@@ -1642,6 +1895,19 @@ final class BenchCLITests: XCTestCase {
         row["subcommand"] = "bench-capacity"
         row["payload"] = payload
         return row
+    }
+
+    private func capacityPromptHashes(
+        promptRepeat: Int,
+        workloadNonce: String
+    ) throws -> [String] {
+        let prompt = Array(repeating: defaultBenchPrompt, count: promptRepeat)
+            .joined(separator: "\n")
+        let workload = try BenchWorkloadIdentity(
+            basePrompt: prompt,
+            nonce: workloadNonce,
+            iterations: 2)
+        return workload.prompts.map { sha256Hex(Data($0.utf8)) }
     }
 
     func testBenchCSVReadFailureIsNotTreatedAsAnEmptyFile() throws {

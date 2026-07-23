@@ -9,6 +9,7 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     case missingWorkloadNonce
     case tierCellMismatch(tier: String, cell: String)
     case unauditedKVTunerPrompt
+    case unauditedCapacityPrompt
     case invalidPromptRepeat(Int)
     case contextLimitExceeded(
         promptTokens: Int, maxTokens: Int, limit: Int)
@@ -18,9 +19,10 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
     case conflictingEvidenceModes
     case capacityEvidenceIncludesQualificationFlags
     case qualificationEvidenceIncludesCapacityFlags
-    case capacityEvidenceRequiresKVarNDirect
+    case capacityEvidenceRequiresDirectCompressedKV
     case capacityEvidenceCannotWriteCSV
     case invalidCapacityExpectedPromptTokens(Int)
+    case invalidCapacityMaxTokens(Int)
     case qualificationFlagsWithoutQualification
     case missingQualificationFlag(String)
     case invalidPostWarmupThermalTarget(String)
@@ -56,6 +58,8 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "bench requires --kv-quant and --cell-id to identify the same executed tier; got \(tier) and \(cell)"
         case .unauditedKVTunerPrompt:
             return "KVTuner bench accepts only the audited built-in prompt; custom --prompt needs a separately authenticated source identity"
+        case .unauditedCapacityPrompt:
+            return "capacity-only bench accepts only the built-in prompt whose salted bytes can be independently reconstructed"
         case .invalidPromptRepeat(let value):
             return "bench --prompt-repeat must be between 1 and 4096; actual=\(value)"
         case .contextLimitExceeded(
@@ -73,12 +77,14 @@ enum BenchCLIError: Error, Equatable, CustomStringConvertible {
             return "capacity-only bench cannot accept matrix-position or thermal-qualification flags"
         case .qualificationEvidenceIncludesCapacityFlags:
             return "speed qualification cannot accept capacity-only workload flags"
-        case .capacityEvidenceRequiresKVarNDirect:
-            return "capacity-only bench requires a KVarN tier with --kv-attention split-kvarn-quantized-mm"
+        case .capacityEvidenceRequiresDirectCompressedKV:
+            return "capacity-only bench requires an admitted direct compressed-KV capacity tier/route"
         case .capacityEvidenceCannotWriteCSV:
             return "capacity-only bench cannot write speed CSV output"
         case .invalidCapacityExpectedPromptTokens(let value):
             return "capacity-only bench requires a positive exact --capacity-expected-prompt-tokens value; actual=\(value)"
+        case .invalidCapacityMaxTokens(let value):
+            return "capacity-only bench requires exact --max-tokens 128; actual=\(value)"
         case .qualificationFlagsWithoutQualification:
             return "bench evidence identity/memory flags require --qualification-evidence true or --capacity-evidence true"
         case .missingQualificationFlag(let flag):
@@ -136,7 +142,7 @@ enum BenchQualificationEvidenceValidationError:
     case unexpectedCapacityEvidence
     case missingCapacityEvidence
     case unexpectedQualificationEvidence
-    case capacityEvidenceRequiresKVarN
+    case capacityEvidenceRequiresDirectCompressedKV
     case missingCapacityMemoryEvidence
     case invalidCapacityWorkloadEvidence
     case invalidCapacityMeasurementEvidence
@@ -254,21 +260,21 @@ func validateBenchCapacityEvidenceData(_ data: Data) throws {
         throw BenchQualificationEvidenceValidationError
             .missingCapacityEvidence
     }
-    guard let capacityCell = KVarNKVRuntimeCell(
-        rawValue: record.payload.kvQuantTier)
-    else {
-        throw BenchQualificationEvidenceValidationError
-            .capacityEvidenceRequiresKVarN
-    }
     guard record.payload.kvtunerSchedule == nil,
         let runtimeBinding = record.payload.compressedKVAttention
     else {
         throw BenchQualificationEvidenceValidationError
-            .capacityEvidenceRequiresKVarN
+            .capacityEvidenceRequiresDirectCompressedKV
     }
     try runtimeBinding.validated()
-    guard runtimeBinding.request == .splitKVarNQuantizedMM,
-        runtimeBinding.admission.modelConfigHash
+    guard let capacityRoute = BenchDirectCompressedCapacityRoute(
+        tier: record.payload.kvQuantTier,
+        request: runtimeBinding.request)
+    else {
+        throw BenchQualificationEvidenceValidationError
+            .capacityEvidenceRequiresDirectCompressedKV
+    }
+    guard runtimeBinding.admission.modelConfigHash
             == record.provenance.modelConfigHash,
         runtimeBinding.admission.checkpointManifestHash
             == record.provenance.modelCheckpointManifestHash
@@ -282,12 +288,30 @@ func validateBenchCapacityEvidenceData(_ data: Data) throws {
         throw BenchQualificationEvidenceValidationError
             .tokenizerIdentityMismatch
     }
-    guard let engagementMax = record.payload.engagementMax,
-        let expectedStorageDType =
-            runtimeBinding.admission.modelNativeDType
-    else {
+    guard let engagementMax = record.payload.engagementMax else {
         throw BenchCLIError.missingLossyEngagement(
             record.payload.kvQuantTier)
+    }
+    let expectedStorageDType: CompressedKVModelNativeDType?
+    switch capacityRoute.kind {
+    case .affine:
+        do {
+            try runtimeBinding.admission.validateAffineGeometry(
+                keyGroupSize: capacityRoute.groupSize,
+                valueGroupSize: capacityRoute.groupSize)
+        } catch {
+            throw BenchQualificationEvidenceValidationError
+                .capacityRuntimeTelemetryMismatch
+        }
+        expectedStorageDType = nil
+    case .kvarn:
+        guard let modelNativeDType =
+            runtimeBinding.admission.modelNativeDType
+        else {
+            throw BenchCLIError.missingLossyEngagement(
+                record.payload.kvQuantTier)
+        }
+        expectedStorageDType = modelNativeDType
     }
     let engagement = EngagementCounters(engagementMax)
     try validateBenchRuntimeEngagement(
@@ -305,15 +329,30 @@ func validateBenchCapacityEvidenceData(_ data: Data) throws {
         let promptHashes = record.payload.workloadPromptSHA256,
         promptHashes.count == 2,
         promptHashes.allSatisfy(isLowercaseSHA256),
-        (record.payload.promptRepeat ?? 0) > 0
+        let promptRepeat = record.payload.promptRepeat,
+        (1 ... 4_096).contains(promptRepeat)
     else {
+        throw BenchQualificationEvidenceValidationError
+            .invalidCapacityWorkloadEvidence
+    }
+    let expectedPrompt = Array(
+        repeating: defaultBenchPrompt,
+        count: promptRepeat
+    ).joined(separator: "\n")
+    let expectedWorkload = try BenchWorkloadIdentity(
+        basePrompt: expectedPrompt,
+        nonce: workloadNonce,
+        iterations: 2)
+    guard promptHashes == expectedWorkload.prompts.map({
+        sha256Hex(Data($0.utf8))
+    }) else {
         throw BenchQualificationEvidenceValidationError
             .invalidCapacityWorkloadEvidence
     }
 
     guard record.payload.measuredRuns == 1,
         let maxTokens = record.payload.maxTokens,
-        maxTokens > 0,
+        maxTokens == 128,
         let promptTokenCounts = record.payload.promptTokenCountsByRun,
         promptTokenCounts.count == 1,
         let promptTokenCount = promptTokenCounts.first,
@@ -348,8 +387,7 @@ func validateBenchCapacityEvidenceData(_ data: Data) throws {
         let generatedTokenCounts = record.payload.generatedTokenCountsByRun,
         generatedTokenCounts.count == 1,
         let generatedTokenCount = generatedTokenCounts.first,
-        generatedTokenCount > 0,
-        generatedTokenCount <= maxTokens,
+        generatedTokenCount == 128,
         let topLevelPrefillRate = record.payload.prefillTokS,
         topLevelPrefillRate.isFinite,
         topLevelPrefillRate > 0,
@@ -367,25 +405,47 @@ func validateBenchCapacityEvidenceData(_ data: Data) throws {
 
     let (expectedCachedTokens, cachedTokenOverflow) = promptTokenCount
         .addingReportingOverflow(generatedTokenCount)
-    let postSinkTokens = max(
-        0, expectedCachedTokens - capacityCell.tier.sinkTokens)
-    let expectedCompletedTiles =
-        postSinkTokens / capacityCell.tier.groupSize
-    let (expectedCompressedTokens, compressedTokenOverflow) =
-        expectedCompletedTiles.multipliedReportingOverflow(
-            by: capacityCell.tier.groupSize)
-    guard !cachedTokenOverflow,
-        !compressedTokenOverflow,
-        engagement.counts["kvarn_tokens"] == expectedCachedTokens,
-        (engagement.counts["kvarn_capacity_tokens"] ?? -1)
-            >= expectedCachedTokens,
-        engagement.counts["kvarn_completed_tiles"]
-            == expectedCompletedTiles,
-        engagement.counts["kvarn_compressed_tokens"]
-            == expectedCompressedTokens
-    else {
+    guard !cachedTokenOverflow else {
         throw BenchQualificationEvidenceValidationError
             .capacityRuntimeTelemetryMismatch
+    }
+    switch capacityRoute.kind {
+    case .affine:
+        guard engagement.counts["affine_tokens"] == expectedCachedTokens,
+            (engagement.counts["affine_capacity_tokens"] ?? -1)
+                >= expectedCachedTokens,
+            engagement.counts["affine_layers"]
+                == runtimeBinding.admission.layerCount
+        else {
+            throw BenchQualificationEvidenceValidationError
+                .capacityRuntimeTelemetryMismatch
+        }
+    case .kvarn:
+        guard let capacityCell = KVarNKVRuntimeCell(
+            rawValue: record.payload.kvQuantTier)
+        else {
+            throw BenchQualificationEvidenceValidationError
+                .capacityEvidenceRequiresDirectCompressedKV
+        }
+        let postSinkTokens = max(
+            0, expectedCachedTokens - capacityCell.tier.sinkTokens)
+        let expectedCompletedTiles =
+            postSinkTokens / capacityCell.tier.groupSize
+        let (expectedCompressedTokens, compressedTokenOverflow) =
+            expectedCompletedTiles.multipliedReportingOverflow(
+                by: capacityCell.tier.groupSize)
+        guard !compressedTokenOverflow,
+            engagement.counts["kvarn_tokens"] == expectedCachedTokens,
+            (engagement.counts["kvarn_capacity_tokens"] ?? -1)
+                >= expectedCachedTokens,
+            engagement.counts["kvarn_completed_tiles"]
+                == expectedCompletedTiles,
+            engagement.counts["kvarn_compressed_tokens"]
+                == expectedCompressedTokens
+        else {
+            throw BenchQualificationEvidenceValidationError
+                .capacityRuntimeTelemetryMismatch
+        }
     }
 
     guard let memoryRuns = record.payload.memoryRuns,
@@ -781,10 +841,17 @@ func parseBenchPlan(_ flags: Flags) throws -> BenchPlan {
         requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
             flags, request: compressedKVAttention)
     if capacityEvidence {
-        guard KVarNKVRuntimeCell(rawValue: runtimeTier) != nil,
-            compressedKVAttention == .splitKVarNQuantizedMM
+        guard BenchDirectCompressedCapacityRoute(
+            tier: runtimeTier,
+            request: compressedKVAttention) != nil
         else {
-            throw BenchCLIError.capacityEvidenceRequiresKVarNDirect
+            throw BenchCLIError.capacityEvidenceRequiresDirectCompressedKV
+        }
+        guard maxTokens == 128 else {
+            throw BenchCLIError.invalidCapacityMaxTokens(maxTokens)
+        }
+        guard promptTemplate == defaultBenchPrompt else {
+            throw BenchCLIError.unauditedCapacityPrompt
         }
         guard csvPath.isEmpty else {
             throw BenchCLIError.capacityEvidenceCannotWriteCSV

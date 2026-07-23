@@ -940,6 +940,12 @@ func runBench(_ flags: Flags) async {
                 promptTokenCounts.append(promptTokens.count)
                 decodeRates.append(decodeRate)
                 ttftMilliseconds.append(metrics.ttftSeconds * 1_000)
+                if plan.capacityContext != nil,
+                    metrics.generatedTokenCount != 128
+                {
+                    throw BenchQualificationEvidenceValidationError
+                        .invalidCapacityMeasurementEvidence
+                }
                 generatedTokenCounts.append(metrics.generatedTokenCount)
                 memoryRuns.append(memoryEvidence)
                 if let qualificationBefore, let qualificationAfter {
@@ -1923,8 +1929,9 @@ struct Harness {
                  --post-warmup-thermal-stability-seconds <N>
                                                record the dropped warmup and admit the retained
                                                row only after a sampled stable nominal/AC window
-                 [--capacity-evidence true]    mutually exclusive loaded KVarN capacity-only lane;
-                                               requires --runs 1, manifest/tokenizer identity and
+                 [--capacity-evidence true]    selected direct compressed-KV capacity lane;
+                                               requires --runs 1, --max-tokens 128,
+                                               manifest/tokenizer identity and
                  --capacity-expected-prompt-tokens <N>
                                                exact retained prompt count plus explicit
                                                MLX/cache/wired limits; nominal/fair only,

@@ -633,7 +633,13 @@ result, not performance evidence.
   exact 15-file/eight-shard snapshot and tokenizer at revision
   `de2dfaf56839b7d0e834157d2401dee02726874d`; receipt SHA-256 is
   `145127546c6c9872e80512716494eed77905d6e3ddd398c47c8f34a5ec796a4f`.
-- [ ] Repeat the applicable loaded 8K smoke/32K/near-128K gate with prompt+output <= 131,072.
+- [x] Run the loaded 8K smoke. It completed 9/9 and the affine-direct cell is
+  negative/dominated under the unchanged speed gate.
+- [x] Attempt the loaded 32K speed gate once. The first fp16 retained row failed closed on a
+  nominal -> fair transition with zero evidence/receipts, so 32K speed is hardware-unavailable
+  and no retry is authorized on the current bench.
+- [ ] Replace the now-unauthorized full near-128K nominal speed matrix with the reviewed
+  affine-direct capacity-only canary and conditional exact near-128K capacity boundary below.
 - [ ] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
   Llama.
 - [ ] Add a third popular, materially different attention geometry before broad/default product
@@ -645,6 +651,87 @@ result, not performance evidence.
   proof.
 - [ ] Quantify Transparent/Balanced/Max-fit speed/capacity/loss, write verdict/content, verify,
   review, scan, commit, and merge only if every claimed gate has fresh proof.
+
+### Loaded-Llama 8K result and long-context scope amendment — 2026-07-23
+
+The source-locked loaded-Llama 8K stability smoke is complete at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-llama3-70b-loaded-c8a56ef/llama-8k-v1-stability-smoke`.
+All 9/9 schema-4 rows, nine receipts, and three cyclic block receipts independently authenticate
+under clean source `c8a56ef00f6137b0bebfd6e494bfd9099a6a57fd`, manifest SHA-256
+`f4b3ce416605b94c8fb46fe20387610a7a49631fa859cfdda33a4b5820de3daa`,
+completion SHA-256 `ee3802178bd48738f82f7a307d8b8a45cd2a51dc8ce4a9e158bb07760e69ad0c`,
+and receipt-set SHA-256 `041277d4e608c13117f3f2fbdaf3d921707cf386806ede52dea36a2f36a4ba9c`.
+Each row carried 8,008 prompt plus 128 generated tokens, at least 60 seconds of continuous nominal
+admission, retained nominal/nominal AC state, exact source/model/tokenizer/checkpoint/workload
+bindings, and no watchdog.
+
+| Llama-3.3-70B 8K cell | Median prefill tok/s | Median decode tok/s | Median TTFT ms | Disposition |
+| --- | ---: | ---: | ---: | --- |
+| fp16 | 270.06 | 11.87 | 29,653.1 | Transparent control |
+| affine K4V2-g64 materialize | 268.58 | 10.51 | 29,816.0 | same-storage control |
+| affine K4V2-g64 direct | 199.41 | 11.74 | 40,157.3 | dominated; no speed promotion |
+
+Affine direct removed the materialize-control decode penalty by 11.70%, but remained 1.10% below
+fp16 decode and regressed prefill by 26.16%. It therefore fails the unchanged speed gate and earns
+no Llama speed tier. The direct rows still prove all 80 layers used
+`split-affine-quantized-mm`, zero materialization, 8,136 compressed tokens in 8,448-token physical
+capacity, 605,552,960 persistent bytes, and 1,107,296,256 peak direct workspace. This is valid
+loaded plumbing and negative/dominated evidence, not a promotion.
+
+The first loaded-Llama 32K matrix is terminal `FAILED` and preserved at
+`/Users/llmbench/perf-work/results/fused-compressed-kv-llama3-70b-loaded-c8a56ef/llama-32k-v1-qualification`.
+Manifest SHA-256 `48ff1fd0da562f41011fbdff24642f1ca37ece038b864315364dc86595ebf366`
+bound the same three cells in cyclic order, exact 32,640 prompt plus 128 output tokens, explicit
+96-GiB MLX memory / 8-GiB cache / 115-GiB wired limits, and the frozen 60-second continuous nominal
+policy. The first fp16 warmup completed at 151.00 prefill tok/s, ended fair, and reacquired nominal
+after a 91.444-second wait with 59 continuous-stability observations spanning 60 seconds. Its
+retained 220.176-second prefill ran at 148.24 tok/s and changed nominal -> fair, so the harness
+emitted zero evidence and zero receipts. Runner-failure, bench-log,
+runner-log, status, progress, and empty receipt-set SHA-256 values are
+`1473c9e5825b059d8dd5d66b56a6f9e1d27a05dd9e6adfb98623147eacd2f533`,
+`a45307c41d3cb558b840a4e19d61118f8e44734042f78d46a2da276de154cf5c`,
+`fa4299f8985b5fcfd87ccf0a9b399734f02c8cbf5e7af0df5ae07ecc53ecb618`,
+`03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f`,
+`9a55481bfd2bbcc54cc047c3529dee125119c03ea7679d76257b57274d9cf2ab`,
+and `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+No process or lock remains. Timings are diagnostic only.
+
+This is `FAILED CLOSED / HARDWARE-UNAVAILABLE` for Llama 32K speed qualification on the current
+bench under the frozen unthrottled nominal contract. Do not retry the 32K matrix, select a longer
+cooldown, or launch a full near-128K nominal speed matrix: the longer workload cannot repair the
+shorter fp16 control's retained thermal transition, and retrying would select for a lucky thermal
+window. Promotion-capable 32K/near-128K evidence now requires a different bench condition such as
+external cooling or hardware that can remain nominal for the retained workload.
+
+The remaining near-128K question is narrowed to a separate **non-promotable capacity/runtime**
+lane. Before any new launch:
+
+1. TDD-generalize the existing capacity-only evidence parser and typed validator from KVarN-direct
+   only to the selected affine K4V2-g64 direct route as an explicit closed set. Continue rejecting
+   fp16, materialize, KVTuner, unknown tiers/routes, qualification flags, multiple retained runs,
+   speed CSV, and any missing storage/workspace/memory/engagement receipt.
+2. Keep `purpose: capacity-only`, `promotable: false`, and `speedAggregation: forbidden` immutable.
+   Require exactly one dropped warmup plus one retained measurement, exact source/model/tokenizer/
+   checkpoint/workload identity, explicit `Memory.memoryLimit`, `Memory.cacheLimit`, and wired
+   limit, all 80 affine-direct layers, exact cached/physical-capacity token counts, positive
+   payload/metadata/control and direct-workspace bytes, zero materialization, finite timing, AC
+   power, Low Power Mode false, and nominal-or-fair before/after states. The one retained run must
+   generate exactly `maxTokens == 128`, and cached tokens must equal exact prompt tokens plus all
+   128 generated tokens; an early stop cannot stand in for the named context boundary.
+   Serious/critical, battery, geometry mismatch, or partial evidence fails closed.
+3. First run one fresh 32K affine-direct capacity canary at the already authenticated
+   32,640+128 workload. Use it only to prove the generalized contract and bound near-128K wall
+   time/memory; it cannot replace the failed speed matrix or enter a tier aggregate.
+4. Only after typed authentication and focused review of that canary, prepare one fresh exact
+   130,944+128 affine-direct capacity boundary. Its watchdog and memory limits must be explicitly
+   derived from the canary with reviewable margin. If the canary shows no credible completion
+   window or memory route, preserve that result and close near-128K as hardware-unavailable rather
+   than launch a knowingly doomed soak.
+
+This amendment does not revive KVarN's shelved speed role, reuse the Qwen KVTuner schedule, alter
+the speed gate, or create a cross-family/default claim. It preserves the useful operator question
+— whether the selected packed affine cache can carry the checkpoint's maximum window — without
+mislabeling a thermally incomparable run as speed evidence.
 
 ## Security, maintenance, and rollback
 

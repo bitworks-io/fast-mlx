@@ -735,6 +735,45 @@ public enum BenchCapacityEvidencePurpose:
     case capacityOnly = "capacity-only"
 }
 
+public enum BenchDirectCompressedCapacityRouteKind:
+    String, Sendable, Equatable
+{
+    case affine
+    case kvarn
+}
+
+/// Pure, closed admission contract for capacity-only evidence rows. The harness runtime still
+/// owns execution, but parser and typed validators share this route set so capacity receipts do
+/// not drift between CLI spelling and post-decode evidence checks.
+public struct BenchDirectCompressedCapacityRoute: Sendable, Equatable {
+    public let tier: String
+    public let request: CompressedKVAttentionRequest
+    public let kind: BenchDirectCompressedCapacityRouteKind
+    public let counterPrefix: String
+    public let groupSize: Int
+
+    public init?(tier: String, request: CompressedKVAttentionRequest?) {
+        guard let request else { return nil }
+        switch (tier, request) {
+        case ("affine-k4v2-g64", .splitAffineQuantizedMM):
+            self.tier = tier
+            self.request = request
+            kind = .affine
+            counterPrefix = "affine"
+            groupSize = 64
+        case ("kvarn-k4v2-g128", .splitKVarNQuantizedMM),
+            ("kvarn-k4v2-g128-i16", .splitKVarNQuantizedMM):
+            self.tier = tier
+            self.request = request
+            kind = .kvarn
+            counterPrefix = "kvarn"
+            groupSize = 128
+        default:
+            return nil
+        }
+    }
+}
+
 public struct BenchCapacityEvidenceContext:
     Codable, Sendable, Equatable
 {
