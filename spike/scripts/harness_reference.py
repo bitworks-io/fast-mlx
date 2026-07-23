@@ -56,6 +56,60 @@ def _version(pkg: str) -> str:
         return "unknown"
 
 
+def prepare_chunked_longrope(model, full_input_tokens: int) -> dict[str, int]:
+    """Normalize chunked reference scoring to the pinned Swift LongRoPE contract.
+
+    The pinned Python runtime dynamically selects short or long factors from
+    ``cache.offset + current_chunk_length``. That makes a chunked forced sequence use a different
+    rotary regime than the pinned Swift runtime, which always uses the configured long factors.
+    Current upstream ``mlx-lm`` also uses the long factors unconditionally. Pin the Python
+    runtime's short aliases to its long values before chunk zero for every sequence length so the
+    teacher oracle and candidate execute the same model semantics.
+    """
+    if not isinstance(full_input_tokens, int) or isinstance(full_input_tokens, bool):
+        raise ValueError("full_input_tokens must be a positive integer")
+    if full_input_tokens <= 0:
+        raise ValueError("full_input_tokens must be a positive integer")
+
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        raise RuntimeError("reference model does not expose named_modules()")
+
+    su_scaled_rope_modules = 0
+    long_regime_modules = 0
+    for name, module in named_modules():
+        if type(module).__name__ != "SuScaledRoPE":
+            continue
+        su_scaled_rope_modules += 1
+        required = (
+            "original_max_position_embeddings",
+            "_short_freqs",
+            "_long_freqs",
+            "_short_scale",
+            "_long_scale",
+        )
+        for attribute in required:
+            if not hasattr(module, attribute):
+                raise RuntimeError(
+                    f"SuScaledRoPE module {name!r} is missing required {attribute}"
+                )
+        threshold = module.original_max_position_embeddings
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or threshold <= 0:
+            raise RuntimeError(
+                f"SuScaledRoPE module {name!r} has invalid "
+                "original_max_position_embeddings"
+            )
+        module._short_freqs = module._long_freqs
+        module._short_scale = module._long_scale
+        long_regime_modules += 1
+
+    return {
+        "fullInputTokens": full_input_tokens,
+        "suScaledRoPEModules": su_scaled_rope_modules,
+        "longRegimeModules": long_regime_modules,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -90,6 +144,7 @@ def main() -> None:
     out_tokens: list[int] = []
     rows: list[np.ndarray] | None = [] if args.logits_out else None
     vocab = None
+    longrope_context = None
     y = mx.array(ids)[None]
     if force is not None:
         # CHUNKED teacher-forced scoring (mirrors SwiftEngineDriver.scoreForced): the row for
@@ -104,6 +159,7 @@ def main() -> None:
         CHUNK = 512
         p = len(ids)
         full = list(ids) + [int(t) for t in force[:-1]]
+        longrope_context = prepare_chunked_longrope(model, len(full))
         for a in range(0, len(full), CHUNK):
             b = min(a + CHUNK, len(full))
             logits = model(mx.array(full[a:b])[None], cache=cache)  # [1, b-a, vocab] raw logits
@@ -139,6 +195,7 @@ def main() -> None:
     print(json.dumps({
         "tokens": out_tokens, "positions": positions, "vocab": vocab,
         "mlx_version": _version("mlx"), "mlx_lm_version": _version("mlx-lm"),
+        "chunked_longrope": longrope_context,
     }))
 
 
