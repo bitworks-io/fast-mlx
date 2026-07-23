@@ -638,9 +638,10 @@ result, not performance evidence.
 - [x] Attempt the loaded 32K speed gate once. The first fp16 retained row failed closed on a
   nominal -> fair transition with zero evidence/receipts, so 32K speed is hardware-unavailable
   and no retry is authorized on the current bench.
-- [ ] Replace the now-unauthorized full near-128K nominal speed matrix with the reviewed
-  affine-direct capacity-only canary and conditional exact near-128K capacity boundary below.
-- [ ] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
+- [x] Replace the unauthorized full near-128K nominal speed matrix with the reviewed
+  affine-direct capacity-only lane. The 32K canary completed; its measured storage/workspace
+  projection exceeds physical RAM at near-128K, so the exact run is NO-GO / NOT RUN.
+- [x] Keep Qwen-specific KVTuner unavailable unless separately calibrated and authenticated for
   Llama.
 - [ ] Add a third popular, materially different attention geometry before broad/default product
   support claims. The current first candidate is
@@ -703,35 +704,27 @@ shorter fp16 control's retained thermal transition, and retrying would select fo
 window. Promotion-capable 32K/near-128K evidence now requires a different bench condition such as
 external cooling or hardware that can remain nominal for the retained workload.
 
-The remaining near-128K question is narrowed to a separate **non-promotable capacity/runtime**
-lane. Before any new launch:
+The generalized affine capacity-only contract and its first 32K canary are now complete under clean
+source `349331443bc37a236b1460681fe24c9c91979089`. The one-shot output
+`/Users/llmbench/perf-work/results/fused-compressed-kv-llama3-70b-loaded-3493314/llama-32k-affine-capacity-v1`
+binds manifest `84151bdb34b1ac9825e9ea3dcb0f8fe549ea252e23f989e595efe0a8161e0fdb`,
+evidence `8b6e147adebd1a705103222f1978f1a86916469e96847a1a105370be83871ab1`,
+completion `e3850c665e1a2ddf59dc23e49658e48fe961774dd958b849934f6cd0b79faf6e`, and
+launch receipt `35be506e873412bff3f9b3a70d3fecebf7f3a65252b8f5f133eddcfdc9df6d4c`.
+It retained exactly 32,640 prompt plus 128 generated tokens, all 80 affine-direct layers, zero
+materialization, 92.61/9.96 prefill/decode tok/s, 130,257,818,032 sampled physical-footprint bytes,
+and 83,292,012,544 maximum process RSS bytes. It remains `promotable:false` and
+`speedAggregation:"forbidden"`.
 
-1. TDD-generalize the existing capacity-only evidence parser and typed validator from KVarN-direct
-   only to the selected affine K4V2-g64 direct route as an explicit closed set. Continue rejecting
-   fp16, materialize, KVTuner, unknown tiers/routes, qualification flags, multiple retained runs,
-   speed CSV, and any missing storage/workspace/memory/engagement receipt.
-2. Keep `purpose: capacity-only`, `promotable: false`, and `speedAggregation: forbidden` immutable.
-   Require exactly one dropped warmup plus one retained measurement, exact source/model/tokenizer/
-   checkpoint/workload identity, explicit `Memory.memoryLimit`, `Memory.cacheLimit`, and wired
-   limit, all 80 affine-direct layers, exact cached/physical-capacity token counts, positive
-   payload/metadata/control and direct-workspace bytes, zero materialization, finite timing, AC
-   power, Low Power Mode false, and nominal-or-fair before/after states. The one retained run must
-   generate exactly `maxTokens == 128`, and cached tokens must equal exact prompt tokens plus all
-   128 generated tokens; an early stop cannot stand in for the named context boundary.
-   Serious/critical, battery, geometry mismatch, or partial evidence fails closed.
-3. First run one fresh 32K affine-direct capacity canary at the already authenticated
-   32,640+128 workload. Use it only to prove the generalized contract and bound near-128K wall
-   time/memory; it cannot replace the failed speed matrix or enter a tier aggregate.
-4. Only after typed authentication and focused review of that canary, prepare one fresh exact
-   130,944+128 affine-direct capacity boundary. Its watchdog and memory limits must be explicitly
-   derived from the canary with reviewable margin. If the canary shows no credible completion
-   window or memory route, preserve that result and close near-128K as hardware-unavailable rather
-   than launch a knowingly doomed soak.
+The near-128K capacity launch is **NO-GO / NOT RUN**. The authenticated 32K row measured
+2,028,994,560 payload, 338,165,760 metadata, 320 control, and 4,328,521,728 direct-workspace bytes.
+Conservatively adding three more 32K segments to the measured physical footprint projects
+150,344,865,136 bytes, which exceeds the host's 137,438,953,472 physical bytes by
+12,905,911,664 bytes before safety margin. This is a reviewed projection from authenticated
+evidence, not a near-128K runtime or refusal row. Do not launch a knowingly impossible soak.
 
-This amendment does not revive KVarN's shelved speed role, reuse the Qwen KVTuner schedule, alter
-the speed gate, or create a cross-family/default claim. It preserves the useful operator question
-— whether the selected packed affine cache can carry the checkpoint's maximum window — without
-mislabeling a thermally incomparable run as speed evidence.
+This closure does not revive KVarN's shelved speed role, reuse the Qwen KVTuner schedule, alter the
+speed gate, or create a cross-family/default claim.
 
 ### Sealed teacher-forced reference scope amendment — 2026-07-23
 
@@ -766,6 +759,26 @@ capture/replay smoke. A sealed bundle is an authenticated teacher artifact, not 
 itself: Llama candidate rows must still pass the unchanged teacher-forced KL, top-1, perplexity,
 tail, task-coherence, model/source, and frontier contracts. Capture or diagnostic outputs never
 enter speed aggregation.
+
+The model-backed replay is now complete at clean source
+`90337258aa741e987111c45e7102a53a29f7415c`. The sealed reference manifest is
+`0d34303497c4f5a6c8b73a8e146cd34914adeb8adc3b4755c4d8e4983df894a1`. fp16 evidence
+`57ad74aca7e60bc8a97cfcbe66955c22d52e76514575aa6ec01b5005c1ee82d1` produced median KL
+9.6688e-7, pooled p95 2.9269e-5, perplexity delta +0.0025966%, and top-1 327/328. Affine-direct
+evidence `7feb19468f307b06084cf65166b7cc38c9bc501c1e83e885601d0abd2e714c53` produced median KL
+0.0069743, pooled p95 1.0595306, perplexity delta -8.8987%, and top-1 285/328 while proving the
+split route and zero materialization/normalization. The deepest scored context was 22,541 tokens,
+below the frozen 24,000-token promotion bar, so this remains finite nonpromotion evidence.
+
+The fp16 task-coherence reference also completed 80/80 at raw SHA-256
+`91bb6b290530110244fadd21d587cf4d0727a97c76a2d30fdb0ad569a95b31e4`: math 10/20,
+code 7/20, structured 20/20, long retrieval 20/20, and structured validity 20/20. The paired
+affine-direct task boundary completed all 80 cases but failed closed at structured validity 14/20
+against the frozen 18/20 floor. Raw/summary/status SHA-256 values are `a171b49d…65345`,
+`960c44c1…fcbd`, and `5b7b29ff…b97b`; negative-auth script/log SHA-256 values are
+`a50d9105…23fa` and `59183ca4…bbbc`. The strict re-derivation authenticated math 10/20, code 6/20,
+structured 14/20, long retrieval 20/20, `hardFloorPassed:false`, and
+`balancedTaskDeltaPassed:false`. This is terminal negative evidence and cannot promote.
 
 ## Security, maintenance, and rollback
 

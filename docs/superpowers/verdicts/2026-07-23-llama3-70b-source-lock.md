@@ -34,9 +34,10 @@ layers and maximum context 131,072, 4-bit group-64 weights, and Llama-3 RoPE. Ch
 SHA-256 `5083c6af…be1400` and tokenizer SHA-256 `da67fb22…be58ab` match the prior phase-0 identities.
 Independent receipt/API/tree validation passed; stderr was empty; no lock or process survived.
 
-## Next safe action
+## Runtime follow-through
 
-Build from the clean source, then run a fresh loaded 8K cyclic smoke with fp16 plus shared affine
-K4V2-g64 materialize/direct. Keep the Qwen KVTuner schedule unavailable. Runtime evidence must bind
-this receipt and still pass the existing thermal, memory-limit, quality, and speed gates before any
-Llama tier or cross-family claim.
+The model-scoped runtime cycle is now recorded separately in
+[`2026-07-23-llama3-70b-runtime.md`](2026-07-23-llama3-70b-runtime.md). The source admission remains
+immutable: it does not itself authorize the retained runtime, quality, capacity, or task claims.
+The runtime verdict binds this receipt, keeps the Qwen KVTuner schedule unavailable, and closes
+without a Llama speed tier or broad/default claim.

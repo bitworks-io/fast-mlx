@@ -191,7 +191,7 @@ Its 10.38 prefill and 4.934 decode tok/s are non-promotable capacity context onl
 Durable terminal-verification receipt SHA-256 is
 `168da54a58ef6b1b0aede8beda2564f4da24c232c9c8dc563933e11a8f6b328f`.
 
-The source-locked Llama-3.3-70B-Instruct-4bit snapshot is now **ADMITTED, NOT RUNTIME-QUALIFIED**.
+The source-locked Llama-3.3-70B-Instruct-4bit snapshot is **ADMITTED**.
 No download was needed: the complete 39,706,010,909-byte flat snapshot already existed on
 `llmbench`. Clean `dcfbbe39c1ee3ee5e9119820ec67994e196968c0` added a fail-closed offline
 authenticator; its 11 focused tests, focused review, and staged gitleaks passed. The one-shot
@@ -206,7 +206,34 @@ Checkpoint-content `5083c6af…be1400` and tokenizer `da67fb22…be58ab` match p
 source only; it cannot promote runtime, loss, capacity, speed, or a tier. Verdict:
 [`2026-07-23-llama3-70b-source-lock.md`](superpowers/verdicts/2026-07-23-llama3-70b-source-lock.md).
 
-**Content practice:** `docs/content/` now has 12 pieces. Keep writing one dated content piece per
+The separate Llama runtime cycle is now **CLOSED WITHOUT A SPEED TIER**. Loaded speed binds clean
+`c8a56ef00f6137b0bebfd6e494bfd9099a6a57fd`, generalized capacity binds clean
+`349331443bc37a236b1460681fe24c9c91979089`, and sealed quality/task binds clean
+`90337258aa741e987111c45e7102a53a29f7415c`. Loaded 8K fp16 / affine-materialize /
+affine-direct medians were 270.06/11.87, 268.58/10.51, and 199.41/11.74 prefill/decode tok/s.
+Direct affine remained 1.10% below fp16 decode and regressed prefill 26.16%, so it is
+negative/dominated. The first 32K fp16 control changed nominal -> fair and emitted zero rows, so
+32K speed remains hardware-unavailable under the frozen thermal contract. A separate 32K
+affine-direct capacity row completed 32,640+128 tokens with all 80 layers, zero materialization,
+92.61/9.96 tok/s, 130,257,818,032 physical-footprint bytes, and `promotable:false` /
+`speedAggregation:"forbidden"`. Conservative four-segment projection is 150,344,865,136 bytes,
+12,905,911,664 above physical RAM, so no near-128K run launched.
+
+Sealed teacher-forced replay authenticated fp16 and affine candidate rows. Affine remained finite
+but different (median KL 0.0069743, pooled p95 1.0595306, top-1 285/328); the deepest scored
+context was 22,541 against the 24,000-token promotion bar. The fp16 task baseline authenticated
+10/20 math, 7/20 code, 20/20 structured, 20/20 long retrieval, and 20/20 structured validity.
+The affine task boundary completed all 80 cases but is terminal negative evidence: 10/20 math,
+6/20 code, 14/20 structured, 20/20 long retrieval, and 14/20 structured validity. Raw/summary/status
+SHA-256 values are `a171b49d…65345`, `960c44c1…fcbd`, and `5b7b29ff…b97b`. Strict negative-auth
+script/log SHA-256 values `a50d9105…23fa` and `59183ca4…bbbc` re-derived
+`hardFloorPassed:false` and `balancedTaskDeltaPassed:false` while preserving the failed root and
+sibling lock unchanged. Verdict:
+[`2026-07-23-llama3-70b-runtime.md`](superpowers/verdicts/2026-07-23-llama3-70b-runtime.md).
+Machine-readable verification packet SHA-256 is
+`4dc2870d2f6872fd9a46d85993cf91c24ba0aaab506d0e88da460308b3e912a4`.
+
+**Content practice:** `docs/content/` now has 13 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
@@ -220,20 +247,15 @@ notable spike, including negative results.
    under the current unthrottled contract. The separately authenticated 32K KVarN capacity-only
    context is complete and cannot feed a speed label. The authenticated near-128K refusal is
    complete at a 131,039-token request against maximum context 40,960. The existing full
-   Llama-3.3-70B snapshot is now source-admitted at exact revision
-   `de2dfaf56839b7d0e834157d2401dee02726874d`; proceed with fresh loaded
-   8K/32K/near-128K qualification without the Qwen-specific KVTuner schedule unless independently
-   calibrated.
-   The KL harness also has a sealed teacher-forced replay path: `kl-reference-capture` captures an
-   immutable bundle, and `kl` can consume it with `--sealed-reference` / `--sealed-reference-sha256`
-   while keeping live Python as the default historical reference path. The payload now binds
-   reference transport plus sealed-bundle digest and fails closed on inconsistent combinations.
-   Pure contract tests pass; clean bench/Xcode and model-backed capture/replay proof are the next
-   gate before using the path for Llama quality evidence.
-   Both first families share
-   Q64/KV8/D128; add a popular materially different geometry before any broad/default support
-   claim. Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial
-   tier.
+   Llama-3.3-70B source/runtime qualification is now model-scoped and closed: 8K affine direct is
+   negative/dominated, 32K speed is hardware-unavailable, 32K affine is capacity-only context,
+   near-128K is a reviewed memory no-go, and the sealed quality/task lane cannot promote because
+   the scored depth stops at 22,541 tokens and the affine task candidate failed structured
+   validity at 14/20. Keep the Qwen-specific KVTuner schedule unavailable.
+   Both first families share Q64/KV8/D128. The next engine gate is the source-locked Phi-4-mini
+   candidate (Phi3 Q24/KV8/D128 with partial RoPE); prove registry/load/runtime support and retain
+   generic sliding-window rejection except for the exact source-locked inert-window geometry.
+   Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial tier.
    [Task](task-inbox/2026-07-12-fused-compressed-kv-attention.md).
 2. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
    warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
@@ -314,9 +336,15 @@ ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/X
 ```
 
 Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; the complete,
-source-locked Llama-3.3-70B-Instruct-4bit model/tokenizer snapshot is admitted at revision
-`de2dfaf56839b7d0e834157d2401dee02726874d`; no Qwen3-32B BF16 target). Python: `~/harness-venv`
-(`transformers<5`).
+source-locked Llama-3.3-70B-Instruct-4bit snapshot is admitted and its model-scoped runtime cycle
+is closed at revision `de2dfaf56839b7d0e834157d2401dee02726874d`; no Qwen3-32B BF16 target).
+Python: `~/harness-venv` (`transformers<5`).
+
+The operator has authorized ordinary in-scope roadmap operations whenever existing access is
+sufficient, including source-locked downloads, network transfer, remote bench work, tests, builds,
+profiling, documentation, and commits. Stop only for a genuinely new boundary: missing
+credentials, elevated privilege or installation, destructive cleanup, external hardware control,
+or a material scope decision.
 
 ## Commit / Checkin
 
