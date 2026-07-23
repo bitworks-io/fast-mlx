@@ -34,6 +34,7 @@ public enum CompressedKVAttentionModelFamily:
 {
     case qwen3
     case llama
+    case phi3
 }
 
 /// Native floating-point dtype declared by the exact authenticated model configuration. This is
@@ -161,6 +162,18 @@ public struct CompressedKVAttentionRuntimeAdmission:
     public let modelNativeDType: CompressedKVModelNativeDType?
 
     private struct ModelConfiguration: Decodable {
+        struct RopeScaling: Decodable {
+            let type: String?
+            let longFactor: [Double]?
+            let shortFactor: [Double]?
+
+            enum CodingKeys: String, CodingKey {
+                case type
+                case longFactor = "long_factor"
+                case shortFactor = "short_factor"
+            }
+        }
+
         let modelType: String
         let architectures: [String]
         let hiddenSize: Int
@@ -170,6 +183,12 @@ public struct CompressedKVAttentionRuntimeAdmission:
         let headDimension: Int?
         let maxPositionEmbeddings: Int
         let useSlidingWindow: Bool?
+        let slidingWindow: Int?
+        let originalMaxPositionEmbeddings: Int?
+        let partialRotaryFactor: Double?
+        let ropeTheta: Double?
+        let ropeScaling: RopeScaling?
+        let fullAttentionMod: Int?
         let torchDType: String?
         let dtype: String?
 
@@ -183,10 +202,68 @@ public struct CompressedKVAttentionRuntimeAdmission:
             case headDimension = "head_dim"
             case maxPositionEmbeddings = "max_position_embeddings"
             case useSlidingWindow = "use_sliding_window"
+            case slidingWindow = "sliding_window"
+            case originalMaxPositionEmbeddings =
+                "original_max_position_embeddings"
+            case partialRotaryFactor = "partial_rotary_factor"
+            case ropeTheta = "rope_theta"
+            case ropeScaling = "rope_scaling"
+            case fullAttentionMod = "full_attn_mod"
             case torchDType = "torch_dtype"
             case dtype
         }
     }
+
+    private static let phi3MiniLongRopeFactors: [Double] = [
+        1,
+        1.118320672,
+        1.250641126,
+        1.398617824,
+        1.564103225,
+        1.74916897,
+        1.956131817,
+        2.187582649,
+        2.446418898,
+        2.735880826,
+        3.059592084,
+        3.421605075,
+        3.826451687,
+        4.279200023,
+        4.785517845,
+        5.351743533,
+        5.984965424,
+        6.693110555,
+        7.485043894,
+        8.370679318,
+        9.36110372,
+        10.4687158,
+        11.70738129,
+        13.09260651,
+        14.64173252,
+        16.37415215,
+        18.31155283,
+        20.47818807,
+        22.90118105,
+        25.61086418,
+        28.64115884,
+        32.03,
+        32.1,
+        32.13,
+        32.23,
+        32.6,
+        32.61,
+        32.64,
+        32.66,
+        32.7,
+        32.71,
+        32.93,
+        32.97,
+        33.28,
+        33.49,
+        33.5,
+        44.16,
+        47.77,
+    ]
 
     /// The compressed-attention KL contract measures one checkpoint with two cache paths.
     /// A distinct reference checkpoint would confound weight and cache loss, and the current
@@ -225,10 +302,16 @@ public struct CompressedKVAttentionRuntimeAdmission:
                 .malformedModelConfig
         }
 
+        let hasPinnedPhi3InertWindow =
+            configuration.modelType == "phi3"
+                && configuration.slidingWindow == 262_144
         for key in [
             "sliding_window", "attention_sinks", "attention_sink_size",
             "num_sink_tokens", "sinks", "text_config",
         ] where root[key].map({ !($0 is NSNull) }) == true {
+            if key == "sliding_window", hasPinnedPhi3InertWindow {
+                continue
+            }
             throw CompressedKVAttentionRuntimeAdmissionError
                 .unsupportedAttentionFeature(key)
         }
@@ -246,6 +329,9 @@ public struct CompressedKVAttentionRuntimeAdmission:
         case "llama":
             family = .llama
             expectedArchitecture = "LlamaForCausalLM"
+        case "phi3":
+            family = .phi3
+            expectedArchitecture = "Phi3ForCausalLM"
         default:
             throw CompressedKVAttentionRuntimeAdmissionError
                 .unsupportedModelType(configuration.modelType)
@@ -298,6 +384,43 @@ public struct CompressedKVAttentionRuntimeAdmission:
                 ? "queryHeadCount" : "denseGQAGeometry"
             throw CompressedKVAttentionRuntimeAdmissionError
                 .invalidGeometry(field)
+        }
+
+        if family == .phi3 {
+            guard configuration.hiddenSize == 3_072,
+                configuration.layerCount == 32,
+                configuration.queryHeadCount == 24,
+                configuration.kvHeadCount == 8,
+                headDimension == 128,
+                configuration.maxPositionEmbeddings == 131_072,
+                (configuration.torchDType ?? configuration.dtype)
+                    == CompressedKVModelNativeDType.bfloat16.rawValue
+            else {
+                throw CompressedKVAttentionRuntimeAdmissionError
+                    .invalidGeometry("phi3SourceLockedGeometry")
+            }
+            guard configuration.slidingWindow == 262_144,
+                configuration.slidingWindow
+                    .map({ $0 > configuration.maxPositionEmbeddings }) == true,
+                configuration.useSlidingWindow == nil
+            else {
+                throw CompressedKVAttentionRuntimeAdmissionError
+                    .unsupportedAttentionFeature("sliding_window")
+            }
+            guard configuration.originalMaxPositionEmbeddings == 4_096,
+                configuration.partialRotaryFactor == 0.75,
+                configuration.ropeTheta == 10_000,
+                configuration.fullAttentionMod == 1,
+                configuration.ropeScaling?.type == "longrope",
+                configuration.ropeScaling?.longFactor
+                    == Self.phi3MiniLongRopeFactors,
+                configuration.ropeScaling?.shortFactor?.count == 48,
+                configuration.ropeScaling?.shortFactor?
+                    .allSatisfy({ $0 == 1 }) == true
+            else {
+                throw CompressedKVAttentionRuntimeAdmissionError
+                    .unsupportedAttentionFeature("phi3_longrope")
+            }
         }
 
         return Self(
@@ -400,6 +523,8 @@ public struct CompressedKVAttentionRuntimeAdmission:
             expectedIdentity = (.qwen3, "qwen3", "Qwen3ForCausalLM")
         case .llama:
             expectedIdentity = (.llama, "llama", "LlamaForCausalLM")
+        case .phi3:
+            expectedIdentity = (.phi3, "phi3", "Phi3ForCausalLM")
         }
         guard family == expectedIdentity.family,
             modelType == expectedIdentity.modelType,
@@ -419,6 +544,18 @@ public struct CompressedKVAttentionRuntimeAdmission:
         else {
             throw CompressedKVAttentionRuntimeAdmissionError
                 .invalidSourceIdentity
+        }
+        if family == .phi3 {
+            guard layerCount == 32,
+                queryHeadCount == 24,
+                kvHeadCount == 8,
+                headDimension == 128,
+                maxPositionEmbeddings == 131_072,
+                modelNativeDType == .bfloat16
+            else {
+                throw CompressedKVAttentionRuntimeAdmissionError
+                    .invalidSourceIdentity
+            }
         }
         return self
     }

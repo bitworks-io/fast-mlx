@@ -138,6 +138,183 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
             elementBytes: 2)
     }
 
+    private func makePhi3MiniCompressedBatchAdmission()
+        throws -> CompressedKVAttentionRuntimeAdmission
+    {
+        return try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: .load(
+                exactModelConfigData: phi3MiniSourceLockedConfig(),
+                checkpointManifestHash: "0123456789abcdef",
+                checkpointContentSHA256: String(repeating: "d", count: 64),
+                tokenizerSHA256: String(repeating: "c", count: 64)))
+    }
+
+    private func makePhi3MiniCompressedBatchSourceSnapshot()
+        throws -> CompressedKVAttentionRuntimeSourceSnapshot
+    {
+        try .load(
+            exactModelConfigData: phi3MiniSourceLockedConfig(),
+            checkpointManifestHash: "0123456789abcdef",
+            checkpointContentSHA256: String(repeating: "d", count: 64),
+            tokenizerSHA256: String(repeating: "c", count: 64))
+    }
+
+    private func phi3MiniSourceLockedConfig() -> Data {
+        Data(#"""
+        {
+            "architectures": [
+                "Phi3ForCausalLM"
+            ],
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "auto_map": {
+                "AutoConfig": "configuration_phi3.Phi3Config",
+                "AutoModelForCausalLM": "modeling_phi3.Phi3ForCausalLM",
+                "AutoTokenizer": "Xenova/gpt-4o"
+            },
+            "bos_token_id": 199999,
+            "embd_pdrop": 0.0,
+            "eos_token_id": 200020,
+            "full_attn_mod": 1,
+            "hidden_act": "silu",
+            "hidden_size": 3072,
+            "initializer_range": 0.02,
+            "intermediate_size": 8192,
+            "interpolate_factor": 1,
+            "lm_head_bias": false,
+            "max_position_embeddings": 131072,
+            "mlp_bias": false,
+            "model_type": "phi3",
+            "num_attention_heads": 24,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 8,
+            "original_max_position_embeddings": 4096,
+            "pad_token_id": 199999,
+            "partial_rotary_factor": 0.75,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "quantization_config": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "resid_pdrop": 0.0,
+            "rms_norm_eps": 1e-05,
+            "rope_scaling": {
+                "long_factor": [
+                    1,
+                    1.118320672,
+                    1.250641126,
+                    1.398617824,
+                    1.564103225,
+                    1.74916897,
+                    1.956131817,
+                    2.187582649,
+                    2.446418898,
+                    2.735880826,
+                    3.059592084,
+                    3.421605075,
+                    3.826451687,
+                    4.279200023,
+                    4.785517845,
+                    5.351743533,
+                    5.984965424,
+                    6.693110555,
+                    7.485043894,
+                    8.370679318,
+                    9.36110372,
+                    10.4687158,
+                    11.70738129,
+                    13.09260651,
+                    14.64173252,
+                    16.37415215,
+                    18.31155283,
+                    20.47818807,
+                    22.90118105,
+                    25.61086418,
+                    28.64115884,
+                    32.03,
+                    32.1,
+                    32.13,
+                    32.23,
+                    32.6,
+                    32.61,
+                    32.64,
+                    32.66,
+                    32.7,
+                    32.71,
+                    32.93,
+                    32.97,
+                    33.28,
+                    33.49,
+                    33.5,
+                    44.16,
+                    47.77
+                ],
+                "short_factor": [
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0
+                ],
+                "type": "longrope"
+            },
+            "rope_theta": 10000.0,
+            "sliding_window": 262144,
+            "tie_word_embeddings": true,
+            "torch_dtype": "bfloat16",
+            "transformers_version": "4.45.0",
+            "use_cache": true,
+            "vocab_size": 200064
+        }
+        """#.utf8)
+    }
+
     private func collect(_ stream: AsyncThrowingStream<Int, Error>) async throws -> [Int] {
         var tokens: [Int] = []
         for try await token in stream { tokens.append(token) }
@@ -352,6 +529,31 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(model.newCacheCallCount, 0)
     }
 
+    func testCompressedBatchRejectsPhi3AdmissionForQwenOnlyContinuousProof() throws {
+        let model = TinyCompressedBatchLanguageModel()
+        let phi3 = try makePhi3MiniCompressedBatchAdmission()
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: model,
+                allocationChunk: 4,
+                maxContextTokens: 131_072,
+                initialDecodeReserve: 3,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: phi3,
+                layerCount: 32,
+                keyValueHeadCount: 8,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+        XCTAssertEqual(model.newCacheCallCount, 0)
+    }
+
     func testCompressedBatchRejectsDifferentExactModelConfigBeforeCacheCreation() throws {
         let model = TinyCompressedBatchLanguageModel()
         let admission = try makeCompressedBatchAdmission()
@@ -511,6 +713,27 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
                 XCTAssertEqual(
                     $0 as? DenseContinuousBatchRuntimeError,
                     .unsupportedModelFamily("qwen3_moe"))
+        }
+    }
+
+    func testConfigDerivedProofRejectsPhi3BeforeRuntimeConstruction() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try makePhi3MiniCompressedBatchSourceSnapshot()
+        try source.exactModelConfigData.write(
+            to: directory.appendingPathComponent("config.json"))
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchModelProof.verifying(
+                modelDirectory: directory,
+                stableCompressedSource: source)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .unsupportedModelFamily("phi3"))
         }
     }
 

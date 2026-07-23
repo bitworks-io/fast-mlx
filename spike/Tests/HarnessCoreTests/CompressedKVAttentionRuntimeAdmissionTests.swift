@@ -89,6 +89,71 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
             keyGroupSize: 128, valueGroupSize: 128))
     }
 
+    func testPhi3MiniAdmissionBindsExactSourceLockedInertLongRopeGeometry()
+        throws
+    {
+        let data = phi3MiniSourceLockedConfig()
+        let snapshot = try CompressedKVAttentionRuntimeSourceSnapshot.load(
+            exactModelConfigData: data,
+            checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
+            tokenizerSHA256: tokenizerSHA256)
+
+        let admission = try CompressedKVAttentionRuntimeAdmission.load(
+            sourceSnapshot: snapshot)
+
+        XCTAssertEqual(admission.family, .phi3)
+        XCTAssertEqual(admission.modelType, "phi3")
+        XCTAssertEqual(admission.architecture, "Phi3ForCausalLM")
+        XCTAssertEqual(admission.layerCount, 32)
+        XCTAssertEqual(admission.queryHeadCount, 24)
+        XCTAssertEqual(admission.kvHeadCount, 8)
+        XCTAssertEqual(admission.headDimension, 128)
+        XCTAssertEqual(admission.maxPositionEmbeddings, 131_072)
+        XCTAssertEqual(admission.modelNativeDType, .bfloat16)
+        XCTAssertEqual(admission.modelConfigHash, fnv1a64(data))
+        XCTAssertEqual(admission.modelConfigSHA256, sha256Hex(data))
+        XCTAssertEqual(admission.checkpointManifestHash, checkpointManifestHash)
+        XCTAssertEqual(
+            admission.checkpointContentSHA256,
+            checkpointContentSHA256)
+        XCTAssertEqual(admission.tokenizerSHA256, tokenizerSHA256)
+        XCTAssertNoThrow(try admission.validateAffineGeometry(
+            keyGroupSize: 128, valueGroupSize: 128))
+    }
+
+    func testPhi3MiniEvidenceRevalidationRejectsForgedSourceLockedScalars()
+        throws
+    {
+        let admitted = try admission(for: phi3MiniSourceLockedConfig())
+        let encoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(admitted)) as? [String: Any])
+        let mutations: [(String, Any)] = [
+            ("layerCount", 31),
+            ("queryHeadCount", 32),
+            ("kvHeadCount", 6),
+            ("headDimension", 96),
+            ("maxPositionEmbeddings", 65_536),
+            ("modelNativeDType", "float16"),
+        ]
+
+        for (field, value) in mutations {
+            var forged = encoded
+            forged[field] = value
+            let decoded = try JSONDecoder().decode(
+                CompressedKVAttentionRuntimeAdmission.self,
+                from: JSONSerialization.data(withJSONObject: forged))
+
+            XCTAssertThrowsError(try decoded.validatedForEvidence(), field) {
+                error in
+                XCTAssertEqual(
+                    error as? CompressedKVAttentionRuntimeAdmissionError,
+                    .invalidSourceIdentity)
+            }
+        }
+    }
+
     func testExplicitRuntimeRequestBindsThePredeclaredCheckpointContent()
         throws
     {
@@ -168,6 +233,186 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
                     error as? CompressedKVAttentionRuntimeAdmissionError,
                     .unsupportedAttentionFeature(name))
             }
+        }
+    }
+
+    func testPhi3MiniAdmissionPreservesGenericSlidingWindowRejection()
+        throws
+    {
+        for window in [131_072, 4_096] {
+            let data = try phi3MiniSourceLockedConfig { root in
+                root["sliding_window"] = window
+            }
+            XCTAssertThrowsError(try admission(for: data), "\(window)") {
+                error in
+                XCTAssertEqual(
+                    error as? CompressedKVAttentionRuntimeAdmissionError,
+                    .unsupportedAttentionFeature("sliding_window"))
+            }
+        }
+    }
+
+    func testPhi3MiniAdmissionRejectsPinnedWindowForNonPhiFamilies()
+        throws
+    {
+        let cases: [(String, Data)] = [
+            ("qwen3", config(extra: "\"sliding_window\":262144")),
+            ("llama", config(
+                modelType: "llama",
+                architecture: "LlamaForCausalLM",
+                hiddenSize: 8192,
+                layerCount: 80,
+                maxPositionEmbeddings: 131_072,
+                extra: """
+                "rope_scaling":{"factor":8.0,"rope_type":"llama3"},
+                "sliding_window":262144
+                """)),
+            ("mistral", config(
+                modelType: "mistral",
+                architecture: "MistralForCausalLM",
+                hiddenSize: 4096,
+                layerCount: 32,
+                queryHeads: 32,
+                maxPositionEmbeddings: 131_072,
+                extra: "\"sliding_window\":262144")),
+        ]
+        for (name, data) in cases {
+            XCTAssertThrowsError(try admission(for: data), name) { error in
+                XCTAssertEqual(
+                    error as? CompressedKVAttentionRuntimeAdmissionError,
+                    .unsupportedAttentionFeature("sliding_window"))
+            }
+        }
+    }
+
+    func testPhi3MiniAdmissionRejectsBadArchitectureAndGeometry() throws {
+        let badArchitecture = try phi3MiniSourceLockedConfig { root in
+            root["architectures"] = ["PhiForCausalLM"]
+        }
+        XCTAssertThrowsError(try admission(for: badArchitecture)) { error in
+            XCTAssertEqual(
+                error as? CompressedKVAttentionRuntimeAdmissionError,
+                .unsupportedArchitecture("PhiForCausalLM"))
+        }
+
+        let mutations: [(String, (inout [String: Any]) -> Void)] = [
+            ("hiddenSize", { (root: inout [String: Any]) in
+                root["hidden_size"] = 4_096
+            }),
+            ("layerCount", { (root: inout [String: Any]) in
+                root["num_hidden_layers"] = 31
+            }),
+            ("queryHeadCount", { (root: inout [String: Any]) in
+                root["num_attention_heads"] = 32
+            }),
+            ("kvHeadCount", { (root: inout [String: Any]) in
+                root["num_key_value_heads"] = 6
+            }),
+            ("headDimension", { (root: inout [String: Any]) in
+                root["head_dim"] = 96
+            }),
+            ("maxPositionEmbeddings", { (root: inout [String: Any]) in
+                root["max_position_embeddings"] = 65_536
+            }),
+            ("modelNativeDType", { (root: inout [String: Any]) in
+                root["torch_dtype"] = "float16"
+            }),
+            ("stillInertButNotSourceLockedWindow", {
+                (root: inout [String: Any]) in
+                root["sliding_window"] = 262_145
+            }),
+        ]
+        for (name, mutation) in mutations {
+            let data = try phi3MiniSourceLockedConfig(mutatingRoot: mutation)
+            XCTAssertThrowsError(try admission(for: data), name)
+        }
+    }
+
+    func testPhi3MiniAdmissionRequiresLongRopePartialRotarySemantics()
+        throws
+    {
+        let mutations: [(String, (inout [String: Any]) -> Void)] = [
+            ("missingSlidingWindow", { (root: inout [String: Any]) in
+                root.removeValue(forKey: "sliding_window")
+            }),
+            ("explicitUseSlidingWindowFalse", {
+                (root: inout [String: Any]) in
+                root["use_sliding_window"] = false
+            }),
+            ("missingOriginalMaxPositionEmbeddings", {
+                (root: inout [String: Any]) in
+                root.removeValue(forKey: "original_max_position_embeddings")
+            }),
+            ("wrongOriginalMaxPositionEmbeddings", {
+                (root: inout [String: Any]) in
+                root["original_max_position_embeddings"] = 8_192
+            }),
+            ("missingPartialRotaryFactor", {
+                (root: inout [String: Any]) in
+                root.removeValue(forKey: "partial_rotary_factor")
+            }),
+            ("wrongPartialRotaryFactor", { (root: inout [String: Any]) in
+                root["partial_rotary_factor"] = 1.0
+            }),
+            ("wrongRopeTheta", { (root: inout [String: Any]) in
+                root["rope_theta"] = 500_000.0
+            }),
+            ("missingRopeScaling", { (root: inout [String: Any]) in
+                root.removeValue(forKey: "rope_scaling")
+            }),
+            ("wrongRopeScalingType", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                ropeScaling["type"] = "linear"
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("missingLongFactor", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                ropeScaling.removeValue(forKey: "long_factor")
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("missingShortFactor", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                ropeScaling.removeValue(forKey: "short_factor")
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("wrongLongFactorLength", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                var longFactor = ropeScaling["long_factor"] as! [Any]
+                longFactor.removeLast()
+                ropeScaling["long_factor"] = longFactor
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("wrongShortFactorLength", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                var shortFactor = ropeScaling["short_factor"] as! [Any]
+                shortFactor.append(1.0)
+                ropeScaling["short_factor"] = shortFactor
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("wrongLongFactorValue", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                var longFactor = ropeScaling["long_factor"] as! [Any]
+                longFactor[1] = 1.118320673
+                ropeScaling["long_factor"] = longFactor
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("wrongShortFactorValue", { (root: inout [String: Any]) in
+                var ropeScaling = root["rope_scaling"] as! [String: Any]
+                var shortFactor = ropeScaling["short_factor"] as! [Any]
+                shortFactor[0] = 0.5
+                ropeScaling["short_factor"] = shortFactor
+                root["rope_scaling"] = ropeScaling
+            }),
+            ("missingFullAttentionMod", { (root: inout [String: Any]) in
+                root.removeValue(forKey: "full_attn_mod")
+            }),
+            ("wrongFullAttentionMod", { (root: inout [String: Any]) in
+                root["full_attn_mod"] = 2
+            }),
+        ]
+        for (name, mutation) in mutations {
+            let data = try phi3MiniSourceLockedConfig(mutatingRoot: mutation)
+            XCTAssertThrowsError(try admission(for: data), name)
         }
     }
 
@@ -441,6 +686,174 @@ final class CompressedKVAttentionRuntimeAdmissionTests: XCTestCase {
             headDimension: headDimension,
             maxPositionEmbeddings: 131_072,
             extra: "\"rope_scaling\":{\"factor\":8.0,\"rope_type\":\"llama3\"}")
+    }
+
+    private func phi3MiniSourceLockedConfig(
+        mutatingRoot mutation: (inout [String: Any]) -> Void
+    ) throws -> Data {
+        var root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: phi3MiniSourceLockedConfig())
+                as? [String: Any])
+        mutation(&root)
+        return try JSONSerialization.data(
+            withJSONObject: root,
+            options: [.sortedKeys])
+    }
+
+    private func phi3MiniSourceLockedConfig() -> Data {
+        Data(#"""
+        {
+            "architectures": [
+                "Phi3ForCausalLM"
+            ],
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "auto_map": {
+                "AutoConfig": "configuration_phi3.Phi3Config",
+                "AutoModelForCausalLM": "modeling_phi3.Phi3ForCausalLM",
+                "AutoTokenizer": "Xenova/gpt-4o"
+            },
+            "bos_token_id": 199999,
+            "embd_pdrop": 0.0,
+            "eos_token_id": 200020,
+            "full_attn_mod": 1,
+            "hidden_act": "silu",
+            "hidden_size": 3072,
+            "initializer_range": 0.02,
+            "intermediate_size": 8192,
+            "interpolate_factor": 1,
+            "lm_head_bias": false,
+            "max_position_embeddings": 131072,
+            "mlp_bias": false,
+            "model_type": "phi3",
+            "num_attention_heads": 24,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 8,
+            "original_max_position_embeddings": 4096,
+            "pad_token_id": 199999,
+            "partial_rotary_factor": 0.75,
+            "quantization": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "quantization_config": {
+                "group_size": 64,
+                "bits": 4
+            },
+            "resid_pdrop": 0.0,
+            "rms_norm_eps": 1e-05,
+            "rope_scaling": {
+                "long_factor": [
+                    1,
+                    1.118320672,
+                    1.250641126,
+                    1.398617824,
+                    1.564103225,
+                    1.74916897,
+                    1.956131817,
+                    2.187582649,
+                    2.446418898,
+                    2.735880826,
+                    3.059592084,
+                    3.421605075,
+                    3.826451687,
+                    4.279200023,
+                    4.785517845,
+                    5.351743533,
+                    5.984965424,
+                    6.693110555,
+                    7.485043894,
+                    8.370679318,
+                    9.36110372,
+                    10.4687158,
+                    11.70738129,
+                    13.09260651,
+                    14.64173252,
+                    16.37415215,
+                    18.31155283,
+                    20.47818807,
+                    22.90118105,
+                    25.61086418,
+                    28.64115884,
+                    32.03,
+                    32.1,
+                    32.13,
+                    32.23,
+                    32.6,
+                    32.61,
+                    32.64,
+                    32.66,
+                    32.7,
+                    32.71,
+                    32.93,
+                    32.97,
+                    33.28,
+                    33.49,
+                    33.5,
+                    44.16,
+                    47.77
+                ],
+                "short_factor": [
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0
+                ],
+                "type": "longrope"
+            },
+            "rope_theta": 10000.0,
+            "sliding_window": 262144,
+            "tie_word_embeddings": true,
+            "torch_dtype": "bfloat16",
+            "transformers_version": "4.45.0",
+            "use_cache": true,
+            "vocab_size": 200064
+        }
+        """#.utf8)
     }
 
     private func config(
