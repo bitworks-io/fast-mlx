@@ -653,6 +653,91 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       "INVALID_EVIDENCE\n")
   }
 
+  func testRunnerAcceptsExactPhi3CompressedAttentionAdmissionEvidence()
+    throws
+  {
+    let fixture = try makeFixture(
+      admissionFamily: "phi3",
+      admissionModelType: "phi3",
+      admissionArchitecture: "Phi3ForCausalLM")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "COMPLETE\n")
+  }
+
+  func testRunnerAcceptsExactLlamaCompressedAttentionAdmissionEvidence()
+    throws
+  {
+    let fixture = try makeFixture(
+      admissionFamily: "llama",
+      admissionModelType: "llama",
+      admissionArchitecture: "LlamaForCausalLM")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertEqual(result.status, 0, result.output)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "COMPLETE\n")
+  }
+
+  func testRunnerRejectsCrossedPhi3CompressedAttentionAdmissionEvidence()
+    throws
+  {
+    let fixture = try makeFixture(
+      admissionFamily: "phi3",
+      admissionModelType: "phi3",
+      admissionArchitecture: "Qwen3ForCausalLM")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_EVIDENCE\n")
+  }
+
+  func testRunnerRejectsCrossedLlamaCompressedAttentionAdmissionEvidence()
+    throws
+  {
+    let fixture = try makeFixture(
+      admissionFamily: "llama",
+      admissionModelType: "llama",
+      admissionArchitecture: "Qwen3ForCausalLM")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_EVIDENCE\n")
+  }
+
+  func testRunnerRejectsUnknownCompressedAttentionAdmissionFamily()
+    throws
+  {
+    let fixture = try makeFixture(
+      admissionFamily: "unknown",
+      admissionModelType: "unknown",
+      admissionArchitecture: "UnknownForCausalLM")
+
+    let result = try runRunner(fixture: fixture)
+
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertEqual(
+      try String(contentsOf: fixture.output.appendingPathComponent(
+        "runner.status"), encoding: .utf8),
+      "INVALID_EVIDENCE\n")
+  }
+
   func testRunnerRejectsTruncatedKVTunerScheduleBindingEvidence() throws {
     let fixture = try makeFixture(
       includeKVTuner: true, truncateKVTunerEvidence: true)
@@ -727,6 +812,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     let requireResolvedRuntimePaths: Bool
     let requireThermalPolicyArguments: Bool
     let lateThermalAdmission: Bool
+    let admissionFamily: String
+    let admissionModelType: String
+    let admissionArchitecture: String
     let kvtunerArtifactSHA256: String
     let kvtunerBundleSHA256: String
   }
@@ -765,6 +853,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
     requireResolvedRuntimePaths: Bool = false,
     requireThermalPolicyArguments: Bool = false,
     lateThermalAdmission: Bool = false,
+    admissionFamily: String = "qwen3",
+    admissionModelType: String = "qwen3",
+    admissionArchitecture: String = "Qwen3ForCausalLM",
     harnessStampInSubdirectory: Bool = false,
     harnessStampFilename: String = ".harness-sha"
   ) throws -> Fixture {
@@ -989,6 +1080,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
         --arg checkpointManifestHash "$FAKE_MODEL_MANIFEST_HASH" \
         --arg schedule "$schedule" --arg scheduleArtifact "$schedule_artifact" \
         --arg scheduleBundle "$FAKE_KVTUNER_BUNDLE_SHA" \
+        --arg admissionFamily "$FAKE_ADMISSION_FAMILY" \
+        --arg admissionModelType "$FAKE_ADMISSION_MODEL_TYPE" \
+        --arg admissionArchitecture "$FAKE_ADMISSION_ARCHITECTURE" \
         --arg modelConfigSHA256 \
           "3333333333333333333333333333333333333333333333333333333333333333" \
         --arg tokenizerSHA256 "$tokenizer_sha" \
@@ -1033,7 +1127,8 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
           generatedTokenCountsByRun:[8],
           compressedKVAttention:(if $attention == "" then null else {
             request:$attention,observedOperation:$observed,admission:({
-              family:"qwen3",modelType:"qwen3",architecture:"Qwen3ForCausalLM",
+              family:$admissionFamily,modelType:$admissionModelType,
+              architecture:$admissionArchitecture,
               modelConfigHash:$configHash,modelConfigSHA256:$modelConfigSHA256,
               checkpointManifestHash:$checkpointManifestHash,
               checkpointContentSHA256:$checkpoint,
@@ -1196,6 +1291,9 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       requireResolvedRuntimePaths: requireResolvedRuntimePaths,
       requireThermalPolicyArguments: requireThermalPolicyArguments,
       lateThermalAdmission: lateThermalAdmission,
+      admissionFamily: admissionFamily,
+      admissionModelType: admissionModelType,
+      admissionArchitecture: admissionArchitecture,
       kvtunerArtifactSHA256: kvtunerArtifactSHA256,
       kvtunerBundleSHA256: kvtunerBundleSHA256)
   }
@@ -1268,6 +1366,10 @@ final class LoadedBenchQualificationRunnerTests: XCTestCase {
       fixture.requireThermalPolicyArguments ? "true" : "false"
     environment["FAKE_LATE_THERMAL_ADMISSION"] =
       fixture.lateThermalAdmission ? "true" : "false"
+    environment["FAKE_ADMISSION_FAMILY"] = fixture.admissionFamily
+    environment["FAKE_ADMISSION_MODEL_TYPE"] = fixture.admissionModelType
+    environment["FAKE_ADMISSION_ARCHITECTURE"] =
+      fixture.admissionArchitecture
     environment["FAKE_MUTATE_HARNESS_STAMP"] =
       fixture.mutateHarnessStampAfterFirstRun ? "true" : "false"
     environment["FAKE_HARNESS_SHA_FILE"] = fixture.harnessSHA.path

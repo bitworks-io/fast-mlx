@@ -929,11 +929,14 @@ for ((block_index = 0; block_index < BLOCK_COUNT; block_index++)); do
               (if $attention == "" then .payload.compressedKVAttention == null
                else .payload.compressedKVAttention.request == $attention and
                  .payload.compressedKVAttention.observedOperation == $expectedObserved and
-                 .payload.compressedKVAttention.admission.family ==
-                   (if .payload.compressedKVAttention.admission.modelType == "qwen3"
-                    then "qwen3" else "llama" end) and
-                 (.payload.compressedKVAttention.admission.architecture == "Qwen3ForCausalLM" or
-                   .payload.compressedKVAttention.admission.architecture == "LlamaForCausalLM") and
+                 (.payload.compressedKVAttention.admission |
+                   if .modelType == "qwen3" then
+                     .family == "qwen3" and .architecture == "Qwen3ForCausalLM"
+                   elif .modelType == "llama" then
+                     .family == "llama" and .architecture == "LlamaForCausalLM"
+                   elif .modelType == "phi3" then
+                     .family == "phi3" and .architecture == "Phi3ForCausalLM"
+                   else false end) and
                  .payload.compressedKVAttention.admission.modelConfigHash == $modelConfigHash and
                  (.payload.compressedKVAttention.admission.modelConfigSHA256 |
                    type == "string" and test("^[0-9a-f]{64}$")) and
