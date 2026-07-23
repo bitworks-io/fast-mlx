@@ -224,6 +224,12 @@ notable spike, including negative results.
    `de2dfaf56839b7d0e834157d2401dee02726874d`; proceed with fresh loaded
    8K/32K/near-128K qualification without the Qwen-specific KVTuner schedule unless independently
    calibrated.
+   The KL harness also has a sealed teacher-forced replay path: `kl-reference-capture` captures an
+   immutable bundle, and `kl` can consume it with `--sealed-reference` / `--sealed-reference-sha256`
+   while keeping live Python as the default historical reference path. The payload now binds
+   reference transport plus sealed-bundle digest and fails closed on inconsistent combinations.
+   Pure contract tests pass; clean bench/Xcode and model-backed capture/replay proof are the next
+   gate before using the path for Llama quality evidence.
    Both first families share
    Q64/KV8/D128; add a popular materially different geometry before any broad/default support
    claim. Synthetic geometry, implementation tests, or partial loaded rows cannot promote a dial

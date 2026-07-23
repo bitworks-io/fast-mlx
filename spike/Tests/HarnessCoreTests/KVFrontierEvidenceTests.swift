@@ -510,7 +510,9 @@ final class KVFrontierEvidenceTests: XCTestCase {
 
     private func payload(
         kvQuantTier: String = "affine-k4v2-g128",
-        frontier: KVFrontierEvidence? = nil
+        frontier: KVFrontierEvidence? = nil,
+        referenceTransport: KLReferenceTransport? = nil,
+        sealedReferenceArtifactSHA256: String? = nil
     ) -> KLPayload {
         KLPayload(
             kvQuantTier: kvQuantTier,
@@ -533,7 +535,10 @@ final class KVFrontierEvidenceTests: XCTestCase {
                 KVEntryScoringEvidence(entryID: "long-0", scoredPositions: 128),
             ],
             longContextMaxDocumentTokens: 24_151,
-            longContextMaxScoredContextTokens: 24_150)
+            longContextMaxScoredContextTokens: 24_150,
+            referenceTransport: referenceTransport,
+            sealedReferenceArtifactSHA256:
+                sealedReferenceArtifactSHA256)
     }
 
     func testCompleteSameWeightsCellValidatesAndRoundTrips() throws {
@@ -546,6 +551,60 @@ final class KVFrontierEvidenceTests: XCTestCase {
         XCTAssertEqual(
             decoded.frontier?.storage?.actual.totalBytes,
             breakdown().totalBytes)
+    }
+
+    func testSealedReferenceArtifactDigestValidatesAndRoundTrips() throws {
+        let digest = String(repeating: "a", count: 64)
+        let validated = try payload(
+            referenceTransport: .sealedReplay,
+            sealedReferenceArtifactSHA256: digest
+        ).validatedForPromotion()
+
+        let data = try JSONEncoder().encode(validated)
+        let decoded = try JSONDecoder().decode(KLPayload.self, from: data)
+
+        XCTAssertEqual(decoded.sealedReferenceArtifactSHA256, digest)
+        XCTAssertEqual(decoded, validated)
+    }
+
+    func testSealedReferenceArtifactDigestFailsClosedWhenMalformed() {
+        for digest in [
+            "",
+            String(repeating: "a", count: 63),
+            String(repeating: "A", count: 64),
+            String(repeating: "g", count: 64),
+        ] {
+            XCTAssertThrowsError(
+                try payload(
+                    referenceTransport: .sealedReplay,
+                    sealedReferenceArtifactSHA256: digest
+                ).validatedForRecord()
+            ) { error in
+                XCTAssertEqual(
+                    error as? KVFrontierEvidenceError,
+                    .invalidPromotionProvenance(
+                        "sealedReferenceArtifactSHA256"))
+            }
+        }
+    }
+
+    func testReferenceTransportRequiresConsistentSealedArtifactBinding() {
+        let digest = String(repeating: "a", count: 64)
+
+        XCTAssertNoThrow(try payload(
+            referenceTransport: .livePython
+        ).validatedForPromotion())
+        XCTAssertNoThrow(try payload().validatedForPromotion())
+        XCTAssertThrowsError(try payload(
+            referenceTransport: .sealedReplay
+        ).validatedForRecord())
+        XCTAssertThrowsError(try payload(
+            referenceTransport: .livePython,
+            sealedReferenceArtifactSHA256: digest
+        ).validatedForRecord())
+        XCTAssertThrowsError(try payload(
+            sealedReferenceArtifactSHA256: digest
+        ).validatedForRecord())
     }
 
     func testCompressedAttentionFrontierAuthenticatesObservedOperationAndIdentity() throws {

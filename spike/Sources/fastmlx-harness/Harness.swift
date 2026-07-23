@@ -1152,9 +1152,28 @@ func runBench(_ flags: Flags) async {
 
 // MARK: - kl (KLDivergenceMetric: candidate vs reference, TEACHER-FORCED)
 
+func runSealedKLReferenceCaptureCommand(_ arguments: [String]) async {
+    do {
+        let plan = try parseSealedKLReferenceCapturePlan(arguments: arguments)
+        try await runSealedKLReferenceCapture(plan)
+        let manifestURL = URL(
+            fileURLWithPath: plan.outputPath,
+            isDirectory: true
+        ).appendingPathComponent("manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifestSHA256 = SealedKLReferenceBundle.sha256Hex(manifestData)
+        print("sealed KL reference: COMPLETE")
+        print("output: \(plan.outputPath)")
+        print("manifest_sha256: \(manifestSHA256)")
+    } catch {
+        print("kl-reference-capture FAILED: \(error)")
+        exit(1)
+    }
+}
+
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--kv-attention materialize|split-affine-quantized-mm|split-kvarn-quantized-mm --checkpoint-content-sha256 <SHA256>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH> | --sealed-reference <DIR> --sealed-reference-sha256 <SHA256> --workload-nonce <ID>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--kv-attention materialize|split-affine-quantized-mm|split-kvarn-quantized-mm --checkpoint-content-sha256 <SHA256>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -1207,6 +1226,10 @@ func runKL(_ flags: Flags) async {
         }
         let sameResolvedModel = ProvenanceCLI.sameResolvedModelPath(
             modelPath, referenceModelPath)
+        let referenceRequest = try requestedKLReference(
+            flags,
+            modelPath: modelPath,
+            sameResolvedModel: sameResolvedModel)
         let preflightCandidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(
             at: modelPath,
             checkpointContentSHA256:
@@ -1295,6 +1318,25 @@ func runKL(_ flags: Flags) async {
         guard !shortEntries.isEmpty, !longEntries.isEmpty,
             shortEntries.count + longEntries.count == corpus.entries.count
         else { throw KVFrontierEvidenceError.missingCohortEvidence }
+        let preparedSealedReference: PreparedSealedKLReferenceReplay?
+        switch referenceRequest {
+        case .livePython:
+            preparedSealedReference = nil
+        case .sealedReplay(let plan):
+            let prepared = try await prepareSealedKLReferenceReplay(plan)
+            guard prepared.driver.bundle.manifest.maxTokens == positions else {
+                throw SealedKLReferenceError.unsupportedConfig(
+                    "positions must be \(prepared.driver.bundle.manifest.maxTokens)")
+            }
+            guard prepared.driver.bundle.manifest.sampleSize
+                == longContextSampleSize
+            else {
+                throw SealedKLReferenceError.unsupportedConfig(
+                    "long-context-sample-positions must be "
+                        + "\(prepared.driver.bundle.manifest.sampleSize)")
+            }
+            preparedSealedReference = prepared
+        }
         let (driver, tokenizer, eos) = try await loadSwiftDriver(
             modelPath: modelPath,
             kvQuantTier: kvQuantTier,
@@ -1302,9 +1344,32 @@ func runKL(_ flags: Flags) async {
             compressedKVAttention: compressedKVAttention,
             compressedKVAttentionExpectedCheckpointContentSHA256:
                 compressedKVAttentionExpectedCheckpointContentSHA256)
-        let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
-        guard reference.modelPath == referenceModelPath else {
-            throw KVFrontierEvidenceError.invalidPromotionProvenance("referenceModelPath")
+        if let preparedSealedReference {
+            try validateSealedKLReferenceSourceUnchanged(
+                before: preparedSealedReference.sourceSnapshot,
+                after: try captureCompressedKVAttentionRuntimeSourceSnapshot(
+                    modelPath: modelPath))
+        }
+        let reference: any EngineDriver
+        let liveReference: ReferenceDriver?
+        let referenceTransport: KLReferenceTransport
+        let sealedReferenceArtifactSHA256: String?
+        if let preparedSealedReference {
+            reference = preparedSealedReference.driver
+            liveReference = nil
+            referenceTransport = .sealedReplay
+            sealedReferenceArtifactSHA256 =
+                preparedSealedReference.manifestSHA256
+        } else {
+            let live = referenceDriver(flags, modelPath: modelPath, eos: eos)
+            guard live.modelPath == referenceModelPath else {
+                throw KVFrontierEvidenceError.invalidPromotionProvenance(
+                    "referenceModelPath")
+            }
+            reference = live
+            liveReference = live
+            referenceTransport = .livePython
+            sealedReferenceArtifactSHA256 = nil
         }
         let config = RunConfig(
             temperature: 0,
@@ -1317,7 +1382,13 @@ func runKL(_ flags: Flags) async {
         let referenceConfig = RunConfig.greedy(maxTokens: positions)
 
         print("candidate: Swift engine on \(modelPath) (kv_quant_tier=\(kvQuantTier ?? "fp16"))")
-        print("reference: mlx-lm on \(reference.modelPath) (fp16 KV)")
+        if let preparedSealedReference {
+            print(
+                "reference: sealed mlx-lm replay "
+                    + "\(preparedSealedReference.manifestSHA256) (fp16 KV)")
+        } else {
+            print("reference: mlx-lm on \(referenceModelPath) (fp16 KV)")
+        }
         print("corpus: \(corpus.corpusId) (content hash \(corpus.contentHash), \(corpus.entries.count) entries)")
         if sameWeights, requestedKVQuantTier == "fp16" {
             print("# SAME weights + fp16 KV both sides -> pipeline/noise-floor proof.")
@@ -1453,7 +1524,12 @@ func runKL(_ flags: Flags) async {
         let top1Rate = Double(top1Matches) / Double(top1ScoredPositions)
         print("teacher_forced_top1_vs_reference: \(top1Matches)/\(top1ScoredPositions) (\(fmt(top1Rate * 100, 2))%)")
 
-        let referenceVersions = await reference.versionSink.versions
+        let referenceVersions: ReferenceDriver.ReferenceVersions?
+        if let liveReference {
+            referenceVersions = await liveReference.versionSink.versions
+        } else {
+            referenceVersions = preparedSealedReference?.referenceVersions
+        }
         let (provenance, _) = ProvenanceCLI.build(
             modelPath: modelPath, referenceVersions: referenceVersions,
             corpus: corpus,
@@ -1793,7 +1869,10 @@ func runKL(_ flags: Flags) async {
             shortEntryScoring: shortEntryScoring,
             longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
-            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
+            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens,
+            referenceTransport: referenceTransport,
+            sealedReferenceArtifactSHA256:
+                sealedReferenceArtifactSHA256)
         let record = ResultRecord(
             subcommand: "kl", provenance: provenance, payload: payload)
         let outputPath = evidencePath(flags)
@@ -1872,6 +1951,9 @@ struct Harness {
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
         case "service-soak": await runServiceSoakBench(flags)
+        case "kl-reference-capture":
+            await runSealedKLReferenceCaptureCommand(
+                Array(arguments.dropFirst(2)))
         case "kl": await runKL(flags)
         case "task-coherence": await runTaskCoherence(flags)
         case "kvtuner-manifest": await runKVTunerManifest(flags)
@@ -1956,11 +2038,19 @@ struct Harness {
           service-soak --model <PATH> --progress <FILE> resident mixed-workload soak
                  [--duration-seconds 86400] [--concurrency 4] [--max-tokens 64]
                  [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
+          kl-reference-capture --model <PATH> --output <NEW-DIR>
+                 --workload-nonce <ID>        capture immutable mlx-lm teacher logits in a
+                                              separate process before any Swift model load
+                 [--corpus <FILE=corpus/measurement-corpus-v2.json>]
+                 [--positions 24] [--long-context-sample-positions 128]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  --matrix-id <ID> --cell-id <ID> pin the frontier matrix/cell identity
                  [--kv-quant <TIER>]          CANDIDATE KV tier (\(kvQuantUsageTiers));
                                                reference always stays fp16 KV
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
+                 [--sealed-reference <DIR>]   replay an exact capture instead of launching Python;
+                 [--sealed-reference-sha256 <SHA256>]
+                 [--workload-nonce <ID>]      all three are required for sealed replay
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells

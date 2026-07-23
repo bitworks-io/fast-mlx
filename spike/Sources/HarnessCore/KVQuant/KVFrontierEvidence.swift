@@ -859,6 +859,11 @@ public struct KVEntryScoringEvidence: Codable, Equatable, Sendable {
     }
 }
 
+public enum KLReferenceTransport: String, Codable, Equatable, Sendable {
+    case livePython = "live-python"
+    case sealedReplay = "sealed-replay"
+}
+
 /// Pure form of the `kl` JSONL payload. Optional additions preserve decoding of historical rows;
 /// every newly written row is validated and supplies top-1 plus frontier identity, while promotion
 /// additionally requires the full geometry/storage contract.
@@ -892,6 +897,13 @@ public struct KLPayload: Codable, Equatable, Sendable {
     /// long file; promotion is based on measured depth, not the corpus tag or document length.
     public let longContextMaxDocumentTokens: Int?
     public let longContextMaxScoredContextTokens: Int?
+    /// Newly written rows identify whether the teacher came from the live Python reference or an
+    /// immutable replay bundle. Historical rows decode with nil for backward compatibility.
+    public let referenceTransport: KLReferenceTransport?
+    /// Exact digest of an immutable, separately captured teacher-forced reference bundle.
+    /// Historical and live-reference rows omit it. Sealed-reference rows supply it so the final
+    /// KL evidence cannot be detached from or silently substituted for the replayed logits.
+    public let sealedReferenceArtifactSHA256: String?
 
     public init(
         kvQuantTier: String,
@@ -910,7 +922,9 @@ public struct KLPayload: Codable, Equatable, Sendable {
         shortEntryScoring: [KVEntryScoringEvidence]? = nil,
         longContextEntryScoring: [KVEntryScoringEvidence]? = nil,
         longContextMaxDocumentTokens: Int? = nil,
-        longContextMaxScoredContextTokens: Int? = nil
+        longContextMaxScoredContextTokens: Int? = nil,
+        referenceTransport: KLReferenceTransport? = nil,
+        sealedReferenceArtifactSHA256: String? = nil
     ) {
         self.kvQuantTier = kvQuantTier
         self.klMedianNats = klMedianNats
@@ -934,6 +948,8 @@ public struct KLPayload: Codable, Equatable, Sendable {
         self.longContextEntryScoring = longContextEntryScoring
         self.longContextMaxDocumentTokens = longContextMaxDocumentTokens
         self.longContextMaxScoredContextTokens = longContextMaxScoredContextTokens
+        self.referenceTransport = referenceTransport
+        self.sealedReferenceArtifactSHA256 = sealedReferenceArtifactSHA256
     }
 }
 
@@ -1051,6 +1067,16 @@ public extension KLPayload {
         guard maxDocumentTokens > 1, maxScoredContextTokens > 0,
             maxScoredContextTokens < maxDocumentTokens
         else { throw KVFrontierEvidenceError.invalidMetric("longContextDepth") }
+        switch (referenceTransport, sealedReferenceArtifactSHA256) {
+        case (.none, .none), (.some(.livePython), .none):
+            break
+        case (.some(.sealedReplay), .some(let digest))
+            where Self.isLowercaseSHA256(digest):
+            break
+        default:
+            throw KVFrontierEvidenceError.invalidPromotionProvenance(
+                "sealedReferenceArtifactSHA256")
+        }
 
         guard let frontier else { throw KVFrontierEvidenceError.missingFrontier }
         try frontier.validateForRecord(candidateTier: kvQuantTier)
@@ -1114,6 +1140,13 @@ public extension KLPayload {
         let punctuation = CharacterSet(charactersIn: "-._:/@+")
         return value.unicodeScalars.allSatisfy {
             CharacterSet.alphanumerics.contains($0) || punctuation.contains($0)
+        }
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39)
+                || ($0 >= 0x61 && $0 <= 0x66)
         }
     }
 }

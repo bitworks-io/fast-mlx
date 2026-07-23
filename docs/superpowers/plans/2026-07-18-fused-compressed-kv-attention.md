@@ -733,6 +733,40 @@ the speed gate, or create a cross-family/default claim. It preserves the useful 
 — whether the selected packed affine cache can carry the checkpoint's maximum window — without
 mislabeling a thermally incomparable run as speed evidence.
 
+### Sealed teacher-forced reference scope amendment — 2026-07-23
+
+The loaded-Llama quality gate cannot use the historical live `kl` process topology safely on the
+current bench. That topology loads the Swift candidate before the Python/MLX teacher performs its
+first request, so the two 70B runtimes can become co-resident. The resulting memory requirement is
+not a useful KV-quality measurement and has no credible route under the authenticated capacity
+envelope.
+
+Preserve the existing teacher-forced metric and corpus semantics, but split reference production
+from candidate scoring:
+
+1. A dedicated `kl-reference-capture` invocation loads only the tokenizer plus Python/MLX teacher,
+   captures the exact greedy continuations and teacher-forced float32 logits, writes each finite
+   logits blob plus its digest into a fresh staging directory, validates the complete bundle, and
+   atomically publishes it. The capture process exits before any candidate invocation begins.
+2. The immutable manifest binds the clean harness SHA, exact model config/checkpoint content and
+   checkpoint-manifest hashes, tokenizer hash, semantic and raw corpus hashes, reference-script
+   hash, MLX/mlx-lm versions, workload nonce, tokenized prompts/continuations, sampled long-context
+   positions, blob sizes, and blob SHA-256 values.
+3. `kl --sealed-reference ...` authenticates the caller-supplied manifest SHA, exact directory and
+   blob set, every source/corpus/tokenization binding, finite little-endian float32 payloads, and
+   the exact replay query before loading the Swift candidate. Replay launches no Python process.
+   Missing, extra, duplicate, malformed, symlinked, non-finite, drifted, or mismatched state fails
+   closed.
+4. Every new KL row identifies `live-python` or `sealed-replay`; a sealed row also binds the exact
+   manifest digest. Historical rows remain readable, while inconsistent transport/digest
+   combinations are rejected.
+
+Pure contract and CLI tests precede Xcode/Release verification and a bounded model-backed
+capture/replay smoke. A sealed bundle is an authenticated teacher artifact, not promotion by
+itself: Llama candidate rows must still pass the unchanged teacher-forced KL, top-1, perplexity,
+tail, task-coherence, model/source, and frontier contracts. Capture or diagnostic outputs never
+enter speed aggregation.
+
 ## Security, maintenance, and rollback
 
 - Custom Metal source is executable GPU code. Bound every shape, byte calculation, grid, thread
