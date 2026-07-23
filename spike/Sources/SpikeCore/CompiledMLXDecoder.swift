@@ -22,6 +22,9 @@ import MLXLMCommon
 public struct CompiledMLXDecoder: Decoder {
     private let model: any LanguageModel
     private let kvCacheKind: KVCacheKind
+    private let affineAttentionMode: AffineKVAttentionMode
+    private let kvarnAttentionMode: KVarNKVAttentionMode
+    private let kvarnStorageDType: KVarNKVScalarDType?
     /// Escape hatch for cache implementations whose update ops fail to trace under
     /// `MLX.compile`: `false` runs the same step closure uncompiled (correctness path;
     /// per-token graph construction returns, so decode perf drops — flagged, never silent).
@@ -29,6 +32,10 @@ public struct CompiledMLXDecoder: Decoder {
     public let executionMode: KVCacheExecutionMode
     private let chunk =
         KVTunerCandidateRuntimeContract.cacheGrowthChunkTokens
+    /// Split affine attention exposes its score tensor, so an all-at-once long prefill would
+    /// allocate O(prompt²) temporary storage. Bound the query side while retaining one fixed
+    /// cache and exact causal semantics; this matches mlx-lm's standard prefill step size.
+    private static let splitAttentionPrefillChunkSize = 512
     /// Decode headroom preallocated beyond the prompt (rounded up to `chunk`).
     private let reserve: Int
 
@@ -46,12 +53,21 @@ public struct CompiledMLXDecoder: Decoder {
     public init(
         model: any LanguageModel,
         reserve: Int = KVTunerCandidateRuntimeContract.cacheReserveTokens,
-        kvCache: KVCacheKind = .fp16, compileStep: Bool = true
+        kvCache: KVCacheKind = .fp16,
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil,
+        compileStep: Bool = true
     ) {
-        let executionMode = kvCache.executionMode(requestingCompilation: compileStep)
+        let executionMode = kvCache.executionMode(
+            requestingCompilation: compileStep,
+            kvarnAttentionMode: kvarnAttentionMode)
         self.model = model
         self.reserve = reserve
         self.kvCacheKind = kvCache
+        self.affineAttentionMode = affineAttentionMode
+        self.kvarnAttentionMode = kvarnAttentionMode
+        self.kvarnStorageDType = kvarnStorageDType
         self.compileStepEnabled = executionMode == .compiled
         self.executionMode = executionMode
     }
@@ -64,7 +80,7 @@ public struct CompiledMLXDecoder: Decoder {
         asyncEval(next)
         pendingNext = next
         cachedTokens += 1
-        return first.item(Int.self)
+        return Self.requireValidGreedyToken(first)
     }
 
     /// Shared prefill: caches allocated/grown, uncompiled prompt forward, compiled step
@@ -80,7 +96,11 @@ public struct CompiledMLXDecoder: Decoder {
             let cap = ((promptLength + reserve + chunk - 1) / chunk) * chunk
             do {
                 caches = try kvCacheKind.makeCaches(
-                    layerCount: layerCount, capacity: cap)
+                    layerCount: layerCount,
+                    capacity: cap,
+                    affineAttentionMode: affineAttentionMode,
+                    kvarnAttentionMode: kvarnAttentionMode,
+                    kvarnStorageDType: kvarnStorageDType)
             } catch {
                 preconditionFailure(
                     "KV-cache policy does not match the loaded model: \(error)")
@@ -90,9 +110,37 @@ public struct CompiledMLXDecoder: Decoder {
             for cache in caches { cache.grow(by: chunk) }
         }
 
-        let ids = MLXArray(promptTokens).reshaped([1, promptLength])
-        let logits = model(ids, cache: caches) // uncompiled prefill, dynamic cache ops
-        let first = argMax(logits[0..., -1, 0...], axis: -1) // [1]
+        let logits: MLXArray
+        if shouldChunkPrefillForSplitAttention,
+            promptLength > Self.splitAttentionPrefillChunkSize
+        {
+            var lastChunkLogits: MLXArray?
+            var start = 0
+            while start < promptLength {
+                let end = min(
+                    start + Self.splitAttentionPrefillChunkSize,
+                    promptLength)
+                let chunkTokens = Array(promptTokens[start..<end])
+                let ids = MLXArray(chunkTokens).reshaped([
+                    1, chunkTokens.count,
+                ])
+                let chunkLogits = model(ids, cache: caches)
+                // Bound the lazy graph and make each cache mutation visible before the next
+                // chunk reads the in-graph offset and packed buffers.
+                eval(chunkLogits)
+                lastChunkLogits = chunkLogits
+                start = end
+            }
+            guard let lastChunkLogits else {
+                preconditionFailure("prefill requires at least one prompt token")
+            }
+            logits = lastChunkLogits
+        } else {
+            let ids = MLXArray(promptTokens).reshaped([1, promptLength])
+            logits = model(ids, cache: caches)
+        }
+        let first = Self.greedyTokenOrInvalidSentinel(
+            logits[0..., -1, 0...]) // [1]
         cachedTokens = promptLength
 
         if compiledStep == nil {
@@ -100,14 +148,25 @@ public struct CompiledMLXDecoder: Decoder {
             let model = self.model
             let caches = self.caches
             let step: ([MLXArray]) -> [MLXArray] = { args in
-                let y = args[0].reshaped([1, 1])
+                // A prior invalid sentinel must never become an embedding lookup. The caller
+                // fails hard before emitting it; clamping only keeps submit-first lookahead from
+                // touching an invalid index while that scalar is read back.
+                let y = maximum(args[0], MLXArray(Int32(0)))
+                    .reshaped([1, 1])
                 let logits = model(y, cache: caches)
-                return [argMax(logits[0..., -1, 0...], axis: -1)]
+                return [Self.greedyTokenOrInvalidSentinel(
+                    logits[0..., -1, 0...])]
             }
             // Uncompiled variant is the same closure, graph-built fresh every call.
             compiledStep = compileStepEnabled ? compile(inputs: caches, outputs: caches, step) : step
         }
         return first
+    }
+
+    private var shouldChunkPrefillForSplitAttention: Bool {
+        if affineAttentionMode == .splitQuantizedMM { return true }
+        guard case .kvarn = kvCacheKind else { return false }
+        return kvarnAttentionMode == .splitQuantizedMM
     }
 
     public mutating func step(last: Int) -> Int {
@@ -121,7 +180,7 @@ public struct CompiledMLXDecoder: Decoder {
         asyncEval(following)
         pendingNext = following
         cachedTokens += 1
-        return next.item(Int.self)
+        return Self.requireValidGreedyToken(next)
     }
 
     /// The speculative-decoding loop (PLD first). High-yield rounds run one verify forward
@@ -204,7 +263,7 @@ public struct CompiledMLXDecoder: Decoder {
                     asyncEval(following)
                     pendingNext = following
                     cachedTokens += 2
-                    last = next.item(Int.self)
+                    last = Self.requireValidGreedyToken(next)
                     lastArr = nil
                 }
                 // Phase-1 flag #2: the gate is fed on EVERY step (cooldown clock).
@@ -233,18 +292,23 @@ public struct CompiledMLXDecoder: Decoder {
                         let caches = self.caches
                         let verify: ([MLXArray]) -> [MLXArray] = { args in
                             let logits = model(args[0], cache: caches)
-                            return [argMax(logits[0], axis: -1)]
+                            return [Self.greedyTokenOrInvalidSentinel(logits[0])]
                         }
                         compiledVerifyStep = compile(inputs: caches, outputs: caches, verify)
                     }
                     verifyArgmax = compiledVerifyStep!([ids])[0]
                 } else {
                     let logits = model(ids, cache: caches)
-                    verifyArgmax = argMax(logits[0], axis: -1)
+                    verifyArgmax = Self.greedyTokenOrInvalidSentinel(logits[0])
                 }
                 let picksAfterInput = verifyArgmax.asType(.int32).asArray(Int32.self).map(Int.init)
+                precondition(
+                    picksAfterInput.allSatisfy { $0 >= 0 },
+                    "non-finite logits reached speculative decode")
                 let prefetched = pendingNext
-                let prefetchedPick = prefetched?.item(Int.self)
+                let prefetchedPick = prefetched.map {
+                    Self.requireValidGreedyToken($0)
+                }
                 cachedTokens += n // the verify forward appended n rows
 
                 let accepted: Int
@@ -305,6 +369,27 @@ public struct CompiledMLXDecoder: Decoder {
         for cache in caches { cache.resetInPlace() }
         pendingNext = nil
         cachedTokens = 0
+    }
+
+    /// The token scalar is already the decode loop's synchronization point. Folding the
+    /// all-finite reduction into the lazy graph preserves that one readback while guaranteeing
+    /// NaN/Inf can never silently collapse to token zero through `argMax`.
+    static func greedyTokenOrInvalidSentinel(
+        _ logits: MLXArray
+    ) -> MLXArray {
+        let token = argMax(logits, axis: -1).asType(.int32)
+        return MLX.where(
+            isFinite(logits).all(),
+            token,
+            MLXArray(Int32(-1)))
+    }
+
+    private static func requireValidGreedyToken(
+        _ token: MLXArray
+    ) -> Int {
+        let value = token.item(Int.self)
+        precondition(value >= 0, "non-finite logits reached greedy decode")
+        return value
     }
 
     /// Engagement probe: the IN-GRAPH cached-token count from layer 0's TurboQuant cache.
@@ -376,12 +461,51 @@ public struct CompiledMLXDecoder: Decoder {
         precondition(
             kvarnCaches.count == caches.count,
             "KVarN tier requested but the decoder contains a different cache type")
-        let telemetry = KVarNKVCacheTelemetry.capture(caches: kvarnCaches)
+        let telemetry = KVarNKVCacheTelemetry
+            .capture(caches: kvarnCaches)
+            .withExecutionMode(executionMode)
         precondition(
             telemetry.tier == cell.tier
                 && telemetry.iterations == cell.iterations
                 && telemetry.executionMode == executionMode,
             "KVarN decoder telemetry does not match its requested runtime cell")
         return telemetry
+    }
+}
+
+private extension KVarNKVCacheTelemetry {
+    func withExecutionMode(_ executionMode: KVCacheExecutionMode)
+        -> KVarNKVCacheTelemetry
+    {
+        KVarNKVCacheTelemetry(
+            tier: tier,
+            iterations: iterations,
+            executionMode: executionMode,
+            cachedTokens: cachedTokens,
+            completedTileCount: completedTileCount,
+            compressedTokens: compressedTokens,
+            layerCount: layerCount,
+            capacityTokens: capacityTokens,
+            packedTileSlots: packedTileSlots,
+            sequences: sequences,
+            kvHeadCount: kvHeadCount,
+            headDimension: headDimension,
+            sourceKeyDTypes: sourceKeyDTypes,
+            sourceValueDTypes: sourceValueDTypes,
+            storageKeyDType: storageKeyDType,
+            storageValueDType: storageValueDType,
+            ingressNormalizationApplied: ingressNormalizationApplied,
+            metadataScalarBytes: metadataScalarBytes,
+            payloadBytes: payloadBytes,
+            metadataBytes: metadataBytes,
+            alignmentPaddingBytes: alignmentPaddingBytes,
+            fp16SinkBytes: fp16SinkBytes,
+            fp16TailBytes: fp16TailBytes,
+            controlBytes: controlBytes,
+            materializationWorkspaceBytes: materializationWorkspaceBytes,
+            normalizationWorkspaceBytes: normalizationWorkspaceBytes,
+            attentionWorkspaceBytes: attentionWorkspaceBytes,
+            workspaceBytes: workspaceBytes,
+            attentionOperation: attentionOperation)
     }
 }

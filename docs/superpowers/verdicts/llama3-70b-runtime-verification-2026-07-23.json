@@ -1,0 +1,250 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-23",
+  "purpose": "llama3-70b-model-scoped-runtime-verification",
+  "draft": false,
+  "promotable": false,
+  "speedAggregation": "forbidden",
+  "verificationMethod": {
+    "mode": "fresh-negative-authentication-and-documentary-audit",
+    "basis": "Fresh strict authentication of the terminal affine task boundary plus exact audit of the retained source-lock, speed, capacity, and sealed-quality artifacts.",
+    "freshRuntimeCommandsRun": false,
+    "freshAuthenticationCommandsRun": true,
+    "repoFilesModified": true
+  },
+  "sourceDocuments": [
+    "docs/superpowers/verdicts/2026-07-23-llama3-70b-source-lock.md",
+    "docs/superpowers/verdicts/2026-07-23-llama3-70b-runtime.md",
+    "docs/content/2026-07-23-llama-ran-without-a-speed-tier.md",
+    "docs/verification-evidence.md",
+    "docs/agent-handoff.md",
+    "docs/superpowers/plans/2026-07-18-fused-compressed-kv-attention.md"
+  ],
+  "modelBoundary": {
+    "model": "mlx-community/Llama-3.3-70B-Instruct-4bit",
+    "modelRevision": "de2dfaf56839b7d0e834157d2401dee02726874d",
+    "checkpointSHA256": "5083c6af8977bfe2afae26835a7163f4dd16f25499d5f34eb4184c2b97be1400",
+    "vocabularyManifestSHA256": "da67fb228e066467d7fe3759a1277252c83ca61c81d6e453e553a8edbfbe58ab",
+    "sourceLockEngineSHA": "dcfbbe39c1ee3ee5e9119820ec67994e196968c0",
+    "loadedSpeedEngineSHA": "c8a56ef00f6137b0bebfd6e494bfd9099a6a57fd",
+    "generalizedCapacityEngineSHA": "349331443bc37a236b1460681fe24c9c91979089",
+    "sealedQualityTaskEngineSHA": "90337258aa741e987111c45e7102a53a29f7415c",
+    "qwenKVTunerReusable": false
+  },
+  "artifactAudit": {
+    "sourceLockReceiptSHA256": "145127546c6c9872e80512716494eed77905d6e3ddd398c47c8f34a5ec796a4f",
+    "sourceLockCompletionSHA256": "f2e9082ac048f36157d1e5d05ca7c513fab9b8cad4dc1fe681e5d76b58eaf7af",
+    "sourceLockSnapshotManifestSHA256": "51d9a8e2c0514bac96781849482985d7cddc16a61c4720588043382378bb5cbb",
+    "sourceLockValidationProgramSHA256": "b14fa61b147b611c8abd76b02635a29f3d571462295c57a7a8125fe27813bd37",
+    "sealedReferenceManifestSHA256": "0d34303497c4f5a6c8b73a8e146cd34914adeb8adc3b4755c4d8e4983df894a1",
+    "fp16QualityEvidenceSHA256": "57ad74aca7e60bc8a97cfcbe66955c22d52e76514575aa6ec01b5005c1ee82d1",
+    "affineQualityEvidenceSHA256": "7feb19468f307b06084cf65166b7cc38c9bc501c1e83e885601d0abd2e714c53",
+    "fp16TaskRawSHA256": "91bb6b290530110244fadd21d587cf4d0727a97c76a2d30fdb0ad569a95b31e4",
+    "fp16TaskSummarySHA256": "c9ae61ba1573cd3d93c7a0652558d406c79d3589de033b3f4fec250be4e0942e",
+    "speed8KManifestSHA256": "f4b3ce416605b94c8fb46fe20387610a7a49631fa859cfdda33a4b5820de3daa",
+    "speed8KCompletionSHA256": "ee3802178bd48738f82f7a307d8b8a45cd2a51dc8ce4a9e158bb07760e69ad0c",
+    "speed8KReceiptSetSHA256": "041277d4e608c13117f3f2fbdaf3d921707cf386806ede52dea36a2f36a4ba9c",
+    "speed32KManifestSHA256": "48ff1fd0da562f41011fbdff24642f1ca37ece038b864315364dc86595ebf366",
+    "speed32KFailureSHA256": "1473c9e5825b059d8dd5d66b56a6f9e1d27a05dd9e6adfb98623147eacd2f533",
+    "speed32KStatusSHA256": "03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f",
+    "capacityManifestSHA256": "84151bdb34b1ac9825e9ea3dcb0f8fe549ea252e23f989e595efe0a8161e0fdb",
+    "capacityEvidenceSHA256": "8b6e147adebd1a705103222f1978f1a86916469e96847a1a105370be83871ab1",
+    "capacityCompletionSHA256": "e3850c665e1a2ddf59dc23e49658e48fe961774dd958b849934f6cd0b79faf6e",
+    "capacityLaunchReceiptSHA256": "35be506e873412bff3f9b3a70d3fecebf7f3a65252b8f5f133eddcfdc9df6d4c",
+    "affineTaskRawSHA256": "a171b49da5be1c371f5628c3efbb9d042b4cb6f4f46216310e09889391765345",
+    "affineTaskSummarySHA256": "960c44c1e6a1e233dd70f15e530f6c909437cf7862071687630d0467470cfcbd",
+    "affineTaskStatusSHA256": "5b7b29ff051dc0fb718b86fc04908fc961f0e6849a6e3993d1d0420f4cb0b97b",
+    "affineTaskLaunchReceiptSHA256": "0bea11ce2a78adbbf7c80a3f6caff45ef348d3ab92f6de831c9f66ea9f4b0357",
+    "affineTaskRunLogSHA256": "3a9550c7a6f96b7f6e4dcce0009301e13c6c3a6a636ffe1c7f035cc118235dfa",
+    "affineTaskTimeLogSHA256": "7929c9ed0011a9833032b8ac5283f58f93e0ecb67b0ee01612a0517f82671d29",
+    "affineTaskMonitorSHA256": "6b055911afa8f84908be78a1909d892ff56895addc57d37943f18ff527febd83",
+    "affineTaskLockOwnerSHA256": "e1f7af99773e1643bb5440ae4498f36262afcf5fe6455a5c17785d65fd6d5bd2",
+    "negativeValidatorSourceSHA256": "8f54da8b755300cf9fc43ffb311bbd98713f0330d066d3b66f107e7f5a1a28eb",
+    "negativeValidatorBinarySHA256": "c62a412745d54e2de77100f6ef77dec04c8aba9f70e321a00113e29518d8ba08",
+    "negativeValidatorBuildReceiptSHA256": "4139fb8da3c368bfcafd86d52fdb62fedd4c1a63a4caedb9768ba3ce839389e1",
+    "negativeValidatorPublisherSHA256": "dd9b59f48645dc1d833d7ced3019ec884b8fe9153c29a31ca53c12edd385cb68",
+    "negativeValidatorPublicationLogSHA256": "9c1779e48daa9c35b93602cedb6ab719eb5a96ebcfa01e1257fef060f36710b4",
+    "negativeValidationProgramSHA256": "a50d9105d1fbdabb62ecf0d49b8bab75514bf895735afff23653ebaf13ec23fa",
+    "negativeValidationLogSHA256": "59183ca4cd024dace4771cf7695f7c8117e8edf60c629727884fc5f1c150ebbc"
+  },
+  "negativeAuthentication": {
+    "validatorPublicationAttempt1": {
+      "status": "FAILED_BEFORE_BUNDLE",
+      "reason": "Coverage-instrumented HarnessCore.o required the LLVM profile runtime.",
+      "publisherSHA256": "e077c52da8db4f3c9b6ef1c6f26ac99f7f6b065c63da9830289b230097928dae",
+      "publicationLogSHA256": "a84cf652f7ced19f1c28376be4241c168353b9afa10b0e8238f6ab1251c449e3",
+      "validatorSourceSHA256": "8f54da8b755300cf9fc43ffb311bbd98713f0330d066d3b66f107e7f5a1a28eb",
+      "finalBundleExists": false,
+      "preserved": true
+    },
+    "validatorPublicationV2": {
+      "status": "PASS",
+      "profileOutput": "/dev/null",
+      "bundleEntryCount": 3,
+      "publisherSHA256": "dd9b59f48645dc1d833d7ced3019ec884b8fe9153c29a31ca53c12edd385cb68",
+      "publicationLogSHA256": "9c1779e48daa9c35b93602cedb6ab719eb5a96ebcfa01e1257fef060f36710b4",
+      "validatorBinarySHA256": "c62a412745d54e2de77100f6ef77dec04c8aba9f70e321a00113e29518d8ba08",
+      "buildReceiptSHA256": "4139fb8da3c368bfcafd86d52fdb62fedd4c1a63a4caedb9768ba3ce839389e1"
+    },
+    "result": {
+      "status": "PASS_FOR_NEGATIVE_EVIDENCE",
+      "validationProgramSHA256": "a50d9105d1fbdabb62ecf0d49b8bab75514bf895735afff23653ebaf13ec23fa",
+      "validationLogSHA256": "59183ca4cd024dace4771cf7695f7c8117e8edf60c629727884fc5f1c150ebbc",
+      "swiftMarker": "TASK_SWIFT_NEGATIVE_VALIDATION_PASS",
+      "authMarker": "AFFINE_TASK_NEGATIVE_AUTH_PASS",
+      "failedBoundaryMutated": false,
+      "siblingLockMutated": false
+    }
+  },
+  "criteria": [
+    {
+      "id": "source_lock_boundary",
+      "claim": "The Llama model cycle is bound to an exact source-locked checkpoint and tokenizer, not a mutable cache alias.",
+      "verdict": "PASS",
+      "evidence": {
+        "receiptSHA256": "145127546c6c9872e80512716494eed77905d6e3ddd398c47c8f34a5ec796a4f",
+        "fileCount": 15,
+        "weightShardCount": 8,
+        "snapshotBytes": 39706010909,
+        "maxContext": 131072,
+        "geometry": "Q64/KV8/D128, 80 layers, Llama-3 RoPE"
+      }
+    },
+    {
+      "id": "loaded_8k_speed_tier",
+      "claim": "An 8K affine direct speed tier requires the direct row to beat fp16 and its same-storage materialize control under the frozen speed gate.",
+      "verdict": "FAIL",
+      "evidence": {
+        "fp16PrefillTokS": 270.06,
+        "fp16DecodeTokS": 11.87,
+        "affineMaterializePrefillTokS": 268.58,
+        "affineMaterializeDecodeTokS": 10.51,
+        "affineDirectPrefillTokS": 199.41,
+        "affineDirectDecodeTokS": 11.74,
+        "directDecodeVsFP16Pct": -1.10,
+        "directPrefillVsFP16Pct": -26.16,
+        "retainedInterpretation": "negative/dominated; no speed tier or default route"
+      }
+    },
+    {
+      "id": "loaded_32k_speed_tier",
+      "claim": "The 32K speed lane requires a retained fp16 control in the declared thermal cohort.",
+      "verdict": "FAIL",
+      "evidence": {
+        "manifestSHA256": "48ff1fd0da562f41011fbdff24642f1ca37ece038b864315364dc86595ebf366",
+        "failureSHA256": "1473c9e5825b059d8dd5d66b56a6f9e1d27a05dd9e6adfb98623147eacd2f533",
+        "statusSHA256": "03cbb6c52e522ce55e217e3f9d66dbd66d21ef6bf85024016a3b7f3080c7944f",
+        "retainedRows": 0,
+        "failure": "fp16 retained environment changed nominal to fair",
+        "retainedInterpretation": "hardware-unavailable under the frozen thermal contract"
+      }
+    },
+    {
+      "id": "loaded_32k_capacity_context",
+      "claim": "The 32K affine direct row may be retained only as non-promotable capacity/runtime context.",
+      "verdict": "PASS",
+      "evidence": {
+        "outputPath": "/Users/llmbench/perf-work/results/fused-compressed-kv-llama3-70b-loaded-3493314/llama-32k-affine-capacity-v1",
+        "promptTokens": 32640,
+        "generatedTokens": 128,
+        "directLayers": 80,
+        "materializationBytes": 0,
+        "prefillTokS": 92.61,
+        "decodeTokS": 9.96,
+        "physicalFootprintBytes": 130257818032,
+        "maxProcessRSSBytes": 83292012544,
+        "promotable": false,
+        "speedAggregation": "forbidden"
+      }
+    },
+    {
+      "id": "near_128k_runtime_boundary",
+      "claim": "Near-128K runtime can launch only if the reviewed projection fits the host physical-memory boundary with margin.",
+      "verdict": "FAIL",
+      "evidence": {
+        "runtimeLaunched": false,
+        "projectionMethod": "32K physical footprint plus three additional measured 32K storage/workspace segments",
+        "projectedBytes": 150344865136,
+        "hostPhysicalBytes": 137438953472,
+        "bytesOverPhysical": 12905911664,
+        "retainedInterpretation": "reviewed no-go / not run; no near-128K runtime or refusal row"
+      }
+    },
+    {
+      "id": "sealed_kl_long_depth_promotion",
+      "claim": "Long-depth quality promotion requires scored context at or above the frozen 24,000-token bar.",
+      "verdict": "FAIL",
+      "evidence": {
+        "fp16MedianKL": 0.00000096688,
+        "fp16PooledP95": 0.000029269,
+        "fp16PPLDeltaPct": 0.0025966,
+        "fp16Top1": "327/328",
+        "affineMedianKL": 0.0069743,
+        "affineTailKL": 2.5286453,
+        "affinePooledP95": 1.0595306,
+        "affinePPLDeltaPct": -8.8987,
+        "affineTop1": "285/328",
+        "deepestScoredContextTokens": 22541,
+        "requiredScoredContextTokens": 24000,
+        "retainedInterpretation": "finite measured evidence; non-promotable due depth failure"
+      }
+    },
+    {
+      "id": "fp16_task_baseline",
+      "claim": "The fp16 task baseline is authenticated and can serve as the paired task reference.",
+      "verdict": "PASS",
+      "evidence": {
+        "rawSHA256": "91bb6b290530110244fadd21d587cf4d0727a97c76a2d30fdb0ad569a95b31e4",
+        "summarySHA256": "c9ae61ba1573cd3d93c7a0652558d406c79d3589de033b3f4fec250be4e0942e",
+        "scores": {
+          "math": "10/20",
+          "code": "7/20",
+          "structured": "20/20",
+          "long": "20/20",
+          "structuredValidity": "20/20"
+        }
+      }
+    },
+    {
+      "id": "affine_task_candidate",
+      "claim": "The affine direct task candidate must satisfy the frozen per-domain and structured-validity hard floors before quality promotion.",
+      "verdict": "FAIL",
+      "evidence": {
+        "terminalStatus": "FAILED",
+        "terminalReason": "affine-direct task-coherence exited 1",
+        "rawSHA256": "a171b49da5be1c371f5628c3efbb9d042b4cb6f4f46216310e09889391765345",
+        "summarySHA256": "960c44c1e6a1e233dd70f15e530f6c909437cf7862071687630d0467470cfcbd",
+        "statusSHA256": "5b7b29ff051dc0fb718b86fc04908fc961f0e6849a6e3993d1d0420f4cb0b97b",
+        "validationProgramSHA256": "a50d9105d1fbdabb62ecf0d49b8bab75514bf895735afff23653ebaf13ec23fa",
+        "validationLogSHA256": "59183ca4cd024dace4771cf7695f7c8117e8edf60c629727884fc5f1c150ebbc",
+        "caseCount": 80,
+        "scores": {
+          "math": "10/20",
+          "code": "6/20",
+          "structured": "14/20",
+          "long": "20/20",
+          "structuredValidity": "14/20"
+        },
+        "requiredStructuredValidity": "18/20",
+        "referenceBaselinePassed": true,
+        "hardFloorPassed": false,
+        "balancedTaskDeltaPassed": false,
+        "retainedInterpretation": "authenticated negative evidence; no retry, promotion, or quality tier"
+      }
+    },
+    {
+      "id": "broad_claim_refusal",
+      "claim": "The model cycle must refuse a broad Llama-family, cross-family, speed-tier, or default-setting claim.",
+      "verdict": "PASS",
+      "evidence": {
+        "noSpeedTier": true,
+        "noDefaultRoute": true,
+        "noBroadFamilyClaim": true,
+        "noNear128KRuntimeClaim": true,
+        "capacityContextOnly": true,
+        "reason": "8K speed is dominated, 32K speed has zero retained rows, near-128K did not run, long-depth quality is below bar, and the affine task candidate failed its structured-validity hard floor."
+      }
+    }
+  ],
+  "overallVerdict": "FINAL NO-TIER: source lock, non-promotable 32K capacity context, fp16 task baseline, and broad-claim refusal pass; 8K and 32K speed tiers, near-128K runtime, long-depth promotion, and the affine task hard floor fail."
+}

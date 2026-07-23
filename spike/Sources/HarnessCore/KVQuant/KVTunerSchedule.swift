@@ -11,7 +11,9 @@ public enum KVTunerScheduleError: Error, Equatable, Sendable {
     case cellGroupSizeMismatch(cell: Int, schedule: Int)
     case cellNominalAverageBitsMismatch(cell: Double, schedule: Double)
     case modelConfigHashMismatch
+    case modelConfigSHA256Mismatch
     case checkpointManifestHashMismatch
+    case checkpointContentSHA256Mismatch
     case unsupportedGroupSize(Int)
     case invalidLayerCount
     case nonCanonicalLayerOrder(position: Int, declaredLayer: Int)
@@ -41,7 +43,9 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
     public var matrixID: String
     public var cellID: String
     public var modelConfigHash: String
+    public var modelConfigSHA256: String
     public var checkpointManifestHash: String
+    public var checkpointContentSHA256: String
     public var tokenizerSHA256: String
     public var groupSize: Int
     public var calibrationCorpusID: String
@@ -60,7 +64,9 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         case matrixID
         case cellID
         case modelConfigHash
+        case modelConfigSHA256
         case checkpointManifestHash
+        case checkpointContentSHA256
         case tokenizerSHA256
         case groupSize
         case calibrationCorpusID
@@ -80,7 +86,9 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         matrixID: String,
         cellID: String,
         modelConfigHash: String,
+        modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         groupSize: Int,
         calibrationCorpusID: String,
@@ -98,7 +106,9 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         self.matrixID = matrixID
         self.cellID = cellID
         self.modelConfigHash = modelConfigHash
+        self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
         self.groupSize = groupSize
         self.calibrationCorpusID = calibrationCorpusID
@@ -117,15 +127,19 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(
             Int.self, forKey: .schemaVersion)
-        guard schemaVersion == 3 else {
+        guard schemaVersion == 4 else {
             throw KVTunerScheduleError.unsupportedSchema(schemaVersion)
         }
         matrixID = try container.decode(String.self, forKey: .matrixID)
         cellID = try container.decode(String.self, forKey: .cellID)
         modelConfigHash = try container.decode(
             String.self, forKey: .modelConfigHash)
+        modelConfigSHA256 = try container.decode(
+            String.self, forKey: .modelConfigSHA256)
         checkpointManifestHash = try container.decode(
             String.self, forKey: .checkpointManifestHash)
+        checkpointContentSHA256 = try container.decode(
+            String.self, forKey: .checkpointContentSHA256)
         tokenizerSHA256 = try container.decode(
             String.self, forKey: .tokenizerSHA256)
         groupSize = try container.decode(Int.self, forKey: .groupSize)
@@ -176,9 +190,11 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         expectedMatrixID: String,
         expectedCellID: String,
         expectedModelConfigHash: String,
-        expectedCheckpointManifestHash: String
+        expectedModelConfigSHA256: String,
+        expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String
     ) throws -> KVTunerSchedule {
-        guard schemaVersion == 3 else {
+        guard schemaVersion == 4 else {
             throw KVTunerScheduleError.unsupportedSchema(schemaVersion)
         }
         guard expectedLayerCount > 0 else {
@@ -209,6 +225,10 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         for digest in [
             sourceSensitivityArtifactSHA256,
             sourceSearchArtifactSHA256,
+            modelConfigSHA256,
+            expectedModelConfigSHA256,
+            checkpointContentSHA256,
+            expectedCheckpointContentSHA256,
             tokenizerSHA256,
         ] {
             guard Self.isLowercaseHex(digest, length: 64) else {
@@ -224,8 +244,16 @@ public struct KVTunerSchedule: Codable, Equatable, Sendable {
         guard modelConfigHash == expectedModelConfigHash else {
             throw KVTunerScheduleError.modelConfigHashMismatch
         }
+        guard modelConfigSHA256 == expectedModelConfigSHA256 else {
+            throw KVTunerScheduleError.modelConfigSHA256Mismatch
+        }
         guard checkpointManifestHash == expectedCheckpointManifestHash else {
             throw KVTunerScheduleError.checkpointManifestHashMismatch
+        }
+        guard checkpointContentSHA256
+                == expectedCheckpointContentSHA256
+        else {
+            throw KVTunerScheduleError.checkpointContentSHA256Mismatch
         }
         guard let cellDescriptor = Self.parseCellDescriptor(cellID) else {
             throw KVTunerScheduleError.invalidCellDescriptor(cellID)

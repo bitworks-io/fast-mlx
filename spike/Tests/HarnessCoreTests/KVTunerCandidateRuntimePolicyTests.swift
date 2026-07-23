@@ -59,11 +59,12 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             }
         }
         let sensitivity = try KVTunerSensitivityArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
             checkpointManifestHash: manifest.checkpointManifestHash,
+            checkpointContentSHA256: manifest.checkpointContentSHA256,
             tokenizerSHA256: manifest.tokenizerSHA256,
             calibrationCorpusID: manifest.corpusID,
             calibrationCorpusHash: manifestSHA256,
@@ -127,6 +128,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: maxCandidates,
@@ -180,7 +183,7 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
         })
         XCTAssertEqual(
             policy.runtimePolicySHA256,
-            "d6787cb170a8bd910969a01ba7029ae3fb9684683552f7e484efcb89a9efb470")
+            "20f3606b16285d1f560c3e8c81b9ac563cfc3adbd39d392077639f0ee1195b52")
         XCTAssertEqual(policy, try load(inputs))
     }
 
@@ -193,6 +196,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,
@@ -209,6 +214,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,
@@ -228,6 +235,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: Data("{".utf8),
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,
@@ -244,6 +253,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: differentConfig,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,
@@ -278,6 +289,8 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactSensitivityArtifactData: inputs.sensitivityData,
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash: "0000000000000000",
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,
@@ -294,6 +307,26 @@ final class KVTunerCandidateRuntimePolicyTests: XCTestCase {
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                String(repeating: "f", count: 64),
+            expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
+            targetPairBitTotal: 36,
+            maxCandidates: 10,
+            candidateOrdinal: 0,
+            tokenizePrompt: tokenizer(for: inputs.manifest))) { error in
+                XCTAssertEqual(
+                    error as? KVTunerCandidateRuntimePolicyError,
+                    .checkpointIdentityMismatch)
+            }
+
+        XCTAssertThrowsError(try KVTunerCandidateRuntimePolicy.load(
+            exactCalibrationManifestData: inputs.manifestData,
+            exactSensitivityArtifactData: inputs.sensitivityData,
+            exactModelConfigData: inputs.configData,
+            expectedCheckpointManifestHash:
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: String(repeating: "0", count: 64),
             targetPairBitTotal: 36,
             maxCandidates: 10,

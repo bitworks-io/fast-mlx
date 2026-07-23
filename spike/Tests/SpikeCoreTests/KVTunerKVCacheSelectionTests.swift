@@ -48,18 +48,32 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
     private let checkpointHash = "fedcba9876543210"
 
     private func selection(
-        sourceSearchArtifactSHA256: String = String(repeating: "b", count: 64)
+        sourceSearchArtifactSHA256: String = String(repeating: "b", count: 64),
+        modelConfigHash: String? = nil,
+        modelConfigSHA256: String? = nil,
+        checkpointManifestHash: String? = nil,
+        checkpointContentSHA256: String? = nil,
+        tokenizerSHA256: String? = nil
     ) throws
         -> KVTunerRuntimeSelection
     {
+        let modelConfigHash = modelConfigHash ?? configHash
+        let modelConfigSHA256 = modelConfigSHA256
+            ?? String(repeating: "d", count: 64)
+        let checkpointManifestHash = checkpointManifestHash ?? checkpointHash
+        let checkpointContentSHA256 = checkpointContentSHA256
+            ?? String(repeating: "e", count: 64)
+        let tokenizerSHA256 = tokenizerSHA256 ?? String(repeating: "c", count: 64)
         let average = String(Double(14) / 3)
         let schedule = KVTunerSchedule(
-            schemaVersion: 3,
+            schemaVersion: 4,
             matrixID: matrixID,
             cellID: "kvtuner-g128-b\(average)",
-            modelConfigHash: configHash,
-            checkpointManifestHash: checkpointHash,
-            tokenizerSHA256: String(repeating: "c", count: 64),
+            modelConfigHash: modelConfigHash,
+            modelConfigSHA256: modelConfigSHA256,
+            checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
+            tokenizerSHA256: tokenizerSHA256,
             groupSize: 128,
             calibrationCorpusID: "kvtuner-calibration-v1",
             calibrationCorpusHash: "1111111111111111",
@@ -87,8 +101,11 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
             expectedLayerCount: 3,
             expectedMatrixID: matrixID,
             expectedCellID: schedule.cellID,
-            expectedModelConfigHash: configHash,
-            expectedCheckpointManifestHash: checkpointHash,
+            expectedModelConfigHash: modelConfigHash,
+            expectedModelConfigSHA256: modelConfigSHA256,
+            expectedCheckpointManifestHash: checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             evaluationCorpora: [
                 try KVTunerEvaluationCorpusIdentity(
                     id: "measurement-corpus-v2",
@@ -116,6 +133,7 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
             modelConfigHash: configHash,
             modelConfigSHA256: String(repeating: "b", count: 64),
             checkpointManifestHash: checkpointHash,
+            checkpointContentSHA256: String(repeating: "d", count: 64),
             tokenizerSHA256: String(repeating: "c", count: 64),
             groupSize: 128)
     }
@@ -154,6 +172,158 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
         XCTAssertEqual(
             kind.executionMode(requestingCompilation: true), .compiled)
         XCTAssertFalse(kind.supportsSpecDecode)
+    }
+
+    func testSelectionFactoryThreadsExplicitSplitModeToEveryScheduledLayer() throws {
+        let kind = KVCacheKind.kvtuner(try selection())
+        let caches = try kind.makeCaches(
+            layerCount: 3,
+            capacity: 7,
+            affineAttentionMode: .splitQuantizedMM)
+        let affine = try XCTUnwrap(caches as? [AffineKVCache])
+
+        XCTAssertEqual(
+            affine.map(\.attentionMode),
+            Array(repeating: .splitQuantizedMM, count: 3))
+    }
+
+    func testContinuousBatchFamilyPreservesAuthenticatedHeterogeneousSchedule() throws {
+        let admission = try makeCompressedBatchAdmission(
+            layerCount: 3,
+            queryHeadCount: 4,
+            keyValueHeadCount: 1,
+            headDimension: 128,
+            maxPositionEmbeddings: 32)
+        let selection = try selection(
+            modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256)
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyKVTunerCandidateModel(),
+            allocationChunk: 4,
+            maxContextTokens: 32,
+            initialDecodeReserve: 2,
+            kvCacheKind: .kvtuner(selection),
+            affineAttentionMode: .splitQuantizedMM,
+            compressedKVAttentionAdmission: admission,
+            layerCount: 3,
+            keyValueHeadCount: 1,
+            headDimension: 128,
+            elementBytes: 2)
+        for (id, token) in [(UInt64(1), 1), (UInt64(2), 2)] {
+            try runtime.prefill(
+                ContinuousBatchRuntimePrefill(
+                    id: BatchRequestID(id),
+                    startToken: 0,
+                    tokens: [token],
+                    isFinal: true,
+                    totalPromptTokens: 1,
+                    maxOutputTokens: 2))
+        }
+
+        let result = try runtime.decode(
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2)],
+                speculationAllowed: false))
+
+        XCTAssertEqual(result.map(\.tokens), [[1], [2]])
+        XCTAssertEqual(runtime.diagnostics().kvBytesPerToken, 472)
+        XCTAssertEqual(runtime.diagnostics().batchPhysicalWrittenEnd, 2)
+    }
+
+    func testContinuousBatchRejectsKVTunerScheduleIdentityMismatch() throws {
+        let admission = try makeCompressedBatchAdmission(
+            layerCount: 3,
+            queryHeadCount: 4,
+            keyValueHeadCount: 1,
+            headDimension: 128,
+            maxPositionEmbeddings: 32)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: TinyKVTunerCandidateModel(),
+                allocationChunk: 4,
+                maxContextTokens: 32,
+                initialDecodeReserve: 2,
+                kvCacheKind: .kvtuner(try selection()),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: admission,
+                layerCount: 3,
+                keyValueHeadCount: 1,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+    }
+
+    func testContinuousBatchRejectsKVTunerScheduleFromSameManifestDifferentCheckpoint()
+        throws
+    {
+        let admission = try makeCompressedBatchAdmission(
+            layerCount: 3,
+            queryHeadCount: 4,
+            keyValueHeadCount: 1,
+            headDimension: 128,
+            maxPositionEmbeddings: 32)
+        let selection = try selection(
+            modelConfigHash: admission.modelConfigHash,
+            modelConfigSHA256: admission.modelConfigSHA256,
+            checkpointManifestHash: admission.checkpointManifestHash,
+            checkpointContentSHA256: String(repeating: "e", count: 64),
+            tokenizerSHA256: admission.tokenizerSHA256)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: TinyKVTunerCandidateModel(),
+                allocationChunk: 4,
+                maxContextTokens: 32,
+                initialDecodeReserve: 2,
+                kvCacheKind: .kvtuner(selection),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: admission,
+                layerCount: 3,
+                keyValueHeadCount: 1,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .compressedBatchAdmissionMismatch)
+        }
+    }
+
+    func testContinuousBatchRejectsPreselectionKVTunerCandidate() throws {
+        let admission = try makeCompressedBatchAdmission(
+            layerCount: 3,
+            queryHeadCount: 4,
+            keyValueHeadCount: 1,
+            headDimension: 128,
+            maxPositionEmbeddings: 32)
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: TinyKVTunerCandidateModel(),
+                allocationChunk: 4,
+                maxContextTokens: 32,
+                initialDecodeReserve: 2,
+                kvCacheKind: .kvtunerCandidate(try candidatePolicy()),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission: admission,
+                layerCount: 3,
+                keyValueHeadCount: 1,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .unsupportedCompressedBatchCache)
+        }
     }
 
     func testRuntimeFactoryRejectsLayerCountMismatchWithoutFallback() throws {
@@ -318,6 +488,10 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
         XCTAssertEqual(
             telemetry.materializationWorkspaceBytes,
             snapshots.map(\.materializationWorkspaceBytes).max())
+        XCTAssertEqual(telemetry.attentionWorkspaceBytes, 0)
+        XCTAssertEqual(
+            telemetry.workspaceBytes,
+            telemetry.materializationWorkspaceBytes)
 
         let predicted = try KVStorageFormat.kvtunerAllocation(
             layerPolicy: selection.layers.map {

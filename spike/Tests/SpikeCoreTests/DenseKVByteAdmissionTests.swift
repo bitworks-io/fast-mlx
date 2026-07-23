@@ -68,4 +68,57 @@ final class DenseKVByteAdmissionTests: XCTestCase {
                 allocationChunk: 256,
                 maxContextTokens: 40_960))
     }
+
+    func testAffineAdmissionCountsIndependentPackedKVMetadataAndPhysicalEnd() throws {
+        let plan = try AffineKVByteAdmissionPlan(
+            configurations: [AffineKVTier.k4v2G64.configuration],
+            keyValueHeadCount: 2,
+            headDimension: 128,
+            metadataScalarBytes: 2,
+            allocationChunk: 4,
+            maxContextTokens: 32)
+
+        XCTAssertEqual(plan.bytesPerToken, 224)
+        XCTAssertEqual(
+            try plan.transitionEnvelopeBytes(capacities: [4, 8]),
+            18_020)
+    }
+
+    func testHeterogeneousAffineAdmissionSumsEveryLayerConfiguration() throws {
+        let plan = try AffineKVByteAdmissionPlan(
+            configurations: [
+                try AffineKVCacheConfiguration(
+                    keyBits: 8, valueBits: 4,
+                    keyGroupSize: 128, valueGroupSize: 128),
+                try AffineKVCacheConfiguration(
+                    keyBits: 4, valueBits: 2,
+                    keyGroupSize: 128, valueGroupSize: 128),
+            ],
+            keyValueHeadCount: 2,
+            headDimension: 128,
+            metadataScalarBytes: 2,
+            allocationChunk: 4,
+            maxContextTokens: 32)
+
+        XCTAssertEqual(plan.bytesPerToken, 608)
+        XCTAssertEqual(
+            try plan.transitionEnvelopeBytes(capacities: [4, 8]),
+            48_800)
+    }
+
+    func testAffinePackedBitArithmeticOverflowFailsClosedWithoutTrapping() {
+        XCTAssertThrowsError(
+            try AffineKVByteAdmissionPlan(
+                configurations: [AffineKVTier.k8v2G64.configuration],
+                keyValueHeadCount: 1,
+                headDimension: Int.max - 63,
+                metadataScalarBytes: 2,
+                allocationChunk: 1,
+                maxContextTokens: 1)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseKVByteAdmissionPlanError,
+                .arithmeticOverflow)
+        }
+    }
 }

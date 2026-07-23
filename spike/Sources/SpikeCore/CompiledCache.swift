@@ -74,12 +74,20 @@ public enum KVCacheKind: Sendable, Hashable {
     /// Build one layer's cache. Native affine geometry is fixed by its named tier. TurboQuant
     /// params resolve lazily from the first update's head_dim; the fixed seed means every layer
     /// derives the identical global Π/S/codebook (the paper's "global parameters").
-    public func makeCache(capacity: Int) -> any CompiledCache {
+    public func makeCache(
+        capacity: Int,
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
+    ) -> any CompiledCache {
         switch self {
         case .fp16:
             CompiledKVCache(capacity: capacity)
         case .affine(let tier):
-            AffineKVCache(capacity: capacity, configuration: tier.configuration)
+            AffineKVCache(
+                capacity: capacity,
+                configuration: tier.configuration,
+                attentionMode: affineAttentionMode)
         case .kvtuner, .kvtunerCandidate:
             preconditionFailure(
                 "KVTuner requires the layer-aware makeCaches factory")
@@ -88,7 +96,9 @@ public enum KVCacheKind: Sendable, Hashable {
         case .kvarn(let cell):
             KVarNKVCache(
                 capacity: capacity, tier: cell.tier,
-                iterations: cell.iterations)
+                iterations: cell.iterations,
+                attentionMode: kvarnAttentionMode,
+                storageDType: kvarnStorageDType)
         }
     }
 
@@ -96,7 +106,11 @@ public enum KVCacheKind: Sendable, Hashable {
     /// KVTuner consumes its immutable authenticated layer policy in canonical index order.
     /// A count or configuration mismatch is an explicit error and never becomes fp16.
     public func makeCaches(
-        layerCount: Int, capacity: Int
+        layerCount: Int,
+        capacity: Int,
+        affineAttentionMode: AffineKVAttentionMode = .materialize,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
+        kvarnStorageDType: KVarNKVScalarDType? = nil
     ) throws -> [any CompiledCache] {
         switch self {
         case .kvtuner(let selection):
@@ -104,28 +118,39 @@ public enum KVCacheKind: Sendable, Hashable {
                 layers: selection.layers,
                 groupSize: selection.groupSize,
                 layerCount: layerCount,
-                capacity: capacity)
+                capacity: capacity,
+                attentionMode: affineAttentionMode)
         case .kvtunerCandidate(let policy):
             return try Self.makeKVTunerCaches(
                 layers: policy.layers,
                 groupSize: policy.groupSize,
                 layerCount: layerCount,
-                capacity: capacity)
+                capacity: capacity,
+                attentionMode: affineAttentionMode)
         case .fp16, .affine, .turboQuant, .kvarn:
             return (0 ..< layerCount).map { _ in
-                makeCache(capacity: capacity)
+                makeCache(
+                    capacity: capacity,
+                    affineAttentionMode: affineAttentionMode,
+                    kvarnAttentionMode: kvarnAttentionMode,
+                    kvarnStorageDType: kvarnStorageDType)
             }
         }
     }
 
-    /// Resolve the actual step mode once, before the decoder builds its closure. KVarN's host
-    /// tile-boundary mutation is not compile-capturable, so a caller cannot accidentally turn it
-    /// into a stale compiled trace by requesting compilation.
-    public func executionMode(requestingCompilation: Bool) -> KVCacheExecutionMode {
+    /// Resolve the actual step mode once, before the decoder builds its closure. KVarN's
+    /// materialized path has host tile-boundary mutation that is not compile-capturable; the
+    /// direct attention path keeps execution in graph state and may compile when requested.
+    public func executionMode(
+        requestingCompilation: Bool,
+        kvarnAttentionMode: KVarNKVAttentionMode = .materialize
+    ) -> KVCacheExecutionMode {
         guard requestingCompilation else { return .uncompiledCorrectness }
         switch self {
         case .kvarn:
-            return .uncompiledCorrectness
+            return kvarnAttentionMode == .splitQuantizedMM
+                ? .compiled
+                : .uncompiledCorrectness
         case .fp16, .affine, .kvtuner, .kvtunerCandidate, .turboQuant:
             return .compiled
         }
@@ -147,7 +172,8 @@ public enum KVCacheKind: Sendable, Hashable {
         layers: [KVTunerRuntimeLayerPolicy],
         groupSize: Int,
         layerCount: Int,
-        capacity: Int
+        capacity: Int,
+        attentionMode: AffineKVAttentionMode
     ) throws -> [any CompiledCache] {
         guard layers.count == layerCount else {
             throw KVCacheKindError.layerCountMismatch(
@@ -170,7 +196,9 @@ public enum KVCacheKind: Sendable, Hashable {
                     layer: position)
             }
             return AffineKVCache(
-                capacity: capacity, configuration: configuration)
+                capacity: capacity,
+                configuration: configuration,
+                attentionMode: attentionMode)
         }
     }
 }

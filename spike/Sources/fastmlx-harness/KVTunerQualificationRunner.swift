@@ -74,6 +74,8 @@ private func requireKVTunerSnapshot(
             == manifest.modelConfigSHA256,
         snapshot.checkpointManifestHash
             == manifest.checkpointManifestHash,
+        snapshot.checkpointContentSHA256
+            == manifest.checkpointContentSHA256,
         snapshot.tokenizerSHA256 == manifest.tokenizerSHA256
     else {
         throw KVTunerQualificationCLIError.sourceIdentityMismatch
@@ -149,6 +151,7 @@ func runKVTunerManifest(_ flags: Flags) async {
                 at: plan.normalizedTargetsPath),
             exactModelConfigData: stable.exactModelConfigData,
             checkpointManifestHash: stable.checkpointManifestHash,
+            checkpointContentSHA256: stable.checkpointContentSHA256,
             tokenizerSHA256: stable.tokenizerSHA256,
             tokenizePrompt: {
                 tokenizer.encode(text: $0, addSpecialTokens: true)
@@ -350,6 +353,7 @@ private func kvtunerCandidateExecutionEnvironment(
         modelConfigHash: policy.modelConfigHash,
         modelConfigSHA256: policy.modelConfigSHA256,
         checkpointManifestHash: policy.checkpointManifestHash,
+        checkpointContentSHA256: policy.checkpointContentSHA256,
         tokenizerSHA256: policy.tokenizerSHA256)
 }
 
@@ -448,6 +452,8 @@ func runKVTunerCandidate(_ flags: Flags) async {
                 exactModelConfigData: before.exactModelConfigData,
                 expectedCheckpointManifestHash:
                     before.checkpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    before.checkpointContentSHA256,
                 expectedTokenizerSHA256: before.tokenizerSHA256,
                 targetPairBitTotal: plan.targetPairBitTotal,
                 maxCandidates: plan.maxCandidates,
@@ -563,6 +569,8 @@ private func kvtunerRuntimePolicies(
             exactModelConfigData: snapshot.exactModelConfigData,
             expectedCheckpointManifestHash:
                 snapshot.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                snapshot.checkpointContentSHA256,
             expectedTokenizerSHA256: snapshot.tokenizerSHA256,
             targetPairBitTotal: targetPairBitTotal,
             maxCandidates: maxCandidates,
@@ -686,7 +694,9 @@ func runKVTunerSearch(_ flags: Flags) async {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: before.exactModelConfigData,
             expectedCheckpointManifestHash:
-                before.checkpointManifestHash)
+                before.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                before.checkpointContentSHA256)
         let scheduleData = try KVTunerArtifactCodec.encode(schedule)
         let after = try captureKVTunerQualificationRuntimeSourceSnapshot(
             modelPath: plan.modelPath)
@@ -745,6 +755,17 @@ func runKVTunerBundle(_ flags: Flags) async {
         let before = try captureKVTunerQualificationRuntimeSourceSnapshot(
             modelPath: plan.modelPath)
         try requireKVTunerSnapshot(before, matches: manifest)
+        let strongBefore = try
+            captureCompressedKVAttentionRuntimeSourceSnapshot(
+                modelPath: plan.modelPath)
+        guard strongBefore.exactModelConfigData
+                == before.exactModelConfigData,
+            strongBefore.checkpointManifestHash
+                == before.checkpointManifestHash,
+            strongBefore.tokenizerSHA256 == before.tokenizerSHA256
+        else {
+            throw KVTunerQualificationCLIError.sourceIdentityMismatch
+        }
         let tokenizer = try await AutoTokenizer.from(
             modelFolder: URL(fileURLWithPath: plan.modelPath))
         guard let eosTokenID = tokenizer.eosToken.flatMap({
@@ -770,12 +791,18 @@ func runKVTunerBundle(_ flags: Flags) async {
             eosTokenID: eosTokenID,
             expectedCheckpointManifestHash:
                 before.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                strongBefore.checkpointContentSHA256,
             tokenizePrompt: tokenizePrompt,
             decodeTokenIDs: decodeTokenIDs)
         let after = try captureKVTunerQualificationRuntimeSourceSnapshot(
             modelPath: plan.modelPath)
         _ = try KVTunerCandidateRuntimeSourceSnapshot.validateUnchanged(
             before: before, after: after)
+        let strongAfter = try captureCompressedKVAttentionRuntimeSourceSnapshot(
+            modelPath: plan.modelPath)
+        _ = try CompressedKVAttentionRuntimeSourceSnapshot.validateUnchanged(
+            before: strongBefore, after: strongAfter)
         let data = try KVTunerArtifactCodec.encode(bundle)
         try writeKVTunerQualificationResult(
             data, to: plan.outputPath, label: "kvtuner-bundle")

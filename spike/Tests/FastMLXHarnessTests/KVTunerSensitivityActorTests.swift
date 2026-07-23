@@ -37,6 +37,7 @@ final class KVTunerSensitivityActorTests: XCTestCase {
         return try KVTunerCandidateRuntimeIdentity.load(
             exactModelConfigData: data,
             checkpointManifestHash: checkpointHash ?? self.checkpointHash,
+            checkpointContentSHA256: String(repeating: "d", count: 64),
             tokenizerSHA256: tokenizerSHA256,
             eosTokenID: 63)
     }

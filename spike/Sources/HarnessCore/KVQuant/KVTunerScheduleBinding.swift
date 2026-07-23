@@ -16,7 +16,7 @@ public enum KVTunerScheduleBindingError: Error, Equatable, Sendable {
 /// result into task/KL evidence, then revalidates its own decoded structure and all externally
 /// expected identities before the evidence is accepted.
 public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
 
     public let schemaVersion: Int
     public let scheduleSchemaVersion: Int
@@ -27,7 +27,9 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
     public let matrixID: String
     public let cellID: String
     public let modelConfigHash: String
+    public let modelConfigSHA256: String
     public let checkpointManifestHash: String
+    public let checkpointContentSHA256: String
     public let tokenizerSHA256: String
     public let groupSize: Int
     public let promptDigestAlgorithm: String
@@ -51,7 +53,9 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         matrixID = selection.matrixID
         cellID = selection.cellID
         modelConfigHash = selection.modelConfigHash
+        modelConfigSHA256 = selection.modelConfigSHA256
         checkpointManifestHash = selection.checkpointManifestHash
+        checkpointContentSHA256 = selection.checkpointContentSHA256
         tokenizerSHA256 = selection.tokenizerSHA256
         groupSize = selection.groupSize
         promptDigestAlgorithm = selection.promptDigestAlgorithm
@@ -80,7 +84,7 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         }
         scheduleSchemaVersion = try container.decode(
             Int.self, forKey: .scheduleSchemaVersion)
-        guard scheduleSchemaVersion == 3 else {
+        guard scheduleSchemaVersion == 4 else {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .unsupportedSchema(scheduleSchemaVersion))
         }
@@ -92,8 +96,12 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         cellID = try container.decode(String.self, forKey: .cellID)
         modelConfigHash = try container.decode(
             String.self, forKey: .modelConfigHash)
+        modelConfigSHA256 = try container.decode(
+            String.self, forKey: .modelConfigSHA256)
         checkpointManifestHash = try container.decode(
             String.self, forKey: .checkpointManifestHash)
+        checkpointContentSHA256 = try container.decode(
+            String.self, forKey: .checkpointContentSHA256)
         tokenizerSHA256 = try container.decode(
             String.self, forKey: .tokenizerSHA256)
         groupSize = try container.decode(Int.self, forKey: .groupSize)
@@ -123,15 +131,17 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         try validateStructure()
     }
 
-    /// Rebinds decoded evidence to the exact runtime/corpus identities expected by its consumer.
-    /// Matching only a tier label is insufficient: every model and schedule field must match, and
-    /// the exact aggregate plus per-prompt corpus identity must be present.
+    /// Rebinds decoded evidence to both portable and exact model identities. Runtime/task/KL
+    /// consumers still validate the same values against an independently captured loaded-model
+    /// admission before touching MLX cache state.
     @discardableResult
     public func validated(
         expectedMatrixID: String,
         expectedCellID: String,
         expectedModelConfigHash: String,
+        expectedModelConfigSHA256: String,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         expectedLayerCount: Int,
         requiredEvaluationCorpus: KVTunerEvaluationCorpusIdentity
     ) throws -> KVTunerScheduleBinding {
@@ -170,9 +180,22 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .modelConfigHashMismatch)
         }
+        guard Self.isLowercaseHex(expectedModelConfigSHA256, length: 64),
+            modelConfigSHA256 == expectedModelConfigSHA256
+        else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .modelConfigSHA256Mismatch)
+        }
         guard checkpointManifestHash == expectedCheckpointManifestHash else {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .checkpointManifestHashMismatch)
+        }
+        guard Self.isLowercaseHex(
+                expectedCheckpointContentSHA256, length: 64),
+            checkpointContentSHA256 == expectedCheckpointContentSHA256
+        else {
+            throw KVTunerScheduleBindingError.invalidSchedule(
+                .checkpointContentSHA256Mismatch)
         }
         guard layers.count == expectedLayerCount else {
             throw KVTunerScheduleBindingError.invalidSchedule(
@@ -190,7 +213,9 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
         expectedMatrixID: String,
         expectedCellID: String,
         expectedModelConfigHash: String,
+        expectedModelConfigSHA256: String,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         expectedLayerCount: Int,
         requiredEvaluationCorpus: KVTunerEvaluationCorpusIdentity
     ) throws -> KVTunerScheduleBinding {
@@ -207,8 +232,11 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             expectedMatrixID: expectedMatrixID,
             expectedCellID: expectedCellID,
             expectedModelConfigHash: expectedModelConfigHash,
+            expectedModelConfigSHA256: expectedModelConfigSHA256,
             expectedCheckpointManifestHash:
                 expectedCheckpointManifestHash,
+            expectedCheckpointContentSHA256:
+                expectedCheckpointContentSHA256,
             expectedLayerCount: expectedLayerCount,
             requiredEvaluationCorpus: requiredEvaluationCorpus)
     }
@@ -222,7 +250,10 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             && matrixID == other.matrixID
             && cellID == other.cellID
             && modelConfigHash == other.modelConfigHash
+            && modelConfigSHA256 == other.modelConfigSHA256
             && checkpointManifestHash == other.checkpointManifestHash
+            && checkpointContentSHA256
+                == other.checkpointContentSHA256
             && tokenizerSHA256 == other.tokenizerSHA256
             && groupSize == other.groupSize
             && promptDigestAlgorithm == other.promptDigestAlgorithm
@@ -246,7 +277,7 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             throw KVTunerScheduleBindingError.unsupportedBindingSchema(
                 schemaVersion)
         }
-        guard scheduleSchemaVersion == 3 else {
+        guard scheduleSchemaVersion == 4 else {
             throw KVTunerScheduleBindingError.invalidSchedule(
                 .unsupportedSchema(scheduleSchemaVersion))
         }
@@ -271,6 +302,8 @@ public struct KVTunerScheduleBinding: Codable, Equatable, Sendable {
             }
         }
         for digest in [
+            modelConfigSHA256,
+            checkpointContentSHA256,
             sourceSensitivityArtifactSHA256,
             sourceSearchArtifactSHA256,
             tokenizerSHA256,

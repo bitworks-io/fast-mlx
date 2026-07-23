@@ -15,10 +15,18 @@ public enum KVStorageFormatKind: String, Codable, Equatable, Sendable {
 public struct KVModelEvidenceIdentity: Codable, Equatable, Sendable {
     public let configHash: String
     public let checkpointManifestHash: String
+    /// Optional full checkpoint-content digest. Historical artifacts omit it; compressed-attention
+    /// qualification requires it and cross-checks it against the independently loaded admission.
+    public let checkpointContentSHA256: String?
 
-    public init(configHash: String, checkpointManifestHash: String) {
+    public init(
+        configHash: String,
+        checkpointManifestHash: String,
+        checkpointContentSHA256: String? = nil
+    ) {
         self.configHash = configHash
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
     }
 }
 
@@ -769,6 +777,19 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
     /// schedule's own claim as both value and expected value.
     public let candidateKVTunerEvaluationCorpus:
         KVTunerEvaluationCorpusIdentity?
+    /// Explicit request plus the operation observed after teacher-forced execution. Optional
+    /// preserves historical storage-frontier rows; any row that carries it is re-authenticated
+    /// against the model, geometry, schedule, and measured workspace before use.
+    public let candidateCompressedKVAttention:
+        CompressedKVAttentionRuntimeBinding?
+    /// Route-specific logical workspace components retained separately so a split row cannot
+    /// relabel "no dense K/V reconstruction" as "no temporary attention workspace." The
+    /// normalization component is optional for backward-compatible schema-2 record decoding.
+    /// New direct-KVarN promotion evidence uses schema 3 and must persist the component even when
+    /// it is zero, so a producer cannot hide normalization cost inside attention workspace.
+    public let candidateMaterializationWorkspaceBytes: Int?
+    public let candidateNormalizationWorkspaceBytes: Int?
+    public let candidateAttentionWorkspaceBytes: Int?
 
     public init(
         schemaVersion: Int, matrixID: String, cellID: String,
@@ -784,7 +805,12 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         candidateMemoryGate: KVarNMemoryGateEvidence? = nil,
         candidateKVTunerSchedule: KVTunerScheduleBinding? = nil,
         candidateKVTunerEvaluationCorpus:
-            KVTunerEvaluationCorpusIdentity? = nil
+            KVTunerEvaluationCorpusIdentity? = nil,
+        candidateCompressedKVAttention:
+            CompressedKVAttentionRuntimeBinding? = nil,
+        candidateMaterializationWorkspaceBytes: Int? = nil,
+        candidateNormalizationWorkspaceBytes: Int? = nil,
+        candidateAttentionWorkspaceBytes: Int? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.matrixID = matrixID
@@ -810,6 +836,14 @@ public struct KVFrontierEvidence: Codable, Equatable, Sendable {
         } else {
             self.candidateKVTunerEvaluationCorpus = nil
         }
+        self.candidateCompressedKVAttention =
+            candidateCompressedKVAttention
+        self.candidateMaterializationWorkspaceBytes =
+            candidateMaterializationWorkspaceBytes
+        self.candidateNormalizationWorkspaceBytes =
+            candidateNormalizationWorkspaceBytes
+        self.candidateAttentionWorkspaceBytes =
+            candidateAttentionWorkspaceBytes
     }
 }
 
@@ -823,6 +857,11 @@ public struct KVEntryScoringEvidence: Codable, Equatable, Sendable {
         self.entryID = entryID
         self.scoredPositions = scoredPositions
     }
+}
+
+public enum KLReferenceTransport: String, Codable, Equatable, Sendable {
+    case livePython = "live-python"
+    case sealedReplay = "sealed-replay"
 }
 
 /// Pure form of the `kl` JSONL payload. Optional additions preserve decoding of historical rows;
@@ -858,6 +897,13 @@ public struct KLPayload: Codable, Equatable, Sendable {
     /// long file; promotion is based on measured depth, not the corpus tag or document length.
     public let longContextMaxDocumentTokens: Int?
     public let longContextMaxScoredContextTokens: Int?
+    /// Newly written rows identify whether the teacher came from the live Python reference or an
+    /// immutable replay bundle. Historical rows decode with nil for backward compatibility.
+    public let referenceTransport: KLReferenceTransport?
+    /// Exact digest of an immutable, separately captured teacher-forced reference bundle.
+    /// Historical and live-reference rows omit it. Sealed-reference rows supply it so the final
+    /// KL evidence cannot be detached from or silently substituted for the replayed logits.
+    public let sealedReferenceArtifactSHA256: String?
 
     public init(
         kvQuantTier: String,
@@ -876,7 +922,9 @@ public struct KLPayload: Codable, Equatable, Sendable {
         shortEntryScoring: [KVEntryScoringEvidence]? = nil,
         longContextEntryScoring: [KVEntryScoringEvidence]? = nil,
         longContextMaxDocumentTokens: Int? = nil,
-        longContextMaxScoredContextTokens: Int? = nil
+        longContextMaxScoredContextTokens: Int? = nil,
+        referenceTransport: KLReferenceTransport? = nil,
+        sealedReferenceArtifactSHA256: String? = nil
     ) {
         self.kvQuantTier = kvQuantTier
         self.klMedianNats = klMedianNats
@@ -900,6 +948,8 @@ public struct KLPayload: Codable, Equatable, Sendable {
         self.longContextEntryScoring = longContextEntryScoring
         self.longContextMaxDocumentTokens = longContextMaxDocumentTokens
         self.longContextMaxScoredContextTokens = longContextMaxScoredContextTokens
+        self.referenceTransport = referenceTransport
+        self.sealedReferenceArtifactSHA256 = sealedReferenceArtifactSHA256
     }
 }
 
@@ -1017,6 +1067,16 @@ public extension KLPayload {
         guard maxDocumentTokens > 1, maxScoredContextTokens > 0,
             maxScoredContextTokens < maxDocumentTokens
         else { throw KVFrontierEvidenceError.invalidMetric("longContextDepth") }
+        switch (referenceTransport, sealedReferenceArtifactSHA256) {
+        case (.none, .none), (.some(.livePython), .none):
+            break
+        case (.some(.sealedReplay), .some(let digest))
+            where Self.isLowercaseSHA256(digest):
+            break
+        default:
+            throw KVFrontierEvidenceError.invalidPromotionProvenance(
+                "sealedReferenceArtifactSHA256")
+        }
 
         guard let frontier else { throw KVFrontierEvidenceError.missingFrontier }
         try frontier.validateForRecord(candidateTier: kvQuantTier)
@@ -1080,6 +1140,13 @@ public extension KLPayload {
         let punctuation = CharacterSet(charactersIn: "-._:/@+")
         return value.unicodeScalars.allSatisfy {
             CharacterSet.alphanumerics.contains($0) || punctuation.contains($0)
+        }
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            ($0 >= 0x30 && $0 <= 0x39)
+                || ($0 >= 0x61 && $0 <= 0x66)
         }
     }
 }
@@ -1292,7 +1359,7 @@ public extension KVarNMemoryGateEvidence {
 
 private extension KVFrontierEvidence {
     func validateForRecord(candidateTier: String) throws {
-        guard schemaVersion == 1 else {
+        guard [1, 2, 3].contains(schemaVersion) else {
             throw KVFrontierEvidenceError.unsupportedSchema(schemaVersion)
         }
         guard KLPayload.isIdentifier(matrixID), KLPayload.isIdentifier(cellID) else {
@@ -1313,7 +1380,11 @@ private extension KVFrontierEvidence {
         }
         if let schedule = candidateKVTunerSchedule {
             guard let evaluation = candidateKVTunerEvaluationCorpus,
-                schedule.evaluationCorpora == [evaluation]
+                schedule.evaluationCorpora == [evaluation],
+                schemaVersion == 2,
+                let compressedBinding = candidateCompressedKVAttention,
+                let checkpointContentSHA256 =
+                    candidateModel.checkpointContentSHA256
             else {
                 throw KVFrontierEvidenceError.invalidKVTunerSchedule
             }
@@ -1322,8 +1393,12 @@ private extension KVFrontierEvidence {
                     expectedMatrixID: matrixID,
                     expectedCellID: cellID,
                     expectedModelConfigHash: candidateModel.configHash,
+                    expectedModelConfigSHA256:
+                        compressedBinding.admission.modelConfigSHA256,
                     expectedCheckpointManifestHash:
                         candidateModel.checkpointManifestHash,
+                    expectedCheckpointContentSHA256:
+                        checkpointContentSHA256,
                     expectedLayerCount:
                         candidateFormat?.layerCount ?? schedule.layers.count,
                     requiredEvaluationCorpus: evaluation)
@@ -1456,10 +1531,161 @@ private extension KVFrontierEvidence {
         case (.some, .none):
             throw KVFrontierEvidenceError.missingStorage
         }
+        try validateCompressedKVAttention(
+            candidateTier: candidateTier)
+    }
+
+    private func validateCompressedKVAttention(
+        candidateTier: String
+    ) throws {
+        let requestsDirectKVarN = candidateCompressedKVAttention?.request
+            == .splitKVarNQuantizedMM
+        let requiresBinding = candidateFormat.map {
+            $0.kind == .affine || $0.kind == .kvtuner
+                || ($0.kind == .kvarn && requestsDirectKVarN)
+        } ?? false
+        if schemaVersion == 1 {
+            guard candidateCompressedKVAttention == nil,
+                candidateMaterializationWorkspaceBytes == nil,
+                candidateNormalizationWorkspaceBytes == nil,
+                candidateAttentionWorkspaceBytes == nil,
+                candidateModel.checkpointContentSHA256 == nil,
+                referenceModel.checkpointContentSHA256 == nil
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+            return
+        }
+        if schemaVersion == 3 {
+            guard requestsDirectKVarN,
+                candidateNormalizationWorkspaceBytes != nil
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        }
+        guard requiresBinding == (candidateCompressedKVAttention != nil),
+            requiresBinding == (candidateModel.checkpointContentSHA256 != nil),
+            requiresBinding == (referenceModel.checkpointContentSHA256 != nil),
+            requiresBinding
+                == (candidateMaterializationWorkspaceBytes != nil),
+            requiresBinding == (candidateAttentionWorkspaceBytes != nil),
+            requiresBinding || candidateNormalizationWorkspaceBytes == nil
+        else {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        guard let binding = candidateCompressedKVAttention else { return }
+        do {
+            try binding.validated()
+        } catch {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        guard let format = candidateFormat,
+            let storage,
+            format.kind == .affine || format.kind == .kvtuner
+                || format.kind == .kvarn,
+            format.tier == candidateTier,
+            binding.admission.modelConfigHash == candidateModel.configHash,
+            binding.admission.checkpointManifestHash
+                == candidateModel.checkpointManifestHash,
+            binding.admission.checkpointContentSHA256
+                == candidateModel.checkpointContentSHA256,
+            binding.admission.layerCount == format.layerCount,
+            binding.admission.kvHeadCount == format.kvHeadCount,
+            binding.admission.headDimension == format.headDimension
+        else {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        do {
+            switch format.kind {
+            case .affine:
+                try binding.admission.validateAffineGeometry(
+                    keyGroupSize: format.groupSize,
+                    valueGroupSize: format.groupSize)
+            case .kvtuner:
+                guard let schedule = candidateKVTunerSchedule else {
+                    throw KVFrontierEvidenceError.invalidRuntimeEvidence
+                }
+                try binding.admission.validateScheduleIdentity(
+                    modelConfigHash: schedule.modelConfigHash,
+                    modelConfigSHA256: schedule.modelConfigSHA256,
+                    checkpointManifestHash:
+                        schedule.checkpointManifestHash,
+                    checkpointContentSHA256:
+                        schedule.checkpointContentSHA256,
+                    tokenizerSHA256: schedule.tokenizerSHA256,
+                    layerCount: schedule.layers.count,
+                    groupSize: schedule.groupSize)
+            case .kvarn:
+                try binding.admission.validateAffineGeometry(
+                    keyGroupSize: format.groupSize,
+                    valueGroupSize: format.groupSize)
+            case .fp16:
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        } catch let error as KVFrontierEvidenceError {
+            throw error
+        } catch {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        guard let materializationWorkspace =
+                candidateMaterializationWorkspaceBytes,
+            let attentionWorkspace = candidateAttentionWorkspaceBytes,
+            materializationWorkspace >= 0, attentionWorkspace >= 0,
+            (candidateNormalizationWorkspaceBytes ?? 0) >= 0
+        else {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        let normalizationWorkspace =
+            candidateNormalizationWorkspaceBytes ?? 0
+        let (partialWorkspaceTotal, partialWorkspaceOverflow) =
+            materializationWorkspace.addingReportingOverflow(
+                normalizationWorkspace)
+        let (workspaceTotal, workspaceOverflow) = partialWorkspaceTotal
+            .addingReportingOverflow(attentionWorkspace)
+        guard !partialWorkspaceOverflow, !workspaceOverflow,
+            storage.actual.workspaceBytes == workspaceTotal
+        else {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
+        switch binding.request {
+        case .splitAffineQuantizedMM:
+            guard format.kind == .affine || format.kind == .kvtuner,
+                materializationWorkspace == 0,
+                normalizationWorkspace == 0,
+                attentionWorkspace > 0
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        case .splitKVarNQuantizedMM:
+            guard format.kind == .kvarn,
+                candidateTier == "kvarn-k4v2-g128",
+                cellID == "kvarn-k4v2-g128-i8",
+                candidateCodecIterations == 8,
+                materializationWorkspace == 0,
+                attentionWorkspace > 0
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        case .materialize:
+            guard format.kind == .affine || format.kind == .kvtuner,
+                materializationWorkspace > 0,
+                normalizationWorkspace == 0,
+                attentionWorkspace == 0
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+        }
     }
 
     func validateForPromotion(candidateTier: String) throws {
         try validateForRecord(candidateTier: candidateTier)
+        if candidateFormat?.kind == .kvarn,
+            candidateCompressedKVAttention?.request
+                == .splitKVarNQuantizedMM,
+            schemaVersion != 3
+        {
+            throw KVFrontierEvidenceError.invalidRuntimeEvidence
+        }
         guard sameWeights, comparisonBaseline == .sameWeightsFP16KV else {
             throw KVFrontierEvidenceError.promotionRequiresSameWeights
         }
@@ -1475,10 +1701,17 @@ private extension KVFrontierEvidence {
     }
 
     static func isIdentity(_ identity: KVModelEvidenceIdentity) -> Bool {
-        [identity.configHash, identity.checkpointManifestHash].allSatisfy {
+        let legacyIdentityIsValid = [
+            identity.configHash, identity.checkpointManifestHash,
+        ].allSatisfy {
             !$0.isEmpty && $0 != "unknown"
                 && $0 == $0.trimmingCharacters(in: .whitespacesAndNewlines)
                 && !$0.contains("\n") && !$0.contains("\r")
+        }
+        guard legacyIdentityIsValid else { return false }
+        guard let digest = identity.checkpointContentSHA256 else { return true }
+        return digest.utf8.count == 64 && digest.utf8.allSatisfy {
+            (48 ... 57).contains($0) || (97 ... 102).contains($0)
         }
     }
 }

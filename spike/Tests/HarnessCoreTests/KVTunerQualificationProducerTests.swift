@@ -86,6 +86,7 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             modelConfigHash: policy.modelConfigHash,
             modelConfigSHA256: policy.modelConfigSHA256,
             checkpointManifestHash: policy.checkpointManifestHash,
+            checkpointContentSHA256: policy.checkpointContentSHA256,
             tokenizerSHA256: policy.tokenizerSHA256)
     }
 
@@ -182,6 +183,7 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             normalizedTargetsData: inputs.normalizedTargets,
             exactModelConfigData: inputs.config,
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "e", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             tokenizePrompt: { try XCTUnwrap(inputs.tokenIDs[$0]) })
 
@@ -215,6 +217,7 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             normalizedTargetsData: inputs.normalizedTargets,
             exactModelConfigData: inputs.config,
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "e", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             tokenizePrompt: { prompt in
                 if prompt == substitutedPrompt {
@@ -235,6 +238,7 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             normalizedTargetsData: inputs.normalizedTargets,
             exactModelConfigData: inputs.config,
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "e", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             tokenizePrompt: { _ in [] }))
     }
@@ -246,6 +250,7 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             normalizedTargetsData: inputs.normalizedTargets,
             exactModelConfigData: inputs.config,
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "e", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             tokenizePrompt: { try XCTUnwrap(inputs.tokenIDs[$0]) })
         let manifestData = try KVTunerArtifactCodec.encode(manifest)
@@ -422,7 +427,9 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
-                inputs.manifest.checkpointManifestHash)
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256)
         schedule.cellID += "-substituted"
 
         XCTAssertThrowsError(try KVTunerQualificationBundle.makeAuthenticated(
@@ -435,6 +442,8 @@ final class KVTunerQualificationProducerTests: XCTestCase {
             eosTokenID: 255,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             tokenizePrompt:
                 KVTunerTestFixtures.tokenizer(for: inputs.manifest),
             decodeTokenIDs: decodeTokenIDs

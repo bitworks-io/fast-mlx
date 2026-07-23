@@ -7,12 +7,18 @@ struct PreparedKVTunerRun {
     let binding: KVTunerScheduleBinding
 }
 
+struct EffectiveCompressedKVAttentionConfiguration: Equatable {
+    let request: CompressedKVAttentionRequest?
+    let checkpointContentSHA256: String?
+}
+
 enum KVTunerCLIError: Error, Equatable, CustomStringConvertible {
     case missingSchedule
     case unexpectedSchedule(tier: String)
     case tierCellMismatch(tier: String, cell: String)
     case unreadableModelConfig(String)
     case modelConfigIdentityMismatch
+    case checkpointContentIdentityMismatch
     case missingEOSToken
     case outputPathCollision(String)
 
@@ -28,12 +34,40 @@ enum KVTunerCLIError: Error, Equatable, CustomStringConvertible {
             return "unable to read the exact model config at \(path)/config.json"
         case .modelConfigIdentityMismatch:
             return "model config bytes do not match the preflight model identity"
+        case .checkpointContentIdentityMismatch:
+            return "checkpoint content does not match the authenticated KVTuner schedule"
         case .missingEOSToken:
             return "KVTuner qualification requires a tokenizer EOS token"
         case .outputPathCollision(let path):
             return "KVTuner qualification bundle must not alias an evidence output: \(path)"
         }
     }
+}
+
+func effectiveCompressedKVAttentionConfiguration(
+    explicitRequest: CompressedKVAttentionRequest?,
+    explicitCheckpointContentSHA256: String?,
+    authenticatedKVTunerCheckpointContentSHA256: String?
+) throws -> EffectiveCompressedKVAttentionConfiguration {
+    if let explicitCheckpointContentSHA256,
+        let authenticatedKVTunerCheckpointContentSHA256,
+        explicitCheckpointContentSHA256
+            != authenticatedKVTunerCheckpointContentSHA256
+    {
+        throw KVTunerCLIError.checkpointContentIdentityMismatch
+    }
+    let request = CompressedKVAttentionRequest.effective(
+        explicit: explicitRequest,
+        hasAuthenticatedKVTunerSchedule:
+            authenticatedKVTunerCheckpointContentSHA256 != nil)
+    let checkpointContentSHA256 = explicitCheckpointContentSHA256
+        ?? authenticatedKVTunerCheckpointContentSHA256
+    guard (request == nil) == (checkpointContentSHA256 == nil) else {
+        throw KVTunerCLIError.checkpointContentIdentityMismatch
+    }
+    return EffectiveCompressedKVAttentionConfiguration(
+        request: request,
+        checkpointContentSHA256: checkpointContentSHA256)
 }
 
 func isKVTunerTier(_ tier: String) -> Bool {
@@ -57,8 +91,9 @@ func validateKVTunerScheduleFlag(
     }
 }
 
-/// Re-derives one exact schedule from its qualification bundle before MLX model loading. Model
-/// geometry and tokenizer identity come from the runtime model files, never the bundled schedule.
+/// Re-derives one exact schedule from its qualification bundle before MLX model loading. Exact
+/// config, checkpoint-content, and tokenizer identities come from runtime model files, never the
+/// bundled schedule alone.
 func prepareKVTunerRun(
     schedulePath: String,
     modelPath: String,
@@ -75,11 +110,21 @@ func prepareKVTunerRun(
     guard fnv1a64(configData) == modelIdentity.configHash else {
         throw KVTunerCLIError.modelConfigIdentityMismatch
     }
+    let source = try captureCompressedKVAttentionRuntimeSourceSnapshot(
+        modelPath: modelPath)
+    guard source.exactModelConfigData == configData,
+        source.checkpointManifestHash
+            == modelIdentity.checkpointManifestHash,
+        modelIdentity.checkpointContentSHA256 == nil
+            || modelIdentity.checkpointContentSHA256
+                == source.checkpointContentSHA256
+    else {
+        throw KVTunerCLIError.modelConfigIdentityMismatch
+    }
     let layerCount = try KVTunerModelConfigPreflight.load(from: configData)
     let scheduleData = try Data(
         contentsOf: URL(fileURLWithPath: schedulePath))
-    let tokenizerSHA256 = try ProvenanceCLI.tokenizerManifestSHA256(
-        at: modelPath)
+    let tokenizerSHA256 = source.tokenizerSHA256
     // Load only the CPU tokenizer before the heavyweight MLX model. This lets qualification
     // replay every authenticated prompt against the live tokenizer while retaining the
     // fail-before-model-load behavior for a bad schedule.
@@ -97,6 +142,8 @@ func prepareKVTunerRun(
         expectedCellID: cellID,
         expectedCheckpointManifestHash:
             modelIdentity.checkpointManifestHash,
+        expectedCheckpointContentSHA256:
+            source.checkpointContentSHA256,
         expectedTokenizerSHA256: tokenizerSHA256,
         expectedEOSTokenID: eosTokenID,
         tokenizePrompt: {
@@ -110,8 +157,11 @@ func prepareKVTunerRun(
         expectedMatrixID: matrixID,
         expectedCellID: cellID,
         expectedModelConfigHash: modelIdentity.configHash,
+        expectedModelConfigSHA256: sha256Hex(configData),
         expectedCheckpointManifestHash:
             modelIdentity.checkpointManifestHash,
+        expectedCheckpointContentSHA256:
+            source.checkpointContentSHA256,
         expectedLayerCount: layerCount,
         requiredEvaluationCorpus: evaluationCorpus)
     return PreparedKVTunerRun(selection: selection, binding: binding)

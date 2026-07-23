@@ -20,6 +20,7 @@ final class KVTunerQualificationCLITests: XCTestCase {
             modelConfigHash: String(repeating: "1", count: 16),
             modelConfigSHA256: String(repeating: "2", count: 64),
             checkpointManifestHash: String(repeating: "3", count: 64),
+            checkpointContentSHA256: String(repeating: "5", count: 64),
             tokenizerSHA256: String(repeating: "4", count: 64))
 
         XCTAssertNoThrow(try validateKVTunerCandidateExecutionEnvironments(

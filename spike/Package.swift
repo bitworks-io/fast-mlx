@@ -12,7 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", exact: "0.31.6"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", revision: "702e5a0eaf990e1f6d3db2b6e7d8872858a44055"),
+        .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],

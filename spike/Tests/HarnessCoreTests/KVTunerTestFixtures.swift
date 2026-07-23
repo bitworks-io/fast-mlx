@@ -85,12 +85,13 @@ enum KVTunerTestFixtures {
             }
         }
         return KVTunerCalibrationManifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             protocolID: "gsm8k-kvtuner-qwen3-adaptation-v1",
             corpusID: "gsm8k-kvtuner-calibration-v1",
             modelConfigHash: "0123456789abcdef",
             modelConfigSHA256: String(repeating: "c", count: 64),
             checkpointManifestHash: "fedcba9876543210",
+            checkpointContentSHA256: String(repeating: "d", count: 64),
             tokenizerSHA256: String(repeating: "a", count: 64),
             datasetSourceRepository: "openai/grade-school-math",
             datasetSourceCommit:
@@ -184,11 +185,12 @@ enum KVTunerTestFixtures {
             }
         }
         let sensitivity = try KVTunerSensitivityArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: "kvarn-qwen3-32b-v1",
             modelConfigHash: manifest.modelConfigHash,
             modelConfigSHA256: manifest.modelConfigSHA256,
             checkpointManifestHash: manifest.checkpointManifestHash,
+            checkpointContentSHA256: manifest.checkpointContentSHA256,
             tokenizerSHA256: manifest.tokenizerSHA256,
             calibrationCorpusID: manifest.corpusID,
             calibrationCorpusHash: manifestSHA256,
@@ -249,6 +251,8 @@ enum KVTunerTestFixtures {
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             targetPairBitTotal: 36,
             maxCandidates: 10,

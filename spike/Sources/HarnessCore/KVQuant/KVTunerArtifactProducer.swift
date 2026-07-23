@@ -53,6 +53,7 @@ extension KVTunerCalibrationManifest {
         normalizedTargetsData: Data,
         exactModelConfigData: Data,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         tokenizePrompt: (String) throws -> [Int]
     ) throws -> KVTunerCalibrationManifest {
@@ -88,12 +89,13 @@ extension KVTunerCalibrationManifest {
         }
 
         return try KVTunerCalibrationManifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             protocolID: "gsm8k-kvtuner-qwen3-adaptation-v1",
             corpusID: "gsm8k-kvtuner-calibration-v1",
             modelConfigHash: fnv1a64(exactModelConfigData),
             modelConfigSHA256: sha256Hex(exactModelConfigData),
             checkpointManifestHash: checkpointManifestHash,
+            checkpointContentSHA256: checkpointContentSHA256,
             tokenizerSHA256: tokenizerSHA256,
             datasetSourceRepository: "openai/grade-school-math",
             datasetSourceCommit:
@@ -150,12 +152,14 @@ extension KVTunerSensitivityArtifact {
     ) throws -> KVTunerSensitivityArtifact {
         let manifestSHA256 = sha256Hex(exactCalibrationManifestData)
         return try KVTunerSensitivityArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             matrixID: matrixID,
             modelConfigHash: calibrationManifest.modelConfigHash,
             modelConfigSHA256: calibrationManifest.modelConfigSHA256,
             checkpointManifestHash:
                 calibrationManifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                calibrationManifest.checkpointContentSHA256,
             tokenizerSHA256: calibrationManifest.tokenizerSHA256,
             calibrationCorpusID: calibrationManifest.corpusID,
             calibrationCorpusHash: manifestSHA256,
@@ -184,7 +188,7 @@ extension KVTunerSensitivityArtifact {
 }
 
 extension KVTunerCandidateEvaluationArtifact {
-    /// Converts actor-produced scalar rows into the exact schema-2 evidence artifact. The result
+    /// Converts actor-produced scalar rows into the exact schema-3 evidence artifact. The result
     /// is encoded and replay-validated before it is returned, so callers cannot persist a row set
     /// whose output text, stop handling, score, or cache receipt is merely self-consistent.
     public static func makeAuthenticated(
@@ -236,7 +240,7 @@ extension KVTunerCandidateEvaluationArtifact {
                 runtimeReceipt: generated.runtimeReceipt)
         }
         let artifact = KVTunerCandidateEvaluationArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             evaluationProtocol: .canonical,
             promptManifestSHA256:
                 sha256Hex(exactCalibrationManifestData),
@@ -298,6 +302,8 @@ extension KVTunerSearchArtifact {
                 exactModelConfigData: exactModelConfigData,
                 expectedCheckpointManifestHash:
                     calibrationManifest.checkpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    calibrationManifest.checkpointContentSHA256,
                 expectedTokenizerSHA256:
                     calibrationManifest.tokenizerSHA256,
                 targetPairBitTotal: targetPairBitTotal,
@@ -328,7 +334,7 @@ extension KVTunerSearchArtifact {
             requiredRuntimePolicySHA256ByCandidate:
                 runtimePolicies.map(\.runtimePolicySHA256))
         let artifact = KVTunerSearchArtifact(
-            schemaVersion: 2,
+            schemaVersion: 3,
             searchMode: "exhaustive-grouped-v1",
             evaluationProtocol: .canonical,
             sourceSensitivityArtifactSHA256:
@@ -339,6 +345,8 @@ extension KVTunerSearchArtifact {
             modelConfigSHA256: calibrationManifest.modelConfigSHA256,
             checkpointManifestHash:
                 calibrationManifest.checkpointManifestHash,
+            checkpointContentSHA256:
+                calibrationManifest.checkpointContentSHA256,
             tokenizerSHA256: calibrationManifest.tokenizerSHA256,
             groupSize: sensitivityArtifact.groupSize,
             targetPairBitTotal: targetPairBitTotal,
@@ -378,6 +386,7 @@ extension KVTunerQualificationBundle {
         exactModelConfigData: Data,
         eosTokenID: Int,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         tokenizePrompt: (String) throws -> [Int],
         decodeTokenIDs: ([Int]) throws -> String
     ) throws -> KVTunerQualificationBundle {
@@ -401,6 +410,8 @@ extension KVTunerQualificationBundle {
                 exactModelConfigData: exactModelConfigData,
                 expectedCheckpointManifestHash:
                     expectedCheckpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    expectedCheckpointContentSHA256,
                 expectedTokenizerSHA256: manifest.tokenizerSHA256,
                 targetPairBitTotal: search.targetPairBitTotal,
                 maxCandidates: search.candidates.count,
@@ -423,12 +434,32 @@ extension KVTunerQualificationBundle {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: exactModelConfigData,
             expectedCheckpointManifestHash:
-                expectedCheckpointManifestHash)
+                expectedCheckpointManifestHash,
+            expectedCheckpointContentSHA256:
+                expectedCheckpointContentSHA256)
         guard suppliedSchedule == derivedSchedule else {
             throw KVTunerScheduleSearchError.searchArtifactMismatch
         }
+        guard expectedCheckpointContentSHA256.count == 64,
+            expectedCheckpointContentSHA256.unicodeScalars.allSatisfy({
+                CharacterSet(charactersIn: "0123456789abcdef")
+                    .contains($0)
+            }),
+            manifest.checkpointContentSHA256
+                == expectedCheckpointContentSHA256,
+            sensitivity.checkpointContentSHA256
+                == expectedCheckpointContentSHA256,
+            search.checkpointContentSHA256
+                == expectedCheckpointContentSHA256,
+            suppliedSchedule.checkpointContentSHA256
+                == expectedCheckpointContentSHA256
+        else {
+            throw KVTunerScheduleSearchError.searchArtifactMismatch
+        }
         return KVTunerQualificationBundle(
-            schemaVersion: 1,
+            schemaVersion: 2,
+            modelConfigSHA256: sha256Hex(exactModelConfigData),
+            checkpointContentSHA256: expectedCheckpointContentSHA256,
             scheduleData: exactScheduleData,
             calibrationManifestData: exactCalibrationManifestData,
             sensitivityArtifactData: exactSensitivityArtifactData,

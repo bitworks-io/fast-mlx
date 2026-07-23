@@ -1,9 +1,12 @@
 import CryptoKit
 import Foundation
+import HuggingFace
+import MLXHuggingFace
 import HarnessCore
 import MLX
 import MLXLMCommon
 import SpikeCore
+import Tokenizers
 
 /// Minimal `--flag value` parser (no ArgumentParser dependency), kept pure in HarnessCore so
 /// malformed promotion-gate commands are regression-tested off-box.
@@ -169,12 +172,19 @@ struct BenchPayload: Codable, Sendable {
     /// Exact cross-process workload identity and salted prompt byte hashes.
     let workloadNonce: String?
     let workloadPromptSHA256: [String]?
+    /// Number of copies of the prompt template joined with newlines before per-run salting.
+    /// Optional so historical bench rows remain decodable.
+    let promptRepeat: Int?
     /// Matrix/cell identity plus the full authenticated frozen KVTuner binding when engaged.
     let matrixID: String?
     let cellID: String?
     let kvtunerSchedule: KVTunerScheduleBinding?
     /// Maximum scalar engagement receipts across post-warmup runs (bytes/tokens/layers/codec).
     let engagementMax: [String: Int]?
+    /// Authenticated explicit compressed-attention request plus the operation actually observed
+    /// after execution. Optional keeps historical/default-materialized rows decodable.
+    let compressedKVAttention:
+        CompressedKVAttentionRuntimeBinding?
     /// Raw post-warmup samples needed to recompute every reported runtime aggregate. Optional so
     /// historical bench evidence remains decodable.
     let maxTokens: Int?
@@ -194,6 +204,42 @@ struct BenchPayload: Codable, Sendable {
     let maxMLXActiveBytes: Int?
     let maxMLXCacheBytes: Int?
     let maxMLXPeakBytes: Int?
+    /// Qualification-only counterbalance, fixed-memory, power/thermal, and process receipts.
+    /// Optional keeps historical and exploratory `bench` rows decodable.
+    let qualification: BenchQualificationEvidence?
+    /// Loaded capacity-only receipts. These are explicitly non-promotable and tolerate only
+    /// safe nominal/fair thermal drift; qualification reducers reject rows carrying this lane.
+    let capacity: BenchCapacityEvidence?
+}
+
+func runBenchQualificationEvidenceValidation(_ flags: Flags) {
+    do {
+        let path = try flags.strictString("evidence", default: "")
+        guard !path.isEmpty else {
+            throw FlagValueError.missingValue(key: "evidence")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        try validateBenchQualificationEvidenceData(data)
+        print("bench qualification evidence: VALID")
+    } catch {
+        print("bench qualification evidence INVALID: \(error)")
+        exit(2)
+    }
+}
+
+func runBenchCapacityEvidenceValidation(_ flags: Flags) {
+    do {
+        let path = try flags.strictString("evidence", default: "")
+        guard !path.isEmpty else {
+            throw FlagValueError.missingValue(key: "evidence")
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        try validateBenchCapacityEvidenceData(data)
+        print("bench capacity evidence: VALID")
+    } catch {
+        print("bench capacity evidence INVALID: \(error)")
+        exit(2)
+    }
 }
 
 func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDriver {
@@ -272,7 +318,8 @@ func runVerify(_ flags: Flags) async {
     }
     let mode = triadMode(forKVQuantTier: kvQuantTier)
     do {
-        let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
+        let (driver, tokenizer, eos) = try await loadSwiftDriver(
+            modelPath: modelPath)
         let promptTokens = tokenizer.encode(text: prompt)
         let config = RunConfig(temperature: 0, maxTokens: n, kvQuant: kvQuantTier)
 
@@ -629,6 +676,23 @@ func runBench(_ flags: Flags) async {
         // misspelled/missing flag cannot be reported as an unrelated environment failure.
         let plan = try parseBenchPlan(flags)
         try assertReleaseBuild()
+        let evidenceModelIdentity = try (
+            plan.qualificationContext != nil
+                || plan.capacityContext != nil
+        ) ? benchQualificationModelIdentity(modelPath: plan.modelPath) : nil
+        if let qualificationContext = plan.qualificationContext,
+            let evidenceModelIdentity
+        {
+            try validateBenchQualificationModelIdentity(
+                evidenceModelIdentity, context: qualificationContext)
+            try configureBenchQualificationMemory(qualificationContext)
+        } else if let capacityContext = plan.capacityContext,
+            let evidenceModelIdentity
+        {
+            try validateBenchCapacityModelIdentity(
+                evidenceModelIdentity, context: capacityContext)
+            try configureBenchCapacityMemory(capacityContext)
+        }
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(plan.kvQuantTier ?? "fp16") {
             guard let matrixID = plan.matrixID else {
@@ -648,8 +712,61 @@ func runBench(_ flags: Flags) async {
             preparedKVTuner = nil
         }
         let mode: Mode = plan.spec == nil ? .none : .pld
+        if plan.compressedKVAttention != nil || preparedKVTuner != nil {
+            let source = try captureCompressedKVAttentionRuntimeSourceSnapshot(
+                modelPath: plan.modelPath)
+            let admission = try CompressedKVAttentionRuntimeAdmission.load(
+                sourceSnapshot: source)
+            _ = try resolveSwiftEngineCacheSelection(
+                config: RunConfig(
+                    kvQuant: plan.kvQuantTier
+                        ?? preparedKVTuner?.selection.cellID,
+                    kvtunerSelection: preparedKVTuner?.selection,
+                    compressedKVAttention: plan.compressedKVAttention,
+                    compressedKVAttentionExpectedCheckpointContentSHA256:
+                        plan
+                            .compressedKVAttentionExpectedCheckpointContentSHA256),
+                compressedKVAttentionAdmission: admission)
+            let preflightTokenizer = try await #huggingFaceTokenizerLoader()
+                .load(from: URL(fileURLWithPath: plan.modelPath))
+            let preflightPromptTokenCounts = plan.workload.prompts.map {
+                preflightTokenizer.encode(text: $0).count
+            }
+            if let capacityContext = plan.capacityContext {
+                guard Array(preflightPromptTokenCounts.dropFirst())
+                    == [capacityContext.expectedPromptTokens]
+                else {
+                    throw BenchQualificationEvidenceValidationError
+                        .invalidCapacityWorkloadEvidence
+                }
+            }
+            try validateBenchContextWindow(
+                promptTokenCounts: preflightPromptTokenCounts,
+                maxTokens: plan.maxTokens,
+                maxPositionEmbeddings:
+                    admission.maxPositionEmbeddings)
+        }
         let (driver, tokenizer, _) = try await loadSwiftDriver(
-            modelPath: plan.modelPath)
+            modelPath: plan.modelPath,
+            kvQuantTier: plan.kvQuantTier,
+            kvtunerSelection: preparedKVTuner?.selection,
+            compressedKVAttention: plan.compressedKVAttention,
+            compressedKVAttentionExpectedCheckpointContentSHA256:
+                plan
+                    .compressedKVAttentionExpectedCheckpointContentSHA256,
+            memoryLimitBytes:
+                plan.qualificationContext?.memoryLimitBytes
+                    ?? plan.capacityContext?.memoryLimitBytes,
+            memoryCacheLimitBytes:
+                plan.qualificationContext?.cacheLimitBytes
+                ?? plan.capacityContext?.cacheLimitBytes
+                ?? KVTunerSensitivityCaptureEnvironment
+                    .requiredMemoryCacheLimitBytes)
+        if let qualificationContext = plan.qualificationContext {
+            try configureBenchQualificationMemory(qualificationContext)
+        } else if let capacityContext = plan.capacityContext {
+            try configureBenchCapacityMemory(capacityContext)
+        }
 
         let modelName = URL(fileURLWithPath: plan.modelPath).lastPathComponent
         // Task 5: the model's OWN declared quantization (config.json), not a dirname-substring
@@ -666,6 +783,13 @@ func runBench(_ flags: Flags) async {
         var ttftMilliseconds: [Double] = []
         var generatedTokenCounts: [Int] = []
         var memoryRuns: [BenchRunMemoryEvidence] = []
+        var qualificationRuns: [BenchQualificationRunEnvironment] = []
+        var capacityRuns: [BenchCapacityRunEnvironment] = []
+        var qualificationWarmup:
+            BenchQualificationWarmupEnvironment?
+        var capacityWarmup: BenchCapacityRunEnvironment?
+        var qualificationThermalAdmission:
+            BenchQualificationThermalAdmission?
         var engagementMax: [String: Int] = [:]
         var draftedTotal = 0, acceptedTotal = 0
         var verifyStepsTotal = 0, normalStepsTotal = 0, gateDisabledTotal = 0
@@ -684,6 +808,11 @@ func runBench(_ flags: Flags) async {
             // sampled on both sides of this exact batch-1 generation.
             Memory.peakMemory = 0
             let memoryStart = serviceMemorySample()
+            let capturesEvidenceEnvironment =
+                plan.qualificationContext != nil
+                    || plan.capacityContext != nil
+            let qualificationBefore = try capturesEvidenceEnvironment
+                ? benchQualificationHostSnapshot() : nil
             let result = try await driver.generate(
                 prompt: promptTokens,
                 config: RunConfig(
@@ -694,7 +823,14 @@ func runBench(_ flags: Flags) async {
                     specMaxDraft: plan.maxDraft,
                     specCompiledVerify: plan.compiledVerify,
                     kvQuant: plan.kvQuantTier,
-                    kvtunerSelection: preparedKVTuner?.selection))
+                    kvtunerSelection: preparedKVTuner?.selection,
+                    compressedKVAttention:
+                        plan.compressedKVAttention,
+                    compressedKVAttentionExpectedCheckpointContentSHA256:
+                        plan
+                            .compressedKVAttentionExpectedCheckpointContentSHA256))
+            let qualificationAfter = try capturesEvidenceEnvironment
+                ? benchQualificationHostSnapshot() : nil
             let memoryEnd = serviceMemorySample()
             let memoryEvidence = try BenchRunMemoryEvidence(
                 samples: [memoryStart, memoryEnd])
@@ -715,7 +851,14 @@ func runBench(_ flags: Flags) async {
                 tier: plan.kvQuantTier ?? "fp16",
                 engagement: result.engagement,
                 expectedKVTunerLayerCount:
-                    preparedKVTuner?.selection.layers.count)
+                    preparedKVTuner?.selection.layers.count,
+                requestedCompressedKVAttention:
+                    plan.compressedKVAttention,
+                expectedKVarNStorageDType:
+                    plan.compressedKVAttention == nil
+                        ? nil
+                        : driver.compressedKVAttentionAdmission?
+                            .modelNativeDType)
             let metrics = DecodeMetrics(submitTime: result.submitTime, tokenTimes: result.tokenTimes)
             guard let decodeRate = metrics.decodeTokensPerSecond else {
                 print("# run \(i): produced one token -> skipped")
@@ -744,15 +887,89 @@ func runBench(_ flags: Flags) async {
                     + "prefill_tok_s=\(fmt(prefillRate, 2)), "
                     + "ttft=\(fmt(metrics.ttftSeconds))s, "
                     + "decode_tok_s=\(fmt(decodeRate, 2))\(specNote)")
-            if i > 0 {
+            if i == 0, let qualificationBefore,
+                let qualificationAfter
+            {
+                if let qualificationContext = plan.qualificationContext {
+                    guard let thermalPolicy =
+                        qualificationContext.postWarmupThermalPolicy
+                    else {
+                        throw BenchQualificationEvidenceError
+                            .invalidThermalTargetContract
+                    }
+                    qualificationWarmup = try
+                        BenchQualificationWarmupEnvironment(
+                            before: qualificationBefore,
+                            after: qualificationAfter)
+                    let thermalAdmission = try await
+                        waitForBenchQualificationThermalAdmission(
+                            policy: thermalPolicy,
+                            initialSnapshot: qualificationAfter)
+                    qualificationThermalAdmission = thermalAdmission
+                    let admitted = thermalAdmission.snapshot
+                    print(
+                        "# warmup thermal admission: target="
+                            + "\(thermalPolicy.target.rawValue), "
+                            + "warmup_after="
+                            + "\(qualificationAfter.thermalState.rawValue), "
+                            + "admitted="
+                            + "\(admitted.thermalState.rawValue), "
+                            + "stability_seconds="
+                            + "\(thermalPolicy.stabilitySeconds), "
+                            + "stability_observations="
+                            + "\(thermalAdmission.stabilityObservations.count), "
+                            + "wait_seconds="
+                            + fmt(
+                                admitted.monotonicTimestampSeconds
+                                    - qualificationAfter
+                                        .monotonicTimestampSeconds))
+                } else if plan.capacityContext != nil {
+                    capacityWarmup = try BenchCapacityRunEnvironment(
+                        before: qualificationBefore,
+                        after: qualificationAfter)
+                    print(
+                        "# capacity warmup environment: before="
+                            + "\(qualificationBefore.thermalState.rawValue), "
+                            + "after="
+                            + "\(qualificationAfter.thermalState.rawValue)")
+                }
+            } else if i > 0 {
                 ttfts.append(metrics.ttftSeconds)
                 prefillRates.append(prefillRate)
                 prefillDurations.append(prefillDuration)
                 promptTokenCounts.append(promptTokens.count)
                 decodeRates.append(decodeRate)
                 ttftMilliseconds.append(metrics.ttftSeconds * 1_000)
+                if plan.capacityContext != nil,
+                    metrics.generatedTokenCount != 128
+                {
+                    throw BenchQualificationEvidenceValidationError
+                        .invalidCapacityMeasurementEvidence
+                }
                 generatedTokenCounts.append(metrics.generatedTokenCount)
                 memoryRuns.append(memoryEvidence)
+                if let qualificationBefore, let qualificationAfter {
+                    if plan.qualificationContext != nil {
+                        print(try
+                            benchQualificationRetainedEnvironmentDiagnosticLine(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                        qualificationRuns.append(
+                            try BenchQualificationRunEnvironment(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                    } else if plan.capacityContext != nil {
+                        capacityRuns.append(
+                            try BenchCapacityRunEnvironment(
+                                before: qualificationBefore,
+                                after: qualificationAfter))
+                        print(
+                            "# capacity retained environment: before="
+                                + "\(qualificationBefore.thermalState.rawValue), "
+                                + "after="
+                                + "\(qualificationAfter.thermalState.rawValue)")
+                    }
+                }
                 for (key, value) in result.engagement.counts {
                     engagementMax[key] = max(engagementMax[key] ?? value, value)
                 }
@@ -769,11 +986,29 @@ func runBench(_ flags: Flags) async {
             decodeRates.count == agg.runs,
             ttftMilliseconds.count == agg.runs,
             generatedTokenCounts.count == agg.runs,
-            memoryRuns.count == agg.runs
+            memoryRuns.count == agg.runs,
+            (plan.qualificationContext == nil
+                ? qualificationRuns.isEmpty
+                : qualificationRuns.count == agg.runs),
+            (plan.capacityContext == nil
+                ? capacityRuns.isEmpty
+                : capacityRuns.count == agg.runs)
         else {
             throw BenchCLIError.invalidPrefillTiming
         }
         let memoryAggregate = try BenchMemoryAggregate(runs: memoryRuns)
+        try validateBenchCompressedAttentionMemoryReceipt(
+            tier: plan.kvQuantTier ?? "fp16",
+            request: plan.compressedKVAttention,
+            engagement: EngagementCounters(engagementMax),
+            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes)
+        let compressedKVAttentionBinding =
+            try makeBenchCompressedKVAttentionRuntimeBinding(
+                tier: plan.kvQuantTier ?? "fp16",
+                request: plan.compressedKVAttention,
+                admission:
+                    driver.compressedKVAttentionAdmission,
+                engagement: EngagementCounters(engagementMax))
         let avgTtftMs = ttfts.isEmpty ? 0 : ttfts.reduce(0, +) / Double(ttfts.count) * 1000
         let avgPrefillTokS = prefillRates.reduce(0, +)
             / Double(prefillRates.count)
@@ -795,8 +1030,16 @@ func runBench(_ flags: Flags) async {
                 preparedKVTuner?.binding.artifactSHA256,
             kvtunerBundleSHA256:
                 preparedKVTuner?.binding.qualificationBundleSHA256)
-        print(BenchRow.csvHeader)
-        print(row.csvLine)
+        if plan.capacityContext == nil {
+            print(BenchRow.csvHeader)
+            print(row.csvLine)
+        } else {
+            print(
+                "# capacity-only diagnostic timing (non-promotable): "
+                    + "prefill_tok_s=\(fmt(row.prefillTokS ?? 0, 2)), "
+                    + "decode_tok_s=\(fmt(row.decodeTokS, 2)), "
+                    + "ttft_ms=\(fmt(row.ttftMs, 1))")
+        }
         print(
             "# memory: sampled_footprint_max="
                 + "\(memoryAggregate.maxSampledPhysicalFootprintBytes), "
@@ -804,16 +1047,25 @@ func runBench(_ flags: Flags) async {
                 + "mlx_cache_max=\(memoryAggregate.maxMLXCacheBytes), "
                 + "mlx_peak_max=\(memoryAggregate.maxMLXPeakBytes), "
                 + "cache_limit="
-                + "\(KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
+                + "\(plan.qualificationContext?.cacheLimitBytes ?? plan.capacityContext?.cacheLimitBytes ?? KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes)")
         if let csvPath = plan.csvPath {
             try appendBenchCSVRow(row, to: csvPath)
             print("# appended to \(csvPath)")
         }
 
+        if let evidenceModelIdentity {
+            guard try benchQualificationModelIdentity(
+                modelPath: plan.modelPath) == evidenceModelIdentity
+            else {
+                throw BenchQualificationRuntimeError.modelIdentityChanged
+            }
+        }
         let (provenance, _) = ProvenanceCLI.build(
             modelPath: plan.modelPath,
             referenceVersions: nil,
-            corpus: nil)
+            corpus: nil,
+            modelCheckpointManifestHash:
+                evidenceModelIdentity?.checkpointManifestHash)
         let payload = BenchPayload(
             label: plan.label, workload: Workload.decode.rawValue, mode: mode.rawValue,
             decodeTokS: row.decodeTokS, ttftMs: row.ttftMs, quant: quant,
@@ -837,10 +1089,13 @@ func runBench(_ flags: Flags) async {
             workloadPromptSHA256: plan.workload.prompts.map {
                 sha256Hex(Data($0.utf8))
             },
+            promptRepeat: plan.promptRepeat,
             matrixID: plan.matrixID,
             cellID: plan.cellID,
             kvtunerSchedule: preparedKVTuner?.binding,
             engagementMax: engagementMax,
+            compressedKVAttention:
+                compressedKVAttentionBinding,
             maxTokens: plan.maxTokens,
             measuredRuns: agg.runs,
             promptTokenCountsByRun: promptTokenCounts,
@@ -850,17 +1105,38 @@ func runBench(_ flags: Flags) async {
             ttftMsByRun: ttftMilliseconds,
             generatedTokenCountsByRun: generatedTokenCounts,
             memoryCacheLimitBytes:
-                KVTunerSensitivityCaptureEnvironment
+                plan.qualificationContext?.cacheLimitBytes
+                ?? plan.capacityContext?.cacheLimitBytes
+                ?? KVTunerSensitivityCaptureEnvironment
                     .requiredMemoryCacheLimitBytes,
             memoryRuns: memoryRuns,
             maxSampledPhysicalFootprintBytes:
                 memoryAggregate.maxSampledPhysicalFootprintBytes,
             maxMLXActiveBytes: memoryAggregate.maxMLXActiveBytes,
             maxMLXCacheBytes: memoryAggregate.maxMLXCacheBytes,
-            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes)
+            maxMLXPeakBytes: memoryAggregate.maxMLXPeakBytes,
+            qualification: try plan.qualificationContext.map {
+                try BenchQualificationEvidence(
+                    context: $0,
+                    warmup: qualificationWarmup,
+                    postWarmupThermalAdmission:
+                        qualificationThermalAdmission,
+                    runs: qualificationRuns)
+            },
+            capacity: try plan.capacityContext.map {
+                guard let capacityWarmup else {
+                    throw BenchQualificationEvidenceError
+                        .invalidCapacityEvidence
+                }
+                return try BenchCapacityEvidence(
+                    context: $0,
+                    warmup: capacityWarmup,
+                    runs: capacityRuns)
+            })
         try appendRequiredJSONLRecord(
             ResultRecord(
-                subcommand: "bench",
+                subcommand: plan.capacityContext == nil
+                    ? "bench" : "bench-capacity",
                 provenance: provenance,
                 payload: payload),
             to: plan.evidencePath)
@@ -876,9 +1152,28 @@ func runBench(_ flags: Flags) async {
 
 // MARK: - kl (KLDivergenceMetric: candidate vs reference, TEACHER-FORCED)
 
+func runSealedKLReferenceCaptureCommand(_ arguments: [String]) async {
+    do {
+        let plan = try parseSealedKLReferenceCapturePlan(arguments: arguments)
+        try await runSealedKLReferenceCapture(plan)
+        let manifestURL = URL(
+            fileURLWithPath: plan.outputPath,
+            isDirectory: true
+        ).appendingPathComponent("manifest.json")
+        let manifestData = try Data(contentsOf: manifestURL)
+        let manifestSHA256 = SealedKLReferenceBundle.sha256Hex(manifestData)
+        print("sealed KL reference: COMPLETE")
+        print("output: \(plan.outputPath)")
+        print("manifest_sha256: \(manifestSHA256)")
+    } catch {
+        print("kl-reference-capture FAILED: \(error)")
+        exit(1)
+    }
+}
+
 func runKL(_ flags: Flags) async {
     guard let modelPath = flags.string("model") else {
-        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
+        print("usage: fastmlx-harness kl --model <PATH> --matrix-id <ID> --cell-id <ID> [--reference-model <PATH> | --sealed-reference <DIR> --sealed-reference-sha256 <SHA256> --workload-nonce <ID>] [--positions 24] [--corpus <FILE>] [--long-context-sample-positions 128] [--promotion-evidence false] [--kvarn-memory-gate <JSONL>] [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] [--kv-attention materialize|split-affine-quantized-mm|split-kvarn-quantized-mm --checkpoint-content-sha256 <SHA256>] [--python <PY>] [--script <REF.py>] [--evidence <FILE=harness-evidence.jsonl>]")
         exit(2)
     }
     do {
@@ -901,6 +1196,11 @@ func runKL(_ flags: Flags) async {
         // the reference NEVER sees kvQuant (referenceConfig strips it) — it is the baseline.
         let kvQuantTier = try requestedKVQuantTier(flags)
         let requestedKVQuantTier = kvQuantTier ?? "fp16"
+        let explicitCompressedKVAttention = try requestedCompressedKVAttention(
+            flags, tier: requestedKVQuantTier)
+        let explicitCheckpointContentSHA256 = try
+            requestedCompressedKVAttentionExpectedCheckpointContentSHA256(
+                flags, request: explicitCompressedKVAttention)
         let kvtunerSchedulePath = try flags.strictString(
             "kvtuner-schedule", default: "")
         try validateKVTunerScheduleFlag(
@@ -924,11 +1224,20 @@ func runKL(_ flags: Flags) async {
             }
             staticCacheKind = parsed
         }
-        let candidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(at: modelPath)
-        let referenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
-            at: referenceModelPath)
-        let sameWeights = ProvenanceCLI.sameResolvedModelPath(
-            modelPath, referenceModelPath) && candidateIdentity == referenceIdentity
+        let sameResolvedModel = ProvenanceCLI.sameResolvedModelPath(
+            modelPath, referenceModelPath)
+        let referenceRequest = try requestedKLReference(
+            flags,
+            modelPath: modelPath,
+            sameResolvedModel: sameResolvedModel)
+        let preflightCandidateIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+            at: modelPath,
+            checkpointContentSHA256:
+                explicitCheckpointContentSHA256)
+        let preflightReferenceIdentity = try ProvenanceCLI.modelEvidenceIdentity(
+            at: referenceModelPath,
+            checkpointContentSHA256: sameResolvedModel
+                ? explicitCheckpointContentSHA256 : nil)
         let corpus = try loadMeasurementCorpus(flags)
         let preparedKVTuner: PreparedKVTunerRun?
         if isKVTunerTier(requestedKVQuantTier) {
@@ -937,12 +1246,41 @@ func runKL(_ flags: Flags) async {
                 modelPath: modelPath,
                 matrixID: matrixID,
                 cellID: cellID,
-                modelIdentity: candidateIdentity,
+                modelIdentity: preflightCandidateIdentity,
                 evaluationCorpus:
                     KVTunerEvaluationCorpusIdentity.measurementCorpus(corpus))
         } else {
             preparedKVTuner = nil
         }
+        let effectiveAttention = try
+            effectiveCompressedKVAttentionConfiguration(
+                explicitRequest: explicitCompressedKVAttention,
+                explicitCheckpointContentSHA256:
+                    explicitCheckpointContentSHA256,
+                authenticatedKVTunerCheckpointContentSHA256:
+                    preparedKVTuner?.binding.checkpointContentSHA256)
+        let compressedKVAttention = effectiveAttention.request
+        let compressedKVAttentionExpectedCheckpointContentSHA256 =
+            effectiveAttention.checkpointContentSHA256
+        try CompressedKVAttentionRuntimeAdmission
+            .validateKLReferenceModel(
+                isSameResolvedModel: sameResolvedModel,
+                request: compressedKVAttention)
+        let candidateIdentity = KVModelEvidenceIdentity(
+            configHash: preflightCandidateIdentity.configHash,
+            checkpointManifestHash:
+                preflightCandidateIdentity.checkpointManifestHash,
+            checkpointContentSHA256:
+                compressedKVAttentionExpectedCheckpointContentSHA256)
+        let referenceIdentity = KVModelEvidenceIdentity(
+            configHash: preflightReferenceIdentity.configHash,
+            checkpointManifestHash:
+                preflightReferenceIdentity.checkpointManifestHash,
+            checkpointContentSHA256: sameResolvedModel
+                ? compressedKVAttentionExpectedCheckpointContentSHA256
+                : nil)
+        let sameWeights = sameResolvedModel
+            && candidateIdentity == referenceIdentity
         let requestedCacheKind: KVCacheKind
         if let selection = preparedKVTuner?.selection {
             requestedCacheKind = .kvtuner(selection)
@@ -980,20 +1318,77 @@ func runKL(_ flags: Flags) async {
         guard !shortEntries.isEmpty, !longEntries.isEmpty,
             shortEntries.count + longEntries.count == corpus.entries.count
         else { throw KVFrontierEvidenceError.missingCohortEvidence }
-        let (driver, tokenizer, eos) = try await loadSwiftDriver(modelPath: modelPath)
-        let reference = referenceDriver(flags, modelPath: modelPath, eos: eos)
-        guard reference.modelPath == referenceModelPath else {
-            throw KVFrontierEvidenceError.invalidPromotionProvenance("referenceModelPath")
+        let preparedSealedReference: PreparedSealedKLReferenceReplay?
+        switch referenceRequest {
+        case .livePython:
+            preparedSealedReference = nil
+        case .sealedReplay(let plan):
+            let prepared = try await prepareSealedKLReferenceReplay(plan)
+            guard prepared.driver.bundle.manifest.maxTokens == positions else {
+                throw SealedKLReferenceError.unsupportedConfig(
+                    "positions must be \(prepared.driver.bundle.manifest.maxTokens)")
+            }
+            guard prepared.driver.bundle.manifest.sampleSize
+                == longContextSampleSize
+            else {
+                throw SealedKLReferenceError.unsupportedConfig(
+                    "long-context-sample-positions must be "
+                        + "\(prepared.driver.bundle.manifest.sampleSize)")
+            }
+            preparedSealedReference = prepared
+        }
+        let (driver, tokenizer, eos) = try await loadSwiftDriver(
+            modelPath: modelPath,
+            kvQuantTier: kvQuantTier,
+            kvtunerSelection: preparedKVTuner?.selection,
+            compressedKVAttention: compressedKVAttention,
+            compressedKVAttentionExpectedCheckpointContentSHA256:
+                compressedKVAttentionExpectedCheckpointContentSHA256)
+        if let preparedSealedReference {
+            try validateSealedKLReferenceSourceUnchanged(
+                before: preparedSealedReference.sourceSnapshot,
+                after: try captureCompressedKVAttentionRuntimeSourceSnapshot(
+                    modelPath: modelPath))
+        }
+        let reference: any EngineDriver
+        let liveReference: ReferenceDriver?
+        let referenceTransport: KLReferenceTransport
+        let sealedReferenceArtifactSHA256: String?
+        if let preparedSealedReference {
+            reference = preparedSealedReference.driver
+            liveReference = nil
+            referenceTransport = .sealedReplay
+            sealedReferenceArtifactSHA256 =
+                preparedSealedReference.manifestSHA256
+        } else {
+            let live = referenceDriver(flags, modelPath: modelPath, eos: eos)
+            guard live.modelPath == referenceModelPath else {
+                throw KVFrontierEvidenceError.invalidPromotionProvenance(
+                    "referenceModelPath")
+            }
+            reference = live
+            liveReference = live
+            referenceTransport = .livePython
+            sealedReferenceArtifactSHA256 = nil
         }
         let config = RunConfig(
             temperature: 0,
             maxTokens: positions,
             kvQuant: kvQuantTier,
-            kvtunerSelection: preparedKVTuner?.selection)
+            kvtunerSelection: preparedKVTuner?.selection,
+            compressedKVAttention: compressedKVAttention,
+            compressedKVAttentionExpectedCheckpointContentSHA256:
+                compressedKVAttentionExpectedCheckpointContentSHA256)
         let referenceConfig = RunConfig.greedy(maxTokens: positions)
 
         print("candidate: Swift engine on \(modelPath) (kv_quant_tier=\(kvQuantTier ?? "fp16"))")
-        print("reference: mlx-lm on \(reference.modelPath) (fp16 KV)")
+        if let preparedSealedReference {
+            print(
+                "reference: sealed mlx-lm replay "
+                    + "\(preparedSealedReference.manifestSHA256) (fp16 KV)")
+        } else {
+            print("reference: mlx-lm on \(referenceModelPath) (fp16 KV)")
+        }
         print("corpus: \(corpus.corpusId) (content hash \(corpus.contentHash), \(corpus.entries.count) entries)")
         if sameWeights, requestedKVQuantTier == "fp16" {
             print("# SAME weights + fp16 KV both sides -> pipeline/noise-floor proof.")
@@ -1129,7 +1524,12 @@ func runKL(_ flags: Flags) async {
         let top1Rate = Double(top1Matches) / Double(top1ScoredPositions)
         print("teacher_forced_top1_vs_reference: \(top1Matches)/\(top1ScoredPositions) (\(fmt(top1Rate * 100, 2))%)")
 
-        let referenceVersions = await reference.versionSink.versions
+        let referenceVersions: ReferenceDriver.ReferenceVersions?
+        if let liveReference {
+            referenceVersions = await liveReference.versionSink.versions
+        } else {
+            referenceVersions = preparedSealedReference?.referenceVersions
+        }
         let (provenance, _) = ProvenanceCLI.build(
             modelPath: modelPath, referenceVersions: referenceVersions,
             corpus: corpus,
@@ -1141,6 +1541,11 @@ func runKL(_ flags: Flags) async {
         let candidateCodecIterations: Int?
         let candidateMemoryGate: KVarNMemoryGateEvidence?
         let candidateKVTunerSchedule: KVTunerScheduleBinding?
+        let candidateCompressedKVAttentionObserved:
+            CompressedKVAttentionObservedOperation?
+        let candidateMaterializationWorkspaceBytes: Int?
+        let candidateNormalizationWorkspaceBytes: Int?
+        let candidateAttentionWorkspaceBytes: Int?
         switch requestedCacheKind {
         case .affine(let tier):
             guard let telemetry = await driver.affineScoringTelemetry() else {
@@ -1163,7 +1568,7 @@ func runKL(_ flags: Flags) async {
                 metadataScalarBytes: telemetry.metadataScalarBytes,
                 recordAlignment: 1)
             let (evidenceTotalBytes, overflow) = telemetry.dataArrayBytes
-                .addingReportingOverflow(telemetry.materializationWorkspaceBytes)
+                .addingReportingOverflow(telemetry.workspaceBytes)
             guard !overflow else {
                 throw KVFrontierEvidenceError.storageArithmeticOverflow
             }
@@ -1173,7 +1578,7 @@ func runKL(_ flags: Flags) async {
                 alignmentPaddingBytes: 0,
                 fp16SinkBytes: 0,
                 fp16TailBytes: 0,
-                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                workspaceBytes: telemetry.workspaceBytes,
                 totalBytes: evidenceTotalBytes)
             candidateFormat = format
             storage = try format.storageEvidence(actual: actual)
@@ -1182,11 +1587,20 @@ func runKL(_ flags: Flags) async {
             candidateCodecIterations = nil
             candidateMemoryGate = nil
             candidateKVTunerSchedule = nil
+            candidateCompressedKVAttentionObserved =
+                telemetry.attentionOperation == .splitQuantizedMM
+                    ? .splitQuantizedMM : .materializedKV
+            candidateMaterializationWorkspaceBytes =
+                telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes = 0
+            candidateAttentionWorkspaceBytes =
+                telemetry.attentionWorkspaceBytes
             print(
                 "# affine storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), control=\(telemetry.controlBytes), "
                     + "persistent_total=\(telemetry.totalPersistentBytes), "
                     + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "attention_workspace=\(telemetry.attentionWorkspaceBytes), "
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), layers=\(telemetry.layerCount), "
                     + "kv_heads=\(telemetry.kvHeadCount), head_dim=\(telemetry.headDimension)")
@@ -1227,7 +1641,7 @@ func runKL(_ flags: Flags) async {
             let evidenceTerms = [
                 telemetry.payloadBytes,
                 telemetry.metadataBytes,
-                telemetry.materializationWorkspaceBytes,
+                telemetry.workspaceBytes,
             ]
             let evidenceTotalBytes = try evidenceTerms.reduce(0) {
                 partial, value in
@@ -1243,7 +1657,7 @@ func runKL(_ flags: Flags) async {
                 alignmentPaddingBytes: 0,
                 fp16SinkBytes: 0,
                 fp16TailBytes: 0,
-                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                workspaceBytes: telemetry.workspaceBytes,
                 totalBytes: evidenceTotalBytes)
             candidateFormat = format
             storage = try format.storageEvidence(
@@ -1254,6 +1668,14 @@ func runKL(_ flags: Flags) async {
             candidateCodecIterations = nil
             candidateMemoryGate = nil
             candidateKVTunerSchedule = binding
+            candidateCompressedKVAttentionObserved =
+                telemetry.attentionOperation == .splitQuantizedMM
+                    ? .splitQuantizedMM : .materializedKV
+            candidateMaterializationWorkspaceBytes =
+                telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes = 0
+            candidateAttentionWorkspaceBytes =
+                telemetry.attentionWorkspaceBytes
             print(
                 "# KVTuner storage: schedule_sha256=\(binding.artifactSHA256), "
                     + "payload=\(telemetry.payloadBytes), "
@@ -1261,6 +1683,7 @@ func runKL(_ flags: Flags) async {
                     + "control=\(telemetry.controlBytes), "
                     + "persistent_total=\(telemetry.totalPersistentBytes), "
                     + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "attention_workspace=\(telemetry.attentionWorkspaceBytes), "
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), "
                     + "layers=\(telemetry.layerCount), "
@@ -1271,7 +1694,10 @@ func runKL(_ flags: Flags) async {
                 "KVTuner candidates are unavailable to the KL tier route")
         case .kvarn(let cell):
             guard let telemetry = await driver.kvarnScoringTelemetry(
-                for: cell)
+                for: cell,
+                attentionMode: compressedKVAttention
+                    == .splitKVarNQuantizedMM
+                    ? .splitQuantizedMM : .materialize)
             else {
                 throw SwiftEngineDriverError.unsupportedConfig(
                     "KVarN KL run completed without KVarN allocation telemetry")
@@ -1305,7 +1731,7 @@ func runKL(_ flags: Flags) async {
                 telemetry.alignmentPaddingBytes,
                 telemetry.fp16SinkBytes,
                 telemetry.fp16TailBytes,
-                telemetry.materializationWorkspaceBytes,
+                telemetry.workspaceBytes,
             ]
             let evidenceTotalBytes = try evidenceTerms.reduce(0) {
                 partial, value in
@@ -1321,7 +1747,7 @@ func runKL(_ flags: Flags) async {
                 alignmentPaddingBytes: telemetry.alignmentPaddingBytes,
                 fp16SinkBytes: telemetry.fp16SinkBytes,
                 fp16TailBytes: telemetry.fp16TailBytes,
-                workspaceBytes: telemetry.materializationWorkspaceBytes,
+                workspaceBytes: telemetry.workspaceBytes,
                 totalBytes: evidenceTotalBytes)
             candidateFormat = format
             storage = try format.storageEvidence(actual: actual)
@@ -1330,6 +1756,15 @@ func runKL(_ flags: Flags) async {
             candidateCodecIterations = telemetry.iterations
             candidateMemoryGate = requestedKVarNMemoryGate
             candidateKVTunerSchedule = nil
+            candidateCompressedKVAttentionObserved =
+                telemetry.attentionOperation == .splitQuantizedMM
+                    ? .splitKVarNQuantizedMM : .materializedKV
+            candidateMaterializationWorkspaceBytes =
+                telemetry.materializationWorkspaceBytes
+            candidateNormalizationWorkspaceBytes =
+                telemetry.normalizationWorkspaceBytes
+            candidateAttentionWorkspaceBytes =
+                telemetry.attentionWorkspaceBytes
             print(
                 "# KVarN storage: payload=\(telemetry.payloadBytes), "
                     + "metadata=\(telemetry.metadataBytes), "
@@ -1338,6 +1773,8 @@ func runKL(_ flags: Flags) async {
                     + "fp16_tail=\(telemetry.fp16TailBytes), "
                     + "control=\(telemetry.controlBytes), "
                     + "materialization_workspace=\(telemetry.materializationWorkspaceBytes), "
+                    + "normalization_workspace=\(telemetry.normalizationWorkspaceBytes), "
+                    + "attention_workspace=\(telemetry.attentionWorkspaceBytes), "
                     + "evidence_total=\(evidenceTotalBytes), "
                     + "capacity=\(telemetry.capacityTokens), "
                     + "layers=\(telemetry.layerCount), "
@@ -1357,10 +1794,41 @@ func runKL(_ flags: Flags) async {
             candidateCodecIterations = nil
             candidateMemoryGate = nil
             candidateKVTunerSchedule = nil
+            candidateCompressedKVAttentionObserved = nil
+            candidateMaterializationWorkspaceBytes = nil
+            candidateNormalizationWorkspaceBytes = nil
+            candidateAttentionWorkspaceBytes = nil
         }
 
+        let candidateCompressedKVAttention:
+            CompressedKVAttentionRuntimeBinding?
+        if let compressedKVAttention {
+            guard let observed = candidateCompressedKVAttentionObserved,
+                let admission = driver.compressedKVAttentionAdmission
+            else {
+                throw KVFrontierEvidenceError.invalidRuntimeEvidence
+            }
+            candidateCompressedKVAttention = try
+                CompressedKVAttentionRuntimeBinding(
+                    request: compressedKVAttention,
+                    observedOperation: observed,
+                    admission: admission)
+        } else {
+            candidateCompressedKVAttention = nil
+        }
+
+        let frontierSchemaVersion: Int
+        switch candidateCompressedKVAttention?.request {
+        case nil:
+            frontierSchemaVersion = 1
+        case .splitKVarNQuantizedMM:
+            frontierSchemaVersion = 3
+        case .materialize, .splitAffineQuantizedMM:
+            frontierSchemaVersion = 2
+        }
         let frontier = KVFrontierEvidence(
-            schemaVersion: 1, matrixID: matrixID, cellID: cellID,
+            schemaVersion: frontierSchemaVersion,
+            matrixID: matrixID, cellID: cellID,
             sameWeights: sameWeights,
             comparisonBaseline: sameWeights
                 ? .sameWeightsFP16KV : .differentWeightsFP16KV,
@@ -1372,7 +1840,18 @@ func runKL(_ flags: Flags) async {
             candidateExecutionMode: candidateExecutionMode,
             candidateCodecIterations: candidateCodecIterations,
             candidateMemoryGate: candidateMemoryGate,
-            candidateKVTunerSchedule: candidateKVTunerSchedule)
+            candidateKVTunerSchedule: candidateKVTunerSchedule,
+            candidateCompressedKVAttention:
+                candidateCompressedKVAttention,
+            candidateMaterializationWorkspaceBytes:
+                candidateCompressedKVAttention == nil
+                    ? nil : candidateMaterializationWorkspaceBytes,
+            candidateNormalizationWorkspaceBytes:
+                candidateCompressedKVAttention == nil
+                    ? nil : candidateNormalizationWorkspaceBytes,
+            candidateAttentionWorkspaceBytes:
+                candidateCompressedKVAttention == nil
+                    ? nil : candidateAttentionWorkspaceBytes)
         let payload = KLPayload(
             kvQuantTier: requestedKVQuantTier,
             klMedianNats: headlineMedian, klLongContextTailP95Nats: longContextTail,
@@ -1390,7 +1869,10 @@ func runKL(_ flags: Flags) async {
             shortEntryScoring: shortEntryScoring,
             longContextEntryScoring: longContextEntryScoring,
             longContextMaxDocumentTokens: longContextMaxDocumentTokens,
-            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens)
+            longContextMaxScoredContextTokens: longContextMaxScoredContextTokens,
+            referenceTransport: referenceTransport,
+            sealedReferenceArtifactSHA256:
+                sealedReferenceArtifactSHA256)
         let record = ResultRecord(
             subcommand: "kl", provenance: provenance, payload: payload)
         let outputPath = evidencePath(flags)
@@ -1461,10 +1943,17 @@ struct Harness {
         case "corpus": runCorpus()
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
+        case "validate-bench-qualification":
+            runBenchQualificationEvidenceValidation(flags)
+        case "validate-bench-capacity":
+            runBenchCapacityEvidenceValidation(flags)
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
         case "service-soak": await runServiceSoakBench(flags)
+        case "kl-reference-capture":
+            await runSealedKLReferenceCaptureCommand(
+                Array(arguments.dropFirst(2)))
         case "kl": await runKL(flags)
         case "task-coherence": await runTaskCoherence(flags)
         case "kvtuner-manifest": await runKVTunerManifest(flags)
@@ -1472,6 +1961,9 @@ struct Harness {
         case "kvtuner-candidate": await runKVTunerCandidate(flags)
         case "kvtuner-search": await runKVTunerSearch(flags)
         case "kvtuner-bundle": await runKVTunerBundle(flags)
+        case "compressed-attention-probe":
+            await runCompressedAttentionProbe(
+                Array(arguments.dropFirst(2)))
         case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
@@ -1499,12 +1991,39 @@ struct Harness {
                  [--kv-quant <TIER>]          KV tier for timed decode (\(kvQuantUsageTiers))
                  [--matrix-id <ID>] [--cell-id <ID>]  explicit frontier identity
                  [--kvtuner-schedule <BUNDLE>] frozen schedule (required for kvtuner-* tier)
+                 [--kv-attention <OP>]         explicit compressed route: materialize,
+                                               split-affine-quantized-mm, or
+                                               split-kvarn-quantized-mm (matching tiers only)
+                 [--checkpoint-content-sha256 <SHA256>] frozen source-lock digest for --kv-attention
                  [--workload-nonce <ID>]      replay identical salted prompts across KV cells
+                 [--prompt-repeat 1]          deterministic long-context prompt construction
                  [--runs 3] [--max-tokens 256] one warmup plus measured batch-1 runs
                  [--csv <FILE>] [--evidence <JSONL>] authenticated runtime artifacts
+                 [--qualification-evidence true] isolated matrix position; requires --runs 1,
+                 [--runner-manifest-sha256 <SHA256>] --matrix-block-index/--matrix-run-position/
+                 [--matrix-cell-count <N>]          plus explicit MLX/wired
+                 [--memory-limit-bytes <N>]          limits; intended for the checked-in runner
+                 [--cache-limit-bytes <N>] [--wired-limit-bytes <N>]
+                 [--model-tokenizer-sha256 <SHA256>] frozen tokenizer file-manifest identity
+                 --post-warmup-thermal-target nominal
+                 --post-warmup-thermal-timeout-seconds <N>
+                 --post-warmup-thermal-poll-milliseconds <N>
+                 --post-warmup-thermal-stability-seconds <N>
+                                               record the dropped warmup and admit the retained
+                                               row only after a sampled stable nominal/AC window
+                 [--capacity-evidence true]    selected direct compressed-KV capacity lane;
+                                               requires --runs 1, --max-tokens 128,
+                                               manifest/tokenizer identity and
+                 --capacity-expected-prompt-tokens <N>
+                                               exact retained prompt count plus explicit
+                                               MLX/cache/wired limits; nominal/fair only,
+                                               always non-promotable and excluded from speed gates
                  [--spec pld]                 time the speculative decode path (CSV mode=pld)
                  [--ngram 3] [--max-draft 8]   PLD match length / max drafted tokens K
                  [--compiled-verify false]     verify forward: fixed-K compiled step vs uncompiled
+          validate-bench-qualification --evidence <JSONL>
+          validate-bench-capacity --evidence <JSONL>
+                                               typed fail-closed validation for one runner row
           service-bench --model <PATH>        aggregate service frontier (Release builds only)
                  --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy
                  --scenario burst             simultaneous admission (initial measured scenario)
@@ -1519,23 +2038,44 @@ struct Harness {
           service-soak --model <PATH> --progress <FILE> resident mixed-workload soak
                  [--duration-seconds 86400] [--concurrency 4] [--max-tokens 64]
                  [--max-rss-drift-percent 5] [--responsiveness-ms 30000]
+          kl-reference-capture --model <PATH> --output <NEW-DIR>
+                 --workload-nonce <ID>        capture immutable mlx-lm teacher logits in a
+                                              separate process before any Swift model load
+                 [--corpus <FILE=corpus/measurement-corpus-v2.json>]
+                 [--positions 24] [--long-context-sample-positions 128]
           kl     --model <PATH>               KLDivergenceMetric vs mlx-lm reference
                  --matrix-id <ID> --cell-id <ID> pin the frontier matrix/cell identity
                  [--kv-quant <TIER>]          CANDIDATE KV tier (\(kvQuantUsageTiers));
                                                reference always stays fp16 KV
                  [--reference-model <PATH>]   (defaults to --model: pipeline proof)
+                 [--sealed-reference <DIR>]   replay an exact capture instead of launching Python;
+                 [--sealed-reference-sha256 <SHA256>]
+                 [--workload-nonce <ID>]      all three are required for sealed replay
                  [--corpus <FILE=corpus/measurement-corpus-v2.json>]
                  [--long-context-sample-positions 128]
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
+                 [--kv-attention <OP>]       explicit authenticated compressed-attention route
+                 [--checkpoint-content-sha256 <SHA256>] required source lock for --kv-attention
                  [--promotion-evidence false] require full storage + clean-SHA coherence gate
           task-coherence --model <PATH>       frozen 80-case secondary coherence/task gate
                  --matrix-id <ID> --cell-id <ID> --evidence <NEW-OR-EMPTY-FILE>
                  [--kv-quant <TIER=fp16>]     authenticated fp16/affine/KVarN/KVTuner runtime tier
                  [--kvtuner-schedule <QUALIFICATION-BUNDLE.json>] required exactly for kvtuner-* cells
+                 [--kv-attention <OP>]       explicit authenticated compressed-attention route
+                 [--checkpoint-content-sha256 <SHA256>] required source lock for --kv-attention
                  [--reference-task-evidence <FP16-JSONL>]
-                                               required for every lossy candidate; forbidden for fp16
                  [--summary-evidence <NEW-OR-EMPTY-FILE>]
                  [--max-tool-tokens 96]       structured-output budget (1...512)
+          compressed-attention-probe          fresh paired synthetic attention profiler
+                 --model <PATH> --model-id <REPO/ID>
+                 --operation fp16-sdpa|swiftlm-quantized-attention|split-affine-quantized-mm|materialize-then-sdpa
+                 --layout fp16|affine --context-tokens 8192|32768|<near-128K>
+                 --query-tokens <N> --prefill-chunk-tokens <N>
+                 --query-heads <N> --kv-heads <N> --head-dimension <N>
+                 --workload-nonce <ID> --evidence <NEW-FILE> --progress <NEW-FILE>
+                 --memory-limit-bytes <N> --cache-limit-bytes <N> --wired-limit-bytes <N>
+                 [--qualification-evidence false] [layout-specific flags]
+                                               strict synthetic capture; never dial promotion
           kvtuner-manifest --model <PATH> --prompt-fixture <JSON> --normalized-targets <JSON>
                  --output <NEW-OR-EXACT-FILE>
           kvtuner-sensitivity --model <PATH> --manifest <JSON> --matrix-id <ID>

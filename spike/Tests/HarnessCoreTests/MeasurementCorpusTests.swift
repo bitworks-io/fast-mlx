@@ -140,6 +140,64 @@ final class MeasurementCorpusTests: XCTestCase {
             longEntries.contains { $0.text.count >= 64_000 },
             "v2 must contain a >=64K-char (>=16K-token) long-context entry")
     }
+
+    func testRealCheckedInCorpusV3OnlyExtendsTheDeepEngineeringEntry() throws {
+        func checkedInCorpus(named name: String) throws -> MeasurementCorpus {
+            var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            for _ in 0..<8 {
+                let candidate = dir.appendingPathComponent("corpus/\(name).json")
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    return try MeasurementCorpusLoader.load(
+                        from: Data(contentsOf: candidate))
+                }
+                dir = dir.deletingLastPathComponent()
+            }
+            throw NSError(
+                domain: "MeasurementCorpusTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "could not locate spike/corpus/\(name).json"])
+        }
+
+        let v2 = try checkedInCorpus(named: "measurement-corpus-v2")
+        let v3 = try checkedInCorpus(named: "measurement-corpus-v3")
+        XCTAssertEqual(v3.corpusId, "measurement-corpus-v3")
+        XCTAssertEqual(
+            v3.contentHash,
+            "01d7eb51cabe3899",
+            "intentional corpus edits must update the pinned semantic content hash")
+
+        let oldDeepID = "long-context-engineering-docs-16k-v1"
+        let newDeepID = "long-context-engineering-docs-24k-v2"
+        let v2ByID = v2.entries.reduce(into: [String: MeasurementCorpusEntry]()) {
+            $0[$1.id] = $1
+        }
+        let v3ByID = v3.entries.reduce(into: [String: MeasurementCorpusEntry]()) {
+            $0[$1.id] = $1
+        }
+        XCTAssertEqual(v2ByID.count, v2.entries.count, "v2 entry IDs must be unique")
+        XCTAssertEqual(v3ByID.count, v3.entries.count, "v3 entry IDs must be unique")
+        let unchangedIDs = Set(v2ByID.keys).subtracting([oldDeepID])
+
+        XCTAssertEqual(
+            Set(v3ByID.keys),
+            unchangedIDs.union([newDeepID]),
+            "v3 must replace only the deep engineering entry")
+        for id in unchangedIDs {
+            XCTAssertEqual(v3ByID[id], v2ByID[id], "\(id) drifted between v2 and v3")
+        }
+
+        let oldDeep = try XCTUnwrap(v2ByID[oldDeepID])
+        let newDeep = try XCTUnwrap(v3ByID[newDeepID])
+        XCTAssertEqual(newDeep.tag, .longContext)
+        XCTAssertTrue(
+            newDeep.text.hasPrefix(oldDeep.text),
+            "v3 deep text must preserve the complete v2 document as an exact prefix")
+        XCTAssertGreaterThanOrEqual(
+            newDeep.text.count - oldDeep.text.count,
+            16_000,
+            "v3 needs a substantial deterministic extension before model-tokenizer proof")
+    }
 }
 
 final class PositionSamplingTests: XCTestCase {

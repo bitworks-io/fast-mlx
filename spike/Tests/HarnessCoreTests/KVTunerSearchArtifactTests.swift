@@ -44,6 +44,7 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             modelConfigHash: policy.modelConfigHash,
             modelConfigSHA256: policy.modelConfigSHA256,
             checkpointManifestHash: policy.checkpointManifestHash,
+            checkpointContentSHA256: policy.checkpointContentSHA256,
             tokenizerSHA256: policy.tokenizerSHA256)
     }
 
@@ -115,7 +116,7 @@ final class KVTunerSearchArtifactTests: XCTestCase {
         let evaluationArtifacts = try zip(candidates, runtimePolicies).map {
             candidate, policy in
             KVTunerCandidateEvaluationArtifact(
-                schemaVersion: 2,
+                schemaVersion: 3,
                 evaluationProtocol: .canonical,
                 promptManifestSHA256: manifestSHA,
                 candidateOrdinal: candidate.ordinal,
@@ -188,7 +189,7 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             searchData: searchData)
     }
 
-    func testCompleteSearchArtifactValidatesAndEmitsSchemaThreeSchedule() throws {
+    func testCompleteSearchArtifactValidatesAndEmitsSchemaFourSchedule() throws {
         let inputs = try inputs()
         let selected = try inputs.search.validated(
             sensitivityArtifact: inputs.sensitivity,
@@ -215,9 +216,11 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
-                inputs.manifest.checkpointManifestHash)
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256)
 
-        XCTAssertEqual(schedule.schemaVersion, 3)
+        XCTAssertEqual(schedule.schemaVersion, 4)
         XCTAssertEqual(
             schedule.tokenizerSHA256,
             inputs.manifest.tokenizerSHA256)
@@ -411,7 +414,9 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: wrongLayerConfig,
             expectedCheckpointManifestHash:
-                inputs.manifest.checkpointManifestHash))
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256))
 
         XCTAssertThrowsError(try KVTunerScheduleSearch.makeSchedule(
             searchArtifact: inputs.search,
@@ -426,7 +431,9 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
-                inputs.manifest.checkpointManifestHash)) { error in
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                inputs.manifest.checkpointContentSHA256)) { error in
                 XCTAssertEqual(
                     error as? KVTunerScheduleSearchError,
                     .searchArtifactMismatch)
@@ -435,6 +442,7 @@ final class KVTunerSearchArtifactTests: XCTestCase {
 
     func testQualifiedRuntimeRebuildsCompleteChainAndRejectsScheduleOrTokenizerSubstitution() throws {
         let inputs = try inputs()
+        let checkpointContentSHA256 = inputs.manifest.checkpointContentSHA256
         let schedule = try KVTunerScheduleSearch.makeSchedule(
             searchArtifact: inputs.search,
             exactSearchArtifactData: inputs.searchData,
@@ -448,7 +456,9 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             decodeTokenIDs: decodeTokenIDs,
             exactModelConfigData: inputs.configData,
             expectedCheckpointManifestHash:
-                inputs.manifest.checkpointManifestHash)
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let scheduleData = try encoder.encode(schedule)
@@ -462,10 +472,17 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             eosTokenID: 255,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             tokenizePrompt:
                 KVTunerTestFixtures.tokenizer(for: inputs.manifest),
             decodeTokenIDs: decodeTokenIDs)
         let bundleData = try KVTunerArtifactCodec.encode(bundle)
+        XCTAssertEqual(bundle.schemaVersion, 2)
+        XCTAssertEqual(bundle.modelConfigSHA256, sha256Hex(inputs.configData))
+        XCTAssertEqual(
+            bundle.checkpointContentSHA256,
+            checkpointContentSHA256)
         let evaluationCorpus = try KVTunerEvaluationCorpusIdentity(
             id: "task-coherence-v2",
             aggregateDigest: "0123456789abcdef",
@@ -487,6 +504,8 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             expectedCellID: schedule.cellID,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             expectedEOSTokenID: 255,
             tokenizePrompt: { try XCTUnwrap(liveTokenIDs[$0]) },
@@ -494,6 +513,10 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             evaluationCorpora: [evaluationCorpus])
         XCTAssertEqual(selection.layers.map(\.keyBits), schedule.layers.map(\.keyBits))
         XCTAssertEqual(selection.tokenizerSHA256, inputs.manifest.tokenizerSHA256)
+        XCTAssertEqual(selection.modelConfigSHA256, sha256Hex(inputs.configData))
+        XCTAssertEqual(
+            selection.checkpointContentSHA256,
+            checkpointContentSHA256)
         XCTAssertEqual(selection.artifactSHA256, sha256Hex(scheduleData))
         XCTAssertEqual(
             selection.qualificationBundleSHA256,
@@ -510,6 +533,8 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             expectedCellID: schedule.cellID,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             expectedEOSTokenID: 255,
             tokenizePrompt: { try XCTUnwrap(liveTokenIDs[$0]) },
@@ -523,11 +548,57 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             expectedCellID: schedule.cellID,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedTokenizerSHA256: String(repeating: "f", count: 64),
             expectedEOSTokenID: 255,
             tokenizePrompt: { try XCTUnwrap(liveTokenIDs[$0]) },
             decodeTokenIDs: decodeTokenIDs,
             evaluationCorpora: [evaluationCorpus]))
+
+        XCTAssertThrowsError(try KVTunerRuntimeSelection.loadQualified(
+            artifactData: bundleData,
+            exactModelConfigData: inputs.configData,
+            expectedMatrixID: schedule.matrixID,
+            expectedCellID: schedule.cellID,
+            expectedCheckpointManifestHash:
+                inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                String(repeating: "f", count: 64),
+            expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
+            expectedEOSTokenID: 255,
+            tokenizePrompt: { try XCTUnwrap(liveTokenIDs[$0]) },
+            decodeTokenIDs: decodeTokenIDs,
+            evaluationCorpora: [evaluationCorpus]
+        )) { error in
+            XCTAssertEqual(
+                error as? KVTunerRuntimeSelectionError,
+                .qualificationArtifactMismatch(
+                    "checkpoint-content-sha256"))
+        }
+
+        XCTAssertThrowsError(try
+            KVTunerQualificationBundle.makeAuthenticated(
+                exactScheduleData: scheduleData,
+                exactCalibrationManifestData: inputs.manifestData,
+                exactSensitivityArtifactData: inputs.sensitivityData,
+                exactSearchArtifactData: inputs.searchData,
+                exactCandidateEvaluationArtifactData:
+                    inputs.evaluationData,
+                exactModelConfigData: inputs.configData,
+                eosTokenID: 255,
+                expectedCheckpointManifestHash:
+                    inputs.manifest.checkpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    String(repeating: "f", count: 64),
+                tokenizePrompt:
+                    KVTunerTestFixtures.tokenizer(for: inputs.manifest),
+                decodeTokenIDs: decodeTokenIDs)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerCandidateRuntimePolicyError,
+                .checkpointIdentityMismatch)
+        }
 
         var wrongLiveTokenIDs = liveTokenIDs
         let firstPrompt = String(
@@ -541,6 +612,8 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             expectedCellID: schedule.cellID,
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                checkpointContentSHA256,
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             expectedEOSTokenID: 255,
             tokenizePrompt: { try XCTUnwrap(wrongLiveTokenIDs[$0]) },
@@ -571,6 +644,8 @@ final class KVTunerSearchArtifactTests: XCTestCase {
             expectedCellID: "kvtuner-g64-b4.5",
             expectedCheckpointManifestHash:
                 inputs.manifest.checkpointManifestHash,
+            expectedCheckpointContentSHA256:
+                String(repeating: "e", count: 64),
             expectedTokenizerSHA256: inputs.manifest.tokenizerSHA256,
             expectedEOSTokenID: 255,
             tokenizePrompt: { _ in [] },

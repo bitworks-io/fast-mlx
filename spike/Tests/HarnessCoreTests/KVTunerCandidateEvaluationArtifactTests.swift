@@ -39,6 +39,7 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
             modelConfigHash: policy.modelConfigHash,
             modelConfigSHA256: policy.modelConfigSHA256,
             checkpointManifestHash: policy.checkpointManifestHash,
+            checkpointContentSHA256: policy.checkpointContentSHA256,
             tokenizerSHA256: policy.tokenizerSHA256)
     }
 
@@ -46,7 +47,7 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
         _ environment: KVTunerCandidateExecutionEnvironment
     ) -> String {
         var transcript = Data(
-            "fast-mlx.kvtuner-candidate-environment.v1\0".utf8)
+            "fast-mlx.kvtuner-candidate-environment.v2\0".utf8)
         func appendUInt64(_ value: UInt64) {
             var encoded = value.bigEndian
             withUnsafeBytes(of: &encoded) {
@@ -68,6 +69,7 @@ final class KVTunerCandidateEvaluationArtifactTests: XCTestCase {
             environment.modelConfigHash,
             environment.modelConfigSHA256,
             environment.checkpointManifestHash,
+            environment.checkpointContentSHA256,
             environment.tokenizerSHA256,
         ] {
             appendString(value)

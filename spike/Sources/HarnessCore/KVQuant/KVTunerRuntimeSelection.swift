@@ -311,8 +311,19 @@ public struct KVTunerEvaluationCorpusIdentity: Codable, Hashable, Sendable {
     ) throws -> KVTunerEvaluationCorpusIdentity {
         let expectedPromptSHA256 =
             "aaa70310381eb25ba917e680397c141e494ae62e174dc42de3e5f0b2a4a261a4"
-        guard workload.basePrompt == defaultBenchPrompt,
-            sha256Hex(Data(workload.basePrompt.utf8)) == expectedPromptSHA256
+        guard sha256Hex(Data(defaultBenchPrompt.utf8)) == expectedPromptSHA256
+        else {
+            throw KVTunerEvaluationCorpusIdentityError
+                .canonicalSourceItemsRequired
+        }
+        // Bench expands long-context workloads by joining exact copies of the audited prompt.
+        // Authenticate every component so prompt-repeat remains eligible without allowing a
+        // custom or partially mutated prompt to borrow the first-party source assertion.
+        let promptComponents = workload.basePrompt.components(
+            separatedBy: "\n")
+        guard !promptComponents.isEmpty,
+            promptComponents.count <= 4_096,
+            promptComponents.allSatisfy({ $0 == defaultBenchPrompt })
         else {
             throw KVTunerEvaluationCorpusIdentityError
                 .canonicalSourceItemsRequired
@@ -521,7 +532,9 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
     public let matrixID: String
     public let cellID: String
     public let modelConfigHash: String
+    public let modelConfigSHA256: String
     public let checkpointManifestHash: String
+    public let checkpointContentSHA256: String
     public let tokenizerSHA256: String
     public let groupSize: Int
     public let promptDigestAlgorithm: String
@@ -549,7 +562,9 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
         matrixID = schedule.matrixID
         cellID = schedule.cellID
         modelConfigHash = schedule.modelConfigHash
+        modelConfigSHA256 = schedule.modelConfigSHA256
         checkpointManifestHash = schedule.checkpointManifestHash
+        checkpointContentSHA256 = schedule.checkpointContentSHA256
         tokenizerSHA256 = schedule.tokenizerSHA256
         groupSize = schedule.groupSize
         promptDigestAlgorithm = KVTunerPromptDigest.algorithm
@@ -581,9 +596,17 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
         expectedMatrixID: String,
         expectedCellID: String,
         expectedModelConfigHash: String,
+        expectedModelConfigSHA256: String,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         evaluationCorpora: [KVTunerEvaluationCorpusIdentity]
     ) throws -> KVTunerRuntimeSelection {
+        guard isLowercaseHex(expectedModelConfigSHA256),
+            isLowercaseHex(expectedCheckpointContentSHA256)
+        else {
+            throw KVTunerRuntimeSelectionError
+                .qualificationArtifactMismatch("strong-model-identity")
+        }
         let schedule: KVTunerSchedule
         do {
             schedule = try JSONDecoder().decode(
@@ -602,8 +625,11 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
                 expectedMatrixID: expectedMatrixID,
                 expectedCellID: expectedCellID,
                 expectedModelConfigHash: expectedModelConfigHash,
+                expectedModelConfigSHA256: expectedModelConfigSHA256,
                 expectedCheckpointManifestHash:
-                    expectedCheckpointManifestHash)
+                    expectedCheckpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    expectedCheckpointContentSHA256)
         } catch let reason as KVTunerScheduleError {
             throw KVTunerRuntimeSelectionError.invalidSchedule(reason)
         } catch {
@@ -647,6 +673,7 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
         expectedMatrixID: String,
         expectedCellID: String,
         expectedCheckpointManifestHash: String,
+        expectedCheckpointContentSHA256: String,
         expectedTokenizerSHA256: String,
         expectedEOSTokenID: Int,
         tokenizePrompt: (String) throws -> [Int],
@@ -662,7 +689,7 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
             throw KVTunerRuntimeSelectionError
                 .malformedQualificationBundle
         }
-        guard discriminator.schemaVersion == 1 else {
+        guard discriminator.schemaVersion == 2 else {
             throw KVTunerRuntimeSelectionError
                 .unsupportedQualificationBundleSchema(
                     discriminator.schemaVersion)
@@ -674,6 +701,20 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
         } catch {
             throw KVTunerRuntimeSelectionError
                 .malformedQualificationBundle
+        }
+        guard isLowercaseHex(bundle.modelConfigSHA256),
+            isLowercaseHex(bundle.checkpointContentSHA256),
+            bundle.modelConfigSHA256 == sha256Hex(exactModelConfigData)
+        else {
+            throw KVTunerRuntimeSelectionError
+                .qualificationArtifactMismatch("model-config-sha256")
+        }
+        guard isLowercaseHex(expectedCheckpointContentSHA256),
+            bundle.checkpointContentSHA256
+                == expectedCheckpointContentSHA256
+        else {
+            throw KVTunerRuntimeSelectionError
+                .qualificationArtifactMismatch("checkpoint-content-sha256")
         }
         // The discriminator is checked before current-schema fields are decoded so a genuine
         // older/newer bundle is never mislabeled as malformed merely because its shape differs.
@@ -711,6 +752,8 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
                     exactModelConfigData: exactModelConfigData,
                     expectedCheckpointManifestHash:
                         expectedCheckpointManifestHash,
+                    expectedCheckpointContentSHA256:
+                        expectedCheckpointContentSHA256,
                     expectedTokenizerSHA256:
                         expectedTokenizerSHA256,
                     targetPairBitTotal: search.targetPairBitTotal,
@@ -754,7 +797,9 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
                 decodeTokenIDs: decodeTokenIDs,
                 exactModelConfigData: exactModelConfigData,
                 expectedCheckpointManifestHash:
-                    expectedCheckpointManifestHash)
+                    expectedCheckpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    expectedCheckpointContentSHA256)
         } catch {
             throw KVTunerRuntimeSelectionError
                 .qualificationArtifactMismatch("derivation")
@@ -796,8 +841,12 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
                 expectedMatrixID: expectedMatrixID,
                 expectedCellID: expectedCellID,
                 expectedModelConfigHash: fnv1a64(exactModelConfigData),
+                expectedModelConfigSHA256:
+                    sha256Hex(exactModelConfigData),
                 expectedCheckpointManifestHash:
-                    expectedCheckpointManifestHash)
+                    expectedCheckpointManifestHash,
+                expectedCheckpointContentSHA256:
+                    expectedCheckpointContentSHA256)
         } catch let reason as KVTunerScheduleError {
             throw KVTunerRuntimeSelectionError.invalidSchedule(reason)
         } catch {
@@ -829,6 +878,13 @@ public struct KVTunerRuntimeSelection: Hashable, Sendable {
             qualificationBundleSHA256: sha256Hex(artifactData),
             schedule: validatedSchedule,
             evaluationCorpora: evaluationCorpora)
+    }
+
+    private static func isLowercaseHex(_ value: String) -> Bool {
+        value.count == 64 && value.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "0123456789abcdef")
+                .contains($0)
+        }
     }
 
     private static func validateLiveTokenization(

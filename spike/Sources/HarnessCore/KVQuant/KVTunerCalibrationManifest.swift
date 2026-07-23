@@ -82,6 +82,7 @@ public struct KVTunerCalibrationManifest: Codable, Equatable, Sendable {
     public var modelConfigHash: String
     public var modelConfigSHA256: String
     public var checkpointManifestHash: String
+    public var checkpointContentSHA256: String
     public var tokenizerSHA256: String
     public var datasetSourceRepository: String
     public var datasetSourceCommit: String
@@ -114,6 +115,7 @@ public struct KVTunerCalibrationManifest: Codable, Equatable, Sendable {
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String,
         datasetSourceRepository: String,
         datasetSourceCommit: String,
@@ -145,6 +147,7 @@ public struct KVTunerCalibrationManifest: Codable, Equatable, Sendable {
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
         self.datasetSourceRepository = datasetSourceRepository
         self.datasetSourceCommit = datasetSourceCommit
@@ -194,7 +197,7 @@ public struct KVTunerCalibrationManifest: Codable, Equatable, Sendable {
 
     @discardableResult
     public func validated() throws -> KVTunerCalibrationManifest {
-        guard schemaVersion == 1 else {
+        guard schemaVersion == 2 else {
             throw KVTunerCalibrationManifestError.unsupportedSchema(
                 schemaVersion)
         }
@@ -266,6 +269,10 @@ public struct KVTunerCalibrationManifest: Codable, Equatable, Sendable {
         guard Self.isIdentityDigest(checkpointManifestHash) else {
             throw KVTunerCalibrationManifestError.invalidIdentity(
                 "checkpointManifestHash")
+        }
+        guard Self.isLowercaseHex(checkpointContentSHA256, length: 64) else {
+            throw KVTunerCalibrationManifestError.invalidIdentity(
+                "checkpointContentSHA256")
         }
         guard Self.isLowercaseHex(tokenizerSHA256, length: 64) else {
             throw KVTunerCalibrationManifestError.invalidIdentity(

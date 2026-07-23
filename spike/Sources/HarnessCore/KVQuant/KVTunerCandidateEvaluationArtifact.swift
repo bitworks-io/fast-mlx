@@ -120,6 +120,7 @@ public struct KVTunerCandidateExecutionEnvironment:
     public var modelConfigHash: String
     public var modelConfigSHA256: String
     public var checkpointManifestHash: String
+    public var checkpointContentSHA256: String
     public var tokenizerSHA256: String
 
     public init(
@@ -134,6 +135,7 @@ public struct KVTunerCandidateExecutionEnvironment:
         modelConfigHash: String,
         modelConfigSHA256: String,
         checkpointManifestHash: String,
+        checkpointContentSHA256: String,
         tokenizerSHA256: String
     ) {
         self.harnessGitSHA = harnessGitSHA
@@ -147,6 +149,7 @@ public struct KVTunerCandidateExecutionEnvironment:
         self.modelConfigHash = modelConfigHash
         self.modelConfigSHA256 = modelConfigSHA256
         self.checkpointManifestHash = checkpointManifestHash
+        self.checkpointContentSHA256 = checkpointContentSHA256
         self.tokenizerSHA256 = tokenizerSHA256
     }
 
@@ -204,6 +207,13 @@ public struct KVTunerCandidateExecutionEnvironment:
             throw KVTunerCandidateEvaluationArtifactError
                 .invalidExecutionEnvironment("checkpointManifestHash")
         }
+        guard checkpointContentSHA256
+                == runtimePolicy.checkpointContentSHA256,
+            Self.isLowercaseHex(checkpointContentSHA256, length: 64)
+        else {
+            throw KVTunerCandidateEvaluationArtifactError
+                .invalidExecutionEnvironment("checkpointContentSHA256")
+        }
         guard tokenizerSHA256 == runtimePolicy.tokenizerSHA256,
             Self.isLowercaseHex(tokenizerSHA256, length: 64)
         else {
@@ -212,7 +222,7 @@ public struct KVTunerCandidateExecutionEnvironment:
         }
 
         var transcript = EnvironmentTranscript(
-            domain: "fast-mlx.kvtuner-candidate-environment.v1")
+            domain: "fast-mlx.kvtuner-candidate-environment.v2")
         for value in [
             harnessGitSHA,
             buildConfiguration,
@@ -223,6 +233,7 @@ public struct KVTunerCandidateExecutionEnvironment:
             modelConfigHash,
             modelConfigSHA256,
             checkpointManifestHash,
+            checkpointContentSHA256,
             tokenizerSHA256,
         ] {
             transcript.appendString(value)
@@ -597,7 +608,7 @@ public struct KVTunerCandidateOutputRow: Codable, Equatable, Sendable {
     }
 }
 
-/// Exact per-candidate output evidence. Schema 2 authenticates the executable candidate policy,
+/// Exact per-candidate output evidence. Schema 3 authenticates the executable candidate policy,
 /// environment, raw token stream, canonical stop handling, and per-row cache/storage telemetry.
 public struct KVTunerCandidateEvaluationArtifact:
     Codable, Equatable, Sendable
@@ -645,7 +656,7 @@ public struct KVTunerCandidateEvaluationArtifact:
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw KVTunerCandidateEvaluationArtifactError.unsupportedSchema(
                 schemaVersion)
         }
@@ -705,7 +716,7 @@ public struct KVTunerCandidateEvaluationArtifact:
         guard decoded == self else {
             throw KVTunerCandidateEvaluationArtifactError.malformedArtifact
         }
-        guard schemaVersion == 2 else {
+        guard schemaVersion == 3 else {
             throw KVTunerCandidateEvaluationArtifactError.unsupportedSchema(
                 schemaVersion)
         }
