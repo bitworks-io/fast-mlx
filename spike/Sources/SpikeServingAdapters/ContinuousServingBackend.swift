@@ -44,25 +44,6 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     }
 }
 
-public struct ContinuousServingBackendSnapshot: Equatable, Sendable {
-    public let activeRequests: Int
-    public let coordinatorSlots: Int
-    public let reservedKVBytes: Int
-    public let maxReservedKVBytes: Int
-
-    public init(
-        activeRequests: Int,
-        coordinatorSlots: Int,
-        reservedKVBytes: Int,
-        maxReservedKVBytes: Int
-    ) {
-        self.activeRequests = activeRequests
-        self.coordinatorSlots = coordinatorSlots
-        self.reservedKVBytes = reservedKVBytes
-        self.maxReservedKVBytes = maxReservedKVBytes
-    }
-}
-
 public enum ContinuousServingBackendError: Error, Equatable, Sendable {
     case emptyRenderedPrompt
     case invalidStopTokenIDs
@@ -191,7 +172,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
     public func snapshot() async -> ContinuousServingBackendSnapshot {
         let slots = await coordinator.snapshots()
         let resources = await coordinator.runtimeResourceSnapshot()
-        return ContinuousServingBackendSnapshot(
+        return ContinuousServingBackendSnapshot.current(
             activeRequests: requests.count,
             coordinatorSlots: slots.count,
             reservedKVBytes: resources?.reservedKVBytes ?? 0,

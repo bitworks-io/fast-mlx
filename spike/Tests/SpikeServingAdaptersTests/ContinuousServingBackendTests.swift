@@ -871,13 +871,65 @@ final class ContinuousServingBackendTests: XCTestCase {
             await backend.snapshot().activeRequests == 0
         }
         let finalSnapshot = await backend.snapshot()
-        XCTAssertEqual(
-            finalSnapshot,
-            ContinuousServingBackendSnapshot(
-                activeRequests: 0,
-                coordinatorSlots: 0,
-                reservedKVBytes: 0,
-                maxReservedKVBytes: 4_096))
+        XCTAssertEqual(finalSnapshot.activeRequests, 0)
+        XCTAssertEqual(finalSnapshot.coordinatorSlots, 0)
+        XCTAssertEqual(finalSnapshot.reservedKVBytes, 0)
+        XCTAssertEqual(finalSnapshot.maxReservedKVBytes, 4_096)
+    }
+
+    func testSnapshotReportsActiveRequestResourcesMLXMemoryAndPromptFreeJSON()
+        async throws
+    {
+        let prompt = "fixture-secret-prompt"
+        let output = "fixture-secret-output"
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 2, 3, 99]],
+                recorder: recorder),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: [prompt: [10]],
+            pieces: [1: output, 2: "!", 3: "?"],
+            stopTokenIDs: [99],
+            mailboxCapacity: .init(maxDeltas: 1, maxBytes: 64))
+
+        let handle = try await backend.start(
+            request(text: prompt, maxTokens: 8))
+        await waitUntil {
+            let mailbox = await handle.mailbox.snapshot()
+            return mailbox.bufferedDeltas == 1
+                && mailbox.waitingProducers == 1
+        }
+
+        let activeSnapshot = await backend.snapshot()
+        XCTAssertEqual(activeSnapshot.activeRequests, 1)
+        XCTAssertEqual(activeSnapshot.coordinatorSlots, 1)
+        XCTAssertEqual(activeSnapshot.reservedKVBytes, 1_024)
+        XCTAssertEqual(activeSnapshot.maxReservedKVBytes, 4_096)
+        XCTAssertGreaterThanOrEqual(activeSnapshot.mlxActiveBytes, 0)
+        XCTAssertGreaterThanOrEqual(activeSnapshot.mlxCacheBytes, 0)
+        XCTAssertGreaterThanOrEqual(activeSnapshot.mlxPeakBytes, 0)
+
+        let encoded = try JSONEncoder().encode(activeSnapshot)
+        let json = String(decoding: encoded, as: UTF8.self)
+        XCTAssertFalse(json.contains(prompt))
+        XCTAssertFalse(json.contains(output))
+
+        let cancelled = await handle.lease.cancel(.clientDisconnected)
+        XCTAssertTrue(cancelled)
+        await assertMailboxCancelled(
+            handle.mailbox,
+            reason: .clientDisconnected)
+        await backend.shutdown()
+
+        let finalSnapshot = await backend.snapshot()
+        XCTAssertEqual(finalSnapshot.activeRequests, 0)
+        XCTAssertEqual(finalSnapshot.coordinatorSlots, 0)
+        XCTAssertEqual(finalSnapshot.reservedKVBytes, 0)
     }
 
     func testRequestStopSplitAcrossTokenChunksCancelsCoordinatorNormally() async throws {
@@ -1082,13 +1134,10 @@ final class ContinuousServingBackendTests: XCTestCase {
                             completionTokens: 1))),
             ])
         let finalSnapshot = await backend.snapshot()
-        XCTAssertEqual(
-            finalSnapshot,
-            ContinuousServingBackendSnapshot(
-                activeRequests: 0,
-                coordinatorSlots: 0,
-                reservedKVBytes: 0,
-                maxReservedKVBytes: 4_096))
+        XCTAssertEqual(finalSnapshot.activeRequests, 0)
+        XCTAssertEqual(finalSnapshot.coordinatorSlots, 0)
+        XCTAssertEqual(finalSnapshot.reservedKVBytes, 0)
+        XCTAssertEqual(finalSnapshot.maxReservedKVBytes, 4_096)
     }
 
     func testRuntimeCapacityFailuresAreTypedBeforeHTTPGenerationStarts()
@@ -1365,13 +1414,10 @@ final class ContinuousServingBackendTests: XCTestCase {
         XCTAssertEqual(activeState, .cancelled(.shutdown))
         XCTAssertEqual(queuedState, .cancelled(.shutdown))
         let finalSnapshot = await backend.snapshot()
-        XCTAssertEqual(
-            finalSnapshot,
-            ContinuousServingBackendSnapshot(
-                activeRequests: 0,
-                coordinatorSlots: 0,
-                reservedKVBytes: 0,
-                maxReservedKVBytes: 4_096))
+        XCTAssertEqual(finalSnapshot.activeRequests, 0)
+        XCTAssertEqual(finalSnapshot.coordinatorSlots, 0)
+        XCTAssertEqual(finalSnapshot.reservedKVBytes, 0)
+        XCTAssertEqual(finalSnapshot.maxReservedKVBytes, 4_096)
 
         do {
             _ = try await backend.start(
