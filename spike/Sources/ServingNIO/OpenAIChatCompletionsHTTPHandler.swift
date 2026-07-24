@@ -420,15 +420,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 try await waitUntilWritable(
                     writabilityGate,
                     timeout: configuration.backpressureStallTimeout)
-                let first = try await started.mailbox.next()
-                guard let first else {
-                    throw RunError.missingCompletion
-                }
                 try await writeSSEHead(
                     keepAlive: keepAlive,
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
                 responseStarted = true
+                let first = try await started.mailbox.next()
+                guard let first else {
+                    throw RunError.missingCompletion
+                }
                 try await writeRoleChunk(
                     for: started,
                     channel: channel,

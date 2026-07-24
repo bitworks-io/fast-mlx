@@ -96,7 +96,9 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
-    func testDisconnectRecordsIncompleteCancellationAndReleasedResources() async throws {
+    func testAdmittedStreamingHeadPrecedesFirstDeltaAndDisconnectReleasesResources()
+        async throws
+    {
         let backend = ScriptedBackend(scripts: [.held])
         let recorder = ServingEvidenceRecorder()
         let snapshots = ServingSnapshotSequence()
@@ -111,6 +113,29 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
 
         try await writeRequest(channel, body: requestBody(stream: true))
         await waitUntil { backend.snapshot().startCount == 1 }
+        var responseHead: HTTPResponseHead?
+        for _ in 0..<10_000 {
+            if let part = try await channel.readOutbound(
+                as: HTTPServerResponsePart.self)
+            {
+                if case .head(let head) = part {
+                    responseHead = head
+                    break
+                }
+                XCTFail("Admitted streaming response must begin with an HTTP head")
+                break
+            }
+            await Task.yield()
+        }
+        let admittedHead = try XCTUnwrap(responseHead)
+        XCTAssertEqual(admittedHead.status, .ok)
+        XCTAssertEqual(
+            admittedHead.headers.first(name: "content-type"),
+            "text/event-stream")
+        let bodyBeforeFirstDelta = try await channel.readOutbound(
+            as: HTTPServerResponsePart.self)
+        XCTAssertNil(bodyBeforeFirstDelta)
+
         try await channel.testingEventLoop.executeInContext {
             channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
         }
@@ -118,11 +143,16 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
 
         let recorded = await recorder.snapshot()
         let evidence = try XCTUnwrap(recorded.evidence.first)
-        XCTAssertNil(evidence.response.status)
+        XCTAssertEqual(evidence.response.status, 200)
         XCTAssertFalse(evidence.response.completed)
         XCTAssertEqual(evidence.response.bodyBytes, 0)
         XCTAssertEqual(evidence.response.chunkCount, 0)
+        XCTAssertEqual(
+            evidence.response.bodySHA256,
+            ServingEvidence.SHA256.hexDigest(of: Data()))
         XCTAssertEqual(evidence.route?.kind, .continuousBatchNoSpec)
+        XCTAssertEqual(evidence.resources?.admission, .accepted)
+        XCTAssertEqual(evidence.resources?.active?.activeRequests, 1)
         XCTAssertEqual(evidence.cancellation?.reason, .clientDisconnected)
         XCTAssertEqual(evidence.resources?.terminal?.activeRequests, 0)
         XCTAssertEqual(backend.snapshot().cancelCount, 1)
