@@ -141,13 +141,14 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
 
     private func submission(
         _ prompt: [Int], maxTokens: Int = 16, eos: Int = 2,
+        stopTokenIDs: Set<Int>? = nil,
         architecture: BatchArchitectureClass = .denseAttention,
         speculation: Bool = false
     ) -> ContinuousBatchSubmission {
         ContinuousBatchSubmission(
             promptTokens: prompt,
             maxOutputTokens: maxTokens,
-            eosToken: eos,
+            stopTokenIDs: stopTokenIDs ?? [eos],
             architecture: architecture,
             requestsSpeculation: speculation)
     }
@@ -207,6 +208,51 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertEqual(tokens, [101])
         let remaining = await coordinator.snapshots()
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testConfiguredStopTokenSetSuppressesEveryTerminalToken() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 2, prefill: 2, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [
+                    10: [101, 99, 102],
+                    20: [201, 2, 202],
+                ]),
+            automaticDrive: false)
+        let handles = try await coordinator.submitBatch([
+            submission([10], stopTokenIDs: [2, 99]),
+            submission([20], stopTokenIDs: [2, 99]),
+        ])
+
+        try await drain(coordinator)
+
+        let firstTokens = try await collect(handles[0].tokens)
+        let secondTokens = try await collect(handles[1].tokens)
+        XCTAssertEqual(firstTokens, [101])
+        XCTAssertEqual(secondTokens, [201])
+        let remaining = await coordinator.snapshots()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testInvalidStopTokenSetFailsBeforeAdmissionAndDoesNotConsumeID() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [20: [201, 2]]),
+            automaticDrive: false)
+
+        do {
+            _ = try await coordinator.submit(
+                submission([10], stopTokenIDs: []))
+            XCTFail("Expected empty stop-token rejection")
+        } catch let error as ContinuousBatchCoordinatorError {
+            XCTAssertEqual(error, .invalidStopTokenIDs)
+        }
+
+        let accepted = try await coordinator.submit(
+            submission([20], stopTokenIDs: [2]))
+        XCTAssertEqual(accepted.id, BatchRequestID(1))
+        await coordinator.shutdown()
     }
 
     func testAutomaticDriveWaitsForBoundedPublicationCapacityBeforeNextDecode() async throws {

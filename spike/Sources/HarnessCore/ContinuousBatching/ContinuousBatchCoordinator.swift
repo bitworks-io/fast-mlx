@@ -95,9 +95,23 @@ extension ContinuousBatchRuntime {
 public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let promptTokens: [Int]
     public let maxOutputTokens: Int
-    public let eosToken: Int
+    public let stopTokenIDs: Set<Int>
     public let architecture: BatchArchitectureClass
     public let requestsSpeculation: Bool
+
+    public init(
+        promptTokens: [Int],
+        maxOutputTokens: Int,
+        stopTokenIDs: Set<Int>,
+        architecture: BatchArchitectureClass,
+        requestsSpeculation: Bool = false
+    ) {
+        self.promptTokens = promptTokens
+        self.maxOutputTokens = maxOutputTokens
+        self.stopTokenIDs = stopTokenIDs
+        self.architecture = architecture
+        self.requestsSpeculation = requestsSpeculation
+    }
 
     public init(
         promptTokens: [Int],
@@ -106,11 +120,12 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         architecture: BatchArchitectureClass,
         requestsSpeculation: Bool = false
     ) {
-        self.promptTokens = promptTokens
-        self.maxOutputTokens = maxOutputTokens
-        self.eosToken = eosToken
-        self.architecture = architecture
-        self.requestsSpeculation = requestsSpeculation
+        self.init(
+            promptTokens: promptTokens,
+            maxOutputTokens: maxOutputTokens,
+            stopTokenIDs: [eosToken],
+            architecture: architecture,
+            requestsSpeculation: requestsSpeculation)
     }
 }
 
@@ -127,6 +142,7 @@ public struct ContinuousBatchRequestHandle: Sendable {
 public enum ContinuousBatchCoordinatorError: Error, Sendable, Equatable {
     case shuttingDown
     case requestIDExhausted
+    case invalidStopTokenIDs
     case unknownRuntimeRequest(BatchRequestID)
 }
 
@@ -233,6 +249,11 @@ public actor ContinuousBatchCoordinator {
         var ids: [BatchRequestID] = []
         ids.reserveCapacity(submissions.count)
         for submission in submissions {
+            guard !submission.stopTokenIDs.isEmpty,
+                submission.stopTokenIDs.allSatisfy({ $0 >= 0 })
+            else {
+                throw ContinuousBatchCoordinatorError.invalidStopTokenIDs
+            }
             guard let rawID = candidateNextID else {
                 throw ContinuousBatchCoordinatorError.requestIDExhausted
             }
@@ -547,7 +568,7 @@ public actor ContinuousBatchCoordinator {
         var finished = result.finished
 
         for token in result.tokens {
-            if token == state.submission.eosToken {
+            if state.submission.stopTokenIDs.contains(token) {
                 finished = true
                 break
             }

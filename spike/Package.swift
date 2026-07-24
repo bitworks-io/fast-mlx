@@ -60,6 +60,7 @@ let package = Package(
         .target(
             name: "SpikeServingAdapters",
             dependencies: [
+                "HarnessCore",
                 "ServingCore",
                 "SpikeCore",
                 .product(name: "MLX", package: "mlx-swift"),
@@ -73,6 +74,7 @@ let package = Package(
         .testTarget(
             name: "SpikeServingAdaptersTests",
             dependencies: [
+                "HarnessCore",
                 "ServingCore",
                 "ServingNIO",
                 "SpikeCore",
