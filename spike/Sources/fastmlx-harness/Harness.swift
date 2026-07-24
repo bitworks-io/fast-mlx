@@ -1964,6 +1964,22 @@ struct Harness {
         case "compressed-attention-probe":
             await runCompressedAttentionProbe(
                 Array(arguments.dropFirst(2)))
+        case "exact-prefix-proof":
+            do {
+                try await runExactPrefixProof(
+                    Array(arguments.dropFirst(2)))
+            } catch {
+                print("exact-prefix-proof FAILED: \(error)")
+                exit(1)
+            }
+        case "validate-exact-prefix-proof":
+            do {
+                _ = try runExactPrefixProofValidation(
+                    Array(arguments.dropFirst(2)))
+            } catch {
+                print("exact-prefix-proof INVALID: \(error)")
+                exit(2)
+            }
         case "ctxprobe": await runCtxProbe(flags)
         default:
             usage()
@@ -2076,6 +2092,24 @@ struct Harness {
                  --memory-limit-bytes <N> --cache-limit-bytes <N> --wired-limit-bytes <N>
                  [--qualification-evidence false] [layout-specific flags]
                                                strict synthetic capture; never dial promotion
+          exact-prefix-proof                  fresh loaded exact request-start proof
+                 --model <PATH> --model-id <ID> --source-revision <CHECKPOINT-SHA256>
+                 --expected-harness-git-sha <SHA>
+                 --expected-binary-sha256 <SHA256>
+                 --checkpoint-content-sha256 <SHA256>
+                 --tokenizer-sha256 <SHA256> --workload-nonce <ID>
+                 --output <NEW-DIR> --max-tokens <2...128>
+                 --prompt-repeat <1...256>
+                 --prefix-max-entries <N>
+                 --prefix-max-retained-bytes <N>
+                 --prefix-minimum-reusable-tokens <N>
+                 --template-max-entries <N>
+                 --template-max-retained-bytes <N>
+                 --memory-limit-bytes <N> --cache-limit-bytes <N>
+                                               source-locked scalar dense-half cold/hit/partial/
+                                               A-B-A/pressure/warmup/template proof; fresh output
+          validate-exact-prefix-proof --output <DIR>
+                                               typed fail-closed validator for one completed proof
           kvtuner-manifest --model <PATH> --prompt-fixture <JSON> --normalized-targets <JSON>
                  --output <NEW-OR-EXACT-FILE>
           kvtuner-sensitivity --model <PATH> --manifest <JSON> --matrix-id <ID>
