@@ -61,6 +61,62 @@ final class RequestStartMetricsTests: XCTestCase {
         XCTAssertEqual(exact.physicalPrefillTokensPerSecond, 0)
     }
 
+    func testRejectedOutcomeRequiresTypedAdmissionReason() throws {
+        let rejected = try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .rejected,
+            prefixCacheRejectionReason: .snapshotExceedsBudget,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0)
+        XCTAssertEqual(
+            rejected.prefixCacheRejectionReason,
+            .snapshotExceedsBudget)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                RequestStartMetrics.self,
+                from: JSONEncoder().encode(rejected)),
+            rejected)
+
+        XCTAssertThrowsError(try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .rejected,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0))
+        XCTAssertThrowsError(try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .miss,
+            prefixCacheRejectionReason: .prefixTooShort,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0))
+    }
+
     func testImpossibleOrPartialEvidenceFailsClosed() throws {
         XCTAssertThrowsError(
             try RequestStartMetrics(

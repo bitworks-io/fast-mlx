@@ -17,6 +17,7 @@ public enum RequestStartMetricsError:
     case invalidTokenCount(String)
     case promptTokenConservation
     case outcomeTokenMismatch
+    case rejectionReasonMismatch
     case invalidDuration(String)
     case invalidRetainedBytes(Int)
     case invalidEntryCount(Int)
@@ -35,6 +36,7 @@ public struct RequestStartMetrics:
         case cacheReadTokenCount
         case physicalPrefillTokenCount
         case prefixCacheOutcome
+        case prefixCacheRejectionReason
         case templateTokenCacheHit
         case templateSeconds
         case tokenizeSeconds
@@ -53,6 +55,8 @@ public struct RequestStartMetrics:
     public let cacheReadTokenCount: Int
     public let physicalPrefillTokenCount: Int
     public let prefixCacheOutcome: PrefixCacheRequestOutcome
+    public let prefixCacheRejectionReason:
+        ExactPrefixCommitSkipReason?
     public let templateTokenCacheHit: Bool
     public let templateSeconds: Double
     public let tokenizeSeconds: Double
@@ -71,6 +75,8 @@ public struct RequestStartMetrics:
         cacheReadTokenCount: Int,
         physicalPrefillTokenCount: Int,
         prefixCacheOutcome: PrefixCacheRequestOutcome,
+        prefixCacheRejectionReason:
+            ExactPrefixCommitSkipReason? = nil,
         templateTokenCacheHit: Bool,
         templateSeconds: Double,
         tokenizeSeconds: Double,
@@ -117,6 +123,32 @@ public struct RequestStartMetrics:
         }
         guard outcomeMatches else {
             throw RequestStartMetricsError.outcomeTokenMismatch
+        }
+        let admissionRejectionReasons: Set<
+            ExactPrefixCommitSkipReason
+        > = [
+            .prefixTooShort,
+            .snapshotExceedsBudget,
+            .reservationCapacityExhausted,
+            .snapshotCaptureFailed,
+            .snapshotRestoreFailed,
+            .snapshotEvidenceMismatch,
+            .padOnlyOutput,
+        ]
+        switch prefixCacheOutcome {
+        case .rejected:
+            guard let prefixCacheRejectionReason,
+                admissionRejectionReasons.contains(
+                    prefixCacheRejectionReason)
+            else {
+                throw RequestStartMetricsError
+                    .rejectionReasonMismatch
+            }
+        case .disabled, .miss, .exactHit, .partialHit:
+            guard prefixCacheRejectionReason == nil else {
+                throw RequestStartMetricsError
+                    .rejectionReasonMismatch
+            }
         }
 
         for (field, duration) in [
@@ -169,6 +201,8 @@ public struct RequestStartMetrics:
         self.physicalPrefillTokenCount =
             physicalPrefillTokenCount
         self.prefixCacheOutcome = prefixCacheOutcome
+        self.prefixCacheRejectionReason =
+            prefixCacheRejectionReason
         self.templateTokenCacheHit = templateTokenCacheHit
         self.templateSeconds = templateSeconds
         self.tokenizeSeconds = tokenizeSeconds
@@ -206,6 +240,9 @@ public struct RequestStartMetrics:
             prefixCacheOutcome: values.decode(
                 PrefixCacheRequestOutcome.self,
                 forKey: .prefixCacheOutcome),
+            prefixCacheRejectionReason: values.decodeIfPresent(
+                ExactPrefixCommitSkipReason.self,
+                forKey: .prefixCacheRejectionReason),
             templateTokenCacheHit: values.decode(
                 Bool.self,
                 forKey: .templateTokenCacheHit),
@@ -265,6 +302,9 @@ public struct RequestStartMetrics:
         try values.encode(
             prefixCacheOutcome,
             forKey: .prefixCacheOutcome)
+        try values.encodeIfPresent(
+            prefixCacheRejectionReason,
+            forKey: .prefixCacheRejectionReason)
         try values.encode(
             templateTokenCacheHit,
             forKey: .templateTokenCacheHit)

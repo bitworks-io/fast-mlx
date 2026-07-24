@@ -24,13 +24,17 @@ public struct RunConfig: Sendable, Hashable {
     /// This comes from a frozen qualification/source-lock artifact, never from the live
     /// checkpoint's own assertion. nil is valid only when no explicit route is requested.
     public var compressedKVAttentionExpectedCheckpointContentSHA256: String?
+    /// Caller-owned request-start isolation/template/tool identity. The loaded actor supplies
+    /// every model/runtime identity and keeps the MLX snapshot payload private.
+    public var exactPrefixRequest: ExactPrefixRequestContext?
     public init(temperature: Float = 0, maxTokens: Int = 256, specDecode: String? = nil,
                 specNgram: Int? = nil, specMaxDraft: Int? = nil, specCompiledVerify: Bool? = nil,
                 kvQuant: String? = nil,
                 kvtunerSelection: KVTunerRuntimeSelection? = nil,
                 compressedKVAttention: CompressedKVAttentionRequest? = nil,
                 compressedKVAttentionExpectedCheckpointContentSHA256:
-                    String? = nil) {
+                    String? = nil,
+                exactPrefixRequest: ExactPrefixRequestContext? = nil) {
         self.temperature = temperature; self.maxTokens = maxTokens; self.specDecode = specDecode
         self.specNgram = specNgram; self.specMaxDraft = specMaxDraft
         self.specCompiledVerify = specCompiledVerify; self.kvQuant = kvQuant
@@ -38,6 +42,7 @@ public struct RunConfig: Sendable, Hashable {
         self.compressedKVAttention = compressedKVAttention
         self.compressedKVAttentionExpectedCheckpointContentSHA256 =
             compressedKVAttentionExpectedCheckpointContentSHA256
+        self.exactPrefixRequest = exactPrefixRequest
     }
     public static func greedy(maxTokens: Int) -> RunConfig { .init(temperature: 0, maxTokens: maxTokens) }
 }
@@ -52,12 +57,18 @@ public struct RunResult: Sendable {
     public var tokenTimes: [Double]
     /// Direct wall time spent inside `decoder.prefill`; nil for untimed/reference drivers.
     public var prefillDurationSeconds: Double?
+    /// Recomputable exact request-start evidence. nil preserves legacy/token-only and
+    /// non-request-start paths; cache-off controls that explicitly request this surface report
+    /// `.disabled` with full physical prefill.
+    public var requestStartMetrics: RequestStartMetrics?
     public init(tokens: [Int], engagement: EngagementCounters = .init(), acceptanceRate: Double? = nil,
                 submitTime: Double = 0, tokenTimes: [Double] = [],
-                prefillDurationSeconds: Double? = nil) {
+                prefillDurationSeconds: Double? = nil,
+                requestStartMetrics: RequestStartMetrics? = nil) {
         self.tokens = tokens; self.engagement = engagement; self.acceptanceRate = acceptanceRate
         self.submitTime = submitTime; self.tokenTimes = tokenTimes
         self.prefillDurationSeconds = prefillDurationSeconds
+        self.requestStartMetrics = requestStartMetrics
     }
 }
 

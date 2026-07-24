@@ -16,13 +16,18 @@ private final class TinyPrefixSnapshotModel:
     Module, LanguageModel, KVCacheDimensionProvider
 {
     let kvHeads: [Int]
+    private let cacheDType: DType
     private let vocabularySize = 4_096
     private(set) var forwardTokenCounts: [Int] = []
 
-    init(layerCount: Int = 1) {
+    init(
+        layerCount: Int = 1,
+        cacheDType: DType = .float16
+    ) {
         // Two KV heads keep this compiled-test signature distinct from the one-head
         // continuous-batching fixture that runs later in the same MLX test process.
         kvHeads = Array(repeating: 2, count: layerCount)
+        self.cacheDType = cacheDType
     }
 
     func prepare(
@@ -40,7 +45,7 @@ private final class TinyPrefixSnapshotModel:
         else {
             preconditionFailure("tiny prefix model requires its exact cache list")
         }
-        let scalar = inputs.asType(.float16).reshaped([
+        let scalar = inputs.asType(cacheDType).reshaped([
             inputs.dim(0), 1, inputs.dim(1), 1,
         ])
         let values = broadcast(
@@ -134,6 +139,34 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
             Array(model.forwardTokenCounts.dropFirst(callsBeforeRestore)),
             [],
             "an exact hit must not rebuild the prompt graph; compiled decode replays do not re-enter Swift")
+    }
+
+    func testBFloat16PromptSnapshotRoundTripsExactly() throws {
+        let prompt = [2, 3, 4]
+        let model = TinyPrefixSnapshotModel(
+            cacheDType: .bfloat16)
+        var decoder = CompiledMLXDecoder(
+            model: model, reserve: 1, kvCache: .fp16)
+
+        let staged =
+            try decoder.prefillCapturingPromptSnapshot(prompt)
+        XCTAssertEqual(
+            staged.snapshot.layerSnapshots.first?.keyDType,
+            .bfloat16)
+        decoder.reset()
+        let restoredFirst = try decoder.prefillRestoredPrefix(
+            staged.snapshot, tailTokens: [5])
+        let restored = decode(
+            &decoder, first: restoredFirst, additionalTokens: 2)
+
+        let controlModel = TinyPrefixSnapshotModel(
+            cacheDType: .bfloat16)
+        var control = CompiledMLXDecoder(
+            model: controlModel, reserve: 1, kvCache: .fp16)
+        let controlFirst = control.prefill(prompt + [5])
+        let expected = decode(
+            &control, first: controlFirst, additionalTokens: 2)
+        XCTAssertEqual(restored, expected)
     }
 
     func testPromptSnapshotPlusTailMatchesUninterruptedControlAndEvaluatesOnlyTail() throws {
@@ -248,6 +281,31 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         assertSnapshotError(.layerCountMismatch) {
             _ = try source.prefillRestoredPrefix(
                 malformed, tailTokens: [])
+        }
+
+        let secondLayer = valid.layerSnapshots[1]
+        let wrongGeometryLayer = CompiledKVCacheSnapshot(
+            rank: secondLayer.rank,
+            batchSize: secondLayer.batchSize,
+            kvHeadCount: secondLayer.kvHeadCount + 1,
+            tokenCount: secondLayer.tokenCount,
+            headDimension: secondLayer.headDimension,
+            keyDType: secondLayer.keyDType,
+            valueDType: secondLayer.valueDType,
+            keyNBytes: secondLayer.keyNBytes,
+            valueNBytes: secondLayer.valueNBytes,
+            keys: secondLayer.keys,
+            values: secondLayer.values)
+        let heterogeneous = CompiledMLXDecoderSnapshot(
+            logicalTokenCount: valid.logicalTokenCount,
+            nextTokenID: valid.nextTokenID,
+            layerSnapshots: [
+                valid.layerSnapshots[0],
+                wrongGeometryLayer,
+            ])
+        assertSnapshotError(.layerGeometryMismatch(layer: 1)) {
+            _ = try source.prefillRestoredPrefix(
+                heterogeneous, tailTokens: [])
         }
 
         let control = CompiledMLXDecoder(

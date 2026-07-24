@@ -139,6 +139,33 @@ final class ExactPrefixCacheTests: XCTestCase {
             try cache.lookup(key: keyB, promptTokens: [10, 20, 30, 40]))
     }
 
+    func testInvalidatedHitIsRemovedAndNextLookupIsAColdMiss() throws {
+        let semanticKey = try key()
+        var cache = ExactPrefixCache<String>(policy: try policy())
+        let committed = try commit(
+            "corrupt-snapshot",
+            key: semanticKey,
+            tokens: [10, 20, 30],
+            into: &cache)
+        let entryID = try XCTUnwrap(committed.entryID)
+
+        let hit = try XCTUnwrap(
+            try cache.lookup(
+                key: semanticKey,
+                promptTokens: [10, 20, 30, 40]))
+        XCTAssertEqual(hit.entryID, entryID)
+
+        XCTAssertTrue(cache.invalidate(entryID: hit.entryID))
+        XCTAssertFalse(cache.invalidate(entryID: hit.entryID))
+        XCTAssertNil(
+            try cache.lookup(
+                key: semanticKey,
+                promptTokens: [10, 20, 30, 40]))
+        XCTAssertEqual(cache.snapshot.entryCount, 0)
+        XCTAssertEqual(cache.snapshot.evictionCount, 1)
+        XCTAssertEqual(cache.snapshot.missCount, 1)
+    }
+
     func testReservationIsInvisibleUntilPositiveCommit() throws {
         let semanticKey = try key()
         var cache = ExactPrefixCache<String>(policy: try policy())
@@ -500,5 +527,63 @@ final class ExactPrefixCacheTests: XCTestCase {
                 promptTokens: [1, 2, 3]))
         XCTAssertEqual(hit.state, "prior")
         XCTAssertEqual(cache.snapshot.entryCount, 1)
+    }
+
+    func testProtectedEntrySurvivesBestEffortReservationPressure() throws {
+        let semanticKey = try key()
+        var cache = ExactPrefixCache<String>(
+            policy: try policy(entries: 1, bytes: 8 * 1024))
+        let primary = try commit(
+            "primary",
+            key: semanticKey,
+            tokens: [1, 2],
+            into: &cache)
+        let primaryID = try XCTUnwrap(primary.entryID)
+
+        let decision = try cache.reserve(
+            key: semanticKey,
+            tokens: [1, 2, 3],
+            snapshotBytes: 64,
+            protectingEntryIDs: [primaryID])
+
+        XCTAssertNil(decision.reservation)
+        XCTAssertEqual(
+            decision.skipReason,
+            .reservationCapacityExhausted)
+        XCTAssertTrue(decision.evictedEntryIDs.isEmpty)
+        XCTAssertEqual(
+            try cache.lookup(
+                key: semanticKey,
+                promptTokens: [1, 2, 9])?.state,
+            "primary")
+    }
+
+    func testRollbackDoesNotReinflatePreallocationEvictions() throws {
+        let semanticKey = try key()
+        let entryBytes = try ExactPrefixCache<String>.retainedBytes(
+            key: semanticKey,
+            tokens: [1, 2],
+            snapshotBytes: 64)
+        var cache = ExactPrefixCache<String>(
+            policy: try policy(entries: 1, bytes: entryBytes))
+        _ = try commit(
+            "evicted-before-allocation",
+            key: semanticKey,
+            tokens: [1, 2],
+            into: &cache)
+
+        let decision = try cache.reserve(
+            key: semanticKey,
+            tokens: [3, 4],
+            snapshotBytes: 64)
+        let reservation = try XCTUnwrap(decision.reservation)
+        XCTAssertEqual(decision.evictedEntryIDs.count, 1)
+        XCTAssertEqual(cache.snapshot.entryCount, 0)
+
+        try cache.rollback(reservation)
+
+        XCTAssertEqual(cache.snapshot.entryCount, 0)
+        XCTAssertEqual(cache.snapshot.reservationCount, 0)
+        XCTAssertEqual(cache.snapshot.evictionCount, 1)
     }
 }

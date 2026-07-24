@@ -249,13 +249,39 @@ Machine-readable verification packet SHA-256 is
 This completes the fused compressed-attention engineering gate as model-scoped, explicit-only
 implementation plus negative evidence; it does not authorize a broad/default route.
 
+**Exact prefix/session cache — INTEGRATION VERIFIED, LOADED PROOF PENDING (2026-07-23):** the
+internal scalar request-start path is implemented on `codex/exact-prefix-session-cache`. It is
+disabled by default and admits only actor-owned, full-attention dense `CompiledKVCache` state with
+native `float16` or `bfloat16` storage. Exact semantic keys bind caller isolation, model/tokenizer,
+prompt/template/tools, KV route, position/architecture state, and drafter state. Longest-prefix
+reuse, success-only publication, mandatory entry/byte budgets, eager warmup, separate
+template/token caches, and logical-versus-physical prefill telemetry are present. Unsupported
+compressed, sliding/recurrent/hybrid/MLA, vision/media, speculative, and continuous-batch state
+fails closed.
+
+Snapshot restore mutates the compiled cache identities in place and now validates actual layer
+count, rank, batch, KV heads, head dimension, dtype, and exact bytes against configured evidence.
+A corrupt hit is invalidated before the same request falls back cold; a best-effort final-context
+snapshot cannot evict its protected primary entry. Focused review found no issues. Fresh
+verification passes 568 HarnessCore XCTest plus 17 Swift Testing tests off-box; 8/8 focused
+`ExactPrefixMLXTests`; 18/18 focused actor/config tests; 125/125 `FastMLXHarnessTests` plus 163/163
+`SpikeCoreTests` through Xcode on `llmbench`; and the Release build.
+
+This checkpoint proves the internal contracts and Apple integration, not model benefit or a
+public/default route. Next, add an independently reviewed fresh-output proof command and run
+source-locked Qwen3, Llama, and Phi boundaries for cold control, exact hit, partial tail, A/B/A,
+pressure eviction, eager warmup, and template/tokenize reuse. Each family must independently prove
+byte identity, bounded engagement, and warm-turn benefit before any model-scoped promotion.
+Plan: [`2026-07-23-exact-prefix-session-cache.md`](superpowers/plans/2026-07-23-exact-prefix-session-cache.md).
+
 **Content practice:** `docs/content/` now has 14 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
-   warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
+1. **Exact prefix/session cache + request-start stack** — internal dense scalar integration is
+   verified; fresh loaded-model Qwen3/Llama/Phi proof and model-scoped verdict are active. Public
+   serving flags, continuous-batch ownership, and SSD remain separate gates.
    [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
 2. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
    propagation, dynamic policy boundaries. [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).

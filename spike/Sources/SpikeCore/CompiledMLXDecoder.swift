@@ -12,6 +12,8 @@ public enum CompiledMLXDecoderSnapshotError: Error, Equatable, Sendable {
     case invalidTailToken(position: Int)
     case layerCountMismatch
     case layerTokenCountMismatch(layer: Int)
+    case layerGeometryMismatch(layer: Int)
+    case layerDTypeMismatch(layer: Int)
     case invalidNextToken
     case invalidSnapshotMetadata
     case byteCountOverflow
@@ -19,8 +21,8 @@ public enum CompiledMLXDecoderSnapshotError: Error, Equatable, Sendable {
 
 /// Exact request-start state for the dense scalar compiled decoder.
 ///
-/// A snapshot contains the logical fp16 prefix for every layer plus the greedy token that the
-/// prefix predicts. Retaining that next-token pipeline state lets an exact hit skip prompt
+/// A snapshot contains the logical native-half prefix for every layer plus the greedy token that
+/// the prefix predicts. Retaining that next-token pipeline state lets an exact hit skip prompt
 /// evaluation entirely while preserving the decoder's submit-first lookahead invariant.
 public struct CompiledMLXDecoderSnapshot {
     public let logicalTokenCount: Int
@@ -29,6 +31,12 @@ public struct CompiledMLXDecoderSnapshot {
     public let arrayNBytes: Int
     public let controlNBytes: Int
     public let totalNBytes: Int
+    public let rank: Int?
+    public let batchSize: Int?
+    public let kvHeadCount: Int?
+    public let headDimension: Int?
+    public let keyDType: DType?
+    public let valueDType: DType?
 
     let layerSnapshots: [CompiledKVCacheSnapshot]
 
@@ -41,6 +49,12 @@ public struct CompiledMLXDecoderSnapshot {
         self.nextTokenID = nextTokenID
         self.layerSnapshots = layerSnapshots
         layerCount = layerSnapshots.count
+        rank = layerSnapshots.first?.rank
+        batchSize = layerSnapshots.first?.batchSize
+        kvHeadCount = layerSnapshots.first?.kvHeadCount
+        headDimension = layerSnapshots.first?.headDimension
+        keyDType = layerSnapshots.first?.keyDType
+        valueDType = layerSnapshots.first?.valueDType
 
         var arrayBytes = 0
         var byteCountOverflow = false
@@ -72,6 +86,25 @@ public struct CompiledMLXDecoderSnapshot {
             controlNBytes = controlBytes
             totalNBytes = allBytes
         }
+    }
+}
+
+public struct CompiledMLXRestoredPrefillMeasurement:
+    Equatable, Sendable
+{
+    public let firstToken: Int
+    public let restoreDurationSeconds: Double
+    public let tailPrefillDurationSeconds: Double
+
+    init(
+        firstToken: Int,
+        restoreDurationSeconds: Double,
+        tailPrefillDurationSeconds: Double
+    ) {
+        self.firstToken = firstToken
+        self.restoreDurationSeconds = restoreDurationSeconds
+        self.tailPrefillDurationSeconds =
+            tailPrefillDurationSeconds
     }
 }
 
@@ -153,7 +186,7 @@ public struct CompiledMLXDecoder: Decoder {
         return armLookahead(from: first)
     }
 
-    /// Cold fp16 prefill that also captures the exact prompt-only state before the first
+    /// Cold dense-half prefill that also captures the exact prompt-only state before the first
     /// generated token is submitted to the compiled decode step.
     ///
     /// This is a consuming request-start transition, not a validation probe. Any thrown
@@ -214,6 +247,18 @@ public struct CompiledMLXDecoder: Decoder {
         _ snapshot: CompiledMLXDecoderSnapshot,
         tailTokens: [Int]
     ) throws -> Int {
+        try prefillRestoredPrefixMeasuring(
+            snapshot, tailTokens: tailTokens
+        ).firstToken
+    }
+
+    /// Timed form used by request-start evidence. Restore preparation/application and physical
+    /// tail prefill are measured independently so logical cache reads cannot inflate kernel
+    /// prefill throughput.
+    public mutating func prefillRestoredPrefixMeasuring(
+        _ snapshot: CompiledMLXDecoderSnapshot,
+        tailTokens: [Int]
+    ) throws -> CompiledMLXRestoredPrefillMeasurement {
         do {
             try validateSnapshotRoute()
             guard !caches.isEmpty, compiledStep != nil else {
@@ -247,6 +292,8 @@ public struct CompiledMLXDecoder: Decoder {
                 targetCapacity = grown
             }
 
+            let restoreStartedAt =
+                ProcessInfo.processInfo.systemUptime
             let denseCaches = try denseSnapshotCaches()
             guard denseCaches.allSatisfy({
                 $0.capacity == denseCaches[0].capacity
@@ -274,6 +321,7 @@ public struct CompiledMLXDecoder: Decoder {
 
             cachedTokens = snapshot.logicalTokenCount
             pendingNext = nil
+            let restoredAt = ProcessInfo.processInfo.systemUptime
 
             let current: MLXArray
             if tailTokens.isEmpty {
@@ -292,7 +340,14 @@ public struct CompiledMLXDecoder: Decoder {
             precondition(
                 emitted == currentToken,
                 "restored prefix token changed while arming lookahead")
-            return emitted
+            let prefillEndedAt =
+                ProcessInfo.processInfo.systemUptime
+            return CompiledMLXRestoredPrefillMeasurement(
+                firstToken: emitted,
+                restoreDurationSeconds:
+                    restoredAt - restoreStartedAt,
+                tailPrefillDurationSeconds:
+                    prefillEndedAt - restoredAt)
         } catch {
             reset()
             throw error
@@ -475,6 +530,21 @@ public struct CompiledMLXDecoder: Decoder {
             guard layerSnapshot.tokenCount == snapshot.logicalTokenCount else {
                 throw CompiledMLXDecoderSnapshotError
                     .layerTokenCountMismatch(layer: layer)
+            }
+            guard layerSnapshot.rank == snapshot.rank,
+                layerSnapshot.batchSize == snapshot.batchSize,
+                layerSnapshot.kvHeadCount == snapshot.kvHeadCount,
+                layerSnapshot.headDimension == snapshot.headDimension
+            else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerGeometryMismatch(layer: layer)
+            }
+            guard layerSnapshot.keyDType == snapshot.keyDType,
+                layerSnapshot.valueDType == snapshot.valueDType,
+                layerSnapshot.keyDType == layerSnapshot.valueDType
+            else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerDTypeMismatch(layer: layer)
             }
             let (next, overflow) = arrayBytes.addingReportingOverflow(
                 layerSnapshot.totalNBytes)

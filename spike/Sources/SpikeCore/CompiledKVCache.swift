@@ -21,9 +21,9 @@ public enum CompiledKVCacheSnapshotError: Error, Equatable, Sendable {
 ///
 /// The payload arrays are intentionally actor-confined and are not exposed publicly. Capture
 /// round-trips the logical prefix through host-owned `Data`, so a later mutation of the live
-/// cache cannot change this snapshot. Phase 1 is deliberately restricted to the dense fp16 route;
-/// compressed, sliding, recurrent, batched, and other cache families require their own complete
-/// checkpoint contracts.
+/// cache cannot change this snapshot. Phase 1 is deliberately restricted to the dense native-half
+/// route (`float16` or `bfloat16`); compressed, sliding, recurrent, batched, and other cache
+/// families require their own complete checkpoint contracts.
 public struct CompiledKVCacheSnapshot {
     public let rank: Int
     public let batchSize: Int
@@ -202,7 +202,7 @@ public final class CompiledKVCache: KVCache, Updatable {
         offset = 0
     }
 
-    /// Capture the exact logical prefix into independently backed, evaluated fp16 arrays.
+    /// Capture the exact logical prefix into independently backed, evaluated dense-half arrays.
     ///
     /// `logicalTokenCount` is authoritative because compiled replay advances `offsetArr` without
     /// executing the Swift `offset` mirror. Capture still requires the in-graph offset to agree,
@@ -225,7 +225,9 @@ public final class CompiledKVCache: KVCache, Updatable {
         }
         let geometry = try Self.validateLiveBuffers(
             keys: keys, values: values, capacity: capacity)
-        guard keys.dtype == .float16, values.dtype == .float16 else {
+        guard Self.isSupportedSnapshotDType(keys.dtype),
+            Self.isSupportedSnapshotDType(values.dtype)
+        else {
             throw CompiledKVCacheSnapshotError.unsupportedDType
         }
 
@@ -315,7 +317,9 @@ public final class CompiledKVCache: KVCache, Updatable {
         guard snapshot.tokenCount <= targetCapacity else {
             throw CompiledKVCacheSnapshotError.insufficientCapacity
         }
-        guard snapshot.keyDType == .float16, snapshot.valueDType == .float16 else {
+        guard Self.isSupportedSnapshotDType(snapshot.keyDType),
+            Self.isSupportedSnapshotDType(snapshot.valueDType)
+        else {
             throw CompiledKVCacheSnapshotError.unsupportedDType
         }
         guard snapshotKeys.dtype == snapshot.keyDType,
@@ -477,9 +481,17 @@ public final class CompiledKVCache: KVCache, Updatable {
 
     private static func arraysAreFinite(_ arrays: [MLXArray]) -> Bool {
         arrays.allSatisfy { array in
-            guard array.dtype == .float16 else { return false }
+            guard isSupportedSnapshotDType(array.dtype) else {
+                return false
+            }
             return isFinite(array).all().item(Bool.self)
         }
+    }
+
+    private static func isSupportedSnapshotDType(
+        _ dtype: DType
+    ) -> Bool {
+        dtype == .float16 || dtype == .bfloat16
     }
 
     private static func detachedCopy(of array: MLXArray) -> MLXArray {
@@ -491,7 +503,7 @@ public final class CompiledKVCache: KVCache, Updatable {
         shape: [Int],
         dtype: DType
     ) throws -> Int {
-        guard dtype == .float16, !shape.isEmpty else {
+        guard isSupportedSnapshotDType(dtype), !shape.isEmpty else {
             throw CompiledKVCacheSnapshotError.unsupportedDType
         }
         var elements = 1

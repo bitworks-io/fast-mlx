@@ -6,6 +6,78 @@ import XCTest
 @testable import fastmlx_harness
 
 final class SwiftEngineDriverConfigTests: XCTestCase {
+    func testExactPrefixRuntimeIdentityRequiresStableAuthenticatedSource()
+        throws
+    {
+        let source = try makeRuntimeSource()
+        let configuration = try ExactPrefixCacheConfiguration(
+            policy: ExactPrefixCachePolicy(
+                maxEntries: 4,
+                maxRetainedBytes: 1_024,
+                minimumReusableTokens: 2),
+            eagerWarmupEnabled: true)
+
+        let identity = try XCTUnwrap(
+            resolveExactPrefixRuntimeIdentity(
+                configuration: configuration,
+                sourceBeforeLoad: source,
+                sourceAfterLoad: source,
+                modelInstanceID: "loaded-model-instance"))
+        XCTAssertEqual(identity.admission.family, .qwen3)
+        XCTAssertEqual(
+            identity.admission.checkpointContentSHA256,
+            source.checkpointContentSHA256)
+        XCTAssertEqual(
+            identity.modelInstanceID, "loaded-model-instance")
+
+        XCTAssertNil(try resolveExactPrefixRuntimeIdentity(
+            configuration: .disabled,
+            sourceBeforeLoad: nil,
+            sourceAfterLoad: nil))
+        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
+            configuration: configuration,
+            sourceBeforeLoad: source,
+            sourceAfterLoad: nil)) {
+            XCTAssertEqual(
+                $0 as? ExactPrefixRuntimeError,
+                .missingRuntimeIdentity)
+        }
+        let changed = try makeRuntimeSource(
+            tokenizerSHA256: String(repeating: "f", count: 64))
+        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
+            configuration: configuration,
+            sourceBeforeLoad: source,
+            sourceAfterLoad: changed)) {
+            XCTAssertEqual(
+                $0 as? CompressedKVAttentionRuntimeAdmissionError,
+                .sourceIdentityChangedDuringModelLoad)
+        }
+
+        let float16 = try makeRuntimeSource(
+            torchDType: "float16")
+        let float16Identity = try XCTUnwrap(
+            resolveExactPrefixRuntimeIdentity(
+                configuration: configuration,
+                sourceBeforeLoad: float16,
+                sourceAfterLoad: float16,
+                modelInstanceID: "loaded-model-instance"))
+        XCTAssertNotEqual(
+            identity.kvRouteSHA256,
+            float16Identity.kvRouteSHA256)
+
+        let float32 = try makeRuntimeSource(
+            torchDType: "float32")
+        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
+            configuration: configuration,
+            sourceBeforeLoad: float32,
+            sourceAfterLoad: float32,
+            modelInstanceID: "loaded-model-instance")) {
+            XCTAssertEqual(
+                $0 as? ExactPrefixRuntimeError,
+                .unsupportedNativeDType("float32"))
+        }
+    }
+
     func testExplicitSplitRequiresAdmissionAndReturnsDistinctDecoderMode() throws {
         let admission = try makeAdmission()
         let config = RunConfig(
@@ -169,6 +241,21 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
             tokenizerSHA256: tokenizerSHA256)
         return try CompressedKVAttentionRuntimeAdmission.load(
             sourceSnapshot: snapshot)
+    }
+
+    private func makeRuntimeSource(
+        tokenizerSHA256: String = String(repeating: "a", count: 64),
+        torchDType: String = "bfloat16"
+    ) throws -> CompressedKVAttentionRuntimeSourceSnapshot {
+        try CompressedKVAttentionRuntimeSourceSnapshot.load(
+            exactModelConfigData: Data(
+                """
+                {"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"hidden_size":5120,"num_hidden_layers":64,"num_attention_heads":64,"num_key_value_heads":8,"head_dim":128,"max_position_embeddings":40960,"use_sliding_window":false,"torch_dtype":"\(torchDType)"}
+                """.utf8),
+            checkpointManifestHash: "0123456789abcdef",
+            checkpointContentSHA256:
+                String(repeating: "d", count: 64),
+            tokenizerSHA256: tokenizerSHA256)
     }
 
     private func makeSelection(

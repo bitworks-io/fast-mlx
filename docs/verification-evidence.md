@@ -542,3 +542,22 @@ SHA-256 `52d1865b27c78a69d7c2b4c371f1d8d8d3acf346aaafad4b4d329d2bfe238ef8`.
 teacher-forced non-garbage floor pass. The 8K speed gate fails; long-context rows are capacity
 context only; the invalid fp16 task reference makes paired task qualification unavailable.
 Generic-window and broad/default claims remain rejected.
+
+## Exact prefix/session cache integration checkpoint — 2026-07-23
+
+**Story:** a repeated scalar request can reuse the longest exact, actor-owned dense prefix without
+changing temperature-zero output, crossing an isolation boundary, restoring incompatible state, or
+retaining unbounded unified memory.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Exact pure contracts | **PASS** | `swift test --disable-sandbox --filter HarnessCoreTests` passes 568 XCTest plus 17 Swift Testing tests. Coverage includes semantic-key isolation, longest-prefix/LRU selection, hard entry/byte budgets, durable pre-allocation eviction, protected-primary skip, success-only publication, corrupt-hit invalidation, template/token cache separation, and complete request-start telemetry validation. |
+| Dense snapshot/restore integrity | **PASS** | Focused Xcode `ExactPrefixMLXTests` pass 8/8 on `llmbench`. Native `float16` and `bfloat16` snapshots detach correctly, restore in place, preserve control/cache identities, and fail closed on actual-versus-configured dtype, byte count, layer count, rank, batch, KV-head, head-dimension, and heterogeneous-layer mismatches. |
+| Actor request lifecycle | **PASS** | Focused Xcode actor and driver-configuration tests pass 18/18. They cover cold commit, exact hit, partial tail, A/B/A isolation, cancellation/error/zero/pad rejection, restore-failure invalidation plus same-request cold recovery, eager warmup, bounded admission, unsupported route rejection, and logical-versus-physical work accounting. |
+| Apple regression and build | **PASS** | The synchronized Apple suite passes 125/125 `FastMLXHarnessTests` and 163/163 `SpikeCoreTests` (288/288 total); the Release build succeeds with `-skipPackagePluginValidation`. |
+| Focused review and scope boundary | **PASS / INTERNAL ONLY** | Independent focused review found no issues. The implementation remains disabled by default and scalar-only; compressed, sliding/recurrent/hybrid/MLA, vision/media, speculative, and continuous-batch state rejects. No model, speed, public API, default, or broad-support claim follows from this checkpoint. |
+| Loaded-model acceptance | **PENDING** | A dedicated fresh-output proof command and independently authenticated Qwen3, Llama, and Phi runs remain required. Each family must prove cache-off/on byte identity, exact engagement, bounded retention, and warm-turn benefit for cold control, exact hit, partial tail, A/B/A, pressure eviction, warmup, and template/tokenize cases. |
+
+**Checkpoint verdict: implementation verification passes; model promotion remains pending.** The
+next safe action is the bounded proof command and fresh per-family evidence, not a production
+serving flag or a continuous-batching/SSD generalization.

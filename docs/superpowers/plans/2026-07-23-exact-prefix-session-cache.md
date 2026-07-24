@@ -1,7 +1,7 @@
 # Exact Prefix / Session Cache and Request-Start Stack Plan
 
 **Date:** 2026-07-23
-**Status:** active design; implementation not yet admitted
+**Status:** actor integration verified; loaded-model proof pending
 **Classification:** EXACT
 **Branch:** `codex/exact-prefix-session-cache`
 
@@ -38,6 +38,9 @@ the same contracts.
 5. **Bounded true retention.** Entry and retained-byte limits are both mandatory. A two-phase
    reservation evicts LRU entries before MLX snapshot allocation, accounts detached array bytes
    plus token/control storage, and releases the reservation on capture or commit failure.
+   Pre-allocation evictions are durable and counted: retaining rollback copies would itself exceed
+   the hard byte budget. A best-effort longer-context reservation must protect the primary
+   prompt/hit entry and skip instead of evicting it when no other capacity is available.
 6. **Compiled identity preservation.** Restore mutates existing cache buffers and control arrays in
    place. It neither swaps the cache objects captured by `MLX.compile` nor uses the custom cache
    types' intentionally unsupported generic `state` setters or `copy()` methods.
@@ -84,12 +87,22 @@ the same contracts.
   cache-off path remains available.
 - **Insufficient byte budget:** evict LRU entries before allocation. If one snapshot exceeds the
   whole budget, skip the commit and keep generation successful.
-- **Snapshot/restore validation failure:** discard the reservation, reset the live decoder in place,
-  and fail the cache-enabled request closed. A later request may use the ordinary cold path.
-- **Generation error/cancel/zero/pad-only/media:** do not commit; prior entries remain unchanged.
+- **Snapshot capture validation failure:** discard the reservation, reset the live decoder in
+  place, perform the request through the ordinary cold path, report a typed cache rejection, and
+  publish nothing.
+- **Snapshot restore validation failure:** invalidate the selected entry, reset the live decoder
+  in place, perform the request through the ordinary cold path, report a typed cache rejection,
+  and publish nothing. A later request observes an ordinary miss rather than retrying the corrupt
+  entry.
+- **Generation error/cancel/zero/pad-only/media:** do not publish a new entry. A reservation may
+  already have evicted LRU entries before snapshot allocation; those cache-only evictions remain
+  durable and observable because retaining rollback copies would violate the hard byte budget.
+  The final-context sidecar protects the primary prompt/hit entry and skips if it cannot fit
+  without evicting that entry.
 - **A/B/A poisoning attempt:** B may use or commit only under B's exact key. A's later output must
   match the original A control byte for byte.
-- **Memory pressure:** evict before capture; never raise wired or MLX cache limits implicitly.
+- **Memory pressure:** evict before capture, count durable pre-allocation evictions, and never raise
+  wired or MLX cache limits implicitly.
 - **Process restart:** phase 1 has no SSD tier, so hot entries disappear. The next request is a cold
   miss, not an error.
 - **Continuous-batch request:** phase 1 rejects reuse. Later integration must transfer a complete
@@ -100,9 +113,9 @@ the same contracts.
 
 | Model/cache shape | Phase-1 disposition | Required proof |
 |---|---|---|
-| Qwen3 dense GQA, full attention, fp16 `CompiledKVCache`, scalar actor | Supported after on-box proof | in-place round trip, partial tail, exact hit, A/B/A, byte accounting |
-| Llama dense GQA, full attention, fp16 `CompiledKVCache`, scalar actor | Supported after independent on-box proof | same suite on source-locked Llama; Qwen evidence cannot promote it |
-| Phi3 dense GQA with the admitted inert-window/LongRoPE geometry, fp16 scalar actor | Supported after independent on-box proof | exact position/LongRoPE identity plus same suite |
+| Qwen3 dense GQA, full attention, native `float16`/`bfloat16` `CompiledKVCache`, scalar actor | Supported after on-box proof | in-place round trip, partial tail, exact hit, A/B/A, byte accounting |
+| Llama dense GQA, full attention, native `float16`/`bfloat16` `CompiledKVCache`, scalar actor | Supported after independent on-box proof | same suite on source-locked Llama; Qwen evidence cannot promote it |
+| Phi3 dense GQA with the admitted inert-window/LongRoPE geometry, native `float16`/`bfloat16` scalar actor | Supported after independent on-box proof | exact position/LongRoPE identity plus same suite |
 | Affine, frozen KVTuner, KVarN, TurboQuant custom cache state | Rejected in phase 1 | per-format detached snapshot, exact in-place restore, true byte accounting, loss-policy proof |
 | Sliding/rotating/local-window attention | Rejected | window cursor, sink/front-trim, mask, and RoPE checkpoint proof |
 | Hybrid linear attention, Mamba/SSM, recurrent or `CacheList` state | Rejected | explicit complete recurrent checkpoint and conservative retained-allocation accounting |
@@ -205,7 +218,8 @@ source identity, and never extends a live request's context window.
 - semantic-key inequality for every axis;
 - identical tokens under different privacy/isolation namespaces never match;
 - longest-prefix selection, exact tie/LRU behavior, and no cross-key match;
-- two-phase reservation, oversized skip, eviction ordering, rollback, overflow, and disabled mode;
+- two-phase reservation, protected-primary skip, durable pre-allocation eviction on rollback,
+  oversized skip, eviction ordering, overflow, and disabled mode;
 - success-only commit table including error/cancel/zero/pad/media;
 - token/control bytes included in retained accounting;
 - template/tokenize exact key, independent budget, and timing counters;

@@ -336,12 +336,15 @@ public enum ExactPrefixCommitDisposition: Equatable, Sendable {
 }
 
 public enum ExactPrefixCommitSkipReason:
-    String, Codable, Equatable, Sendable
+    String, Codable, CaseIterable, Equatable, Hashable, Sendable
 {
     case disabled
     case prefixTooShort = "prefix-too-short"
     case snapshotExceedsBudget = "snapshot-exceeds-budget"
     case reservationCapacityExhausted = "reservation-capacity-exhausted"
+    case snapshotCaptureFailed = "snapshot-capture-failed"
+    case snapshotRestoreFailed = "snapshot-restore-failed"
+    case snapshotEvidenceMismatch = "snapshot-evidence-mismatch"
     case generationFailed = "generation-failed"
     case cancelled
     case unsupportedMedia = "unsupported-media"
@@ -557,7 +560,8 @@ public struct ExactPrefixCache<State> {
     public mutating func reserve(
         key: ExactPrefixSemanticKey,
         tokens: [Int],
-        snapshotBytes: Int
+        snapshotBytes: Int,
+        protectingEntryIDs: Set<UInt64> = []
     ) throws -> ExactPrefixReservationDecision {
         guard policy.isEnabled else {
             return ExactPrefixReservationDecision(
@@ -598,8 +602,9 @@ public struct ExactPrefixCache<State> {
                 skipReason: .reservationCapacityExhausted)
         }
 
-        let protectedEntryIDs = replacementEntryIDs.union(
-            pendingReplacementEntryIDs)
+        let protectedEntryIDs = replacementEntryIDs
+            .union(pendingReplacementEntryIDs)
+            .union(protectingEntryIDs)
         var plannedEvictions: [UInt64] = []
         var plannedEvictionIDs: Set<UInt64> = []
 
@@ -658,6 +663,9 @@ public struct ExactPrefixCache<State> {
             plannedEvictionIDs.insert(id)
         }
 
+        // Evict before the caller allocates the detached MLX snapshot so committed plus reserved
+        // bytes never exceed the hard budget. Rollback therefore releases only this reservation;
+        // it cannot recreate evicted payloads without retaining a second over-budget copy.
         for id in plannedEvictions {
             removeEntry(id)
         }
@@ -749,11 +757,28 @@ public struct ExactPrefixCache<State> {
     public mutating func rollback(
         _ reservation: ExactPrefixReservation
     ) throws {
+        // Pre-allocation evictions are intentionally durable. See `reserve`: retaining rollback
+        // copies would defeat the byte budget the reservation exists to enforce.
         guard reservations.removeValue(forKey: reservation.id) != nil
         else {
             throw ExactPrefixCacheError.unknownReservation(
                 reservation.id)
         }
+    }
+
+    /// Remove a selected entry after its opaque payload fails actor-side validation or restore.
+    ///
+    /// The entry ID comes from `lookup`, so callers can quarantine exactly the broken snapshot
+    /// without exposing semantic keys or prompt tokens. A repeated invalidation is a no-op. The
+    /// removal is counted as an eviction because it releases retained payload bytes and is visible
+    /// in the same bounded-cache telemetry as policy-driven eviction.
+    @discardableResult
+    public mutating func invalidate(entryID: UInt64) -> Bool {
+        guard entries[entryID] != nil else {
+            return false
+        }
+        removeEntry(entryID)
+        return true
     }
 
     private func leastRecentlyUsedEntryID(
