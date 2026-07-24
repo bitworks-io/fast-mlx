@@ -19,6 +19,52 @@ private enum ExactPrefixProofRunnerError: Error, Equatable {
     case invalidValidationArguments
 }
 
+func exactPrefixProofPromptText(
+    workloadNonce: String,
+    label: String,
+    repeatCount: Int
+) -> String {
+    let block = """
+        exact-prefix-proof \(workloadNonce) \(label): deterministic ledger row for cache admission and byte identity.
+        Continue the ledger by replying with the single lowercase word ready.
+        Response:
+        """
+    return Array(repeating: block, count: repeatCount)
+        .joined(separator: "\n")
+}
+
+func exactPrefixProofFormattingOptionsSHA256() -> String {
+    sha256Hex(Data(
+        """
+        fast-mlx-exact-prefix-proof-format-v2
+        explicit-response-cue
+
+        """.utf8))
+}
+
+func exactPrefixProofPromptTemplateSHA256() -> String {
+    sha256Hex(Data(
+        """
+        fast-mlx-exact-prefix-proof-template-v2
+        fixed-ledger-response
+
+        """.utf8))
+}
+
+func exactPrefixProofPromptContentSHA256(
+    workloadNonce: String,
+    group: String
+) -> String {
+    sha256Hex(Data(
+        """
+        fast-mlx-exact-prefix-proof-content-v2
+        explicit-response-cue
+        \(workloadNonce)
+        \(group)
+
+        """.utf8))
+}
+
 func runExactPrefixProof(_ rawArguments: [String]) async throws {
     let raw = try parseExactPrefixProofRawCommand(arguments: rawArguments)
     let startedAt = ProcessInfo.processInfo.systemUptime
@@ -537,8 +583,8 @@ private struct ExactPrefixProofRuntime {
                 requestContext.promptTemplateSHA256,
             toolsSHA256: requestContext.toolsSHA256,
             promptContentSHA256: promptContentSHA256(for: caseID),
-            formattingOptionsSHA256: sha256Hex(Data(
-                "fast-mlx-exact-prefix-proof-format-v1\n".utf8)))
+            formattingOptionsSHA256:
+                exactPrefixProofFormattingOptionsSHA256())
     }
 
     private mutating func referenceHashes(
@@ -612,11 +658,10 @@ private struct ExactPrefixProofRuntime {
     }
 
     private func encodedPrompt(label: String) throws -> [Int] {
-        let line = """
-            exact-prefix-proof \(command.plan.workloadNonce) \(label): deterministic ledger row for cache admission and byte identity.
-            """
-        let text = Array(repeating: line, count: command.plan.promptRepeat)
-            .joined(separator: "\n")
+        let text = exactPrefixProofPromptText(
+            workloadNonce: command.plan.workloadNonce,
+            label: label,
+            repeatCount: command.plan.promptRepeat)
         let tokens = tokenizer.encode(text: text, addSpecialTokens: true)
         guard !tokens.isEmpty else {
             throw ExactPrefixProofRunnerError.emptyGeneration(.coldControlA)
@@ -639,8 +684,9 @@ private struct ExactPrefixProofRuntime {
         case .postWarmupControl, .postWarmupMiss, .postWarmupHit:
             group = "warmup"
         }
-        return sha256Hex(Data(
-            "fast-mlx-exact-prefix-proof-content-v1\n\(command.plan.workloadNonce)\n\(group)\n".utf8))
+        return exactPrefixProofPromptContentSHA256(
+            workloadNonce: command.plan.workloadNonce,
+            group: group)
     }
 
     private func outputSHA256(_ tokens: [Int]) -> String {
@@ -666,8 +712,8 @@ private func exactPrefixProofRequestContext(
     try ExactPrefixRequestContext(
         isolationNamespaceSHA256: sha256Hex(Data(
             "fast-mlx-exact-prefix-proof-namespace-v1\n\(plan.workloadNonce)\n".utf8)),
-        promptTemplateSHA256: sha256Hex(Data(
-            "fast-mlx-exact-prefix-proof-template-v1\nfixed-ledger\n".utf8)),
+        promptTemplateSHA256:
+            exactPrefixProofPromptTemplateSHA256(),
         toolsSHA256: sha256Hex(Data(
             "fast-mlx-exact-prefix-proof-tools-v1\nnone\n".utf8)))
 }

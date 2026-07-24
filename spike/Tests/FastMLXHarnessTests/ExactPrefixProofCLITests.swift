@@ -64,6 +64,56 @@ final class ExactPrefixProofCLITests: XCTestCase {
             .fp16)
     }
 
+    func testProofPromptEndsEveryRepeatedBlockWithAnExplicitResponseCue() {
+        let text = exactPrefixProofPromptText(
+            workloadNonce: "nonce",
+            label: "A",
+            repeatCount: 2)
+
+        XCTAssertEqual(
+            text,
+            """
+            exact-prefix-proof nonce A: deterministic ledger row for cache admission and byte identity.
+            Continue the ledger by replying with the single lowercase word ready.
+            Response:
+            exact-prefix-proof nonce A: deterministic ledger row for cache admission and byte identity.
+            Continue the ledger by replying with the single lowercase word ready.
+            Response:
+            """)
+        XCTAssertEqual(
+            text.components(separatedBy: "Response:").count - 1,
+            2)
+        XCTAssertTrue(text.hasSuffix("Response:"))
+        XCTAssertEqual(
+            exactPrefixProofFormattingOptionsSHA256(),
+            digest(
+                """
+                fast-mlx-exact-prefix-proof-format-v2
+                explicit-response-cue
+
+                """))
+        XCTAssertEqual(
+            exactPrefixProofPromptTemplateSHA256(),
+            digest(
+                """
+                fast-mlx-exact-prefix-proof-template-v2
+                fixed-ledger-response
+
+                """))
+        XCTAssertEqual(
+            exactPrefixProofPromptContentSHA256(
+                workloadNonce: "nonce",
+                group: "A"),
+            digest(
+                """
+                fast-mlx-exact-prefix-proof-content-v2
+                explicit-response-cue
+                nonce
+                A
+
+                """))
+    }
+
     func testStrictCommandParserRejectsUnknownDuplicateAndIdentityDrift()
         throws
     {
