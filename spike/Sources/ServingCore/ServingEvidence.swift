@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 
 public struct ServingEvidence: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     public let request: Request
@@ -195,7 +195,8 @@ extension ServingEvidence {
     }
 
     public struct Response: Codable, Equatable, Sendable {
-        public let status: Int
+        public let status: Int?
+        public let completed: Bool
         public let durationMilliseconds: Double
         public let chunkCount: Int
         public let bodyBytes: Int
@@ -213,6 +214,7 @@ extension ServingEvidence {
             try ServingEvidence.validateNonNegative(body.count, field: "bodyBytes")
 
             self.status = status
+            self.completed = true
             self.durationMilliseconds = durationMilliseconds
             self.chunkCount = chunkCount
             self.bodyBytes = body.count
@@ -233,6 +235,34 @@ extension ServingEvidence {
             try ServingEvidence.validateSHA256Hex(bodySHA256, field: "bodySHA256")
 
             self.status = status
+            self.completed = true
+            self.durationMilliseconds = durationMilliseconds
+            self.chunkCount = chunkCount
+            self.bodyBytes = bodyBytes
+            self.bodySHA256 = bodySHA256
+        }
+
+        public init(
+            status: Int?,
+            completed: Bool,
+            durationMilliseconds: Double,
+            chunkCount: Int,
+            bodyBytes: Int,
+            bodySHA256: String
+        ) throws {
+            if let status {
+                try ServingEvidence.validateHTTPStatus(status)
+            }
+            guard !completed || status != nil else {
+                throw ValidationError.noncanonicalField("response.status")
+            }
+            try ServingEvidence.validateFiniteNonNegative(durationMilliseconds, field: "durationMilliseconds")
+            try ServingEvidence.validateNonNegative(chunkCount, field: "chunkCount")
+            try ServingEvidence.validateNonNegative(bodyBytes, field: "bodyBytes")
+            try ServingEvidence.validateSHA256Hex(bodySHA256, field: "bodySHA256")
+
+            self.status = status
+            self.completed = completed
             self.durationMilliseconds = durationMilliseconds
             self.chunkCount = chunkCount
             self.bodyBytes = bodyBytes
@@ -241,6 +271,7 @@ extension ServingEvidence {
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
             case status
+            case completed
             case durationMilliseconds = "duration_milliseconds"
             case chunkCount = "chunk_count"
             case bodyBytes = "body_bytes"
@@ -253,7 +284,12 @@ extension ServingEvidence {
                 allowed: CodingKeys.allCases.map(\.rawValue))
             let container = try decoder.container(keyedBy: CodingKeys.self)
             try self.init(
-                status: container.decode(Int.self, forKey: .status),
+                status: ServingEvidence.decodeCanonicalOptional(
+                    Int.self,
+                    from: container,
+                    forKey: .status,
+                    field: "response.status"),
+                completed: container.decode(Bool.self, forKey: .completed),
                 durationMilliseconds: container.decode(Double.self, forKey: .durationMilliseconds),
                 chunkCount: container.decode(Int.self, forKey: .chunkCount),
                 bodyBytes: container.decode(Int.self, forKey: .bodyBytes),
@@ -401,18 +437,57 @@ extension ServingEvidence {
     public struct ResourceFacts: Codable, Equatable, Sendable {
         public let admission: Admission
         public let queueDepth: Int?
+        public let before: ResourceSnapshot?
+        public let active: ResourceSnapshot?
+        public let terminal: ResourceSnapshot?
+        public let failedSnapshots: [ResourceSnapshotStage]
 
-        public init(admission: Admission, queueDepth: Int? = nil) throws {
+        public init(
+            admission: Admission,
+            queueDepth: Int? = nil,
+            before: ResourceSnapshot? = nil,
+            active: ResourceSnapshot? = nil,
+            terminal: ResourceSnapshot? = nil,
+            failedSnapshots: [ResourceSnapshotStage] = []
+        ) throws {
             if let queueDepth {
                 try ServingEvidence.validateNonNegative(queueDepth, field: "queueDepth")
             }
+            guard failedSnapshots == failedSnapshots.sorted(by: { $0.order < $1.order }),
+                Set(failedSnapshots).count == failedSnapshots.count
+            else {
+                throw ValidationError.noncanonicalField(
+                    "resources.failedSnapshots")
+            }
+            var successfulStages: Set<ResourceSnapshotStage> = []
+            if before != nil {
+                successfulStages.insert(.before)
+            }
+            if active != nil {
+                successfulStages.insert(.active)
+            }
+            if terminal != nil {
+                successfulStages.insert(.terminal)
+            }
+            guard successfulStages.isDisjoint(with: failedSnapshots) else {
+                throw ValidationError.noncanonicalField(
+                    "resources.failedSnapshots")
+            }
             self.admission = admission
             self.queueDepth = queueDepth
+            self.before = before
+            self.active = active
+            self.terminal = terminal
+            self.failedSnapshots = failedSnapshots
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
             case admission
             case queueDepth = "queue_depth"
+            case before
+            case active
+            case terminal
+            case failedSnapshots = "failed_snapshots"
         }
 
         public init(from decoder: Decoder) throws {
@@ -426,12 +501,117 @@ extension ServingEvidence {
                     Int.self,
                     from: container,
                     forKey: .queueDepth,
-                    field: "queueDepth"))
+                    field: "queueDepth"),
+                before: ServingEvidence.decodeCanonicalOptional(
+                    ResourceSnapshot.self,
+                    from: container,
+                    forKey: .before,
+                    field: "resources.before"),
+                active: ServingEvidence.decodeCanonicalOptional(
+                    ResourceSnapshot.self,
+                    from: container,
+                    forKey: .active,
+                    field: "resources.active"),
+                terminal: ServingEvidence.decodeCanonicalOptional(
+                    ResourceSnapshot.self,
+                    from: container,
+                    forKey: .terminal,
+                    field: "resources.terminal"),
+                failedSnapshots: ServingEvidence.decodeCanonicalOptional(
+                    [ResourceSnapshotStage].self,
+                    from: container,
+                    forKey: .failedSnapshots,
+                    field: "resources.failedSnapshots")
+                    ?? [])
+        }
+    }
+
+    public enum ResourceSnapshotStage: String, Codable, Equatable, Hashable, Sendable {
+        case before
+        case active
+        case terminal
+
+        fileprivate var order: Int {
+            switch self {
+            case .before:
+                0
+            case .active:
+                1
+            case .terminal:
+                2
+            }
+        }
+    }
+
+    public struct ResourceSnapshot: Codable, Equatable, Sendable {
+        public let activeRequests: Int
+        public let coordinatorSlots: Int
+        public let reservedKVBytes: Int
+        public let maxReservedKVBytes: Int
+        public let mlxActiveBytes: Int
+        public let mlxCacheBytes: Int
+        public let mlxPeakBytes: Int
+
+        public init(
+            activeRequests: Int,
+            coordinatorSlots: Int,
+            reservedKVBytes: Int,
+            maxReservedKVBytes: Int,
+            mlxActiveBytes: Int,
+            mlxCacheBytes: Int,
+            mlxPeakBytes: Int
+        ) throws {
+            let values = [
+                ("activeRequests", activeRequests),
+                ("coordinatorSlots", coordinatorSlots),
+                ("reservedKVBytes", reservedKVBytes),
+                ("maxReservedKVBytes", maxReservedKVBytes),
+                ("mlxActiveBytes", mlxActiveBytes),
+                ("mlxCacheBytes", mlxCacheBytes),
+                ("mlxPeakBytes", mlxPeakBytes),
+            ]
+            for (field, value) in values {
+                try ServingEvidence.validateNonNegative(value, field: field)
+            }
+            self.activeRequests = activeRequests
+            self.coordinatorSlots = coordinatorSlots
+            self.reservedKVBytes = reservedKVBytes
+            self.maxReservedKVBytes = maxReservedKVBytes
+            self.mlxActiveBytes = mlxActiveBytes
+            self.mlxCacheBytes = mlxCacheBytes
+            self.mlxPeakBytes = mlxPeakBytes
+        }
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case activeRequests = "active_requests"
+            case coordinatorSlots = "coordinator_slots"
+            case reservedKVBytes = "reserved_kv_bytes"
+            case maxReservedKVBytes = "max_reserved_kv_bytes"
+            case mlxActiveBytes = "mlx_active_bytes"
+            case mlxCacheBytes = "mlx_cache_bytes"
+            case mlxPeakBytes = "mlx_peak_bytes"
+        }
+
+        public init(from decoder: Decoder) throws {
+            try ServingEvidence.rejectUnknownKeys(
+                from: decoder,
+                allowed: CodingKeys.allCases.map(\.rawValue))
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            try self.init(
+                activeRequests: container.decode(Int.self, forKey: .activeRequests),
+                coordinatorSlots: container.decode(Int.self, forKey: .coordinatorSlots),
+                reservedKVBytes: container.decode(Int.self, forKey: .reservedKVBytes),
+                maxReservedKVBytes: container.decode(Int.self, forKey: .maxReservedKVBytes),
+                mlxActiveBytes: container.decode(Int.self, forKey: .mlxActiveBytes),
+                mlxCacheBytes: container.decode(Int.self, forKey: .mlxCacheBytes),
+                mlxPeakBytes: container.decode(Int.self, forKey: .mlxPeakBytes))
         }
     }
 
     public enum Admission: String, Codable, Equatable, Sendable {
         case accepted
+        case notAdmitted = "not_admitted"
+        case backendFailure = "backend_failure"
         case queueFull = "queue_full"
         case capacityExceeded = "capacity_exceeded"
         case requestTooLarge = "request_too_large"

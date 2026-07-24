@@ -20,12 +20,33 @@ struct FastMLXServe {
             $0.isEmpty ? nil : $0
         }
         let prepared = try await prepareBackend(arguments)
+        let evidenceSink: ServingEvidenceJSONLSink?
+        do {
+            evidenceSink = try arguments.evidencePath.map {
+                try ServingEvidenceJSONLSink(path: $0.path)
+            }
+        } catch {
+            await prepared.backend.shutdown()
+            throw error
+        }
+        let evidenceConfiguration = evidenceSink.map { sink in
+            ServingHTTPEvidenceConfiguration(
+                snapshot: prepared.evidenceSnapshot,
+                record: { evidence in
+                    try await sink.record(evidence)
+                },
+                reportFailure: { message in
+                    FileHandle.standardError.write(
+                        Data("fastmlx-serve evidence_failure=\(message)\n".utf8))
+                })
+        }
         let configuration = ServingHTTPConfiguration(
             launchedModel: arguments.model,
             requestLimits: .productionDefault,
             requiredBearerToken: apiKey,
             maximumNonStreamingResponseBytes: 1_048_576,
-            backpressureStallTimeout: .seconds(5))
+            backpressureStallTimeout: .seconds(5),
+            evidence: evidenceConfiguration)
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(
@@ -33,6 +54,7 @@ struct FastMLXServe {
                 configuration: configuration,
                 backend: prepared.backend)
         } catch {
+            try? await evidenceSink?.finish()
             await prepared.backend.shutdown()
             throw error
         }
@@ -41,7 +63,13 @@ struct FastMLXServe {
         print("fastmlx-serve ready=true; press Control-C to stop.")
 
         await waitForShutdownSignal()
-        try await server.shutdown(gracePeriod: .seconds(5))
+        do {
+            try await server.shutdown(gracePeriod: .seconds(5))
+            try await evidenceSink?.finish()
+        } catch {
+            try? await evidenceSink?.finish()
+            throw error
+        }
         print("fastmlx-serve shutdown=complete")
     }
 }
@@ -53,6 +81,8 @@ private enum PreparedServingStartupReport {
 
 private struct PreparedServingBackend {
     let backend: any ServingGenerationBackend
+    let evidenceSnapshot:
+        ServingHTTPEvidenceConfiguration.SnapshotProvider?
     let mode: String
     let launchedModel: String
     let startupReport: PreparedServingStartupReport?
@@ -131,6 +161,7 @@ private func prepareBackend(
     case .scripted:
         return PreparedServingBackend(
             backend: ScriptedTransportBackend(),
+            evidenceSnapshot: nil,
             mode: "scripted",
             launchedModel: arguments.model,
             startupReport: nil)
@@ -154,6 +185,7 @@ private func prepareBackend(
                         maxBytes: 32 * 1_024))))
         return PreparedServingBackend(
             backend: loaded.backend,
+            evidenceSnapshot: nil,
             mode: "scalar",
             launchedModel: arguments.model,
             startupReport: .scalar(loaded.startupReport))
@@ -184,6 +216,17 @@ private func prepareBackend(
                         maxBytes: 32 * 1_024))))
         return PreparedServingBackend(
             backend: loaded.backend,
+            evidenceSnapshot: {
+                let snapshot = await loaded.backend.snapshot()
+                return try ServingEvidence.ResourceSnapshot(
+                    activeRequests: snapshot.activeRequests,
+                    coordinatorSlots: snapshot.coordinatorSlots,
+                    reservedKVBytes: snapshot.reservedKVBytes,
+                    maxReservedKVBytes: snapshot.maxReservedKVBytes,
+                    mlxActiveBytes: snapshot.mlxActiveBytes,
+                    mlxCacheBytes: snapshot.mlxCacheBytes,
+                    mlxPeakBytes: snapshot.mlxPeakBytes)
+            },
             mode: "continuous-batch-no-spec",
             launchedModel: arguments.model,
             startupReport: .continuous(loaded.startupReport))

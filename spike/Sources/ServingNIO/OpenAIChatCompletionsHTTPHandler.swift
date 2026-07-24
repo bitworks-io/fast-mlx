@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import NIOCore
 import NIOHTTP1
@@ -153,6 +154,37 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        let requestEvidence: ServingEvidence.Request?
+        do {
+            requestEvidence = try configuration.evidence.map { _ in
+                try ServingEvidence.Request(
+                    method: head.method.rawValue,
+                    path: head.uri,
+                    headers: head.headers.map {
+                        ServingEvidence.Header(
+                            name: $0.name,
+                            value: $0.value)
+                    },
+                    body: bodyData,
+                    stream: request.stream,
+                    messageCount: request.messages.count,
+                    maxCompletionTokens: request.maxCompletionTokens)
+            }
+        } catch {
+            configuration.evidence?.reportFailure(
+                "serving evidence request construction failed")
+            context.close(promise: nil)
+            return
+        }
+        if let evidence = configuration.evidence,
+            !evidence.tracker.begin()
+        {
+            evidence.reportFailure(
+                "serving evidence shutdown rejected request")
+            context.close(promise: nil)
+            return
+        }
+
         let control = ServingTransportRequestControl()
         let writabilityGate = ServingChannelWritabilityGate(
             initiallyWritable: context.channel.isWritable)
@@ -168,7 +200,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             backend: backend,
             channel: channel,
             control: control,
-            writabilityGate: writabilityGate)
+            writabilityGate: writabilityGate,
+            requestEvidence: requestEvidence)
     }
 
     private func validateHead(
@@ -281,10 +314,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         }
         let task = activeTask
         control.markTerminal()
-        Task {
-            await control.cancellation.cancel(reason)
-            task?.cancel()
-        }
+        _ = control.cancellation.record(reason)
+        task?.cancel()
     }
 }
 
@@ -304,17 +335,26 @@ private extension OpenAIChatCompletionsHTTPHandler {
         backend: any ServingGenerationBackend,
         channel: any Channel,
         control: ServingTransportRequestControl,
-        writabilityGate: ServingChannelWritabilityGate
+        writabilityGate: ServingChannelWritabilityGate,
+        requestEvidence: ServingEvidence.Request?
     ) -> Task<Void, Never> {
-        Task.detached {
-            await runGeneration(
-                request: request,
-                keepAlive: keepAlive,
-                configuration: configuration,
-                backend: backend,
-                channel: channel,
-                control: control,
-                writabilityGate: writabilityGate)
+        let responseAccumulator = requestEvidence.map { _ in
+            ServingResponseEvidenceAccumulator()
+        }
+        return Task.detached {
+            await ServingTransportEvidenceTaskContext.$responseAccumulator
+                .withValue(responseAccumulator) {
+                    await runGeneration(
+                        request: request,
+                        keepAlive: keepAlive,
+                        configuration: configuration,
+                        backend: backend,
+                        channel: channel,
+                        control: control,
+                        writabilityGate: writabilityGate,
+                        requestEvidence: requestEvidence,
+                        responseAccumulator: responseAccumulator)
+                }
         }
     }
 
@@ -325,12 +365,30 @@ private extension OpenAIChatCompletionsHTTPHandler {
         backend: any ServingGenerationBackend,
         channel: any Channel,
         control: ServingTransportRequestControl,
-        writabilityGate: ServingChannelWritabilityGate
+        writabilityGate: ServingChannelWritabilityGate,
+        requestEvidence: ServingEvidence.Request?,
+        responseAccumulator: ServingResponseEvidenceAccumulator?
     ) async {
         var handle: ServingGenerationHandle?
         var responseStarted = false
+        var admission = ServingEvidence.Admission.notAdmitted
+        var route: ServingEvidence.RouteFacts?
+        var beforeResources: ServingEvidence.ResourceSnapshot?
+        var activeResources: ServingEvidence.ResourceSnapshot?
+        var failedSnapshots: [ServingEvidence.ResourceSnapshotStage] = []
         defer {
             control.markTerminal()
+            configuration.evidence?.tracker.end()
+        }
+
+        if let snapshot = configuration.evidence?.snapshot {
+            do {
+                beforeResources = try await snapshot()
+            } catch {
+                failedSnapshots.append(.before)
+                configuration.evidence?.reportFailure(
+                    "serving evidence pre-admission snapshot failed")
+            }
         }
 
         do {
@@ -345,6 +403,17 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await started.lease.activate()
             else {
                 throw RunError.invalidBackendHandle
+            }
+            admission = .accepted
+            route = try ServingEvidence.RouteFacts(kind: started.route)
+            if let snapshot = configuration.evidence?.snapshot {
+                do {
+                    activeResources = try await snapshot()
+                } catch {
+                    failedSnapshots.append(.active)
+                    configuration.evidence?.reportFailure(
+                        "serving evidence active snapshot failed")
+                }
             }
 
             if request.stream {
@@ -402,11 +471,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await close(channel)
             }
         } catch let admissionError as ServingBackendAdmissionError {
-            await writeAdmissionFailure(
+            admission = servingEvidenceAdmission(for: admissionError.reason)
+            if let writeCancellation = await writeAdmissionFailure(
                 admissionError,
                 keepAlive: keepAlive,
                 channel: channel,
                 timeout: configuration.backpressureStallTimeout)
+            {
+                await control.cancellation.cancel(writeCancellation)
+            }
         } catch is CancellationError {
             await control.cancellation.cancel(.clientDisconnected)
             await close(channel)
@@ -422,11 +495,14 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await close(channel)
             case .backend(let message):
                 _ = await handle?.lease.fail(message)
-                await writeFailureIfPossible(
+                if let writeCancellation = await writeFailureIfPossible(
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
+                {
+                    await control.cancellation.cancel(writeCancellation)
+                }
             }
         } catch let runError as RunError {
             switch runError {
@@ -434,30 +510,91 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await control.cancellation.cancel(.backpressureTimeout)
                 await close(channel)
             case .responseLimitExceeded:
-                await control.cancellation.cancel(.responseLimitExceeded)
-                await writeFailureIfPossible(
+                let writeCancellation = await writeFailureIfPossible(
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
+                await control.cancellation.cancel(
+                    writeCancellation ?? .responseLimitExceeded)
             case .writeFailure:
                 await control.cancellation.cancel(.clientDisconnected)
                 await close(channel)
-            case .invalidBackendHandle, .missingCompletion:
+            case .invalidBackendHandle:
+                admission = .backendFailure
                 _ = await handle?.lease.fail("invalid generation contract")
-                await writeFailureIfPossible(
+                if let writeCancellation = await writeFailureIfPossible(
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
+                {
+                    await control.cancellation.cancel(writeCancellation)
+                }
+            case .missingCompletion:
+                _ = await handle?.lease.fail("invalid generation contract")
+                if let writeCancellation = await writeFailureIfPossible(
+                    responseStarted: responseStarted,
+                    keepAlive: keepAlive,
+                    channel: channel,
+                    timeout: configuration.backpressureStallTimeout)
+                {
+                    await control.cancellation.cancel(writeCancellation)
+                }
             }
         } catch {
+            if handle == nil {
+                admission = .backendFailure
+            }
             _ = await handle?.lease.fail("generation failed")
-            await writeFailureIfPossible(
+            if let writeCancellation = await writeFailureIfPossible(
                 responseStarted: responseStarted,
                 keepAlive: keepAlive,
                 channel: channel,
                 timeout: configuration.backpressureStallTimeout)
+            {
+                await control.cancellation.cancel(writeCancellation)
+            }
+        }
+
+        await control.cancellation.waitForPropagation()
+        guard let evidenceConfiguration = configuration.evidence,
+            let requestEvidence,
+            let responseAccumulator
+        else {
+            return
+        }
+        var terminalResources: ServingEvidence.ResourceSnapshot?
+        if let snapshot = evidenceConfiguration.snapshot {
+            do {
+                terminalResources = try await snapshot()
+            } catch {
+                failedSnapshots.append(.terminal)
+                evidenceConfiguration.reportFailure(
+                    "serving evidence terminal snapshot failed")
+            }
+        }
+        do {
+            let cancellationReason = control.cancellation.reason
+            let evidence = try ServingEvidence(
+                request: requestEvidence,
+                response: try await responseAccumulator.response(),
+                route: route,
+                cancellation: try ServingEvidence.CancellationFacts(
+                    cancelled: cancellationReason != nil,
+                    reason: cancellationReason),
+                resources: try ServingEvidence.ResourceFacts(
+                    admission: admission,
+                    before: beforeResources,
+                    active: activeResources,
+                    terminal: terminalResources,
+                    failedSnapshots: failedSnapshots))
+            try await evidenceConfiguration.record(evidence)
+        } catch {
+            evidenceConfiguration.tracker.failClosed()
+            evidenceConfiguration.reportFailure(
+                "serving evidence terminal persistence failed")
+            await close(channel)
         }
     }
 
@@ -647,6 +784,30 @@ private extension OpenAIChatCompletionsHTTPHandler {
         channel: any Channel,
         timeout: Duration
     ) async throws {
+        let responseAccumulator =
+            ServingTransportEvidenceTaskContext.responseAccumulator
+        let evidencePart: ServingWrittenResponsePart?
+        if responseAccumulator != nil {
+            switch part {
+            case .head(let head):
+                evidencePart = .head(status: Int(head.status.code))
+            case .body(.byteBuffer(let buffer)):
+                guard let bytes = buffer.getBytes(
+                    at: buffer.readerIndex,
+                    length: buffer.readableBytes)
+                else {
+                    throw RunError.writeFailure
+                }
+                evidencePart = .body(Data(bytes))
+            case .body(.fileRegion):
+                throw RunError.writeFailure
+            case .end:
+                evidencePart = .end
+            }
+        } else {
+            evidencePart = nil
+        }
+
         let race = ServingWriteCompletionRace()
         let result = channel.eventLoop.makePromise(of: Void.self)
         channel.writeAndFlush(part).whenComplete { writeResult in
@@ -666,6 +827,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         }
         do {
             try await result.futureResult.get()
+            if let evidencePart {
+                try await responseAccumulator?.record(evidencePart)
+            }
         } catch let error as RunError {
             throw error
         } catch {
@@ -678,7 +842,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         keepAlive: Bool,
         channel: any Channel,
         timeout: Duration
-    ) async {
+    ) async -> ServingCancellationReason? {
         let error = OpenAIErrorEnvelope(
             error: OpenAIServingError.server(
                 "Generation failed",
@@ -713,8 +877,16 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     await close(channel)
                 }
             }
+            return nil
+        } catch RunError.backpressureTimeout {
+            await close(channel)
+            return .backpressureTimeout
+        } catch RunError.writeFailure {
+            await close(channel)
+            return .clientDisconnected
         } catch {
             await close(channel)
+            return nil
         }
     }
 
@@ -723,7 +895,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         keepAlive: Bool,
         channel: any Channel,
         timeout: Duration
-    ) async {
+    ) async -> ServingCancellationReason? {
         let payload: OpenAIErrorPayload
         let status: HTTPResponseStatus
         switch admissionError.reason {
@@ -773,8 +945,16 @@ private extension OpenAIChatCompletionsHTTPHandler {
             if !keepAlive {
                 await close(channel)
             }
+            return nil
+        } catch RunError.backpressureTimeout {
+            await close(channel)
+            return .backpressureTimeout
+        } catch RunError.writeFailure {
+            await close(channel)
+            return .clientDisconnected
         } catch {
             await close(channel)
+            return nil
         }
     }
 
@@ -810,24 +990,150 @@ private final class ServingWriteCompletionRace: Sendable {
     }
 }
 
-private actor ServingTransportCancellationContext {
-    private var cancellationReason: ServingCancellationReason?
-    private var lease: ServingRequestLease?
+private final class ServingTransportCancellationContext: Sendable {
+    private struct State: Sendable {
+        var cancellationReason: ServingCancellationReason?
+        var lease: ServingRequestLease?
+        var propagationTask: Task<Void, Never>?
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     func attach(_ lease: ServingRequestLease) async {
-        if let cancellationReason {
-            _ = await lease.cancel(cancellationReason)
-            return
+        let propagationTask = state.withLock {
+            state -> Task<Void, Never>? in
+            if let cancellationReason = state.cancellationReason {
+                let task = Task {
+                    _ = await lease.cancel(cancellationReason)
+                }
+                state.propagationTask = task
+                return task
+            }
+            state.lease = lease
+            return nil
         }
-        self.lease = lease
+        await propagationTask?.value
     }
 
     func cancel(_ reason: ServingCancellationReason) async {
-        guard cancellationReason == nil else {
-            return
+        let propagationTask = state.withLock {
+            state -> Task<Void, Never>? in
+            if state.cancellationReason != nil {
+                return state.propagationTask
+            }
+            state.cancellationReason = reason
+            guard let lease = state.lease else {
+                return nil
+            }
+            state.lease = nil
+            let task = Task {
+                _ = await lease.cancel(reason)
+            }
+            state.propagationTask = task
+            return task
         }
-        cancellationReason = reason
-        _ = await lease?.cancel(reason)
+        await propagationTask?.value
+    }
+
+    func record(_ reason: ServingCancellationReason) -> Bool {
+        state.withLock { state in
+            guard state.cancellationReason == nil else {
+                return false
+            }
+            state.cancellationReason = reason
+            if let lease = state.lease {
+                state.lease = nil
+                state.propagationTask = Task {
+                    _ = await lease.cancel(reason)
+                }
+            }
+            return true
+        }
+    }
+
+    func waitForPropagation() async {
+        let propagationTask = state.withLock { $0.propagationTask }
+        await propagationTask?.value
+    }
+
+    var reason: ServingCancellationReason? {
+        state.withLock { $0.cancellationReason }
+    }
+}
+
+private enum ServingTransportEvidenceTaskContext {
+    @TaskLocal static var responseAccumulator:
+        ServingResponseEvidenceAccumulator?
+}
+
+private enum ServingWrittenResponsePart: Sendable {
+    case head(status: Int)
+    case body(Data)
+    case end
+}
+
+private actor ServingResponseEvidenceAccumulator {
+    private let clock = ContinuousClock()
+    private let startedAt: ContinuousClock.Instant
+    private var status: Int?
+    private var completed = false
+    private var terminalAt: ContinuousClock.Instant?
+    private var chunkCount = 0
+    private var bodyBytes = 0
+    private var bodyHasher = CryptoKit.SHA256()
+    private var finalized = false
+
+    init() {
+        startedAt = clock.now
+    }
+
+    func record(_ part: ServingWrittenResponsePart) throws {
+        guard !finalized, !completed else {
+            throw OpenAIChatCompletionsHTTPHandler.RunError.writeFailure
+        }
+        switch part {
+        case .head(let status):
+            guard self.status == nil else {
+                throw OpenAIChatCompletionsHTTPHandler.RunError.writeFailure
+            }
+            self.status = status
+        case .body(let data):
+            guard status != nil else {
+                throw OpenAIChatCompletionsHTTPHandler.RunError.writeFailure
+            }
+            chunkCount += 1
+            bodyBytes += data.count
+            bodyHasher.update(data: data)
+        case .end:
+            guard status != nil else {
+                throw OpenAIChatCompletionsHTTPHandler.RunError.writeFailure
+            }
+            completed = true
+            terminalAt = clock.now
+        }
+    }
+
+    func response() throws -> ServingEvidence.Response {
+        guard !finalized else {
+            throw OpenAIChatCompletionsHTTPHandler.RunError.writeFailure
+        }
+        finalized = true
+        let finishedAt = terminalAt ?? clock.now
+        let duration = startedAt.duration(to: finishedAt)
+        let components = duration.components
+        let durationMilliseconds =
+            Double(components.seconds) * 1_000
+            + Double(components.attoseconds) / 1_000_000_000_000_000
+        let digest = bodyHasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return try ServingEvidence.Response(
+            status: status,
+            completed: completed,
+            durationMilliseconds: durationMilliseconds,
+            chunkCount: chunkCount,
+            bodyBytes: bodyBytes,
+            bodySHA256: digest)
     }
 }
 
@@ -847,6 +1153,19 @@ private func bearerToken(from authorization: String) -> String? {
         return nil
     }
     return String(parts[1])
+}
+
+private func servingEvidenceAdmission(
+    for reason: ServingBackendAdmissionError.Reason
+) -> ServingEvidence.Admission {
+    switch reason {
+    case .queueFull:
+        .queueFull
+    case .capacityExceeded:
+        .capacityExceeded
+    case .requestTooLarge:
+        .requestTooLarge
+    }
 }
 
 private func constantTimeEqual(_ lhs: String, _ rhs: String) -> Bool {

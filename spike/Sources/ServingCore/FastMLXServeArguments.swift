@@ -26,6 +26,7 @@ public enum FastMLXServeArgumentError:
     case missingRequiredOption(String)
     case invalidModelIdentifier
     case modelPathMustBeAbsolute
+    case evidencePathMustBeAbsolute
     case cacheLimitExceedsMemoryLimit
     case reservedKVLimitExceedsMemoryLimit
     case optionRequiresContinuousBatchMode(String)
@@ -52,6 +53,8 @@ public enum FastMLXServeArgumentError:
             "--model must be a non-empty identifier"
         case .modelPathMustBeAbsolute:
             "--model-path must be an absolute local path"
+        case .evidencePathMustBeAbsolute:
+            "--evidence-path must be an absolute local path"
         case .cacheLimitExceedsMemoryLimit:
             "--cache-limit-bytes cannot exceed --memory-limit-bytes"
         case .reservedKVLimitExceedsMemoryLimit:
@@ -70,7 +73,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             --model-path PATH --model MODEL
             --memory-limit-bytes N --cache-limit-bytes N
             [--max-reserved-kv-bytes N]
-            [--host HOST] [--port PORT]
+            [--host HOST] [--port PORT] [--evidence-path PATH]
 
           --scripted                  Transport-only backend; no model is loaded.
           --continuous-batch-no-spec  Explicit dense continuous-batch route.
@@ -81,6 +84,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
           --max-reserved-kv-bytes N   Required continuous-route aggregate KV cap.
           --host HOST                 Bind host (default: 127.0.0.1).
           --port PORT                 Bind port (default: 8080; 0 is ephemeral).
+          --evidence-path PATH        Fresh append-only canonical evidence output.
           --help                      Show this help.
 
         Set FASTMLX_API_KEY to require Bearer authentication. A non-loopback host
@@ -91,6 +95,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     public let host: String
     public let port: Int
     public let model: String
+    public let evidencePath: URL?
     public let showHelp: Bool
 
     private init(
@@ -98,12 +103,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         host: String,
         port: Int,
         model: String,
+        evidencePath: URL?,
         showHelp: Bool
     ) {
         self.backend = backend
         self.host = host
         self.port = port
         self.model = model
+        self.evidencePath = evidencePath
         self.showHelp = showHelp
     }
 
@@ -122,6 +129,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var memoryLimitBytes: Int?
         var cacheLimitBytes: Int?
         var maxReservedKVBytes: Int?
+        var evidencePath: URL?
 
         var index = 0
         while index < arguments.count {
@@ -160,6 +168,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 index += 1
                 modelPath = try value(
                     at: index, in: arguments, for: argument)
+            case "--evidence-path":
+                index += 1
+                let path = try value(
+                    at: index, in: arguments, for: argument)
+                guard path.hasPrefix("/") else {
+                    throw FastMLXServeArgumentError
+                        .evidencePathMustBeAbsolute
+                }
+                evidencePath = URL(fileURLWithPath: path)
             case "--memory-limit-bytes":
                 index += 1
                 memoryLimitBytes = try positiveInteger(
@@ -187,6 +204,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 host: host,
                 port: port,
                 model: model ?? "fastmlx-scripted",
+                evidencePath: evidencePath,
                 showHelp: true)
         }
 
@@ -204,6 +222,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 host: host,
                 port: port,
                 model: launchedModel,
+                evidencePath: evidencePath,
                 showHelp: false)
         }
 
@@ -269,6 +288,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             host: host,
             port: port,
             model: launchedModel,
+            evidencePath: evidencePath,
             showHelp: false)
     }
 
@@ -281,6 +301,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--port",
         "--model",
         "--model-path",
+        "--evidence-path",
         "--memory-limit-bytes",
         "--cache-limit-bytes",
         "--max-reserved-kv-bytes",

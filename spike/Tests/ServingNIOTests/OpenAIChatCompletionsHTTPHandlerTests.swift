@@ -9,6 +9,295 @@ import XCTest
 @testable import ServingNIO
 
 final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
+    func testSuccessfulRequestRecordsExactlyOnePromptFreeOnWireEvidence() async throws {
+        let promptSentinel = "PROMPT-SENTINEL-handler"
+        let apiKeySentinel = "sk-API-KEY-SENTINEL-handler"
+        let generatedSentinel = "GENERATED-SENTINEL-handler"
+        let backend = ScriptedBackend(scripts: [
+            .completed(
+                text: [generatedSentinel],
+                promptTokens: 1,
+                completionTokens: 1)
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let snapshots = ServingSnapshotSequence()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { try await snapshots.next() },
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { message in
+                    Task { await recorder.recordFailure(message) }
+                }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"\(promptSentinel)"}],"max_completion_tokens":8,"temperature":0,"stream":false}
+        """
+
+        try await writeRequest(
+            channel,
+            body: body,
+            authorization: "Bearer \(apiKeySentinel)")
+        let response = try await collectResponse(from: channel)
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        let canonical = try evidence.canonicalJSONData()
+        let json = try XCTUnwrap(String(data: canonical, encoding: .utf8))
+        XCTAssertEqual(evidence.response.status, 200)
+        XCTAssertTrue(evidence.response.completed)
+        XCTAssertEqual(evidence.response.chunkCount, 1)
+        XCTAssertEqual(evidence.response.bodyBytes, response.body.utf8.count)
+        XCTAssertEqual(
+            evidence.response.bodySHA256,
+            ServingEvidence.SHA256.hexDigest(of: Data(response.body.utf8)))
+        XCTAssertEqual(evidence.route?.kind, .continuousBatchNoSpec)
+        XCTAssertEqual(evidence.cancellation?.cancelled, false)
+        XCTAssertEqual(evidence.resources?.admission, .accepted)
+        XCTAssertEqual(evidence.resources?.before?.activeRequests, 0)
+        XCTAssertEqual(evidence.resources?.active?.activeRequests, 1)
+        XCTAssertEqual(evidence.resources?.terminal?.activeRequests, 0)
+        XCTAssertFalse(json.contains(promptSentinel))
+        XCTAssertFalse(json.contains(apiKeySentinel))
+        XCTAssertFalse(json.contains(generatedSentinel))
+        XCTAssertTrue(recorded.failures.isEmpty)
+
+        _ = try await channel.finish()
+    }
+
+    func testAdmissionFailureRecordsCompletedTypedEvidenceWithoutRoute() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .admissionRejected(.queueFull(retryAfterSeconds: 2))
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        _ = try await collectResponse(from: channel)
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertEqual(evidence.response.status, 429)
+        XCTAssertTrue(evidence.response.completed)
+        XCTAssertNil(evidence.route)
+        XCTAssertEqual(evidence.resources?.admission, .queueFull)
+        XCTAssertEqual(evidence.cancellation?.cancelled, false)
+
+        _ = try await channel.finish()
+    }
+
+    func testDisconnectRecordsIncompleteCancellationAndReleasedResources() async throws {
+        let backend = ScriptedBackend(scripts: [.held])
+        let recorder = ServingEvidenceRecorder()
+        let snapshots = ServingSnapshotSequence()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { try await snapshots.next() },
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().startCount == 1 }
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+        }
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertNil(evidence.response.status)
+        XCTAssertFalse(evidence.response.completed)
+        XCTAssertEqual(evidence.response.bodyBytes, 0)
+        XCTAssertEqual(evidence.response.chunkCount, 0)
+        XCTAssertEqual(evidence.route?.kind, .continuousBatchNoSpec)
+        XCTAssertEqual(evidence.cancellation?.reason, .clientDisconnected)
+        XCTAssertEqual(evidence.resources?.terminal?.activeRequests, 0)
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testQuiesceRecordsShutdownBeforeClosingConnection() async throws {
+        let backend = ScriptedBackend(scripts: [.held])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().startCount == 1 }
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireUserInboundEventTriggered(
+                ChannelShouldQuiesceEvent())
+        }
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertFalse(evidence.response.completed)
+        XCTAssertEqual(evidence.cancellation?.reason, .shutdown)
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testTerminalSnapshotWaitsForShutdownResourceRelease() async throws {
+        let cancellationGate = DelayedCancellationGate()
+        let backend = ScriptedBackend(scripts: [
+            .heldWithDelayedCancel(cancellationGate)
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: {
+                    let active = backend.snapshot().cancelCount == 0 ? 1 : 0
+                    return try ServingEvidence.ResourceSnapshot(
+                        activeRequests: active,
+                        coordinatorSlots: active,
+                        reservedKVBytes: active * 4_096,
+                        maxReservedKVBytes: 16_384,
+                        mlxActiveBytes: 8_192,
+                        mlxCacheBytes: 1_024,
+                        mlxPeakBytes: 16_384)
+                },
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().startCount == 1 }
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireUserInboundEventTriggered(
+                ChannelShouldQuiesceEvent())
+        }
+        await waitUntil { await cancellationGate.isWaiting }
+        try await Task.sleep(for: .milliseconds(20))
+        let evidenceBeforeRelease = await recorder.evidence
+        XCTAssertTrue(evidenceBeforeRelease.isEmpty)
+
+        await cancellationGate.release()
+        await waitUntil { await recorder.evidence.count == 1 }
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertEqual(evidence.cancellation?.reason, .shutdown)
+        XCTAssertEqual(evidence.resources?.terminal?.activeRequests, 0)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testRecorderFailureIsReportedAndConnectionFailsClosed() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["done"], promptTokens: 1, completionTokens: 1)
+        ])
+        let reporter = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { _ in
+                    throw ServingEvidenceRecorder.RecorderError.rejected
+                },
+                reportFailure: { message in
+                    Task { await reporter.recordFailure(message) }
+                }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+        await waitUntil { await reporter.failures.count == 1 }
+        await waitUntil { !channel.isActive }
+
+        XCTAssertEqual(response.head.status, .ok)
+        let reported = await reporter.snapshot()
+        XCTAssertEqual(
+            reported.failures,
+            ["serving evidence terminal persistence failed"])
+        XCTAssertFalse(configuration.evidence?.tracker.begin() ?? true)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testThrowingResourceSnapshotsRemainTypedInTerminalEvidence() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["done"], promptTokens: 1, completionTokens: 1)
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: {
+                    throw ServingSnapshotError.unavailable
+                },
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { message in
+                    Task { await recorder.recordFailure(message) }
+                }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        XCTAssertEqual(response.head.status, .ok)
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertEqual(
+            evidence.resources?.failedSnapshots,
+            [.before, .active, .terminal])
+        XCTAssertEqual(recorded.failures.count, 3)
+        XCTAssertTrue(evidence.response.completed)
+
+        _ = try await channel.finish()
+    }
+
+    func testAdmissionFailureWriteFailureRecordsClientDisconnect() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .admissionRejected(.queueFull(retryAfterSeconds: 1))
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await NIOAsyncTestingChannel { channel in
+            try channel.pipeline.syncOperations.addHandlers(
+                FailingOutboundHandler(),
+                OpenAIChatCompletionsHTTPHandler(
+                    configuration: configuration,
+                    backend: backend))
+        }
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await waitUntil { await recorder.evidence.count == 1 }
+
+        let recorded = await recorder.snapshot()
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertFalse(evidence.response.completed)
+        XCTAssertEqual(evidence.cancellation?.reason, .clientDisconnected)
+        XCTAssertEqual(evidence.resources?.admission, .queueFull)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
     func testNonStreamingRequestReturnsOpenAIJSONAndAllowsSequentialKeepAlive() async throws {
         let backend = ScriptedBackend(scripts: [
             .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2),
@@ -380,12 +669,19 @@ private func makeChannel(
 }
 
 private func defaultConfiguration() -> ServingHTTPConfiguration {
+    defaultConfiguration(evidence: nil)
+}
+
+private func defaultConfiguration(
+    evidence: ServingHTTPEvidenceConfiguration?
+) -> ServingHTTPConfiguration {
     ServingHTTPConfiguration(
         launchedModel: "qwen3-32b",
         requestLimits: .productionDefault,
         requiredBearerToken: nil,
         maximumNonStreamingResponseBytes: 1_048_576,
-        backpressureStallTimeout: .seconds(1))
+        backpressureStallTimeout: .seconds(1),
+        evidence: evidence)
 }
 
 private func requestBody(stream: Bool) -> String {
@@ -419,6 +715,56 @@ private func writeRequest(
     _ = try await channel.writeInbound(
         HTTPServerRequestPart.body(ByteBuffer(string: body)))
     _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
+private actor ServingEvidenceRecorder {
+    enum RecorderError: Error {
+        case rejected
+    }
+
+    private(set) var evidence: [ServingEvidence] = []
+    private(set) var failures: [String] = []
+
+    func record(_ value: ServingEvidence) throws {
+        evidence.append(value)
+    }
+
+    func recordFailure(_ message: String) {
+        failures.append(message)
+    }
+
+    func snapshot() -> (evidence: [ServingEvidence], failures: [String]) {
+        (evidence, failures)
+    }
+}
+
+private actor ServingSnapshotSequence {
+    private var index = 0
+
+    func next() throws -> ServingEvidence.ResourceSnapshot {
+        defer { index += 1 }
+        switch index {
+        case 0:
+            return try snapshot(activeRequests: 0)
+        case 1:
+            return try snapshot(activeRequests: 1)
+        default:
+            return try snapshot(activeRequests: 0)
+        }
+    }
+
+    private func snapshot(
+        activeRequests: Int
+    ) throws -> ServingEvidence.ResourceSnapshot {
+        try ServingEvidence.ResourceSnapshot(
+            activeRequests: activeRequests,
+            coordinatorSlots: activeRequests,
+            reservedKVBytes: activeRequests * 4_096,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 8_192 + activeRequests * 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 16_384)
+    }
 }
 
 private func collectResponse(
@@ -484,6 +830,7 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
         case cancelled(ServingCancellationReason)
         case admissionRejected(ServingBackendAdmissionError)
         case held
+        case heldWithDelayedCancel(DelayedCancellationGate)
     }
 
     private struct State: Sendable {
@@ -508,11 +855,21 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
         }
         let mailbox = BoundedDeltaMailbox(
             capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 1, maxBytes: 64))
-        let lease = ServingRequestLease(
-            id: ServingRequestID("request-\(sequence)"),
-            onCancel: { [self] in
-                state.withLock { $0.cancelCount += 1 }
-            })
+        let lease: ServingRequestLease
+        if case .heldWithDelayedCancel(let cancellationGate) = script {
+            lease = ServingRequestLease(
+                id: ServingRequestID("request-\(sequence)"),
+                onCancel: { [self] in
+                    await cancellationGate.wait()
+                    state.withLock { $0.cancelCount += 1 }
+                })
+        } else {
+            lease = ServingRequestLease(
+                id: ServingRequestID("request-\(sequence)"),
+                onCancel: { [self] in
+                    state.withLock { $0.cancelCount += 1 }
+                })
+        }
         state.withLock {
             $0.lastMailbox = mailbox
             $0.lastLease = lease
@@ -562,6 +919,27 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
                 lastLease: $0.lastLease)
         }
     }
+}
+
+private actor DelayedCancellationGate {
+    private(set) var isWaiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        isWaiting = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private enum ServingSnapshotError: Error {
+    case unavailable
 }
 
 private struct SyntheticWriteFailure: Error {}

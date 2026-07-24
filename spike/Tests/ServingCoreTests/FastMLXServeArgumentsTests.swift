@@ -10,7 +10,32 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertEqual(arguments.host, "127.0.0.1")
         XCTAssertEqual(arguments.port, 8_080)
         XCTAssertEqual(arguments.model, "fastmlx-scripted")
+        XCTAssertNil(arguments.evidencePath)
         XCTAssertFalse(arguments.showHelp)
+    }
+
+    func testEvidencePathIsExplicitAbsoluteAndFreshnessIsDeferredToStartup() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--evidence-path", "/tmp/fastmlx-serving-evidence.jsonl",
+        ])
+
+        XCTAssertEqual(
+            arguments.evidencePath,
+            URL(fileURLWithPath: "/tmp/fastmlx-serving-evidence.jsonl"))
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--evidence-path PATH"))
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--evidence-path", "relative/evidence.jsonl",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .evidencePathMustBeAbsolute)
+        }
     }
 
     func testScalarModeRequiresAndPreservesExplicitIdentityAndMemoryLimits() throws {

@@ -8,6 +8,71 @@ import XCTest
 @testable import ServingNIO
 
 final class ServingHTTPServerTests: XCTestCase {
+    func testEvidenceTrackerStopsNewRequestsAndDrainsRegisteredWork() async {
+        let configuration = ServingHTTPEvidenceConfiguration(
+            snapshot: nil,
+            record: { _ in },
+            reportFailure: { _ in })
+        let tracker = configuration.tracker
+        let clock = ContinuousClock()
+
+        XCTAssertTrue(tracker.begin())
+        tracker.stopAccepting()
+        XCTAssertFalse(tracker.begin())
+        let timedOut = await tracker.waitUntilIdle(
+            clock: clock,
+            deadline: clock.now.advanced(by: .milliseconds(5)))
+        XCTAssertFalse(timedOut)
+
+        tracker.end()
+        let drained = await tracker.waitUntilIdle(
+            clock: clock,
+            deadline: clock.now.advanced(by: .milliseconds(50)))
+        XCTAssertTrue(drained)
+    }
+
+    func testServerShutdownWaitsForTerminalEvidencePersistence() async throws {
+        let backend = SocketBackend(script: .completed)
+        let recorder = BlockingServingEvidenceRecorder()
+        let configuration = socketConfiguration(
+            requiredBearerToken: nil,
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in
+                    try await recorder.record(evidence)
+                },
+                reportFailure: { _ in }))
+        let server = try await ServingHTTPServer.start(
+            configuration: configuration,
+            backend: backend)
+        let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let client = try await ClientBootstrap(group: clientGroup)
+            .connect(to: server.localAddress)
+            .get()
+        try await sendRawStreamingRequest(on: client)
+        try await waitUntilSocketTest { await recorder.hasStarted }
+
+        let completion = ShutdownResultRecorder()
+        Task {
+            do {
+                try await server.shutdown(gracePeriod: .seconds(1))
+                await completion.finish(error: nil)
+            } catch {
+                await completion.finish(error: String(describing: error))
+            }
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let finishedBeforeRelease = await completion.isFinished
+        XCTAssertFalse(finishedBeforeRelease)
+
+        await recorder.release()
+        try await waitUntilSocketTest { await completion.isFinished }
+        let shutdownError = await completion.error
+        XCTAssertNil(shutdownError)
+        try? await client.close().get()
+        try await clientGroup.shutdownGracefully()
+    }
+
     func testRemoteBindRequiresAuthenticationBeforeOpeningListener() async throws {
         let backend = SocketBackend(script: .held)
         let configuration = socketConfiguration(requiredBearerToken: nil)
@@ -198,14 +263,16 @@ final class ServingHTTPServerTests: XCTestCase {
 
 private func socketConfiguration(
     requiredBearerToken: String?,
-    backpressureStallTimeout: Duration = .seconds(1)
+    backpressureStallTimeout: Duration = .seconds(1),
+    evidence: ServingHTTPEvidenceConfiguration? = nil
 ) -> ServingHTTPConfiguration {
     ServingHTTPConfiguration(
         launchedModel: "qwen3-32b",
         requestLimits: .productionDefault,
         requiredBearerToken: requiredBearerToken,
         maximumNonStreamingResponseBytes: 1_048_576,
-        backpressureStallTimeout: backpressureStallTimeout)
+        backpressureStallTimeout: backpressureStallTimeout,
+        evidence: evidence)
 }
 
 private func sendRawStreamingRequest(on channel: any Channel) async throws {
@@ -240,6 +307,7 @@ private func waitUntilSocketTest(
 
 private final class SocketBackend: ServingGenerationBackend, Sendable {
     enum Script: Sendable {
+        case completed
         case held
         case oneDeltaThenHold
         case unboundedLargeDeltas
@@ -286,6 +354,22 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
         }
 
         switch script {
+        case .completed:
+            Task { [mailbox] in
+                do {
+                    try await mailbox.send(.text("complete"))
+                    try await mailbox.send(
+                        .completion(
+                            ServingGenerationCompletion(
+                                finishReason: .stop,
+                                usage: OpenAIChatUsage(
+                                    promptTokens: 1,
+                                    completionTokens: 1))))
+                    await mailbox.finish()
+                } catch {
+                    // The lease state is the cancellation authority.
+                }
+            }
         case .held:
             break
         case .oneDeltaThenHold:
@@ -341,6 +425,33 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
             return nil
         }
         return await lease.state
+    }
+}
+
+private actor BlockingServingEvidenceRecorder {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var hasStarted = false
+
+    func record(_ evidence: ServingEvidence) async throws {
+        hasStarted = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor ShutdownResultRecorder {
+    private(set) var isFinished = false
+    private(set) var error: String?
+
+    func finish(error: String?) {
+        self.error = error
+        isFinished = true
     }
 }
 

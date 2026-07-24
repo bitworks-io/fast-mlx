@@ -234,6 +234,7 @@ final class ServingEvidenceTests: XCTestCase {
         let body = Data(generatedSentinel.utf8)
         let response = try ServingEvidence.Response(
             status: 200,
+            completed: true,
             durationMilliseconds: 7.5,
             chunkCount: 4,
             bodyBytes: body.count,
@@ -244,6 +245,117 @@ final class ServingEvidenceTests: XCTestCase {
         XCTAssertFalse(json.contains(generatedSentinel))
         XCTAssertTrue(json.contains(#""body_bytes":\#(body.count)"#))
         XCTAssertTrue(json.contains(#""body_sha256":"\#(body.sha256HexForTest())""#))
+    }
+
+    func testIncompleteResponseAndLifecycleSnapshotsRemainCanonicalAndPromptFree() throws {
+        let emptyDigest = Data().sha256HexForTest()
+        let before = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let active = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 1,
+            coordinatorSlots: 1,
+            reservedKVBytes: 2_048,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 6_144,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let terminal = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let evidence = try ServingEvidence(
+            request: ServingEvidence.Request(
+                method: "POST",
+                path: "/v1/chat/completions",
+                headers: [],
+                body: Data(#"{"messages":[{"content":"PROMPT-SENTINEL"}]}"#.utf8),
+                stream: true,
+                messageCount: 1,
+                maxCompletionTokens: 8),
+            response: ServingEvidence.Response(
+                status: nil,
+                completed: false,
+                durationMilliseconds: 3,
+                chunkCount: 0,
+                bodyBytes: 0,
+                bodySHA256: emptyDigest),
+            cancellation: .init(
+                cancelled: true,
+                reason: .clientDisconnected),
+            resources: .init(
+                admission: .accepted,
+                before: before,
+                active: active,
+                terminal: terminal))
+
+        let canonical = try evidence.canonicalJSONData()
+        let json = try XCTUnwrap(String(data: canonical, encoding: .utf8))
+
+        XCTAssertEqual(evidence.schemaVersion, 2)
+        XCTAssertFalse(json.contains("PROMPT-SENTINEL"))
+        XCTAssertTrue(json.contains(#""completed":false"#))
+        XCTAssertFalse(json.contains(#""status":"#))
+        XCTAssertTrue(json.contains(#""active_requests":1"#))
+        XCTAssertEqual(
+            try ServingEvidence.decodeCanonicalJSONData(canonical),
+            evidence)
+    }
+
+    func testResourceSnapshotFailuresAreCanonicalAndUnique() throws {
+        let resources = try ServingEvidence.ResourceFacts(
+            admission: .accepted,
+            failedSnapshots: [.before, .active, .terminal])
+        let evidence = try ServingEvidence(
+            request: ServingEvidence.Request(
+                method: "POST",
+                path: "/v1/chat/completions",
+                headers: [],
+                body: Data("{}".utf8),
+                stream: false,
+                messageCount: 0,
+                maxCompletionTokens: nil),
+            response: ServingEvidence.Response(
+                status: 200,
+                durationMilliseconds: 1,
+                chunkCount: 1,
+                body: Data("{}".utf8)),
+            resources: resources)
+
+        let canonical = try evidence.canonicalJSONData()
+        XCTAssertEqual(
+            try ServingEvidence.decodeCanonicalJSONData(canonical),
+            evidence)
+        XCTAssertThrowsError(
+            try ServingEvidence.ResourceFacts(
+                admission: .accepted,
+                failedSnapshots: [.active, .before]))
+        XCTAssertThrowsError(
+            try ServingEvidence.ResourceFacts(
+                admission: .accepted,
+                failedSnapshots: [.active, .active]))
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0)
+        XCTAssertThrowsError(
+            try ServingEvidence.ResourceFacts(
+                admission: .accepted,
+                before: snapshot,
+                failedSnapshots: [.before]))
     }
 
     func testDecoderRejectsExplicitNullForCanonicallyOmittedOptionalFields() throws {
@@ -328,6 +440,15 @@ final class ServingEvidenceTests: XCTestCase {
                 maxCompletionTokens: -1))
         XCTAssertThrowsError(try ServingEvidence.RouteFacts(kind: .soloPLD, batchSize: -1))
         XCTAssertThrowsError(try ServingEvidence.ResourceFacts(admission: .accepted, queueDepth: -1))
+        XCTAssertThrowsError(
+            try ServingEvidence.ResourceSnapshot(
+                activeRequests: -1,
+                coordinatorSlots: 0,
+                reservedKVBytes: 0,
+                maxReservedKVBytes: 0,
+                mlxActiveBytes: 0,
+                mlxCacheBytes: 0,
+                mlxPeakBytes: 0))
     }
 }
 

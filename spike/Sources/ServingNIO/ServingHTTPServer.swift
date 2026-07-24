@@ -12,6 +12,7 @@ public enum ServingHTTPServerError: Error, Equatable, Sendable {
     case listenerAddressUnavailable
     case serverStopping
     case backendShutdownTimedOut
+    case evidenceDrainTimedOut
 }
 
 public struct ServingHTTPBind: Equatable, Sendable {
@@ -104,6 +105,7 @@ public actor ServingHTTPServer {
     private let eventLoopGroup: MultiThreadedEventLoopGroup
     private let connections: ServingHTTPConnectionRegistry
     private let backend: any ServingGenerationBackend
+    private let evidenceTracker: ServingHTTPEvidenceTracker?
     private var isShutDown = false
 
     private init(
@@ -111,12 +113,14 @@ public actor ServingHTTPServer {
         eventLoopGroup: MultiThreadedEventLoopGroup,
         connections: ServingHTTPConnectionRegistry,
         backend: any ServingGenerationBackend,
+        evidenceTracker: ServingHTTPEvidenceTracker?,
         localAddress: SocketAddress
     ) {
         self.listener = listener
         self.eventLoopGroup = eventLoopGroup
         self.connections = connections
         self.backend = backend
+        self.evidenceTracker = evidenceTracker
         self.localAddress = localAddress
     }
 
@@ -177,6 +181,7 @@ public actor ServingHTTPServer {
                 eventLoopGroup: group,
                 connections: connections,
                 backend: backend,
+                evidenceTracker: configuration.evidence?.tracker,
                 localAddress: localAddress)
         } catch {
             try? await group.shutdownGracefully()
@@ -197,6 +202,7 @@ public actor ServingHTTPServer {
 
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: gracePeriod)
+        evidenceTracker?.stopAccepting()
         let activeChannels = connections.stopAcceptingAndSnapshot()
         let backendShutdownCompletion = ServingHTTPBackendShutdownCompletion()
         let backend = self.backend
@@ -225,6 +231,11 @@ public actor ServingHTTPServer {
             forcedClose.cancel()
         }
 
+        let evidenceDrained =
+            await evidenceTracker?.waitUntilIdle(
+                clock: clock,
+                deadline: deadline)
+            ?? true
         let backendShutdownCompleted = await backendShutdownCompletion.waitUntilComplete(
             clock: clock,
             deadline: deadline)
@@ -236,6 +247,9 @@ public actor ServingHTTPServer {
 
         if !backendShutdownCompleted {
             throw ServingHTTPServerError.backendShutdownTimedOut
+        }
+        if !evidenceDrained {
+            throw ServingHTTPServerError.evidenceDrainTimedOut
         }
     }
 }
