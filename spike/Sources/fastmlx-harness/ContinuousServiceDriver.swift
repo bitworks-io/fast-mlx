@@ -557,7 +557,7 @@ private func observedServiceTick(
 }
 
 private func collectServiceTokens(
-    _ stream: AsyncThrowingStream<Int, Error>
+    _ stream: ContinuousBatchTokenStream
 ) async throws -> [Int] {
     var tokens: [Int] = []
     for try await token in stream { tokens.append(token) }

@@ -156,7 +156,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         while try await coordinator.runOneTick() {}
     }
 
-    private func collect(_ stream: AsyncThrowingStream<Int, Error>) async throws -> [Int] {
+    private func collect(_ stream: ContinuousBatchTokenStream) async throws -> [Int] {
         var tokens: [Int] = []
         for try await token in stream {
             tokens.append(token)
@@ -205,6 +205,148 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
 
         let tokens = try await collect(handle.tokens)
         XCTAssertEqual(tokens, [101])
+        let remaining = await coordinator.snapshots()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testAutomaticDriveWaitsForBoundedPublicationCapacityBeforeNextDecode() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 102, 2]]),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let handle = try await coordinator.submit(submission([10]))
+
+        for _ in 0 ..< 1_000 {
+            if await handle.tokens.snapshot().waitingProducers == 1 {
+                break
+            }
+            await Task.yield()
+        }
+
+        let blocked = await handle.tokens.snapshot()
+        let blockedTrace = await coordinator.executionTrace()
+        let blockedDecodes = blockedTrace.filter {
+            if case .operation(.decode) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(blocked.bufferedTokens, 1)
+        XCTAssertEqual(blocked.reservedTokens, 0)
+        XCTAssertEqual(blocked.waitingProducers, 1)
+        XCTAssertEqual(blockedDecodes.count, 1)
+
+        var iterator = handle.tokens.makeAsyncIterator()
+        let first = try await iterator.next()
+        let second = try await iterator.next()
+        let terminal = try await iterator.next()
+        XCTAssertEqual(first, 101)
+        XCTAssertEqual(second, 102)
+        XCTAssertNil(terminal)
+        await coordinator.waitUntilIdle()
+
+        let finished = await handle.tokens.snapshot()
+        let remaining = await coordinator.snapshots()
+        XCTAssertEqual(finished.terminal, .finished)
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testCancellationWhilePublicationCapacityBlockedReleasesSlotAndPump() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [
+                    10: [101, 102, 103, 2],
+                    20: [201, 2],
+                ]),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let blockedHandle = try await coordinator.submit(submission([10]))
+
+        for _ in 0 ..< 1_000 {
+            if await blockedHandle.tokens.snapshot().waitingProducers == 1 {
+                break
+            }
+            await Task.yield()
+        }
+        let blocked = await blockedHandle.tokens.snapshot()
+        XCTAssertEqual(blocked.waitingProducers, 1)
+
+        let cancellation = await coordinator.cancel(blockedHandle.id)
+        XCTAssertEqual(
+            cancellation,
+            .cancelled(
+                id: blockedHandle.id,
+                previousPhase: .decoding(
+                    emittedTokens: 1,
+                    hasPendingSoloLookahead: true)))
+        await coordinator.waitUntilIdle()
+        let cancelledSlot = await coordinator.snapshot(for: blockedHandle.id)
+        let cancelledTokens = await blockedHandle.tokens.snapshot()
+        XCTAssertNil(cancelledSlot)
+        XCTAssertEqual(cancelledTokens.terminal, .cancelled)
+
+        let replacement = try await coordinator.submit(submission([20]))
+        var replacementIterator = replacement.tokens.makeAsyncIterator()
+        let replacementToken = try await replacementIterator.next()
+        let replacementTerminal = try await replacementIterator.next()
+        XCTAssertEqual(replacementToken, 201)
+        XCTAssertNil(replacementTerminal)
+        await coordinator.waitUntilIdle()
+        let remaining = await coordinator.snapshots()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testBatchReservationReleasesPartialCapacityWhileAnotherClientIsBlocked() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 2, prefill: 2, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [
+                    10: [101, 102, 2],
+                    20: [201, 202, 2],
+                ]),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let handles = try await coordinator.submitBatch([
+            submission([10]),
+            submission([20]),
+        ])
+
+        for _ in 0 ..< 1_000 {
+            let first = await handles[0].tokens.snapshot()
+            if first.bufferedTokens == 1, first.waitingProducers == 1 {
+                break
+            }
+            await Task.yield()
+        }
+
+        var firstIterator = handles[0].tokens.makeAsyncIterator()
+        var secondIterator = handles[1].tokens.makeAsyncIterator()
+        let firstToken = try await firstIterator.next()
+        XCTAssertEqual(firstToken, 101)
+
+        for _ in 0 ..< 1_000 {
+            let second = await handles[1].tokens.snapshot()
+            if second.waitingProducers == 1 { break }
+            await Task.yield()
+        }
+
+        let firstWhileSecondBlocked = await handles[0].tokens.snapshot()
+        let secondBlocked = await handles[1].tokens.snapshot()
+        XCTAssertEqual(firstWhileSecondBlocked.reservedTokens, 0)
+        XCTAssertEqual(secondBlocked.waitingProducers, 1)
+
+        let secondToken = try await secondIterator.next()
+        let firstNext = try await firstIterator.next()
+        let secondNext = try await secondIterator.next()
+        let firstTerminal = try await firstIterator.next()
+        let secondTerminal = try await secondIterator.next()
+        XCTAssertEqual(secondToken, 201)
+        XCTAssertEqual(firstNext, 102)
+        XCTAssertEqual(secondNext, 202)
+        XCTAssertNil(firstTerminal)
+        XCTAssertNil(secondTerminal)
+        await coordinator.waitUntilIdle()
         let remaining = await coordinator.snapshots()
         XCTAssertTrue(remaining.isEmpty)
     }
@@ -471,6 +613,190 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                     .cancelled(id: handle.id, previousPhase: .queued))))
     }
 
+    func testDroppingIteratorWithoutPendingNextCancelsAndReleasesQueuedSlot() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 1),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 2], 20: [201, 2]]),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+
+        let abandonedID: BatchRequestID
+        do {
+            let abandoned = try await coordinator.submit(submission([10, 11]))
+            abandonedID = abandoned.id
+            _ = abandoned.tokens.makeAsyncIterator()
+        }
+
+        for _ in 0 ..< 1_000 {
+            if await coordinator.snapshot(for: abandonedID) == nil { break }
+            await Task.yield()
+        }
+
+        let abandonedSnapshot = await coordinator.snapshot(for: abandonedID)
+        XCTAssertNil(abandonedSnapshot)
+        let replacement = try await coordinator.submit(submission([20]))
+        XCTAssertEqual(replacement.id, BatchRequestID(2))
+        await coordinator.shutdown()
+    }
+
+    func testIteratorKeepsConsumerAliveAfterTheStreamHandleIsDropped() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 2]]),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+
+        let id: BatchRequestID
+        var iterator: ContinuousBatchTokenStream.AsyncIterator
+        do {
+            let handle = try await coordinator.submit(submission([10]))
+            id = handle.id
+            iterator = handle.tokens.makeAsyncIterator()
+        }
+
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        let retainedSnapshot = await coordinator.snapshot(for: id)
+        XCTAssertNotNil(retainedSnapshot)
+
+        _ = try await coordinator.runOneTick()
+        _ = try await coordinator.runOneTick()
+        let visibleToken = try await iterator.next()
+        try await drain(coordinator)
+        let terminal = try await iterator.next()
+        XCTAssertEqual(visibleToken, 101)
+        XCTAssertNil(terminal)
+    }
+
+    func testDroppingOneOfTwoIteratorsKeepsTheRemainingConsumerAlive() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 2]]),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+        let handle = try await coordinator.submit(submission([10]))
+        var retainedIterator = handle.tokens.makeAsyncIterator()
+        do {
+            _ = handle.tokens.makeAsyncIterator()
+        }
+
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        let retainedSnapshot = await coordinator.snapshot(for: handle.id)
+        XCTAssertNotNil(retainedSnapshot)
+
+        _ = try await coordinator.runOneTick()
+        _ = try await coordinator.runOneTick()
+        let visibleToken = try await retainedIterator.next()
+        try await drain(coordinator)
+        let terminal = try await retainedIterator.next()
+        XCTAssertEqual(visibleToken, 101)
+        XCTAssertNil(terminal)
+    }
+
+    func testCancelledManualPumpThrowsWithoutPoisoningCoordinator() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 102, 2], 20: [201, 2]]),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+        let blocked = try await coordinator.submit(submission([10]))
+        _ = try await coordinator.runOneTick()
+        _ = try await coordinator.runOneTick()
+
+        let blockedPump = Task { try await coordinator.runOneTick() }
+        for _ in 0 ..< 1_000 {
+            if await blocked.tokens.snapshot().waitingProducers == 1 { break }
+            await Task.yield()
+        }
+        blockedPump.cancel()
+        do {
+            _ = try await blockedPump.value
+            XCTFail("cancelled manual pump should throw CancellationError")
+        } catch is CancellationError {
+            // Expected: no runtime work executes after the cancelled reservation wait.
+        }
+
+        let coordinatorIsShutDown = await coordinator.isShutDown()
+        XCTAssertFalse(coordinatorIsShutDown)
+        _ = await coordinator.cancel(blocked.id)
+        let replacement = try await coordinator.submit(submission([20]))
+        let replacementStream = replacement.tokens
+        let collector = Task {
+            var tokens: [Int] = []
+            for try await token in replacementStream {
+                tokens.append(token)
+            }
+            return tokens
+        }
+        try await drain(coordinator)
+        let replacementTokens = try await collector.value
+        let finalSnapshots = await coordinator.snapshots()
+        XCTAssertEqual(replacementTokens, [201])
+        XCTAssertTrue(finalSnapshots.isEmpty)
+    }
+
+    func testCancelledPumpFinishesCommittedMultiTokenPublicationBeforeThrowing() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 102, 103, 2]],
+                speculativeSoloWidth: 3),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+        let handle = try await coordinator.submit(
+            submission([10], maxTokens: 3, speculation: true))
+        _ = try await coordinator.runOneTick()
+
+        let pump = Task { try await coordinator.runOneTick() }
+        for _ in 0 ..< 1_000 {
+            if await handle.tokens.snapshot().waitingProducers == 1 { break }
+            await Task.yield()
+        }
+        pump.cancel()
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+
+        let committedPublication = await handle.tokens.snapshot()
+        guard committedPublication.waitingProducers == 1 else {
+            _ = await coordinator.cancel(handle.id)
+            _ = try? await pump.value
+            return XCTFail(
+                "task cancellation dropped an already committed multi-token publication")
+        }
+
+        var iterator = handle.tokens.makeAsyncIterator()
+        let first = try await iterator.next()
+        let second = try await iterator.next()
+        let third = try await iterator.next()
+        let terminal = try await iterator.next()
+        do {
+            _ = try await pump.value
+            XCTFail("the pump should report cancellation after committed publication")
+        } catch is CancellationError {
+            // The scheduler/publication transaction completed before cancellation surfaced.
+        }
+
+        let streamSnapshot = await handle.tokens.snapshot()
+        let finalSnapshots = await coordinator.snapshots()
+        XCTAssertEqual([first, second, third].compactMap { $0 }, [101, 102, 103])
+        XCTAssertNil(terminal)
+        XCTAssertEqual(streamSnapshot.terminal, .finished)
+        XCTAssertTrue(finalSnapshots.isEmpty)
+    }
+
     func testShutdownFinishesStreamsRejectsNewWorkAndIsIdempotent() async throws {
         let coordinator = ContinuousBatchCoordinator(
             configuration: configuration(),
@@ -529,7 +855,11 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                 let tokens = try await collect(handle.tokens)
                 XCTFail("failed tick yielded tokens: \(tokens)")
             } catch {
-                // coordinator forwards the scheduler failure to every stream
+                XCTAssertEqual(
+                    error as? ContinuousBatchSchedulerError,
+                    .invalidDecodeOutcomeIDs(
+                        expected: [handles[0].id, handles[1].id],
+                        actual: [handles[0].id]))
             }
         }
         let remaining = await coordinator.snapshots()

@@ -315,7 +315,7 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         """#.utf8)
     }
 
-    private func collect(_ stream: AsyncThrowingStream<Int, Error>) async throws -> [Int] {
+    private func collect(_ stream: ContinuousBatchTokenStream) async throws -> [Int] {
         var tokens: [Int] = []
         for try await token in stream { tokens.append(token) }
         return tokens

@@ -116,9 +116,9 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
 
 public struct ContinuousBatchRequestHandle: Sendable {
     public let id: BatchRequestID
-    public let tokens: AsyncThrowingStream<Int, Error>
+    public let tokens: ContinuousBatchTokenStream
 
-    public init(id: BatchRequestID, tokens: AsyncThrowingStream<Int, Error>) {
+    public init(id: BatchRequestID, tokens: ContinuousBatchTokenStream) {
         self.id = id
         self.tokens = tokens
     }
@@ -147,15 +147,19 @@ public enum ContinuousBatchTimingEvent: Sendable, Equatable {
 
 /// MLX-free orchestration actor around the pure scheduler.
 ///
-/// One tick is one transaction with no suspension point: execute decode first, execute bounded
-/// prompt slices, validate/apply the exact scheduler plan, then publish tokens and terminal
-/// events. The automatic pump yields only after that commit, so new submissions and
-/// cancellation can interleave between ticks but never attach to partially executed work.
+/// Publication capacity is reserved before a decode tick. After that reservation, one tick's
+/// runtime work and scheduler commit form a transaction with no suspension point. Publishing
+/// the already-committed result may suspend only after the MLX mutation window has closed.
 public actor ContinuousBatchCoordinator {
     private struct RequestState {
         let submission: ContinuousBatchSubmission
-        let continuation: AsyncThrowingStream<Int, Error>.Continuation
+        let mailbox: ContinuousBatchTokenMailbox
         var emittedTokens = 0
+    }
+
+    private struct ReservedPublication {
+        let mailbox: ContinuousBatchTokenMailbox
+        let reservation: ContinuousBatchPublicationReservation
     }
 
     private struct PreparedDecode {
@@ -168,6 +172,7 @@ public actor ContinuousBatchCoordinator {
     private var scheduler: ContinuousBatchScheduler
     private let runtime: any ContinuousBatchRuntime
     private let automaticDrive: Bool
+    private let configuredPublicationCapacity: Int?
     private let traceLimit: Int
     private var trace: [ContinuousBatchCoordinatorEvent] = []
     private var timingTrace: [ContinuousBatchTimingEvent] = []
@@ -185,6 +190,22 @@ public actor ContinuousBatchCoordinator {
         self.scheduler = ContinuousBatchScheduler(configuration: configuration)
         self.runtime = runtime
         self.automaticDrive = automaticDrive
+        self.configuredPublicationCapacity = nil
+        self.traceLimit = max(0, traceLimit)
+    }
+
+    public init(
+        configuration: ContinuousBatchConfiguration,
+        runtime: sending any ContinuousBatchRuntime,
+        automaticDrive: Bool = true,
+        publicationCapacity: Int,
+        traceLimit: Int = 0
+    ) {
+        precondition(publicationCapacity > 0, "publicationCapacity must be positive")
+        self.scheduler = ContinuousBatchScheduler(configuration: configuration)
+        self.runtime = runtime
+        self.automaticDrive = automaticDrive
+        self.configuredPublicationCapacity = publicationCapacity
         self.traceLimit = max(0, traceLimit)
     }
 
@@ -234,20 +255,21 @@ public actor ContinuousBatchCoordinator {
         var handles: [ContinuousBatchRequestHandle] = []
         handles.reserveCapacity(submissions.count)
         for (id, submission) in zip(ids, submissions) {
-            var captured: AsyncThrowingStream<Int, Error>.Continuation?
-            let stream = AsyncThrowingStream<Int, Error> { continuation in
-                captured = continuation
-            }
-            guard let continuation = captured else {
-                preconditionFailure("AsyncThrowingStream did not synchronously vend a continuation")
-            }
-            continuation.onTermination = { [weak self] termination in
-                guard case .cancelled = termination else { return }
+            let consumerCancellation = ContinuousBatchCancellationHook { [weak self] in
                 Task { _ = await self?.cancel(id) }
             }
+            let mailbox = ContinuousBatchTokenMailbox(
+                // Manual proof drivers historically drain before consuming. Their default
+                // remains lossless and bounded by the declared output budget; production
+                // serving supplies a smaller explicit capacity for client backpressure.
+                capacity: configuredPublicationCapacity ?? submission.maxOutputTokens,
+                consumerCancellation: consumerCancellation)
+            let stream = ContinuousBatchTokenStream(
+                mailbox: mailbox,
+                cancellationHook: consumerCancellation)
             requests[id] = RequestState(
                 submission: submission,
-                continuation: continuation)
+                mailbox: mailbox)
             handles.append(ContinuousBatchRequestHandle(id: id, tokens: stream))
         }
 
@@ -258,27 +280,29 @@ public actor ContinuousBatchCoordinator {
     }
 
     @discardableResult
-    public func cancel(_ id: BatchRequestID) -> BatchCancellationResult {
+    public func cancel(_ id: BatchRequestID) async -> BatchCancellationResult {
         let result = scheduler.cancel(id)
-        guard case .cancelled = result else { return result }
+        guard let state = requests.removeValue(forKey: id) else { return result }
         runtime.remove(id)
-        if let state = requests.removeValue(forKey: id) {
-            state.continuation.finish()
-        }
-        record(.cancelled(result))
+        if case .cancelled = result { record(.cancelled(result)) }
+        await state.mailbox.cancel()
         return result
     }
 
     /// Deterministic pump seam for tests. Returns whether work remains after this commit.
     @discardableResult
-    public func runOneTick() throws -> Bool {
+    public func runOneTick() async throws -> Bool {
         guard !shuttingDown else { throw ContinuousBatchCoordinatorError.shuttingDown }
         guard !scheduler.isEmpty else { return false }
         do {
-            try executeOneTick()
+            try Task.checkCancellation()
+            try await executeOneTick()
+            try Task.checkCancellation()
             return !scheduler.isEmpty
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
-            failAll(with: error, terminal: true)
+            await failAll(with: error, terminal: true)
             throw error
         }
     }
@@ -298,13 +322,16 @@ public actor ContinuousBatchCoordinator {
         let task = driveTask
         task?.cancel()
         let ids = Array(requests.keys)
+        var mailboxes: [ContinuousBatchTokenMailbox] = []
         for id in ids {
             let result = scheduler.cancel(id)
             runtime.remove(id)
-            requests.removeValue(forKey: id)?.continuation.finish(
-                throwing: CancellationError())
+            if let state = requests.removeValue(forKey: id) {
+                mailboxes.append(state.mailbox)
+            }
             if case .cancelled = result { record(.cancelled(result)) }
         }
+        for mailbox in mailboxes { await mailbox.cancel() }
         if let task { await task.value }
     }
 
@@ -349,48 +376,161 @@ public actor ContinuousBatchCoordinator {
         defer { driveTask = nil }
         while !Task.isCancelled, !scheduler.isEmpty, !shuttingDown {
             do {
-                try executeOneTick()
+                try await executeOneTick()
+            } catch is CancellationError {
+                return
             } catch {
-                failAll(with: error, terminal: true)
+                await failAll(with: error, terminal: true)
                 return
             }
             await Task.yield()
         }
     }
 
-    private func executeOneTick() throws {
-        let plan = scheduler.makeTick()
-        var preparedDecode: [PreparedDecode] = []
-
-        for operation in plan.operations {
-            switch operation {
-            case .decode(let action):
-                preparedDecode = try runtime.decode(action).map(prepareDecodeResult)
-            case .prefill(let slice):
-                guard let state = requests[slice.id] else {
-                    throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(slice.id)
-                }
-                let range = slice.startToken ..< slice.endToken
-                let prompt = state.submission.promptTokens
-                guard range.lowerBound >= 0, range.upperBound <= prompt.count else {
-                    throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(slice.id)
-                }
-                try runtime.prefill(
-                    ContinuousBatchRuntimePrefill(
-                        id: slice.id,
-                        startToken: slice.startToken,
-                        tokens: Array(prompt[range]),
-                        isFinal: slice.endToken == prompt.count,
-                        totalPromptTokens: prompt.count,
-                        maxOutputTokens: state.submission.maxOutputTokens))
+    private func executeOneTick() async throws {
+        let plan: BatchTickPlan
+        let reservations: [BatchRequestID: ReservedPublication]
+        while true {
+            try Task.checkCancellation()
+            let candidate = scheduler.makeTick()
+            guard let candidateReservations = try await reservePublications(
+                for: candidate)
+            else {
+                if scheduler.isEmpty || shuttingDown || Task.isCancelled { return }
+                continue
             }
+            plan = candidate
+            reservations = candidateReservations
+            break
         }
 
-        try scheduler.apply(
-            plan,
-            decodeOutcomes: preparedDecode.map(\.outcome))
-        for operation in plan.operations { record(.operation(operation)) }
-        commit(preparedDecode)
+        var preparedDecode: [PreparedDecode] = []
+        do {
+            for operation in plan.operations {
+                switch operation {
+                case .decode(let action):
+                    preparedDecode = try runtime.decode(action).map(prepareDecodeResult)
+                case .prefill(let slice):
+                    guard let state = requests[slice.id] else {
+                        throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(slice.id)
+                    }
+                    let range = slice.startToken ..< slice.endToken
+                    let prompt = state.submission.promptTokens
+                    guard range.lowerBound >= 0, range.upperBound <= prompt.count else {
+                        throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(slice.id)
+                    }
+                    try runtime.prefill(
+                        ContinuousBatchRuntimePrefill(
+                            id: slice.id,
+                            startToken: slice.startToken,
+                            tokens: Array(prompt[range]),
+                            isFinal: slice.endToken == prompt.count,
+                            totalPromptTokens: prompt.count,
+                            maxOutputTokens: state.submission.maxOutputTokens))
+                }
+            }
+
+            try scheduler.apply(
+                plan,
+                decodeOutcomes: preparedDecode.map(\.outcome))
+            for result in preparedDecode {
+                guard var state = requests[result.id] else {
+                    throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(result.id)
+                }
+                state.emittedTokens += result.visibleTokens.count
+                requests[result.id] = state
+            }
+            for operation in plan.operations { record(.operation(operation)) }
+        } catch {
+            await release(reservations)
+            throw error
+        }
+
+        try await publish(preparedDecode, reservations: reservations)
+    }
+
+    private func reservePublications(
+        for plan: BatchTickPlan
+    ) async throws -> [BatchRequestID: ReservedPublication]? {
+        try Task.checkCancellation()
+        guard let decode = plan.decode else { return [:] }
+        let ids: [BatchRequestID]
+        switch decode {
+        case .drainSoloPipeline(let id), .solo(let id, _):
+            ids = [id]
+        case .batch(let batchIDs, _):
+            ids = batchIDs
+        }
+
+        while true {
+            try Task.checkCancellation()
+            var result: [BatchRequestID: ReservedPublication] = [:]
+            result.reserveCapacity(ids.count)
+            var blockedMailbox: ContinuousBatchTokenMailbox?
+            do {
+                for id in ids {
+                    guard let state = requests[id] else {
+                        throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(id)
+                    }
+                    guard let reservation = try await state.mailbox.tryReserve() else {
+                        blockedMailbox = state.mailbox
+                        break
+                    }
+                    result[id] = ReservedPublication(
+                        mailbox: state.mailbox,
+                        reservation: reservation)
+                }
+            } catch {
+                await release(result)
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                if shuttingDown || scheduler.makeTick() != plan {
+                    return nil
+                }
+                throw error
+            }
+
+            guard let blockedMailbox else {
+                if Task.isCancelled {
+                    await release(result)
+                    throw CancellationError()
+                }
+                guard scheduler.makeTick() == plan else {
+                    await release(result)
+                    return nil
+                }
+                return result
+            }
+
+            // Never hold one client's capacity while awaiting another. Reserve-and-release
+            // one slot only as a readiness signal, then retry the whole batch from scratch.
+            await release(result)
+            do {
+                let signal = try await blockedMailbox.reserve()
+                await blockedMailbox.release(signal)
+            } catch {
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                if shuttingDown || scheduler.makeTick() != plan {
+                    return nil
+                }
+                throw error
+            }
+            try Task.checkCancellation()
+            guard scheduler.makeTick() == plan else {
+                return nil
+            }
+        }
+    }
+
+    private func release(
+        _ reservations: [BatchRequestID: ReservedPublication]
+    ) async {
+        for publication in reservations.values {
+            await publication.mailbox.release(publication.reservation)
+        }
     }
 
     private func prepareDecodeResult(_ result: ContinuousBatchRuntimeDecodeResult) throws
@@ -434,41 +574,83 @@ public actor ContinuousBatchCoordinator {
                     ? false : result.hasPendingSoloLookahead))
     }
 
-    private func commit(_ prepared: [PreparedDecode]) {
+    private func publish(
+        _ prepared: [PreparedDecode],
+        reservations: [BatchRequestID: ReservedPublication]
+    ) async throws {
+        var unconsumed = reservations
         for result in prepared {
-            guard var state = requests[result.id] else { continue }
-            for token in result.visibleTokens {
-                recordTiming(
-                    .emitted(
-                        result.id,
-                        timestamp: ProcessInfo.processInfo.systemUptime))
-                state.continuation.yield(token)
+            guard let publication = unconsumed.removeValue(forKey: result.id) else {
+                await release(unconsumed)
+                throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(result.id)
             }
-            state.emittedTokens += result.visibleTokens.count
-            if result.finished {
-                recordTiming(
-                    .finished(
-                        result.id,
-                        timestamp: ProcessInfo.processInfo.systemUptime))
-                state.continuation.finish()
+
+            do {
+                if let first = result.visibleTokens.first {
+                    let timestamp = ProcessInfo.processInfo.systemUptime
+                    try await publication.mailbox.commit(
+                        publication.reservation,
+                        token: first)
+                    recordTiming(.emitted(result.id, timestamp: timestamp))
+
+                    for token in result.visibleTokens.dropFirst() {
+                        let reservation = try await publication.mailbox.reserveCommitted()
+                        let extraTimestamp = ProcessInfo.processInfo.systemUptime
+                        do {
+                            try await publication.mailbox.commit(
+                                reservation,
+                                token: token)
+                        } catch {
+                            await publication.mailbox.release(reservation)
+                            throw error
+                        }
+                        recordTiming(.emitted(result.id, timestamp: extraTimestamp))
+                    }
+                } else {
+                    await publication.mailbox.release(publication.reservation)
+                }
+            } catch {
+                await publication.mailbox.release(publication.reservation)
+                if requests[result.id] == nil || shuttingDown {
+                    continue
+                }
+                await release(unconsumed)
+                throw error
+            }
+
+            if result.finished, requests[result.id] != nil {
+                let timestamp = ProcessInfo.processInfo.systemUptime
                 runtime.remove(result.id)
                 requests[result.id] = nil
                 record(.finished(result.id))
-            } else {
-                requests[result.id] = state
+                await publication.mailbox.finish()
+                recordTiming(.finished(result.id, timestamp: timestamp))
             }
+        }
+
+        if !unconsumed.isEmpty {
+            await release(unconsumed)
+            throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(
+                unconsumed.keys.sorted().first!)
         }
     }
 
-    private func failAll(with error: Error, terminal: Bool) {
+    private func failAll(with error: Error, terminal: Bool) async {
+        let message = String(describing: error)
         let ids = Array(requests.keys)
+        var mailboxes: [ContinuousBatchTokenMailbox] = []
         for id in ids {
             _ = scheduler.cancel(id)
             runtime.remove(id)
-            requests.removeValue(forKey: id)?.continuation.finish(throwing: error)
+            if let state = requests.removeValue(forKey: id) {
+                mailboxes.append(state.mailbox)
+            }
         }
-        record(.failed(String(describing: error)))
+        record(.failed(message))
         if terminal { shuttingDown = true }
+        for mailbox in mailboxes {
+            await mailbox.fail(error)
+        }
     }
 
     private func record(_ event: ContinuousBatchCoordinatorEvent) {
