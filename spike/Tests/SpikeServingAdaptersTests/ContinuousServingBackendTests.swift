@@ -8,6 +8,832 @@ import SpikeCore
 @testable import SpikeServingAdapters
 
 final class ContinuousServingBackendTests: XCTestCase {
+    func testDynamicAdmissionSingleHeldExpiryStartsSoloPLDWithSpeculation()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        let start = Task {
+            try await backend.start(request(text: "solo", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let handle = try await start.value
+
+        XCTAssertEqual(handle.route, .soloPLD)
+        try await runUntilDecode(coordinator, recorder: recorder)
+        XCTAssertEqual(
+            recorder.decodeActions.first,
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionTwoHeldRequestsExpireAsAtomicBatchNoSpec()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "one": [10],
+                "two": [20],
+            ],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99])
+
+        let oneStart = Task {
+            try await backend.start(request(text: "one", maxTokens: 2))
+        }
+        let twoStart = Task {
+            try await backend.start(request(text: "two", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 2
+        }
+
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let one = try await oneStart.value
+        let two = try await twoStart.value
+
+        XCTAssertEqual(one.route, .continuousBatchNoSpec)
+        XCTAssertEqual(two.route, .continuousBatchNoSpec)
+        let batchIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            batchIDs,
+            [BatchRequestID(1), BatchRequestID(2)])
+        try await runUntilDecode(coordinator, recorder: recorder)
+        XCTAssertEqual(
+            recorder.decodeActions.first,
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2)],
+                speculationAllowed: false))
+
+        _ = await one.lease.cancel(.clientDisconnected)
+        _ = await two.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionThirdArrivalWaitsForInFlightCoordinatorAdmissionWithoutResubmittingCohort()
+        async throws
+    {
+        let admissionGate = BlockingRuntimeResourceSnapshotGate()
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 3, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                    30: [3, 99],
+                ],
+                recorder: recorder,
+                allowsSpeculation: true,
+                resourceSnapshotGate: admissionGate),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "one": [10],
+                "two": [20],
+                "three": [30],
+            ],
+            pieces: [1: "a", 2: "b", 3: "c"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 3)
+
+        let oneStart = Task {
+            try await backend.start(request(text: "one", maxTokens: 2))
+        }
+        let twoStart = Task {
+            try await backend.start(request(text: "two", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 2
+        }
+
+        let coordinatorBlocker = Task {
+            await coordinator.runtimeResourceSnapshot()
+        }
+        await waitUntil { admissionGate.hasEntered }
+        let expiry = Task {
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+        }
+        await waitUntil {
+            await backend.diagnosticExecutingAdmissionRequestCount() == 2
+        }
+
+        let threeStart = Task {
+            try await backend.start(request(text: "three", maxTokens: 2))
+        }
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        let executingWhileCoordinatorBlocked =
+            await backend.diagnosticExecutingAdmissionRequestCount()
+        XCTAssertEqual(
+            executingWhileCoordinatorBlocked,
+            2,
+            "the third request must wait at the coordinator preflight instead of reentering the in-flight cohort")
+
+        admissionGate.release()
+        _ = await coordinatorBlocker.value
+        await expiry.value
+        let one = try await oneStart.value
+        let two = try await twoStart.value
+        let three = try await threeStart.value
+
+        XCTAssertEqual(recorder.admissionBatchSizes, [2, 1])
+        let coordinatorIDs =
+            await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            coordinatorIDs,
+            [BatchRequestID(1), BatchRequestID(2), BatchRequestID(3)])
+
+        _ = await one.lease.cancel(.clientDisconnected)
+        _ = await two.lease.cancel(.clientDisconnected)
+        _ = await three.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionCancellationWhileCoordinatorAdmissionIsInFlight()
+        async throws
+    {
+        let admissionGate = BlockingRuntimeResourceSnapshotGate()
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true,
+                resourceSnapshotGate: admissionGate),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["in-flight": [10]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1)
+
+        let start = Task {
+            try await backend.start(
+                request(text: "in-flight", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+        let coordinatorBlocker = Task {
+            await coordinator.runtimeResourceSnapshot()
+        }
+        await waitUntil { admissionGate.hasEntered }
+        let expiry = Task {
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+        }
+        await waitUntil {
+            await backend.diagnosticExecutingAdmissionRequestCount() == 1
+        }
+
+        start.cancel()
+        do {
+            _ = try await start.value
+            XCTFail("Expected in-flight start cancellation")
+        } catch is CancellationError {
+        }
+        let executingBeforePhysicalRemoval =
+            await backend.diagnosticExecutingAdmissionRequestCount()
+        XCTAssertEqual(
+            executingBeforePhysicalRemoval,
+            1,
+            "the reducer reservation must remain held until the coordinator can physically remove the cancelled admission")
+
+        admissionGate.release()
+        _ = await coordinatorBlocker.value
+        await expiry.value
+        await waitUntil {
+            await backend.diagnosticExecutingAdmissionRequestCount() == 0
+        }
+        await waitUntil {
+            await coordinator.snapshots().isEmpty
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [1])
+        let cancellationSlots = await coordinator.snapshots()
+        XCTAssertTrue(cancellationSlots.isEmpty)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionCancellationInFlightKeepsReplacementQueuedUntilPhysicalRemoval()
+        async throws
+    {
+        let admissionGate = BlockingRuntimeResourceSnapshotGate()
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: recorder,
+                allowsSpeculation: true,
+                resourceSnapshotGate: admissionGate),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "cancelled": [10],
+                "replacement": [20],
+            ],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            maximumQueuedRequests: 1)
+
+        let cancelledStart = Task {
+            try await backend.start(
+                request(text: "cancelled", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+        let replacementStart = Task {
+            try await backend.start(
+                request(text: "replacement", maxTokens: 2))
+        }
+        await waitUntil {
+            let held =
+                await backend.diagnosticPendingAdmissionRequestCount()
+            let queued =
+                await backend.diagnosticQueuedAdmissionRequestCount()
+            return held == 1 && queued == 1
+        }
+
+        let coordinatorBlocker = Task {
+            await coordinator.runtimeResourceSnapshot()
+        }
+        await waitUntil { admissionGate.hasEntered }
+        let firstExpiry = Task {
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+        }
+        await waitUntil {
+            await backend.diagnosticExecutingAdmissionRequestCount() == 1
+        }
+
+        cancelledStart.cancel()
+        do {
+            _ = try await cancelledStart.value
+            XCTFail("Expected in-flight start cancellation")
+        } catch is CancellationError {
+        }
+
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 0
+        }
+        let queuedBeforePhysicalRemoval =
+            await backend.diagnosticQueuedAdmissionRequestCount()
+        XCTAssertEqual(
+            queuedBeforePhysicalRemoval,
+            1,
+            "replacement must not enter coordinator admission before the cancelled slot is physically removed")
+
+        admissionGate.release()
+        _ = await coordinatorBlocker.value
+        await firstExpiry.value
+        await waitUntil {
+            let queued =
+                await backend.diagnosticQueuedAdmissionRequestCount()
+            let held =
+                await backend.diagnosticPendingAdmissionRequestCount()
+            return queued == 0 && held == 1
+        }
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let replacement = try await replacementStart.value
+        XCTAssertEqual(replacement.route, .soloPLD)
+        XCTAssertEqual(recorder.admissionBatchSizes, [1, 1])
+
+        _ = await replacement.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionShutdownCancelsCoordinatorAdmissionInFlight()
+        async throws
+    {
+        let admissionGate = BlockingRuntimeResourceSnapshotGate()
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true,
+                resourceSnapshotGate: admissionGate),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["in-flight": [10]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1)
+
+        let start = Task {
+            try await backend.start(
+                request(text: "in-flight", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+        let coordinatorBlocker = Task {
+            await coordinator.runtimeResourceSnapshot()
+        }
+        await waitUntil { admissionGate.hasEntered }
+        let expiry = Task {
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+        }
+        await waitUntil {
+            await backend.diagnosticExecutingAdmissionRequestCount() == 1
+        }
+
+        let shutdown = Task {
+            await backend.shutdown()
+        }
+        do {
+            _ = try await start.value
+            XCTFail("Expected shutdown to release the in-flight start")
+        } catch let error as ContinuousServingBackendError {
+            XCTAssertEqual(error, .shuttingDown)
+        }
+
+        admissionGate.release()
+        _ = await coordinatorBlocker.value
+        await expiry.value
+        await shutdown.value
+        XCTAssertEqual(recorder.admissionBatchSizes, [1])
+        let shutdownSlots = await coordinator.snapshots()
+        XCTAssertTrue(shutdownSlots.isEmpty)
+    }
+
+    func testDynamicAdmissionShutdownDuringValidationDoesNotEnqueueLatePendingStart()
+        async throws
+    {
+        let validationBlocker = BlockingRuntimeResourceSnapshotGate()
+        let renderGate = BlockingRuntimeResourceSnapshotGate()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: ContinuousRuntimeRecorder(),
+                resourceSnapshotGate: validationBlocker),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["validating": [10]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            renderGate: renderGate)
+
+        let coordinatorBlocker = Task {
+            await coordinator.runtimeResourceSnapshot()
+        }
+        await waitUntil { validationBlocker.hasEntered }
+
+        let start = Task {
+            try await backend.start(
+                request(text: "validating", maxTokens: 2))
+        }
+        await waitUntil { renderGate.hasEntered }
+        renderGate.release()
+        let pendingWhileValidationBlocked =
+            await backend.diagnosticPendingAdmissionRequestCount()
+        XCTAssertEqual(pendingWhileValidationBlocked, 0)
+
+        let shutdown = Task {
+            await backend.shutdown()
+        }
+        await waitUntil {
+            await !backend.diagnosticAcceptingRequests()
+        }
+        do {
+            _ = try await backend.start(
+                request(text: "validating", maxTokens: 2))
+            XCTFail("Expected shutdown admission rejection")
+        } catch let error as ContinuousServingBackendError {
+            XCTAssertEqual(error, .shuttingDown)
+        }
+
+        validationBlocker.release()
+        _ = await coordinatorBlocker.value
+        await shutdown.value
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+
+        let pendingAfterShutdown =
+            await backend.diagnosticPendingAdmissionRequestCount()
+        if pendingAfterShutdown != 0 {
+            start.cancel()
+        }
+        do {
+            _ = try await start.value
+            XCTFail("Expected validation-time shutdown rejection")
+        } catch let error as ContinuousServingBackendError {
+            XCTAssertEqual(error, .shuttingDown)
+        } catch is CancellationError {
+            XCTFail("shutdown left a late pending start that required cancellation")
+        }
+        XCTAssertEqual(
+            pendingAfterShutdown,
+            0,
+            "validation must not enqueue a continuation after shutdown snapshots pending admissions")
+    }
+
+    func testDynamicAdmissionArrivalAfterSoloPLDQueuesUntilSoloLeaves()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 2, 99],
+                    20: [3, 99],
+                ],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "solo": [10],
+                "late": [20],
+            ],
+            pieces: [1: "a", 2: "b", 3: "c"],
+            stopTokenIDs: [99])
+
+        let soloStart = Task {
+            try await backend.start(request(text: "solo", maxTokens: 3))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let solo = try await soloStart.value
+        XCTAssertEqual(solo.route, .soloPLD)
+
+        try await runUntilDecode(coordinator, recorder: recorder)
+        XCTAssertEqual(
+            recorder.decodeActions.first,
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        let lateStart = Task {
+            try await backend.start(request(text: "late", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticQueuedAdmissionRequestCount() == 1
+        }
+        let soloCoordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            soloCoordinatorIDs,
+            [BatchRequestID(1)])
+
+        _ = await solo.lease.cancel(.clientDisconnected)
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+        let afterSoloCancelIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(afterSoloCancelIDs, [])
+
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let late = try await lateStart.value
+
+        XCTAssertEqual(late.route, .soloPLD)
+        let lateCoordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            lateCoordinatorIDs,
+            [BatchRequestID(2)])
+
+        _ = await late.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionCancellationWhileHeldReleasesPendingStart()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["held": [10]],
+            pieces: [1: "h"],
+            stopTokenIDs: [99])
+
+        let start = Task {
+            try await backend.start(request(text: "held", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+
+        start.cancel()
+
+        do {
+            _ = try await start.value
+            XCTFail("Expected held start cancellation")
+        } catch is CancellationError {
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 0
+        }
+        let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(coordinatorIDs, [])
+        XCTAssertEqual(snapshots, [])
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionAutomaticWindowStartsWithoutDiagnosticIntervention()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["automatic": [10]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            coalescing: .automatic(.milliseconds(1)))
+
+        let handle = try await backend.start(
+            request(text: "automatic", maxTokens: 2))
+
+        XCTAssertEqual(handle.route, .soloPLD)
+        let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            coordinatorIDs,
+            [BatchRequestID(1)])
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionCancellingLastHeldDisarmsAutomaticWindow()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "cancelled": [10],
+                "replacement": [20],
+            ],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            coalescing: .automatic(.seconds(30)))
+
+        let cancelledStart = Task {
+            try await backend.start(
+                request(text: "cancelled", maxTokens: 2))
+        }
+        await waitUntil {
+            let held =
+                await backend.diagnosticPendingAdmissionRequestCount()
+            let armed =
+                await backend.diagnosticAdmissionCoalescingWindowArmed()
+            return held == 1 && armed
+        }
+        let firstWindowArmed =
+            await backend.diagnosticAdmissionCoalescingWindowArmed()
+        XCTAssertTrue(firstWindowArmed)
+
+        cancelledStart.cancel()
+        _ = try? await cancelledStart.value
+        await waitUntil {
+            let held =
+                await backend.diagnosticPendingAdmissionRequestCount()
+            let armed =
+                await backend.diagnosticAdmissionCoalescingWindowArmed()
+            return held == 0 && !armed
+        }
+        let windowArmedAfterCancellation =
+            await backend.diagnosticAdmissionCoalescingWindowArmed()
+        XCTAssertFalse(
+            windowArmedAfterCancellation,
+            "the cancelled cohort must not leave a stale timer for the next request")
+
+        let replacementStart = Task {
+            try await backend.start(
+                request(text: "replacement", maxTokens: 2))
+        }
+        await waitUntil {
+            let held =
+                await backend.diagnosticPendingAdmissionRequestCount()
+            let armed =
+                await backend.diagnosticAdmissionCoalescingWindowArmed()
+            return held == 1 && armed
+        }
+        let replacementWindowArmed =
+            await backend.diagnosticAdmissionCoalescingWindowArmed()
+        XCTAssertTrue(replacementWindowArmed)
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let replacement = try await replacementStart.value
+
+        _ = await replacement.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testDynamicAdmissionShutdownReleasesEveryHeldContinuation()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["held": [10]],
+            pieces: [1: "h"],
+            stopTokenIDs: [99])
+        let start = Task {
+            try await backend.start(request(text: "held", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+
+        await backend.shutdown()
+
+        do {
+            _ = try await start.value
+            XCTFail("Expected shutdown to release the held start")
+        } catch let error as ContinuousServingBackendError {
+            XCTAssertEqual(error, .shuttingDown)
+        }
+        let pendingCount =
+            await backend.diagnosticPendingAdmissionRequestCount()
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(
+            pendingCount,
+            0)
+        XCTAssertTrue(snapshots.isEmpty)
+    }
+
+    func testDynamicAdmissionRejectsQueueOverflowBeforeCoordinatorAdmission()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "held": [10],
+                "overflow": [20],
+            ],
+            pieces: [1: "h", 2: "o"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            maximumQueuedRequests: 0)
+        let held = Task {
+            try await backend.start(request(text: "held", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+
+        do {
+            _ = try await backend.start(
+                request(text: "overflow", maxTokens: 2))
+            XCTFail("Expected the bounded admission queue to reject overflow")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(
+                error,
+                .queueFull(retryAfterSeconds: 2))
+        }
+        let snapshots = await coordinator.snapshots()
+        XCTAssertTrue(snapshots.isEmpty)
+
+        held.cancel()
+        _ = try? await held.value
+        await backend.shutdown()
+    }
+
+    func testDefaultConfigurationStillStartsImmediateBatchNoSpec()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 2),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["default": [10]],
+            pieces: [1: "d"],
+            stopTokenIDs: [99])
+
+        let handle = try await backend.start(
+            request(text: "default", maxTokens: 2))
+
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            coordinatorIDs,
+            [BatchRequestID(1)])
+        try await runUntilDecode(coordinator, recorder: recorder)
+        XCTAssertEqual(
+            recorder.decodeActions.first,
+            .solo(BatchRequestID(1), speculationAllowed: false))
+
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
     func testContinuousRoutePublishesExactTextUsageAndResolvedStopSet() async throws {
         let recorder = ContinuousRuntimeRecorder()
         let coordinator = ContinuousBatchCoordinator(
@@ -358,6 +1184,53 @@ final class ContinuousServingBackendTests: XCTestCase {
         await permanentBackend.shutdown()
     }
 
+    func testDynamicAdmissionRejectsPermanentOversizeBeforeItOccupiesHoldOrQueue()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: AdmissionValidationFailureContinuousRuntime(
+                error: .contextLimitExceeded(
+                    BatchRequestID(1),
+                    requested: 4_097,
+                    limit: 4_096)),
+            automaticDrive: false,
+            publicationCapacity: 1)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["oversized": [10]],
+            pieces: [:],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            maximumQueuedRequests: 1)
+
+        let start = Task {
+            try await backend.start(
+                request(text: "oversized", maxTokens: 1))
+        }
+        for _ in 0 ..< 100 {
+            await Task.yield()
+        }
+        let pending =
+            await backend.diagnosticPendingAdmissionRequestCount()
+        XCTAssertEqual(
+            pending,
+            0,
+            "permanently oversized work must fail before dynamic hold/queue admission")
+        if pending != 0 {
+            start.cancel()
+        }
+        do {
+            _ = try await start.value
+            XCTFail("Expected a typed request-size admission failure")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(error, .requestTooLarge())
+        } catch is CancellationError {
+            XCTFail("oversized request reached the dynamic hold instead of failing preflight")
+        }
+        await backend.shutdown()
+    }
+
     func testBoundedDiagnosticsExposeCoordinatorMembershipAndTraceOnly()
         async throws
     {
@@ -525,6 +1398,7 @@ private extension BatchDecodeAction {
 private final class ContinuousRuntimeRecorder: Sendable {
     private struct State: Sendable {
         var decodeActions: [BatchDecodeAction] = []
+        var admissionBatchSizes: [Int] = []
         var activeRequests = 0
     }
 
@@ -534,12 +1408,19 @@ private final class ContinuousRuntimeRecorder: Sendable {
         state.withLock { $0.decodeActions }
     }
 
+    var admissionBatchSizes: [Int] {
+        state.withLock { $0.admissionBatchSizes }
+    }
+
     func record(_ action: BatchDecodeAction) {
         state.withLock { $0.decodeActions.append(action) }
     }
 
     func admitted(_ count: Int) {
-        state.withLock { $0.activeRequests += count }
+        state.withLock {
+            $0.admissionBatchSizes.append(count)
+            $0.activeRequests += count
+        }
     }
 
     func removed() {
@@ -558,27 +1439,60 @@ private final class ContinuousRuntimeRecorder: Sendable {
     }
 }
 
+private final class BlockingRuntimeResourceSnapshotGate: Sendable {
+    private struct State: Sendable {
+        var hasEntered = false
+        var isReleased = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var hasEntered: Bool {
+        state.withLock(\.hasEntered)
+    }
+
+    func wait() {
+        state.withLock { $0.hasEntered = true }
+        while !state.withLock(\.isReleased) {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+    }
+
+    func release() {
+        state.withLock { $0.isReleased = true }
+    }
+}
+
 private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     private struct Slot {
         var processedTokens = 0
         var ready = false
-        var pendingSoloLookahead = false
+        var soloPipelineState: BatchSoloPipelineState = .canonical
         var script: [Int]
         var cursor = 0
     }
 
     private let scriptsByPromptHead: [Int: [Int]]
     private let recorder: ContinuousRuntimeRecorder
+    private let allowsSpeculation: Bool
+    private let speculativeSoloState: BatchSoloPipelineState
+    private let resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate?
     private var admittedIDs: Set<BatchRequestID> = []
     private var promptHeadByID: [BatchRequestID: Int] = [:]
     private var slots: [BatchRequestID: Slot] = [:]
 
     init(
         scriptsByPromptHead: [Int: [Int]],
-        recorder: ContinuousRuntimeRecorder
+        recorder: ContinuousRuntimeRecorder,
+        allowsSpeculation: Bool = false,
+        speculativeSoloState: BatchSoloPipelineState = .speculative,
+        resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate? = nil
     ) {
         self.scriptsByPromptHead = scriptsByPromptHead
         self.recorder = recorder
+        self.allowsSpeculation = allowsSpeculation
+        self.speculativeSoloState = speculativeSoloState
+        self.resourceSnapshotGate = resourceSnapshotGate
     }
 
     func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
@@ -587,7 +1501,8 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     }
 
     func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
-        recorder.resources
+        resourceSnapshotGate?.wait()
+        return recorder.resources
     }
 
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
@@ -617,31 +1532,33 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     ) throws -> [ContinuousBatchRuntimeDecodeResult] {
         recorder.record(action)
         let ids: [BatchRequestID]
-        let pendingAfter: Bool
+        let stateAfter: BatchSoloPipelineState
         switch action {
         case .solo(let id, let speculationAllowed):
-            guard !speculationAllowed else {
+            guard !speculationAllowed || allowsSpeculation else {
                 throw FixtureContinuousRuntimeError.speculation
             }
             ids = [id]
-            pendingAfter = true
+            stateAfter = speculationAllowed
+                ? speculativeSoloState
+                : .pipelinedLookahead
         case .drainSoloPipeline(let id):
-            guard slots[id]?.pendingSoloLookahead == true else {
+            guard slots[id]?.soloPipelineState.requiresDrain == true else {
                 throw FixtureContinuousRuntimeError.invalidDrain
             }
             ids = [id]
-            pendingAfter = false
+            stateAfter = .canonical
         case .batch(let batchIDs, let speculationAllowed):
-            guard !speculationAllowed else {
+            guard !speculationAllowed || allowsSpeculation else {
                 throw FixtureContinuousRuntimeError.speculation
             }
             guard batchIDs.allSatisfy({
-                slots[$0]?.pendingSoloLookahead == false
+                slots[$0]?.soloPipelineState == .canonical
             }) else {
                 throw FixtureContinuousRuntimeError.invalidBatch
             }
             ids = batchIDs
-            pendingAfter = false
+            stateAfter = .canonical
         }
 
         return try ids.map { id in
@@ -658,13 +1575,13 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
                 tokens = []
                 finished = true
             }
-            slot.pendingSoloLookahead = pendingAfter
+            slot.soloPipelineState = stateAfter
             slots[id] = slot
             return ContinuousBatchRuntimeDecodeResult(
                 id: id,
                 tokens: tokens,
                 finished: finished,
-                hasPendingSoloLookahead: pendingAfter)
+                soloPipelineState: stateAfter)
         }
     }
 
@@ -717,6 +1634,39 @@ private final class AdmissionFailureContinuousRuntime:
     func remove(_ id: BatchRequestID) {}
 }
 
+private final class AdmissionValidationFailureContinuousRuntime:
+    ContinuousBatchRuntime
+{
+    private let error: DenseContinuousBatchRuntimeError
+
+    init(error: DenseContinuousBatchRuntimeError) {
+        self.error = error
+    }
+
+    func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        throw error
+    }
+
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
+        ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 64,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 4_096)
+    }
+
+    func prefill(_ work: ContinuousBatchRuntimePrefill) throws {}
+
+    func decode(
+        _ action: BatchDecodeAction
+    ) throws -> [ContinuousBatchRuntimeDecodeResult] {
+        []
+    }
+
+    func remove(_ id: BatchRequestID) {}
+}
+
 private enum FixtureContinuousRuntimeError: Error {
     case invalidPrefill
     case decodeBeforeReady
@@ -728,8 +1678,10 @@ private enum FixtureContinuousRuntimeError: Error {
 private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
     let promptByText: [String: [Int]]
     let pieces: [Int: String]
+    let renderGate: BlockingRuntimeResourceSnapshotGate?
 
     func render(messages: [OpenAIChatMessage]) throws -> [Int] {
+        renderGate?.wait()
         guard let text = messages.last?.text,
             let prompt = promptByText[text]
         else {
@@ -786,13 +1738,48 @@ private func makeBackend(
         coordinator: coordinator,
         codec: FixtureContinuousTextCodec(
             promptByText: promptByText,
-            pieces: pieces),
+            pieces: pieces,
+            renderGate: nil),
         stopTokenIDs: stopTokenIDs,
         modelStopStrings: [],
         configuration: ContinuousServingBackendConfiguration(
             defaultMaximumCompletionTokens: 8,
             queueRetryAfterSeconds: 2,
             mailboxCapacity: mailboxCapacity))
+}
+
+private func makeDynamicBackend(
+    coordinator: ContinuousBatchCoordinator,
+    promptByText: [String: [Int]],
+    pieces: [Int: String],
+    stopTokenIDs: Set<Int>,
+    maximumBatchRequests: Int = 2,
+    maximumQueuedRequests: Int = 4,
+    coalescing: ContinuousServingAdmissionCoalescing = .manualDiagnostic,
+    mailboxCapacity: BoundedDeltaMailbox.Capacity = .init(
+        maxDeltas: 2,
+        maxBytes: 4_096),
+    renderGate: BlockingRuntimeResourceSnapshotGate? = nil
+) -> ContinuousServingBackend {
+    ContinuousServingBackend(
+        launchedModel: "fixture",
+        coordinator: coordinator,
+        codec: FixtureContinuousTextCodec(
+            promptByText: promptByText,
+            pieces: pieces,
+            renderGate: renderGate),
+        stopTokenIDs: stopTokenIDs,
+        modelStopStrings: [],
+        configuration: ContinuousServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 8,
+            queueRetryAfterSeconds: 2,
+            mailboxCapacity: mailboxCapacity,
+            admission: .dynamic(
+                configuration: ServingAdmissionConfiguration(
+                    soloPLDQualified: true,
+                    maximumBatchRequests: maximumBatchRequests,
+                    maximumQueuedRequests: maximumQueuedRequests),
+                coalescing: coalescing)))
 }
 
 private func request(
@@ -843,6 +1830,24 @@ private func assertMailboxCancelled(
             file: file,
             line: line)
     }
+}
+
+private func runUntilDecode(
+    _ coordinator: ContinuousBatchCoordinator,
+    recorder: ContinuousRuntimeRecorder,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async throws {
+    for _ in 0 ..< 100 {
+        if !recorder.decodeActions.isEmpty {
+            return
+        }
+        let advanced = try await coordinator.runOneTick()
+        if !advanced {
+            break
+        }
+    }
+    XCTFail("Coordinator did not reach decode", file: file, line: line)
 }
 
 private func waitUntil(

@@ -118,11 +118,27 @@ public enum ContinuousBatchSchedulerError: Error, Sendable, Equatable {
     case outputBudgetExceeded(BatchRequestID, attempted: Int, remaining: Int)
 }
 
+/// Cache/pipeline state left by the most recent solo decode action.
+///
+/// `pipelinedLookahead` means KV contains every emitted token and the runtime has the next
+/// greedy token staged. `speculative` means the last emitted PLD bonus token is staged but is
+/// not yet committed to KV. Both require a drain before shared-batch membership, but only the
+/// speculative drain is allowed to be outputless because its staged token was already emitted.
+public enum BatchSoloPipelineState: Sendable, Equatable {
+    case canonical
+    case pipelinedLookahead
+    case speculative
+
+    public var requiresDrain: Bool { self != .canonical }
+}
+
 public enum BatchSlotPhase: Sendable, Equatable {
     case queued
     case prefilling(processedTokens: Int, totalTokens: Int)
     case ready
-    case decoding(emittedTokens: Int, hasPendingSoloLookahead: Bool)
+    case decoding(
+        emittedTokens: Int,
+        soloPipelineState: BatchSoloPipelineState)
 }
 
 public struct BatchSlotSnapshot: Sendable, Equatable {
@@ -172,18 +188,38 @@ public struct BatchDecodeOutcome: Sendable, Equatable {
     public let id: BatchRequestID
     public let emittedTokenCount: Int
     public let finished: Bool
-    public let hasPendingSoloLookahead: Bool
+    public let soloPipelineState: BatchSoloPipelineState
 
+    public var hasPendingSoloLookahead: Bool {
+        soloPipelineState.requiresDrain
+    }
+
+    public init(
+        id: BatchRequestID,
+        emittedTokenCount: Int,
+        finished: Bool,
+        soloPipelineState: BatchSoloPipelineState
+    ) {
+        self.id = id
+        self.emittedTokenCount = emittedTokenCount
+        self.finished = finished
+        self.soloPipelineState = soloPipelineState
+    }
+
+    /// Source-compatible bridge for existing non-speculative runtimes and fixtures.
     public init(
         id: BatchRequestID,
         emittedTokenCount: Int,
         finished: Bool,
         hasPendingSoloLookahead: Bool
     ) {
-        self.id = id
-        self.emittedTokenCount = emittedTokenCount
-        self.finished = finished
-        self.hasPendingSoloLookahead = hasPendingSoloLookahead
+        self.init(
+            id: id,
+            emittedTokenCount: emittedTokenCount,
+            finished: finished,
+            soloPipelineState: hasPendingSoloLookahead
+                ? .pipelinedLookahead
+                : .canonical)
     }
 }
 
@@ -387,8 +423,8 @@ public struct ContinuousBatchScheduler: Sendable {
         let decode: BatchDecodeAction?
         if selectedDecodeCandidates.count >= 2 {
             if let pending = selectedDecodeCandidates.first(where: {
-                if case .decoding(_, hasPendingSoloLookahead: true) = $0.phase {
-                    return true
+                if case .decoding(_, let state) = $0.phase {
+                    return state.requiresDrain
                 }
                 return false
             }) {
@@ -530,8 +566,22 @@ public struct ContinuousBatchScheduler: Sendable {
     ) throws {
         for id in expectedIDs {
             guard let slot = slots[id], let outcome = outcomes[id] else { continue }
+            let previousSoloState: BatchSoloPipelineState = {
+                guard case .decoding(_, let state) = slot.phase else {
+                    return .canonical
+                }
+                return state
+            }()
+            let isOutputlessSpeculativeDrain =
+                action == .drainSoloPipeline(id)
+                && previousSoloState == .speculative
+                && outcome.emittedTokenCount == 0
+                && !outcome.finished
+                && outcome.soloPipelineState == .canonical
             guard outcome.emittedTokenCount >= 0,
-                outcome.emittedTokenCount > 0 || outcome.finished
+                outcome.emittedTokenCount > 0
+                    || outcome.finished
+                    || isOutputlessSpeculativeDrain
             else {
                 throw ContinuousBatchSchedulerError.invalidEmittedTokenCount(
                     id,
@@ -559,7 +609,7 @@ public struct ContinuousBatchScheduler: Sendable {
 
             switch action {
             case .drainSoloPipeline, .batch:
-                guard !outcome.hasPendingSoloLookahead else {
+                guard outcome.soloPipelineState == .canonical else {
                     throw ContinuousBatchSchedulerError.invalidPendingLookahead(id)
                 }
                 guard outcome.emittedTokenCount <= 1 else {
@@ -574,6 +624,11 @@ public struct ContinuousBatchScheduler: Sendable {
                         id,
                         outcome.emittedTokenCount
                     )
+                }
+                if !speculationAllowed,
+                    outcome.soloPipelineState == .speculative
+                {
+                    throw ContinuousBatchSchedulerError.invalidPendingLookahead(id)
                 }
             case nil:
                 break
@@ -600,7 +655,7 @@ public struct ContinuousBatchScheduler: Sendable {
         } else {
             slot.phase = .decoding(
                 emittedTokens: emitted,
-                hasPendingSoloLookahead: outcome.hasPendingSoloLookahead
+                soloPipelineState: outcome.soloPipelineState
             )
             slots[outcome.id] = slot
         }

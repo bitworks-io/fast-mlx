@@ -14,7 +14,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     private struct Slot {
         var processedTokens = 0
         var ready = false
-        var hasPendingSoloLookahead = false
+        var soloPipelineState: BatchSoloPipelineState = .canonical
         var script: [Int]
         var cursor = 0
     }
@@ -23,6 +23,8 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     private let reverseBatchResults: Bool
     private let omittedPromptHead: Int?
     private let speculativeSoloWidth: Int
+    private let soloPipelineStateAfterSolo: BatchSoloPipelineState
+    private let outputlessSpeculativeDrain: Bool
     private let resources: ContinuousBatchRuntimeResourceSnapshot?
     private let cohortByPromptHead: [Int: BatchDecodeCohort]
     private var slots: [BatchRequestID: Slot] = [:]
@@ -33,6 +35,8 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         reverseBatchResults: Bool = false,
         omittedPromptHead: Int? = nil,
         speculativeSoloWidth: Int = 1,
+        soloPipelineStateAfterSolo: BatchSoloPipelineState = .pipelinedLookahead,
+        outputlessSpeculativeDrain: Bool = false,
         resources: ContinuousBatchRuntimeResourceSnapshot? = nil,
         cohortByPromptHead: [Int: BatchDecodeCohort] = [:]
     ) {
@@ -40,6 +44,8 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         self.reverseBatchResults = reverseBatchResults
         self.omittedPromptHead = omittedPromptHead
         self.speculativeSoloWidth = speculativeSoloWidth
+        self.soloPipelineStateAfterSolo = soloPipelineStateAfterSolo
+        self.outputlessSpeculativeDrain = outputlessSpeculativeDrain
         self.resources = resources
         self.cohortByPromptHead = cohortByPromptHead
     }
@@ -79,26 +85,28 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
 
     func decode(_ action: BatchDecodeAction) throws -> [ContinuousBatchRuntimeDecodeResult] {
         let ids: [BatchRequestID]
-        let pendingAfter: Bool
+        let soloPipelineStateAfter: BatchSoloPipelineState
         let resultWidth: Int
         switch action {
         case .solo(let id, let speculationAllowed):
             ids = [id]
-            pendingAfter = true
+            soloPipelineStateAfter = speculationAllowed
+                ? soloPipelineStateAfterSolo
+                : .pipelinedLookahead
             resultWidth = speculationAllowed ? speculativeSoloWidth : 1
         case .drainSoloPipeline(let id):
-            guard slots[id]?.hasPendingSoloLookahead == true else {
+            guard let state = slots[id]?.soloPipelineState, state.requiresDrain else {
                 throw ScriptedBatchRuntimeError.drainWithoutPending(id)
             }
             ids = [id]
-            pendingAfter = false
-            resultWidth = 1
+            soloPipelineStateAfter = .canonical
+            resultWidth = state == .speculative && outputlessSpeculativeDrain ? 0 : 1
         case .batch(let batchIDs, _):
-            for id in batchIDs where slots[id]?.hasPendingSoloLookahead == true {
+            for id in batchIDs where slots[id]?.soloPipelineState.requiresDrain == true {
                 throw ScriptedBatchRuntimeError.batchWithPending(id)
             }
             ids = batchIDs
-            pendingAfter = false
+            soloPipelineStateAfter = .canonical
             resultWidth = 1
         }
 
@@ -120,14 +128,14 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
             } else {
                 finished = true
             }
-            slot.hasPendingSoloLookahead = pendingAfter
+            slot.soloPipelineState = soloPipelineStateAfter
             slots[id] = slot
             results.append(
                 ContinuousBatchRuntimeDecodeResult(
                     id: id,
                     tokens: tokens,
                     finished: finished,
-                    hasPendingSoloLookahead: pendingAfter))
+                    soloPipelineState: soloPipelineStateAfter))
         }
         if reverseBatchResults, case .batch = action {
             results.reverse()
@@ -387,7 +395,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                 id: blockedHandle.id,
                 previousPhase: .decoding(
                     emittedTokens: 1,
-                    hasPendingSoloLookahead: true)))
+                    soloPipelineState: .pipelinedLookahead)))
         await coordinator.waitUntilIdle()
         let cancelledSlot = await coordinator.snapshot(for: blockedHandle.id)
         let cancelledTokens = await blockedHandle.tokens.snapshot()
@@ -545,6 +553,82 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertEqual(shortTokens, [201, 202])
     }
 
+    func testOutputlessSpeculativeDrainDoesNotWaitForPublicationCapacityBeforeBatchJoin()
+        async throws
+    {
+        let runtime = ScriptedBatchRuntime(
+            scriptsByPromptHead: [
+                10: [101, 102, 2],
+                20: [201, 202, 2],
+            ],
+            soloPipelineStateAfterSolo: .speculative,
+            outputlessSpeculativeDrain: true)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 2, prefill: 2, chunk: 2),
+            runtime: runtime,
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 64)
+        let handles = try await coordinator.submitBatch([
+            submission([10, 11, 12, 13]),
+            submission([20, 21], speculation: true),
+        ])
+
+        _ = try await coordinator.runOneTick() // both prefill; short becomes ready
+        _ = try await coordinator.runOneTick() // solo(short), then long prefill
+        let blockedShort = await handles[1].tokens.snapshot()
+        XCTAssertEqual(blockedShort.bufferedTokens, 1)
+
+        let drainTask = Task { try await coordinator.runOneTick() }
+        for _ in 0 ..< 1_000 {
+            let snapshot = await coordinator.snapshot(for: handles[1].id)
+            if snapshot?.phase == .decoding(
+                emittedTokens: 1,
+                soloPipelineState: .canonical)
+            {
+                break
+            }
+            await Task.yield()
+        }
+
+        guard
+            let drained = await coordinator.snapshot(for: handles[1].id),
+            drained.phase == .decoding(
+                emittedTokens: 1,
+                soloPipelineState: .canonical)
+        else {
+            drainTask.cancel()
+            do {
+                _ = try await drainTask.value
+            } catch {
+                // Expected on the pre-fix path: drain is incorrectly blocked by output capacity.
+            }
+            return XCTFail(
+                "outputless speculative drain should not wait for stream publication capacity")
+        }
+        let workRemainsAfterDrain = try await drainTask.value
+        XCTAssertTrue(workRemainsAfterDrain)
+
+        var shortIterator = handles[1].tokens.makeAsyncIterator()
+        let shortToken = try await shortIterator.next()
+        XCTAssertEqual(shortToken, 201)
+
+        _ = try await coordinator.runOneTick()
+        let operations = await coordinator.executionTrace().compactMap { event in
+            if case .operation(let operation) = event { return operation }
+            return nil
+        }
+        XCTAssertTrue(
+            operations.contains(
+                .decode(.drainSoloPipeline(handles[1].id))))
+        XCTAssertTrue(
+            operations.contains(
+                .decode(
+                    .batch(
+                        [handles[0].id, handles[1].id],
+                        speculationAllowed: false))))
+    }
+
     func testMultiTokenSpeculativeSoloResultConsumesEOSAndHonorsBudget() async throws {
         let eosCoordinator = ContinuousBatchCoordinator(
             configuration: configuration(chunk: 8),
@@ -619,7 +703,8 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
             .cancelled(
                 id: decodingHandle.id,
                 previousPhase: .decoding(
-                    emittedTokens: 1, hasPendingSoloLookahead: true)))
+                    emittedTokens: 1,
+                    soloPipelineState: .pipelinedLookahead)))
     }
 
     func testDecodingCancellationReusesSlotAndReformsSharedBatch() async throws {
@@ -669,7 +754,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                 id: initial[1].id,
                 previousPhase: .decoding(
                     emittedTokens: 1,
-                    hasPendingSoloLookahead: false)))
+                    soloPipelineState: .canonical)))
         try await drain(coordinator)
 
         let survivorTokens = try await collect(initial[0].tokens)

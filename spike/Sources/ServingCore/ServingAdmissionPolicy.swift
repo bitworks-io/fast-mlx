@@ -69,6 +69,10 @@ public struct ServingAdmissionReducer: Equatable, Sendable {
 
     public private(set) var currentExecutionRoute: ServingExecutionRoute?
 
+    public var heldRequestIDs: [ServingRequestID] { held }
+    public var queuedRequestIDs: [ServingRequestID] { queued }
+    public var executingRequestIDs: [ServingRequestID] { executing }
+
     public init(configuration: ServingAdmissionConfiguration) {
         self.configuration = configuration
     }

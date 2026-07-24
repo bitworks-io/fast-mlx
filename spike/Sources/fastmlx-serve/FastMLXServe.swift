@@ -87,6 +87,7 @@ private struct PreparedServingBackend {
             let nativeCacheKinds = Set(
                 report.nativeCacheKinds.map(\.rawValue)
             ).sorted().joined(separator: ",")
+            let soloPLD = report.soloPLDPolicy
             return """
                 fastmlx-serve mode=\(mode) route=\(report.route.rawValue) \
                 model=\(report.launchedModel) \
@@ -111,6 +112,11 @@ private struct PreparedServingBackend {
                 prefill_chunk_size=\(report.prefillChunkSize) \
                 max_queued_requests=\(report.maxQueuedRequests) \
                 publication_capacity=\(report.publicationCapacity) \
+                solo_pld_policy_configured=\(soloPLD != nil) \
+                solo_pld_ngram=\(soloPLD?.ngram ?? 0) \
+                solo_pld_max_draft=\(soloPLD?.maxDraft ?? 0) \
+                solo_pld_lookback=\(soloPLD?.lookback ?? 0) \
+                solo_pld_compiled_verify=\(soloPLD?.compiledVerify ?? false) \
                 model_proof_verified=\(report.modelProofVerified) \
                 listening=\(localAddress)
                 """

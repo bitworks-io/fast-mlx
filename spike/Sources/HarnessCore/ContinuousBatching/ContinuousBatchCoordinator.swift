@@ -31,18 +31,38 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
     public let id: BatchRequestID
     public let tokens: [Int]
     public let finished: Bool
-    public let hasPendingSoloLookahead: Bool
+    public let soloPipelineState: BatchSoloPipelineState
 
+    public var hasPendingSoloLookahead: Bool {
+        soloPipelineState.requiresDrain
+    }
+
+    public init(
+        id: BatchRequestID,
+        tokens: [Int],
+        finished: Bool,
+        soloPipelineState: BatchSoloPipelineState
+    ) {
+        self.id = id
+        self.tokens = tokens
+        self.finished = finished
+        self.soloPipelineState = soloPipelineState
+    }
+
+    /// Source-compatible bridge for existing non-speculative runtimes and fixtures.
     public init(
         id: BatchRequestID,
         tokens: [Int],
         finished: Bool,
         hasPendingSoloLookahead: Bool
     ) {
-        self.id = id
-        self.tokens = tokens
-        self.finished = finished
-        self.hasPendingSoloLookahead = hasPendingSoloLookahead
+        self.init(
+            id: id,
+            tokens: tokens,
+            finished: finished,
+            soloPipelineState: hasPendingSoloLookahead
+                ? .pipelinedLookahead
+                : .canonical)
     }
 }
 
@@ -57,19 +77,81 @@ public struct ContinuousBatchRuntimeAdmission: Sendable, Equatable {
 }
 
 /// Value-only resource state exported by an actor-confined runtime for service evidence.
+public struct ContinuousBatchRuntimeSpeculationSnapshot:
+    Sendable, Equatable, Codable
+{
+    public let requestedRequests: Int
+    public let activeSessions: Int
+    public let draftedTokens: Int
+    public let acceptedDraftTokens: Int
+    public let verificationRounds: Int
+    public let fallbackRounds: Int
+
+    public init(
+        requestedRequests: Int,
+        activeSessions: Int,
+        draftedTokens: Int,
+        acceptedDraftTokens: Int,
+        verificationRounds: Int,
+        fallbackRounds: Int
+    ) {
+        self.requestedRequests = requestedRequests
+        self.activeSessions = activeSessions
+        self.draftedTokens = draftedTokens
+        self.acceptedDraftTokens = acceptedDraftTokens
+        self.verificationRounds = verificationRounds
+        self.fallbackRounds = fallbackRounds
+    }
+
+    /// Actual PLD engagement requires a real non-empty verify round. Merely allowing
+    /// speculation on a scheduler action is not evidence that the drafter engaged.
+    /// This is cumulative process history; service-run telemetry must use
+    /// `speculationEngagedDuringInterval(from:to:)` instead of reading this directly.
+    public var engaged: Bool {
+        draftedTokens > 0 && verificationRounds > 0
+    }
+}
+
+/// Returns true only when actual speculative work happened inside one measurement interval.
+///
+/// `activeSessions` is a point-in-time gauge and may rise or fall. The other speculation fields
+/// are cumulative runtime counters, so any regression or missing start/end pair fails closed.
+public func speculationEngagedDuringInterval(
+    from start: ContinuousBatchRuntimeSpeculationSnapshot?,
+    to end: ContinuousBatchRuntimeSpeculationSnapshot?
+) -> Bool {
+    guard let start, let end else { return false }
+    guard start.activeSessions >= 0, end.activeSessions >= 0 else { return false }
+    let cumulativePairs = [
+        (start.requestedRequests, end.requestedRequests),
+        (start.draftedTokens, end.draftedTokens),
+        (start.acceptedDraftTokens, end.acceptedDraftTokens),
+        (start.verificationRounds, end.verificationRounds),
+        (start.fallbackRounds, end.fallbackRounds),
+    ]
+    guard cumulativePairs.allSatisfy({ $0.0 >= 0 && $0.1 >= $0.0 }) else {
+        return false
+    }
+    return end.draftedTokens - start.draftedTokens > 0
+        && end.verificationRounds - start.verificationRounds > 0
+}
+
 public struct ContinuousBatchRuntimeResourceSnapshot: Sendable, Equatable, Codable {
     public let kvBytesPerToken: Int
     public let reservedKVBytes: Int
     public let maxReservedKVBytes: Int
+    public let speculation: ContinuousBatchRuntimeSpeculationSnapshot?
 
     public init(
         kvBytesPerToken: Int,
         reservedKVBytes: Int,
-        maxReservedKVBytes: Int
+        maxReservedKVBytes: Int,
+        speculation: ContinuousBatchRuntimeSpeculationSnapshot? = nil
     ) {
         self.kvBytesPerToken = kvBytesPerToken
         self.reservedKVBytes = reservedKVBytes
         self.maxReservedKVBytes = maxReservedKVBytes
+        self.speculation = speculation
     }
 }
 
@@ -247,6 +329,28 @@ public actor ContinuousBatchCoordinator {
         -> [ContinuousBatchRequestHandle]
     {
         try enqueue(submissions)
+    }
+
+    /// Validate one request against immutable runtime capability and per-request limits without
+    /// consuming an ID, scheduler slot, cache reservation, or queue position.
+    public func validateSubmission(
+        _ submission: ContinuousBatchSubmission
+    ) throws {
+        guard !shuttingDown else {
+            throw ContinuousBatchCoordinatorError.shuttingDown
+        }
+        guard !submission.stopTokenIDs.isEmpty,
+            submission.stopTokenIDs.allSatisfy({ $0 >= 0 })
+        else {
+            throw ContinuousBatchCoordinatorError.invalidStopTokenIDs
+        }
+        guard let rawID = nextRequestID else {
+            throw ContinuousBatchCoordinatorError.requestIDExhausted
+        }
+        _ = try runtime.decodeCohort(
+            for: ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(rawID),
+                submission: submission))
     }
 
     private func enqueue(_ submissions: [ContinuousBatchSubmission]) throws
@@ -468,6 +572,9 @@ public actor ContinuousBatchCoordinator {
                 }
             }
 
+            try validateReservedPublicationCoverage(
+                preparedDecode,
+                reservations: reservations)
             try scheduler.apply(
                 plan,
                 decodeOutcomes: preparedDecode.map(\.outcome))
@@ -495,7 +602,7 @@ public actor ContinuousBatchCoordinator {
         let ids: [BatchRequestID]
         switch decode {
         case .drainSoloPipeline(let id), .solo(let id, _):
-            ids = [id]
+            ids = requiresPublicationReservation(for: decode, id: id) ? [id] : []
         case .batch(let batchIDs, _):
             ids = batchIDs
         }
@@ -563,6 +670,29 @@ public actor ContinuousBatchCoordinator {
         }
     }
 
+    private func requiresPublicationReservation(
+        for decode: BatchDecodeAction,
+        id: BatchRequestID
+    ) -> Bool {
+        guard case .drainSoloPipeline(let drainID) = decode,
+            drainID == id,
+            case .decoding(_, .speculative) = scheduler.snapshot(for: id)?.phase
+        else {
+            return true
+        }
+        return false
+    }
+
+    private func validateReservedPublicationCoverage(
+        _ prepared: [PreparedDecode],
+        reservations: [BatchRequestID: ReservedPublication]
+    ) throws {
+        for result in prepared
+        where !result.visibleTokens.isEmpty && reservations[result.id] == nil {
+            throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(result.id)
+        }
+    }
+
     private func release(
         _ reservations: [BatchRequestID: ReservedPublication]
     ) async {
@@ -608,8 +738,8 @@ public actor ContinuousBatchCoordinator {
                 id: result.id,
                 emittedTokenCount: visible.count,
                 finished: finished,
-                hasPendingSoloLookahead: finished
-                    ? false : result.hasPendingSoloLookahead))
+                soloPipelineState: finished
+                    ? .canonical : result.soloPipelineState))
     }
 
     private func publish(
@@ -620,7 +750,18 @@ public actor ContinuousBatchCoordinator {
         for result in prepared {
             guard let publication = unconsumed.removeValue(forKey: result.id) else {
                 await release(unconsumed)
-                throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(result.id)
+                guard result.visibleTokens.isEmpty else {
+                    throw ContinuousBatchCoordinatorError.unknownRuntimeRequest(result.id)
+                }
+                if result.finished, let state = requests[result.id] {
+                    let timestamp = ProcessInfo.processInfo.systemUptime
+                    runtime.remove(result.id)
+                    requests[result.id] = nil
+                    record(.finished(result.id))
+                    await state.mailbox.finish()
+                    recordTiming(.finished(result.id, timestamp: timestamp))
+                }
+                continue
             }
 
             do {

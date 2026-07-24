@@ -305,4 +305,226 @@ final class SpecDecodeTests: XCTestCase {
         XCTAssertEqual(r.emit, [1, 99])
         XCTAssertTrue(r.done)
     }
+
+    // MARK: - Incremental serving PLD state
+
+    func testIncrementalPLDPlansFromBoundedContextSuffix() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3, 4, 5, 6],
+            drafter: FirstContextTokenDrafter(),
+            maxDraft: 3,
+            lookback: 4)
+        try session.recordFirstToken(7)
+
+        XCTAssertEqual(
+            try session.makeRoundPlan(),
+            .verifyPipelined(draft: [4]))
+    }
+
+    func testIncrementalPLDPipelinedVerifyCommitsExactAcceptedPrefixAndBonus() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10, 11, 12]),
+            maxDraft: 3,
+            lookback: 32)
+        try session.recordFirstToken(9)
+        let plan = try session.makeRoundPlan()
+        XCTAssertEqual(
+            plan,
+            .verifyPipelined(draft: [10, 11, 12]))
+
+        let commit = try session.commitVerification(
+            plan,
+            prefetchedToken: 10,
+            verifyArgmax: [11, 7, 99])
+
+        XCTAssertEqual(
+            commit,
+            IncrementalPLDCommit(
+                acceptedDraftTokens: 2,
+                bonusToken: 7,
+                emittedTokens: [10, 11, 7]))
+        XCTAssertEqual(session.cacheInvariant, .speculative)
+        XCTAssertEqual(session.context, [1, 2, 3, 9, 10, 11, 7])
+    }
+
+    func testIncrementalPLDSpeculativeVerifyIncludesLastEmittedTokenExactlyOnce() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10]),
+            maxDraft: 1,
+            lookback: 32)
+        try session.recordFirstToken(9)
+        let pipelined = try session.makeRoundPlan()
+        _ = try session.commitVerification(
+            pipelined,
+            prefetchedToken: 10,
+            verifyArgmax: [11])
+
+        let speculative = try session.makeRoundPlan()
+        XCTAssertEqual(
+            speculative,
+            .verifySpeculative(lastEmittedToken: 11, draft: [10]))
+        let commit = try session.commitVerification(
+            speculative,
+            prefetchedToken: nil,
+            verifyArgmax: [10, 12])
+
+        XCTAssertEqual(commit.emittedTokens, [10, 12])
+        XCTAssertEqual(session.context, [1, 2, 3, 9, 10, 11, 10, 12])
+        XCTAssertEqual(session.cacheInvariant, .speculative)
+    }
+
+    func testIncrementalPLDColdSpeculativeFallbackReturnsToPipelinedInvariant() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: ColdAfterTokenDrafter(
+                hotUntilLastToken: 11,
+                hotDraft: [10]),
+            maxDraft: 1,
+            lookback: 32)
+        try session.recordFirstToken(9)
+        let verify = try session.makeRoundPlan()
+        _ = try session.commitVerification(
+            verify,
+            prefetchedToken: 10,
+            verifyArgmax: [11])
+
+        XCTAssertEqual(
+            try session.makeRoundPlan(),
+            .fallbackFromSpeculative(lastEmittedToken: 11))
+        try session.commitFallback(emittedToken: 12)
+
+        XCTAssertEqual(session.cacheInvariant, .pipelined)
+        XCTAssertEqual(session.context.suffix(2), [11, 12])
+    }
+
+    func testIncrementalPLDPlanningClampsAndPadsToBoundedVerificationWidth() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10]),
+            maxDraft: 4,
+            lookback: 32)
+        try session.recordFirstToken(9)
+
+        let plan = try session.makeRoundPlan(
+            maximumDraftTokens: 2,
+            fixedDraftWidth: 2)
+        XCTAssertEqual(
+            plan,
+            .verifyPipelined(draft: [10, 10]))
+
+        let commit = try session.commitVerification(
+            plan,
+            prefetchedToken: 10,
+            verifyArgmax: [10, 11])
+        XCTAssertEqual(commit.emittedTokens, [10, 10, 11])
+        XCTAssertEqual(session.draftedTokens, 2)
+    }
+
+    func testIncrementalPLDZeroRemainingDraftBudgetFallsBackWithoutVerification() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10, 11]),
+            maxDraft: 2,
+            lookback: 32)
+        try session.recordFirstToken(9)
+
+        let plan = try session.makeRoundPlan(maximumDraftTokens: 0)
+        XCTAssertEqual(plan, .plainFromPipeline)
+        try session.commitFallback(plan, emittedToken: 10)
+
+        XCTAssertEqual(session.context.suffix(2), [9, 10])
+        XCTAssertEqual(session.cacheInvariant, .pipelined)
+    }
+
+    func testIncrementalPLDCanonicalBatchTokensKeepContextFreshForSoloReentry() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10]),
+            maxDraft: 1,
+            lookback: 32)
+
+        try session.recordCanonicalToken(9)
+        try session.recordCanonicalToken(10)
+
+        XCTAssertEqual(session.context, [1, 2, 3, 9, 10])
+        XCTAssertEqual(session.cacheInvariant, .pipelined)
+        XCTAssertEqual(
+            try session.makeRoundPlan(),
+            .verifyPipelined(draft: [10]))
+    }
+
+    func testIncrementalPLDCanonicalBatchTokensDoNotCountAsFailedDraftRounds() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [42]),
+            maxDraft: 1,
+            lookback: 32)
+
+        try session.recordCanonicalToken(9)
+        for token in 10 ... 13 {
+            try session.recordCanonicalToken(token)
+        }
+
+        XCTAssertEqual(
+            try session.makeRoundPlan(),
+            .verifyPipelined(draft: [42]))
+    }
+
+    func testIncrementalPLDCanonicalDrainRequiresExactSpeculativeBonus() throws {
+        var session = try IncrementalPLDSession(
+            promptTokens: [1, 2, 3],
+            drafter: FixedSpecDrafter(tokens: [10]),
+            maxDraft: 1,
+            lookback: 32)
+        try session.recordFirstToken(9)
+        let verify = try session.makeRoundPlan()
+        _ = try session.commitVerification(
+            verify,
+            prefetchedToken: 10,
+            verifyArgmax: [11])
+
+        XCTAssertThrowsError(
+            try session.recordCanonicalDrain(forwardedToken: 99)
+        ) { error in
+            XCTAssertEqual(
+                error as? IncrementalPLDSessionError,
+                .invalidDrainToken(expected: 11, actual: 99))
+        }
+        try session.recordCanonicalDrain(forwardedToken: 11)
+        XCTAssertEqual(session.cacheInvariant, .pipelined)
+        XCTAssertThrowsError(
+            try session.recordCanonicalDrain(forwardedToken: 11)
+        ) { error in
+            XCTAssertEqual(
+                error as? IncrementalPLDSessionError,
+                .invalidTransition)
+        }
+    }
+}
+
+private struct FixedSpecDrafter: SpecDrafter {
+    let tokens: [Int]
+
+    func propose(context _: [Int], maxDraft: Int) -> [Int] {
+        Array(tokens.prefix(maxDraft))
+    }
+}
+
+private struct FirstContextTokenDrafter: SpecDrafter {
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard maxDraft > 0, let first = context.first else { return [] }
+        return [first]
+    }
+}
+
+private struct ColdAfterTokenDrafter: SpecDrafter {
+    let hotUntilLastToken: Int
+    let hotDraft: [Int]
+
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard context.last != hotUntilLastToken else { return [] }
+        return Array(hotDraft.prefix(maxDraft))
+    }
 }

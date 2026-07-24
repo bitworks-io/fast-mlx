@@ -23,10 +23,15 @@ private final class TinyDenseLanguageModel: Module, LanguageModel, KVCacheDimens
         }
         let (keys, _) = cache.update(keys: values, values: values)
 
-        let historyTarget = keys.sum(axes: [1, 2, 3]).asType(.int32) + 1
-        let target = broadcast(
-            historyTarget.reshaped([inputs.dim(0), 1, 1]),
-            to: [inputs.dim(0), inputs.dim(1), 1])
+        let flatInputs = inputs.asType(.int32)
+        let historyBeforeChunk =
+            keys.sum(axes: [1, 2, 3]).asType(.int32)
+            - flatInputs.sum(axis: 1)
+        let target = (
+            historyBeforeChunk.reshaped([inputs.dim(0), 1])
+                + flatInputs.cumsum(axis: 1)
+                + 1
+        ).expandedDimensions(axis: -1)
         let vocabulary = MLXArray(Int32(0) ..< Int32(vocabularySize))
             .reshaped([1, 1, vocabularySize])
         return (target .== vocabulary).asType(.float32) * 100
@@ -80,12 +85,145 @@ private final class TinyCompressedBatchLanguageModel:
     }
 }
 
+private struct TinyDenseExactDrafter: SpecDrafter {
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard maxDraft > 0 else { return [] }
+        var working = context
+        var result: [Int] = []
+        result.reserveCapacity(maxDraft)
+        for _ in 0 ..< maxDraft {
+            let next = working.reduce(0, +) + 1
+            result.append(next)
+            working.append(next)
+        }
+        return result
+    }
+}
+
+private struct TinyDenseSingleDraftDrafter: SpecDrafter {
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard maxDraft > 0 else { return [] }
+        return [context.reduce(0, +) + 1]
+    }
+}
+
+private struct TinyDenseColdAfterTokenDrafter: SpecDrafter {
+    let coldLastToken: Int
+
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard context.last != coldLastToken else { return [] }
+        return TinyDenseExactDrafter().propose(
+            context: context,
+            maxDraft: maxDraft)
+    }
+}
+
+private struct TinyDenseInvalidDrafter: SpecDrafter {
+    func propose(context _: [Int], maxDraft: Int) -> [Int] {
+        maxDraft > 0 ? [2_048] : []
+    }
+}
+
+private struct TinyNextTokenDrafter: SpecDrafter {
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard let last = context.last, maxDraft > 0 else { return [] }
+        return (1 ... maxDraft).map { last + $0 }
+    }
+}
+
+private struct TinyNextTokenColdAfterTokenDrafter: SpecDrafter {
+    let coldLastToken: Int
+
+    func propose(context: [Int], maxDraft: Int) -> [Int] {
+        guard context.last != coldLastToken else { return [] }
+        return TinyNextTokenDrafter().propose(
+            context: context,
+            maxDraft: maxDraft)
+    }
+}
+
+private final class TinyNonFiniteLanguageModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    let kvHeads = [1]
+
+    func prepare(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray {
+        let values = inputs.asType(.float32).reshaped([
+            inputs.dim(0), 1, inputs.dim(1), 1,
+        ])
+        guard let cache = cache?.first else {
+            preconditionFailure("tiny non-finite model requires one cache")
+        }
+        _ = cache.update(keys: values, values: values)
+        return MLXArray.full(
+            [inputs.dim(0), inputs.dim(1), 2_048],
+            values: MLXArray(Float.nan))
+    }
+}
+
+private final class TinyDelayedNonFiniteLanguageModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    let kvHeads = [1]
+    private let invalidInput: Int32
+
+    init(invalidInput: Int32) {
+        self.invalidInput = invalidInput
+    }
+
+    func prepare(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray {
+        let values = inputs.asType(.float32).reshaped([
+            inputs.dim(0), 1, inputs.dim(1), 1,
+        ])
+        guard let cache = cache?.first else {
+            preconditionFailure("tiny delayed non-finite model requires one cache")
+        }
+        _ = cache.update(keys: values, values: values)
+
+        let targets = (inputs.asType(.int32) + 1).expandedDimensions(axis: -1)
+        let vocabulary = MLXArray(Int32(0) ..< Int32(2_048))
+            .reshaped([1, 1, 2_048])
+        let finite = (targets .== vocabulary).asType(.float32) * 100
+        let invalid = (inputs.asType(.int32) .== invalidInput)
+            .expandedDimensions(axis: -1)
+        return which(
+            invalid,
+            MLXArray.full(
+                [inputs.dim(0), inputs.dim(1), 2_048],
+                values: MLXArray(Float.nan)),
+            finite)
+    }
+}
+
 final class DenseContinuousBatchRuntimeTests: XCTestCase {
     private func makeRuntime(
         allocationChunk: Int = 4,
         maxContextTokens: Int = 32_768,
         initialDecodeReserve: Int = 384,
-        maxReservedKVBytes: Int? = nil
+        maxReservedKVBytes: Int? = nil,
+        soloPLDConfiguration: SpecDecodeConfig? = nil
     ) throws
         -> DenseContinuousBatchRuntime
     {
@@ -94,7 +232,8 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
             allocationChunk: allocationChunk,
             maxContextTokens: maxContextTokens,
             initialDecodeReserve: initialDecodeReserve,
-            maxReservedKVBytes: maxReservedKVBytes)
+            maxReservedKVBytes: maxReservedKVBytes,
+            soloPLDConfiguration: soloPLDConfiguration)
     }
 
     private func prefill(
@@ -366,6 +505,638 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(scalar, [11, 22, 44, 88])
     }
 
+    func testIncrementalSoloPLDMatchesScalarAndDrainsWithoutDuplicateToken() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 3,
+                gate: PLDGate(
+                    window: 8,
+                    minimumSamples: 4,
+                    minAcceptPerStep: 0.5,
+                    cooldown: 8),
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let speculative = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let drain = try runtime.decode(
+            .drainSoloPipeline(BatchRequestID(1)))
+
+        XCTAssertEqual(first.map(\.tokens), [[11]])
+        XCTAssertEqual(first.map(\.soloPipelineState), [.pipelinedLookahead])
+        XCTAssertEqual(speculative.map(\.tokens), [[22, 44, 88, 176]])
+        XCTAssertEqual(speculative.map(\.soloPipelineState), [.speculative])
+        XCTAssertEqual(
+            drain,
+            [
+                ContinuousBatchRuntimeDecodeResult(
+                    id: BatchRequestID(1),
+                    tokens: [],
+                    finished: false,
+                    soloPipelineState: .canonical),
+            ])
+        let engagedResources = try XCTUnwrap(runtime.resourceSnapshot())
+        XCTAssertEqual(
+            engagedResources.speculation,
+            ContinuousBatchRuntimeSpeculationSnapshot(
+                requestedRequests: 1,
+                activeSessions: 1,
+                draftedTokens: 3,
+                acceptedDraftTokens: 3,
+                verificationRounds: 1,
+                fallbackRounds: 0))
+
+        let reference = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16)
+        try prefill(
+            reference,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+        let expected = try (0 ..< 6).map { _ in
+            try reference.decode(
+                .solo(BatchRequestID(1), speculationAllowed: false))[0]
+                .tokens[0]
+        }
+        let afterDrain = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: false))
+        XCTAssertEqual(
+            first[0].tokens + speculative[0].tokens + afterDrain[0].tokens,
+            expected)
+
+        runtime.remove(BatchRequestID(1))
+        let releasedResources = try XCTUnwrap(runtime.resourceSnapshot())
+        XCTAssertEqual(releasedResources.speculation?.activeSessions, 0)
+        XCTAssertEqual(releasedResources.speculation?.draftedTokens, 3)
+        XCTAssertEqual(releasedResources.speculation?.verificationRounds, 1)
+    }
+
+    func testIncrementalSoloPLDDrainThenSharedBatchMatchesScalarControls() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 2,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(2),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [20],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 16)
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let speculative = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        try prefill(runtime, id: 2, tokens: [20], chunks: [1], maxOutputTokens: 16)
+        let drain = try runtime.decode(.drainSoloPipeline(BatchRequestID(1)))
+        let shared = try runtime.decode(
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2)],
+                speculationAllowed: false))
+
+        XCTAssertTrue(drain[0].tokens.isEmpty)
+        XCTAssertEqual(drain[0].soloPipelineState, .canonical)
+
+        var actual: [UInt64: [Int]] = [
+            1: first[0].tokens + speculative[0].tokens,
+            2: [],
+        ]
+        for result in shared {
+            actual[result.id.rawValue, default: []].append(
+                contentsOf: result.tokens)
+        }
+
+        for (id, prompt) in [(UInt64(1), 10), (UInt64(2), 20)] {
+            let control = try makeRuntime(
+                allocationChunk: 8,
+                maxContextTokens: 128,
+                initialDecodeReserve: 16)
+            try prefill(
+                control,
+                id: id,
+                tokens: [prompt],
+                chunks: [1],
+                maxOutputTokens: 16)
+            let expectedCount = actual[id]!.count
+            let expected = try (0 ..< expectedCount).map { _ in
+                try control.decode(
+                    .solo(
+                        BatchRequestID(id),
+                        speculationAllowed: false))[0].tokens[0]
+            }
+            XCTAssertEqual(actual[id], expected, "request \(id)")
+        }
+    }
+
+    func testIncrementalSoloPLDRejectsLossyKVAtRuntimeConstruction() throws {
+        XCTAssertThrowsError(
+            try DenseContinuousBatchRuntime(
+                testing: TinyCompressedBatchLanguageModel(),
+                allocationChunk: 64,
+                maxContextTokens: 64,
+                initialDecodeReserve: 8,
+                kvCacheKind: .affine(.k4v2G64),
+                affineAttentionMode: .splitQuantizedMM,
+                compressedKVAttentionAdmission:
+                    try makeCompressedBatchAdmission(),
+                soloPLDConfiguration: SpecDecodeConfig(),
+                keyValueHeadCount: 2,
+                headDimension: 128,
+                elementBytes: 2)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .speculationUnsupported)
+        }
+    }
+
+    func testIncrementalSoloPLDCompiledShortDraftPadsWithoutChangingScalarOutput()
+        throws
+    {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseSingleDraftDrafter(),
+                maxDraft: 3,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let padded = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertEqual(first[0].tokens + padded[0].tokens, [11, 22, 44])
+        XCTAssertEqual(padded[0].soloPipelineState, .speculative)
+    }
+
+    func testIncrementalSoloPLDLastOutputTokenFallsBackWithinContextLimit() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 12,
+            initialDecodeReserve: 2,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 3,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 2,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 2)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let last = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertEqual(first[0].tokens + last[0].tokens, [11, 22])
+        XCTAssertEqual(last[0].soloPipelineState, .pipelinedLookahead)
+    }
+
+    func testIncrementalSoloPLDBatchThenSoloReentryUsesFreshContext() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 2,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(2),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [20],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 16)
+        try prefill(runtime, id: 2, tokens: [20], chunks: [1], maxOutputTokens: 16)
+        let shared = try runtime.decode(
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2)],
+                speculationAllowed: false))
+        runtime.remove(BatchRequestID(2))
+        let solo = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertEqual(shared[0].tokens + solo[0].tokens, [11, 22, 44, 88])
+        XCTAssertEqual(solo[0].soloPipelineState, .speculative)
+    }
+
+    func testIncrementalSoloPLDColdFallbackFromSpeculativeMatchesScalar() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseColdAfterTokenDrafter(coldLastToken: 88),
+                maxDraft: 2,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let speculative = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let fallback = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertEqual(
+            first[0].tokens + speculative[0].tokens + fallback[0].tokens,
+            [11, 22, 44, 88, 176])
+        XCTAssertEqual(fallback[0].soloPipelineState, .pipelinedLookahead)
+    }
+
+    func testIncrementalSoloPLDRemovalIsSafeFromEveryCacheInvariant() throws {
+        for decodeRounds in 0 ... 2 {
+            let runtime = try makeRuntime(
+                allocationChunk: 8,
+                maxContextTokens: 128,
+                initialDecodeReserve: 16,
+                soloPLDConfiguration: SpecDecodeConfig(
+                    drafter: TinyDenseExactDrafter(),
+                    maxDraft: 2,
+                    lookback: 32,
+                    compiledVerify: true))
+            let id = BatchRequestID(1)
+            try runtime.admit([
+                ContinuousBatchRuntimeAdmission(
+                    id: id,
+                    submission: ContinuousBatchSubmission(
+                        promptTokens: [10],
+                        maxOutputTokens: 16,
+                        eosToken: 2,
+                        architecture: .denseAttention,
+                        requestsSpeculation: true)),
+            ])
+            try prefill(
+                runtime,
+                id: id.rawValue,
+                tokens: [10],
+                chunks: [1],
+                maxOutputTokens: 16)
+            for _ in 0 ..< decodeRounds {
+                _ = try runtime.decode(
+                    .solo(id, speculationAllowed: true))
+            }
+
+            runtime.remove(id)
+            try runtime.admit([
+                ContinuousBatchRuntimeAdmission(
+                    id: id,
+                    submission: ContinuousBatchSubmission(
+                        promptTokens: [5],
+                        maxOutputTokens: 4,
+                        eosToken: 2,
+                        architecture: .denseAttention)),
+            ])
+            try prefill(
+                runtime,
+                id: id.rawValue,
+                tokens: [5],
+                chunks: [1],
+                maxOutputTokens: 4)
+            XCTAssertEqual(
+                try runtime.decode(
+                    .solo(id, speculationAllowed: false))[0].tokens,
+                [6],
+                "decode rounds \(decodeRounds)")
+        }
+    }
+
+    func testIncrementalSoloPLDRejectsInvalidDraftTokenBeforeVerification() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseInvalidDrafter(),
+                maxDraft: 1,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+        _ = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertThrowsError(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: true))
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .invalidTokenID(BatchRequestID(1), 2_048))
+        }
+    }
+
+    func testIncrementalSoloPLDRollsBackKVAfterInvalidVerifyToken() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 12),
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyNextTokenDrafter(),
+                maxDraft: 1,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+        XCTAssertEqual(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: true))[0].tokens,
+            [11])
+        let before = runtime.diagnosticScalarLogicalOffset(
+            for: BatchRequestID(1))
+
+        for _ in 0 ..< 2 {
+            XCTAssertThrowsError(
+                try runtime.decode(
+                    .solo(BatchRequestID(1), speculationAllowed: true))
+            ) { error in
+                XCTAssertEqual(
+                    error as? DenseContinuousBatchRuntimeError,
+                    .invalidTokenID(BatchRequestID(1), -1))
+            }
+            XCTAssertEqual(
+                runtime.diagnosticScalarLogicalOffset(
+                    for: BatchRequestID(1)),
+                before)
+        }
+    }
+
+    func testIncrementalSoloPLDRollsBackKVAfterInvalidSpeculativeFallbackToken()
+        throws
+    {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 13),
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyNextTokenColdAfterTokenDrafter(coldLastToken: 13),
+                maxDraft: 1,
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+        XCTAssertEqual(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: true))[0].tokens,
+            [11])
+        let speculative = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        XCTAssertEqual(speculative[0].tokens, [12, 13])
+        XCTAssertEqual(speculative[0].soloPipelineState, .speculative)
+        let before = runtime.diagnosticScalarLogicalOffset(
+            for: BatchRequestID(1))
+
+        for _ in 0 ..< 2 {
+            XCTAssertThrowsError(
+                try runtime.decode(
+                    .solo(BatchRequestID(1), speculationAllowed: true))
+            ) { error in
+                XCTAssertEqual(
+                    error as? DenseContinuousBatchRuntimeError,
+                    .invalidTokenID(BatchRequestID(1), -1))
+            }
+            XCTAssertEqual(
+                runtime.diagnosticScalarLogicalOffset(
+                    for: BatchRequestID(1)),
+                before)
+        }
+    }
+
+    func testContinuousRuntimeRejectsNonFiniteGreedyToken() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyNonFiniteLanguageModel(),
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 4)
+
+        XCTAssertThrowsError(
+            try prefill(
+                runtime,
+                id: 1,
+                tokens: [10],
+                chunks: [1],
+                maxOutputTokens: 4)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .invalidTokenID(BatchRequestID(1), -1))
+        }
+    }
+
+    func testScalarRejectsStagedNonFiniteTokenBeforeItMutatesKV() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 11),
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 8)
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 4)
+
+        XCTAssertEqual(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: false))[0].tokens,
+            [11])
+        let before = runtime.diagnosticScalarLogicalOffset(
+            for: BatchRequestID(1))
+
+        XCTAssertThrowsError(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: false))
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .invalidTokenID(BatchRequestID(1), -1))
+        }
+        XCTAssertEqual(
+            runtime.diagnosticScalarLogicalOffset(for: BatchRequestID(1)),
+            before)
+    }
+
+    func testBatchRejectsStagedNonFiniteTokensBeforeTheyMutateKV() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 11),
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 8)
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1])
+        try prefill(runtime, id: 2, tokens: [10], chunks: [1])
+
+        XCTAssertEqual(
+            emitted(
+                try runtime.decode(
+                    .batch(
+                        [BatchRequestID(1), BatchRequestID(2)],
+                        speculationAllowed: false))),
+            [1: [11], 2: [11]])
+        let before = runtime.diagnostics().batchPhysicalWrittenEnd
+
+        XCTAssertThrowsError(
+            try runtime.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(2)],
+                    speculationAllowed: false))
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .invalidTokenID(BatchRequestID(1), -1))
+        }
+        XCTAssertEqual(
+            runtime.diagnostics().batchPhysicalWrittenEnd,
+            before)
+    }
+
     func testMiddleRemovalPreservesStableIDRowMapping() throws {
         let runtime = try makeRuntime()
         try prefill(runtime, id: 1, tokens: [10], chunks: [1])
@@ -382,6 +1153,54 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
 
         XCTAssertEqual(emitted(first), [1: [11], 2: [21], 3: [31]])
         XCTAssertEqual(emitted(second), [1: [22], 3: [62]])
+    }
+
+    func testRemovedRequestIDReuseRebuildsPhysicalBatchRow() throws {
+        let runtime = try makeRuntime()
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1])
+        try prefill(runtime, id: 2, tokens: [20], chunks: [1])
+
+        XCTAssertEqual(
+            emitted(
+                try runtime.decode(
+                    .batch(
+                        [BatchRequestID(1), BatchRequestID(2)],
+                        speculationAllowed: false))),
+            [1: [11], 2: [21]])
+        runtime.remove(BatchRequestID(2))
+
+        try prefill(runtime, id: 2, tokens: [100], chunks: [1])
+        let replacement = try runtime.decode(
+            .batch(
+                [BatchRequestID(1), BatchRequestID(2)],
+                speculationAllowed: false))
+
+        XCTAssertEqual(
+            emitted(replacement),
+            [1: [22], 2: [101]],
+            "a reused request ID must not inherit the removed request's staged token or KV row")
+    }
+
+    func testReusedRemovedRequestIDDoesNotBlockSurvivorScalarExtraction() throws {
+        let runtime = try makeRuntime()
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1])
+        try prefill(runtime, id: 2, tokens: [20], chunks: [1])
+        XCTAssertEqual(
+            emitted(
+                try runtime.decode(
+                    .batch(
+                        [BatchRequestID(1), BatchRequestID(2)],
+                        speculationAllowed: false))),
+            [1: [11], 2: [21]])
+
+        runtime.remove(BatchRequestID(2))
+        try prefill(runtime, id: 2, tokens: [100], chunks: [1])
+
+        XCTAssertEqual(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: false))[0].tokens,
+            [22],
+            "a replacement incarnation must not keep the removed physical row live")
     }
 
     func testCompressedLongestRowDepartureMatchesUninterruptedScalarSurvivors() throws {
@@ -1315,6 +2134,42 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 200)
     }
 
+    func testReplacementIDDoesNotKeepFullyRemovedPhysicalBatchReserved() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 2,
+            maxReservedKVBytes: 400)
+        let submission = ContinuousBatchSubmission(
+            promptTokens: [10],
+            maxOutputTokens: 2,
+            eosToken: 2,
+            architecture: .denseAttention)
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(1), submission: submission),
+            ContinuousBatchRuntimeAdmission(id: BatchRequestID(2), submission: submission),
+        ])
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 2)
+        try prefill(runtime, id: 2, tokens: [10], chunks: [1], maxOutputTokens: 2)
+        _ = try runtime.decode(
+            .batch([BatchRequestID(1), BatchRequestID(2)], speculationAllowed: false))
+
+        runtime.remove(BatchRequestID(1))
+        try prefill(runtime, id: 1, tokens: [100], chunks: [1], maxOutputTokens: 2)
+        runtime.remove(BatchRequestID(2))
+
+        XCTAssertTrue(runtime.diagnostics().batchMembership.isEmpty)
+        XCTAssertNil(runtime.diagnostics().batchCapacity)
+        XCTAssertEqual(
+            runtime.diagnostics().reservedKVBytes,
+            200,
+            "a replacement incarnation must not keep a fully removed physical batch reserved")
+        XCTAssertEqual(
+            try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: false))[0].tokens,
+            [101])
+    }
+
     func testDifferentCapacityRowsRemainIndependentAndReleaseOwnReservations() throws {
         let runtime = try makeRuntime(
             allocationChunk: 4,
@@ -1387,5 +2242,67 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertTrue(
             operations.contains(
                 .decode(.batch([handles[0].id, handles[1].id], speculationAllowed: false))))
+    }
+
+    func testCoordinatorTrimsDensePLDBatchAtEOSAndReusesReleasedRuntime()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try ContinuousBatchConfiguration(
+                maxActiveSlots: 1,
+                maxPrefillSlots: 1,
+                prefillChunkSize: 4),
+            runtime: try DenseContinuousBatchRuntime(
+                testing: TinyDenseLanguageModel(),
+                allocationChunk: 8,
+                maxContextTokens: 128,
+                initialDecodeReserve: 16,
+                soloPLDConfiguration: SpecDecodeConfig(
+                    drafter: TinyDenseExactDrafter(),
+                    maxDraft: 2,
+                    lookback: 32,
+                    compiledVerify: true)),
+            automaticDrive: false,
+            traceLimit: 32)
+        let speculative = try await coordinator.submit(
+            ContinuousBatchSubmission(
+                promptTokens: [10],
+                maxOutputTokens: 16,
+                stopTokenIDs: [44],
+                architecture: .denseAttention,
+                requestsSpeculation: true))
+
+        while try await coordinator.runOneTick() {}
+
+        let speculativeTokens = try await collect(speculative.tokens)
+        let speculativeSnapshots = await coordinator.snapshots()
+        let speculativeResources = await coordinator.runtimeResourceSnapshot()
+        XCTAssertEqual(speculativeTokens, [11, 22])
+        XCTAssertTrue(speculativeSnapshots.isEmpty)
+        XCTAssertEqual(speculativeResources?.reservedKVBytes, 0)
+        let trace = await coordinator.executionTrace()
+        XCTAssertTrue(
+            trace.contains(
+                .operation(
+                    .decode(
+                        .solo(
+                            speculative.id,
+                            speculationAllowed: true)))))
+        XCTAssertTrue(trace.contains(.finished(speculative.id)))
+
+        let replacement = try await coordinator.submit(
+            ContinuousBatchSubmission(
+                promptTokens: [5],
+                maxOutputTokens: 2,
+                stopTokenIDs: [127],
+                architecture: .denseAttention))
+        while try await coordinator.runOneTick() {}
+
+        let replacementTokens = try await collect(replacement.tokens)
+        let replacementSnapshots = await coordinator.snapshots()
+        let replacementResources = await coordinator.runtimeResourceSnapshot()
+        XCTAssertEqual(replacementTokens, [6, 12])
+        XCTAssertTrue(replacementSnapshots.isEmpty)
+        XCTAssertEqual(replacementResources?.reservedKVBytes, 0)
     }
 }

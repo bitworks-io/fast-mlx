@@ -8,6 +8,15 @@ import SpikeCore
 @testable import SpikeServingAdapters
 
 final class MLXContinuousServingTests: XCTestCase {
+    func testQwen3WidthOnePolicyPinsVerifiedExactShape() {
+        let policy = ContinuousServingSoloPLDPolicy.qwen3WidthOne
+
+        XCTAssertEqual(policy.ngram, 3)
+        XCTAssertEqual(policy.maxDraft, 1)
+        XCTAssertEqual(policy.lookback, 4_096)
+        XCTAssertTrue(policy.compiledVerify)
+    }
+
     func testStartupValidationExecutesRuntimeAndReleasesEveryReservation()
         async throws
     {
@@ -118,6 +127,115 @@ final class MLXContinuousServingTests: XCTestCase {
         XCTAssertEqual(validated.maxReservedKVBytes, 4_096)
         XCTAssertEqual(validated.coordinatorConfiguration.maxActiveSlots, 4)
         XCTAssertEqual(validated.publicationCapacity, 1)
+    }
+
+    func testLoaderConfigurationRequiresExactSoloPLDPolicyAndDynamicAdmission()
+        throws
+    {
+        let coordinator = try ContinuousBatchConfiguration(
+            maxActiveSlots: 4,
+            maxPrefillSlots: 2,
+            prefillChunkSize: 512,
+            maxQueuedRequests: 8)
+        let dynamicBackend = ContinuousServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 512,
+            queueRetryAfterSeconds: 1,
+            mailboxCapacity: .init(
+                maxDeltas: 8,
+                maxBytes: 32 * 1_024),
+            admission: .dynamic(
+                configuration: ServingAdmissionConfiguration(
+                    soloPLDQualified: true,
+                    maximumBatchRequests: 4,
+                    maximumQueuedRequests: 8),
+                coalescing: .automatic(.milliseconds(5))))
+        let policy = ContinuousServingSoloPLDPolicy.qwen3WidthOne
+        let validated = try validateContinuousServingModelLoadConfiguration(
+            ContinuousServingModelLoadConfiguration(
+                launchedModel: "qwen3-source-locked",
+                modelDirectory: URL(fileURLWithPath: "/tmp"),
+                memoryLimitBytes: 8_192,
+                cacheLimitBytes: 1_024,
+                maxReservedKVBytes: 4_096,
+                coordinatorConfiguration: coordinator,
+                publicationCapacity: 1,
+                backendConfiguration: dynamicBackend,
+                soloPLDPolicy: policy))
+
+        XCTAssertEqual(validated.soloPLDPolicy, policy)
+
+        let unqualifiedWidePolicy = ContinuousServingSoloPLDPolicy(
+            ngram: 3,
+            maxDraft: 8,
+            lookback: 4_096,
+            compiledVerify: true)
+        XCTAssertThrowsError(
+            try validateContinuousServingModelLoadConfiguration(
+                ContinuousServingModelLoadConfiguration(
+                    launchedModel: "qwen3-source-locked",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    maxReservedKVBytes: 4_096,
+                    coordinatorConfiguration: coordinator,
+                    publicationCapacity: 1,
+                    backendConfiguration: dynamicBackend,
+                    soloPLDPolicy: unqualifiedWidePolicy))
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousServingModelLoadError,
+                .soloPLDPolicyMismatch)
+        }
+
+        XCTAssertThrowsError(
+            try validateContinuousServingModelLoadConfiguration(
+                ContinuousServingModelLoadConfiguration(
+                    launchedModel: "qwen3-source-locked",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    maxReservedKVBytes: 4_096,
+                    coordinatorConfiguration: coordinator,
+                    publicationCapacity: 1,
+                    backendConfiguration: dynamicBackend))
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousServingModelLoadError,
+                .soloPLDPolicyMismatch)
+        }
+    }
+
+    func testLoaderRejectsDefaultCompletionBudgetAboveBatchableReserve() throws {
+        let backend = ContinuousServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 129,
+            queueRetryAfterSeconds: 1,
+            mailboxCapacity: .init(
+                maxDeltas: 8,
+                maxBytes: 32 * 1_024))
+
+        XCTAssertThrowsError(
+            try validateContinuousServingModelLoadConfiguration(
+                ContinuousServingModelLoadConfiguration(
+                    launchedModel: "qwen3-source-locked",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    maxReservedKVBytes: 4_096,
+                    initialDecodeReserve: 128,
+                    coordinatorConfiguration: try ContinuousBatchConfiguration(
+                        maxActiveSlots: 4,
+                        maxPrefillSlots: 2,
+                        prefillChunkSize: 512,
+                        maxQueuedRequests: 8),
+                    publicationCapacity: 1,
+                    backendConfiguration: backend))
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousServingModelLoadError,
+                .defaultCompletionBudgetExceedsInitialDecodeReserve(
+                    defaultCompletionTokens: 129,
+                    initialDecodeReserve: 128))
+        }
     }
 
     func testLoaderConfigurationRejectsUnboundedOrUnsafeKVPolicy() throws {

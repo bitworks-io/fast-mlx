@@ -22,8 +22,12 @@ public enum ContinuousServingModelLoadError: Error, Equatable, Sendable {
     case invalidReservedContextLimit
     case invalidAllocationChunk
     case invalidInitialDecodeReserve
+    case defaultCompletionBudgetExceedsInitialDecodeReserve(
+        defaultCompletionTokens: Int,
+        initialDecodeReserve: Int)
     case invalidPublicationCapacity
     case invalidTraceLimit
+    case soloPLDPolicyMismatch
     case memoryLimitNotApplied(expected: Int, observed: Int)
     case cacheLimitNotApplied(expected: Int, observed: Int)
     case invalidStopStrings
@@ -31,6 +35,52 @@ public enum ContinuousServingModelLoadError: Error, Equatable, Sendable {
     case startupResourceTelemetryUnavailable
     case startupSlotsNotReleased(Int)
     case startupKVBytesNotReleased(Int)
+}
+
+public struct ContinuousServingSoloPLDPolicy:
+    Codable, Equatable, Sendable
+{
+    /// The only experimental PLD shape admitted for the current source-locked Qwen3 boundary.
+    ///
+    /// Drafts wider than one token changed a loaded temperature-zero argmax even when compilation
+    /// was disabled. One drafted token retained exact scalar parity and is intentionally pinned.
+    /// The three-token lookup key is the previously verified policy shape; a measured two-token
+    /// experiment increased matches but did not meet the service speed gate. After a speculative
+    /// bonus the standard PLD transition forwards `[last, draft]`. This policy remains
+    /// non-promoted unless a later identical-workload service qualification clears its speed gate.
+    public static let qwen3WidthOne = Self(
+        ngram: 3,
+        maxDraft: 1,
+        lookback: 4_096,
+        compiledVerify: true)
+
+    public let ngram: Int
+    public let maxDraft: Int
+    public let lookback: Int
+    public let compiledVerify: Bool
+
+    public init(
+        ngram: Int,
+        maxDraft: Int,
+        lookback: Int,
+        compiledVerify: Bool
+    ) {
+        precondition(ngram > 0, "ngram must be positive")
+        precondition(maxDraft > 0, "maxDraft must be positive")
+        precondition(lookback > 0, "lookback must be positive")
+        self.ngram = ngram
+        self.maxDraft = maxDraft
+        self.lookback = lookback
+        self.compiledVerify = compiledVerify
+    }
+
+    func runtimeConfiguration() -> SpecDecodeConfig {
+        SpecDecodeConfig(
+            drafter: PromptLookupDrafter(ngram: ngram),
+            maxDraft: maxDraft,
+            lookback: lookback,
+            compiledVerify: compiledVerify)
+    }
 }
 
 public struct ContinuousServingModelLoadConfiguration: Sendable {
@@ -53,6 +103,7 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
     public let publicationCapacity: Int
     public let traceLimit: Int
     public let backendConfiguration: ContinuousServingBackendConfiguration
+    public let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
     public let startupMessages: [OpenAIChatMessage]
 
     public init(
@@ -64,11 +115,12 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         maxContextTokens: Int? = nil,
         maxReservedContextTokens: Int? = nil,
         allocationChunk: Int = 256,
-        initialDecodeReserve: Int = 384,
+        initialDecodeReserve: Int = 512,
         coordinatorConfiguration: ContinuousBatchConfiguration,
         publicationCapacity: Int,
         traceLimit: Int = 0,
         backendConfiguration: ContinuousServingBackendConfiguration,
+        soloPLDPolicy: ContinuousServingSoloPLDPolicy? = nil,
         startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages
     ) {
         self.launchedModel = launchedModel
@@ -84,6 +136,7 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         self.publicationCapacity = publicationCapacity
         self.traceLimit = traceLimit
         self.backendConfiguration = backendConfiguration
+        self.soloPLDPolicy = soloPLDPolicy
         self.startupMessages = startupMessages
     }
 }
@@ -111,6 +164,7 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
     public let prefillChunkSize: Int
     public let maxQueuedRequests: Int
     public let publicationCapacity: Int
+    public let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
     public let modelProofVerified: Bool
 
     public init(
@@ -136,6 +190,7 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
         prefillChunkSize: Int,
         maxQueuedRequests: Int,
         publicationCapacity: Int,
+        soloPLDPolicy: ContinuousServingSoloPLDPolicy?,
         modelProofVerified: Bool
     ) {
         self.launchedModel = launchedModel
@@ -160,6 +215,7 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.maxQueuedRequests = maxQueuedRequests
         self.publicationCapacity = publicationCapacity
+        self.soloPLDPolicy = soloPLDPolicy
         self.modelProofVerified = modelProofVerified
     }
 }
@@ -230,11 +286,35 @@ public func validateContinuousServingModelLoadConfiguration(
     guard configuration.initialDecodeReserve > 0 else {
         throw ContinuousServingModelLoadError.invalidInitialDecodeReserve
     }
+    guard
+        configuration.backendConfiguration.defaultMaximumCompletionTokens
+            <= configuration.initialDecodeReserve
+    else {
+        throw ContinuousServingModelLoadError
+            .defaultCompletionBudgetExceedsInitialDecodeReserve(
+                defaultCompletionTokens:
+                    configuration.backendConfiguration
+                    .defaultMaximumCompletionTokens,
+                initialDecodeReserve: configuration.initialDecodeReserve)
+    }
     guard configuration.publicationCapacity > 0 else {
         throw ContinuousServingModelLoadError.invalidPublicationCapacity
     }
     guard configuration.traceLimit >= 0 else {
         throw ContinuousServingModelLoadError.invalidTraceLimit
+    }
+    let soloPLDQualified: Bool
+    switch configuration.backendConfiguration.admission {
+    case .immediateBatchNoSpec:
+        soloPLDQualified = false
+    case .dynamic(let admission, _):
+        soloPLDQualified = admission.soloPLDQualified
+    }
+    guard soloPLDQualified == (configuration.soloPLDPolicy != nil),
+        !soloPLDQualified
+            || configuration.soloPLDPolicy == .qwen3WidthOne
+    else {
+        throw ContinuousServingModelLoadError.soloPLDPolicyMismatch
     }
     guard !configuration.startupMessages.isEmpty else {
         throw ContinuousServingModelLoadError.emptyStartupPrompt
@@ -292,7 +372,9 @@ public func loadContinuousServingModel(
         initialDecodeReserve: configuration.initialDecodeReserve,
         maxReservedKVBytes: configuration.maxReservedKVBytes,
         kvCacheKind: .fp16,
-        affineAttentionMode: .materialize)
+        affineAttentionMode: .materialize,
+        soloPLDConfiguration:
+            configuration.soloPLDPolicy?.runtimeConfiguration())
     let coordinator = ContinuousBatchCoordinator(
         configuration: configuration.coordinatorConfiguration,
         runtime: runtime,
@@ -334,6 +416,7 @@ public func loadContinuousServingModel(
         prefillChunkSize: scheduler.prefillChunkSize,
         maxQueuedRequests: scheduler.maxQueuedRequests,
         publicationCapacity: configuration.publicationCapacity,
+        soloPLDPolicy: configuration.soloPLDPolicy,
         modelProofVerified: true)
     return LoadedContinuousServingModel(
         backend: backend,

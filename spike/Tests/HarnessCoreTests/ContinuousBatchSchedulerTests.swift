@@ -259,7 +259,9 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         XCTAssertEqual(firstSolo.decode, .solo(id(1), speculationAllowed: true))
         XCTAssertEqual(
             scheduler.snapshot(for: id(1))?.phase,
-            .decoding(emittedTokens: 1, hasPendingSoloLookahead: true)
+            .decoding(
+                emittedTokens: 1,
+                soloPipelineState: .pipelinedLookahead)
         )
 
         try scheduler.submit(request(2, promptTokens: 1, speculation: true))
@@ -283,7 +285,9 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         )
         XCTAssertEqual(
             scheduler.snapshot(for: id(1))?.phase,
-            .decoding(emittedTokens: 3, hasPendingSoloLookahead: false)
+            .decoding(
+                emittedTokens: 3,
+                soloPipelineState: .canonical)
         )
 
         let shared = scheduler.makeTick()
@@ -295,6 +299,118 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
             shared.operations.first,
             .decode(.batch([id(1), id(2)], speculationAllowed: false))
         )
+    }
+
+    func testSpeculativeSoloRequiresOutputlessCanonicalDrainBeforeSharedBatch() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 2, prefill: 1, chunk: 1))
+        try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+
+        _ = try applyNext(&scheduler) // request 1 -> ready
+        let speculative = scheduler.makeTick()
+        XCTAssertEqual(
+            speculative.decode,
+            .solo(id(1), speculationAllowed: true))
+        try scheduler.apply(
+            speculative,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 3,
+                    finished: false,
+                    soloPipelineState: .speculative),
+            ])
+        XCTAssertEqual(
+            scheduler.snapshot(for: id(1))?.phase,
+            .decoding(
+                emittedTokens: 3,
+                soloPipelineState: .speculative))
+
+        try scheduler.submit(request(2, promptTokens: 1, speculation: true))
+        let join = scheduler.makeTick()
+        XCTAssertEqual(join.admissions, [id(2)])
+        try scheduler.apply(
+            join,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 1,
+                    finished: false,
+                    soloPipelineState: .speculative),
+            ])
+
+        let drain = scheduler.makeTick()
+        XCTAssertEqual(drain.decode, .drainSoloPipeline(id(1)))
+        try scheduler.apply(
+            drain,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 0,
+                    finished: false,
+                    soloPipelineState: .canonical),
+            ])
+        XCTAssertEqual(
+            scheduler.snapshot(for: id(1))?.phase,
+            .decoding(
+                emittedTokens: 4,
+                soloPipelineState: .canonical))
+        XCTAssertEqual(
+            scheduler.makeTick().decode,
+            .batch([id(1), id(2)], speculationAllowed: false))
+    }
+
+    func testCancellingSpeculativeSoloMakesItsPlannedDrainStale() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 2, prefill: 1, chunk: 1))
+        try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+        _ = try applyNext(&scheduler)
+        let speculative = scheduler.makeTick()
+        try scheduler.apply(
+            speculative,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 2,
+                    finished: false,
+                    soloPipelineState: .speculative),
+            ])
+        try scheduler.submit(request(2, promptTokens: 1, speculation: true))
+        let join = scheduler.makeTick()
+        try scheduler.apply(
+            join,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 1,
+                    finished: false,
+                    soloPipelineState: .speculative),
+            ])
+
+        let staleDrain = scheduler.makeTick()
+        XCTAssertEqual(staleDrain.decode, .drainSoloPipeline(id(1)))
+        XCTAssertEqual(scheduler.cancel(id(1)).id, id(1))
+        try scheduler.submit(request(1, promptTokens: 2, speculation: true))
+
+        XCTAssertThrowsError(
+            try scheduler.apply(
+                staleDrain,
+                decodeOutcomes: [
+                    BatchDecodeOutcome(
+                        id: id(1),
+                        emittedTokenCount: 0,
+                        finished: false,
+                        soloPipelineState: .canonical),
+                ])
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousBatchSchedulerError,
+                .staleTick(
+                    expected: staleDrain.sequence + 2,
+                    actual: staleDrain.sequence))
+        }
+        XCTAssertEqual(scheduler.snapshot(for: id(1))?.phase, .queued)
+        XCTAssertEqual(scheduler.snapshot(for: id(2))?.phase, .ready)
     }
 
     func testSharedDecodeDisablesSpeculationForEverySlot() throws {
@@ -436,7 +552,9 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         )
         XCTAssertEqual(
             scheduler.snapshot(for: id(1))?.phase,
-            .decoding(emittedTokens: 3, hasPendingSoloLookahead: false)
+            .decoding(
+                emittedTokens: 3,
+                soloPipelineState: .canonical)
         )
 
         try scheduler.submit(request(2, promptTokens: 1, speculation: false))
@@ -512,7 +630,8 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
                 .cancelled(
                     id: id(4),
                     previousPhase: .decoding(
-                        emittedTokens: 1, hasPendingSoloLookahead: true)
+                        emittedTokens: 1,
+                        soloPipelineState: .pipelinedLookahead)
                 )
             )
         }

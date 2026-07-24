@@ -295,6 +295,7 @@ public struct ServiceOperationSummary: Sendable, Codable, Equatable {
     public let promptChunkCount: Int
     public let promptTokensProcessed: Int
     public let drainCount: Int
+    public let speculationAllowed: Bool
     public let speculationEngaged: Bool
 
     public init(
@@ -306,6 +307,7 @@ public struct ServiceOperationSummary: Sendable, Codable, Equatable {
         promptChunkCount: Int,
         promptTokensProcessed: Int,
         drainCount: Int,
+        speculationAllowed: Bool,
         speculationEngaged: Bool
     ) {
         self.tickCount = tickCount
@@ -316,18 +318,66 @@ public struct ServiceOperationSummary: Sendable, Codable, Equatable {
         self.promptChunkCount = promptChunkCount
         self.promptTokensProcessed = promptTokensProcessed
         self.drainCount = drainCount
+        self.speculationAllowed = speculationAllowed
         self.speculationEngaged = speculationEngaged
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tickCount
+        case maxActiveSlots
+        case meanActiveSlots
+        case maxQueuedSlots
+        case decodeBatchSizeHistogram
+        case promptChunkCount
+        case promptTokensProcessed
+        case drainCount
+        case speculationAllowed
+        case speculationEngaged
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        tickCount = try values.decode(Int.self, forKey: .tickCount)
+        maxActiveSlots = try values.decode(Int.self, forKey: .maxActiveSlots)
+        meanActiveSlots = try values.decode(Double.self, forKey: .meanActiveSlots)
+        maxQueuedSlots = try values.decode(Int.self, forKey: .maxQueuedSlots)
+        decodeBatchSizeHistogram = try values.decode(
+            [Int: Int].self,
+            forKey: .decodeBatchSizeHistogram)
+        promptChunkCount = try values.decode(Int.self, forKey: .promptChunkCount)
+        promptTokensProcessed = try values.decode(
+            Int.self,
+            forKey: .promptTokensProcessed)
+        drainCount = try values.decode(Int.self, forKey: .drainCount)
+        if let allowed = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .speculationAllowed)
+        {
+            speculationAllowed = allowed
+            speculationEngaged = try values.decode(
+                Bool.self,
+                forKey: .speculationEngaged)
+        } else {
+            // Historical evidence used `speculationEngaged` for scheduler permission.
+            // Preserve that fact as "allowed" without upgrading it to proof of execution.
+            speculationAllowed = try values.decode(
+                Bool.self,
+                forKey: .speculationEngaged)
+            speculationEngaged = false
+        }
     }
 }
 
 public func summarizeServiceOperations(
-    _ observations: [ServiceTickObservation]
+    _ observations: [ServiceTickObservation],
+    speculationStartSnapshot: ContinuousBatchRuntimeSpeculationSnapshot? = nil,
+    speculationEndSnapshot: ContinuousBatchRuntimeSpeculationSnapshot? = nil
 ) -> ServiceOperationSummary {
     var histogram: [Int: Int] = [:]
     var promptChunks = 0
     var promptTokens = 0
     var drains = 0
-    var speculation = false
+    var speculationAllowed = false
     for observation in observations {
         for operation in observation.operations {
             switch operation {
@@ -338,10 +388,10 @@ public func summarizeServiceOperations(
                 drains += 1
             case .decode(.solo(_, let allowed)):
                 histogram[1, default: 0] += 1
-                speculation = speculation || allowed
+                speculationAllowed = speculationAllowed || allowed
             case .decode(.batch(let ids, let allowed)):
                 histogram[ids.count, default: 0] += 1
-                speculation = speculation || allowed
+                speculationAllowed = speculationAllowed || allowed
             }
         }
     }
@@ -356,7 +406,10 @@ public func summarizeServiceOperations(
         promptChunkCount: promptChunks,
         promptTokensProcessed: promptTokens,
         drainCount: drains,
-        speculationEngaged: speculation)
+        speculationAllowed: speculationAllowed,
+        speculationEngaged: speculationEngagedDuringInterval(
+            from: speculationStartSnapshot,
+            to: speculationEndSnapshot))
 }
 
 public struct ServiceCancellationTimeline: Sendable, Equatable {

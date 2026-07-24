@@ -3,6 +3,23 @@ import XCTest
 @testable import HarnessCore
 
 final class ServiceBenchMetricsTests: XCTestCase {
+    private func speculationSnapshot(
+        requestedRequests: Int = 0,
+        activeSessions: Int = 0,
+        draftedTokens: Int = 0,
+        acceptedDraftTokens: Int = 0,
+        verificationRounds: Int = 0,
+        fallbackRounds: Int = 0
+    ) -> ContinuousBatchRuntimeSpeculationSnapshot {
+        ContinuousBatchRuntimeSpeculationSnapshot(
+            requestedRequests: requestedRequests,
+            activeSessions: activeSessions,
+            draftedTokens: draftedTokens,
+            acceptedDraftTokens: acceptedDraftTokens,
+            verificationRounds: verificationRounds,
+            fallbackRounds: fallbackRounds)
+    }
+
     private func timeline(
         _ id: UInt64,
         submittedAt: Double,
@@ -141,7 +158,130 @@ final class ServiceBenchMetricsTests: XCTestCase {
         XCTAssertEqual(summary.promptChunkCount, 1)
         XCTAssertEqual(summary.promptTokensProcessed, 16)
         XCTAssertEqual(summary.drainCount, 1)
+        XCTAssertFalse(summary.speculationAllowed)
         XCTAssertFalse(summary.speculationEngaged)
+    }
+
+    func testSeparatesSpeculationPermissionFromActualRuntimeEngagement() throws {
+        let request = BatchRequestID(1)
+        let allowedOnly = summarizeServiceOperations([
+            ServiceTickObservation(
+                activeSlots: 1,
+                queuedSlots: 0,
+                operations: [
+                    .decode(.solo(request, speculationAllowed: true))
+                ])
+        ])
+
+        XCTAssertTrue(allowedOnly.speculationAllowed)
+        XCTAssertFalse(allowedOnly.speculationEngaged)
+
+        let engaged = summarizeServiceOperations(
+            [
+                ServiceTickObservation(
+                    activeSlots: 1,
+                    queuedSlots: 0,
+                    operations: [
+                        .decode(.solo(request, speculationAllowed: true))
+                    ])
+            ],
+            speculationStartSnapshot: speculationSnapshot(),
+            speculationEndSnapshot: ContinuousBatchRuntimeSpeculationSnapshot(
+                requestedRequests: 1,
+                activeSessions: 0,
+                draftedTokens: 3,
+                acceptedDraftTokens: 2,
+                verificationRounds: 1,
+                fallbackRounds: 0))
+
+        XCTAssertTrue(engaged.speculationAllowed)
+        XCTAssertTrue(engaged.speculationEngaged)
+    }
+
+    func testDoesNotTreatHistoricalSpeculationCountersAsCurrentRunEngagement() {
+        let summary = summarizeServiceOperations(
+            [],
+            speculationStartSnapshot: speculationSnapshot(
+                requestedRequests: 4,
+                draftedTokens: 12,
+                acceptedDraftTokens: 8,
+                verificationRounds: 3),
+            speculationEndSnapshot: speculationSnapshot(
+                requestedRequests: 4,
+                draftedTokens: 12,
+                acceptedDraftTokens: 8,
+                verificationRounds: 3))
+
+        XCTAssertFalse(summary.speculationEngaged)
+    }
+
+    func testSpeculationIntervalFailsClosedForCounterRegressionAndPresenceMismatch() {
+        XCTAssertFalse(
+            speculationEngagedDuringInterval(
+                from: nil,
+                to: speculationSnapshot(
+                    requestedRequests: 1,
+                    draftedTokens: 4,
+                    verificationRounds: 1)))
+        XCTAssertFalse(
+            speculationEngagedDuringInterval(
+                from: speculationSnapshot(
+                    requestedRequests: 1,
+                    draftedTokens: 4,
+                    verificationRounds: 1),
+                to: nil))
+        XCTAssertFalse(
+            speculationEngagedDuringInterval(
+                from: speculationSnapshot(
+                    requestedRequests: 2,
+                    draftedTokens: 6,
+                    acceptedDraftTokens: 4,
+                    verificationRounds: 2),
+                to: speculationSnapshot(
+                    requestedRequests: 3,
+                    draftedTokens: 5,
+                    acceptedDraftTokens: 4,
+                    verificationRounds: 3)))
+    }
+
+    func testSpeculationIntervalTreatsActiveSessionsAsGaugeOnly() {
+        XCTAssertTrue(
+            speculationEngagedDuringInterval(
+                from: speculationSnapshot(
+                    requestedRequests: 4,
+                    activeSessions: 3,
+                    draftedTokens: 10,
+                    acceptedDraftTokens: 7,
+                    verificationRounds: 2),
+                to: speculationSnapshot(
+                    requestedRequests: 5,
+                    activeSessions: 0,
+                    draftedTokens: 12,
+                    acceptedDraftTokens: 8,
+                    verificationRounds: 3)))
+    }
+
+    func testDecodesHistoricalSpeculationFieldAsPermissionNotEngagement() throws {
+        let historical = """
+            {
+              "tickCount": 1,
+              "maxActiveSlots": 1,
+              "meanActiveSlots": 1,
+              "maxQueuedSlots": 0,
+              "decodeBatchSizeHistogram": {"1": 1},
+              "promptChunkCount": 1,
+              "promptTokensProcessed": 4,
+              "drainCount": 0,
+              "speculationEngaged": true
+            }
+            """
+
+        let decoded = try JSONDecoder().decode(
+            ServiceOperationSummary.self,
+            from: Data(historical.utf8))
+
+        XCTAssertTrue(decoded.speculationAllowed)
+        XCTAssertFalse(decoded.speculationEngaged)
     }
 
     func testSummarizesCancellationLatencyAndMemoryDriftSeparately() throws {

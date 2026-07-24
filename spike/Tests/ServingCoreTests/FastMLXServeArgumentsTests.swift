@@ -71,6 +71,18 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertNil(arguments.backend)
     }
 
+    func testNonPromotedDynamicPLDModeIsNotExposedByCLI() {
+        XCTAssertFalse(
+            FastMLXServeArguments.usage.contains("--continuous-dynamic-pld"))
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--continuous-dynamic-pld"])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .unknownArgument("--continuous-dynamic-pld"))
+        }
+    }
+
     func testMissingAndConflictingBackendModesFailClosed() {
         XCTAssertThrowsError(
             try FastMLXServeArguments.parse(["--model", "fixture"])
