@@ -33,11 +33,14 @@ private final class PendingContinuationGate: Sendable {
 
 public enum ServingResponseDelta: Equatable, Sendable {
     case text(String)
+    case completion(ServingGenerationCompletion)
 
     public var utf8ByteCount: Int {
         switch self {
         case .text(let text):
             return text.utf8.count
+        case .completion:
+            return 0
         }
     }
 }
@@ -45,6 +48,7 @@ public enum ServingResponseDelta: Equatable, Sendable {
 public enum ServingCancellationReason: String, Codable, Equatable, Sendable {
     case backpressureTimeout
     case clientDisconnected
+    case responseLimitExceeded
     case shutdown
 }
 

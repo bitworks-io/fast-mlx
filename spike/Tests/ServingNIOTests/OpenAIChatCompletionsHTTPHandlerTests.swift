@@ -1,0 +1,490 @@
+import Foundation
+import NIOCore
+import NIOEmbedded
+import NIOHTTP1
+import os
+import XCTest
+
+@testable import ServingCore
+@testable import ServingNIO
+
+final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
+    func testNonStreamingRequestReturnsOpenAIJSONAndAllowsSequentialKeepAlive() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2),
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .ok)
+        XCTAssertEqual(first.head.headers.first(name: "content-type"), "application/json")
+        let firstObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(first.body.utf8)) as? [String: Any])
+        let firstChoice = try XCTUnwrap((firstObject["choices"] as? [[String: Any]])?.first)
+        let firstMessage = try XCTUnwrap(firstChoice["message"] as? [String: Any])
+        XCTAssertEqual(firstObject["object"] as? String, "chat.completion")
+        XCTAssertEqual(firstMessage["content"] as? String, "hello")
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
+    func testStreamingRequestReturnsOrderedSSEAndExactlyOneDone() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(
+                text: ["hel", "lo"],
+                finishReason: .length,
+                promptTokens: 3,
+                completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "text/event-stream")
+        let roleRange = try XCTUnwrap(response.body.range(of: #""role":"assistant""#))
+        let firstRange = try XCTUnwrap(response.body.range(of: #""content":"hel""#))
+        let secondRange = try XCTUnwrap(response.body.range(of: #""content":"lo""#))
+        let finishRange = try XCTUnwrap(response.body.range(of: #""finish_reason":"length""#))
+        let doneRange = try XCTUnwrap(response.body.range(of: "data: [DONE]\n\n"))
+        XCTAssertLessThan(roleRange.lowerBound, firstRange.lowerBound)
+        XCTAssertLessThan(firstRange.lowerBound, secondRange.lowerBound)
+        XCTAssertLessThan(secondRange.lowerBound, finishRange.lowerBound)
+        XCTAssertLessThan(finishRange.lowerBound, doneRange.lowerBound)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    func testAuthenticationAndBodyBoundsRejectBeforeBackendAdmission() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let authLimits = OpenAIChatRequestLimits(
+            maximumBodyBytes: 1_024,
+            maximumCompletionTokens: 8)
+        let authChannel = try await makeChannel(
+            backend: backend,
+            configuration: .init(
+                launchedModel: "qwen3-32b",
+                requestLimits: authLimits,
+                requiredBearerToken: "secret",
+                maximumNonStreamingResponseBytes: 1_024,
+                backpressureStallTimeout: .seconds(1)))
+
+        try await writeRequest(authChannel, body: requestBody(stream: false))
+        let unauthorized = try await collectResponse(from: authChannel)
+        XCTAssertEqual(unauthorized.head.status, .unauthorized)
+        XCTAssertTrue(unauthorized.body.contains(#""type":"invalid_request_error""#))
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await authChannel.finish()
+
+        let bodyLimits = OpenAIChatRequestLimits(
+            maximumBodyBytes: 32,
+            maximumCompletionTokens: 8)
+        let oversizedChannel = try await makeChannel(
+            backend: backend,
+            configuration: .init(
+                launchedModel: "qwen3-32b",
+                requestLimits: bodyLimits,
+                requiredBearerToken: nil,
+                maximumNonStreamingResponseBytes: 1_024,
+                backpressureStallTimeout: .seconds(1)))
+        let head = validHead(contentLength: 128)
+        _ = try await oversizedChannel.writeInbound(HTTPServerRequestPart.head(head))
+        let tooLarge = try await collectResponse(from: oversizedChannel)
+        XCTAssertEqual(tooLarge.head.status, .payloadTooLarge)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await oversizedChannel.finish()
+    }
+
+    func testInputCloseCancelsActiveLeaseExactlyOnce() async throws {
+        let backend = ScriptedBackend(scripts: [.held])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().startCount == 1 }
+
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+            channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+        }
+        await waitUntil { backend.snapshot().cancelCount == 1 }
+
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testOverlappingSecondRequestIsRejectedBeforeAdmission() async throws {
+        let backend = ScriptedBackend(scripts: [.held])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().startCount == 1 }
+        _ = try await channel.writeInbound(
+            HTTPServerRequestPart.head(validHead(contentLength: 1)))
+        await waitUntil { backend.snapshot().cancelCount == 1 }
+
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testNonWritableChannelLeavesProducerBoundedUntilWritabilityReturns() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["a", "b"], promptTokens: 1, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+        channel.isWritable = false
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireChannelWritabilityChanged()
+        }
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil {
+            guard let mailbox = backend.snapshot().lastMailbox else { return false }
+            let snapshot = await mailbox.snapshot()
+            return snapshot.bufferedDeltas == 1 && snapshot.waitingProducers == 1
+        }
+        let blockedOutbound = try await channel.readOutbound(
+            as: HTTPServerResponsePart.self)
+        XCTAssertNil(blockedOutbound)
+
+        channel.isWritable = true
+        try await channel.testingEventLoop.executeInContext {
+            channel.pipeline.fireChannelWritabilityChanged()
+        }
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains(#""content":"a""#))
+        XCTAssertTrue(response.body.contains(#""content":"b""#))
+
+        _ = try await channel.finish()
+    }
+
+    func testWritabilityGateAppliesRapidTransitionsInEventLoopOrder() async throws {
+        let gate = ServingChannelWritabilityGate(initiallyWritable: true)
+
+        gate.update(isWritable: false)
+        gate.update(isWritable: true)
+
+        try await gate.waitUntilWritable(timeout: .milliseconds(10))
+    }
+
+    func testOutboundWriteFailureCancelsActiveLease() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hello"], promptTokens: 1, completionTokens: 1)
+        ])
+        let configuration = defaultConfiguration()
+        let channel = try await NIOAsyncTestingChannel { channel in
+            try channel.pipeline.syncOperations.addHandlers(
+                FailingOutboundHandler(),
+                OpenAIChatCompletionsHTTPHandler(
+                    configuration: configuration,
+                    backend: backend))
+        }
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().cancelCount == 1 }
+
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testBackendMailboxCancellationClosesClientInsteadOfLeavingItHanging() async throws {
+        let backend = ScriptedBackend(scripts: [.cancelled(.shutdown)])
+        let channel = try await makeChannel(backend: backend)
+        let connectPromise = channel.eventLoop.makePromise(of: Void.self)
+        channel.connect(
+            to: try SocketAddress(ipAddress: "127.0.0.1", port: 9_999),
+            promise: connectPromise)
+        try await connectPromise.futureResult.get()
+        XCTAssertTrue(channel.isActive)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        await waitUntil { backend.snapshot().cancelCount == 1 }
+        await waitUntil { !channel.isActive }
+
+        let lease = try XCTUnwrap(backend.snapshot().lastLease)
+        let leaseState = await lease.state
+        XCTAssertEqual(leaseState, .cancelled(.shutdown))
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testRawHTTPPipelineParsesRequestAndEncodesResponse() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["raw"], promptTokens: 1, completionTokens: 1)
+        ])
+        let configuration = defaultConfiguration()
+        let channel = try await NIOAsyncTestingChannel { channel in
+            try channel.pipeline.syncOperations.configureHTTPServerPipeline(
+                withPipeliningAssistance: false,
+                withErrorHandling: true)
+            try channel.pipeline.syncOperations.addHandler(
+                OpenAIChatCompletionsHTTPHandler(
+                    configuration: configuration,
+                    backend: backend))
+        }
+
+        let body = requestBody(stream: false)
+        let rawRequest = """
+        POST /v1/chat/completions HTTP/1.1\r
+        Host: localhost\r
+        Content-Type: application/json\r
+        Content-Length: \(body.utf8.count)\r
+        \r
+        \(body)
+        """
+        _ = try await channel.writeInbound(ByteBuffer(string: rawRequest))
+
+        var rawResponse = ""
+        while !rawResponse.contains(#""content":"raw""#) {
+            var buffer: ByteBuffer = try await channel.waitForOutboundWrite()
+            rawResponse += buffer.readString(length: buffer.readableBytes) ?? ""
+        }
+        XCTAssertTrue(rawResponse.hasPrefix("HTTP/1.1 200"))
+        XCTAssertTrue(rawResponse.contains(#""object":"chat.completion""#))
+
+        _ = try await channel.finish()
+    }
+
+    func testConnectionCloseCompletesLeaseBeforeClosingChannel() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["bye"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+        let connectPromise = channel.eventLoop.makePromise(of: Void.self)
+        channel.connect(
+            to: try SocketAddress(ipAddress: "127.0.0.1", port: 9_998),
+            promise: connectPromise)
+        try await connectPromise.futureResult.get()
+        XCTAssertTrue(channel.isActive)
+        let body = requestBody(stream: false)
+        var head = validHead(contentLength: body.utf8.count)
+        head.headers.replaceOrAdd(name: "connection", value: "close")
+
+        _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+        _ = try await channel.writeInbound(
+            HTTPServerRequestPart.body(ByteBuffer(string: body)))
+        _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+        let response = try await collectResponse(from: channel)
+        await waitUntil { !channel.isActive }
+
+        XCTAssertEqual(response.head.status, .ok)
+        let lease = try XCTUnwrap(backend.snapshot().lastLease)
+        let leaseState = await lease.state
+        XCTAssertEqual(leaseState, .completed)
+        XCTAssertEqual(backend.snapshot().cancelCount, 0)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+}
+
+private struct CollectedResponse {
+    let head: HTTPResponseHead
+    let body: String
+}
+
+private func makeChannel(
+    backend: ScriptedBackend,
+    configuration: ServingHTTPConfiguration = defaultConfiguration()
+) async throws -> NIOAsyncTestingChannel {
+    try await NIOAsyncTestingChannel { channel in
+        try channel.pipeline.syncOperations.addHandler(
+            OpenAIChatCompletionsHTTPHandler(
+                configuration: configuration,
+                backend: backend))
+    }
+}
+
+private func defaultConfiguration() -> ServingHTTPConfiguration {
+    ServingHTTPConfiguration(
+        launchedModel: "qwen3-32b",
+        requestLimits: .productionDefault,
+        requiredBearerToken: nil,
+        maximumNonStreamingResponseBytes: 1_048_576,
+        backpressureStallTimeout: .seconds(1))
+}
+
+private func requestBody(stream: Bool) -> String {
+    """
+    {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":\(stream)}
+    """
+}
+
+private func validHead(contentLength: Int) -> HTTPRequestHead {
+    HTTPRequestHead(
+        version: .http1_1,
+        method: .POST,
+        uri: "/v1/chat/completions",
+        headers: [
+            "host": "localhost",
+            "content-type": "application/json",
+            "content-length": "\(contentLength)",
+        ])
+}
+
+private func writeRequest(
+    _ channel: NIOAsyncTestingChannel,
+    body: String,
+    authorization: String? = nil
+) async throws {
+    var head = validHead(contentLength: body.utf8.count)
+    if let authorization {
+        head.headers.add(name: "authorization", value: authorization)
+    }
+    _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+    _ = try await channel.writeInbound(
+        HTTPServerRequestPart.body(ByteBuffer(string: body)))
+    _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
+private func collectResponse(
+    from channel: NIOAsyncTestingChannel
+) async throws -> CollectedResponse {
+    var head: HTTPResponseHead?
+    var body = ""
+    while true {
+        let part: HTTPServerResponsePart = try await channel.waitForOutboundWrite()
+        switch part {
+        case .head(let value):
+            head = value
+        case .body(.byteBuffer(var buffer)):
+            body += buffer.readString(length: buffer.readableBytes) ?? ""
+        case .body(.fileRegion):
+            XCTFail("Serving responses must not emit file regions")
+        case .end:
+            return CollectedResponse(head: try XCTUnwrap(head), body: body)
+        }
+    }
+}
+
+private func waitUntil(
+    attempts: Int = 10_000,
+    _ predicate: () async -> Bool
+) async {
+    for _ in 0..<attempts {
+        if await predicate() {
+            return
+        }
+        await Task.yield()
+    }
+    XCTFail("Condition was not reached")
+}
+
+private final class ScriptedBackend: ServingGenerationBackend, Sendable {
+    struct Snapshot: Sendable {
+        let startCount: Int
+        let cancelCount: Int
+        let lastMailbox: BoundedDeltaMailbox?
+        let lastLease: ServingRequestLease?
+    }
+
+    enum Script: Sendable {
+        case completed(
+            text: [String],
+            finishReason: OpenAIChatFinishReason = .stop,
+            promptTokens: Int,
+            completionTokens: Int)
+        case cancelled(ServingCancellationReason)
+        case held
+    }
+
+    private struct State: Sendable {
+        var scripts: [Script]
+        var startCount = 0
+        var cancelCount = 0
+        var lastMailbox: BoundedDeltaMailbox?
+        var lastLease: ServingRequestLease?
+    }
+
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(scripts: [Script]) {
+        state = OSAllocatedUnfairLock(initialState: State(scripts: scripts))
+    }
+
+    func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
+        let (script, sequence) = state.withLock { state -> (Script, Int) in
+            state.startCount += 1
+            let script = state.scripts.isEmpty ? .held : state.scripts.removeFirst()
+            return (script, state.startCount)
+        }
+        let mailbox = BoundedDeltaMailbox(
+            capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 1, maxBytes: 64))
+        let lease = ServingRequestLease(
+            id: ServingRequestID("request-\(sequence)"),
+            onCancel: { [self] in
+                state.withLock { $0.cancelCount += 1 }
+            })
+        state.withLock {
+            $0.lastMailbox = mailbox
+            $0.lastLease = lease
+        }
+        let handle = ServingGenerationHandle(
+            responseID: "chatcmpl-\(sequence)",
+            created: 1_775_000_000,
+            model: request.model,
+            route: .continuousBatchNoSpec,
+            mailbox: mailbox,
+            lease: lease)
+
+        if case .completed(let text, let finishReason, let promptTokens, let completionTokens) = script {
+            Task {
+                do {
+                    for delta in text {
+                        try await mailbox.send(.text(delta))
+                    }
+                    try await mailbox.send(
+                        .completion(
+                            ServingGenerationCompletion(
+                                finishReason: finishReason,
+                                usage: OpenAIChatUsage(
+                                    promptTokens: promptTokens,
+                                    completionTokens: completionTokens))))
+                    await mailbox.finish()
+                } catch {
+                    // Cancellation is observed through the lease counter.
+                }
+            }
+        } else if case .cancelled(let reason) = script {
+            Task {
+                await mailbox.cancel(reason)
+            }
+        }
+        return handle
+    }
+
+    func snapshot() -> Snapshot {
+        state.withLock {
+            Snapshot(
+                startCount: $0.startCount,
+                cancelCount: $0.cancelCount,
+                lastMailbox: $0.lastMailbox,
+                lastLease: $0.lastLease)
+        }
+    }
+}
+
+private struct SyntheticWriteFailure: Error {}
+
+private final class FailingOutboundHandler: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = HTTPServerResponsePart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    func write(
+        context: ChannelHandlerContext,
+        data: NIOAny,
+        promise: EventLoopPromise<Void>?
+    ) {
+        promise?.fail(SyntheticWriteFailure())
+    }
+}

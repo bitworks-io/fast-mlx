@@ -15,6 +15,7 @@ public struct ServingRequestID: RawRepresentable, Hashable, Codable, Sendable {
 public enum ServingExecutionRoute: String, Codable, Equatable, Sendable {
     case continuousBatchNoSpec = "continuous-batch-no-spec"
     case scalarGreedy = "scalar-greedy"
+    case scriptedTransport = "scripted-transport"
     case soloPLD = "solo-pld"
 }
 

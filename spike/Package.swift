@@ -6,7 +6,9 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "ServingCore", targets: ["ServingCore"]),
+        .library(name: "ServingNIO", targets: ["ServingNIO"]),
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
+        .executable(name: "fastmlx-serve", targets: ["fastmlx-serve"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
         .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"]),
         .executable(name: "fastmlx-capacity", targets: ["fastmlx-capacity"]),
@@ -16,6 +18,7 @@ let package = Package(
         .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.2"),
     ],
     targets: [
         // ServingCore is PURE — NO MLX/SpikeCore dependency — so protocol, policy, and
@@ -28,6 +31,36 @@ let package = Package(
         .testTarget(
             name: "ServingCoreTests",
             dependencies: ["ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // ServingNIO owns transport only. Model, tokenizer, and MLX state remain behind
+        // ServingCore contracts and actor-confined adapters.
+        .target(
+            name: "ServingNIO",
+            dependencies: [
+                "ServingCore",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingNIOTests",
+            dependencies: [
+                "ServingCore",
+                "ServingNIO",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Phase 1 composition smoke. This target requires --scripted and never claims model
+        // inference; later phases replace its backend with actor-confined serving adapters.
+        .executableTarget(
+            name: "fastmlx-serve",
+            dependencies: ["ServingCore", "ServingNIO"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
