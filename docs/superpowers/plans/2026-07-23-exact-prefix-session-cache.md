@@ -1,9 +1,36 @@
 # Exact Prefix / Session Cache and Request-Start Stack Plan
 
 **Date:** 2026-07-23
-**Status:** observed-live-dtype recovery verified under dirty identity; clean-SHA proof pending
+**Status:** model-scoped closure — Qwen3-32B and Phi-4-mini promoted; Llama-3.3-70B rejected on the measured host
 **Classification:** EXACT
 **Branch:** `codex/exact-prefix-session-cache`
+
+## 2026-07-24 selected-prefix provenance and loaded-proof closure
+
+Clean `ecd2915a0c4cd036169c7865db9dd07df8b68ca8` closes the proof-layer ambiguity exposed by
+Qwen's first loaded run. The runtime correctly selected the longest same-key prefix, which can be
+the prior successful final context rather than the source prompt. Evidence schema 3 now binds the
+actual source case, source kind (`prompt-only` or `final-context`), token count, and token SHA-256.
+Schema 1 and 2 remain readable; only schema 3 can promote this new binding.
+
+Clean verification passes 584 HarnessCore XCTest plus 17 Swift Testing tests off-box, 140/140
+`FastMLXHarnessTests`, 8/8 `ExactPrefixMLXTests`, 163/163 `SpikeCoreTests`, and the Release build.
+Verification receipt SHA-256 is
+`9a5bf6d29247bc68768d4404e80f9dbb4161ece58f3844b1e9a9c2fde75eb814`;
+clean binary SHA-256 is
+`477ab6b27dc8042bba393c586b069bf70ea4b230aa5d6400447757141e8e2cdf`.
+
+Fresh schema-v3 Phi and Qwen boundaries each complete 11/11 and promote model-scoped. Phi
+authenticates its observed-live-`float16` recovery; Qwen's partial hit authenticates reuse of the
+202-token `cold-commit-A` final context and exact cache-off output. Llama-3.3-70B is terminal
+negative evidence: its per-case footprint exceeded the explicit 96-GiB proof limit, checkpoint
+content revalidation raised process footprint above host RAM, and macOS killed it before
+finalization. It cannot promote and must not be retried unchanged.
+
+Verdict:
+[`2026-07-24-exact-prefix-session-cache.md`](../verdicts/2026-07-24-exact-prefix-session-cache.md).
+The next ranked item is the continuous-batching serving route; it may consume these contracts
+without broadening their state or model claims.
 
 ## 2026-07-24 observed-live-dtype identity amendment
 
@@ -317,7 +344,8 @@ promote.
 6. Integrate the actor cache and honest telemetry; run focused harness tests, full Xcode suites, and
    Release build.
 7. Build a bounded fresh-output loaded-model proof CLI/artifact; independently review before launch.
-8. Run Qwen3 first, then source-locked Llama and Phi independently. Preserve negative cells.
+8. Run a bounded Phi regression first, then Qwen3 and source-locked Llama independently. Preserve
+   negative cells. **Complete:** Phi and Qwen promote model-scoped; Llama is terminal negative.
 9. Write the dated verdict, public fast-mlx-only content, verification packet, and handoff.
 10. Focused correctness/security review, diff inspection, link check, secret scan, coherent commits
     with the required trailer, fresh clean-SHA proof, and `--no-ff` merge.
