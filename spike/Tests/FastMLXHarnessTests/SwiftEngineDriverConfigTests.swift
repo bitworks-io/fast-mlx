@@ -17,24 +17,25 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
                 minimumReusableTokens: 2),
             eagerWarmupEnabled: true)
 
-        let identity = try XCTUnwrap(
-            resolveExactPrefixRuntimeIdentity(
+        let identitySource = try XCTUnwrap(
+            resolveExactPrefixRuntimeIdentitySource(
                 configuration: configuration,
                 sourceBeforeLoad: source,
                 sourceAfterLoad: source,
                 modelInstanceID: "loaded-model-instance"))
-        XCTAssertEqual(identity.admission.family, .qwen3)
+        XCTAssertEqual(identitySource.admission.family, .qwen3)
         XCTAssertEqual(
-            identity.admission.checkpointContentSHA256,
+            identitySource.admission.checkpointContentSHA256,
             source.checkpointContentSHA256)
         XCTAssertEqual(
-            identity.modelInstanceID, "loaded-model-instance")
+            identitySource.modelInstanceID,
+            "loaded-model-instance")
 
-        XCTAssertNil(try resolveExactPrefixRuntimeIdentity(
+        XCTAssertNil(try resolveExactPrefixRuntimeIdentitySource(
             configuration: .disabled,
             sourceBeforeLoad: nil,
             sourceAfterLoad: nil))
-        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
+        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentitySource(
             configuration: configuration,
             sourceBeforeLoad: source,
             sourceAfterLoad: nil)) {
@@ -44,7 +45,7 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
         }
         let changed = try makeRuntimeSource(
             tokenizerSHA256: String(repeating: "f", count: 64))
-        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
+        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentitySource(
             configuration: configuration,
             sourceBeforeLoad: source,
             sourceAfterLoad: changed)) {
@@ -55,23 +56,47 @@ final class SwiftEngineDriverConfigTests: XCTestCase {
 
         let float16 = try makeRuntimeSource(
             torchDType: "float16")
-        let float16Identity = try XCTUnwrap(
-            resolveExactPrefixRuntimeIdentity(
+        let float16Source = try XCTUnwrap(
+            resolveExactPrefixRuntimeIdentitySource(
                 configuration: configuration,
                 sourceBeforeLoad: float16,
                 sourceAfterLoad: float16,
                 modelInstanceID: "loaded-model-instance"))
+        let observedFloat16FromBFloatConfig =
+            try ExactPrefixRuntimeIdentity(
+                source: identitySource,
+                observedNativeDType: .float16)
+        let observedFloat16FromFloatConfig =
+            try ExactPrefixRuntimeIdentity(
+                source: float16Source,
+                observedNativeDType: .float16)
+        XCTAssertEqual(
+            observedFloat16FromBFloatConfig.kvRouteSHA256,
+            observedFloat16FromFloatConfig.kvRouteSHA256)
         XCTAssertNotEqual(
-            identity.kvRouteSHA256,
-            float16Identity.kvRouteSHA256)
+            observedFloat16FromBFloatConfig
+                .architectureStateSHA256,
+            observedFloat16FromFloatConfig
+                .architectureStateSHA256)
+        let observedBFloat16 =
+            try ExactPrefixRuntimeIdentity(
+                source: identitySource,
+                observedNativeDType: .bfloat16)
+        XCTAssertNotEqual(
+            observedFloat16FromBFloatConfig.kvRouteSHA256,
+            observedBFloat16.kvRouteSHA256)
 
         let float32 = try makeRuntimeSource(
             torchDType: "float32")
-        XCTAssertThrowsError(try resolveExactPrefixRuntimeIdentity(
-            configuration: configuration,
-            sourceBeforeLoad: float32,
-            sourceAfterLoad: float32,
-            modelInstanceID: "loaded-model-instance")) {
+        let float32Source = try XCTUnwrap(
+            resolveExactPrefixRuntimeIdentitySource(
+                configuration: configuration,
+                sourceBeforeLoad: float32,
+                sourceAfterLoad: float32,
+                modelInstanceID: "loaded-model-instance"))
+        XCTAssertThrowsError(try ExactPrefixRuntimeIdentity(
+            source: float32Source,
+            observedNativeDType: .float32)) {
             XCTAssertEqual(
                 $0 as? ExactPrefixRuntimeError,
                 .unsupportedNativeDType("float32"))

@@ -400,6 +400,7 @@ private struct ExactPrefixProofRuntime {
             retainedBytes: metrics.retainedBytes,
             entryCount: metrics.entryCount,
             evictionCount: metrics.evictionCount,
+            runtimeIdentity: metrics.runtimeIdentity,
             eagerWarmupSeconds: warmupSeconds)
     }
 

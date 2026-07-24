@@ -27,6 +27,83 @@ public enum RequestStartMetricsError:
     case derivedRateMismatch(String)
 }
 
+public enum ExactPrefixDenseRuntimeIdentityEvidenceError:
+    Error, Equatable, Sendable
+{
+    case unsupportedObservedDenseHalfDType
+    case routeIdentityMismatch
+}
+
+/// Typed, recomputable receipt for the scalar dense-half cache route MLX actually emitted.
+///
+/// Model configuration remains bound separately by the authenticated admission. This receipt is
+/// deliberately derived from the homogeneous live K/V arrays so a declared bf16 model whose
+/// loaded cache is f16 cannot inherit a config-selected route identity.
+public struct ExactPrefixDenseRuntimeIdentityEvidence:
+    Codable, Equatable, Hashable, Sendable
+{
+    public let observedDenseHalfDType:
+        CompressedKVModelNativeDType
+    public let kvRouteSHA256: String
+
+    public init(
+        observedDenseHalfDType:
+            CompressedKVModelNativeDType
+    ) throws {
+        guard observedDenseHalfDType == .float16
+            || observedDenseHalfDType == .bfloat16
+        else {
+            throw ExactPrefixDenseRuntimeIdentityEvidenceError
+                .unsupportedObservedDenseHalfDType
+        }
+        self.observedDenseHalfDType =
+            observedDenseHalfDType
+        self.kvRouteSHA256 = sha256Hex(Data(
+            """
+            fast-mlx-exact-prefix-kv-route-v2
+            scalar
+            compiled
+            observed-dense-half=\(observedDenseHalfDType.rawValue)
+            full-attention
+            """.utf8))
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case observedDenseHalfDType
+        case kvRouteSHA256
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(
+            keyedBy: CodingKeys.self)
+        let observedDenseHalfDType = try values.decode(
+            CompressedKVModelNativeDType.self,
+            forKey: .observedDenseHalfDType)
+        let kvRouteSHA256 = try values.decode(
+            String.self,
+            forKey: .kvRouteSHA256)
+        let recomputed = try Self(
+            observedDenseHalfDType:
+                observedDenseHalfDType)
+        guard recomputed.kvRouteSHA256 == kvRouteSHA256 else {
+            throw ExactPrefixDenseRuntimeIdentityEvidenceError
+                .routeIdentityMismatch
+        }
+        self = recomputed
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(
+            keyedBy: CodingKeys.self)
+        try values.encode(
+            observedDenseHalfDType,
+            forKey: .observedDenseHalfDType)
+        try values.encode(
+            kvRouteSHA256,
+            forKey: .kvRouteSHA256)
+    }
+}
+
 /// Recomputable request-start evidence. Logical cache reads and physically evaluated prefill rows
 /// are deliberately distinct so a hot hit cannot inflate a kernel throughput claim.
 public struct RequestStartMetrics:
@@ -48,6 +125,7 @@ public struct RequestStartMetrics:
         case retainedBytes
         case entryCount
         case evictionCount
+        case runtimeIdentity
         case eagerWarmupSeconds
         case apparentPrefillTokensPerSecond
         case physicalPrefillTokensPerSecond
@@ -69,6 +147,8 @@ public struct RequestStartMetrics:
     public let retainedBytes: Int
     public let entryCount: Int
     public let evictionCount: Int
+    public let runtimeIdentity:
+        ExactPrefixDenseRuntimeIdentityEvidence?
     public let eagerWarmupSeconds: Double?
     public let apparentPrefillTokensPerSecond: Double
     public let physicalPrefillTokensPerSecond: Double
@@ -90,6 +170,8 @@ public struct RequestStartMetrics:
         retainedBytes: Int,
         entryCount: Int,
         evictionCount: Int,
+        runtimeIdentity:
+            ExactPrefixDenseRuntimeIdentityEvidence? = nil,
         eagerWarmupSeconds: Double? = nil
     ) throws {
         guard promptTokenCount > 0 else {
@@ -234,6 +316,7 @@ public struct RequestStartMetrics:
         self.retainedBytes = retainedBytes
         self.entryCount = entryCount
         self.evictionCount = evictionCount
+        self.runtimeIdentity = runtimeIdentity
         self.eagerWarmupSeconds = eagerWarmupSeconds
         self.apparentPrefillTokensPerSecond =
             apparentPrefillTokensPerSecond
@@ -295,6 +378,9 @@ public struct RequestStartMetrics:
             evictionCount: values.decode(
                 Int.self,
                 forKey: .evictionCount),
+            runtimeIdentity: values.decodeIfPresent(
+                ExactPrefixDenseRuntimeIdentityEvidence.self,
+                forKey: .runtimeIdentity),
             eagerWarmupSeconds: values.decodeIfPresent(
                 Double.self,
                 forKey: .eagerWarmupSeconds))
@@ -344,6 +430,9 @@ public struct RequestStartMetrics:
         try values.encode(retainedBytes, forKey: .retainedBytes)
         try values.encode(entryCount, forKey: .entryCount)
         try values.encode(evictionCount, forKey: .evictionCount)
+        try values.encodeIfPresent(
+            runtimeIdentity,
+            forKey: .runtimeIdentity)
         try values.encodeIfPresent(
             eagerWarmupSeconds,
             forKey: .eagerWarmupSeconds)

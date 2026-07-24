@@ -75,59 +75,21 @@ enum ExactPrefixRuntimeError:
     }
 }
 
-/// Path-free loaded-model identity and exact dense geometry retained inside the model actor.
-/// The caller contributes only privacy/template/tool hashes; every model/runtime axis below is
-/// derived from independently authenticated source bytes.
-struct ExactPrefixRuntimeIdentity: Sendable {
+/// Stable, path-free source identity retained before the actor observes any live KV arrays.
+///
+/// Config dtype remains authenticated provenance, but it is not allowed to select the cache route:
+/// some source-locked models declare bfloat16 while their loaded MLX attention path emits float16.
+struct ExactPrefixRuntimeIdentitySource: Sendable {
     let admission: CompressedKVAttentionRuntimeAdmission
     let modelInstanceID: String
-    let kvRouteSHA256: String
-    let positionSemanticsSHA256: String
-    let architectureStateSHA256: String
-    let drafterStateSHA256: String
-    let nativeDType: CompressedKVModelNativeDType
 
     init(
         admission: CompressedKVAttentionRuntimeAdmission,
         modelInstanceID: String = UUID().uuidString.lowercased()
     ) throws {
         let admission = try admission.validatedForEvidence()
-        guard let nativeDType = admission.modelNativeDType,
-            nativeDType == .float16 || nativeDType == .bfloat16
-        else {
-            throw ExactPrefixRuntimeError.unsupportedNativeDType(
-                admission.modelNativeDType?.rawValue ?? "missing")
-        }
-        let kvRouteSHA256 = sha256Hex(Data(
-            """
-            fast-mlx-exact-prefix-kv-route-v1
-            scalar
-            compiled
-            dense-half=\(nativeDType.rawValue)
-            full-attention
-            """.utf8))
-        let positionSemanticsSHA256 = sha256Hex(Data(
-            """
-            fast-mlx-exact-prefix-position-v1
-            family=\(admission.family.rawValue)
-            config=\(admission.modelConfigSHA256)
-            max=\(admission.maxPositionEmbeddings)
-            """.utf8))
-        let architectureStateSHA256 = sha256Hex(Data(
-            """
-            fast-mlx-exact-prefix-architecture-v1
-            model_type=\(admission.modelType)
-            architecture=\(admission.architecture)
-            layers=\(admission.layerCount)
-            query_heads=\(admission.queryHeadCount)
-            kv_heads=\(admission.kvHeadCount)
-            head_dim=\(admission.headDimension)
-            native_dtype=\(admission.modelNativeDType?.rawValue ?? "unknown")
-            """.utf8))
-        let drafterStateSHA256 = sha256Hex(Data(
-            "fast-mlx-exact-prefix-drafter-v1\nnone\n".utf8))
         // Reuse the semantic key's strict path-free validation for the ephemeral instance and
-        // every derived digest before this identity can enter actor state.
+        // authenticated source identities before unresolved state can enter the actor.
         _ = try ExactPrefixSemanticKey(
             isolationNamespaceSHA256: String(
                 repeating: "0", count: 64),
@@ -138,12 +100,179 @@ struct ExactPrefixRuntimeIdentity: Sendable {
             promptTemplateSHA256: String(
                 repeating: "1", count: 64),
             toolsSHA256: String(repeating: "2", count: 64),
+            kvRouteSHA256: String(repeating: "3", count: 64),
+            positionSemanticsSHA256: String(
+                repeating: "4", count: 64),
+            architectureStateSHA256: String(
+                repeating: "5", count: 64),
+            drafterStateSHA256: String(repeating: "6", count: 64))
+        self.admission = admission
+        self.modelInstanceID = modelInstanceID
+    }
+
+    func resolve(
+        snapshot: CompiledMLXDecoderSnapshot
+    ) throws -> ExactPrefixRuntimeIdentity {
+        let observed = try observedDenseDType(snapshot: snapshot)
+        let identity = try ExactPrefixRuntimeIdentity(
+            source: self, observedNativeDType: observed)
+        let expectedBytes = try identity.snapshotBytes(
+            tokenCount: snapshot.logicalTokenCount)
+        guard snapshot.totalNBytes == expectedBytes else {
+            throw ExactPrefixRuntimeError
+                .snapshotByteCountMismatch(
+                    expected: expectedBytes,
+                    actual: snapshot.totalNBytes)
+        }
+        return identity
+    }
+
+    func observedDenseDType(
+        snapshot: CompiledMLXDecoderSnapshot
+    ) throws -> CompressedKVModelNativeDType {
+        let profile = try snapshot.validatedDenseHalfProfile()
+        let expectedGeometry =
+            "rank=4,batch=1,layers=\(admission.layerCount),kvHeads=\(admission.kvHeadCount),headDim=\(admission.headDimension)"
+        let actualGeometry =
+            "rank=\(profile.rank),batch=\(profile.batchSize),layers=\(profile.layerCount),kvHeads=\(profile.kvHeadCount),headDim=\(profile.headDimension)"
+        guard profile.rank == 4,
+            profile.batchSize == 1,
+            profile.layerCount == admission.layerCount,
+            profile.kvHeadCount == admission.kvHeadCount,
+            profile.headDimension == admission.headDimension
+        else {
+            throw ExactPrefixRuntimeError.snapshotGeometryMismatch(
+                expected: expectedGeometry,
+                actual: actualGeometry)
+        }
+        switch profile.dtype {
+        case .float16:
+            return .float16
+        case .bfloat16:
+            return .bfloat16
+        default:
+            throw ExactPrefixRuntimeError.unsupportedNativeDType(
+                String(describing: profile.dtype))
+        }
+    }
+
+    /// Exact detached snapshot bytes are independent of which supported half dtype is observed:
+    /// both f16 and bf16 occupy two bytes per scalar. This lets the actor reject an undersized
+    /// policy before allocating even the one-token live identity probe.
+    func snapshotBytes(tokenCount: Int) throws -> Int {
+        guard tokenCount > 0 else {
+            throw ExactPrefixRuntimeError.invalidPrompt
+        }
+        func multiply(_ lhs: Int, _ rhs: Int) throws -> Int {
+            let (value, overflow) =
+                lhs.multipliedReportingOverflow(by: rhs)
+            guard !overflow else {
+                throw ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow
+            }
+            return value
+        }
+        func add(_ lhs: Int, _ rhs: Int) throws -> Int {
+            let (value, overflow) =
+                lhs.addingReportingOverflow(rhs)
+            guard !overflow else {
+                throw ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow
+            }
+            return value
+        }
+
+        var arrayBytes = try multiply(
+            admission.layerCount, admission.kvHeadCount)
+        arrayBytes = try multiply(arrayBytes, tokenCount)
+        arrayBytes = try multiply(
+            arrayBytes, admission.headDimension)
+        arrayBytes = try multiply(
+            arrayBytes, MemoryLayout<UInt16>.stride)
+        arrayBytes = try multiply(arrayBytes, 2)
+        let layerControlBytes = try multiply(
+            admission.layerCount,
+            MemoryLayout<CompiledKVCacheSnapshot>.stride)
+        let controlBytes = try add(
+            layerControlBytes, MemoryLayout<Int32>.stride)
+        return try add(arrayBytes, controlBytes)
+    }
+}
+
+/// Fully resolved actor-owned identity for one observed scalar dense-half route.
+///
+/// The semantic key binds both the independently authenticated source/config and the homogeneous
+/// dtype emitted by every live K/V layer. Only this resolved form may touch the cache policy plane.
+struct ExactPrefixRuntimeIdentity: Sendable {
+    let source: ExactPrefixRuntimeIdentitySource
+    let evidence: ExactPrefixDenseRuntimeIdentityEvidence
+    let kvRouteSHA256: String
+    let positionSemanticsSHA256: String
+    let architectureStateSHA256: String
+    let drafterStateSHA256: String
+    let nativeDType: CompressedKVModelNativeDType
+
+    var admission: CompressedKVAttentionRuntimeAdmission {
+        source.admission
+    }
+
+    var modelInstanceID: String {
+        source.modelInstanceID
+    }
+
+    init(
+        source: ExactPrefixRuntimeIdentitySource,
+        observedNativeDType nativeDType:
+            CompressedKVModelNativeDType
+    ) throws {
+        guard nativeDType == .float16 || nativeDType == .bfloat16
+        else {
+            throw ExactPrefixRuntimeError.unsupportedNativeDType(
+                nativeDType.rawValue)
+        }
+
+        let admission = source.admission
+        let evidence =
+            try ExactPrefixDenseRuntimeIdentityEvidence(
+                observedDenseHalfDType: nativeDType)
+        let kvRouteSHA256 = evidence.kvRouteSHA256
+        let positionSemanticsSHA256 = sha256Hex(Data(
+            """
+            fast-mlx-exact-prefix-position-v1
+            family=\(admission.family.rawValue)
+            config=\(admission.modelConfigSHA256)
+            max=\(admission.maxPositionEmbeddings)
+            """.utf8))
+        let architectureStateSHA256 = sha256Hex(Data(
+            """
+            fast-mlx-exact-prefix-architecture-v2
+            model_type=\(admission.modelType)
+            architecture=\(admission.architecture)
+            layers=\(admission.layerCount)
+            query_heads=\(admission.queryHeadCount)
+            kv_heads=\(admission.kvHeadCount)
+            head_dim=\(admission.headDimension)
+            configured_dtype=\(admission.modelNativeDType?.rawValue ?? "unknown")
+            observed_dense_half_dtype=\(nativeDType.rawValue)
+            """.utf8))
+        let drafterStateSHA256 = sha256Hex(Data(
+            "fast-mlx-exact-prefix-drafter-v1\nnone\n".utf8))
+        _ = try ExactPrefixSemanticKey(
+            isolationNamespaceSHA256: String(
+                repeating: "0", count: 64),
+            modelInstanceID: source.modelInstanceID,
+            modelRevisionSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
+            promptTemplateSHA256: String(
+                repeating: "1", count: 64),
+            toolsSHA256: String(repeating: "2", count: 64),
             kvRouteSHA256: kvRouteSHA256,
             positionSemanticsSHA256: positionSemanticsSHA256,
             architectureStateSHA256: architectureStateSHA256,
             drafterStateSHA256: drafterStateSHA256)
-        self.admission = admission
-        self.modelInstanceID = modelInstanceID
+        self.source = source
+        self.evidence = evidence
         self.kvRouteSHA256 = kvRouteSHA256
         self.positionSemanticsSHA256 = positionSemanticsSHA256
         self.architectureStateSHA256 = architectureStateSHA256
@@ -171,77 +300,19 @@ struct ExactPrefixRuntimeIdentity: Sendable {
     }
 
     func snapshotBytes(tokenCount: Int) throws -> Int {
-        guard tokenCount > 0 else {
-            throw ExactPrefixRuntimeError.invalidPrompt
-        }
-        func multiply(_ lhs: Int, _ rhs: Int) throws -> Int {
-            let (value, overflow) =
-                lhs.multipliedReportingOverflow(by: rhs)
-            guard !overflow else {
-                throw ExactPrefixRuntimeError
-                    .snapshotByteCountOverflow
-            }
-            return value
-        }
-        func add(_ lhs: Int, _ rhs: Int) throws -> Int {
-            let (value, overflow) = lhs.addingReportingOverflow(rhs)
-            guard !overflow else {
-                throw ExactPrefixRuntimeError
-                    .snapshotByteCountOverflow
-            }
-            return value
-        }
-
-        var arrayBytes = try multiply(
-            admission.layerCount, admission.kvHeadCount)
-        arrayBytes = try multiply(arrayBytes, tokenCount)
-        arrayBytes = try multiply(
-            arrayBytes, admission.headDimension)
-        arrayBytes = try multiply(
-            arrayBytes, MemoryLayout<UInt16>.stride)
-        arrayBytes = try multiply(arrayBytes, 2)
-        let layerControlBytes = try multiply(
-            admission.layerCount,
-            MemoryLayout<CompiledKVCacheSnapshot>.stride)
-        let controlBytes = try add(
-            layerControlBytes, MemoryLayout<Int32>.stride)
-        return try add(arrayBytes, controlBytes)
+        try source.snapshotBytes(tokenCount: tokenCount)
     }
 
     func validate(
         snapshot: CompiledMLXDecoderSnapshot
     ) throws {
-        let expectedGeometry =
-            "rank=4,batch=1,layers=\(admission.layerCount),kvHeads=\(admission.kvHeadCount),headDim=\(admission.headDimension)"
-        let actualGeometry =
-            "rank=\(snapshot.rank.map(String.init) ?? "missing"),batch=\(snapshot.batchSize.map(String.init) ?? "missing"),layers=\(snapshot.layerCount),kvHeads=\(snapshot.kvHeadCount.map(String.init) ?? "missing"),headDim=\(snapshot.headDimension.map(String.init) ?? "missing")"
-        guard snapshot.rank == 4,
-            snapshot.batchSize == 1,
-            snapshot.layerCount == admission.layerCount,
-            snapshot.kvHeadCount == admission.kvHeadCount,
-            snapshot.headDimension == admission.headDimension
-        else {
-            throw ExactPrefixRuntimeError.snapshotGeometryMismatch(
-                expected: expectedGeometry,
-                actual: actualGeometry)
-        }
-        let expected: DType =
-            switch nativeDType {
-            case .float16: .float16
-            case .bfloat16: .bfloat16
-            case .float32:
-                preconditionFailure(
-                    "float32 cannot enter exact-prefix runtime identity")
-            }
-        guard snapshot.keyDType == expected,
-            snapshot.valueDType == expected
-        else {
+        let actual = try source.observedDenseDType(
+            snapshot: snapshot)
+        guard actual == nativeDType else {
             throw ExactPrefixRuntimeError.snapshotDTypeMismatch(
                 expected: nativeDType.rawValue,
-                key: snapshot.keyDType.map(String.init(describing:))
-                    ?? "missing",
-                value: snapshot.valueDType.map(String.init(describing:))
-                    ?? "missing")
+                key: actual.rawValue,
+                value: actual.rawValue)
         }
     }
 }
@@ -519,8 +590,14 @@ actor HarnessEngineActor {
     private let kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity?
     private let exactPrefixCacheConfiguration:
         ExactPrefixCacheConfiguration
-    private let exactPrefixRuntimeIdentity:
+    private let exactPrefixRuntimeIdentitySource:
+        ExactPrefixRuntimeIdentitySource?
+    private var exactPrefixRuntimeIdentity:
         ExactPrefixRuntimeIdentity?
+    private var exactPrefixRuntimeIdentityRejectionReason:
+        ExactPrefixCommitSkipReason?
+    private var exactPrefixRuntimeIdentityRejectionDetail:
+        String?
     /// Both the pure index and its MLX-backed snapshot payloads stay inside this actor.
     private var exactPrefixCache:
         ExactPrefixCache<CompiledMLXDecoderSnapshot>
@@ -553,15 +630,18 @@ actor HarnessEngineActor {
         kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity? = nil,
         exactPrefixCacheConfiguration:
             ExactPrefixCacheConfiguration = .disabled,
-        exactPrefixRuntimeIdentity:
-            ExactPrefixRuntimeIdentity? = nil
+        exactPrefixRuntimeIdentitySource:
+            ExactPrefixRuntimeIdentitySource? = nil
     ) {
         self.model = model
         self.kvtunerRuntimeIdentity = kvtunerRuntimeIdentity
         self.exactPrefixCacheConfiguration =
             exactPrefixCacheConfiguration
-        self.exactPrefixRuntimeIdentity =
-            exactPrefixRuntimeIdentity
+        self.exactPrefixRuntimeIdentitySource =
+            exactPrefixRuntimeIdentitySource
+        exactPrefixRuntimeIdentity = nil
+        exactPrefixRuntimeIdentityRejectionReason = nil
+        exactPrefixRuntimeIdentityRejectionDetail = nil
         exactPrefixCache = ExactPrefixCache(
             policy: exactPrefixCacheConfiguration.policy)
     }
@@ -570,12 +650,95 @@ actor HarnessEngineActor {
         exactPrefixCache.snapshot
     }
 
+    func exactPrefixRuntimeIdentityEvidence()
+        -> ExactPrefixDenseRuntimeIdentityEvidence?
+    {
+        exactPrefixRuntimeIdentity?.evidence
+    }
+
+    /// Resolve the live scalar dense-half route with a one-token detached snapshot.
+    ///
+    /// The probe is admitted against the cache byte policy before allocation, never touches the
+    /// prefix index, and records a terminal actor-local rejection so unsupported models serve
+    /// cold without retrying or mutating the cache plane.
+    func prepareExactPrefixRuntimeIdentity() {
+        guard exactPrefixCacheConfiguration.policy.isEnabled,
+            exactPrefixRuntimeIdentitySource != nil,
+            exactPrefixRuntimeIdentity == nil,
+            exactPrefixRuntimeIdentityRejectionReason == nil
+        else {
+            return
+        }
+        let key = DecoderKey(
+            kind: .fp16,
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .materialize,
+            kvarnStorageDType: nil)
+        if decoders[key] == nil {
+            decoders[key] = CompiledMLXDecoder(
+                model: model, kvCache: .fp16)
+        }
+        var decoder = decoders[key]!
+        resolveExactPrefixRuntimeIdentityIfNeeded(
+            decoder: &decoder)
+        decoder.reset()
+        decoders[key] = decoder
+    }
+
+    private func resolveExactPrefixRuntimeIdentityIfNeeded(
+        decoder: inout CompiledMLXDecoder
+    ) {
+        guard exactPrefixRuntimeIdentity == nil,
+            exactPrefixRuntimeIdentityRejectionReason == nil,
+            let exactPrefixRuntimeIdentitySource
+        else {
+            return
+        }
+        do {
+            let probeBytes =
+                try exactPrefixRuntimeIdentitySource
+                    .snapshotBytes(tokenCount: 1)
+            guard probeBytes <= exactPrefixCacheConfiguration
+                .policy.maxRetainedBytes
+            else {
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotExceedsBudget
+                return
+            }
+            decoder.reset()
+            let staged =
+                try decoder.prefillCapturingPromptSnapshot([1])
+            exactPrefixRuntimeIdentity =
+                try exactPrefixRuntimeIdentitySource.resolve(
+                    snapshot: staged.snapshot)
+        } catch {
+            switch error {
+            case ExactPrefixRuntimeError
+                .snapshotByteCountMismatch(_, _),
+                ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow,
+                ExactPrefixRuntimeError
+                    .snapshotDTypeMismatch(_, _, _),
+                ExactPrefixRuntimeError
+                    .snapshotGeometryMismatch(_, _):
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotEvidenceMismatch
+                exactPrefixRuntimeIdentityRejectionDetail =
+                    String(describing: error)
+            default:
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotCaptureFailed
+            }
+        }
+        decoder.reset()
+    }
+
     /// Optional load-time warmup for the exact scalar dense-half route. It is idempotent, never
     /// touches the prefix index, and resets the decoder after exercising one- and eight-token
     /// prefill plus compiled single-token decode shapes.
     func performExactPrefixWarmup() throws -> Double {
         guard exactPrefixCacheConfiguration.policy.isEnabled,
-            exactPrefixRuntimeIdentity != nil
+            exactPrefixRuntimeIdentitySource != nil
         else {
             throw ExactPrefixRuntimeError.missingRuntimeIdentity
         }
@@ -592,6 +755,8 @@ actor HarnessEngineActor {
                 model: model, kvCache: .fp16)
         }
         var decoder = decoders[key]!
+        resolveExactPrefixRuntimeIdentityIfNeeded(
+            decoder: &decoder)
         let startedAt = ProcessInfo.processInfo.systemUptime
         for prompt in [[1], Array(repeating: 1, count: 8)] {
             decoder.reset()
@@ -680,25 +845,41 @@ actor HarnessEngineActor {
             let cacheEnabled =
                 exactPrefixRequest != nil
                 && exactPrefixCacheConfiguration.policy.isEnabled
-            let semanticKey: ExactPrefixSemanticKey?
+            var prefixCacheRejectionReason:
+                ExactPrefixCommitSkipReason?
+            var prefixCacheRejectionDetail: String?
+            var semanticKey: ExactPrefixSemanticKey?
             if cacheEnabled {
-                guard let exactPrefixRuntimeIdentity,
+                guard exactPrefixRuntimeIdentitySource != nil,
                     let exactPrefixRequest
                 else {
                     throw ExactPrefixRuntimeError
                         .missingRuntimeIdentity
                 }
-                semanticKey = try exactPrefixRuntimeIdentity
-                    .semanticKey(request: exactPrefixRequest)
+                resolveExactPrefixRuntimeIdentityIfNeeded(
+                    decoder: &decoder)
+                prefixCacheRejectionReason =
+                    exactPrefixRuntimeIdentityRejectionReason
+                prefixCacheRejectionDetail =
+                    exactPrefixRuntimeIdentityRejectionDetail
+                if prefixCacheRejectionReason == nil {
+                    semanticKey = try exactPrefixRuntimeIdentity?
+                        .semanticKey(
+                            request: exactPrefixRequest)
+                } else {
+                    semanticKey = nil
+                }
             } else {
                 semanticKey = nil
             }
 
             let lookupStartedAt =
                 ProcessInfo.processInfo.systemUptime
+            var lookupPerformed = false
             let hit: ExactPrefixCacheHit<
                 CompiledMLXDecoderSnapshot>?
             if let semanticKey {
+                lookupPerformed = true
                 hit = try exactPrefixCache.lookup(
                     key: semanticKey,
                     promptTokens: prompt)
@@ -710,9 +891,6 @@ actor HarnessEngineActor {
                 ProcessInfo.processInfo.systemUptime
                     - lookupStartedAt
 
-            var prefixCacheRejectionReason:
-                ExactPrefixCommitSkipReason?
-            var prefixCacheRejectionDetail: String?
             if hit == nil, let semanticKey,
                 let exactPrefixRuntimeIdentity
             {
@@ -1024,7 +1202,7 @@ actor HarnessEngineActor {
                     templateSeconds: 0,
                     tokenizeSeconds: 0,
                     lookupSeconds:
-                        semanticKey == nil ? 0 : lookupSeconds,
+                        lookupPerformed ? lookupSeconds : 0,
                     restoreSeconds: restoreSeconds,
                     prefillSeconds:
                         physicalPrefillDuration,
@@ -1033,6 +1211,8 @@ actor HarnessEngineActor {
                     entryCount: cacheSnapshot.entryCount,
                     evictionCount:
                         cacheSnapshot.evictionCount,
+                    runtimeIdentity:
+                        exactPrefixRuntimeIdentity?.evidence,
                     eagerWarmupSeconds:
                         exactPrefixWarmupSeconds)
             } else {
@@ -2052,14 +2232,14 @@ func captureCompressedKVAttentionRuntimeSourceSnapshot(
 /// Turns the source snapshots sampled around model loading into the path-free identity carried
 /// by the model actor. Disabled caches do not consume an identity even when the same snapshots
 /// were captured for compressed-attention admission.
-func resolveExactPrefixRuntimeIdentity(
+func resolveExactPrefixRuntimeIdentitySource(
     configuration: ExactPrefixCacheConfiguration,
     sourceBeforeLoad:
         CompressedKVAttentionRuntimeSourceSnapshot?,
     sourceAfterLoad:
         CompressedKVAttentionRuntimeSourceSnapshot?,
     modelInstanceID: String = UUID().uuidString.lowercased()
-) throws -> ExactPrefixRuntimeIdentity? {
+) throws -> ExactPrefixRuntimeIdentitySource? {
     guard configuration.policy.isEnabled else {
         return nil
     }
@@ -2072,7 +2252,7 @@ func resolveExactPrefixRuntimeIdentity(
             after: sourceAfterLoad)
     let admission = try CompressedKVAttentionRuntimeAdmission.load(
         sourceSnapshot: stableSource)
-    return try ExactPrefixRuntimeIdentity(
+    return try ExactPrefixRuntimeIdentitySource(
         admission: admission,
         modelInstanceID: modelInstanceID)
 }
@@ -2180,8 +2360,8 @@ func loadSwiftDriver(
         compressedAdmission = nil
         compressedSourceAfterLoad = nil
     }
-    let exactPrefixRuntimeIdentity = try
-        resolveExactPrefixRuntimeIdentity(
+    let exactPrefixRuntimeIdentitySource = try
+        resolveExactPrefixRuntimeIdentitySource(
             configuration: exactPrefixCacheConfiguration,
             sourceBeforeLoad: compressedSourceBeforeLoad,
             sourceAfterLoad: compressedSourceAfterLoad)
@@ -2190,8 +2370,9 @@ func loadSwiftDriver(
         kvtunerRuntimeIdentity: runtimeIdentity,
         exactPrefixCacheConfiguration:
             exactPrefixCacheConfiguration,
-        exactPrefixRuntimeIdentity:
-            exactPrefixRuntimeIdentity)
+        exactPrefixRuntimeIdentitySource:
+            exactPrefixRuntimeIdentitySource)
+    await engine.prepareExactPrefixRuntimeIdentity()
     if exactPrefixCacheConfiguration.eagerWarmupEnabled {
         _ = try await engine.performExactPrefixWarmup()
     }

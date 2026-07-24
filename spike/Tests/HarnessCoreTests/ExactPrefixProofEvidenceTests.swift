@@ -11,7 +11,22 @@ final class ExactPrefixProofEvidenceTests: XCTestCase {
             .postWarmupHit: 0.012,
         ])
 
-        XCTAssertEqual(evidence.schemaVersion, 1)
+        XCTAssertEqual(evidence.schemaVersion, 2)
+        XCTAssertEqual(
+            evidence.cases[1].requestStartMetrics?
+                .runtimeIdentity?.observedDenseHalfDType,
+            .float16)
+        XCTAssertEqual(
+            evidence.cases[1].requestStartMetrics?
+                .runtimeIdentity?.kvRouteSHA256,
+            digest(
+                """
+                fast-mlx-exact-prefix-kv-route-v2
+                scalar
+                compiled
+                observed-dense-half=float16
+                full-attention
+                """))
         XCTAssertTrue(evidence.byteIdentityPassed)
         XCTAssertTrue(evidence.engagementPassed)
         XCTAssertTrue(evidence.boundedPassed)
@@ -55,6 +70,77 @@ final class ExactPrefixProofEvidenceTests: XCTestCase {
             XCTAssertEqual(
                 $0 as? ExactPrefixProofEvidenceError,
                 .invalidPromptRepeat)
+        }
+    }
+
+    func testRuntimeIdentityTamperingFailsClosed()
+        throws
+    {
+        let evidence = try proofEvidence()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(evidence))
+                as? [String: Any])
+        var cases = try XCTUnwrap(
+            object["cases"] as? [[String: Any]])
+        var requestStartMetrics = try XCTUnwrap(
+            cases[1]["requestStartMetrics"]
+                as? [String: Any])
+        var runtimeIdentity = try XCTUnwrap(
+            requestStartMetrics["runtimeIdentity"]
+                as? [String: Any])
+        runtimeIdentity["kvRouteSHA256"] =
+            String(repeating: "0", count: 64)
+        requestStartMetrics["runtimeIdentity"] =
+            runtimeIdentity
+        cases[1]["requestStartMetrics"] =
+            requestStartMetrics
+        object["cases"] = cases
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                ExactPrefixProofEvidence.self,
+                from: JSONSerialization.data(
+                    withJSONObject: object,
+                    options: [.sortedKeys])))
+
+    }
+
+    func testSchemaOneNegativeDiagnosticsRemainReadableButCannotPromote()
+        throws
+    {
+        var outcomeMiss = try proofEvidence().cases
+        outcomeMiss[2] = outcomeMiss[2]
+            .replacing(requestStartMetrics: metrics(
+                outcome: .miss,
+                templateHit: true,
+                promptTokens: 64))
+            .replacing(
+                reusedPrefixTokenIDsSHA256: nil,
+                reusedPrefixTokenCount: 0)
+        let negative = try proofEvidence(cases: outcomeMiss)
+        let decodedNegative = try JSONDecoder().decode(
+            ExactPrefixProofEvidence.self,
+            from: JSONSerialization.data(
+                withJSONObject:
+                    try legacySchemaOneObject(from: negative),
+                options: [.sortedKeys]))
+
+        XCTAssertEqual(decodedNegative.schemaVersion, 1)
+        XCTAssertFalse(decodedNegative.engagementPassed)
+        XCTAssertFalse(decodedNegative.promotable)
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                ExactPrefixProofEvidence.self,
+                from: JSONSerialization.data(
+                    withJSONObject:
+                        try legacySchemaOneObject(
+                            from: proofEvidence()),
+                    options: [.sortedKeys])))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .legacyPromotableEvidence)
         }
     }
 
@@ -506,6 +592,27 @@ private let checkpointSHA = String(repeating: "d", count: 64)
 private let tokenizerSHA = String(repeating: "c", count: 64)
 private let binarySHA = String(repeating: "b", count: 64)
 
+private func legacySchemaOneObject(
+    from evidence: ExactPrefixProofEvidence
+) throws -> [String: Any] {
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(evidence))
+            as? [String: Any])
+    var cases = try XCTUnwrap(
+        object["cases"] as? [[String: Any]])
+    for index in cases.indices {
+        guard var requestStartMetrics =
+            cases[index]["requestStartMetrics"] as? [String: Any]
+        else { continue }
+        requestStartMetrics.removeValue(forKey: "runtimeIdentity")
+        cases[index]["requestStartMetrics"] = requestStartMetrics
+    }
+    object["schemaVersion"] = 1
+    object["cases"] = cases
+    return object
+}
+
 private func proofEvidence(
     modelID: String = "loaded-qwen3",
     sourceRevision: String = checkpointSHA,
@@ -814,6 +921,9 @@ private func metrics(
         retainedBytes: outcome == .miss ? 0 : 512,
         entryCount: outcome == .miss ? 0 : 1,
         evictionCount: evictionCount,
+        runtimeIdentity:
+            try! ExactPrefixDenseRuntimeIdentityEvidence(
+                observedDenseHalfDType: .float16),
         eagerWarmupSeconds: eagerWarmupSeconds)
 }
 

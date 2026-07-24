@@ -116,7 +116,7 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         eos: Int = 4_095
     ) throws -> SwiftEngineDriver {
         let admission = try admission(nativeDType: admissionDType)
-        let identity = try ExactPrefixRuntimeIdentity(
+        let identitySource = try ExactPrefixRuntimeIdentitySource(
             admission: admission,
             modelInstanceID: "tiny-qwen-instance")
         return SwiftEngineDriver(
@@ -126,9 +126,9 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
                     kvHeadCount: modelKVHeadCount,
                     headDimension: modelHeadDimension),
                 exactPrefixCacheConfiguration: configuration,
-                exactPrefixRuntimeIdentity:
+                exactPrefixRuntimeIdentitySource:
                     configuration.policy.isEnabled
-                    ? identity : nil),
+                    ? identitySource : nil),
             eos: eos,
             compressedKVAttentionAdmission: admission)
     }
@@ -226,7 +226,7 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
             exact.requestStartMetrics?.prefixCacheOutcome, .exactHit)
     }
 
-    func testConfiguredAndObservedDenseDTypeMismatchRejectsCache()
+    func testObservedDenseDTypeResolvesConfigMismatchBeforeCaching()
         async throws
     {
         let driver = try makeDriver(
@@ -237,6 +237,61 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
             configuration: .disabled,
             modelDType: .float16,
             admissionDType: "float16")
+        let context = try request()
+        let prompt = [2, 3, 4]
+
+        let cold = try await driver.generate(
+            prompt: prompt, config: config(context))
+        let exact = try await driver.generate(
+            prompt: prompt, config: config(context))
+        let control = try await disabled.generate(
+            prompt: prompt, config: config(context))
+
+        XCTAssertEqual(cold.tokens, control.tokens)
+        XCTAssertEqual(exact.tokens, control.tokens)
+        XCTAssertEqual(
+            cold.requestStartMetrics?.prefixCacheOutcome, .miss)
+        XCTAssertNil(
+            cold.requestStartMetrics?.prefixCacheRejectionReason)
+        XCTAssertNil(
+            cold.requestStartMetrics?.prefixCacheRejectionDetail)
+        XCTAssertEqual(
+            exact.requestStartMetrics?.prefixCacheOutcome, .exactHit)
+        XCTAssertEqual(
+            exact.requestStartMetrics?.cacheReadTokenCount,
+            prompt.count)
+        XCTAssertEqual(
+            exact.requestStartMetrics?.runtimeIdentity,
+            cold.requestStartMetrics?.runtimeIdentity)
+        let runtimeIdentity =
+            await driver.engine.exactPrefixRuntimeIdentityEvidence()
+        XCTAssertEqual(
+            runtimeIdentity?.observedDenseHalfDType,
+            .float16)
+        XCTAssertEqual(
+            cold.requestStartMetrics?.runtimeIdentity?
+                .observedDenseHalfDType,
+            .float16)
+        XCTAssertEqual(
+            cold.requestStartMetrics?.runtimeIdentity?
+                .kvRouteSHA256,
+            runtimeIdentity?.kvRouteSHA256)
+        let cache = await driver.engine.exactPrefixCacheSnapshot()
+        XCTAssertGreaterThan(cache.entryCount, 0)
+        XCTAssertEqual(cache.reservationCount, 0)
+    }
+
+    func testUnsupportedObservedDenseDTypeRejectsBeforeCacheMutation()
+        async throws
+    {
+        let driver = try makeDriver(
+            configuration: cacheConfiguration(),
+            modelDType: .float32,
+            admissionDType: "bfloat16")
+        let disabled = try makeDriver(
+            configuration: .disabled,
+            modelDType: .float32,
+            admissionDType: "bfloat16")
         let context = try request()
         let prompt = [2, 3, 4]
 
@@ -251,12 +306,19 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
             .rejected)
         XCTAssertEqual(
             result.requestStartMetrics?.prefixCacheRejectionReason,
-            .snapshotEvidenceMismatch)
-        XCTAssertEqual(
-            result.requestStartMetrics?.prefixCacheRejectionDetail,
-            "exact prefix snapshot dtype key=float16 value=float16 != expected bfloat16")
+            .snapshotCaptureFailed)
         let cache = await driver.engine.exactPrefixCacheSnapshot()
         XCTAssertEqual(cache.entryCount, 0)
+        XCTAssertEqual(cache.reservationCount, 0)
+        XCTAssertEqual(cache.retainedBytes, 0)
+        XCTAssertEqual(cache.reservedBytes, 0)
+        XCTAssertEqual(cache.hitCount, 0)
+        XCTAssertEqual(cache.missCount, 0)
+        XCTAssertEqual(cache.evictionCount, 0)
+        let rejectedRuntimeIdentity =
+            await driver.engine
+                .exactPrefixRuntimeIdentityEvidence()
+        XCTAssertNil(rejectedRuntimeIdentity)
     }
 
     func testEqualByteProductButWrongDenseGeometryRejectsCache()
@@ -292,11 +354,51 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         XCTAssertEqual(cache.entryCount, 0)
     }
 
+    func testResolvedLiveDTypeRejectsLaterDifferentDenseSnapshot()
+        throws
+    {
+        let identitySource = try ExactPrefixRuntimeIdentitySource(
+            admission: admission(nativeDType: "bfloat16"),
+            modelInstanceID: "tiny-qwen-instance")
+        var float16Decoder = CompiledMLXDecoder(
+            model: TinyExactPrefixHarnessModel(
+                cacheDType: .float16),
+            kvCache: .fp16)
+        let float16Snapshot =
+            try float16Decoder
+                .prefillCapturingPromptSnapshot([2, 3, 4])
+                .snapshot
+        let resolved = try identitySource.resolve(
+            snapshot: float16Snapshot)
+
+        var bfloat16Decoder = CompiledMLXDecoder(
+            model: TinyExactPrefixHarnessModel(
+                cacheDType: .bfloat16),
+            kvCache: .fp16)
+        let bfloat16Snapshot =
+            try bfloat16Decoder
+                .prefillCapturingPromptSnapshot([2, 3, 4])
+                .snapshot
+
+        XCTAssertThrowsError(
+            try resolved.validate(snapshot: bfloat16Snapshot)
+        ) {
+            XCTAssertEqual(
+                $0 as? ExactPrefixRuntimeError,
+                .snapshotDTypeMismatch(
+                    expected: "float16",
+                    key: "bfloat16",
+                    value: "bfloat16"))
+        }
+    }
+
     func testIsolationAndSemanticKeysPreventCrossRequestPoisoning()
         async throws
     {
         let driver = try makeDriver(
-            configuration: cacheConfiguration())
+            configuration: cacheConfiguration(),
+            modelDType: .float16,
+            admissionDType: "bfloat16")
         let a = try request(namespace: "a")
         let b = try request(namespace: "f")
         let prompt = [3, 4, 5]
@@ -347,6 +449,51 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
             .exactPrefixCacheSnapshot()
         XCTAssertEqual(cache.entryCount, 0)
         XCTAssertEqual(cache.reservationCount, 0)
+        let rejectedRuntimeIdentity =
+            await rejected.engine
+                .exactPrefixRuntimeIdentityEvidence()
+        XCTAssertNil(rejectedRuntimeIdentity)
+    }
+
+    func testUnsupportedLiveDTypeDuringWarmupFailsCacheClosedWithoutFailingLoad()
+        async throws
+    {
+        let driver = try makeDriver(
+            configuration: cacheConfiguration(),
+            modelDType: .float32,
+            admissionDType: "bfloat16")
+        let disabled = try makeDriver(
+            configuration: .disabled,
+            modelDType: .float32,
+            admissionDType: "bfloat16")
+        let context = try request()
+
+        let warmupSeconds =
+            try await driver.engine.performExactPrefixWarmup()
+        XCTAssertGreaterThan(warmupSeconds, 0)
+        let rejectedRuntimeIdentity =
+            await driver.engine
+                .exactPrefixRuntimeIdentityEvidence()
+        XCTAssertNil(rejectedRuntimeIdentity)
+
+        let result = try await driver.generate(
+            prompt: [8, 9, 10],
+            config: config(context))
+        let control = try await disabled.generate(
+            prompt: [8, 9, 10],
+            config: config(context))
+        XCTAssertEqual(result.tokens, control.tokens)
+        XCTAssertEqual(
+            result.requestStartMetrics?.prefixCacheOutcome,
+            .rejected)
+        XCTAssertEqual(
+            result.requestStartMetrics?.prefixCacheRejectionReason,
+            .snapshotCaptureFailed)
+        let cache = await driver.engine
+            .exactPrefixCacheSnapshot()
+        XCTAssertEqual(cache.entryCount, 0)
+        XCTAssertEqual(cache.reservationCount, 0)
+        XCTAssertEqual(cache.retainedBytes, 0)
     }
 
     func testRejectedPromptCannotPublishLongerFinalContext()
@@ -423,7 +570,9 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         async throws
     {
         let driver = try makeDriver(
-            configuration: cacheConfiguration())
+            configuration: cacheConfiguration(),
+            modelDType: .float16,
+            admissionDType: "bfloat16")
         let context = try request()
         let prompt = [5, 6, 7]
 
@@ -433,6 +582,9 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         let postWarmup =
             await driver.engine.exactPrefixCacheSnapshot()
         XCTAssertEqual(postWarmup.entryCount, 0)
+        XCTAssertEqual(postWarmup.reservationCount, 0)
+        XCTAssertEqual(postWarmup.hitCount, 0)
+        XCTAssertEqual(postWarmup.missCount, 0)
 
         let empty = try await driver.generate(
             prompt: prompt,

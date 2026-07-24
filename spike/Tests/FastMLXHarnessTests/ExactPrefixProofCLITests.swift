@@ -563,6 +563,9 @@ final class ExactPrefixProofCLITests: XCTestCase {
                 entryCount: 1,
                 evictionCount:
                     id == .pressureEvictedA ? 1 : 0,
+                runtimeIdentity:
+                    try ExactPrefixDenseRuntimeIdentityEvidence(
+                        observedDenseHalfDType: .float16),
                 eagerWarmupSeconds:
                     id == .postWarmupMiss
                         || id == .postWarmupHit

@@ -84,6 +84,7 @@ public enum ExactPrefixProofCacheReceipt:
 
 public enum ExactPrefixProofEvidenceError: Error, Equatable, Sendable {
     case unsupportedSchemaVersion(Int)
+    case legacyPromotableEvidence
     case invalidModelID
     case invalidSourceRevision
     case sourceRevisionIdentityMismatch
@@ -671,7 +672,7 @@ public struct ExactPrefixProofDerived:
 public struct ExactPrefixProofEvidence:
     Codable, Equatable, Sendable
 {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public let schemaVersion: Int
     public let modelID: String
@@ -752,7 +753,8 @@ public struct ExactPrefixProofEvidence:
             ?? Self.recomputeDerived(
                 cases: cases,
                 memoryLimitBytes: memoryLimitBytes,
-                cacheLimitBytes: cacheLimitBytes)
+                cacheLimitBytes: cacheLimitBytes,
+                requiresRuntimeIdentity: true)
         try validated()
     }
 
@@ -862,7 +864,9 @@ public struct ExactPrefixProofEvidence:
 
     @discardableResult
     public func validated() throws -> Self {
-        guard schemaVersion == Self.currentSchemaVersion else {
+        guard schemaVersion == 1
+            || schemaVersion == Self.currentSchemaVersion
+        else {
             throw ExactPrefixProofEvidenceError
                 .unsupportedSchemaVersion(schemaVersion)
         }
@@ -945,9 +949,15 @@ public struct ExactPrefixProofEvidence:
         let recomputed = try Self.recomputeDerived(
             cases: cases,
             memoryLimitBytes: memoryLimitBytes,
-            cacheLimitBytes: cacheLimitBytes)
+            cacheLimitBytes: cacheLimitBytes,
+            requiresRuntimeIdentity:
+                schemaVersion == Self.currentSchemaVersion)
         guard derived == recomputed else {
             throw ExactPrefixProofEvidenceError.derivedClaimMismatch
+        }
+        guard schemaVersion != 1 || !derived.promotable else {
+            throw ExactPrefixProofEvidenceError
+                .legacyPromotableEvidence
         }
         return self
     }
@@ -955,7 +965,8 @@ public struct ExactPrefixProofEvidence:
     private static func recomputeDerived(
         cases: [ExactPrefixProofCaseEvidence],
         memoryLimitBytes: Int,
-        cacheLimitBytes: Int
+        cacheLimitBytes: Int,
+        requiresRuntimeIdentity: Bool
     ) throws -> ExactPrefixProofDerived {
         let ordered = cases.map(\.caseID) == ExactPrefixProofCaseID.requiredOrder
         guard ordered else {
@@ -971,7 +982,17 @@ public struct ExactPrefixProofEvidence:
                 == $0.referenceGeneratedTokenIDsSHA256
                 && $0.outputSHA256 == $0.referenceOutputSHA256
         }
-        let engagementPassed = ordered && cases.allSatisfy { row in
+        let cacheRows = cases.filter { !$0.caseID.isControl }
+        let runtimeIdentities = cacheRows.compactMap {
+            $0.requestStartMetrics?.runtimeIdentity
+        }
+        let runtimeIdentityPassed =
+            !requiresRuntimeIdentity
+            || (runtimeIdentities.count == cacheRows.count
+                && Set(runtimeIdentities).count == 1)
+        let engagementPassed =
+            ordered && runtimeIdentityPassed
+            && cases.allSatisfy { row in
             guard row.templateTokenCacheReceipt
                 == row.caseID.expectedTemplateReceipt
             else { return false }
@@ -990,7 +1011,7 @@ public struct ExactPrefixProofEvidence:
                 || (requestStartMetrics?.evictionCount ?? 0) > 0
             return expectedOutcome && expectedTemplate
                 && expectedEviction
-        }
+            }
         let boundedPassed = cases.allSatisfy { row in
             guard let memory = row.memoryEvidence else { return false }
             return memory.summary.maxMLXPeakBytes <= memoryLimitBytes

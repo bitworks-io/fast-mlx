@@ -19,6 +19,19 @@ public enum CompiledMLXDecoderSnapshotError: Error, Equatable, Sendable {
     case byteCountOverflow
 }
 
+/// Homogeneous scalar dense-half geometry observed across every decoder layer.
+///
+/// This is intentionally derived from the detached snapshot rather than model config so callers
+/// can bind cache identity to the MLX arrays the loaded model actually emitted.
+public struct CompiledMLXDenseSnapshotProfile {
+    public let rank: Int
+    public let batchSize: Int
+    public let layerCount: Int
+    public let kvHeadCount: Int
+    public let headDimension: Int
+    public let dtype: DType
+}
+
 /// Exact request-start state for the dense scalar compiled decoder.
 ///
 /// A snapshot contains the logical native-half prefix for every layer plus the greedy token that
@@ -86,6 +99,48 @@ public struct CompiledMLXDecoderSnapshot {
             controlNBytes = controlBytes
             totalNBytes = allBytes
         }
+    }
+
+    /// Revalidate the per-layer geometry and dtype before the actor derives a semantic identity.
+    ///
+    /// Snapshot capture and restore already perform the same checks. Keeping this explicit profile
+    /// surface prevents an identity consumer from trusting only the first layer's aggregate fields.
+    public func validatedDenseHalfProfile()
+        throws -> CompiledMLXDenseSnapshotProfile
+    {
+        guard let first = layerSnapshots.first else {
+            throw CompiledMLXDecoderSnapshotError.decoderNotInitialized
+        }
+        let expectedDType = first.keyDType
+        for (layer, snapshot) in layerSnapshots.enumerated() {
+            guard snapshot.tokenCount == logicalTokenCount else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerTokenCountMismatch(layer: layer)
+            }
+            guard snapshot.rank == first.rank,
+                snapshot.batchSize == first.batchSize,
+                snapshot.kvHeadCount == first.kvHeadCount,
+                snapshot.headDimension == first.headDimension
+            else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerGeometryMismatch(layer: layer)
+            }
+            guard snapshot.keyDType == snapshot.valueDType,
+                snapshot.keyDType == expectedDType,
+                snapshot.keyDType == .float16
+                    || snapshot.keyDType == .bfloat16
+            else {
+                throw CompiledMLXDecoderSnapshotError
+                    .layerDTypeMismatch(layer: layer)
+            }
+        }
+        return CompiledMLXDenseSnapshotProfile(
+            rank: first.rank,
+            batchSize: first.batchSize,
+            layerCount: layerSnapshots.count,
+            kvHeadCount: first.kvHeadCount,
+            headDimension: first.headDimension,
+            dtype: expectedDType)
     }
 }
 
@@ -524,6 +579,7 @@ public struct CompiledMLXDecoder: Decoder {
         else {
             throw CompiledMLXDecoderSnapshotError.byteCountOverflow
         }
+        _ = try snapshot.validatedDenseHalfProfile()
 
         var arrayBytes = 0
         for (layer, layerSnapshot) in snapshot.layerSnapshots.enumerated() {

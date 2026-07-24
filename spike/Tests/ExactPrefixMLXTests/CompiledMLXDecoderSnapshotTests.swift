@@ -268,6 +268,13 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         var source = CompiledMLXDecoder(
             model: sourceModel, reserve: 1, kvCache: .fp16)
         let valid = try source.prefillCapturingPromptSnapshot([1, 2]).snapshot
+        let validProfile = try valid.validatedDenseHalfProfile()
+        XCTAssertEqual(validProfile.layerCount, 2)
+        XCTAssertEqual(validProfile.rank, 4)
+        XCTAssertEqual(validProfile.batchSize, 1)
+        XCTAssertEqual(validProfile.kvHeadCount, 2)
+        XCTAssertEqual(validProfile.headDimension, 1)
+        XCTAssertEqual(validProfile.dtype, .float16)
         assertSnapshotError(.decoderNotInitialized) {
             _ = try fresh.prefillRestoredPrefix(
                 valid, tailTokens: [])
@@ -306,6 +313,33 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         assertSnapshotError(.layerGeometryMismatch(layer: 1)) {
             _ = try source.prefillRestoredPrefix(
                 heterogeneous, tailTokens: [])
+        }
+
+        let wrongDTypeLayer = CompiledKVCacheSnapshot(
+            rank: secondLayer.rank,
+            batchSize: secondLayer.batchSize,
+            kvHeadCount: secondLayer.kvHeadCount,
+            tokenCount: secondLayer.tokenCount,
+            headDimension: secondLayer.headDimension,
+            keyDType: .float16,
+            valueDType: .bfloat16,
+            keyNBytes: secondLayer.keyNBytes,
+            valueNBytes: secondLayer.valueNBytes,
+            keys: secondLayer.keys,
+            values: secondLayer.values)
+        let mixedDType = CompiledMLXDecoderSnapshot(
+            logicalTokenCount: valid.logicalTokenCount,
+            nextTokenID: valid.nextTokenID,
+            layerSnapshots: [
+                valid.layerSnapshots[0],
+                wrongDTypeLayer,
+            ])
+        assertSnapshotError(.layerDTypeMismatch(layer: 1)) {
+            _ = try mixedDType.validatedDenseHalfProfile()
+        }
+        assertSnapshotError(.layerDTypeMismatch(layer: 1)) {
+            _ = try source.prefillRestoredPrefix(
+                mixedDType, tailTokens: [])
         }
 
         let control = CompiledMLXDecoder(

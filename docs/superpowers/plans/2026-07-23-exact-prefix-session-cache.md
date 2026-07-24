@@ -1,9 +1,50 @@
 # Exact Prefix / Session Cache and Request-Start Stack Plan
 
 **Date:** 2026-07-23
-**Status:** actor integration verified; loaded-model proof pending
+**Status:** observed-live-dtype recovery verified under dirty identity; clean-SHA proof pending
 **Classification:** EXACT
 **Branch:** `codex/exact-prefix-session-cache`
+
+## 2026-07-24 observed-live-dtype identity amendment
+
+The first authenticated loaded-model proof exposed a real identity distinction that the initial
+plan treated too narrowly. Phi's source-locked config declares `bfloat16`, while all eight
+cache-enabled cases in the clean `5cf0d188` v3 proof produced homogeneous live dense
+`float16` K/V snapshots. The run completed 11/11 byte-identical cases and remained bounded, but
+correctly published zero cache entries under the old config-derived dtype identity. The immutable
+diagnostic boundary is:
+
+- output:
+  `/Users/llmbench/perf-work/results/exact-prefix-session-cache-5cf0d18/phi4-mini-v3`
+- evidence SHA-256:
+  `eb8fc3c4610d07cdefea83c0faae4bd7f258ae9cd32c33c604da586d8fb135ab`
+- completion SHA-256:
+  `92ec42af3dd6654fc45253800e5a8443b7cdc48139c1c808b3fe9565d94272da`
+- exact rejection:
+  `exact prefix snapshot dtype key=float16 value=float16 != expected bfloat16`
+
+The recovery does not relax snapshot validation. It changes the identity lifecycle:
+
+1. Source admission remains bound to the stable config, checkpoint content, tokenizer, geometry,
+   position semantics, architecture, and ephemeral loaded-model instance.
+2. The actor begins with an unresolved live-cache identity and performs no cache lookup,
+   reservation, or eviction under the config-declared dtype.
+3. Eager warmup or the first cache-enabled cold request captures a decoder-validated scalar dense
+   snapshot. Every layer must have the admitted geometry, matching K/V dtype, one homogeneous
+   dtype across layers, and exactly `float16` or `bfloat16`.
+4. The actor derives the KV-route identity from that observed live half dtype while retaining the
+   declared config dtype and all source hashes as separate architecture/provenance bindings.
+5. Only the resolved identity may lookup, reserve, or commit. Publication still occurs only after
+   successful generation and positive commit. Every later capture and restore is revalidated
+   against the resolved dtype; any change invalidates or skips reuse and falls back cold.
+
+Observable acceptance is: config `bfloat16` plus homogeneous live `float16` cold-commits once and
+then exact/partial-hits byte-identically; matching `bfloat16` remains supported; mixed layers,
+mixed K/V, missing dtype, non-half dtype, wrong geometry, stale resolved dtype, failed generation,
+and incomplete evidence publish nothing. Proof is a failing actor regression first, focused Xcode
+tests on `llmbench`, the broad Xcode suites and Release build, then fresh authenticated Phi, Qwen,
+and Llama proof boundaries. Historical v1-v3 outputs remain diagnostic/non-promotion evidence and
+are never resumed or overwritten.
 
 ## Operator story
 

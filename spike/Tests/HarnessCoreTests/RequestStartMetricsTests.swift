@@ -205,6 +205,62 @@ final class RequestStartMetricsTests: XCTestCase {
         }
     }
 
+    func testObservedDenseRuntimeIdentityRoundTripsAndTamperingFailsClosed()
+        throws
+    {
+        let identity = try ExactPrefixDenseRuntimeIdentityEvidence(
+            observedDenseHalfDType: .float16)
+        let metrics = try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .miss,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0,
+            restoreSeconds: 0,
+            prefillSeconds: 1,
+            retainedBytes: 1_024,
+            entryCount: 1,
+            evictionCount: 0,
+            runtimeIdentity: identity)
+        XCTAssertEqual(
+            metrics.runtimeIdentity?.observedDenseHalfDType,
+            .float16)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                RequestStartMetrics.self,
+                from: JSONEncoder().encode(metrics)),
+            metrics)
+
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(metrics))
+                as? [String: Any])
+        var receipt = try XCTUnwrap(
+            object["runtimeIdentity"] as? [String: Any])
+        receipt["kvRouteSHA256"] =
+            String(repeating: "0", count: 64)
+        object["runtimeIdentity"] = receipt
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                RequestStartMetrics.self,
+                from: JSONSerialization.data(
+                    withJSONObject: object)))
+
+        object.removeValue(forKey: "runtimeIdentity")
+        let legacy = try JSONDecoder().decode(
+            RequestStartMetrics.self,
+            from: JSONSerialization.data(
+                withJSONObject: object))
+        XCTAssertNil(legacy.runtimeIdentity)
+
+        XCTAssertThrowsError(
+            try ExactPrefixDenseRuntimeIdentityEvidence(
+                observedDenseHalfDType: .float32))
+    }
+
     func testImpossibleOrPartialEvidenceFailsClosed() throws {
         XCTAssertThrowsError(
             try RequestStartMetrics(
