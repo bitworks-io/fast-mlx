@@ -5,6 +5,7 @@ let package = Package(
     name: "fast-mlx-spike",
     platforms: [.macOS(.v14)],
     products: [
+        .library(name: "ServingCore", targets: ["ServingCore"]),
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
         .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"]),
@@ -17,6 +18,18 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
     targets: [
+        // ServingCore is PURE — NO MLX/SpikeCore dependency — so protocol, policy, and
+        // lifecycle contracts remain independently buildable and testable off-box.
+        .target(
+            name: "ServingCore",
+            dependencies: [],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingCoreTests",
+            dependencies: ["ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .target(
             name: "SpikeCore",
             dependencies: [
