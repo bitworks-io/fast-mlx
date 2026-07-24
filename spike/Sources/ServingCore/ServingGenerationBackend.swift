@@ -2,6 +2,34 @@ import Foundation
 
 public protocol ServingGenerationBackend: Sendable {
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle
+    func shutdown() async
+}
+
+extension ServingGenerationBackend {
+    public func shutdown() async {}
+}
+
+public struct ServingBackendAdmissionError: Error, Equatable, Sendable {
+    public enum Reason: Equatable, Sendable {
+        case queueFull
+    }
+
+    public let reason: Reason
+    public let retryAfterSeconds: Int
+
+    private init(reason: Reason, retryAfterSeconds: Int) {
+        precondition(
+            (1...3_600).contains(retryAfterSeconds),
+            "retryAfterSeconds must be between 1 and 3600")
+        self.reason = reason
+        self.retryAfterSeconds = retryAfterSeconds
+    }
+
+    public static func queueFull(retryAfterSeconds: Int) -> ServingBackendAdmissionError {
+        ServingBackendAdmissionError(
+            reason: .queueFull,
+            retryAfterSeconds: retryAfterSeconds)
+    }
 }
 
 public struct ServingGenerationHandle: Sendable {

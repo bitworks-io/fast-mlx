@@ -3,6 +3,7 @@ import Foundation
 
 public enum OpenAIErrorType: String, Codable, Sendable, Equatable {
     case invalidRequest = "invalid_request_error"
+    case rateLimit = "rate_limit_error"
     case serverError = "server_error"
 }
 
@@ -53,12 +54,15 @@ public struct OpenAIErrorEnvelope: Codable, Sendable, Equatable {
 
 public enum OpenAIServingError: Error, Sendable, Equatable {
     case invalidRequest(String, param: String?)
+    case rateLimited(String, code: String?)
     case server(String, code: String?)
 
     public var openAIError: OpenAIErrorPayload {
         switch self {
         case .invalidRequest(let message, let param):
             OpenAIErrorPayload(type: .invalidRequest, message: message, param: param, code: nil)
+        case .rateLimited(let message, let code):
+            OpenAIErrorPayload(type: .rateLimit, message: message, param: nil, code: code)
         case .server(let message, let code):
             OpenAIErrorPayload(type: .serverError, message: message, param: nil, code: code)
         }
@@ -287,6 +291,7 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
     public var created: Int
     public var model: String
     public var choices: [Choice]
+    public var usage: OpenAIChatUsage?
 
     public init(
         id: String,
@@ -294,12 +299,37 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
         model: String,
         index: Int,
         delta: Delta,
-        finishReason: OpenAIChatFinishReason?
+        finishReason: OpenAIChatFinishReason?,
+        usage: OpenAIChatUsage? = nil
     ) {
         self.id = id
         self.created = created
         self.model = model
         self.choices = [Choice(index: index, delta: delta, finishReason: finishReason)]
+        self.usage = usage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case object
+        case created
+        case model
+        case choices
+        case usage
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(object, forKey: .object)
+        try container.encode(created, forKey: .created)
+        try container.encode(model, forKey: .model)
+        try container.encode(choices, forKey: .choices)
+        if let usage {
+            try container.encode(usage, forKey: .usage)
+        } else {
+            try container.encodeNil(forKey: .usage)
+        }
     }
 
     public static let doneSSEEvent = "data: [DONE]\n\n"

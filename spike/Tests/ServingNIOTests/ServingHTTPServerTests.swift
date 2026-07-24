@@ -136,6 +136,7 @@ final class ServingHTTPServerTests: XCTestCase {
         let leaseState = await backend.lastLeaseState()
         let activeConnectionCount = await server.activeConnectionCount
         XCTAssertEqual(leaseState, .cancelled(.shutdown))
+        XCTAssertEqual(backend.snapshot().shutdownCount, 1)
         XCTAssertEqual(activeConnectionCount, 0)
         do {
             _ = try await ClientBootstrap(group: clientGroup)
@@ -146,6 +147,50 @@ final class ServingHTTPServerTests: XCTestCase {
             // Refused connection is the observable listener-release proof.
         }
 
+        try? await client.close().get()
+        try await clientGroup.shutdownGracefully()
+    }
+
+    func testShutdownGraceBoundsSuspendedBackendShutdownAndClosesSockets() async throws {
+        let backend = SuspendedShutdownBackend()
+        let server = try await ServingHTTPServer.start(
+            configuration: socketConfiguration(requiredBearerToken: nil),
+            backend: backend)
+        let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let client = try await ClientBootstrap(group: clientGroup)
+            .connect(to: server.localAddress)
+            .get()
+        try await sendRawStreamingRequest(on: client)
+        try await waitUntilSocketTest {
+            await backend.snapshot().startCount == 1
+        }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            try await server.shutdown(gracePeriod: .milliseconds(100))
+            XCTFail("A suspended backend shutdown must time out instead of exceeding grace")
+        } catch let error as ServingHTTPServerError {
+            XCTAssertEqual(error, .backendShutdownTimedOut)
+        }
+        let elapsed = started.duration(to: clock.now)
+        XCTAssertLessThan(elapsed, .milliseconds(500))
+
+        let activeConnectionCount = await server.activeConnectionCount
+        let backendSnapshot = await backend.snapshot()
+        XCTAssertEqual(activeConnectionCount, 0)
+        XCTAssertTrue(backendSnapshot.shutdownStarted)
+        XCTAssertFalse(backendSnapshot.shutdownFinished)
+        do {
+            _ = try await ClientBootstrap(group: clientGroup)
+                .connect(to: server.localAddress)
+                .get()
+            XCTFail("The listener must be closed even when backend shutdown times out")
+        } catch {
+            // Refused connection proves listener release before the typed timeout returns.
+        }
+
+        await backend.releaseShutdown()
         try? await client.close().get()
         try await clientGroup.shutdownGracefully()
     }
@@ -203,6 +248,7 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
     struct Snapshot: Sendable {
         let startCount: Int
         let cancelCount: Int
+        let shutdownCount: Int
         let publishedDeltaCount: Int
         let lastMailbox: BoundedDeltaMailbox?
         let lastLease: ServingRequestLease?
@@ -211,6 +257,7 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
     private struct State: Sendable {
         var startCount = 0
         var cancelCount = 0
+        var shutdownCount = 0
         var publishedDeltaCount = 0
         var lastMailbox: BoundedDeltaMailbox?
         var lastLease: ServingRequestLease?
@@ -273,11 +320,16 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
             lease: lease)
     }
 
+    func shutdown() async {
+        state.withLock { $0.shutdownCount += 1 }
+    }
+
     func snapshot() -> Snapshot {
         state.withLock {
             Snapshot(
                 startCount: $0.startCount,
                 cancelCount: $0.cancelCount,
+                shutdownCount: $0.shutdownCount,
                 publishedDeltaCount: $0.publishedDeltaCount,
                 lastMailbox: $0.lastMailbox,
                 lastLease: $0.lastLease)
@@ -289,5 +341,56 @@ private final class SocketBackend: ServingGenerationBackend, Sendable {
             return nil
         }
         return await lease.state
+    }
+}
+
+private actor SuspendedShutdownBackend: ServingGenerationBackend {
+    struct Snapshot: Sendable {
+        let startCount: Int
+        let shutdownStarted: Bool
+        let shutdownFinished: Bool
+    }
+
+    private var startCount = 0
+    private var shutdownStarted = false
+    private var shutdownFinished = false
+    private var shutdownContinuation: CheckedContinuation<Void, Never>?
+
+    func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
+        let mailbox = BoundedDeltaMailbox(
+            capacity: .init(maxDeltas: 1, maxBytes: 65_536))
+        let lease = ServingRequestLease(
+            id: ServingRequestID("suspended-shutdown-request"),
+            onCancelWithReason: { reason in
+                await mailbox.cancel(reason)
+            })
+        startCount += 1
+        return ServingGenerationHandle(
+            responseID: "chatcmpl-suspended-shutdown",
+            created: 1_775_000_000,
+            model: request.model,
+            route: .continuousBatchNoSpec,
+            mailbox: mailbox,
+            lease: lease)
+    }
+
+    func shutdown() async {
+        shutdownStarted = true
+        await withCheckedContinuation { continuation in
+            shutdownContinuation = continuation
+        }
+        shutdownFinished = true
+    }
+
+    func releaseShutdown() {
+        shutdownContinuation?.resume()
+        shutdownContinuation = nil
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            startCount: startCount,
+            shutdownStarted: shutdownStarted,
+            shutdownFinished: shutdownFinished)
     }
 }

@@ -279,10 +279,11 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         guard let control = activeControl, !control.isTerminal else {
             return
         }
-        activeTask?.cancel()
+        let task = activeTask
         control.markTerminal()
         Task {
             await control.cancellation.cancel(reason)
+            task?.cancel()
         }
     }
 }
@@ -400,6 +401,12 @@ private extension OpenAIChatCompletionsHTTPHandler {
             if !keepAlive {
                 await close(channel)
             }
+        } catch let admissionError as ServingBackendAdmissionError {
+            await writeAdmissionFailure(
+                admissionError,
+                keepAlive: keepAlive,
+                channel: channel,
+                timeout: configuration.backpressureStallTimeout)
         } catch is CancellationError {
             await control.cancellation.cancel(.clientDisconnected)
             await close(channel)
@@ -578,7 +585,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
             model: handle.model,
             index: 0,
             delta: .init(role: nil, content: nil),
-            finishReason: completion.finishReason)
+            finishReason: completion.finishReason,
+            usage: completion.usage)
         try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
         try await writeBody(
             OpenAIChatCompletionChunk.doneSSEEvent,
@@ -704,6 +712,54 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 if !keepAlive {
                     await close(channel)
                 }
+            }
+        } catch {
+            await close(channel)
+        }
+    }
+
+    static func writeAdmissionFailure(
+        _ admissionError: ServingBackendAdmissionError,
+        keepAlive: Bool,
+        channel: any Channel,
+        timeout: Duration
+    ) async {
+        let payload: OpenAIErrorPayload
+        let status: HTTPResponseStatus
+        switch admissionError.reason {
+        case .queueFull:
+            payload = OpenAIServingError.rateLimited(
+                "The serving queue is full",
+                code: "queue_full").openAIError
+            status = .tooManyRequests
+        }
+
+        do {
+            let data = try JSONEncoder.openAI.encode(
+                OpenAIErrorEnvelope(error: payload))
+            var headers = HTTPHeaders()
+            headers.add(name: "content-type", value: "application/json")
+            headers.add(name: "content-length", value: "\(data.count)")
+            headers.add(
+                name: "retry-after",
+                value: "\(admissionError.retryAfterSeconds)")
+            if !keepAlive {
+                headers.add(name: "connection", value: "close")
+            }
+            let head = HTTPResponseHead(
+                version: .http1_1,
+                status: status,
+                headers: headers)
+            try await writePart(.head(head), channel: channel, timeout: timeout)
+            var body = channel.allocator.buffer(capacity: data.count)
+            body.writeBytes(data)
+            try await writePart(
+                .body(.byteBuffer(body)),
+                channel: channel,
+                timeout: timeout)
+            try await writePart(.end(nil), channel: channel, timeout: timeout)
+            if !keepAlive {
+                await close(channel)
             }
         } catch {
             await close(channel)

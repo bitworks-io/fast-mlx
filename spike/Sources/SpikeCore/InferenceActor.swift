@@ -23,24 +23,155 @@ public struct ScriptedDecoder: Decoder {
     public mutating func reset() { i = 0 }
 }
 
+public enum InferenceActorError: Error, Equatable, Sendable {
+    case emptyPrompt
+    case generationAlreadyActive
+    case invalidEndOfSequence
+    case invalidMaximumTokens
+    case invalidTokenID(Int)
+}
+
+public enum InferenceTokenDisposition: Equatable, Sendable {
+    case continueGeneration
+    case stopGeneration
+}
+
+public enum InferenceRunFinishReason: Equatable, Sendable {
+    case consumerStop
+    case endOfSequence
+    case length
+}
+
+public struct InferenceRunSummary: Equatable, Sendable {
+    public let promptTokenCount: Int
+    public let generatedTokenCount: Int
+    public let finishReason: InferenceRunFinishReason
+
+    public init(
+        promptTokenCount: Int,
+        generatedTokenCount: Int,
+        finishReason: InferenceRunFinishReason
+    ) {
+        self.promptTokenCount = promptTokenCount
+        self.generatedTokenCount = generatedTokenCount
+        self.finishReason = finishReason
+    }
+}
+
 /// Single-owner actor: owns the decoder (and, transitively, all MLX state) and streams
 /// generated token ids to callers without ever exposing MLX types across the actor boundary.
 public actor InferenceActor {
     private var decoder: any Decoder
+    private var boundedGenerationActive = false
+
     public init(decoder: sending any Decoder) { self.decoder = decoder }
 
     /// Discard per-conversation state (KV cache) so a subsequent `submit` starts fresh.
     /// Lets one actor/decoder/model be reused across bench runs without crossing the
     /// actor boundary again with a non-Sendable model reference (see `MLXDecoder`).
-    public func resetForNewRun() {
+    public func resetForNewRun() throws {
+        guard !boundedGenerationActive else {
+            throw InferenceActorError.generationAlreadyActive
+        }
         decoder.reset()
     }
 
     /// Non-blocking: returns a stream immediately; decode runs inside the actor.
     public func submit(promptTokens: [Int], maxTokens: Int, eos: Int = 2) -> AsyncThrowingStream<Int, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task { await self.run(promptTokens, maxTokens, eos, continuation) }
+        guard !boundedGenerationActive else {
+            return AsyncThrowingStream { continuation in
+                continuation.finish(
+                    throwing: InferenceActorError.generationAlreadyActive)
+            }
+        }
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                self.run(promptTokens, maxTokens, eos, continuation)
+            }
             continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Generate one scalar request through a suspending consumer callback.
+    ///
+    /// Unlike `submit`, this path cannot run ahead into an unbounded `AsyncThrowingStream`:
+    /// the decoder advances only after the consumer accepts the current token. The callback is
+    /// therefore the production backpressure seam used by serving adapters. Actor reentrancy is
+    /// explicit and fail-closed: while the callback is suspended, another bounded generation is
+    /// rejected without touching decoder state.
+    public func generateBounded(
+        promptTokens: [Int],
+        maxTokens: Int,
+        eos: Int,
+        consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
+    ) async throws -> InferenceRunSummary {
+        try await generateBounded(
+            promptTokens: promptTokens,
+            maxTokens: maxTokens,
+            stopTokenIDs: [eos],
+            consume: consume)
+    }
+
+    /// Generate one scalar request and stop before publishing any configured stop token.
+    public func generateBounded(
+        promptTokens: [Int],
+        maxTokens: Int,
+        stopTokenIDs: Set<Int>,
+        consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
+    ) async throws -> InferenceRunSummary {
+        guard !promptTokens.isEmpty else {
+            throw InferenceActorError.emptyPrompt
+        }
+        guard maxTokens > 0 else {
+            throw InferenceActorError.invalidMaximumTokens
+        }
+        guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
+            throw InferenceActorError.invalidEndOfSequence
+        }
+        guard !boundedGenerationActive else {
+            throw InferenceActorError.generationAlreadyActive
+        }
+
+        boundedGenerationActive = true
+        decoder.reset()
+        defer {
+            decoder.reset()
+            boundedGenerationActive = false
+        }
+
+        try Task.checkCancellation()
+        var token = decoder.prefill(promptTokens)
+        var generatedTokenCount = 0
+
+        while true {
+            try Task.checkCancellation()
+            if stopTokenIDs.contains(token) {
+                return InferenceRunSummary(
+                    promptTokenCount: promptTokens.count,
+                    generatedTokenCount: generatedTokenCount,
+                    finishReason: .endOfSequence)
+            }
+            guard token >= 0 else {
+                throw InferenceActorError.invalidTokenID(token)
+            }
+
+            generatedTokenCount += 1
+            let disposition = try await consume(token)
+            if disposition == .stopGeneration {
+                return InferenceRunSummary(
+                    promptTokenCount: promptTokens.count,
+                    generatedTokenCount: generatedTokenCount,
+                    finishReason: .consumerStop)
+            }
+            if generatedTokenCount == maxTokens {
+                return InferenceRunSummary(
+                    promptTokenCount: promptTokens.count,
+                    generatedTokenCount: generatedTokenCount,
+                    finishReason: .length)
+            }
+
+            try Task.checkCancellation()
+            token = decoder.step(last: token)
         }
     }
 
@@ -48,6 +179,11 @@ public actor InferenceActor {
         _ prompt: [Int], _ maxTokens: Int, _ eos: Int,
         _ cont: AsyncThrowingStream<Int, Error>.Continuation
     ) {
+        guard !boundedGenerationActive else {
+            cont.finish(
+                throwing: InferenceActorError.generationAlreadyActive)
+            return
+        }
         var tok = decoder.prefill(prompt)
         var n = 0
         while n < maxTokens {

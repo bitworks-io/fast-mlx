@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "ServingCore", targets: ["ServingCore"]),
         .library(name: "ServingNIO", targets: ["ServingNIO"]),
+        .library(name: "SpikeServingAdapters", targets: ["SpikeServingAdapters"]),
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
         .executable(name: "fastmlx-serve", targets: ["fastmlx-serve"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
@@ -56,11 +57,39 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
-        // Phase 1 composition smoke. This target requires --scripted and never claims model
-        // inference; later phases replace its backend with actor-confined serving adapters.
+        .target(
+            name: "SpikeServingAdapters",
+            dependencies: [
+                "ServingCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "SpikeServingAdaptersTests",
+            dependencies: [
+                "ServingCore",
+                "ServingNIO",
+                "SpikeCore",
+                "SpikeServingAdapters",
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Composition executable: transport-only scripted mode remains available for isolated
+        // tests, while model serving is delegated to actor-confined serving adapters.
         .executableTarget(
             name: "fastmlx-serve",
-            dependencies: ["ServingCore", "ServingNIO"],
+            dependencies: [
+                "ServingCore",
+                "ServingNIO",
+                "SpikeServingAdapters",
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(

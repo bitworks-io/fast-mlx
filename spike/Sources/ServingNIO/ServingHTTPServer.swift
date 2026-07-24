@@ -11,6 +11,7 @@ public enum ServingHTTPServerError: Error, Equatable, Sendable {
     case remoteBindRequiresAuthentication
     case listenerAddressUnavailable
     case serverStopping
+    case backendShutdownTimedOut
 }
 
 public struct ServingHTTPBind: Equatable, Sendable {
@@ -102,17 +103,20 @@ public actor ServingHTTPServer {
     private let listener: any Channel
     private let eventLoopGroup: MultiThreadedEventLoopGroup
     private let connections: ServingHTTPConnectionRegistry
+    private let backend: any ServingGenerationBackend
     private var isShutDown = false
 
     private init(
         listener: any Channel,
         eventLoopGroup: MultiThreadedEventLoopGroup,
         connections: ServingHTTPConnectionRegistry,
+        backend: any ServingGenerationBackend,
         localAddress: SocketAddress
     ) {
         self.listener = listener
         self.eventLoopGroup = eventLoopGroup
         self.connections = connections
+        self.backend = backend
         self.localAddress = localAddress
     }
 
@@ -172,6 +176,7 @@ public actor ServingHTTPServer {
                 listener: listener,
                 eventLoopGroup: group,
                 connections: connections,
+                backend: backend,
                 localAddress: localAddress)
         } catch {
             try? await group.shutdownGracefully()
@@ -190,14 +195,21 @@ public actor ServingHTTPServer {
         }
         isShutDown = true
 
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: gracePeriod)
         let activeChannels = connections.stopAcceptingAndSnapshot()
+        let backendShutdownCompletion = ServingHTTPBackendShutdownCompletion()
+        let backend = self.backend
+        let backendShutdownTask = Task { [backend, backendShutdownCompletion] in
+            await backend.shutdown()
+            backendShutdownCompletion.markComplete()
+        }
+
         try? await listener.close().get()
         for channel in activeChannels {
             channel.pipeline.fireUserInboundEventTriggered(ChannelShouldQuiesceEvent())
         }
 
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: gracePeriod)
         for channel in activeChannels {
             let remaining = clock.now.duration(to: deadline)
             if remaining <= .zero {
@@ -213,7 +225,44 @@ public actor ServingHTTPServer {
             forcedClose.cancel()
         }
 
+        let backendShutdownCompleted = await backendShutdownCompletion.waitUntilComplete(
+            clock: clock,
+            deadline: deadline)
+        if !backendShutdownCompleted {
+            backendShutdownTask.cancel()
+        }
+
         try await eventLoopGroup.shutdownGracefully()
+
+        if !backendShutdownCompleted {
+            throw ServingHTTPServerError.backendShutdownTimedOut
+        }
+    }
+}
+
+private final class ServingHTTPBackendShutdownCompletion: Sendable {
+    private let completed = OSAllocatedUnfairLock(initialState: false)
+
+    func markComplete() {
+        completed.withLock { $0 = true }
+    }
+
+    func waitUntilComplete(
+        clock: ContinuousClock,
+        deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        while clock.now < deadline {
+            if completed.withLock({ $0 }) {
+                return true
+            }
+            let remaining = clock.now.duration(to: deadline)
+            guard remaining > .zero else {
+                break
+            }
+            try? await Task.sleep(
+                for: remaining < .milliseconds(1) ? remaining : .milliseconds(1))
+        }
+        return completed.withLock { $0 }
     }
 }
 

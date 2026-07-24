@@ -49,6 +49,50 @@ final class ServingLifecyclePolicyTests: XCTestCase {
         XCTAssertEqual(terminalState, .completed)
     }
 
+    func testRequestLeaseDeliversExactCancellationReasonToBackend() async {
+        let recorder = CancellationReasonRecorder()
+        let lease = ServingRequestLease(
+            id: ServingRequestID("req-reason"),
+            onCancelWithReason: { reason in
+                await recorder.record(reason)
+            })
+
+        let activated = await lease.activate()
+        let firstCancellation = await lease.cancel(.backpressureTimeout)
+        let secondCancellation = await lease.cancel(.shutdown)
+        let reasons = await recorder.reasons
+        let state = await lease.state
+
+        XCTAssertTrue(activated)
+        XCTAssertTrue(firstCancellation)
+        XCTAssertFalse(secondCancellation)
+        XCTAssertEqual(reasons, [.backpressureTimeout])
+        XCTAssertEqual(state, .cancelled(.backpressureTimeout))
+    }
+
+    func testBackendCancellationTransitionsLeaseWithoutReenteringCancelCallback() async {
+        let recorder = CancellationReasonRecorder()
+        let lease = ServingRequestLease(
+            id: ServingRequestID("req-backend-cancel"),
+            onCancelWithReason: { reason in
+                await recorder.record(reason)
+            })
+
+        let activated = await lease.activate()
+        let backendCancellation = await lease.cancelFromBackend(.shutdown)
+        let clientCancellation = await lease.cancel(.clientDisconnected)
+        let reasons = await recorder.reasons
+        let state = await lease.state
+        let cancellationReason = lease.terminalCancellationReason
+
+        XCTAssertTrue(activated)
+        XCTAssertTrue(backendCancellation)
+        XCTAssertFalse(clientCancellation)
+        XCTAssertEqual(reasons, [])
+        XCTAssertEqual(state, .cancelled(.shutdown))
+        XCTAssertEqual(cancellationReason, .shutdown)
+    }
+
     func testAdmissionReducerChoosesBatchForSimultaneousHeldRequests() {
         var reducer = ServingAdmissionReducer(configuration: .init(soloPLDQualified: true))
 
@@ -271,5 +315,13 @@ private actor CancelCounter {
 
     func cancel() {
         count += 1
+    }
+}
+
+private actor CancellationReasonRecorder {
+    private(set) var reasons: [ServingCancellationReason] = []
+
+    func record(_ reason: ServingCancellationReason) {
+        reasons.append(reason)
     }
 }

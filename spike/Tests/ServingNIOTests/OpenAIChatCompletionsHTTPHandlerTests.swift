@@ -61,6 +61,16 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertLessThan(secondRange.lowerBound, finishRange.lowerBound)
         XCTAssertLessThan(finishRange.lowerBound, doneRange.lowerBound)
         XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+        let events = try sseJSONEvents(from: response.body)
+        let terminal = try XCTUnwrap(
+            events.last { object in
+                let choices = object["choices"] as? [[String: Any]]
+                return choices?.first?["finish_reason"] as? String == "length"
+            })
+        let usage = try XCTUnwrap(terminal["usage"] as? [String: Any])
+        XCTAssertEqual(usage["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(usage["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 5)
 
         _ = try await channel.finish()
     }
@@ -103,6 +113,24 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(tooLarge.head.status, .payloadTooLarge)
         XCTAssertEqual(backend.snapshot().startCount, 0)
         _ = try await oversizedChannel.finish()
+    }
+
+    func testQueueExhaustionReturnsTyped429WithBoundedRetrySignal() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .admissionRejected(.queueFull(retryAfterSeconds: 2))
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .tooManyRequests)
+        XCTAssertEqual(response.head.headers.first(name: "retry-after"), "2")
+        XCTAssertTrue(response.body.contains(#""type":"rate_limit_error""#))
+        XCTAssertTrue(response.body.contains(#""code":"queue_full""#))
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+
+        _ = try await channel.finish()
     }
 
     func testInputCloseCancelsActiveLeaseExactlyOnce() async throws {
@@ -367,6 +395,19 @@ private func collectResponse(
     }
 }
 
+private func sseJSONEvents(from body: String) throws -> [[String: Any]] {
+    try body
+        .components(separatedBy: "\n\n")
+        .compactMap { rawEvent -> [String: Any]? in
+            guard rawEvent.hasPrefix("data: "), rawEvent != "data: [DONE]" else {
+                return nil
+            }
+            let payload = String(rawEvent.dropFirst("data: ".count))
+            return try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        }
+}
+
 private func waitUntil(
     attempts: Int = 10_000,
     _ predicate: () async -> Bool
@@ -395,6 +436,7 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             promptTokens: Int,
             completionTokens: Int)
         case cancelled(ServingCancellationReason)
+        case admissionRejected(ServingBackendAdmissionError)
         case held
     }
 
@@ -437,7 +479,9 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             mailbox: mailbox,
             lease: lease)
 
-        if case .completed(let text, let finishReason, let promptTokens, let completionTokens) = script {
+        if case .admissionRejected(let error) = script {
+            throw error
+        } else if case .completed(let text, let finishReason, let promptTokens, let completionTokens) = script {
             Task {
                 do {
                     for delta in text {

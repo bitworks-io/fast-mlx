@@ -208,6 +208,33 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertTrue(events[3].contains(#""finish_reason":"stop""#))
         XCTAssertEqual(events[4], "data: [DONE]\n\n")
     }
+
+    func testSSETerminalChunkCanCarryExactUsage() throws {
+        let finish = OpenAIChatCompletionChunk(
+            id: "chatcmpl-test",
+            created: 1_775_000_000,
+            model: "qwen3-32b",
+            index: 0,
+            delta: .init(role: nil, content: nil),
+            finishReason: .length,
+            usage: OpenAIChatUsage(promptTokens: 3, completionTokens: 2))
+
+        let event = try finish.sseEvent()
+        let payload = try XCTUnwrap(
+            event
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: " ", maxSplits: 1)
+                .last)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any])
+        let choices = try XCTUnwrap(object["choices"] as? [[String: Any]])
+        let usage = try XCTUnwrap(object["usage"] as? [String: Any])
+
+        XCTAssertEqual(choices.first?["finish_reason"] as? String, "length")
+        XCTAssertEqual(usage["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(usage["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 5)
+    }
 }
 
 private func XCTAssertOpenAIError<T>(
