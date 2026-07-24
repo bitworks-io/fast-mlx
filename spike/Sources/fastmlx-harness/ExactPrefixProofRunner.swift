@@ -336,6 +336,8 @@ private struct ExactPrefixProofRuntime {
     )] = [:]
     var committedPrompts:
         [ExactPrefixProofCaseID: [Int]] = [:]
+    var committedFinalContexts:
+        [ExactPrefixProofCaseID: [Int]] = [:]
 
     init(
         command: ExactPrefixProofCommand,
@@ -428,6 +430,8 @@ private struct ExactPrefixProofRuntime {
         let reference = try referenceHashes(
             for: caseID,
             generatedTokens: result.tokens)
+        let finalContextTokens =
+            prepared.tokens + result.tokens
         let hostRequestSeconds =
             prepared.templateSeconds + prepared.tokenizeSeconds
         let actorTTFT = result.tokenTimes.first.map {
@@ -459,6 +463,8 @@ private struct ExactPrefixProofRuntime {
             || caseID == .postWarmupMiss
         {
             committedPrompts[caseID] = prepared.tokens
+            committedFinalContexts[caseID] =
+                finalContextTokens
         }
         return try ExactPrefixProofCaseEvidence(
             caseID: caseID,
@@ -471,6 +477,9 @@ private struct ExactPrefixProofRuntime {
                 reference.generatedTokenIDsSHA256,
             referenceOutputSHA256: reference.outputSHA256,
             generatedTokenCount: result.tokens.count,
+            finalContextTokenIDsSHA256:
+                taskTokenIDsSHA256(finalContextTokens),
+            finalContextTokenCount: finalContextTokens.count,
             timing: ExactPrefixProofCaseTiming(
                 requestStartSeconds: requestStartSeconds,
                 ttftSeconds: requestStartSeconds,
@@ -482,6 +491,9 @@ private struct ExactPrefixProofRuntime {
             templateTokenCacheReceipt: prepared.receipt,
             reusedPrefixTokenIDsSHA256: reusedPrefix.sha256,
             reusedPrefixTokenCount: reusedPrefix.count,
+            reusedPrefixSourceCaseID:
+                reusedPrefix.sourceCaseID,
+            reusedPrefixSourceKind: reusedPrefix.sourceKind,
             requestContext:
                 isControl(caseID) ? nil : requestContext)
     }
@@ -530,12 +542,17 @@ private struct ExactPrefixProofRuntime {
         for caseID: ExactPrefixProofCaseID,
         prompt: [Int],
         metrics: RequestStartMetrics?
-    ) throws -> (sha256: String?, count: Int) {
+    ) throws -> (
+        sha256: String?,
+        count: Int,
+        sourceCaseID: ExactPrefixProofCaseID?,
+        sourceKind: ExactPrefixProofReusedPrefixKind?
+    ) {
         let sourceID: ExactPrefixProofCaseID?
         guard metrics?.prefixCacheOutcome == .exactHit
             || metrics?.prefixCacheOutcome == .partialHit
         else {
-            return (nil, 0)
+            return (nil, 0, nil, nil)
         }
         switch caseID {
         case .exactHitA, .partialHit, .returnHitA,
@@ -548,7 +565,7 @@ private struct ExactPrefixProofRuntime {
             sourceID = nil
         }
         guard let sourceID else {
-            return (nil, 0)
+            return (nil, 0, nil, nil)
         }
         guard let sourcePrompt = committedPrompts[sourceID],
             let metrics
@@ -556,15 +573,25 @@ private struct ExactPrefixProofRuntime {
             throw ExactPrefixProofRunnerError
                 .reusedPrefixUnavailable(caseID)
         }
-        guard prompt.starts(with: sourcePrompt),
-            metrics.cacheReadTokenCount == sourcePrompt.count
-        else {
+        let reusedPrefix = Array(
+            prompt.prefix(metrics.cacheReadTokenCount))
+        let sourceKind: ExactPrefixProofReusedPrefixKind
+        if reusedPrefix == sourcePrompt {
+            sourceKind = .promptOnly
+        } else if let sourceFinalContext =
+            committedFinalContexts[sourceID],
+            reusedPrefix == sourceFinalContext
+        {
+            sourceKind = .finalContext
+        } else {
             throw ExactPrefixProofRunnerError
                 .reusedPrefixDoesNotMatchPrompt(caseID)
         }
         return (
-            taskTokenIDsSHA256(sourcePrompt),
-            sourcePrompt.count)
+            taskTokenIDsSHA256(reusedPrefix),
+            reusedPrefix.count,
+            sourceID,
+            sourceKind)
     }
 
     private mutating func forcePressureEviction(

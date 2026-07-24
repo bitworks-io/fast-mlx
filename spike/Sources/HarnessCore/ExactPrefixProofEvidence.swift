@@ -82,6 +82,13 @@ public enum ExactPrefixProofCacheReceipt:
     }
 }
 
+public enum ExactPrefixProofReusedPrefixKind:
+    String, Codable, Equatable, Hashable, Sendable
+{
+    case promptOnly = "prompt-only"
+    case finalContext = "final-context"
+}
+
 public enum ExactPrefixProofEvidenceError: Error, Equatable, Sendable {
     case unsupportedSchemaVersion(Int)
     case legacyPromotableEvidence
@@ -99,6 +106,7 @@ public enum ExactPrefixProofEvidenceError: Error, Equatable, Sendable {
     case invalidHash(ExactPrefixProofCaseID)
     case invalidPromptTokenCount(ExactPrefixProofCaseID)
     case invalidGeneratedTokenCount(ExactPrefixProofCaseID)
+    case invalidFinalContext(ExactPrefixProofCaseID)
     case invalidTiming(ExactPrefixProofCaseID)
     case partialEvidence(ExactPrefixProofCaseID)
     case caseOrderMismatch
@@ -214,12 +222,17 @@ public struct ExactPrefixProofCaseEvidence:
     public let referenceGeneratedTokenIDsSHA256: String
     public let referenceOutputSHA256: String
     public let generatedTokenCount: Int
+    public let finalContextTokenIDsSHA256: String?
+    public let finalContextTokenCount: Int?
     public let timing: ExactPrefixProofCaseTiming
     public let requestStartMetrics: RequestStartMetrics?
     public let memoryEvidence: BenchRunMemoryEvidence?
     public let templateTokenCacheReceipt: ExactPrefixProofCacheReceipt
     public let reusedPrefixTokenIDsSHA256: String?
     public let reusedPrefixTokenCount: Int
+    public let reusedPrefixSourceCaseID: ExactPrefixProofCaseID?
+    public let reusedPrefixSourceKind:
+        ExactPrefixProofReusedPrefixKind?
     public let requestContext: ExactPrefixRequestContext?
 
     public init(
@@ -231,12 +244,17 @@ public struct ExactPrefixProofCaseEvidence:
         referenceGeneratedTokenIDsSHA256: String,
         referenceOutputSHA256: String,
         generatedTokenCount: Int,
+        finalContextTokenIDsSHA256: String? = nil,
+        finalContextTokenCount: Int? = nil,
         timing: ExactPrefixProofCaseTiming,
         requestStartMetrics: RequestStartMetrics?,
         memoryEvidence: BenchRunMemoryEvidence?,
         templateTokenCacheReceipt: ExactPrefixProofCacheReceipt,
         reusedPrefixTokenIDsSHA256: String? = nil,
         reusedPrefixTokenCount: Int = 0,
+        reusedPrefixSourceCaseID: ExactPrefixProofCaseID? = nil,
+        reusedPrefixSourceKind:
+            ExactPrefixProofReusedPrefixKind? = nil,
         requestContext: ExactPrefixRequestContext? = nil
     ) throws {
         self.init(
@@ -249,6 +267,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -256,6 +277,14 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixTokenIDsSHA256 == nil
+                    && reusedPrefixTokenCount == 0
+                    ? nil : reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind:
+                reusedPrefixTokenIDsSHA256 == nil
+                    && reusedPrefixTokenCount == 0
+                    ? nil : reusedPrefixSourceKind,
             requestContext: requestContext)
         try validate(
             memoryLimitBytes: Int.max,
@@ -271,12 +300,17 @@ public struct ExactPrefixProofCaseEvidence:
         referenceGeneratedTokenIDsSHA256: String,
         referenceOutputSHA256: String,
         generatedTokenCount: Int,
+        finalContextTokenIDsSHA256: String?,
+        finalContextTokenCount: Int?,
         timing: ExactPrefixProofCaseTiming,
         requestStartMetrics: RequestStartMetrics?,
         memoryEvidence: BenchRunMemoryEvidence?,
         templateTokenCacheReceipt: ExactPrefixProofCacheReceipt,
         reusedPrefixTokenIDsSHA256: String?,
         reusedPrefixTokenCount: Int,
+        reusedPrefixSourceCaseID: ExactPrefixProofCaseID?,
+        reusedPrefixSourceKind:
+            ExactPrefixProofReusedPrefixKind?,
         requestContext: ExactPrefixRequestContext?
     ) {
         self.caseID = caseID
@@ -288,6 +322,9 @@ public struct ExactPrefixProofCaseEvidence:
             referenceGeneratedTokenIDsSHA256
         self.referenceOutputSHA256 = referenceOutputSHA256
         self.generatedTokenCount = generatedTokenCount
+        self.finalContextTokenIDsSHA256 =
+            finalContextTokenIDsSHA256
+        self.finalContextTokenCount = finalContextTokenCount
         self.timing = timing
         self.requestStartMetrics = requestStartMetrics
         self.memoryEvidence = memoryEvidence
@@ -295,6 +332,9 @@ public struct ExactPrefixProofCaseEvidence:
         self.reusedPrefixTokenIDsSHA256 =
             reusedPrefixTokenIDsSHA256
         self.reusedPrefixTokenCount = reusedPrefixTokenCount
+        self.reusedPrefixSourceCaseID =
+            reusedPrefixSourceCaseID
+        self.reusedPrefixSourceKind = reusedPrefixSourceKind
         self.requestContext = requestContext
     }
 
@@ -320,6 +360,27 @@ public struct ExactPrefixProofCaseEvidence:
             throw ExactPrefixProofEvidenceError
                 .invalidGeneratedTokenCount(caseID)
         }
+        let (expectedFinalContextTokenCount, finalContextOverflow) =
+            promptTokenCount.addingReportingOverflow(
+                generatedTokenCount)
+        switch (
+            finalContextTokenIDsSHA256,
+            finalContextTokenCount
+        ) {
+        case (nil, nil):
+            break
+        case let (sha256?, count?):
+            guard !finalContextOverflow,
+                requestStartIsLowercaseSHA256(sha256),
+                count == expectedFinalContextTokenCount
+            else {
+                throw ExactPrefixProofEvidenceError
+                    .invalidFinalContext(caseID)
+            }
+        case (.some, nil), (nil, .some):
+            throw ExactPrefixProofEvidenceError
+                .invalidFinalContext(caseID)
+        }
         guard ExactPrefixProofCaseTiming.valid(
             timing.requestStartSeconds),
             ExactPrefixProofCaseTiming.valid(timing.ttftSeconds),
@@ -338,7 +399,9 @@ public struct ExactPrefixProofCaseEvidence:
             guard requestStartMetrics == nil,
                 requestContext == nil,
                 reusedPrefixTokenIDsSHA256 == nil,
-                reusedPrefixTokenCount == 0
+                reusedPrefixTokenCount == 0,
+                reusedPrefixSourceCaseID == nil,
+                reusedPrefixSourceKind == nil
             else {
                 throw ExactPrefixProofEvidenceError
                     .controlCarriesRequestMetrics(caseID)
@@ -369,14 +432,18 @@ public struct ExactPrefixProofCaseEvidence:
                         reusedPrefixTokenIDsSHA256),
                     reusedPrefixTokenCount > 0,
                     reusedPrefixTokenCount
-                        == requestStartMetrics.cacheReadTokenCount
+                        == requestStartMetrics.cacheReadTokenCount,
+                    (reusedPrefixSourceCaseID == nil)
+                        == (reusedPrefixSourceKind == nil)
                 else {
                     throw ExactPrefixProofEvidenceError
                         .reusedPrefixMismatch(caseID)
                 }
             case .disabled, .miss, .rejected:
                 guard reusedPrefixTokenIDsSHA256 == nil,
-                    reusedPrefixTokenCount == 0
+                    reusedPrefixTokenCount == 0,
+                    reusedPrefixSourceCaseID == nil,
+                    reusedPrefixSourceKind == nil
                 else {
                     throw ExactPrefixProofEvidenceError
                         .reusedPrefixMismatch(caseID)
@@ -399,6 +466,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -406,6 +476,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -422,6 +495,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -429,6 +505,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -445,6 +524,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -452,6 +534,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -468,6 +553,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -475,6 +563,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -491,6 +582,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -498,6 +592,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -514,6 +611,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -521,6 +621,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -537,6 +640,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -544,6 +650,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -560,6 +669,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -567,6 +679,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -584,6 +699,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -591,6 +709,75 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixTokenIDsSHA256 == nil
+                    && reusedPrefixTokenCount == 0
+                    ? nil : reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind:
+                reusedPrefixTokenIDsSHA256 == nil
+                    && reusedPrefixTokenCount == 0
+                    ? nil : reusedPrefixSourceKind,
+            requestContext: requestContext)
+    }
+
+    func replacing(
+        reusedPrefixSourceCaseID: ExactPrefixProofCaseID?,
+        reusedPrefixSourceKind:
+            ExactPrefixProofReusedPrefixKind?
+    ) -> ExactPrefixProofCaseEvidence {
+        Self(
+            uncheckedCaseID: caseID,
+            promptTokenIDsSHA256: promptTokenIDsSHA256,
+            promptTokenCount: promptTokenCount,
+            generatedTokenIDsSHA256: generatedTokenIDsSHA256,
+            outputSHA256: outputSHA256,
+            referenceGeneratedTokenIDsSHA256:
+                referenceGeneratedTokenIDsSHA256,
+            referenceOutputSHA256: referenceOutputSHA256,
+            generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
+            timing: timing,
+            requestStartMetrics: requestStartMetrics,
+            memoryEvidence: memoryEvidence,
+            templateTokenCacheReceipt: templateTokenCacheReceipt,
+            reusedPrefixTokenIDsSHA256:
+                reusedPrefixTokenIDsSHA256,
+            reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
+            requestContext: requestContext)
+    }
+
+    func replacing(
+        finalContextTokenIDsSHA256: String?,
+        finalContextTokenCount: Int?
+    ) -> ExactPrefixProofCaseEvidence {
+        Self(
+            uncheckedCaseID: caseID,
+            promptTokenIDsSHA256: promptTokenIDsSHA256,
+            promptTokenCount: promptTokenCount,
+            generatedTokenIDsSHA256: generatedTokenIDsSHA256,
+            outputSHA256: outputSHA256,
+            referenceGeneratedTokenIDsSHA256:
+                referenceGeneratedTokenIDsSHA256,
+            referenceOutputSHA256: referenceOutputSHA256,
+            generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
+            timing: timing,
+            requestStartMetrics: requestStartMetrics,
+            memoryEvidence: memoryEvidence,
+            templateTokenCacheReceipt: templateTokenCacheReceipt,
+            reusedPrefixTokenIDsSHA256:
+                reusedPrefixTokenIDsSHA256,
+            reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 
@@ -607,6 +794,9 @@ public struct ExactPrefixProofCaseEvidence:
                 referenceGeneratedTokenIDsSHA256,
             referenceOutputSHA256: referenceOutputSHA256,
             generatedTokenCount: generatedTokenCount,
+            finalContextTokenIDsSHA256:
+                finalContextTokenIDsSHA256,
+            finalContextTokenCount: finalContextTokenCount,
             timing: timing,
             requestStartMetrics: requestStartMetrics,
             memoryEvidence: memoryEvidence,
@@ -614,6 +804,9 @@ public struct ExactPrefixProofCaseEvidence:
             reusedPrefixTokenIDsSHA256:
                 reusedPrefixTokenIDsSHA256,
             reusedPrefixTokenCount: reusedPrefixTokenCount,
+            reusedPrefixSourceCaseID:
+                reusedPrefixSourceCaseID,
+            reusedPrefixSourceKind: reusedPrefixSourceKind,
             requestContext: requestContext)
     }
 }
@@ -672,7 +865,7 @@ public struct ExactPrefixProofDerived:
 public struct ExactPrefixProofEvidence:
     Codable, Equatable, Sendable
 {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public let schemaVersion: Int
     public let modelID: String
@@ -865,6 +1058,7 @@ public struct ExactPrefixProofEvidence:
     @discardableResult
     public func validated() throws -> Self {
         guard schemaVersion == 1
+            || schemaVersion == 2
             || schemaVersion == Self.currentSchemaVersion
         else {
             throw ExactPrefixProofEvidenceError
@@ -939,6 +1133,16 @@ public struct ExactPrefixProofEvidence:
                 memoryLimitBytes: memoryLimitBytes,
                 cacheLimitBytes: cacheLimitBytes)
         }
+        if schemaVersion >= 3 {
+            for row in cases {
+                guard row.finalContextTokenIDsSHA256 != nil,
+                    row.finalContextTokenCount != nil
+                else {
+                    throw ExactPrefixProofEvidenceError
+                        .invalidFinalContext(row.caseID)
+                }
+            }
+        }
         try validateReferenceGroups(cases)
         try validateCacheBindings(cases)
         try validateWarmupBindings(cases)
@@ -951,7 +1155,7 @@ public struct ExactPrefixProofEvidence:
             memoryLimitBytes: memoryLimitBytes,
             cacheLimitBytes: cacheLimitBytes,
             requiresRuntimeIdentity:
-                schemaVersion == Self.currentSchemaVersion)
+                schemaVersion >= 2)
         guard derived == recomputed else {
             throw ExactPrefixProofEvidenceError.derivedClaimMismatch
         }
@@ -1136,13 +1340,43 @@ public struct ExactPrefixProofEvidence:
             else {
                 continue
             }
-            guard hit.reusedPrefixTokenIDsSHA256
-                == source.promptTokenIDsSHA256,
-                hit.reusedPrefixTokenCount
-                    == source.promptTokenCount
+            if schemaVersion < 3 {
+                guard hit.reusedPrefixTokenIDsSHA256
+                    == source.promptTokenIDsSHA256,
+                    hit.reusedPrefixTokenCount
+                        == source.promptTokenCount
+                else {
+                    throw ExactPrefixProofEvidenceError
+                        .reusedPrefixMismatch(hitID)
+                }
+                continue
+            }
+            guard hit.reusedPrefixSourceCaseID == sourceID,
+                let reusedPrefixSourceKind =
+                    hit.reusedPrefixSourceKind
             else {
                 throw ExactPrefixProofEvidenceError
                     .reusedPrefixMismatch(hitID)
+            }
+            switch reusedPrefixSourceKind {
+            case .promptOnly:
+                guard hit.reusedPrefixTokenIDsSHA256
+                    == source.promptTokenIDsSHA256,
+                    hit.reusedPrefixTokenCount
+                        == source.promptTokenCount
+                else {
+                    throw ExactPrefixProofEvidenceError
+                        .reusedPrefixMismatch(hitID)
+                }
+            case .finalContext:
+                guard hit.reusedPrefixTokenIDsSHA256
+                    == source.finalContextTokenIDsSHA256,
+                    hit.reusedPrefixTokenCount
+                        == source.finalContextTokenCount
+                else {
+                    throw ExactPrefixProofEvidenceError
+                        .reusedPrefixMismatch(hitID)
+                }
             }
         }
     }

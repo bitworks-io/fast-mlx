@@ -197,6 +197,35 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
             partial.requestStartMetrics?.physicalPrefillTokenCount, 1)
     }
 
+    func testPartialHitPrefersTheLongerSuccessfulFinalContext()
+        async throws
+    {
+        let enabled = try makeDriver(
+            configuration: cacheConfiguration())
+        let disabled = try makeDriver(configuration: .disabled)
+        let context = try request()
+        let prompt = [2, 3, 4]
+
+        let cold = try await enabled.generate(
+            prompt: prompt, config: config(context))
+        let extended = prompt + cold.tokens + [7]
+        let partial = try await enabled.generate(
+            prompt: extended, config: config(context))
+        let control = try await disabled.generate(
+            prompt: extended, config: config(context))
+
+        XCTAssertEqual(partial.tokens, control.tokens)
+        XCTAssertEqual(
+            partial.requestStartMetrics?.prefixCacheOutcome,
+            .partialHit)
+        XCTAssertEqual(
+            partial.requestStartMetrics?.cacheReadTokenCount,
+            prompt.count + cold.tokens.count)
+        XCTAssertEqual(
+            partial.requestStartMetrics?.physicalPrefillTokenCount,
+            1)
+    }
+
     func testBFloat16RuntimeCapturesAndRestoresExactHit()
         async throws
     {

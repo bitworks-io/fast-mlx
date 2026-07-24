@@ -11,7 +11,7 @@ final class ExactPrefixProofEvidenceTests: XCTestCase {
             .postWarmupHit: 0.012,
         ])
 
-        XCTAssertEqual(evidence.schemaVersion, 2)
+        XCTAssertEqual(evidence.schemaVersion, 3)
         XCTAssertEqual(
             evidence.cases[1].requestStartMetrics?
                 .runtimeIdentity?.observedDenseHalfDType,
@@ -40,6 +40,120 @@ final class ExactPrefixProofEvidenceTests: XCTestCase {
                 ExactPrefixProofEvidence.self,
                 from: JSONEncoder().encode(evidence)),
             evidence)
+    }
+
+    func testPartialHitMayBindTheLongerSuccessfulFinalContext()
+        throws
+    {
+        var cases = try proofEvidence().cases
+        let source = cases[1]
+        let finalContextTokenCount =
+            source.promptTokenCount + source.generatedTokenCount
+        cases[4] = cases[4]
+            .replacing(requestStartMetrics: metrics(
+                outcome: .partialHit,
+                templateHit: true,
+                cacheReadTokenCount: finalContextTokenCount))
+            .replacing(
+                reusedPrefixTokenIDsSHA256:
+                    try XCTUnwrap(
+                        source.finalContextTokenIDsSHA256),
+                reusedPrefixTokenCount: finalContextTokenCount)
+            .replacing(
+                reusedPrefixSourceCaseID: .coldCommitA,
+                reusedPrefixSourceKind: .finalContext)
+
+        XCTAssertNoThrow(try proofEvidence(cases: cases))
+    }
+
+    func testFinalContextReuseBindingFailsClosedOnWrongSourceKindHashOrCount()
+        throws
+    {
+        let baseline = try proofEvidence().cases
+        let source = baseline[1]
+        let finalContextTokenCount = try XCTUnwrap(
+            source.finalContextTokenCount)
+        let finalContextSHA256 = try XCTUnwrap(
+            source.finalContextTokenIDsSHA256)
+
+        func finalContextCases(
+            hash: String,
+            count: Int,
+            sourceCaseID: ExactPrefixProofCaseID,
+            sourceKind: ExactPrefixProofReusedPrefixKind
+        ) -> [ExactPrefixProofCaseEvidence] {
+            var cases = baseline
+            cases[4] = cases[4]
+                .replacing(requestStartMetrics: metrics(
+                    outcome: .partialHit,
+                    templateHit: true,
+                    cacheReadTokenCount: count))
+                .replacing(
+                    reusedPrefixTokenIDsSHA256: hash,
+                    reusedPrefixTokenCount: count)
+                .replacing(
+                    reusedPrefixSourceCaseID: sourceCaseID,
+                    reusedPrefixSourceKind: sourceKind)
+            return cases
+        }
+
+        XCTAssertThrowsError(try proofEvidence(cases:
+            finalContextCases(
+                hash: digest("wrong-final-context"),
+                count: finalContextTokenCount,
+                sourceCaseID: .coldCommitA,
+                sourceKind: .finalContext)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .reusedPrefixMismatch(.partialHit))
+        }
+        XCTAssertThrowsError(try proofEvidence(cases:
+            finalContextCases(
+                hash: finalContextSHA256,
+                count: finalContextTokenCount,
+                sourceCaseID: .coldCommitB,
+                sourceKind: .finalContext)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .reusedPrefixMismatch(.partialHit))
+        }
+        XCTAssertThrowsError(try proofEvidence(cases:
+            finalContextCases(
+                hash: finalContextSHA256,
+                count: finalContextTokenCount,
+                sourceCaseID: .coldCommitA,
+                sourceKind: .promptOnly)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .reusedPrefixMismatch(.partialHit))
+        }
+        XCTAssertThrowsError(try proofEvidence(cases:
+            finalContextCases(
+                hash: finalContextSHA256,
+                count: finalContextTokenCount - 1,
+                sourceCaseID: .coldCommitA,
+                sourceKind: .finalContext)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .reusedPrefixMismatch(.partialHit))
+        }
+    }
+
+    func testSchemaThreeRequiresEveryFinalContextBinding() throws {
+        var cases = try proofEvidence().cases
+        cases[1] = cases[1].replacing(
+            finalContextTokenIDsSHA256: nil,
+            finalContextTokenCount: nil)
+
+        XCTAssertThrowsError(try proofEvidence(cases: cases)) {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofEvidenceError,
+                .invalidFinalContext(.coldCommitA))
+        }
     }
 
     func testNegativeWarmBenefitIsValidButNotPromotable() throws {
@@ -142,6 +256,27 @@ final class ExactPrefixProofEvidenceTests: XCTestCase {
                 $0 as? ExactPrefixProofEvidenceError,
                 .legacyPromotableEvidence)
         }
+    }
+
+    func testSchemaTwoPromptOnlyEvidenceRemainsReadableAndPromotable()
+        throws
+    {
+        let decoded = try JSONDecoder().decode(
+            ExactPrefixProofEvidence.self,
+            from: JSONSerialization.data(
+                withJSONObject:
+                    try legacySchemaTwoObject(
+                        from: proofEvidence()),
+                options: [.sortedKeys]))
+
+        XCTAssertEqual(decoded.schemaVersion, 2)
+        XCTAssertTrue(decoded.promotable)
+        XCTAssertTrue(decoded.cases.allSatisfy {
+            $0.finalContextTokenIDsSHA256 == nil
+                && $0.finalContextTokenCount == nil
+                && $0.reusedPrefixSourceCaseID == nil
+                && $0.reusedPrefixSourceKind == nil
+        })
     }
 
     func testEveryRequiredWarmCellMustBeatItsPairedControl() throws {
@@ -595,10 +730,7 @@ private let binarySHA = String(repeating: "b", count: 64)
 private func legacySchemaOneObject(
     from evidence: ExactPrefixProofEvidence
 ) throws -> [String: Any] {
-    var object = try XCTUnwrap(
-        JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(evidence))
-            as? [String: Any])
+    var object = try legacySchemaTwoObject(from: evidence)
     var cases = try XCTUnwrap(
         object["cases"] as? [[String: Any]])
     for index in cases.indices {
@@ -609,6 +741,30 @@ private func legacySchemaOneObject(
         cases[index]["requestStartMetrics"] = requestStartMetrics
     }
     object["schemaVersion"] = 1
+    object["cases"] = cases
+    return object
+}
+
+private func legacySchemaTwoObject(
+    from evidence: ExactPrefixProofEvidence
+) throws -> [String: Any] {
+    var object = try XCTUnwrap(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(evidence))
+            as? [String: Any])
+    var cases = try XCTUnwrap(
+        object["cases"] as? [[String: Any]])
+    for index in cases.indices {
+        cases[index].removeValue(
+            forKey: "finalContextTokenIDsSHA256")
+        cases[index].removeValue(
+            forKey: "finalContextTokenCount")
+        cases[index].removeValue(
+            forKey: "reusedPrefixSourceCaseID")
+        cases[index].removeValue(
+            forKey: "reusedPrefixSourceKind")
+    }
+    object["schemaVersion"] = 2
     object["cases"] = cases
     return object
 }
@@ -857,16 +1013,29 @@ private func caseEvidence(
         promptGroup = "prompt-warm"
         promptTokenCount = 128
     }
-    let reusedPrefix: (sha256: String?, count: Int)
+    let reusedPrefix: (
+        sha256: String?,
+        count: Int,
+        sourceCaseID: ExactPrefixProofCaseID?,
+        sourceKind: ExactPrefixProofReusedPrefixKind?
+    )
     switch id {
     case .exactHitA, .partialHit, .returnHitA:
-        reusedPrefix = (digest("prompt-a"), 64)
+        reusedPrefix = (
+            digest("prompt-a"),
+            64,
+            .coldCommitA,
+            .promptOnly)
     case .postWarmupHit:
-        reusedPrefix = (digest("prompt-warm"), 128)
+        reusedPrefix = (
+            digest("prompt-warm"),
+            128,
+            .postWarmupMiss,
+            .promptOnly)
     case .coldControlA, .coldCommitA, .partialControl,
         .coldCommitB, .pressureEvictedA, .postWarmupControl,
         .postWarmupMiss:
-        reusedPrefix = (nil, 0)
+        reusedPrefix = (nil, 0, nil, nil)
     }
     return try ExactPrefixProofCaseEvidence(
         caseID: id,
@@ -877,6 +1046,9 @@ private func caseEvidence(
         referenceGeneratedTokenIDsSHA256: referenceTokenSHA,
         referenceOutputSHA256: referenceOutputSHA,
         generatedTokenCount: 8,
+        finalContextTokenIDsSHA256:
+            digest("final-\(promptGroup)"),
+        finalContextTokenCount: promptTokenCount + 8,
         timing: ExactPrefixProofCaseTiming(
             requestStartSeconds: requestStartSeconds,
             ttftSeconds: requestStartSeconds + 0.020,
@@ -887,6 +1059,9 @@ private func caseEvidence(
         templateTokenCacheReceipt: templateReceipt,
         reusedPrefixTokenIDsSHA256: reusedPrefix.sha256,
         reusedPrefixTokenCount: reusedPrefix.count,
+        reusedPrefixSourceCaseID:
+            reusedPrefix.sourceCaseID,
+        reusedPrefixSourceKind: reusedPrefix.sourceKind,
         requestContext: id.isControl ? nil : requestContext())
 }
 

@@ -765,16 +765,29 @@ final class ExactPrefixProofCLITests: XCTestCase {
         } else {
             metrics = nil
         }
-        let reusedPrefix: (sha256: String?, count: Int)
+        let reusedPrefix: (
+            sha256: String?,
+            count: Int,
+            sourceCaseID: ExactPrefixProofCaseID?,
+            sourceKind: ExactPrefixProofReusedPrefixKind?
+        )
         switch id {
         case .exactHitA, .partialHit, .returnHitA:
-            reusedPrefix = (digest("prompt-a"), 64)
+            reusedPrefix = (
+                digest("prompt-a"),
+                64,
+                .coldCommitA,
+                .promptOnly)
         case .postWarmupHit:
-            reusedPrefix = (digest("prompt-warm"), 128)
+            reusedPrefix = (
+                digest("prompt-warm"),
+                128,
+                .postWarmupMiss,
+                .promptOnly)
         case .coldControlA, .coldCommitA, .partialControl,
             .coldCommitB, .pressureEvictedA, .postWarmupControl,
             .postWarmupMiss:
-            reusedPrefix = (nil, 0)
+            reusedPrefix = (nil, 0, nil, nil)
         }
         return try ExactPrefixProofCaseEvidence(
             caseID: id,
@@ -786,6 +799,9 @@ final class ExactPrefixProofCLITests: XCTestCase {
                 digest("tokens-\(group)"),
             referenceOutputSHA256: digest("output-\(group)"),
             generatedTokenCount: 8,
+            finalContextTokenIDsSHA256:
+                digest("final-context-\(group)"),
+            finalContextTokenCount: promptTokenCount + 8,
             timing: ExactPrefixProofCaseTiming(
                 requestStartSeconds: requestStartSeconds,
                 ttftSeconds: requestStartSeconds + 0.01,
@@ -809,6 +825,9 @@ final class ExactPrefixProofCLITests: XCTestCase {
             templateTokenCacheReceipt: templateReceipt,
             reusedPrefixTokenIDsSHA256: reusedPrefix.sha256,
             reusedPrefixTokenCount: reusedPrefix.count,
+            reusedPrefixSourceCaseID:
+                reusedPrefix.sourceCaseID,
+            reusedPrefixSourceKind: reusedPrefix.sourceKind,
             requestContext:
                 outcome == nil ? nil : try proofRequestContext())
     }
