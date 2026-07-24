@@ -1,7 +1,8 @@
 # Production continuous-batching serving route plan
 
 - **Date:** 2026-07-24
-- **Status:** active — Phases 0–4 complete; explicit-no-spec production evidence Phase 5 is next
+- **Status:** active — Phases 0–4 complete; Phase 5 product smoke and bounded transport preflight
+  pass, while the 24-hour resident soak awaits a correctly identified 256-GiB host
 - **Owner:** Codex
 - **Branch:** `codex/continuous-batching-serving-route`
 - **Evaluation lane:** EXACT
@@ -353,14 +354,27 @@ SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
 
 ### Phase 5 — production evidence and closure
 
-1. Run a fresh Release smoke, hostile disconnect/A/B/A packet, and transport-level resident soak
-   with progress/lock/watchdog/RSS/MLX/resource telemetry.
-2. Authenticate exact source, binary, dependency, model/tokenizer/checkpoint, config, request,
-   workload, redacted-envelope, and evidence hashes. Run a regression fixture and secret scan that
-   prove known prompt/key sentinels are absent from evidence.
+1. **PARTIAL:** fresh Release product smoke v8 and the hostile C=4 transport preflight v2 are
+   `COMPLETE` and independently authenticated. The preflight carries one dropped warmup plus
+   135.580501 measured seconds, 24 evidence rows, four typed `clientDisconnected` rows, bounded
+   recovery, stable memory, and no watchdog/orphan. The transport-level 24-hour resident soak
+   remains unlaunched.
+2. **PARTIAL:** exact source, binary, dependency, model/tokenizer/checkpoint, workload, redaction,
+   and evidence hashes authenticate for smoke v8 and preflight v2. The prepared soak packet uses
+   incremental evidence scanning, exact request/response pairing, normalized power snapshots, and
+   explicit memory/cache limits; its final host-specific hashes must be reviewed again after the
+   target host is admitted.
 3. Write the dated verdict, public fast-mlx-only content, verification packet, and handoff.
 4. Run focused correctness/security review, diff inspection, relative-link checks, ShellCheck,
    staged gitleaks, coherent commits with the required trailer, fresh proof, and `--no-ff` merge.
+
+Phase-5 checkpoint verification:
+[`continuous-serving-phase5-preflight-verification-2026-07-24.json`](../verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json).
+The intended `192.168.1.253` host currently presents Dropbear 2022.83 with only an RSA host key,
+not the expected macOS OpenSSH Remote Login identity. No key was trusted and no credentials or
+workloads were sent. Correct the network/Remote Login mapping, authenticate the host read-only,
+then derive a fresh host-specific soak packet; do not copy the `.252` laptop paths or 140-W
+charger contract onto a desktop host.
 
 ## Proof mapping
 

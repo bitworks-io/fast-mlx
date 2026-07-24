@@ -348,11 +348,52 @@ is already available.
   manifests, no watchdog/lock/orphan. Packet
   [`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json)
   SHA-256 is `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
-- **Blockers / residual risk:** Phase 5 production soak/redaction/release proof remains open.
-  `llmbench@192.168.1.253` (M3 Ultra, 256 GiB) must not be contacted before 2026-07-24 17:44 CDT;
-  afterward qualify it read-only and keep its provenance/results separate from `.252`.
-- **Next safe action:** run a fresh clean explicit-no-spec Release smoke and hostile transport
-  packet on `.252`, then begin the resident soak on non-overlapping qualified hosts.
+- **Blockers / residual risk:** Phase 5 resident-soak/release proof remains open. Product smoke v8
+  and the bounded transport preflight v2 now pass; the intended 256-GiB host at
+  `llmbench@192.168.1.253` instead presents Dropbear 2022.83 with only an RSA host key, not the
+  expected macOS OpenSSH Remote Login identity. No key was trusted and no credential or workload
+  was sent.
+- **Next safe action:** correct or confirm the `.253` network/Remote Login mapping, authenticate
+  that host read-only, then derive and independently review a fresh desktop-specific 24-hour soak
+  packet. Do not copy `.252` paths or its 140-W laptop power contract onto `.253`.
+
+**Continuous-batching serving route — PHASE 5 PREFLIGHT PASS, RESIDENT SOAK BLOCKED
+(2026-07-24):**
+
+- Clean `24c7df0fa0c7f10ddf65a0443e41c7f97abb8e6d` exposes an admitted SSE 200 head before
+  awaiting the first backend delta. Product smoke v8 is fresh `COMPLETE` with seven evidence
+  rows: six completed responses and one zero-body typed `clientDisconnected` row; maximum active
+  requests and coordinator slots are three, followed by zero-resource recovery.
+- Transport preflight v2 is fresh `COMPLETE` at
+  `/Users/llmbench/perf-work/results/continuous-serving-phase5-transport-preflight-24c7df0-v2`.
+  It carries one dropped warmup plus three measured C=4 cycles, 135.580501 measured seconds,
+  24 evidence rows, four typed disconnects, maximum cancel-to-evidence 0.991962 seconds, maximum
+  recovery 11.783074 seconds, 18,171,392 KiB maximum RSS, 1.000028177 post-warmup peak/baseline
+  RSS ratio, MLX active/cache/peak within explicit 96/8-GiB limits, six retained AC/High-Power/
+  Foundation-nominal samples, and no watchdog, failure, lock, port, or orphan.
+- Preflight v1 remains terminal before server launch; its immutable sibling manual-failure receipt
+  and sidecar SHA-256 values are
+  `e3f5f307a4e5b13219cf5d5ca5cf5789b039510ceb0416f5f427ae7714e355e8` and
+  `5c26b7c85c2d55a06cb171cd08c41ea5a4d1fc625d6d16cb81be596e87100dc4`.
+  Never resume, overwrite, or promote v1.
+- The independently recomputed preflight manifest, evidence, cycle-receipt, authentication,
+  completion, and artifact-list SHA-256 values are
+  `ed4bd96959564be8b794720c37624497e1f215a79411319ed218e1b66a63f82f`,
+  `d5408bab04aa81e4894f92a79176eb8b2e8044b4acf7abe25dbabc07ca8fe5de`,
+  `dc2c2b33e4f5e037a2aa4199952b1e27bf25828c9f2a367a2d0852176a361d29`,
+  `d5e20e46db5796a40c053b1121ab2002c4ed2648330b5299b27402240150381e`,
+  `b3b04ab393ebb7124499a502f06f9369500f8e9ca920bf68879b63cf3aa348ab`,
+  and `9cd9f618cd6dd6097acff44d626f0666d1dea0c00f378d82e0b57d90c739619d`.
+- The static-reviewed but unlaunched `.252` 24-hour draft packet has client, launcher, and
+  manifest SHA-256
+  values `81dc2b7fe4d6080a20721fe5729f1084a2d1a384e22f634bbc78c66e45e37dfc`,
+  `ad2d5cc592ae79fe579b1e614562f376e389d619b3b13590e5967dae74f2dc46`,
+  and `5c11ac363d076a440e20183d79fd7b948dee11cc0bce6e4dd083a3ae77282fec`.
+  It is `.252`-specific and must remain unlaunched; after `.253` admission, derive fresh paths,
+  desktop power policy, source/binary/model hashes, nonce, and output root.
+- Checkpoint packet:
+  [`continuous-serving-phase5-preflight-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json),
+  SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
 
 **Content practice:** `docs/content/` now has 16 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
@@ -360,7 +401,8 @@ notable spike, including negative results.
 ## Open Work Queue
 
 1. **Continuous-batching serving route Phase 5** — Phase 4 solo PLD is exact but fails the speed
-   gate and is shelved; run the explicit-no-spec Release smoke, hostile transport packet, resident
+   gate and is shelved; product smoke v8 and bounded transport preflight v2 pass. Correct the
+   `.253` host identity, derive and review a fresh host-specific resident soak packet, then finish
    soak, redaction/provenance proof, final review, and merge only after fresh proof.
    [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
 2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are

@@ -623,7 +623,7 @@ workload also improves completion throughput by at least 5%.
 | Fresh provenance and resource telemetry | **PASS** | The reviewed launcher binds clean source and Phase 4 files, loaded test binary/xctestrun, exact model/tokenizer/shard hashes, explicit 96/8/16-GiB limits, High Power/140 W AC/Foundation nominal state, PID signatures, heartbeat/log mtime/bytes, and positive RSS. Launcher, artifact-manifest, xcresult-manifest, and test-log SHA-256 values are `8113355209b5f65d33b13922cbcb7de8cfad165c3810ef2a229c2f2ac5b2b6f4`, `7878a01464cd89aae6c083f94119b4869a78c538951599ed45beec1717671b74`, `bf549d33c11e9970e4818fe538068b171544b729350554e7ee4b5ed3d27b9742`, and `8a879074f6460d8d2757fe830861f8bce4072e65b46cd42c03bd06a90d9da2da`. Max XCTest RSS is 18,261,232 KiB; watchdog, lock, and orphans are absent. |
 | Dynamic solo-PLD speed gate | **FAIL / SHELVE** | The same-workload HTTP diagnostic preserves output SHA-256 `e2bd50d…a7270d`, but retained ngram-3 improves C=1 only 21.7851→22.0880 tok/s (+1.3902%) versus +5% required. Bounded ngram-2 improves only 21.8526→22.0981 tok/s (+1.1236%). Dirty/diagnostic logs `4a7bdad7…72a3a` and `a374ec84…22c66` cannot promote; they are sufficient to refuse an unchanged route. |
 | Shipping/default claim boundary | **PASS** | Dynamic PLD remains internal diagnostic machinery, marked `diagnostic-only`, `promotable:false`, and `speedAggregation:forbidden`; the CLI exposes only explicit `continuous-batch-no-spec`. Shared-batch speculation and lossy-KV-plus-PLD remain rejected. |
-| Phase 5 resident production proof | **PENDING** | Clean explicit-no-spec Release smoke, hostile disconnect/A/B/A packet, transport resident soak, redaction proof, final review, merge, and release evidence remain open. |
+| Phase 5 resident production proof | **PARTIAL / HOST BLOCKED** | Clean `24c7df0` product smoke v8 and transport preflight v2 are fresh `COMPLETE`. V2 proves one warmup plus three measured C=4 cycles, 135.580501 measured seconds, 24 evidence rows, four zero-body typed disconnects, ≤0.991962-second cancellation evidence, ≤11.783074-second recovery to zero, bounded MLX/RSS, six stable power samples, exact provenance/redaction, and no watchdog/orphan. A static-reviewed `.252` draft exists but is not launch-ready; the intended host `.253` presents Dropbear rather than the expected macOS OpenSSH identity, and a fresh host-specific packet and review remain required. |
 
 Machine-readable criterion mapping:
 [`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json),
@@ -632,3 +632,9 @@ SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
 **Overall verdict: PARTIAL — SHELVE_DYNAMIC_SOLO_PLD_KEEP_EXPLICIT_NO_SPEC.** Correctness,
 exactness, shared-batch safety, provenance, and clean Apple verification pass. The declared speed
 gate fails, so no dynamic/default route is authorized. Phase 5 remains the next active gate.
+
+Phase-5 checkpoint verification:
+[`continuous-serving-phase5-preflight-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json).
+SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
+This checkpoint is non-promotable and does not replace the required 24-hour resident transport
+soak, final release proof, or merge.
