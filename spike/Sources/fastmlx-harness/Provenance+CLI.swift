@@ -352,9 +352,10 @@ enum ProvenanceCLI {
     static func tokenizerManifestSHA256(at modelPath: String) throws -> String {
         let directory = URL(fileURLWithPath: modelPath)
         let recognizedNames: Set<String> = [
-            "added_tokens.json", "merges.txt", "sentencepiece.bpe.model",
-            "special_tokens_map.json", "spiece.model", "tokenizer.model",
-            "vocab.json", "vocab.txt",
+            "added_tokens.json", "chat_template.jinja",
+            "chat_template.json", "merges.txt",
+            "sentencepiece.bpe.model", "special_tokens_map.json",
+            "spiece.model", "tokenizer.model", "vocab.json", "vocab.txt",
         ]
         let candidates = try FileManager.default.contentsOfDirectory(
             at: directory,

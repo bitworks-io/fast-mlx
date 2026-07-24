@@ -1,9 +1,94 @@
 import CryptoKit
 import Foundation
 import HarnessCore
+import MLXLMCommon
 import XCTest
 
 @testable import fastmlx_harness
+
+private enum ExactPrefixPromptTokenizerError: Error {
+    case invalidRequest
+    case missingTemplate
+}
+
+private struct ExactPrefixPromptTokenizer: MLXLMCommon.Tokenizer {
+    enum Mode {
+        case preservesPrefix
+        case breaksPrefix
+        case empty
+        case missingTemplate
+    }
+
+    let mode: Mode
+    let bosToken: String? = nil
+    let eosToken: String? = "<eos>"
+    let unknownToken: String? = nil
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        (addSpecialTokens ? [7] : []) + text.utf8.map(Int.init)
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        ""
+    }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        token == "<eos>" ? 2 : nil
+    }
+
+    func convertIdToToken(_ id: Int) -> String? {
+        id == 2 ? "<eos>" : nil
+    }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        guard mode != .missingTemplate else {
+            throw ExactPrefixPromptTokenizerError.missingTemplate
+        }
+        guard mode != .empty else { return [] }
+        guard tools == nil,
+            additionalContext?["enable_thinking"] as? Bool == false,
+            messages.first?["role"] as? String == "user",
+            let firstContent = messages.first?["content"] as? String
+        else {
+            throw ExactPrefixPromptTokenizerError.invalidRequest
+        }
+        let base = [9_001]
+            + encode(text: firstContent, addSpecialTokens: false)
+            + [9_002, 9_003]
+        guard messages.count == 3 else {
+            guard messages.count == 1 else {
+                throw ExactPrefixPromptTokenizerError.invalidRequest
+            }
+            return base
+        }
+        guard messages[1]["role"] as? String == "assistant",
+            messages[1]["content"] as? String
+                == exactPrefixProofAssistantContinuation,
+            messages[1]["reasoning_content"] as? String == "",
+            messages[2]["role"] as? String == "user",
+            let tailContent = messages[2]["content"] as? String
+        else {
+            throw ExactPrefixPromptTokenizerError.invalidRequest
+        }
+        let extensionTokens =
+            encode(text: tailContent, addSpecialTokens: false)
+                + [9_004]
+        switch mode {
+        case .preservesPrefix:
+            return base + extensionTokens
+        case .breaksPrefix:
+            return [8_999] + extensionTokens
+        case .empty:
+            return []
+        case .missingTemplate:
+            throw ExactPrefixPromptTokenizerError.missingTemplate
+        }
+    }
+}
 
 final class ExactPrefixProofCLITests: XCTestCase {
     private let harnessSHA = String(repeating: "a", count: 40)
@@ -64,7 +149,9 @@ final class ExactPrefixProofCLITests: XCTestCase {
             .fp16)
     }
 
-    func testProofPromptEndsEveryRepeatedBlockWithAnExplicitResponseCue() {
+    func testProofPromptUsesCheckpointChatTemplateAndExactMultiTurnPrefix()
+        throws
+    {
         let text = exactPrefixProofPromptText(
             workloadNonce: "nonce",
             label: "A",
@@ -84,20 +171,39 @@ final class ExactPrefixProofCLITests: XCTestCase {
             text.components(separatedBy: "Response:").count - 1,
             2)
         XCTAssertTrue(text.hasSuffix("Response:"))
+        let tokenizer = ExactPrefixPromptTokenizer(
+            mode: .preservesPrefix)
+        let base = try exactPrefixProofPromptTokenIDs(
+            workloadNonce: "nonce",
+            label: "A",
+            repeatCount: 2,
+            tokenizer: tokenizer)
+        let extended = try exactPrefixProofExtendedPromptTokenIDs(
+            workloadNonce: "nonce",
+            baseLabel: "A",
+            tailLabel: "partial-tail",
+            repeatCount: 2,
+            tokenizer: tokenizer)
+        XCTAssertTrue(extended.starts(with: base))
+        XCTAssertGreaterThan(extended.count, base.count)
         XCTAssertEqual(
             exactPrefixProofFormattingOptionsSHA256(),
             digest(
                 """
-                fast-mlx-exact-prefix-proof-format-v2
-                explicit-response-cue
+                fast-mlx-exact-prefix-proof-format-v3
+                checkpoint-chat-template-generation-prompt
+                thinking-disabled
+                exact-multiturn-prefix
 
                 """))
         XCTAssertEqual(
             exactPrefixProofPromptTemplateSHA256(),
             digest(
                 """
-                fast-mlx-exact-prefix-proof-template-v2
+                fast-mlx-exact-prefix-proof-template-v3
                 fixed-ledger-response
+                assistant-prefix-continuation-v1
+                assistant-reasoning-content-empty
 
                 """))
         XCTAssertEqual(
@@ -106,12 +212,48 @@ final class ExactPrefixProofCLITests: XCTestCase {
                 group: "A"),
             digest(
                 """
-                fast-mlx-exact-prefix-proof-content-v2
+                fast-mlx-exact-prefix-proof-content-v3
                 explicit-response-cue
                 nonce
                 A
 
                 """))
+    }
+
+    func testProofPromptFailsClosedForMissingOrNonPrefixChatTemplate() {
+        XCTAssertThrowsError(try exactPrefixProofPromptTokenIDs(
+            workloadNonce: "nonce",
+            label: "A",
+            repeatCount: 1,
+            tokenizer: ExactPrefixPromptTokenizer(mode: .empty)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofPromptRenderingError,
+                .emptyPrompt)
+        }
+        XCTAssertThrowsError(try exactPrefixProofPromptTokenIDs(
+            workloadNonce: "nonce",
+            label: "A",
+            repeatCount: 1,
+            tokenizer: ExactPrefixPromptTokenizer(
+                mode: .missingTemplate)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixPromptTokenizerError,
+                .missingTemplate)
+        }
+        XCTAssertThrowsError(try exactPrefixProofExtendedPromptTokenIDs(
+            workloadNonce: "nonce",
+            baseLabel: "A",
+            tailLabel: "partial-tail",
+            repeatCount: 1,
+            tokenizer: ExactPrefixPromptTokenizer(
+                mode: .breaksPrefix)))
+        {
+            XCTAssertEqual(
+                $0 as? ExactPrefixProofPromptRenderingError,
+                .extendedPromptDoesNotPreserveBasePrefix)
+        }
     }
 
     func testStrictCommandParserRejectsUnknownDuplicateAndIdentityDrift()

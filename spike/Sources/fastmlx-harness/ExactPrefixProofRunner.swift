@@ -19,6 +19,14 @@ private enum ExactPrefixProofRunnerError: Error, Equatable {
     case invalidValidationArguments
 }
 
+enum ExactPrefixProofPromptRenderingError: Error, Equatable {
+    case emptyPrompt
+    case extendedPromptDoesNotPreserveBasePrefix
+}
+
+let exactPrefixProofAssistantContinuation =
+    "<think>\n\n</think>\n\nready"
+
 func exactPrefixProofPromptText(
     workloadNonce: String,
     label: String,
@@ -36,8 +44,10 @@ func exactPrefixProofPromptText(
 func exactPrefixProofFormattingOptionsSHA256() -> String {
     sha256Hex(Data(
         """
-        fast-mlx-exact-prefix-proof-format-v2
-        explicit-response-cue
+        fast-mlx-exact-prefix-proof-format-v3
+        checkpoint-chat-template-generation-prompt
+        thinking-disabled
+        exact-multiturn-prefix
 
         """.utf8))
 }
@@ -45,8 +55,10 @@ func exactPrefixProofFormattingOptionsSHA256() -> String {
 func exactPrefixProofPromptTemplateSHA256() -> String {
     sha256Hex(Data(
         """
-        fast-mlx-exact-prefix-proof-template-v2
+        fast-mlx-exact-prefix-proof-template-v3
         fixed-ledger-response
+        assistant-prefix-continuation-v1
+        assistant-reasoning-content-empty
 
         """.utf8))
 }
@@ -57,12 +69,76 @@ func exactPrefixProofPromptContentSHA256(
 ) -> String {
     sha256Hex(Data(
         """
-        fast-mlx-exact-prefix-proof-content-v2
+        fast-mlx-exact-prefix-proof-content-v3
         explicit-response-cue
         \(workloadNonce)
         \(group)
 
         """.utf8))
+}
+
+func exactPrefixProofPromptTokenIDs(
+    workloadNonce: String,
+    label: String,
+    repeatCount: Int,
+    tokenizer: Tokenizer
+) throws -> [Int] {
+    let text = exactPrefixProofPromptText(
+        workloadNonce: workloadNonce,
+        label: label,
+        repeatCount: repeatCount)
+    let tokens = try tokenizer.applyChatTemplate(
+        messages: [["role": "user", "content": text]],
+        tools: nil,
+        additionalContext: ["enable_thinking": false])
+    guard !tokens.isEmpty else {
+        throw ExactPrefixProofPromptRenderingError.emptyPrompt
+    }
+    return tokens
+}
+
+func exactPrefixProofExtendedPromptTokenIDs(
+    workloadNonce: String,
+    baseLabel: String,
+    tailLabel: String,
+    repeatCount: Int,
+    tokenizer: Tokenizer
+) throws -> [Int] {
+    let base = try exactPrefixProofPromptTokenIDs(
+        workloadNonce: workloadNonce,
+        label: baseLabel,
+        repeatCount: repeatCount,
+        tokenizer: tokenizer)
+    let baseText = exactPrefixProofPromptText(
+        workloadNonce: workloadNonce,
+        label: baseLabel,
+        repeatCount: repeatCount)
+    let tailText = exactPrefixProofPromptText(
+        workloadNonce: workloadNonce,
+        label: tailLabel,
+        repeatCount: repeatCount)
+    let extended = try tokenizer.applyChatTemplate(
+        messages: [
+            ["role": "user", "content": baseText],
+            // Qwen's thinking-disabled generation prompt ends with this empty thinking block.
+            // A defined reasoning field prevents its historical-turn parser from stripping the
+            // block; templates that ignore the field remain guarded by the exact token-prefix check.
+            [
+                "role": "assistant",
+                "content": exactPrefixProofAssistantContinuation,
+                "reasoning_content": "",
+            ],
+            ["role": "user", "content": tailText],
+        ],
+        tools: nil,
+        additionalContext: ["enable_thinking": false])
+    guard extended.count > base.count,
+        extended.starts(with: base)
+    else {
+        throw ExactPrefixProofPromptRenderingError
+            .extendedPromptDoesNotPreserveBasePrefix
+    }
+    return extended
 }
 
 func runExactPrefixProof(_ rawArguments: [String]) async throws {
@@ -644,8 +720,12 @@ private struct ExactPrefixProofRuntime {
             .pressureEvictedA:
             return try encodedPrompt(label: "A")
         case .partialControl, .partialHit:
-            return try encodedPrompt(label: "A")
-                + encodedPrompt(label: "partial-tail")
+            return try exactPrefixProofExtendedPromptTokenIDs(
+                workloadNonce: command.plan.workloadNonce,
+                baseLabel: "A",
+                tailLabel: "partial-tail",
+                repeatCount: command.plan.promptRepeat,
+                tokenizer: tokenizer)
         case .coldCommitB:
             return try encodedPrompt(label: "B")
         case .postWarmupControl, .postWarmupMiss, .postWarmupHit:
@@ -658,15 +738,11 @@ private struct ExactPrefixProofRuntime {
     }
 
     private func encodedPrompt(label: String) throws -> [Int] {
-        let text = exactPrefixProofPromptText(
+        try exactPrefixProofPromptTokenIDs(
             workloadNonce: command.plan.workloadNonce,
             label: label,
-            repeatCount: command.plan.promptRepeat)
-        let tokens = tokenizer.encode(text: text, addSpecialTokens: true)
-        guard !tokens.isEmpty else {
-            throw ExactPrefixProofRunnerError.emptyGeneration(.coldControlA)
-        }
-        return tokens
+            repeatCount: command.plan.promptRepeat,
+            tokenizer: tokenizer)
     }
 
     private func promptContentSHA256(
