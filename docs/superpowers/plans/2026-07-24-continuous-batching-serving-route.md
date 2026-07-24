@@ -1,7 +1,7 @@
 # Production continuous-batching serving route plan
 
 - **Date:** 2026-07-24
-- **Status:** active — review amendments incorporated; Phase 0 contract frozen
+- **Status:** active — Phases 0–3 complete; measured solo-PLD Phase 4 is next
 - **Owner:** Codex
 - **Branch:** `codex/continuous-batching-serving-route`
 - **Evaluation lane:** EXACT
@@ -275,6 +275,38 @@ progress, drain-before-same-cohort join, and legacy unrestricted runtimes; MLX r
 the capacity classification and reject mixed-capacity decode directly; the loaded Apple proof
 then covers same-capacity B3→B2→B3 hostile compaction plus cross-capacity isolation. Historical
 failed boundaries remain diagnostic-only and unchanged.
+
+#### Phase 3 closure — 2026-07-24
+
+Phase 3 is complete at clean source
+`d9143ce24ac084d295e3903443c96aa07c1fe6e7`. The pure serving/core verification passes 675
+XCTest plus 17 Swift Testing tests. The synchronized Apple verification passes 140
+`FastMLXHarnessTests`, 176 `SpikeCoreTests`, and 30 `SpikeServingAdaptersTests` with the two loaded
+tests intentionally skipped when their model environment is absent; the Release build succeeds.
+Xcode test and Release log SHA-256 values are
+`eb763b849d7d4d53f4d7e094cbe9091c8c620efa1252d84ce09413bc8b7cf937` and
+`463f331dbd79a0d6f27d2738688839dc70338e9590d32a0c0b12e61b10385324`.
+
+The fresh clean loaded proof is terminal `COMPLETE` at
+`/Users/llmbench/perf-work/results/continuous-serving-phase3-loaded-capacity-cohort-d9143ce-v6`.
+Exactly one selected real-Qwen integration test passed in 48 seconds. It closes a real TCP/SSE
+client during loaded prefill, closes the logically longest same-capacity middle row during shared
+decode, preserves survivor and replacement bytes, proves B3→B2→B3 slot reuse, proves two
+incompatible 2-row capacity cohorts share only internally, keeps speculation absent, and ends
+with zero live slots, reserved KV bytes, and TCP connections. The launcher, artifact manifest,
+xcresult-file manifest, and test log SHA-256 values are
+`62af08aeb247e1c932258f7dd2fc005cf2f8cb180a01dc40f9fc3f66ca87917a`,
+`8a540c31cacd79254432ca6e300d5c27b3d3fde1c23f8a8202f3239aefa0ecc9`,
+`0b2ab7a3f2c79a96f8fc57cf02766d7a4fbcf08a98a187c41050b3082a53ecdf`, and
+`0a242aa14209452c3480c2906b4e5b4895cc7ff9ed3ba8dd65c83f8858998a16`.
+The generic XCTest child was identity-tracked at a maximum 18,231,568 KiB RSS; no lock, watchdog,
+or orphan remains. The verification packet is
+[`continuous-serving-phase3-verification-2026-07-24.json`](../verdicts/continuous-serving-phase3-verification-2026-07-24.json),
+SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
+
+This authorizes the explicit `continuous-batch-no-spec` route for the qualified dense-Qwen
+boundary only. It does not authorize the dynamic router, solo PLD, a broad loader-family claim, or
+a default switch. Those remain Phase 4 and later acceptance work.
 
 ### Phase 4 — measured solo-PLD policy
 

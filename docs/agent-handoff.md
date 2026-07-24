@@ -26,16 +26,18 @@ capacity model by architecture, `SystemProfiler`, `fastmlx-capacity`, PLD framew
 and exact continuous-batching/chunked-prefill engine proof. The currently shipped operator surface
 is the engine, harness, and capacity CLI.
 
-**Not shipped yet:** adaptive native macOS UI/dial, production OpenAI-compatible service route,
-model management, menu-bar controls/metrics, auto-update, website/community surfaces, and
-benchmark publication automation. These are high-priority roadmap work, not current product
-surface. Captures include [`2026-07-18-adaptive-macos-dial-ui.md`](task-inbox/2026-07-18-adaptive-macos-dial-ui.md)
+**Not shipped yet:** adaptive native macOS UI/dial, a merged/released OpenAI-compatible service
+route with its measured dynamic policy, model management, menu-bar controls/metrics, auto-update,
+website/community surfaces, and benchmark publication automation. These are high-priority roadmap
+work, not current product surface. Captures include
+[`2026-07-18-adaptive-macos-dial-ui.md`](task-inbox/2026-07-18-adaptive-macos-dial-ui.md)
 and [`2026-07-18-website-benchmark-community.md`](task-inbox/2026-07-18-website-benchmark-community.md).
 
 **Major dated outcomes:** TurboQuant v1 was shelved as a dated negative result; PLD was promoted
 as exact for repetition-heavy/echo workloads; Qwen3-32B EAGLE-3 was shelved on byte-identity
-failure; continuous batching was promoted as an exact engine building block but has no production
-API route yet.
+failure; continuous batching was promoted as an exact engine building block, and the feature
+branch now has a clean, explicit no-spec production route. Solo-PLD routing, final production
+closure, merge, and release remain open.
 
 **KVarN/asymmetric KV frontier — COMPLETE (2026-07-18):** selected lossy capacity tiers were
 promoted, but no speed tier was proven. Verdict:
@@ -285,13 +287,54 @@ SSD tier follows. Verdict:
 plan:
 [`2026-07-23-exact-prefix-session-cache.md`](superpowers/plans/2026-07-23-exact-prefix-session-cache.md).
 
+**Continuous-batching serving route — PHASE 3 COMPLETE, BRANCH-LOCAL (2026-07-24):** branch
+`codex/continuous-batching-serving-route` now carries the explicit
+`continuous-batch-no-spec` OpenAI-compatible HTTP/SSE route at clean
+`d9143ce24ac084d295e3903443c96aa07c1fe6e7`. The route is additive and preserves scalar defaults.
+It has bounded request bodies, bounded suspending publication, typed 400 versus 429 admission,
+loopback-by-default/authenticated remote binding, actor-confined model ownership, fixed-capacity
+decode cohorts, real disconnect propagation, shutdown cleanup, and honest no-spec telemetry.
+
+Pure verification passes 675 XCTest plus 17 Swift Testing tests. On `llmbench`, clean Xcode
+verification passes 140/140 `FastMLXHarnessTests`, 176/176 `SpikeCoreTests`, and 30
+`SpikeServingAdaptersTests` with the two loaded tests intentionally skipped outside an explicit
+model environment; Release builds both serving binaries. Xcode and Release log SHA-256 values are
+`eb763b849d7d4d53f4d7e094cbe9091c8c620efa1252d84ce09413bc8b7cf937` and
+`463f331dbd79a0d6f27d2738688839dc70338e9590d32a0c0b12e61b10385324`.
+
+The fresh loaded proof is terminal `COMPLETE` at
+`/Users/llmbench/perf-work/results/continuous-serving-phase3-loaded-capacity-cohort-d9143ce-v6`.
+One selected Qwen3-32B test passed in 48 seconds. It closes a real TCP/SSE client during loaded
+prefill and hostile shared decode, proves cancellation within five seconds, exact survivor and
+replacement output, same-capacity B3→B2→B3 reuse, two internally shared but mutually isolated
+fixed-capacity B2 cohorts, no speculation, final zero slots/reserved KV/connections, and explicit
+96-GiB MLX / 8-GiB cache / 16-GiB aggregate-KV limits. Launcher, artifact-manifest,
+xcresult-file-manifest, and test-log SHA-256 values are
+`62af08aeb247e1c932258f7dd2fc005cf2f8cb180a01dc40f9fc3f66ca87917a`,
+`8a540c31cacd79254432ca6e300d5c27b3d3fde1c23f8a8202f3239aefa0ecc9`,
+`0b2ab7a3f2c79a96f8fc57cf02766d7a4fbcf08a98a187c41050b3082a53ecdf`, and
+`0a242aa14209452c3480c2906b4e5b4895cc7ff9ed3ba8dd65c83f8858998a16`.
+The generic XCTest child reached 18,231,568 KiB max RSS; all artifact and xcresult hashes
+reauthenticate, and no lock, watchdog, or orphan remains.
+
+Verification packet:
+[`continuous-serving-phase3-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase3-verification-2026-07-24.json),
+SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
+This is not a dynamic/default or broad-family promotion. Phase 4 must implement and measure the
+actor-confined solo-PLD transition; Phase 5 still owns the resident transport soak, dated public
+fast-mlx-only verdict/content, final verification, merge, and release proof. The operator has
+authorized routine in-scope downloads and remote bench operations needed to continue the roadmap;
+do not pause for a separate conversational approval when the capability is already available.
+
 **Content practice:** `docs/content/` now has 15 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
-   propagation, dynamic policy boundaries. [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
+1. **Continuous-batching serving route Phase 4/5** — explicit no-spec transport and loaded
+   disconnect proof are complete; implement measured solo-PLD routing, run the resident transport
+   soak, finish public evidence, and merge only after fresh proof.
+   [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
 2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
 3. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
