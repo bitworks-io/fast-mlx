@@ -1,7 +1,7 @@
 # Production continuous-batching serving route plan
 
 - **Date:** 2026-07-24
-- **Status:** active — Phases 0–3 complete; measured solo-PLD Phase 4 is next
+- **Status:** active — Phases 0–4 complete; explicit-no-spec production evidence Phase 5 is next
 - **Owner:** Codex
 - **Branch:** `codex/continuous-batching-serving-route`
 - **Evaluation lane:** EXACT
@@ -306,7 +306,7 @@ SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
 
 This authorizes the explicit `continuous-batch-no-spec` route for the qualified dense-Qwen
 boundary only. It does not authorize the dynamic router, solo PLD, a broad loader-family claim, or
-a default switch. Those remain Phase 4 and later acceptance work.
+a default switch. At the Phase 3 boundary, those remained Phase 4 and later acceptance work.
 
 ### Phase 4 — measured solo-PLD policy
 
@@ -318,6 +318,38 @@ a default switch. Those remain Phase 4 and later acceptance work.
 4. Re-run the identical Qwen C=1/2/4/8 workload through real HTTP. The dynamic router must preserve
    the measured policy frontier; otherwise keep `batch-no-spec` explicit and do not promote a
    default.
+
+#### Phase 4 closure — 2026-07-24
+
+Phase 4 is complete at clean source
+`520a106708f4f0d47cf8bc9f08a188078c4915d8`. The actor-confined incremental PLD session preserves
+bounded lookback, stale-plan rejection, cancellation, outputless drain-before-join ordering,
+shared-batch no-spec execution, exact temperature-zero bytes, cache lifecycle, masks/GQA, hostile
+compaction, and lossy-KV-plus-PLD rejection. The shipping CLI does not expose dynamic PLD.
+
+The clean Apple regression passes 140 `FastMLXHarnessTests`, 194 `SpikeCoreTests`, and 50
+`SpikeServingAdaptersTests` with four expected loaded-environment skips; Release and
+build-for-testing succeed. The fresh loaded exactness boundary is terminal `COMPLETE` at
+`/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1`: exactly one
+selected Qwen test passed in 22.459 seconds, all artifact/xcresult hashes reauthenticate, maximum
+XCTest RSS was 18,261,232 KiB, and no watchdog, lock, or orphan remains.
+
+The identical real-HTTP diagnostic closes the speed gate negative. Retained ngram-3 improved C=1
+from 21.7851 to 22.0880 tok/s (**+1.3902%**); bounded ngram-2 improved 21.8526 to 22.0981 tok/s
+(**+1.1236%**). Both preserve exact output SHA-256
+`e2bd50d266a2af3f7913eb8ad8b6c5842d4131f62fa3d3bc6dcc98ce93a7270d`, but both miss the required
++5%. Diagnostic evidence is non-promotable and forbidden from speed aggregation.
+
+Verdict: **SHELVE dynamic solo PLD for this cycle; retain the correctness implementation and
+continue with explicit `continuous-batch-no-spec`.** Do not rerun or retune the unchanged policy.
+Reopen only after a profile identifies one bounded actor-confined change with a credible route
+past +5%.
+
+Verdict:
+[`2026-07-24-continuous-serving-solo-pld.md`](../verdicts/2026-07-24-continuous-serving-solo-pld.md);
+verification packet:
+[`continuous-serving-phase4-verification-2026-07-24.json`](../verdicts/continuous-serving-phase4-verification-2026-07-24.json),
+SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
 
 ### Phase 5 — production evidence and closure
 

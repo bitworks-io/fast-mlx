@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-24",
+  "feature": "continuous-batching-serving-route-phase4",
+  "classification": "EXACT",
+  "source": {
+    "gitSHA": "520a106708f4f0d47cf8bc9f08a188078c4915d8",
+    "xcodeTestLogSHA256": "227a02fd9e112fd374a0ca6bc67c351c742bfd6869ec524825a796dfe1676b0b",
+    "xcodeResultFileManifestSHA256": "103d8b3bd9da2c6b58285d50bd6663c50a4182c6c7acbc9c694a9af1fafba85b",
+    "releaseBuildLogSHA256": "7dd06e45a76da0c4df7691877d2f7ad5916b99df5030e4faadb2992f771db7c7",
+    "buildForTestingLogSHA256": "419bf1fc0949b5d894ebcba50c4d49d5721f2d30d00ab43df17aa34f956e9f4c",
+    "fastMLXHarnessBinarySHA256": "39277431f77f20fb141d6ff4bdeab905a2bf3f488b06e649ea766a698fee34fa",
+    "fastMLXServeBinarySHA256": "6ad7eff4337591515ad9a808b0e514dda544793f09c9c995ef1f61b4aa0e2412",
+    "genericXCTestRunSHA256": "fe091fda8b5e634040a09f1b00de744c9a1d67809caae09e1d6d1de23aa2d2ce",
+    "loadedTestBinarySHA256": "cacbca6bfb1653ef93d1f152e6fbf061f1f1d77a06504536c28a4e0dc3070000"
+  },
+  "verification": {
+    "focusedPureXCTest": {
+      "executed": 136,
+      "failures": 0
+    },
+    "fastMLXHarnessTests": {
+      "executed": 140,
+      "failures": 0
+    },
+    "spikeCoreTests": {
+      "executed": 194,
+      "failures": 0
+    },
+    "spikeServingAdaptersTests": {
+      "executed": 50,
+      "skippedWithoutLoadedEnvironment": 4,
+      "failures": 0
+    },
+    "releaseBuildSucceeded": true,
+    "focusedSourceReview": "NO HIGH OR MEDIUM FINDINGS",
+    "loadedLauncherReview": "NO HIGH OR MEDIUM FINDINGS"
+  },
+  "criteria": [
+    {
+      "id": "actor-confined-incremental-pld-contract",
+      "verdict": "PASS",
+      "evidence": "Pure coordinator, scheduler, metrics, admission, backend, and speculative-decoding tests cover bounded draft lookback, stale-plan rejection, outputless drain ordering, cancellation, resource release, and fail-closed validation. MLX runtime tests preserve cache lifecycle, masks, GQA, finite-input checks, hostile compaction, and lossy-KV-plus-PLD rejection."
+    },
+    {
+      "id": "loaded-temperature-zero-exactness",
+      "verdict": "PASS",
+      "evidence": "The clean loaded Qwen test compares the solo-PLD result to an independent no-spec control, observes positive solo engagement and accepted draft tokens, then runs two shared requests with speculation disabled and exact control parity. It finishes with zero active requests, coordinator slots, and reserved KV bytes."
+    },
+    {
+      "id": "dynamic-solo-pld-speed-gate",
+      "verdict": "FAIL",
+      "evidence": "The same-workload real-HTTP diagnostic measured 22.0879779577 versus 21.7851245802 completion tok/s at C=1, only +1.390184%, below the required +5%. A bounded ngram-2 follow-up measured 22.0981401899 versus 21.8526041802 tok/s, only +1.123601%. Both retained the exact output SHA-256; diagnostic or dirty evidence cannot promote."
+    },
+    {
+      "id": "shared-batch-speculation-boundary",
+      "verdict": "PASS",
+      "evidence": "At C=2, C=4, and C=8 the dynamic admission path uses explicit shared no-spec decode. Trace telemetry shows zero drafted or accepted speculative tokens for shared batches, and every output hash matches the no-spec control."
+    },
+    {
+      "id": "shipping-route-and-cli-boundary",
+      "verdict": "PASS",
+      "evidence": "The shipping CLI exposes only the explicit continuous-batch-no-spec route. Dynamic PLD remains internal diagnostic machinery; its loaded frontier marks evidenceRole diagnostic-only, promotable false, and speedAggregation forbidden."
+    },
+    {
+      "id": "clean-apple-regression-release-and-loaded-proof",
+      "verdict": "PASS",
+      "evidence": "Clean source 520a106 passes 140 FastMLXHarnessTests, 194 SpikeCoreTests, and 50 SpikeServingAdaptersTests with four expected loaded-environment skips, plus Release and build-for-testing. A fresh selected loaded test then passes 1/1 with authenticated artifacts."
+    },
+    {
+      "id": "fresh-provenance-power-and-resource-telemetry",
+      "verdict": "PASS",
+      "evidence": "The reviewed launcher binds clean source and Phase 4 files, test binary/xctestrun, complete expected model file set and hashes, explicit 96/8/16 GiB memory/cache/KV limits, High Power mode, 140 W AC, Foundation low-power false/thermal nominal, PID signatures, log mtime/bytes, positive RSS, fresh output, and no watchdog, lock, or orphan."
+    },
+    {
+      "id": "resident-production-soak-and-release",
+      "verdict": "PENDING",
+      "evidence": "Phase 5 still requires a clean explicit-no-spec Release smoke, hostile transport packet, resident soak, redaction proof, final review, merge, and release evidence."
+    }
+  ],
+  "diagnosticFrontier": {
+    "evidenceRole": "diagnostic-only",
+    "promotable": false,
+    "speedAggregation": "forbidden",
+    "model": "qwen3-32b-source-locked",
+    "maximumCompletionTokens": 128,
+    "measuredBurstCount": 2,
+    "outputSHA256": "e2bd50d266a2af3f7913eb8ad8b6c5842d4131f62fa3d3bc6dcc98ce93a7270d",
+    "requiredC1SpeedupPercent": 5.0,
+    "ngram3": {
+      "concurrencies": [1, 2, 4, 8],
+      "c1NoSpecMeanCompletionTokensPerSecond": 21.78512458024818,
+      "c1DynamicMeanCompletionTokensPerSecond": 22.087977957663973,
+      "c1DynamicSpeedupPercent": 1.3901842805635445,
+      "c1DraftedTokens": 12,
+      "c1AcceptedDraftTokens": 10,
+      "c8MaximumPhysicalDecodeBatchSize": 6,
+      "testLogSHA256": "4a7bdad78d9853b1c9dd9ae5c12ef3961f4a8ec1ab9148504dbc16edddb72a3a"
+    },
+    "ngram2FollowUp": {
+      "concurrencies": [1],
+      "c1NoSpecMeanCompletionTokensPerSecond": 21.8526041802372,
+      "c1DynamicMeanCompletionTokensPerSecond": 22.098140189877643,
+      "c1DynamicSpeedupPercent": 1.1236006821671918,
+      "c1DraftedTokens": 14,
+      "c1AcceptedDraftTokens": 12,
+      "testLogSHA256": "a374ec8405e58bbd9a4bb47ed17f2d7d84d2dba52d5b177d1a9b227c2ab22c66"
+    }
+  },
+  "loadedEvidence": {
+    "state": "COMPLETE",
+    "outputRoot": "/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1",
+    "selectedTest": "LoadedContinuousServingIntegrationTests/testLoadedDynamicSoloPLDIsExactAndSharedBatchNeverSpeculates()",
+    "testDurationSeconds": 22.45900011062622,
+    "testCount": 1,
+    "passedTests": 1,
+    "failedTests": 0,
+    "skippedTests": 0,
+    "launcherSHA256": "8113355209b5f65d33b13922cbcb7de8cfad165c3810ef2a229c2f2ac5b2b6f4",
+    "loadedXCTestRunSHA256": "7e4f95306b0ee44962a93476cede133e8af231248f0b6cf99dfbc9b40a666698",
+    "artifactManifestSHA256": "7878a01464cd89aae6c083f94119b4869a78c538951599ed45beec1717671b74",
+    "xcresultFileManifestSHA256": "bf549d33c11e9970e4818fe538068b171544b729350554e7ee4b5ed3d27b9742",
+    "xcresultSummarySHA256": "c759468b30dccf9c6620473588507a31f88a55943911808b075541fece0fbb70",
+    "xcresultTestsSHA256": "c3ce481acd9d907e8c7eddb0be2b8043f56662806f198a64530fee4f15588567",
+    "testLogSHA256": "8a879074f6460d8d2757fe830861f8bce4072e65b46cd42c03bd06a90d9da2da",
+    "preflightSHA256": "c9966aea2c58e39b6e762c4db6af57550f77675d1360133808b4f0f5e25bf3ed",
+    "maxXCTestRSSKB": 18261232,
+    "maxXCTestRSSBytes": 18699501568,
+    "memoryLimitBytes": 103079215104,
+    "cacheLimitBytes": 8589934592,
+    "maxReservedKVBytes": 17179869184,
+    "watchdog": false,
+    "lockReleased": true,
+    "orphanProcesses": 0
+  },
+  "overall": {
+    "verdict": "SHELVE_DYNAMIC_SOLO_PLD_KEEP_EXPLICIT_NO_SPEC",
+    "incrementalPLDCorrectnessRetained": true,
+    "dynamicSoloPLDDefaultAuthorized": false,
+    "explicitContinuousNoSpecRouteRemainsAuthorizedForQualifiedDenseQwen": true,
+    "broadModelFamilyDefaultAuthorized": false,
+    "unchangedSpeedRetryAuthorized": false,
+    "nextRoadmapItem": "phase5 explicit-no-spec production evidence and resident transport soak"
+  }
+}

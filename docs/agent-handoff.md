@@ -320,20 +320,48 @@ reauthenticate, and no lock, watchdog, or orphan remains.
 Verification packet:
 [`continuous-serving-phase3-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase3-verification-2026-07-24.json),
 SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
-This is not a dynamic/default or broad-family promotion. Phase 4 must implement and measure the
-actor-confined solo-PLD transition; Phase 5 still owns the resident transport soak, dated public
-fast-mlx-only verdict/content, final verification, merge, and release proof. The operator has
-authorized routine in-scope downloads and remote bench operations needed to continue the roadmap;
-do not pause for a separate conversational approval when the capability is already available.
+This is not a dynamic/default or broad-family promotion. At that Phase 3 boundary, Phase 4 still
+had to implement and measure the actor-confined solo-PLD transition; Phase 5 owned the resident
+transport soak, dated public fast-mlx-only verdict/content, final verification, merge, and release
+proof. The operator has authorized routine in-scope downloads and remote bench operations needed
+to continue the roadmap; do not pause for a separate conversational approval when the capability
+is already available.
 
-**Content practice:** `docs/content/` now has 15 dated pieces. Keep writing one dated content piece per
+**Continuous-batching serving route — PHASE 4 COMPLETE, NEGATIVE SPEED VERDICT (2026-07-24):**
+
+- **Objective:** qualify an actor-confined solo-PLD transition without weakening exact
+  temperature-zero or shared-batch contracts.
+- **Current state:** clean `520a106708f4f0d47cf8bc9f08a188078c4915d8` retains the internal
+  incremental session, while the shipping CLI exposes only explicit `continuous-batch-no-spec`.
+  Dynamic PLD is shelved after +1.3902% retained ngram-3 and +1.1236% ngram-2 C=1 gains missed the
+  +5% gate.
+- **Accepted decisions:** keep exactness/cancellation/drain tests; forbid dynamic evidence from
+  promotion or speed aggregation; do not rerun or retune unchanged PLD; reopen only from a bounded
+  profile showing a credible +5% route.
+- **Changed files:** Phase 4 source/tests are committed at `520a106`; dated verdict, criterion
+  packet, plan closure, handoff, and public fast-mlx-only content record the negative disposition.
+- **Verification:** 136 focused pure tests; 140 `FastMLXHarnessTests`; 194 `SpikeCoreTests`; 50
+  `SpikeServingAdaptersTests` with four expected loaded skips; Release/build-for-testing pass.
+  Fresh loaded root
+  `/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1` is
+  `COMPLETE`: 1/1 in 22.459 seconds, max RSS 18,261,232 KiB, authenticated artifact and xcresult
+  manifests, no watchdog/lock/orphan. Packet
+  [`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json)
+  SHA-256 is `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
+- **Blockers / residual risk:** Phase 5 production soak/redaction/release proof remains open.
+  `llmbench@192.168.1.253` (M3 Ultra, 256 GiB) must not be contacted before 2026-07-24 17:44 CDT;
+  afterward qualify it read-only and keep its provenance/results separate from `.252`.
+- **Next safe action:** run a fresh clean explicit-no-spec Release smoke and hostile transport
+  packet on `.252`, then begin the resident soak on non-overlapping qualified hosts.
+
+**Content practice:** `docs/content/` now has 16 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Continuous-batching serving route Phase 4/5** — explicit no-spec transport and loaded
-   disconnect proof are complete; implement measured solo-PLD routing, run the resident transport
-   soak, finish public evidence, and merge only after fresh proof.
+1. **Continuous-batching serving route Phase 5** — Phase 4 solo PLD is exact but fails the speed
+   gate and is shelved; run the explicit-no-spec Release smoke, hostile transport packet, resident
+   soak, redaction/provenance proof, final review, and merge only after fresh proof.
    [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
 2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).

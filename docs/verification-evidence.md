@@ -607,3 +607,28 @@ SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
 **Overall verdict: PASS_PHASE3_EXPLICIT_NO_SPEC.** The exact production no-spec route is ready for
 the next branch phase, not for a dynamic/default or broad-model claim. The next safe action is the
 measured actor-confined solo-PLD policy.
+
+## Continuous serving Phase 4 exactness pass / speed failure — 2026-07-24
+
+**Story:** a dense-Qwen request may use bounded prompt-lookup decoding while it is alone, drain to
+canonical scalar state before sharing the resident batch, preserve exact temperature-zero output,
+and disable all shared speculation. The dynamic route is available only if the identical C=1 HTTP
+workload also improves completion throughput by at least 5%.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Actor-confined incremental PLD contract | **PASS** | Clean `520a106708f4f0d47cf8bc9f08a188078c4915d8` carries bounded draft history, stale-plan rejection, cancellation, outputless drain-before-join ordering, shared-batch speculation rejection, and fail-closed lossy-KV/non-finite behavior. The focused pure slice passes 136/136. |
+| Clean Apple regression and Release | **PASS** | On `.252`, 140/140 `FastMLXHarnessTests`, 194/194 `SpikeCoreTests`, and 50/50 `SpikeServingAdaptersTests` pass with four expected loaded-environment skips; Release and build-for-testing succeed. Xcode, xcresult-manifest, Release, and build-for-testing log SHA-256 values are `227a02fd9e112fd374a0ca6bc67c351c742bfd6869ec524825a796dfe1676b0b`, `103d8b3bd9da2c6b58285d50bd6663c50a4182c6c7acbc9c694a9af1fafba85b`, `7dd06e45a76da0c4df7691877d2f7ad5916b99df5030e4faadb2992f771db7c7`, and `419bf1fc0949b5d894ebcba50c4d49d5721f2d30d00ab43df17aa34f956e9f4c`. |
+| Loaded solo exactness and shared no-spec boundary | **PASS** | Fresh root `/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1` is `COMPLETE`: exactly 1 selected Qwen test passed in 22.459 seconds. Solo PLD engages and equals an independent no-spec control; two shared requests use no-spec decode and both equal control; final requests/slots/reserved KV are zero. |
+| Fresh provenance and resource telemetry | **PASS** | The reviewed launcher binds clean source and Phase 4 files, loaded test binary/xctestrun, exact model/tokenizer/shard hashes, explicit 96/8/16-GiB limits, High Power/140 W AC/Foundation nominal state, PID signatures, heartbeat/log mtime/bytes, and positive RSS. Launcher, artifact-manifest, xcresult-manifest, and test-log SHA-256 values are `8113355209b5f65d33b13922cbcb7de8cfad165c3810ef2a229c2f2ac5b2b6f4`, `7878a01464cd89aae6c083f94119b4869a78c538951599ed45beec1717671b74`, `bf549d33c11e9970e4818fe538068b171544b729350554e7ee4b5ed3d27b9742`, and `8a879074f6460d8d2757fe830861f8bce4072e65b46cd42c03bd06a90d9da2da`. Max XCTest RSS is 18,261,232 KiB; watchdog, lock, and orphans are absent. |
+| Dynamic solo-PLD speed gate | **FAIL / SHELVE** | The same-workload HTTP diagnostic preserves output SHA-256 `e2bd50d…a7270d`, but retained ngram-3 improves C=1 only 21.7851→22.0880 tok/s (+1.3902%) versus +5% required. Bounded ngram-2 improves only 21.8526→22.0981 tok/s (+1.1236%). Dirty/diagnostic logs `4a7bdad7…72a3a` and `a374ec84…22c66` cannot promote; they are sufficient to refuse an unchanged route. |
+| Shipping/default claim boundary | **PASS** | Dynamic PLD remains internal diagnostic machinery, marked `diagnostic-only`, `promotable:false`, and `speedAggregation:forbidden`; the CLI exposes only explicit `continuous-batch-no-spec`. Shared-batch speculation and lossy-KV-plus-PLD remain rejected. |
+| Phase 5 resident production proof | **PENDING** | Clean explicit-no-spec Release smoke, hostile disconnect/A/B/A packet, transport resident soak, redaction proof, final review, merge, and release evidence remain open. |
+
+Machine-readable criterion mapping:
+[`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json),
+SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
+
+**Overall verdict: PARTIAL — SHELVE_DYNAMIC_SOLO_PLD_KEEP_EXPLICIT_NO_SPEC.** Correctness,
+exactness, shared-batch safety, provenance, and clean Apple verification pass. The declared speed
+gate fails, so no dynamic/default route is authorized. Phase 5 remains the next active gate.
