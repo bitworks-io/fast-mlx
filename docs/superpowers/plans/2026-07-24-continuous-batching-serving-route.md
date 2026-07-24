@@ -246,11 +246,35 @@ remains explicit `batch-no-spec`/scalar and cannot claim the dynamic default.
    disconnect during loaded prefill and during decode, not only while awaiting the next token.
 3. Sync with `spike/scripts/sync_llmbench.sh`; run MLX-coupled tests only through
    `xcodebuild -skipPackagePluginValidation` on `llmbench`.
-4. Run a fresh real-network Qwen test: two survivors plus a longest middle request, disconnect the
-   middle socket, append a replacement, and prove output parity, logical slot reuse, bounded
-   membership rebuild, final zero physical reservations, bounded cancellation, and no batched
-   speculation.
-5. Run non-stream and SSE exactness against the frozen in-process controls.
+4. Preserve exact greedy semantics across ragged service traffic by assigning every request an
+   actor-derived fixed KV-capacity cohort. Only equal-capacity requests may share a model
+   forward; incompatible cohorts receive fair solo/shared turns and never silently widen one
+   another's attention reduction shape. Requests that can outgrow their initial reserve remain
+   isolated until a separately proven dynamic-capacity contract exists.
+5. Run a fresh real-network Qwen test: two survivors plus a logically longest same-capacity middle
+   request, disconnect the middle socket, append a same-capacity replacement, and prove output
+   parity, logical slot reuse, bounded membership rebuild, final zero physical reservations,
+   bounded cancellation, and no batched speculation. Add a separate cross-capacity case that
+   proves incompatible rows never share a decode action and still make progress.
+6. Run non-stream and SSE exactness against the frozen in-process controls.
+
+#### Phase 3 diagnostic amendment — 2026-07-24
+
+The first production-route proof found a real scope gap in the earlier engine promotion. A
+long-lived equal-capacity B=2 pair remained byte-identical to independent scalar controls, but
+adding a much longer middle row widened the shared fixed-capacity attention buffers; both
+survivors later diverged while the replacement remained exact. The hash-bound failure therefore
+rules out transport and stable batching and localizes the unsafe behavior to cross-capacity
+membership. Masked padding is mechanically unreachable, but changing the reduction width can
+still change close logits on the loaded quantized model. The production route must not treat
+different physical widths as one exact batch merely because their logical cache layouts are
+valid.
+
+Recovery is test-first and fail-closed: pure scheduling tests cover cohort isolation, round-robin
+progress, drain-before-same-cohort join, and legacy unrestricted runtimes; MLX runtime tests bind
+the capacity classification and reject mixed-capacity decode directly; the loaded Apple proof
+then covers same-capacity B3→B2→B3 hostile compaction plus cross-capacity isolation. Historical
+failed boundaries remain diagnostic-only and unchanged.
 
 ### Phase 4 — measured solo-PLD policy
 

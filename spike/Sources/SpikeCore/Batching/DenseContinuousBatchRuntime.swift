@@ -18,6 +18,30 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
     fileprivate let headDimension: Int
     fileprivate let elementBytes: Int
 
+    public var verifiedModelFamily: CompressedKVAttentionModelFamily {
+        modelFamily
+    }
+
+    public var modelConfigurationSHA256: String {
+        modelConfigSHA256
+    }
+
+    public var maximumContextTokens: Int {
+        maxPositionEmbeddings
+    }
+
+    public var verifiedLayerCount: Int {
+        layerCount
+    }
+
+    public var verifiedKeyValueHeadCount: Int {
+        keyValueHeadCount
+    }
+
+    public var verifiedHeadDimension: Int {
+        headDimension
+    }
+
     private struct Configuration: Decodable {
         let modelType: String
         let maxPositionEmbeddings: Int
@@ -174,10 +198,19 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     case drainWithoutPendingLookahead(BatchRequestID)
     case pendingLookaheadInBatch(BatchRequestID)
     case invalidBatchMembership([BatchRequestID])
+    case incompatibleDecodeCohort([BatchRequestID])
     case speculationUnsupported
     case cacheLayerMismatch(BatchRequestID, expected: Int, actual: Int)
     case cacheLengthMismatch(BatchRequestID, expected: Int, actual: Int)
     case contextLimitExceeded(BatchRequestID, requested: Int, limit: Int)
+    case requestReservedContextLimitExceeded(
+        BatchRequestID,
+        requested: Int,
+        limit: Int)
+    case requestReservedKVByteLimitExceeded(
+        BatchRequestID,
+        requested: Int,
+        limit: Int)
     case aggregateContextLimitExceeded(requested: Int, limit: Int)
     case aggregateKVByteLimitExceeded(requested: Int, limit: Int)
     case kvByteAccountingOverflow
@@ -220,6 +253,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var processedTokens: Int
         var cachedTokens: Int
         var prefillComplete: Bool
+        let decodeCohort: BatchDecodeCohort
         var hasPendingSoloLookahead: Bool
         var scalarCaches: [any ContinuousScalarKVCache]?
         var stagedToken: MLXArray?
@@ -484,8 +518,31 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             } catch {
                 throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
             }
+            let requestedTokens =
+                submission.promptTokens.count + submission.maxOutputTokens
+            guard requestedTokens <= maxReservedContextTokens else {
+                throw DenseContinuousBatchRuntimeError
+                    .requestReservedContextLimitExceeded(
+                        admission.id,
+                        requested: requestedTokens,
+                        limit: maxReservedContextTokens)
+            }
+            let requestKVBytes: Int
+            do {
+                requestKVBytes = try kvBytePlan.transitionEnvelopeBytes(
+                    capacities: [capacity])
+            } catch {
+                throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+            }
+            guard requestKVBytes <= maxReservedKVBytes else {
+                throw DenseContinuousBatchRuntimeError
+                    .requestReservedKVByteLimitExceeded(
+                        admission.id,
+                        requested: requestKVBytes,
+                        limit: maxReservedKVBytes)
+            }
             additions.append(
-                (admission.id, submission.promptTokens.count + submission.maxOutputTokens, capacity))
+                (admission.id, requestedTokens, capacity))
         }
 
         if !additions.isEmpty {
@@ -520,6 +577,21 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             kvCapacityReservations[id] = capacity
         }
         reservedKVBytes = requestedKVBytes
+    }
+
+    public func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        let submission = admission.submission
+        try validateRequest(
+            id: admission.id,
+            promptTokens: submission.promptTokens,
+            totalPromptTokens: submission.promptTokens.count,
+            maxOutputTokens: submission.maxOutputTokens)
+        return try decodeCohort(
+            id: admission.id,
+            promptTokens: submission.promptTokens.count,
+            maxOutputTokens: submission.maxOutputTokens)
     }
 
     public func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
@@ -562,12 +634,17 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 promptTokens: work.totalPromptTokens,
                 outputTokens: min(work.maxOutputTokens, initialDecodeReserve),
                 id: work.id)
+            let decodeCohort = try decodeCohort(
+                id: work.id,
+                promptTokens: work.totalPromptTokens,
+                maxOutputTokens: work.maxOutputTokens)
             slot = Slot(
                 totalPromptTokens: work.totalPromptTokens,
                 maxOutputTokens: work.maxOutputTokens,
                 processedTokens: 0,
                 cachedTokens: 0,
                 prefillComplete: false,
+                decodeCohort: decodeCohort,
                 hasPendingSoloLookahead: false,
                 scalarCaches: cacheFamily.makeScalarCaches(
                     layerCount: layerCount,
@@ -738,6 +815,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 throw DenseContinuousBatchRuntimeError.pendingLookaheadInBatch(id)
             }
         }
+        let cohorts = ids.compactMap { slots[$0]?.decodeCohort }
+        guard cohorts.count == ids.count,
+            Set(cohorts).count == 1,
+            ifCaseFixedKVCapacity(cohorts[0]) != nil
+        else {
+            throw DenseContinuousBatchRuntimeError.incompatibleDecodeCohort(ids)
+        }
 
         try ensureBatch(ids)
         guard var batch else {
@@ -815,22 +899,28 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         if batch?.ids == ids { return }
 
         var materialized: [BatchRequestID: MaterializedSlot] = [:]
+        var spilledRows: [BatchRequestID: MaterializedSlot] = [:]
         if let existingBatch = batch {
             let liveExisting = existingBatch.ids.filter { slots[$0] != nil }
-            guard liveExisting.allSatisfy(ids.contains) else {
-                throw DenseContinuousBatchRuntimeError.invalidBatchMembership(ids)
-            }
-            for id in ids {
+            for id in liveExisting {
                 guard let row = existingBatch.ids.firstIndex(of: id),
                     let slot = slots[id]
-                else { continue }
+                else {
+                    throw DenseContinuousBatchRuntimeError.unknownRequest(id)
+                }
                 let caches = try existingBatch.caches.map {
                     try $0.extractContinuous(slot: row)
                 }
                 let staged = existingBatch.stagedTokens[row].reshaped([1])
                 eval([staged] + caches.flatMap { $0.innerState() })
                 try validateCacheLengths(caches, id: id, expected: slot.cachedTokens)
-                materialized[id] = MaterializedSlot(caches: caches, stagedToken: staged)
+                let spilled = MaterializedSlot(
+                    caches: caches,
+                    stagedToken: staged)
+                spilledRows[id] = spilled
+                if ids.contains(id) {
+                    materialized[id] = spilled
+                }
             }
         }
 
@@ -851,6 +941,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             return row
         }
+        guard let expectedCapacity = ifCaseFixedKVCapacity(
+            slots[ids[0]]!.decodeCohort),
+            rows.allSatisfy({ row in
+                row.caches.allSatisfy { $0.capacity == expectedCapacity }
+            })
+        else {
+            throw DenseContinuousBatchRuntimeError.incompatibleDecodeCohort(ids)
+        }
         let lengths = ids.map { slots[$0]!.cachedTokens }
         var caches: [any ContinuousBatchedKVCache] = []
         caches.reserveCapacity(layerCount)
@@ -865,12 +963,21 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         eval([staged] + caches.flatMap { $0.innerState() })
 
         let traceCounter = TraceCounter()
-        batch = BatchState(
+        let nextBatch = BatchState(
             ids: ids,
             caches: caches,
             stagedTokens: staged,
             step: nil,
             traceCounter: traceCounter)
+        for (id, spilled) in spilledRows where !ids.contains(id) {
+            guard var slot = slots[id] else { continue }
+            slot.scalarCaches = spilled.caches
+            slot.stagedToken = spilled.stagedToken
+            slot.scalarStep = nil
+            slot.scalarTraceCounter = nil
+            slot.hasPendingSoloLookahead = false
+            slots[id] = slot
+        }
         for id in ids {
             var slot = slots[id]!
             slot.scalarCaches = nil
@@ -880,6 +987,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.hasPendingSoloLookahead = false
             slots[id] = slot
         }
+        batch = nextBatch
         recordPhysicalKVCapacity(caches[0].capacity, for: ids)
         pruneKVReservationsToLiveSlots()
     }
@@ -1083,6 +1191,30 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         for token in promptTokens where token < 0 || token >= vocabularySize {
             throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
         }
+    }
+
+    private func decodeCohort(
+        id: BatchRequestID,
+        promptTokens: Int,
+        maxOutputTokens: Int
+    ) throws -> BatchDecodeCohort {
+        guard maxOutputTokens <= initialDecodeReserve else {
+            return .isolated(id)
+        }
+        return .fixedKVCapacity(
+            try roundedCapacity(
+                promptTokens: promptTokens,
+                outputTokens: maxOutputTokens,
+                id: id))
+    }
+
+    private func ifCaseFixedKVCapacity(
+        _ cohort: BatchDecodeCohort
+    ) -> Int? {
+        guard case .fixedKVCapacity(let capacity) = cohort else {
+            return nil
+        }
+        return capacity
     }
 
     private func roundedCapacity(

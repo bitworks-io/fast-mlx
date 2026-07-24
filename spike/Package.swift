@@ -80,6 +80,8 @@ let package = Package(
                 "SpikeCore",
                 "SpikeServingAdapters",
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -88,6 +90,7 @@ let package = Package(
         .executableTarget(
             name: "fastmlx-serve",
             dependencies: [
+                "HarnessCore",
                 "ServingCore",
                 "ServingNIO",
                 "SpikeServingAdapters",

@@ -24,6 +24,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     private let omittedPromptHead: Int?
     private let speculativeSoloWidth: Int
     private let resources: ContinuousBatchRuntimeResourceSnapshot?
+    private let cohortByPromptHead: [Int: BatchDecodeCohort]
     private var slots: [BatchRequestID: Slot] = [:]
     private var promptHeadByID: [BatchRequestID: Int] = [:]
 
@@ -32,16 +33,27 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         reverseBatchResults: Bool = false,
         omittedPromptHead: Int? = nil,
         speculativeSoloWidth: Int = 1,
-        resources: ContinuousBatchRuntimeResourceSnapshot? = nil
+        resources: ContinuousBatchRuntimeResourceSnapshot? = nil,
+        cohortByPromptHead: [Int: BatchDecodeCohort] = [:]
     ) {
         self.scriptsByPromptHead = scriptsByPromptHead
         self.reverseBatchResults = reverseBatchResults
         self.omittedPromptHead = omittedPromptHead
         self.speculativeSoloWidth = speculativeSoloWidth
         self.resources = resources
+        self.cohortByPromptHead = cohortByPromptHead
     }
 
     func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { resources }
+
+    func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        guard let head = admission.submission.promptTokens.first else {
+            throw ScriptedBatchRuntimeError.invalidPrefill(admission.id)
+        }
+        return cohortByPromptHead[head] ?? .unrestricted
+    }
 
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
         var slot: Slot
@@ -193,6 +205,56 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertTrue(
             operations.contains(
                 .decode(.batch([handles[0].id, handles[1].id], speculationAllowed: false))))
+    }
+
+    func testRuntimeDerivedDecodeCohortsAreAppliedBeforeSchedulerAdmission() async throws {
+        let runtime = ScriptedBatchRuntime(
+            scriptsByPromptHead: [
+                10: [101, 102, 103, 2],
+                20: [201, 202, 203, 2],
+                30: [301, 302, 303, 2],
+            ],
+            cohortByPromptHead: [
+                10: .fixedKVCapacity(256),
+                20: .fixedKVCapacity(256),
+                30: .fixedKVCapacity(512),
+            ])
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 3, prefill: 3, chunk: 8),
+            runtime: runtime,
+            automaticDrive: false,
+            traceLimit: 64)
+        let handles = try await coordinator.submitBatch([
+            submission([10]),
+            submission([20]),
+            submission([30]),
+        ])
+
+        try await drain(coordinator)
+
+        let operations = await coordinator.executionTrace().compactMap { event in
+            if case .operation(let operation) = event { return operation }
+            return nil
+        }
+        XCTAssertTrue(
+            operations.contains(
+                .decode(
+                    .batch(
+                        [handles[0].id, handles[1].id],
+                        speculationAllowed: false))))
+        XCTAssertTrue(
+            operations.contains(
+                .decode(
+                    .solo(
+                        handles[2].id,
+                        speculationAllowed: false))))
+        XCTAssertFalse(
+            operations.contains {
+                guard case .decode(.batch(let ids, _)) = $0 else {
+                    return false
+                }
+                return ids.contains(handles[2].id)
+            })
     }
 
     func testAutomaticDriveCompletesAStreamAndWaitUntilIdleJoinsThePump() async throws {

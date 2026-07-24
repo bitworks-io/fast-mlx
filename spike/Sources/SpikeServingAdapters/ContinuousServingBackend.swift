@@ -2,6 +2,7 @@ import Foundation
 
 import HarnessCore
 import ServingCore
+import SpikeCore
 
 public struct ContinuousServingBackendConfiguration: Sendable {
     public let defaultMaximumCompletionTokens: Int
@@ -127,6 +128,21 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         } catch ContinuousBatchSchedulerError.queueCapacityExceeded {
             throw ServingBackendAdmissionError.queueFull(
                 retryAfterSeconds: configuration.queueRetryAfterSeconds)
+        } catch let runtimeError as DenseContinuousBatchRuntimeError {
+            switch runtimeError {
+            case .contextLimitExceeded, .positionOverflow,
+                .kvByteAccountingOverflow,
+                .requestReservedContextLimitExceeded,
+                .requestReservedKVByteLimitExceeded:
+                throw ServingBackendAdmissionError.requestTooLarge()
+            case .aggregateContextLimitExceeded,
+                .aggregateKVByteLimitExceeded:
+                throw ServingBackendAdmissionError.capacityExceeded(
+                    retryAfterSeconds:
+                        configuration.queueRetryAfterSeconds)
+            default:
+                throw runtimeError
+            }
         }
 
         guard acceptingRequests else {
@@ -178,6 +194,30 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             coordinatorSlots: slots.count,
             reservedKVBytes: resources?.reservedKVBytes ?? 0,
             maxReservedKVBytes: resources?.maxReservedKVBytes ?? 0)
+    }
+
+    /// Package diagnostics deliberately expose only opaque coordinator IDs and bounded,
+    /// prompt-free scheduler telemetry. They are used by authenticated serving evidence to
+    /// prove cancellation and membership transitions without logging request content.
+    func diagnosticCoordinatorRequestIDs() -> [BatchRequestID] {
+        requests.values.map(\.coordinatorID).sorted()
+    }
+
+    func diagnosticCoordinatorSnapshots() async -> [BatchSlotSnapshot] {
+        await coordinator.snapshots()
+    }
+
+    func diagnosticCoordinatorExecutionTrace()
+        async -> [ContinuousBatchCoordinatorEvent]
+    {
+        await coordinator.executionTrace()
+    }
+
+    @discardableResult
+    func diagnosticTakeCoordinatorExecutionTrace()
+        async -> [ContinuousBatchCoordinatorEvent]
+    {
+        await coordinator.takeExecutionTrace()
     }
 
     public func shutdown() async {

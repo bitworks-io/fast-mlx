@@ -12,15 +12,19 @@ extension ServingGenerationBackend {
 public struct ServingBackendAdmissionError: Error, Equatable, Sendable {
     public enum Reason: Equatable, Sendable {
         case queueFull
+        case capacityExceeded
+        case requestTooLarge
     }
 
     public let reason: Reason
-    public let retryAfterSeconds: Int
+    public let retryAfterSeconds: Int?
 
-    private init(reason: Reason, retryAfterSeconds: Int) {
-        precondition(
-            (1...3_600).contains(retryAfterSeconds),
-            "retryAfterSeconds must be between 1 and 3600")
+    private init(reason: Reason, retryAfterSeconds: Int?) {
+        if let retryAfterSeconds {
+            precondition(
+                (1...3_600).contains(retryAfterSeconds),
+                "retryAfterSeconds must be between 1 and 3600")
+        }
         self.reason = reason
         self.retryAfterSeconds = retryAfterSeconds
     }
@@ -29,6 +33,20 @@ public struct ServingBackendAdmissionError: Error, Equatable, Sendable {
         ServingBackendAdmissionError(
             reason: .queueFull,
             retryAfterSeconds: retryAfterSeconds)
+    }
+
+    public static func capacityExceeded(
+        retryAfterSeconds: Int
+    ) -> ServingBackendAdmissionError {
+        ServingBackendAdmissionError(
+            reason: .capacityExceeded,
+            retryAfterSeconds: retryAfterSeconds)
+    }
+
+    public static func requestTooLarge() -> ServingBackendAdmissionError {
+        ServingBackendAdmissionError(
+            reason: .requestTooLarge,
+            retryAfterSeconds: nil)
     }
 }
 

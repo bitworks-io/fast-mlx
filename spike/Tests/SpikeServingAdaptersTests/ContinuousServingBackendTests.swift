@@ -4,6 +4,7 @@ import XCTest
 
 import HarnessCore
 import ServingCore
+import SpikeCore
 @testable import SpikeServingAdapters
 
 final class ContinuousServingBackendTests: XCTestCase {
@@ -262,6 +263,151 @@ final class ContinuousServingBackendTests: XCTestCase {
                 coordinatorSlots: 0,
                 reservedKVBytes: 0,
                 maxReservedKVBytes: 4_096))
+    }
+
+    func testRuntimeCapacityFailuresAreTypedBeforeHTTPGenerationStarts()
+        async throws
+    {
+        let singleCoordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: AdmissionFailureContinuousRuntime(
+                failureOnAdmission: 1,
+                error: .contextLimitExceeded(
+                    BatchRequestID(1),
+                    requested: 4_097,
+                    limit: 4_096)),
+            automaticDrive: false,
+            publicationCapacity: 1)
+        let singleBackend = makeBackend(
+            coordinator: singleCoordinator,
+            promptByText: ["oversized": [10]],
+            pieces: [:],
+            stopTokenIDs: [99])
+
+        do {
+            _ = try await singleBackend.start(
+                request(text: "oversized", maxTokens: 1))
+            XCTFail("Expected a typed request-size admission failure")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(error, .requestTooLarge())
+        }
+
+        let sharedCoordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 1),
+            runtime: AdmissionFailureContinuousRuntime(
+                failureOnAdmission: 2,
+                error: .aggregateKVByteLimitExceeded(
+                    requested: 8_192,
+                    limit: 4_096)),
+            automaticDrive: false,
+            publicationCapacity: 1)
+        let sharedBackend = makeBackend(
+            coordinator: sharedCoordinator,
+            promptByText: [
+                "active": [10],
+                "blocked": [20],
+            ],
+            pieces: [:],
+            stopTokenIDs: [99])
+        let active = try await sharedBackend.start(
+            request(text: "active", maxTokens: 1))
+        _ = try await sharedCoordinator.runOneTick()
+
+        do {
+            _ = try await sharedBackend.start(
+                request(text: "blocked", maxTokens: 1))
+            XCTFail("Expected a typed aggregate-capacity admission failure")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(
+                error,
+                .capacityExceeded(retryAfterSeconds: 2))
+        }
+        _ = await active.lease.cancel(.clientDisconnected)
+        await sharedBackend.shutdown()
+
+        let permanentCoordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 1),
+            runtime: AdmissionFailureContinuousRuntime(
+                failureOnAdmission: 2,
+                error: .requestReservedKVByteLimitExceeded(
+                    BatchRequestID(2),
+                    requested: 8_192,
+                    limit: 4_096)),
+            automaticDrive: false,
+            publicationCapacity: 1)
+        let permanentBackend = makeBackend(
+            coordinator: permanentCoordinator,
+            promptByText: [
+                "active": [10],
+                "permanent": [20],
+            ],
+            pieces: [:],
+            stopTokenIDs: [99])
+        let permanentActive = try await permanentBackend.start(
+            request(text: "active", maxTokens: 1))
+        _ = try await permanentCoordinator.runOneTick()
+
+        do {
+            _ = try await permanentBackend.start(
+                request(text: "permanent", maxTokens: 1))
+            XCTFail("Expected permanent request oversize to remain non-retryable")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(error, .requestTooLarge())
+        }
+        _ = await permanentActive.lease.cancel(.clientDisconnected)
+        await permanentBackend.shutdown()
+    }
+
+    func testBoundedDiagnosticsExposeCoordinatorMembershipAndTraceOnly()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 2),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: ContinuousRuntimeRecorder()),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 8)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "one": [10],
+                "two": [20],
+            ],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99])
+
+        let one = try await backend.start(
+            request(text: "one", maxTokens: 1))
+        let two = try await backend.start(
+            request(text: "two", maxTokens: 1))
+
+        let requestIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(
+            requestIDs,
+            [BatchRequestID(1), BatchRequestID(2)])
+        let queuedSnapshots = await backend
+            .diagnosticCoordinatorSnapshots()
+        XCTAssertEqual(queuedSnapshots.map(\.request.id), [
+            BatchRequestID(1), BatchRequestID(2),
+        ])
+        _ = try await coordinator.runOneTick()
+        let trace = await backend.diagnosticCoordinatorExecutionTrace()
+        XCTAssertTrue(trace.contains {
+            if case .operation(.prefill(let slice)) = $0 {
+                return slice.id == BatchRequestID(1)
+                    || slice.id == BatchRequestID(2)
+            }
+            return false
+        })
+
+        _ = await one.lease.cancel(.clientDisconnected)
+        _ = await two.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
     }
 
     func testServingMailboxBackpressureStopsFurtherCoordinatorDecode() async throws {
@@ -529,6 +675,46 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
         }
         promptHeadByID[id] = nil
     }
+}
+
+private final class AdmissionFailureContinuousRuntime:
+    ContinuousBatchRuntime
+{
+    private let failureOnAdmission: Int
+    private let error: DenseContinuousBatchRuntimeError
+    private var admissionCount = 0
+
+    init(
+        failureOnAdmission: Int,
+        error: DenseContinuousBatchRuntimeError
+    ) {
+        self.failureOnAdmission = failureOnAdmission
+        self.error = error
+    }
+
+    func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
+        admissionCount += 1
+        if admissionCount == failureOnAdmission {
+            throw error
+        }
+    }
+
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
+        ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 64,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 4_096)
+    }
+
+    func prefill(_ work: ContinuousBatchRuntimePrefill) throws {}
+
+    func decode(
+        _ action: BatchDecodeAction
+    ) throws -> [ContinuousBatchRuntimeDecodeResult] {
+        []
+    }
+
+    func remove(_ id: BatchRequestID) {}
 }
 
 private enum FixtureContinuousRuntimeError: Error {

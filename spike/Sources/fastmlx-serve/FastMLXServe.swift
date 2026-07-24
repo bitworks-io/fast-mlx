@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import HarnessCore
 import ServingCore
 import ServingNIO
 import SpikeServingAdapters
@@ -45,11 +46,16 @@ struct FastMLXServe {
     }
 }
 
+private enum PreparedServingStartupReport {
+    case scalar(ScalarServingModelStartupReport)
+    case continuous(ContinuousServingModelStartupReport)
+}
+
 private struct PreparedServingBackend {
     let backend: any ServingGenerationBackend
     let mode: String
     let launchedModel: String
-    let startupReport: ScalarServingModelStartupReport?
+    let startupReport: PreparedServingStartupReport?
 
     func startupLine(localAddress: String) -> String {
         guard let startupReport else {
@@ -58,23 +64,57 @@ private struct PreparedServingBackend {
                 model=\(launchedModel) listening=\(localAddress)
                 """
         }
-        let nativeCacheKinds = Set(
-            startupReport.nativeCacheKinds.map(\.rawValue)
-        ).sorted().joined(separator: ",")
-        return """
-            fastmlx-serve mode=\(mode) route=\(startupReport.route.rawValue) \
-            model=\(startupReport.launchedModel) \
-            memory_limit_bytes=\(startupReport.memoryLimitBytes) \
-            cache_limit_bytes=\(startupReport.cacheLimitBytes) \
-            native_cache_layers=\(startupReport.nativeCacheKinds.count) \
-            native_cache_kinds=\(nativeCacheKinds) \
-            stop_token_count=\(startupReport.stopTokenCount) \
-            stop_string_count=\(startupReport.stopStringCount) \
-            startup_prompt_token_count=\(startupReport.startupPromptTokenCount) \
-            startup_generated_token_count=\(startupReport.startupGeneratedTokenCount) \
-            reset_parity_verified=\(startupReport.resetParityVerified) \
-            listening=\(localAddress)
-            """
+        switch startupReport {
+        case .scalar(let report):
+            let nativeCacheKinds = Set(
+                report.nativeCacheKinds.map(\.rawValue)
+            ).sorted().joined(separator: ",")
+            return """
+                fastmlx-serve mode=\(mode) route=\(report.route.rawValue) \
+                model=\(report.launchedModel) \
+                memory_limit_bytes=\(report.memoryLimitBytes) \
+                cache_limit_bytes=\(report.cacheLimitBytes) \
+                native_cache_layers=\(report.nativeCacheKinds.count) \
+                native_cache_kinds=\(nativeCacheKinds) \
+                stop_token_count=\(report.stopTokenCount) \
+                stop_string_count=\(report.stopStringCount) \
+                startup_prompt_token_count=\(report.startupPromptTokenCount) \
+                startup_generated_token_count=\(report.startupGeneratedTokenCount) \
+                reset_parity_verified=\(report.resetParityVerified) \
+                listening=\(localAddress)
+                """
+        case .continuous(let report):
+            let nativeCacheKinds = Set(
+                report.nativeCacheKinds.map(\.rawValue)
+            ).sorted().joined(separator: ",")
+            return """
+                fastmlx-serve mode=\(mode) route=\(report.route.rawValue) \
+                model=\(report.launchedModel) \
+                memory_limit_bytes=\(report.memoryLimitBytes) \
+                cache_limit_bytes=\(report.cacheLimitBytes) \
+                max_reserved_kv_bytes=\(report.maxReservedKVBytes) \
+                max_context_tokens=\(report.maxContextTokens) \
+                max_reserved_context_tokens=\(report.maxReservedContextTokens) \
+                model_family=\(report.modelFamily.rawValue) \
+                model_config_sha256=\(report.modelConfigurationSHA256) \
+                model_layers=\(report.layerCount) \
+                kv_heads=\(report.keyValueHeadCount) \
+                head_dimension=\(report.headDimension) \
+                native_cache_layers=\(report.nativeCacheKinds.count) \
+                native_cache_kinds=\(nativeCacheKinds) \
+                stop_token_count=\(report.stopTokenCount) \
+                stop_string_count=\(report.stopStringCount) \
+                startup_prompt_token_count=\(report.startupPromptTokenCount) \
+                startup_generated_token_count=\(report.startupGeneratedTokenCount) \
+                max_active_slots=\(report.maxActiveSlots) \
+                max_prefill_slots=\(report.maxPrefillSlots) \
+                prefill_chunk_size=\(report.prefillChunkSize) \
+                max_queued_requests=\(report.maxQueuedRequests) \
+                publication_capacity=\(report.publicationCapacity) \
+                model_proof_verified=\(report.modelProofVerified) \
+                listening=\(localAddress)
+                """
+        }
     }
 }
 
@@ -110,7 +150,37 @@ private func prepareBackend(
             backend: loaded.backend,
             mode: "scalar",
             launchedModel: arguments.model,
-            startupReport: loaded.startupReport)
+            startupReport: .scalar(loaded.startupReport))
+    case .continuousBatchNoSpec(
+        let modelDirectory,
+        let memoryLimitBytes,
+        let cacheLimitBytes,
+        let maxReservedKVBytes
+    ):
+        let loaded = try await loadContinuousServingModel(
+            configuration: ContinuousServingModelLoadConfiguration(
+                launchedModel: arguments.model,
+                modelDirectory: modelDirectory,
+                memoryLimitBytes: memoryLimitBytes,
+                cacheLimitBytes: cacheLimitBytes,
+                maxReservedKVBytes: maxReservedKVBytes,
+                coordinatorConfiguration: try ContinuousBatchConfiguration(
+                    maxActiveSlots: 4,
+                    maxPrefillSlots: 2,
+                    prefillChunkSize: 512,
+                    maxQueuedRequests: 8),
+                publicationCapacity: 1,
+                backendConfiguration: ContinuousServingBackendConfiguration(
+                    defaultMaximumCompletionTokens: 512,
+                    queueRetryAfterSeconds: 1,
+                    mailboxCapacity: .init(
+                        maxDeltas: 8,
+                        maxBytes: 32 * 1_024))))
+        return PreparedServingBackend(
+            backend: loaded.backend,
+            mode: "continuous-batch-no-spec",
+            launchedModel: arguments.model,
+            startupReport: .continuous(loaded.startupReport))
     case nil:
         preconditionFailure("help is the only invocation without a backend")
     }

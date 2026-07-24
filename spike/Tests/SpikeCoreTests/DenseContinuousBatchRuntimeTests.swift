@@ -127,9 +127,9 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
     private func makeCompressedRuntime() throws -> DenseContinuousBatchRuntime {
         try DenseContinuousBatchRuntime(
             testing: TinyCompressedBatchLanguageModel(),
-            allocationChunk: 4,
+            allocationChunk: 64,
             maxContextTokens: 64,
-            initialDecodeReserve: 3,
+            initialDecodeReserve: 8,
             kvCacheKind: .affine(.k4v2G64),
             affineAttentionMode: .splitQuantizedMM,
             compressedKVAttentionAdmission: try makeCompressedBatchAdmission(),
@@ -631,17 +631,17 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(solo.map(\.tokens), [[22]])
     }
 
-    func testStableBatchMembershipCompilesOnceAndUsesBoundedInitialReserve() throws {
+    func testStableFixedCapacityBatchMembershipCompilesOnce() throws {
         let runtime = try makeRuntime(
-            allocationChunk: 4,
+            allocationChunk: 8,
             maxContextTokens: 256,
             initialDecodeReserve: 2)
         try prefill(
             runtime, id: 1, tokens: [10, 11, 12], chunks: [1, 2],
-            maxOutputTokens: 100)
+            maxOutputTokens: 2)
         try prefill(
             runtime, id: 2, tokens: [20], chunks: [1],
-            maxOutputTokens: 100)
+            maxOutputTokens: 2)
 
         _ = try runtime.decode(
             .batch([BatchRequestID(1), BatchRequestID(2)], speculationAllowed: false))
@@ -652,6 +652,250 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(diagnostics.batchTraceCount, 1)
         XCTAssertEqual(diagnostics.batchMembership, [BatchRequestID(1), BatchRequestID(2)])
         XCTAssertEqual(diagnostics.batchCapacity, 8)
+    }
+
+    func testDecodeCohortUsesExactFixedCapacityAndIsolatesGrowthEligibleRequests()
+        throws
+    {
+        let runtime = try makeRuntime(
+            allocationChunk: 256,
+            maxContextTokens: 4_096,
+            initialDecodeReserve: 384)
+
+        func admission(
+            id: UInt64,
+            promptCount: Int,
+            outputCount: Int
+        ) -> ContinuousBatchRuntimeAdmission {
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(id),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: Array(repeating: 10, count: promptCount),
+                    maxOutputTokens: outputCount,
+                    eosToken: 2,
+                    architecture: .denseAttention))
+        }
+
+        XCTAssertEqual(
+            try runtime.decodeCohort(
+                for: admission(id: 1, promptCount: 40, outputCount: 128)),
+            .fixedKVCapacity(256))
+        XCTAssertEqual(
+            try runtime.decodeCohort(
+                for: admission(id: 2, promptCount: 100, outputCount: 128)),
+            .fixedKVCapacity(256))
+        XCTAssertEqual(
+            try runtime.decodeCohort(
+                for: admission(id: 3, promptCount: 200, outputCount: 128)),
+            .fixedKVCapacity(512))
+        XCTAssertEqual(
+            try runtime.decodeCohort(
+                for: admission(id: 4, promptCount: 40, outputCount: 385)),
+            .isolated(BatchRequestID(4)))
+    }
+
+    func testDirectMixedCapacityBatchFailsClosedBeforeCacheMerge() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 64,
+            initialDecodeReserve: 8)
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 2)
+        try prefill(
+            runtime,
+            id: 2,
+            tokens: [20, 21, 22, 23, 24],
+            chunks: [5],
+            maxOutputTokens: 2)
+
+        XCTAssertThrowsError(
+            try runtime.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(2)],
+                    speculationAllowed: false))
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .incompatibleDecodeCohort(
+                    [BatchRequestID(1), BatchRequestID(2)]))
+        }
+        XCTAssertNil(runtime.diagnostics().batchCapacity)
+    }
+
+    func testSameCapacityHostileB3B2B3MatchesScalarControls() throws {
+        let prompts: [UInt64: [Int]] = [
+            1: [10],
+            2: [30, 31, 32],
+            3: [20, 21],
+            4: [40, 41],
+        ]
+        let outputCount = 8
+
+        func scalarControl(
+            id: UInt64,
+            count: Int
+        ) throws -> [Int] {
+            let runtime = try makeRuntime(
+                allocationChunk: 16,
+                maxContextTokens: 64,
+                initialDecodeReserve: outputCount)
+            try prefill(
+                runtime,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: outputCount)
+            return try (0 ..< count).flatMap { _ in
+                try runtime.decode(
+                    .solo(
+                        BatchRequestID(id),
+                        speculationAllowed: false)
+                )[0].tokens
+            }
+        }
+
+        let controls = try Dictionary(
+            uniqueKeysWithValues: prompts.keys.map {
+                ($0, try scalarControl(id: $0, count: 6))
+            })
+        let runtime = try makeRuntime(
+            allocationChunk: 16,
+            maxContextTokens: 64,
+            initialDecodeReserve: outputCount)
+        for id in [UInt64(1), 2, 3] {
+            try prefill(
+                runtime,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: outputCount)
+        }
+
+        var actual: [UInt64: [Int]] = [1: [], 2: [], 3: [], 4: []]
+        for _ in 0 ..< 2 {
+            for result in try runtime.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(2), BatchRequestID(3)],
+                    speculationAllowed: false))
+            {
+                actual[result.id.rawValue, default: []].append(
+                    contentsOf: result.tokens)
+            }
+        }
+
+        runtime.remove(BatchRequestID(2))
+        for _ in 0 ..< 2 {
+            for result in try runtime.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(3)],
+                    speculationAllowed: false))
+            {
+                actual[result.id.rawValue, default: []].append(
+                    contentsOf: result.tokens)
+            }
+        }
+
+        try prefill(
+            runtime,
+            id: 4,
+            tokens: prompts[4]!,
+            chunks: [prompts[4]!.count],
+            maxOutputTokens: outputCount)
+        for _ in 0 ..< 2 {
+            for result in try runtime.decode(
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(3), BatchRequestID(4)],
+                    speculationAllowed: false))
+            {
+                actual[result.id.rawValue, default: []].append(
+                    contentsOf: result.tokens)
+            }
+        }
+
+        XCTAssertEqual(actual[1], controls[1])
+        XCTAssertEqual(actual[2], Array(controls[2]!.prefix(2)))
+        XCTAssertEqual(actual[3], controls[3])
+        XCTAssertEqual(actual[4], Array(controls[4]!.prefix(2)))
+        XCTAssertEqual(runtime.diagnostics().batchCapacity, 16)
+    }
+
+    func testTwoFixedCapacityCohortsCanAlternateSharedBatchesWithoutStateLoss()
+        throws
+    {
+        let prompts: [UInt64: [Int]] = [
+            1: [10],
+            2: [20, 21],
+            3: [30, 31, 32, 33, 34],
+            4: [40, 41, 42, 43, 44, 45],
+        ]
+        let outputCount = 8
+
+        func scalarControl(
+            id: UInt64,
+            count: Int
+        ) throws -> [Int] {
+            let runtime = try makeRuntime(
+                allocationChunk: 4,
+                maxContextTokens: 64,
+                initialDecodeReserve: outputCount)
+            try prefill(
+                runtime,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: outputCount)
+            return try (0 ..< count).flatMap { _ in
+                try runtime.decode(
+                    .solo(
+                        BatchRequestID(id),
+                        speculationAllowed: false)
+                )[0].tokens
+            }
+        }
+
+        let controls = try Dictionary(
+            uniqueKeysWithValues: prompts.keys.map {
+                ($0, try scalarControl(id: $0, count: 3))
+            })
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 64,
+            initialDecodeReserve: outputCount)
+        for id in prompts.keys.sorted() {
+            try prefill(
+                runtime,
+                id: id,
+                tokens: prompts[id]!,
+                chunks: [prompts[id]!.count],
+                maxOutputTokens: outputCount)
+        }
+
+        let cohortA = [BatchRequestID(1), BatchRequestID(2)]
+        let cohortB = [BatchRequestID(3), BatchRequestID(4)]
+        var actual: [UInt64: [Int]] = [
+            1: [], 2: [], 3: [], 4: [],
+        ]
+        for _ in 0 ..< 3 {
+            for ids in [cohortA, cohortB] {
+                for result in try runtime.decode(
+                    .batch(ids, speculationAllowed: false))
+                {
+                    actual[result.id.rawValue, default: []].append(
+                        contentsOf: result.tokens)
+                }
+            }
+        }
+
+        XCTAssertEqual(actual[1], controls[1])
+        XCTAssertEqual(actual[2], controls[2])
+        XCTAssertEqual(actual[3], controls[3])
+        XCTAssertEqual(actual[4], controls[4])
+        XCTAssertEqual(runtime.diagnostics().batchMembership, cohortB)
+        XCTAssertEqual(runtime.diagnostics().batchCapacity, 16)
     }
 
     func testInvalidTransitionsAndSpeculationFailClosed() throws {
@@ -911,6 +1155,34 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         await coordinator.shutdown()
     }
 
+    func testPerRequestReservedContextLimitRejectsBeforeAggregateAccounting()
+        throws
+    {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDenseLanguageModel(),
+            allocationChunk: 4,
+            maxContextTokens: 32,
+            maxReservedContextTokens: 8,
+            initialDecodeReserve: 2)
+        let admission = ContinuousBatchRuntimeAdmission(
+            id: BatchRequestID(7),
+            submission: ContinuousBatchSubmission(
+                promptTokens: [10, 11, 12, 13, 14],
+                maxOutputTokens: 4,
+                eosToken: 2,
+                architecture: .denseAttention))
+
+        XCTAssertThrowsError(try runtime.admit([admission])) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError,
+                .requestReservedContextLimitExceeded(
+                    BatchRequestID(7),
+                    requested: 9,
+                    limit: 8))
+        }
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 0)
+    }
+
     func testKVByteReservationRejectsAtomicallyAndReleasesOnRemoval() throws {
         let submission = ContinuousBatchSubmission(
             promptTokens: [10],
@@ -928,7 +1200,10 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try rejected.admit([admission])) {
             XCTAssertEqual(
                 $0 as? DenseContinuousBatchRuntimeError,
-                .aggregateKVByteLimitExceeded(requested: 200, limit: 199))
+                .requestReservedKVByteLimitExceeded(
+                    BatchRequestID(1),
+                    requested: 200,
+                    limit: 199))
         }
         XCTAssertEqual(rejected.diagnostics().reservedKVBytes, 0)
 
@@ -942,6 +1217,41 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(accepted.diagnostics().kvBytesPerToken, 8)
         accepted.remove(BatchRequestID(1))
         XCTAssertEqual(accepted.diagnostics().reservedKVBytes, 0)
+    }
+
+    func testAggregateKVByteReservationDistinguishesTransientPressure()
+        throws
+    {
+        let submission = ContinuousBatchSubmission(
+            promptTokens: [10],
+            maxOutputTokens: 1,
+            eosToken: 2,
+            architecture: .denseAttention)
+        let runtime = try makeRuntime(
+            allocationChunk: 4,
+            maxContextTokens: 16,
+            initialDecodeReserve: 1,
+            maxReservedKVBytes: 300)
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: submission)
+        ])
+
+        XCTAssertThrowsError(
+            try runtime.admit([
+                ContinuousBatchRuntimeAdmission(
+                    id: BatchRequestID(2),
+                    submission: submission)
+            ])
+        ) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError,
+                .aggregateKVByteLimitExceeded(
+                    requested: 400,
+                    limit: 300))
+        }
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 200)
     }
 
     func testKVGeometryCalibrationRejectsBeforeAdmissionReservation() throws {
@@ -978,7 +1288,7 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         let runtime = try makeRuntime(
             allocationChunk: 4,
             maxContextTokens: 16,
-            initialDecodeReserve: 1,
+            initialDecodeReserve: 2,
             maxReservedKVBytes: 400)
         let submission = ContinuousBatchSubmission(
             promptTokens: [10],
@@ -1005,11 +1315,11 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 200)
     }
 
-    func testMixedCapacitySurvivorRetainsPaddedPhysicalReservation() throws {
+    func testDifferentCapacityRowsRemainIndependentAndReleaseOwnReservations() throws {
         let runtime = try makeRuntime(
             allocationChunk: 4,
             maxContextTokens: 16,
-            initialDecodeReserve: 1,
+            initialDecodeReserve: 2,
             maxReservedKVBytes: 720)
         let short = ContinuousBatchSubmission(
             promptTokens: [10],
@@ -1029,15 +1339,16 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         try prefill(runtime, id: 1, tokens: short.promptTokens, chunks: [1], maxOutputTokens: 2)
         try prefill(runtime, id: 2, tokens: long.promptTokens, chunks: [5], maxOutputTokens: 2)
         _ = try runtime.decode(
-            .batch([BatchRequestID(1), BatchRequestID(2)], speculationAllowed: false))
+            .solo(BatchRequestID(1), speculationAllowed: false))
+        XCTAssertNil(runtime.diagnostics().batchCapacity)
 
         runtime.remove(BatchRequestID(2))
-        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 720)
-        _ = try runtime.decode(.solo(BatchRequestID(1), speculationAllowed: false))
         XCTAssertEqual(
             runtime.diagnostics().reservedKVBytes,
-            360,
-            "the short survivor still owns a scalar cache padded to the removed row's capacity")
+            200,
+            "removing the wider isolated cohort releases its reservation without padding the survivor")
+        runtime.remove(BatchRequestID(1))
+        XCTAssertEqual(runtime.diagnostics().reservedKVBytes, 0)
     }
 
     func testCoordinatorExecutesDecodeFirstDrainAndSharedBatchEndToEnd() async throws {

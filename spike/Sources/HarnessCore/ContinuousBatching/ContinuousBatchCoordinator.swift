@@ -79,6 +79,12 @@ public struct ContinuousBatchRuntimeResourceSnapshot: Sendable, Equatable, Codab
 /// arrays, caches, and compiled functions. A `sending` initializer transfers that whole
 /// isolation region into the coordinator actor, and no runtime value crosses back out.
 public protocol ContinuousBatchRuntime: AnyObject {
+    /// Return the exact shared-forward cohort for a candidate admission without mutating
+    /// runtime state. The coordinator asks before committing scheduler admission, then calls
+    /// `admit(_:)` atomically for the same value-only request set.
+    func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort
     func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws
     func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot?
     func prefill(_ work: ContinuousBatchRuntimePrefill) throws
@@ -88,6 +94,11 @@ public protocol ContinuousBatchRuntime: AnyObject {
 
 extension ContinuousBatchRuntime {
     /// Runtimes with no additional capability or resource gate can accept scheduler-valid work.
+    public func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        .unrestricted
+    }
     public func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {}
     public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { nil }
 }
@@ -247,7 +258,9 @@ public actor ContinuousBatchCoordinator {
         var candidateScheduler = scheduler
         var candidateNextID = nextRequestID
         var ids: [BatchRequestID] = []
+        var admissions: [ContinuousBatchRuntimeAdmission] = []
         ids.reserveCapacity(submissions.count)
+        admissions.reserveCapacity(submissions.count)
         for submission in submissions {
             guard !submission.stopTokenIDs.isEmpty,
                 submission.stopTokenIDs.allSatisfy({ $0 >= 0 })
@@ -258,20 +271,24 @@ public actor ContinuousBatchCoordinator {
                 throw ContinuousBatchCoordinatorError.requestIDExhausted
             }
             let id = BatchRequestID(rawID)
+            let admission = ContinuousBatchRuntimeAdmission(
+                id: id,
+                submission: submission)
+            let decodeCohort = try runtime.decodeCohort(
+                for: admission)
             try candidateScheduler.submit(
                 BatchRequest(
                     id: id,
                     promptTokenCount: submission.promptTokens.count,
                     maxOutputTokens: submission.maxOutputTokens,
                     architecture: submission.architecture,
-                    requestsSpeculation: submission.requestsSpeculation))
+                    requestsSpeculation: submission.requestsSpeculation,
+                    decodeCohort: decodeCohort))
             ids.append(id)
+            admissions.append(admission)
             candidateNextID = rawID == UInt64.max ? nil : rawID + 1
         }
-        try runtime.admit(
-            zip(ids, submissions).map {
-                ContinuousBatchRuntimeAdmission(id: $0.0, submission: $0.1)
-            })
+        try runtime.admit(admissions)
 
         var handles: [ContinuousBatchRequestHandle] = []
         handles.reserveCapacity(submissions.count)

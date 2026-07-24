@@ -732,6 +732,16 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 "The serving queue is full",
                 code: "queue_full").openAIError
             status = .tooManyRequests
+        case .capacityExceeded:
+            payload = OpenAIServingError.rateLimited(
+                "The loaded model has no remaining request capacity",
+                code: "capacity_exhausted").openAIError
+            status = .tooManyRequests
+        case .requestTooLarge:
+            payload = OpenAIServingError.invalidRequest(
+                "Request exceeds the loaded model or KV limit",
+                param: "messages").openAIError
+            status = .badRequest
         }
 
         do {
@@ -740,9 +750,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
             var headers = HTTPHeaders()
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
-            headers.add(
-                name: "retry-after",
-                value: "\(admissionError.retryAfterSeconds)")
+            if let retryAfterSeconds = admissionError.retryAfterSeconds {
+                headers.add(
+                    name: "retry-after",
+                    value: "\(retryAfterSeconds)")
+            }
             if !keepAlive {
                 headers.add(name: "connection", value: "close")
             }

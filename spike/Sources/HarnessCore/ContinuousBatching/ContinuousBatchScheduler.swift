@@ -16,6 +16,18 @@ public struct BatchRequestID: RawRepresentable, Hashable, Comparable, Sendable {
     }
 }
 
+/// Runtime-derived equivalence class for one exact shared decode forward.
+///
+/// The scheduler treats the value as opaque policy metadata. A runtime may use a fixed physical
+/// KV width or another shape invariant; requests from different cohorts are never submitted in
+/// the same model call. `unrestricted` preserves the behavior of runtimes whose result is
+/// independent of shared tensor geometry. `isolated` keeps one request on solo decode.
+public enum BatchDecodeCohort: Hashable, Sendable {
+    case unrestricted
+    case fixedKVCapacity(Int)
+    case isolated(BatchRequestID)
+}
+
 public enum BatchArchitectureClass: String, CaseIterable, Sendable, Equatable {
     case denseAttention
     case mixtureOfExperts
@@ -31,19 +43,22 @@ public struct BatchRequest: Sendable, Equatable {
     public let maxOutputTokens: Int
     public let architecture: BatchArchitectureClass
     public let requestsSpeculation: Bool
+    public let decodeCohort: BatchDecodeCohort
 
     public init(
         id: BatchRequestID,
         promptTokenCount: Int,
         maxOutputTokens: Int,
         architecture: BatchArchitectureClass,
-        requestsSpeculation: Bool = false
+        requestsSpeculation: Bool = false,
+        decodeCohort: BatchDecodeCohort = .unrestricted
     ) {
         self.id = id
         self.promptTokenCount = promptTokenCount
         self.maxOutputTokens = maxOutputTokens
         self.architecture = architecture
         self.requestsSpeculation = requestsSpeculation
+        self.decodeCohort = decodeCohort
     }
 }
 
@@ -229,6 +244,7 @@ public struct ContinuousBatchScheduler: Sendable {
     private var slots: [BatchRequestID: Slot] = [:]
     private var queue: [BatchRequestID] = []
     private var nextArrivalOrdinal: UInt64 = 0
+    private var lastDecodedCohort: BatchDecodeCohort?
     /// Monotonic state revision, not merely a count of executed ticks. Submit and cancellation
     /// also advance it so stale executor work cannot attach to a same-ID replacement request.
     private var stateRevision = 0
@@ -305,6 +321,9 @@ public struct ContinuousBatchScheduler: Sendable {
             return .notFound(id)
         }
         queue.removeAll { $0 == id }
+        if slots.isEmpty {
+            lastDecodedCohort = nil
+        }
         stateRevision += 1
         return .cancelled(id: id, previousPhase: slot.phase)
     }
@@ -346,9 +365,28 @@ public struct ContinuousBatchScheduler: Sendable {
             }
             .sorted { $0.arrivalOrdinal < $1.arrivalOrdinal }
 
+        var orderedCohorts: [BatchDecodeCohort] = []
+        for candidate in decodeCandidates
+        where !orderedCohorts.contains(candidate.request.decodeCohort) {
+            orderedCohorts.append(candidate.request.decodeCohort)
+        }
+        let selectedCohort: BatchDecodeCohort? = {
+            guard !orderedCohorts.isEmpty else { return nil }
+            guard let lastDecodedCohort,
+                let previous = orderedCohorts.firstIndex(of: lastDecodedCohort),
+                orderedCohorts.count > 1
+            else {
+                return orderedCohorts[0]
+            }
+            return orderedCohorts[(previous + 1) % orderedCohorts.count]
+        }()
+        let selectedDecodeCandidates = decodeCandidates.filter {
+            $0.request.decodeCohort == selectedCohort
+        }
+
         let decode: BatchDecodeAction?
-        if decodeCandidates.count >= 2 {
-            if let pending = decodeCandidates.first(where: {
+        if selectedDecodeCandidates.count >= 2 {
+            if let pending = selectedDecodeCandidates.first(where: {
                 if case .decoding(_, hasPendingSoloLookahead: true) = $0.phase {
                     return true
                 }
@@ -359,11 +397,11 @@ public struct ContinuousBatchScheduler: Sendable {
                 decode = .drainSoloPipeline(pending.request.id)
             } else {
                 decode = .batch(
-                    decodeCandidates.map(\.request.id),
+                    selectedDecodeCandidates.map(\.request.id),
                     speculationAllowed: false
                 )
             }
-        } else if let only = decodeCandidates.first {
+        } else if let only = selectedDecodeCandidates.first {
             decode = .solo(
                 only.request.id,
                 speculationAllowed: only.request.requestsSpeculation
@@ -450,6 +488,9 @@ public struct ContinuousBatchScheduler: Sendable {
         next.queue.removeAll { admitted.contains($0) }
 
         if let decode = plan.decode {
+            if let firstID = decode.requestIDs.first {
+                next.lastDecodedCohort = next.slots[firstID]?.request.decodeCohort
+            }
             for id in decode.requestIDs {
                 next.advanceDecode(outcomeByID[id]!)
             }
@@ -469,6 +510,9 @@ public struct ContinuousBatchScheduler: Sendable {
             next.slots[slice.id] = slot
         }
 
+        if next.slots.isEmpty {
+            next.lastDecodedCohort = nil
+        }
         next.stateRevision += 1
         self = next
     }

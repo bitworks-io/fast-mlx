@@ -6,6 +6,11 @@ public enum FastMLXServeBackend: Equatable, Sendable {
         modelDirectory: URL,
         memoryLimitBytes: Int,
         cacheLimitBytes: Int)
+    case continuousBatchNoSpec(
+        modelDirectory: URL,
+        memoryLimitBytes: Int,
+        cacheLimitBytes: Int,
+        maxReservedKVBytes: Int)
 }
 
 public enum FastMLXServeArgumentError:
@@ -22,6 +27,8 @@ public enum FastMLXServeArgumentError:
     case invalidModelIdentifier
     case modelPathMustBeAbsolute
     case cacheLimitExceedsMemoryLimit
+    case reservedKVLimitExceedsMemoryLimit
+    case optionRequiresContinuousBatchMode(String)
 
     public var description: String {
         switch self {
@@ -38,15 +45,19 @@ public enum FastMLXServeArgumentError:
         case .missingBackendMode:
             "Choose --scripted or provide --model-path with explicit model limits"
         case .conflictingBackendModes:
-            "--scripted cannot be combined with scalar model options"
+            "--scripted cannot be combined with loaded-model options"
         case .missingRequiredOption(let option):
-            "Scalar model serving requires \(option)"
+            "Loaded model serving requires \(option)"
         case .invalidModelIdentifier:
             "--model must be a non-empty identifier"
         case .modelPathMustBeAbsolute:
             "--model-path must be an absolute local path"
         case .cacheLimitExceedsMemoryLimit:
             "--cache-limit-bytes cannot exceed --memory-limit-bytes"
+        case .reservedKVLimitExceedsMemoryLimit:
+            "--max-reserved-kv-bytes cannot exceed --memory-limit-bytes"
+        case .optionRequiresContinuousBatchMode(let option):
+            "\(option) requires --continuous-batch-no-spec"
         }
     }
 }
@@ -55,18 +66,22 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     public static let usage = """
         Usage:
           fastmlx-serve --scripted [--host HOST] [--port PORT] [--model MODEL]
-          fastmlx-serve --model-path PATH --model MODEL
+          fastmlx-serve [--continuous-batch-no-spec]
+            --model-path PATH --model MODEL
             --memory-limit-bytes N --cache-limit-bytes N
+            [--max-reserved-kv-bytes N]
             [--host HOST] [--port PORT]
 
-          --scripted              Transport-only backend; no model is loaded.
-          --model-path PATH       Absolute local source-locked model directory.
-          --model MODEL           Exact OpenAI request model identifier.
-          --memory-limit-bytes N  Explicit positive MLX memory limit.
-          --cache-limit-bytes N   Explicit positive MLX cache limit.
-          --host HOST             Bind host (default: 127.0.0.1).
-          --port PORT             Bind port (default: 8080; 0 is ephemeral).
-          --help                  Show this help.
+          --scripted                  Transport-only backend; no model is loaded.
+          --continuous-batch-no-spec  Explicit dense continuous-batch route.
+          --model-path PATH           Absolute local source-locked model directory.
+          --model MODEL               Exact OpenAI request model identifier.
+          --memory-limit-bytes N      Explicit positive MLX memory limit.
+          --cache-limit-bytes N       Explicit positive MLX cache limit.
+          --max-reserved-kv-bytes N   Required continuous-route aggregate KV cap.
+          --host HOST                 Bind host (default: 127.0.0.1).
+          --port PORT                 Bind port (default: 8080; 0 is ephemeral).
+          --help                      Show this help.
 
         Set FASTMLX_API_KEY to require Bearer authentication. A non-loopback host
         is rejected unless that environment variable is non-empty.
@@ -98,6 +113,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         let arguments = Array(rawArguments)
         var seen: Set<String> = []
         var scripted = false
+        var continuousBatchNoSpec = false
         var showHelp = false
         var host = "127.0.0.1"
         var port = 8_080
@@ -105,6 +121,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var modelPath: String?
         var memoryLimitBytes: Int?
         var cacheLimitBytes: Int?
+        var maxReservedKVBytes: Int?
 
         var index = 0
         while index < arguments.count {
@@ -119,6 +136,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             switch argument {
             case "--scripted":
                 scripted = true
+            case "--continuous-batch-no-spec":
+                continuousBatchNoSpec = true
             case "--help", "-h":
                 showHelp = true
             case "--host":
@@ -151,6 +170,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 cacheLimitBytes = try positiveInteger(
                     try value(at: index, in: arguments, for: argument),
                     option: argument)
+            case "--max-reserved-kv-bytes":
+                index += 1
+                maxReservedKVBytes = try positiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -166,9 +190,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 showHelp: true)
         }
 
-        let hasScalarOptions =
+        let hasLoadedModelOptions =
             modelPath != nil || memoryLimitBytes != nil || cacheLimitBytes != nil
-        if scripted, hasScalarOptions {
+                || maxReservedKVBytes != nil
+        if scripted, continuousBatchNoSpec || hasLoadedModelOptions {
             throw FastMLXServeArgumentError.conflictingBackendModes
         }
         if scripted {
@@ -182,8 +207,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 showHelp: false)
         }
 
-        guard hasScalarOptions else {
+        guard continuousBatchNoSpec || hasLoadedModelOptions else {
             throw FastMLXServeArgumentError.missingBackendMode
+        }
+        if !continuousBatchNoSpec, maxReservedKVBytes != nil {
+            throw FastMLXServeArgumentError.optionRequiresContinuousBatchMode(
+                "--max-reserved-kv-bytes")
         }
         guard let modelPath else {
             throw FastMLXServeArgumentError.missingRequiredOption(
@@ -207,14 +236,36 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         guard cacheLimitBytes <= memoryLimitBytes else {
             throw FastMLXServeArgumentError.cacheLimitExceedsMemoryLimit
         }
+        let resolvedMaxReservedKVBytes: Int?
+        if continuousBatchNoSpec {
+            guard let maxReservedKVBytes else {
+                throw FastMLXServeArgumentError.missingRequiredOption(
+                    "--max-reserved-kv-bytes")
+            }
+            guard maxReservedKVBytes <= memoryLimitBytes else {
+                throw FastMLXServeArgumentError
+                    .reservedKVLimitExceedsMemoryLimit
+            }
+            resolvedMaxReservedKVBytes = maxReservedKVBytes
+        } else {
+            resolvedMaxReservedKVBytes = nil
+        }
 
         return FastMLXServeArguments(
-            backend: .scalar(
-                modelDirectory: URL(
-                    fileURLWithPath: modelPath,
-                    isDirectory: true),
-                memoryLimitBytes: memoryLimitBytes,
-                cacheLimitBytes: cacheLimitBytes),
+            backend: continuousBatchNoSpec
+                ? .continuousBatchNoSpec(
+                    modelDirectory: URL(
+                        fileURLWithPath: modelPath,
+                        isDirectory: true),
+                    memoryLimitBytes: memoryLimitBytes,
+                    cacheLimitBytes: cacheLimitBytes,
+                    maxReservedKVBytes: resolvedMaxReservedKVBytes!)
+                : .scalar(
+                    modelDirectory: URL(
+                        fileURLWithPath: modelPath,
+                        isDirectory: true),
+                    memoryLimitBytes: memoryLimitBytes,
+                    cacheLimitBytes: cacheLimitBytes),
             host: host,
             port: port,
             model: launchedModel,
@@ -223,6 +274,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
 
     private static let supportedOptions: Set<String> = [
         "--scripted",
+        "--continuous-batch-no-spec",
         "--help",
         "-h",
         "--host",
@@ -231,6 +283,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--model-path",
         "--memory-limit-bytes",
         "--cache-limit-bytes",
+        "--max-reserved-kv-bytes",
     ]
 
     private static func value(

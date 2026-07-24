@@ -133,6 +133,52 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    func testRuntimeCapacityAndRequestSizeAdmissionFailuresStayTyped()
+        async throws
+    {
+        let capacityBackend = ScriptedBackend(scripts: [
+            .admissionRejected(
+                .capacityExceeded(retryAfterSeconds: 3))
+        ])
+        let capacityChannel = try await makeChannel(
+            backend: capacityBackend)
+        try await writeRequest(
+            capacityChannel,
+            body: requestBody(stream: false))
+        let capacityResponse = try await collectResponse(
+            from: capacityChannel)
+
+        XCTAssertEqual(capacityResponse.head.status, .tooManyRequests)
+        XCTAssertEqual(
+            capacityResponse.head.headers.first(name: "retry-after"),
+            "3")
+        XCTAssertTrue(
+            capacityResponse.body.contains(#""code":"capacity_exhausted""#))
+        _ = try await capacityChannel.finish()
+
+        let oversizedBackend = ScriptedBackend(scripts: [
+            .admissionRejected(.requestTooLarge())
+        ])
+        let oversizedChannel = try await makeChannel(
+            backend: oversizedBackend)
+        try await writeRequest(
+            oversizedChannel,
+            body: requestBody(stream: false))
+        let oversizedResponse = try await collectResponse(
+            from: oversizedChannel)
+
+        XCTAssertEqual(oversizedResponse.head.status, .badRequest)
+        XCTAssertNil(
+            oversizedResponse.head.headers.first(name: "retry-after"))
+        XCTAssertTrue(
+            oversizedResponse.body.contains(
+                #""type":"invalid_request_error""#))
+        XCTAssertTrue(
+            oversizedResponse.body.contains(
+                #"Request exceeds the loaded model or KV limit"#))
+        _ = try await oversizedChannel.finish()
+    }
+
     func testInputCloseCancelsActiveLeaseExactlyOnce() async throws {
         let backend = ScriptedBackend(scripts: [.held])
         let channel = try await makeChannel(backend: backend)
