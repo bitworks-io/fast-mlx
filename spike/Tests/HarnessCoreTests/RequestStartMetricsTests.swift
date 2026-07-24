@@ -117,6 +117,94 @@ final class RequestStartMetricsTests: XCTestCase {
             evictionCount: 0))
     }
 
+    func testSnapshotRejectionDetailIsBoundedAndOnlyAccompaniesSnapshotEvidence()
+        throws
+    {
+        let detail =
+            "exact prefix snapshot dtype key=float16 value=float16 != expected bfloat16"
+        let rejected = try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .rejected,
+            prefixCacheRejectionReason: .snapshotEvidenceMismatch,
+            prefixCacheRejectionDetail: detail,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0)
+        XCTAssertEqual(rejected.prefixCacheRejectionDetail, detail)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                RequestStartMetrics.self,
+                from: JSONEncoder().encode(rejected)),
+            rejected)
+
+        XCTAssertThrowsError(try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .rejected,
+            prefixCacheRejectionReason: .snapshotExceedsBudget,
+            prefixCacheRejectionDetail: detail,
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0))
+
+        XCTAssertThrowsError(try RequestStartMetrics(
+            promptTokenCount: 100,
+            cacheReadTokenCount: 0,
+            physicalPrefillTokenCount: 100,
+            prefixCacheOutcome: .rejected,
+            prefixCacheRejectionReason: .snapshotEvidenceMismatch,
+            prefixCacheRejectionDetail: String(
+                repeating: "x", count: 513),
+            templateTokenCacheHit: false,
+            templateSeconds: 0,
+            tokenizeSeconds: 0,
+            lookupSeconds: 0.01,
+            restoreSeconds: 0,
+            prefillSeconds: 0.5,
+            retainedBytes: 0,
+            entryCount: 0,
+            evictionCount: 0))
+
+        for invalidDetail in [
+            "snapshot path=/private/tmp/model",
+            #"snapshot path=\private\tmp\model"#,
+            "snapshot\nmultiline",
+            "snapshot dtype=flöat16",
+        ] {
+            XCTAssertThrowsError(try RequestStartMetrics(
+                promptTokenCount: 100,
+                cacheReadTokenCount: 0,
+                physicalPrefillTokenCount: 100,
+                prefixCacheOutcome: .rejected,
+                prefixCacheRejectionReason: .snapshotEvidenceMismatch,
+                prefixCacheRejectionDetail: invalidDetail,
+                templateTokenCacheHit: false,
+                templateSeconds: 0,
+                tokenizeSeconds: 0,
+                lookupSeconds: 0.01,
+                restoreSeconds: 0,
+                prefillSeconds: 0.5,
+                retainedBytes: 0,
+                entryCount: 0,
+                evictionCount: 0))
+        }
+    }
+
     func testImpossibleOrPartialEvidenceFailsClosed() throws {
         XCTAssertThrowsError(
             try RequestStartMetrics(

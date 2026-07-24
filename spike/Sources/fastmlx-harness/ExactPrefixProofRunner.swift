@@ -389,6 +389,8 @@ private struct ExactPrefixProofRuntime {
             prefixCacheOutcome: metrics.prefixCacheOutcome,
             prefixCacheRejectionReason:
                 metrics.prefixCacheRejectionReason,
+            prefixCacheRejectionDetail:
+                metrics.prefixCacheRejectionDetail,
             templateTokenCacheHit: prepared.receipt == .hit,
             templateSeconds: prepared.templateSeconds,
             tokenizeSeconds: prepared.tokenizeSeconds,

@@ -252,6 +252,9 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         XCTAssertEqual(
             result.requestStartMetrics?.prefixCacheRejectionReason,
             .snapshotEvidenceMismatch)
+        XCTAssertEqual(
+            result.requestStartMetrics?.prefixCacheRejectionDetail,
+            "exact prefix snapshot dtype key=float16 value=float16 != expected bfloat16")
         let cache = await driver.engine.exactPrefixCacheSnapshot()
         XCTAssertEqual(cache.entryCount, 0)
     }
@@ -282,6 +285,9 @@ final class ExactPrefixHarnessActorTests: XCTestCase {
         XCTAssertEqual(
             result.requestStartMetrics?.prefixCacheRejectionReason,
             .snapshotEvidenceMismatch)
+        XCTAssertEqual(
+            result.requestStartMetrics?.prefixCacheRejectionDetail,
+            "exact prefix snapshot geometry rank=4,batch=1,layers=1,kvHeads=1,headDim=2 != expected rank=4,batch=1,layers=1,kvHeads=2,headDim=1")
         let cache = await driver.engine.exactPrefixCacheSnapshot()
         XCTAssertEqual(cache.entryCount, 0)
     }

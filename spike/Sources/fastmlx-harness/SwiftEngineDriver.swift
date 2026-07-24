@@ -712,6 +712,7 @@ actor HarnessEngineActor {
 
             var prefixCacheRejectionReason:
                 ExactPrefixCommitSkipReason?
+            var prefixCacheRejectionDetail: String?
             if hit == nil, let semanticKey,
                 let exactPrefixRuntimeIdentity
             {
@@ -734,6 +735,12 @@ actor HarnessEngineActor {
                 } catch {
                     prefixCacheRejectionReason =
                         .snapshotEvidenceMismatch
+                    if let runtimeError =
+                        error as? ExactPrefixRuntimeError
+                    {
+                        prefixCacheRejectionDetail =
+                            runtimeError.description
+                    }
                 }
             }
 
@@ -852,6 +859,8 @@ actor HarnessEngineActor {
                             .snapshotGeometryMismatch(_, _):
                         prefixCacheRejectionReason =
                             .snapshotEvidenceMismatch
+                        prefixCacheRejectionDetail =
+                            String(describing: error)
                     default:
                         prefixCacheRejectionReason =
                             .snapshotCaptureFailed
@@ -1009,6 +1018,8 @@ actor HarnessEngineActor {
                     prefixCacheOutcome: prefixCacheOutcome,
                     prefixCacheRejectionReason:
                         prefixCacheRejectionReason,
+                    prefixCacheRejectionDetail:
+                        prefixCacheRejectionDetail,
                     templateTokenCacheHit: false,
                     templateSeconds: 0,
                     tokenizeSeconds: 0,
