@@ -52,6 +52,21 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // Keep compiled snapshot/restore tests independently filterable. The documented on-box
+        // verification invokes this target in a separate xcodebuild process because MLX compiled
+        // functions use pointer-keyed backend identities, and rapid construction of unrelated
+        // compiled runtime fixtures in one XCTest process can contaminate later test suites.
+        .testTarget(
+            name: "ExactPrefixMLXTests",
+            dependencies: [
+                "HarnessCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         // HarnessCore is PURE — NO MLX/SpikeCore dependency — so it (and HarnessCoreTests) build+test off-box with `swift test`.
         .target(
             name: "HarnessCore",

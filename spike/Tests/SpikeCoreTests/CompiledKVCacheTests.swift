@@ -7,11 +7,30 @@ import XCTest
 /// the invariants the compiled decode step depends on).
 final class CompiledKVCacheTests: XCTestCase {
 
-    private func makeKV(_ value: Float, n: Int = 1) -> (MLXArray, MLXArray) {
+    private func makeKV(
+        _ value: Float, n: Int = 1, dtype: DType = .float32
+    ) -> (MLXArray, MLXArray) {
         // [B=1, kvHeads=2, n, headDim=4]
-        let k = MLXArray.full([1, 2, n, 4], values: MLXArray(value))
-        let v = MLXArray.full([1, 2, n, 4], values: MLXArray(value * 10))
+        let k = MLXArray.full([1, 2, n, 4], values: MLXArray(value)).asType(dtype)
+        let v = MLXArray.full([1, 2, n, 4], values: MLXArray(value * 10)).asType(dtype)
         return (k, v)
+    }
+
+    private func bytes(_ array: MLXArray) -> Data {
+        array.asData(access: .copy).data
+    }
+
+    private func assertSnapshotError(
+        _ expected: CompiledKVCacheSnapshotError,
+        _ body: () throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try body(), file: file, line: line) {
+            XCTAssertEqual(
+                $0 as? CompiledKVCacheSnapshotError, expected,
+                file: file, line: line)
+        }
     }
 
     func testUpdateWritesAtOffsetAndAdvancesInGraph() {
@@ -125,5 +144,267 @@ final class CompiledKVCacheTests: XCTestCase {
         XCTAssertEqual(cache.keysBuf![0, 0, 1, 0].item(Float.self), 5)
         XCTAssertEqual(cache.keysBuf![0, 0, 6, 0].item(Float.self), 0)
         XCTAssertEqual(cache.offsetArr.item(Int32.self), 2) // growth does not move offset
+    }
+
+    func testSnapshotCapturesDetachedLogicalPrefixAndExactMetadata() throws {
+        let cache = CompiledKVCache(capacity: 8)
+        let (keys, values) = makeKV(3, n: 3, dtype: .float16)
+        _ = cache.update(keys: keys, values: values)
+
+        let snapshot = try cache.captureSnapshot(logicalTokenCount: 3)
+
+        XCTAssertEqual(snapshot.rank, 4)
+        XCTAssertEqual(snapshot.batchSize, 1)
+        XCTAssertEqual(snapshot.kvHeadCount, 2)
+        XCTAssertEqual(snapshot.tokenCount, 3)
+        XCTAssertEqual(snapshot.headDimension, 4)
+        XCTAssertEqual(snapshot.keyDType, .float16)
+        XCTAssertEqual(snapshot.valueDType, .float16)
+        XCTAssertEqual(snapshot.keyNBytes, 48)
+        XCTAssertEqual(snapshot.valueNBytes, 48)
+        XCTAssertEqual(snapshot.totalNBytes, 96)
+        XCTAssertEqual(snapshot.keys?.shape, [1, 2, 3, 4])
+        XCTAssertEqual(snapshot.values?.shape, [1, 2, 3, 4])
+
+        let snapshotKeys = try XCTUnwrap(snapshot.keys)
+        let snapshotValues = try XCTUnwrap(snapshot.values)
+        let capturedKeyBytes = bytes(snapshotKeys)
+        let capturedValueBytes = bytes(snapshotValues)
+
+        cache.resetInPlace()
+        let (replacementKeys, replacementValues) = makeKV(9, n: 3, dtype: .float16)
+        _ = cache.update(keys: replacementKeys, values: replacementValues)
+
+        XCTAssertEqual(bytes(snapshotKeys), capturedKeyBytes)
+        XCTAssertEqual(bytes(snapshotValues), capturedValueBytes)
+        XCTAssertEqual(snapshotKeys[0, 0, 2, 0].item(Float.self), 3)
+        XCTAssertEqual(snapshotValues[0, 1, 2, 3].item(Float.self), 30)
+    }
+
+    func testRestorePreservesIdentitiesUpdatesBothOffsetsAndZerosTail() throws {
+        let source = CompiledKVCache(capacity: 8)
+        let (sourceKeys, sourceValues) = makeKV(2, n: 3, dtype: .float16)
+        _ = source.update(keys: sourceKeys, values: sourceValues)
+        let snapshot = try source.captureSnapshot(logicalTokenCount: 3)
+
+        let target = CompiledKVCache(capacity: 8)
+        let (staleKeys, staleValues) = makeKV(7, n: 6, dtype: .float16)
+        _ = target.update(keys: staleKeys, values: staleValues)
+        let keysObject = try XCTUnwrap(target.keysBuf)
+        let valuesObject = try XCTUnwrap(target.valuesBuf)
+        let offsetObject = target.offsetArr
+
+        try target.restoreInPlace(from: snapshot)
+
+        XCTAssertTrue(target.keysBuf! === keysObject)
+        XCTAssertTrue(target.valuesBuf! === valuesObject)
+        XCTAssertTrue(target.offsetArr === offsetObject)
+        XCTAssertEqual(target.offsetArr.item(Int32.self), 3)
+        XCTAssertEqual(target.offset, 3)
+        XCTAssertEqual(target.keysBuf![0, 0, 2, 0].item(Float.self), 2)
+        XCTAssertEqual(target.valuesBuf![0, 1, 2, 3].item(Float.self), 20)
+        for token in 3 ..< target.capacity {
+            XCTAssertEqual(
+                target.keysBuf![0, 0, token, 0].item(Float.self), 0,
+                "key tail token \(token)")
+            XCTAssertEqual(
+                target.valuesBuf![0, 1, token, 3].item(Float.self), 0,
+                "value tail token \(token)")
+        }
+    }
+
+    func testRestoreThenAppendMatchesUninterruptedControl() throws {
+        let control = CompiledKVCache(capacity: 8)
+        let restored = CompiledKVCache(capacity: 8)
+        let (prefixKeys, prefixValues) = makeKV(1, n: 2, dtype: .float16)
+        _ = control.update(keys: prefixKeys, values: prefixValues)
+        _ = restored.update(keys: prefixKeys, values: prefixValues)
+        let snapshot = try restored.captureSnapshot(logicalTokenCount: 2)
+
+        let (tailKeys, tailValues) = makeKV(6, n: 3, dtype: .float16)
+        _ = control.update(keys: tailKeys, values: tailValues)
+
+        restored.resetInPlace()
+        try restored.restoreInPlace(from: snapshot)
+        _ = restored.update(keys: tailKeys, values: tailValues)
+
+        XCTAssertEqual(restored.offsetArr.item(Int32.self), 5)
+        XCTAssertEqual(restored.offset, 5)
+        XCTAssertEqual(bytes(restored.keysBuf!), bytes(control.keysBuf!))
+        XCTAssertEqual(bytes(restored.valuesBuf!), bytes(control.valuesBuf!))
+    }
+
+    func testPreparedGrowthDoesNotMutateLiveCapacityUntilAtomicApply() throws {
+        let source = CompiledKVCache(capacity: 4)
+        let (sourceKeys, sourceValues) = makeKV(2, n: 2, dtype: .float16)
+        _ = source.update(keys: sourceKeys, values: sourceValues)
+        let snapshot = try source.captureSnapshot(logicalTokenCount: 2)
+
+        let target = CompiledKVCache(capacity: 4)
+        let (targetKeys, targetValues) = makeKV(7, n: 2, dtype: .float16)
+        _ = target.update(keys: targetKeys, values: targetValues)
+        let originalKeys = try XCTUnwrap(target.keysBuf)
+        let originalValues = try XCTUnwrap(target.valuesBuf)
+        let originalKeyBytes = bytes(originalKeys)
+        let originalValueBytes = bytes(originalValues)
+
+        let plan = try target.prepareRestore(
+            from: snapshot, targetCapacity: 260)
+
+        XCTAssertEqual(target.capacity, 4)
+        XCTAssertTrue(target.keysBuf === originalKeys)
+        XCTAssertTrue(target.valuesBuf === originalValues)
+        XCTAssertEqual(bytes(target.keysBuf!), originalKeyBytes)
+        XCTAssertEqual(bytes(target.valuesBuf!), originalValueBytes)
+        XCTAssertEqual(target.offsetArr.item(Int32.self), 2)
+
+        target.applyPreparedRestore(plan)
+
+        XCTAssertEqual(target.capacity, 260)
+        XCTAssertEqual(target.keysBuf?.shape, [1, 2, 260, 4])
+        XCTAssertEqual(target.valuesBuf?.shape, [1, 2, 260, 4])
+        XCTAssertEqual(target.offsetArr.item(Int32.self), 2)
+        XCTAssertEqual(target.offset, 2)
+        XCTAssertEqual(target.keysBuf![0, 0, 1, 0].item(Float.self), 2)
+        XCTAssertEqual(target.keysBuf![0, 0, 259, 0].item(Float.self), 0)
+    }
+
+    func testCaptureRejectsUninitializedInvalidLengthOffsetMismatchAndNonFinite() {
+        let uninitialized = CompiledKVCache(capacity: 8)
+        assertSnapshotError(.uninitializedCache) {
+            _ = try uninitialized.captureSnapshot(logicalTokenCount: 1)
+        }
+
+        let cache = CompiledKVCache(capacity: 8)
+        let (keys, values) = makeKV(1, n: 2)
+        _ = cache.update(keys: keys, values: values)
+        assertSnapshotError(.invalidTokenCount) {
+            _ = try cache.captureSnapshot(logicalTokenCount: 0)
+        }
+        assertSnapshotError(.invalidTokenCount) {
+            _ = try cache.captureSnapshot(logicalTokenCount: 9)
+        }
+        assertSnapshotError(.offsetMismatch) {
+            _ = try cache.captureSnapshot(logicalTokenCount: 1)
+        }
+        assertSnapshotError(.unsupportedDType) {
+            _ = try cache.captureSnapshot(logicalTokenCount: 2)
+        }
+
+        let nonFinite = CompiledKVCache(capacity: 4)
+        let badKeys = MLXArray.full(
+            [1, 2, 1, 4], values: MLXArray(Float16.nan), dtype: .float16)
+        let goodValues = MLXArray.zeros([1, 2, 1, 4], dtype: .float16)
+        _ = nonFinite.update(keys: badKeys, values: goodValues)
+        assertSnapshotError(.nonFiniteValues) {
+            _ = try nonFinite.captureSnapshot(logicalTokenCount: 1)
+        }
+
+        let invalidControl = CompiledKVCache(capacity: 4)
+        let (validKeys, validValues) = makeKV(1, dtype: .float16)
+        _ = invalidControl.update(keys: validKeys, values: validValues)
+        invalidControl.offsetArr = MLXArray([Float32(1)])
+        assertSnapshotError(.invalidControlState) {
+            _ = try invalidControl.captureSnapshot(logicalTokenCount: 1)
+        }
+    }
+
+    func testRestoreRejectsCapacityDTypeShapeBytesPartialAndNonFiniteWithoutMutation() throws {
+        let source = CompiledKVCache(capacity: 8)
+        let (keys, values) = makeKV(4, n: 3, dtype: .float16)
+        _ = source.update(keys: keys, values: values)
+        let valid = try source.captureSnapshot(logicalTokenCount: 3)
+
+        let tooSmall = CompiledKVCache(capacity: 2)
+        let (smallKeys, smallValues) = makeKV(8, n: 1, dtype: .float16)
+        _ = tooSmall.update(keys: smallKeys, values: smallValues)
+        assertSnapshotError(.insufficientCapacity) {
+            try tooSmall.restoreInPlace(from: valid)
+        }
+
+        let wrongDType = CompiledKVCache(capacity: 8)
+        let (floatKeys, floatValues) = makeKV(8, n: 1, dtype: .float32)
+        _ = wrongDType.update(keys: floatKeys, values: floatValues)
+        assertSnapshotError(.dtypeMismatch) {
+            try wrongDType.restoreInPlace(from: valid)
+        }
+
+        let target = CompiledKVCache(capacity: 8)
+        let (targetKeys, targetValues) = makeKV(8, n: 2, dtype: .float16)
+        _ = target.update(keys: targetKeys, values: targetValues)
+        let originalKeyBytes = bytes(target.keysBuf!)
+        let originalValueBytes = bytes(target.valuesBuf!)
+        let originalOffset = target.offsetArr.item(Int32.self)
+
+        let malformedShape = CompiledKVCacheSnapshot(
+            rank: 4,
+            batchSize: 1,
+            kvHeadCount: 2,
+            tokenCount: 3,
+            headDimension: 4,
+            keyDType: .float16,
+            valueDType: .float16,
+            keyNBytes: valid.keyNBytes,
+            valueNBytes: valid.valueNBytes,
+            keys: MLXArray.zeros([1, 1, 3, 4], dtype: .float16),
+            values: valid.values)
+        assertSnapshotError(.shapeMismatch) {
+            try target.restoreInPlace(from: malformedShape)
+        }
+
+        let malformedBytes = CompiledKVCacheSnapshot(
+            rank: valid.rank,
+            batchSize: valid.batchSize,
+            kvHeadCount: valid.kvHeadCount,
+            tokenCount: valid.tokenCount,
+            headDimension: valid.headDimension,
+            keyDType: valid.keyDType,
+            valueDType: valid.valueDType,
+            keyNBytes: valid.keyNBytes + 1,
+            valueNBytes: valid.valueNBytes,
+            keys: valid.keys,
+            values: valid.values)
+        assertSnapshotError(.byteCountMismatch) {
+            try target.restoreInPlace(from: malformedBytes)
+        }
+
+        let partial = CompiledKVCacheSnapshot(
+            rank: valid.rank,
+            batchSize: valid.batchSize,
+            kvHeadCount: valid.kvHeadCount,
+            tokenCount: valid.tokenCount,
+            headDimension: valid.headDimension,
+            keyDType: valid.keyDType,
+            valueDType: valid.valueDType,
+            keyNBytes: valid.keyNBytes,
+            valueNBytes: valid.valueNBytes,
+            keys: valid.keys,
+            values: nil)
+        assertSnapshotError(.partialSnapshot) {
+            try target.restoreInPlace(from: partial)
+        }
+
+        let nonFiniteValues = MLXArray.full(
+            [1, 2, 3, 4], values: MLXArray(Float16.nan), dtype: .float16)
+        let nonFinite = CompiledKVCacheSnapshot(
+            rank: valid.rank,
+            batchSize: valid.batchSize,
+            kvHeadCount: valid.kvHeadCount,
+            tokenCount: valid.tokenCount,
+            headDimension: valid.headDimension,
+            keyDType: valid.keyDType,
+            valueDType: valid.valueDType,
+            keyNBytes: valid.keyNBytes,
+            valueNBytes: valid.valueNBytes,
+            keys: valid.keys,
+            values: nonFiniteValues)
+        assertSnapshotError(.nonFiniteValues) {
+            try target.restoreInPlace(from: nonFinite)
+        }
+
+        XCTAssertEqual(bytes(target.keysBuf!), originalKeyBytes)
+        XCTAssertEqual(bytes(target.valuesBuf!), originalValueBytes)
+        XCTAssertEqual(target.offsetArr.item(Int32.self), originalOffset)
+        XCTAssertEqual(target.offset, Int(originalOffset))
     }
 }

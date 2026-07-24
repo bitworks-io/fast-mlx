@@ -28,6 +28,295 @@ struct SwiftEngineCacheSelection: Equatable, Sendable {
     let kvarnStorageDType: KVarNKVScalarDType?
 }
 
+enum ExactPrefixRuntimeError:
+    Error, Equatable, CustomStringConvertible
+{
+    case missingRuntimeIdentity
+    case unsupportedRoute
+    case unsupportedNativeDType(String)
+    case invalidPrompt
+    case snapshotByteCountOverflow
+    case snapshotByteCountMismatch(expected: Int, actual: Int)
+    case snapshotDTypeMismatch(
+        expected: String,
+        key: String,
+        value: String)
+    case snapshotGeometryMismatch(
+        expected: String,
+        actual: String)
+    case logicalTokenCountMismatch(expected: Int, actual: Int)
+
+    var description: String {
+        switch self {
+        case .missingRuntimeIdentity:
+            "exact prefix cache is enabled without a loaded runtime identity"
+        case .unsupportedRoute:
+            "exact prefix cache requires scalar compiled dense-half full attention"
+        case .unsupportedNativeDType(let dtype):
+            "exact prefix cache requires float16 or bfloat16 dense state, got \(dtype)"
+        case .invalidPrompt:
+            "exact prefix cache requires positive Int32 prompt tokens"
+        case .snapshotByteCountOverflow:
+            "exact prefix snapshot byte count overflow"
+        case .snapshotByteCountMismatch(let expected, let actual):
+            "exact prefix snapshot bytes \(actual) != expected \(expected)"
+        case .snapshotDTypeMismatch(
+            let expected,
+            let key,
+            let value):
+            "exact prefix snapshot dtype key=\(key) value=\(value) != expected \(expected)"
+        case .snapshotGeometryMismatch(
+            let expected,
+            let actual):
+            "exact prefix snapshot geometry \(actual) != expected \(expected)"
+        case .logicalTokenCountMismatch(let expected, let actual):
+            "exact prefix logical tokens \(actual) != expected \(expected)"
+        }
+    }
+}
+
+/// Stable, path-free source identity retained before the actor observes any live KV arrays.
+///
+/// Config dtype remains authenticated provenance, but it is not allowed to select the cache route:
+/// some source-locked models declare bfloat16 while their loaded MLX attention path emits float16.
+struct ExactPrefixRuntimeIdentitySource: Sendable {
+    let admission: CompressedKVAttentionRuntimeAdmission
+    let modelInstanceID: String
+
+    init(
+        admission: CompressedKVAttentionRuntimeAdmission,
+        modelInstanceID: String = UUID().uuidString.lowercased()
+    ) throws {
+        let admission = try admission.validatedForEvidence()
+        // Reuse the semantic key's strict path-free validation for the ephemeral instance and
+        // authenticated source identities before unresolved state can enter the actor.
+        _ = try ExactPrefixSemanticKey(
+            isolationNamespaceSHA256: String(
+                repeating: "0", count: 64),
+            modelInstanceID: modelInstanceID,
+            modelRevisionSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
+            promptTemplateSHA256: String(
+                repeating: "1", count: 64),
+            toolsSHA256: String(repeating: "2", count: 64),
+            kvRouteSHA256: String(repeating: "3", count: 64),
+            positionSemanticsSHA256: String(
+                repeating: "4", count: 64),
+            architectureStateSHA256: String(
+                repeating: "5", count: 64),
+            drafterStateSHA256: String(repeating: "6", count: 64))
+        self.admission = admission
+        self.modelInstanceID = modelInstanceID
+    }
+
+    func resolve(
+        snapshot: CompiledMLXDecoderSnapshot
+    ) throws -> ExactPrefixRuntimeIdentity {
+        let observed = try observedDenseDType(snapshot: snapshot)
+        let identity = try ExactPrefixRuntimeIdentity(
+            source: self, observedNativeDType: observed)
+        let expectedBytes = try identity.snapshotBytes(
+            tokenCount: snapshot.logicalTokenCount)
+        guard snapshot.totalNBytes == expectedBytes else {
+            throw ExactPrefixRuntimeError
+                .snapshotByteCountMismatch(
+                    expected: expectedBytes,
+                    actual: snapshot.totalNBytes)
+        }
+        return identity
+    }
+
+    func observedDenseDType(
+        snapshot: CompiledMLXDecoderSnapshot
+    ) throws -> CompressedKVModelNativeDType {
+        let profile = try snapshot.validatedDenseHalfProfile()
+        let expectedGeometry =
+            "rank=4,batch=1,layers=\(admission.layerCount),kvHeads=\(admission.kvHeadCount),headDim=\(admission.headDimension)"
+        let actualGeometry =
+            "rank=\(profile.rank),batch=\(profile.batchSize),layers=\(profile.layerCount),kvHeads=\(profile.kvHeadCount),headDim=\(profile.headDimension)"
+        guard profile.rank == 4,
+            profile.batchSize == 1,
+            profile.layerCount == admission.layerCount,
+            profile.kvHeadCount == admission.kvHeadCount,
+            profile.headDimension == admission.headDimension
+        else {
+            throw ExactPrefixRuntimeError.snapshotGeometryMismatch(
+                expected: expectedGeometry,
+                actual: actualGeometry)
+        }
+        switch profile.dtype {
+        case .float16:
+            return .float16
+        case .bfloat16:
+            return .bfloat16
+        default:
+            throw ExactPrefixRuntimeError.unsupportedNativeDType(
+                String(describing: profile.dtype))
+        }
+    }
+
+    /// Exact detached snapshot bytes are independent of which supported half dtype is observed:
+    /// both f16 and bf16 occupy two bytes per scalar. This lets the actor reject an undersized
+    /// policy before allocating even the one-token live identity probe.
+    func snapshotBytes(tokenCount: Int) throws -> Int {
+        guard tokenCount > 0 else {
+            throw ExactPrefixRuntimeError.invalidPrompt
+        }
+        func multiply(_ lhs: Int, _ rhs: Int) throws -> Int {
+            let (value, overflow) =
+                lhs.multipliedReportingOverflow(by: rhs)
+            guard !overflow else {
+                throw ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow
+            }
+            return value
+        }
+        func add(_ lhs: Int, _ rhs: Int) throws -> Int {
+            let (value, overflow) =
+                lhs.addingReportingOverflow(rhs)
+            guard !overflow else {
+                throw ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow
+            }
+            return value
+        }
+
+        var arrayBytes = try multiply(
+            admission.layerCount, admission.kvHeadCount)
+        arrayBytes = try multiply(arrayBytes, tokenCount)
+        arrayBytes = try multiply(
+            arrayBytes, admission.headDimension)
+        arrayBytes = try multiply(
+            arrayBytes, MemoryLayout<UInt16>.stride)
+        arrayBytes = try multiply(arrayBytes, 2)
+        let layerControlBytes = try multiply(
+            admission.layerCount,
+            MemoryLayout<CompiledKVCacheSnapshot>.stride)
+        let controlBytes = try add(
+            layerControlBytes, MemoryLayout<Int32>.stride)
+        return try add(arrayBytes, controlBytes)
+    }
+}
+
+/// Fully resolved actor-owned identity for one observed scalar dense-half route.
+///
+/// The semantic key binds both the independently authenticated source/config and the homogeneous
+/// dtype emitted by every live K/V layer. Only this resolved form may touch the cache policy plane.
+struct ExactPrefixRuntimeIdentity: Sendable {
+    let source: ExactPrefixRuntimeIdentitySource
+    let evidence: ExactPrefixDenseRuntimeIdentityEvidence
+    let kvRouteSHA256: String
+    let positionSemanticsSHA256: String
+    let architectureStateSHA256: String
+    let drafterStateSHA256: String
+    let nativeDType: CompressedKVModelNativeDType
+
+    var admission: CompressedKVAttentionRuntimeAdmission {
+        source.admission
+    }
+
+    var modelInstanceID: String {
+        source.modelInstanceID
+    }
+
+    init(
+        source: ExactPrefixRuntimeIdentitySource,
+        observedNativeDType nativeDType:
+            CompressedKVModelNativeDType
+    ) throws {
+        guard nativeDType == .float16 || nativeDType == .bfloat16
+        else {
+            throw ExactPrefixRuntimeError.unsupportedNativeDType(
+                nativeDType.rawValue)
+        }
+
+        let admission = source.admission
+        let evidence =
+            try ExactPrefixDenseRuntimeIdentityEvidence(
+                observedDenseHalfDType: nativeDType)
+        let kvRouteSHA256 = evidence.kvRouteSHA256
+        let positionSemanticsSHA256 = sha256Hex(Data(
+            """
+            fast-mlx-exact-prefix-position-v1
+            family=\(admission.family.rawValue)
+            config=\(admission.modelConfigSHA256)
+            max=\(admission.maxPositionEmbeddings)
+            """.utf8))
+        let architectureStateSHA256 = sha256Hex(Data(
+            """
+            fast-mlx-exact-prefix-architecture-v2
+            model_type=\(admission.modelType)
+            architecture=\(admission.architecture)
+            layers=\(admission.layerCount)
+            query_heads=\(admission.queryHeadCount)
+            kv_heads=\(admission.kvHeadCount)
+            head_dim=\(admission.headDimension)
+            configured_dtype=\(admission.modelNativeDType?.rawValue ?? "unknown")
+            observed_dense_half_dtype=\(nativeDType.rawValue)
+            """.utf8))
+        let drafterStateSHA256 = sha256Hex(Data(
+            "fast-mlx-exact-prefix-drafter-v1\nnone\n".utf8))
+        _ = try ExactPrefixSemanticKey(
+            isolationNamespaceSHA256: String(
+                repeating: "0", count: 64),
+            modelInstanceID: source.modelInstanceID,
+            modelRevisionSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
+            promptTemplateSHA256: String(
+                repeating: "1", count: 64),
+            toolsSHA256: String(repeating: "2", count: 64),
+            kvRouteSHA256: kvRouteSHA256,
+            positionSemanticsSHA256: positionSemanticsSHA256,
+            architectureStateSHA256: architectureStateSHA256,
+            drafterStateSHA256: drafterStateSHA256)
+        self.source = source
+        self.evidence = evidence
+        self.kvRouteSHA256 = kvRouteSHA256
+        self.positionSemanticsSHA256 = positionSemanticsSHA256
+        self.architectureStateSHA256 = architectureStateSHA256
+        self.drafterStateSHA256 = drafterStateSHA256
+        self.nativeDType = nativeDType
+    }
+
+    func semanticKey(
+        request: ExactPrefixRequestContext
+    ) throws -> ExactPrefixSemanticKey {
+        try ExactPrefixSemanticKey(
+            isolationNamespaceSHA256:
+                request.isolationNamespaceSHA256,
+            modelInstanceID: modelInstanceID,
+            modelRevisionSHA256:
+                admission.checkpointContentSHA256,
+            tokenizerSHA256: admission.tokenizerSHA256,
+            promptTemplateSHA256:
+                request.promptTemplateSHA256,
+            toolsSHA256: request.toolsSHA256,
+            kvRouteSHA256: kvRouteSHA256,
+            positionSemanticsSHA256: positionSemanticsSHA256,
+            architectureStateSHA256: architectureStateSHA256,
+            drafterStateSHA256: drafterStateSHA256)
+    }
+
+    func snapshotBytes(tokenCount: Int) throws -> Int {
+        try source.snapshotBytes(tokenCount: tokenCount)
+    }
+
+    func validate(
+        snapshot: CompiledMLXDecoderSnapshot
+    ) throws {
+        let actual = try source.observedDenseDType(
+            snapshot: snapshot)
+        guard actual == nativeDType else {
+            throw ExactPrefixRuntimeError.snapshotDTypeMismatch(
+                expected: nativeDType.rawValue,
+                key: actual.rawValue,
+                value: actual.rawValue)
+        }
+    }
+}
+
 /// Resolve and authenticate a runtime request without allocating MLX cache state. A frozen
 /// KVTuner selection always requires a live checkpoint admission, even when its attention route
 /// is the legacy default, because layer-count compatibility alone is not model identity.
@@ -219,6 +508,61 @@ private func kvarnIngressEngagement(
     return counts
 }
 
+private func exactPrefixEngagement(
+    _ metrics: RequestStartMetrics
+) -> [String: Int] {
+    func nanoseconds(_ seconds: Double) -> Int {
+        let scaled = seconds * 1_000_000_000
+        guard scaled < Double(Int.max) else {
+            return Int.max
+        }
+        return max(0, Int(scaled.rounded()))
+    }
+    var counts = [
+        "prefix_cache_request_start": 1,
+        "prefix_cache_read_tokens":
+            metrics.cacheReadTokenCount,
+        "prefix_cache_physical_prefill_tokens":
+            metrics.physicalPrefillTokenCount,
+        "prefix_cache_retained_bytes":
+            metrics.retainedBytes,
+        "prefix_cache_entries": metrics.entryCount,
+        "prefix_cache_evictions": metrics.evictionCount,
+        "prefix_cache_template_hit":
+            metrics.templateTokenCacheHit ? 1 : 0,
+        "prefix_cache_template_ns":
+            nanoseconds(metrics.templateSeconds),
+        "prefix_cache_tokenize_ns":
+            nanoseconds(metrics.tokenizeSeconds),
+        "prefix_cache_lookup_ns":
+            nanoseconds(metrics.lookupSeconds),
+        "prefix_cache_restore_ns":
+            nanoseconds(metrics.restoreSeconds),
+        "prefix_cache_prefill_ns":
+            nanoseconds(metrics.prefillSeconds),
+    ]
+    for outcome in [
+        PrefixCacheRequestOutcome.disabled,
+        .miss, .exactHit, .partialHit, .rejected,
+    ] {
+        counts[
+            "prefix_cache_outcome_\(outcome.rawValue)"
+        ] = metrics.prefixCacheOutcome == outcome ? 1 : 0
+    }
+    for reason in ExactPrefixCommitSkipReason.allCases {
+        let suffix = reason.rawValue.replacingOccurrences(
+            of: "-", with: "_")
+        counts[
+            "prefix_cache_rejection_\(suffix)"
+        ] = metrics.prefixCacheRejectionReason == reason ? 1 : 0
+    }
+    if let eagerWarmupSeconds = metrics.eagerWarmupSeconds {
+        counts["prefix_cache_eager_warmup_ns"] =
+            nanoseconds(eagerWarmupSeconds)
+    }
+    return counts
+}
+
 /// Single-owner actor over the spike's compiled decode core. Owns BOTH the model and the
 /// `CompiledMLXDecoder` (one isolation region) because `logprobs` needs direct forward access
 /// to full-vocab logits, which the token-only `Decoder` protocol deliberately doesn't expose.
@@ -244,6 +588,20 @@ actor HarnessEngineActor {
     /// Captured from the same model directory and live tokenizer used to construct `model`.
     /// Candidate policies must reconcile against this independent identity inside the actor.
     private let kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity?
+    private let exactPrefixCacheConfiguration:
+        ExactPrefixCacheConfiguration
+    private let exactPrefixRuntimeIdentitySource:
+        ExactPrefixRuntimeIdentitySource?
+    private var exactPrefixRuntimeIdentity:
+        ExactPrefixRuntimeIdentity?
+    private var exactPrefixRuntimeIdentityRejectionReason:
+        ExactPrefixCommitSkipReason?
+    private var exactPrefixRuntimeIdentityRejectionDetail:
+        String?
+    /// Both the pure index and its MLX-backed snapshot payloads stay inside this actor.
+    private var exactPrefixCache:
+        ExactPrefixCache<CompiledMLXDecoderSnapshot>
+    private var exactPrefixWarmupSeconds: Double?
     /// One decoder per KV-cache kind, built lazily and kept alive so each kind's compiled
     /// step function survives across runs (an fp16 baseline and a TurboQuant candidate can
     /// alternate within one verify invocation without retracing either).
@@ -269,10 +627,148 @@ actor HarnessEngineActor {
 
     init(
         model: sending any LanguageModel,
-        kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity? = nil
+        kvtunerRuntimeIdentity: KVTunerCandidateRuntimeIdentity? = nil,
+        exactPrefixCacheConfiguration:
+            ExactPrefixCacheConfiguration = .disabled,
+        exactPrefixRuntimeIdentitySource:
+            ExactPrefixRuntimeIdentitySource? = nil
     ) {
         self.model = model
         self.kvtunerRuntimeIdentity = kvtunerRuntimeIdentity
+        self.exactPrefixCacheConfiguration =
+            exactPrefixCacheConfiguration
+        self.exactPrefixRuntimeIdentitySource =
+            exactPrefixRuntimeIdentitySource
+        exactPrefixRuntimeIdentity = nil
+        exactPrefixRuntimeIdentityRejectionReason = nil
+        exactPrefixRuntimeIdentityRejectionDetail = nil
+        exactPrefixCache = ExactPrefixCache(
+            policy: exactPrefixCacheConfiguration.policy)
+    }
+
+    func exactPrefixCacheSnapshot() -> ExactPrefixCacheSnapshot {
+        exactPrefixCache.snapshot
+    }
+
+    func exactPrefixRuntimeIdentityEvidence()
+        -> ExactPrefixDenseRuntimeIdentityEvidence?
+    {
+        exactPrefixRuntimeIdentity?.evidence
+    }
+
+    /// Resolve the live scalar dense-half route with a one-token detached snapshot.
+    ///
+    /// The probe is admitted against the cache byte policy before allocation, never touches the
+    /// prefix index, and records a terminal actor-local rejection so unsupported models serve
+    /// cold without retrying or mutating the cache plane.
+    func prepareExactPrefixRuntimeIdentity() {
+        guard exactPrefixCacheConfiguration.policy.isEnabled,
+            exactPrefixRuntimeIdentitySource != nil,
+            exactPrefixRuntimeIdentity == nil,
+            exactPrefixRuntimeIdentityRejectionReason == nil
+        else {
+            return
+        }
+        let key = DecoderKey(
+            kind: .fp16,
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .materialize,
+            kvarnStorageDType: nil)
+        if decoders[key] == nil {
+            decoders[key] = CompiledMLXDecoder(
+                model: model, kvCache: .fp16)
+        }
+        var decoder = decoders[key]!
+        resolveExactPrefixRuntimeIdentityIfNeeded(
+            decoder: &decoder)
+        decoder.reset()
+        decoders[key] = decoder
+    }
+
+    private func resolveExactPrefixRuntimeIdentityIfNeeded(
+        decoder: inout CompiledMLXDecoder
+    ) {
+        guard exactPrefixRuntimeIdentity == nil,
+            exactPrefixRuntimeIdentityRejectionReason == nil,
+            let exactPrefixRuntimeIdentitySource
+        else {
+            return
+        }
+        do {
+            let probeBytes =
+                try exactPrefixRuntimeIdentitySource
+                    .snapshotBytes(tokenCount: 1)
+            guard probeBytes <= exactPrefixCacheConfiguration
+                .policy.maxRetainedBytes
+            else {
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotExceedsBudget
+                return
+            }
+            decoder.reset()
+            let staged =
+                try decoder.prefillCapturingPromptSnapshot([1])
+            exactPrefixRuntimeIdentity =
+                try exactPrefixRuntimeIdentitySource.resolve(
+                    snapshot: staged.snapshot)
+        } catch {
+            switch error {
+            case ExactPrefixRuntimeError
+                .snapshotByteCountMismatch(_, _),
+                ExactPrefixRuntimeError
+                    .snapshotByteCountOverflow,
+                ExactPrefixRuntimeError
+                    .snapshotDTypeMismatch(_, _, _),
+                ExactPrefixRuntimeError
+                    .snapshotGeometryMismatch(_, _):
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotEvidenceMismatch
+                exactPrefixRuntimeIdentityRejectionDetail =
+                    String(describing: error)
+            default:
+                exactPrefixRuntimeIdentityRejectionReason =
+                    .snapshotCaptureFailed
+            }
+        }
+        decoder.reset()
+    }
+
+    /// Optional load-time warmup for the exact scalar dense-half route. It is idempotent, never
+    /// touches the prefix index, and resets the decoder after exercising one- and eight-token
+    /// prefill plus compiled single-token decode shapes.
+    func performExactPrefixWarmup() throws -> Double {
+        guard exactPrefixCacheConfiguration.policy.isEnabled,
+            exactPrefixRuntimeIdentitySource != nil
+        else {
+            throw ExactPrefixRuntimeError.missingRuntimeIdentity
+        }
+        if let exactPrefixWarmupSeconds {
+            return exactPrefixWarmupSeconds
+        }
+        let key = DecoderKey(
+            kind: .fp16,
+            affineAttentionMode: .materialize,
+            kvarnAttentionMode: .materialize,
+            kvarnStorageDType: nil)
+        if decoders[key] == nil {
+            decoders[key] = CompiledMLXDecoder(
+                model: model, kvCache: .fp16)
+        }
+        var decoder = decoders[key]!
+        resolveExactPrefixRuntimeIdentityIfNeeded(
+            decoder: &decoder)
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        for prompt in [[1], Array(repeating: 1, count: 8)] {
+            decoder.reset()
+            let first = decoder.prefill(prompt)
+            _ = decoder.step(last: first)
+        }
+        decoder.reset()
+        let duration =
+            ProcessInfo.processInfo.systemUptime - startedAt
+        decoders[key] = decoder
+        exactPrefixWarmupSeconds = duration
+        return duration
     }
 
     /// Greedy decode via the compiled core. The returned ids INCLUDE a terminal eos if one is
@@ -285,14 +781,16 @@ actor HarnessEngineActor {
         kvCache kind: KVCacheKind,
         affineAttentionMode: AffineKVAttentionMode,
         kvarnAttentionMode: KVarNKVAttentionMode = .materialize,
-        kvarnStorageDType: KVarNKVScalarDType? = nil
+        kvarnStorageDType: KVarNKVScalarDType? = nil,
+        exactPrefixRequest: ExactPrefixRequestContext? = nil
     )
-        -> (
+        throws -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
             prefillDurationSeconds: Double?,
             turboQuantTokens: Int?, affineTelemetry: AffineKVCacheTelemetry?,
             kvtunerTelemetry: KVTunerKVCacheTelemetry?,
-            kvarnTelemetry: KVarNKVCacheTelemetry?
+            kvarnTelemetry: KVarNKVCacheTelemetry?,
+            requestStartMetrics: RequestStartMetrics?
         )
     {
         if case .kvtunerCandidate = kind {
@@ -317,64 +815,466 @@ actor HarnessEngineActor {
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
         let submitTime = Date().timeIntervalSinceReferenceDate
         guard maxTokens > 0 else {
-            return ([], submitTime, [], nil, nil, nil, nil, nil)
+            return (
+                [], submitTime, [], nil, nil, nil, nil, nil,
+                nil)
         }
-        var tokens: [Int] = []
-        var tokenTimes: [Double] = []
-        let prefillStartedAt = ProcessInfo.processInfo.systemUptime
-        var tok = decoder.prefill(prompt)
-        let prefillDurationSeconds =
-            ProcessInfo.processInfo.systemUptime - prefillStartedAt
-        let prefillEnd = Date().timeIntervalSinceReferenceDate
-        tokens.append(tok)
-        tokenTimes.append(prefillEnd)
-        while tokens.count < maxTokens && tok != eos {
-            tok = decoder.step(last: tok)
-            tokens.append(tok)
-            tokenTimes.append(Date().timeIntervalSinceReferenceDate)
+        guard !prompt.isEmpty,
+            prompt.allSatisfy({
+                $0 >= 0 && Int32(exactly: $0) != nil
+            })
+        else {
+            throw ExactPrefixRuntimeError.invalidPrompt
         }
-        let turboQuantTokens = decoder.turboQuantCachedTokens()
-        let affineTelemetry = decoder.affineKVTelemetry()
-        let kvtunerTelemetry = decoder.kvtunerKVTelemetry()
-        let kvarnTelemetry = decoder.kvarnKVTelemetry()
-        if case .turboQuant = kind {
-            // A TurboQuant run whose decoder somehow holds an fp16 cache is a plumbing bug,
-            // not a measurement — fail loudly (mirrors requireSupported's contract).
-            precondition(turboQuantTokens != nil, "TurboQuant tier requested but the quantized cache did not engage")
+        if exactPrefixRequest != nil {
+            guard kind == .fp16,
+                affineAttentionMode == .materialize,
+                kvarnAttentionMode == .materialize,
+                kvarnStorageDType == nil
+            else {
+                throw ExactPrefixRuntimeError.unsupportedRoute
+            }
         }
-        if case .affine = kind {
-            precondition(
-                affineTelemetry != nil,
-                "affine tier requested but the affine cache did not engage")
+
+        var promptReservation: ExactPrefixReservation?
+        var stagedPromptSnapshot:
+            CompiledMLXDecoderSnapshot?
+        do {
+            try Task.checkCancellation()
+
+            let cacheEnabled =
+                exactPrefixRequest != nil
+                && exactPrefixCacheConfiguration.policy.isEnabled
+            var prefixCacheRejectionReason:
+                ExactPrefixCommitSkipReason?
+            var prefixCacheRejectionDetail: String?
+            var semanticKey: ExactPrefixSemanticKey?
+            if cacheEnabled {
+                guard exactPrefixRuntimeIdentitySource != nil,
+                    let exactPrefixRequest
+                else {
+                    throw ExactPrefixRuntimeError
+                        .missingRuntimeIdentity
+                }
+                resolveExactPrefixRuntimeIdentityIfNeeded(
+                    decoder: &decoder)
+                prefixCacheRejectionReason =
+                    exactPrefixRuntimeIdentityRejectionReason
+                prefixCacheRejectionDetail =
+                    exactPrefixRuntimeIdentityRejectionDetail
+                if prefixCacheRejectionReason == nil {
+                    semanticKey = try exactPrefixRuntimeIdentity?
+                        .semanticKey(
+                            request: exactPrefixRequest)
+                } else {
+                    semanticKey = nil
+                }
+            } else {
+                semanticKey = nil
+            }
+
+            let lookupStartedAt =
+                ProcessInfo.processInfo.systemUptime
+            var lookupPerformed = false
+            let hit: ExactPrefixCacheHit<
+                CompiledMLXDecoderSnapshot>?
+            if let semanticKey {
+                lookupPerformed = true
+                hit = try exactPrefixCache.lookup(
+                    key: semanticKey,
+                    promptTokens: prompt)
+            } else {
+                hit = nil
+            }
+            var primaryEntryID = hit?.entryID
+            let lookupSeconds =
+                ProcessInfo.processInfo.systemUptime
+                    - lookupStartedAt
+
+            if hit == nil, let semanticKey,
+                let exactPrefixRuntimeIdentity
+            {
+                do {
+                    let expectedBytes =
+                        try exactPrefixRuntimeIdentity
+                            .snapshotBytes(
+                                tokenCount: prompt.count)
+                    let decision = try exactPrefixCache.reserve(
+                        key: semanticKey,
+                        tokens: prompt,
+                        snapshotBytes: expectedBytes)
+                    promptReservation = decision.reservation
+                    if decision.reservation == nil,
+                        decision.skipReason != .disabled
+                    {
+                        prefixCacheRejectionReason =
+                            decision.skipReason
+                    }
+                } catch {
+                    prefixCacheRejectionReason =
+                        .snapshotEvidenceMismatch
+                    if let runtimeError =
+                        error as? ExactPrefixRuntimeError
+                    {
+                        prefixCacheRejectionDetail =
+                            runtimeError.description
+                    }
+                }
+            }
+
+            var restoreSeconds = 0.0
+            var physicalPrefillDuration =
+                Double.leastNonzeroMagnitude
+            let physicalPrefillTokenCount: Int
+            var prefixCacheOutcome: PrefixCacheRequestOutcome
+            let prefillStartedAt =
+                ProcessInfo.processInfo.systemUptime
+            var tok: Int
+            if let hit {
+                let tail = Array(
+                    prompt.dropFirst(hit.prefixTokenCount))
+                let restoreAttemptStartedAt =
+                    ProcessInfo.processInfo.systemUptime
+                do {
+                    guard let exactPrefixRuntimeIdentity else {
+                        throw ExactPrefixRuntimeError
+                            .missingRuntimeIdentity
+                    }
+                    try exactPrefixRuntimeIdentity.validate(
+                        snapshot: hit.state)
+                    let measured =
+                        try decoder
+                            .prefillRestoredPrefixMeasuring(
+                                hit.state, tailTokens: tail)
+                    tok = measured.firstToken
+                    restoreSeconds =
+                        measured.restoreDurationSeconds
+                    physicalPrefillDuration = max(
+                        measured.tailPrefillDurationSeconds,
+                        Double.leastNonzeroMagnitude)
+                    physicalPrefillTokenCount = tail.count
+                    prefixCacheOutcome =
+                        tail.isEmpty ? .exactHit : .partialHit
+                } catch {
+                    _ = exactPrefixCache.invalidate(
+                        entryID: hit.entryID)
+                    restoreSeconds =
+                        ProcessInfo.processInfo.systemUptime
+                            - restoreAttemptStartedAt
+                    decoder.reset()
+                    let coldPrefillStartedAt =
+                        ProcessInfo.processInfo.systemUptime
+                    tok = decoder.prefill(prompt)
+                    physicalPrefillDuration = max(
+                        ProcessInfo.processInfo.systemUptime
+                            - coldPrefillStartedAt,
+                        Double.leastNonzeroMagnitude)
+                    physicalPrefillTokenCount = prompt.count
+                    prefixCacheOutcome = .rejected
+                    prefixCacheRejectionReason =
+                        .snapshotRestoreFailed
+                }
+            } else if promptReservation != nil {
+                let coldPrefillStartedAt =
+                    ProcessInfo.processInfo.systemUptime
+                do {
+                    let staged =
+                        try decoder
+                            .prefillCapturingPromptSnapshot(
+                                prompt)
+                    guard let exactPrefixRuntimeIdentity else {
+                        throw ExactPrefixRuntimeError
+                            .missingRuntimeIdentity
+                    }
+                    try exactPrefixRuntimeIdentity.validate(
+                        snapshot: staged.snapshot)
+                    let expectedBytes =
+                        try exactPrefixRuntimeIdentity
+                            .snapshotBytes(
+                                tokenCount: prompt.count)
+                    guard staged.snapshot.totalNBytes
+                        == expectedBytes
+                    else {
+                        throw ExactPrefixRuntimeError
+                            .snapshotByteCountMismatch(
+                                expected: expectedBytes,
+                                actual:
+                                    staged.snapshot.totalNBytes)
+                    }
+                    tok = staged.firstToken
+                    physicalPrefillDuration = max(
+                        ProcessInfo.processInfo.systemUptime
+                            - coldPrefillStartedAt,
+                        Double.leastNonzeroMagnitude)
+                    stagedPromptSnapshot = staged.snapshot
+                    physicalPrefillTokenCount = prompt.count
+                    prefixCacheOutcome = .miss
+                } catch {
+                    if let promptReservation {
+                        try? exactPrefixCache.rollback(
+                            promptReservation)
+                    }
+                    promptReservation = nil
+                    stagedPromptSnapshot = nil
+                    decoder.reset()
+                    let fallbackPrefillStartedAt =
+                        ProcessInfo.processInfo.systemUptime
+                    tok = decoder.prefill(prompt)
+                    physicalPrefillDuration = max(
+                        ProcessInfo.processInfo.systemUptime
+                            - fallbackPrefillStartedAt,
+                        Double.leastNonzeroMagnitude)
+                    physicalPrefillTokenCount = prompt.count
+                    prefixCacheOutcome = .rejected
+                    switch error {
+                    case ExactPrefixRuntimeError
+                        .snapshotByteCountMismatch(_, _),
+                        ExactPrefixRuntimeError
+                            .snapshotByteCountOverflow,
+                        ExactPrefixRuntimeError
+                            .snapshotDTypeMismatch(_, _, _),
+                        ExactPrefixRuntimeError
+                            .snapshotGeometryMismatch(_, _):
+                        prefixCacheRejectionReason =
+                            .snapshotEvidenceMismatch
+                        prefixCacheRejectionDetail =
+                            String(describing: error)
+                    default:
+                        prefixCacheRejectionReason =
+                            .snapshotCaptureFailed
+                    }
+                }
+            } else {
+                let coldPrefillStartedAt =
+                    ProcessInfo.processInfo.systemUptime
+                tok = decoder.prefill(prompt)
+                physicalPrefillDuration = max(
+                    ProcessInfo.processInfo.systemUptime
+                        - coldPrefillStartedAt,
+                    Double.leastNonzeroMagnitude)
+                physicalPrefillTokenCount = prompt.count
+                if exactPrefixRequest != nil,
+                    !exactPrefixCacheConfiguration.policy
+                        .isEnabled
+                {
+                    prefixCacheOutcome = .disabled
+                } else if prefixCacheRejectionReason != nil {
+                    prefixCacheOutcome = .rejected
+                } else {
+                    prefixCacheOutcome = .miss
+                }
+            }
+            let fullPrefillDuration =
+                ProcessInfo.processInfo.systemUptime
+                    - prefillStartedAt
+
+            var tokens: [Int] = [tok]
+            var tokenTimes: [Double] = [
+                Date().timeIntervalSinceReferenceDate,
+            ]
+            while tokens.count < maxTokens && tok != eos {
+                tok = decoder.step(last: tok)
+                tokens.append(tok)
+                tokenTimes.append(
+                    Date().timeIntervalSinceReferenceDate)
+            }
+            try Task.checkCancellation()
+
+            let visibleTokenCount = tokens.reduce(into: 0) {
+                if $1 != eos { $0 += 1 }
+            }
+            let disposition = ExactPrefixCommitDisposition
+                .successfulText(
+                    generatedTokenCount: tokens.count,
+                    visibleTokenCount: visibleTokenCount)
+            if let reservation = promptReservation,
+                let stagedPromptSnapshot
+            {
+                do {
+                    let decision = try exactPrefixCache.commit(
+                        reservation,
+                        state: stagedPromptSnapshot,
+                        actualSnapshotBytes:
+                            stagedPromptSnapshot.totalNBytes,
+                        disposition: disposition)
+                    if let skipReason = decision.skipReason {
+                        prefixCacheOutcome = .rejected
+                        prefixCacheRejectionReason = skipReason
+                    } else {
+                        primaryEntryID = decision.entryID
+                    }
+                } catch {
+                    try? exactPrefixCache.rollback(
+                        reservation)
+                    prefixCacheRejectionReason =
+                        .snapshotEvidenceMismatch
+                    prefixCacheOutcome = .rejected
+                }
+                promptReservation = nil
+            }
+
+            if prefixCacheOutcome != .rejected,
+                visibleTokenCount > 0, let semanticKey,
+                let exactPrefixRuntimeIdentity
+            {
+                var finalReservation:
+                    ExactPrefixReservation?
+                do {
+                    let finalTokens = prompt + tokens
+                    let expectedBytes =
+                        try exactPrefixRuntimeIdentity
+                            .snapshotBytes(
+                                tokenCount: finalTokens.count)
+                        let finalDecision = try exactPrefixCache
+                            .reserve(
+                                key: semanticKey,
+                                tokens: finalTokens,
+                                snapshotBytes: expectedBytes,
+                                protectingEntryIDs:
+                                    primaryEntryID.map {
+                                        Set([$0])
+                                    } ?? [])
+                    if let reserved =
+                        finalDecision.reservation
+                    {
+                        finalReservation =
+                            reserved
+                        let finalSnapshot =
+                            try decoder
+                                .captureContinuationSnapshot()
+                        try exactPrefixRuntimeIdentity.validate(
+                            snapshot: finalSnapshot)
+                        guard finalSnapshot.logicalTokenCount
+                            == finalTokens.count
+                        else {
+                            throw ExactPrefixRuntimeError
+                                .logicalTokenCountMismatch(
+                                    expected: finalTokens.count,
+                                    actual: finalSnapshot
+                                        .logicalTokenCount)
+                        }
+                        guard finalSnapshot.totalNBytes
+                            == expectedBytes
+                        else {
+                            throw ExactPrefixRuntimeError
+                                .snapshotByteCountMismatch(
+                                    expected: expectedBytes,
+                                    actual:
+                                        finalSnapshot.totalNBytes)
+                        }
+                        _ = try exactPrefixCache.commit(
+                            reserved,
+                            state: finalSnapshot,
+                            actualSnapshotBytes:
+                                finalSnapshot.totalNBytes,
+                            disposition: disposition)
+                        finalReservation = nil
+                    }
+                } catch {
+                    if let finalReservation {
+                        try? exactPrefixCache.rollback(
+                            finalReservation)
+                    }
+                    // The visible request has already succeeded. Final-context caching is a
+                    // best-effort sidecar; an incomplete snapshot must not retroactively fail
+                    // generation or invalidate the independently committed prompt snapshot.
+                }
+            }
+
+            let cacheSnapshot = exactPrefixCache.snapshot
+            let requestStartMetrics:
+                RequestStartMetrics?
+            if exactPrefixRequest != nil {
+                let cacheReadTokenCount =
+                    prompt.count - physicalPrefillTokenCount
+                requestStartMetrics = try RequestStartMetrics(
+                    promptTokenCount: prompt.count,
+                    cacheReadTokenCount:
+                        cacheReadTokenCount,
+                    physicalPrefillTokenCount:
+                        physicalPrefillTokenCount,
+                    prefixCacheOutcome: prefixCacheOutcome,
+                    prefixCacheRejectionReason:
+                        prefixCacheRejectionReason,
+                    prefixCacheRejectionDetail:
+                        prefixCacheRejectionDetail,
+                    templateTokenCacheHit: false,
+                    templateSeconds: 0,
+                    tokenizeSeconds: 0,
+                    lookupSeconds:
+                        lookupPerformed ? lookupSeconds : 0,
+                    restoreSeconds: restoreSeconds,
+                    prefillSeconds:
+                        physicalPrefillDuration,
+                    retainedBytes:
+                        cacheSnapshot.retainedBytes,
+                    entryCount: cacheSnapshot.entryCount,
+                    evictionCount:
+                        cacheSnapshot.evictionCount,
+                    runtimeIdentity:
+                        exactPrefixRuntimeIdentity?.evidence,
+                    eagerWarmupSeconds:
+                        exactPrefixWarmupSeconds)
+            } else {
+                requestStartMetrics = nil
+            }
+
+            let turboQuantTokens =
+                decoder.turboQuantCachedTokens()
+            let affineTelemetry = decoder.affineKVTelemetry()
+            let kvtunerTelemetry = decoder.kvtunerKVTelemetry()
+            let kvarnTelemetry = decoder.kvarnKVTelemetry()
+            if case .turboQuant = kind {
+                precondition(
+                    turboQuantTokens != nil,
+                    "TurboQuant tier requested but the quantized cache did not engage")
+            }
+            if case .affine = kind {
+                precondition(
+                    affineTelemetry != nil,
+                    "affine tier requested but the affine cache did not engage")
+            }
+            if case .kvtuner(let selection) = kind {
+                precondition(
+                    kvtunerTelemetry?.artifactSHA256
+                        == selection.artifactSHA256,
+                    "KVTuner tier requested but matching schedule telemetry did not engage")
+            }
+            if case .kvarn(let cell) = kind {
+                let expectedExecutionMode = kind.executionMode(
+                    requestingCompilation: true,
+                    kvarnAttentionMode: kvarnAttentionMode)
+                precondition(
+                    kvarnTelemetry?.tier == cell.tier
+                        && kvarnTelemetry?.iterations
+                            == cell.iterations
+                        && kvarnTelemetry?.executionMode
+                            == expectedExecutionMode
+                        && kvarnTelemetry?.attentionOperation
+                            == expectedKVarNAttentionOperation(
+                                kvarnAttentionMode)
+                        && (kvarnStorageDType == nil
+                            || kvarnTelemetry?.storageKeyDType
+                                == kvarnStorageDType)
+                        && (kvarnStorageDType == nil
+                            || kvarnTelemetry?.storageValueDType
+                                == kvarnStorageDType),
+                    "KVarN tier requested but matching KVarN telemetry did not engage")
+            }
+            return (
+                tokens, submitTime, tokenTimes,
+                fullPrefillDuration,
+                turboQuantTokens, affineTelemetry,
+                kvtunerTelemetry, kvarnTelemetry,
+                requestStartMetrics)
+        } catch {
+            if let promptReservation {
+                try? exactPrefixCache.rollback(
+                    promptReservation)
+            }
+            decoder.reset()
+            throw error
         }
-        if case .kvtuner(let selection) = kind {
-            precondition(
-                kvtunerTelemetry?.artifactSHA256
-                    == selection.artifactSHA256,
-                "KVTuner tier requested but matching schedule telemetry did not engage")
-        }
-        if case .kvarn(let cell) = kind {
-            let expectedExecutionMode = kind.executionMode(
-                requestingCompilation: true,
-                kvarnAttentionMode: kvarnAttentionMode)
-            precondition(
-                kvarnTelemetry?.tier == cell.tier
-                    && kvarnTelemetry?.iterations == cell.iterations
-                    && kvarnTelemetry?.executionMode == expectedExecutionMode
-                    && kvarnTelemetry?.attentionOperation
-                        == expectedKVarNAttentionOperation(kvarnAttentionMode)
-                    && (kvarnStorageDType == nil
-                        || kvarnTelemetry?.storageKeyDType
-                            == kvarnStorageDType)
-                    && (kvarnStorageDType == nil
-                        || kvarnTelemetry?.storageValueDType
-                            == kvarnStorageDType),
-                "KVarN tier requested but matching KVarN telemetry did not engage")
-        }
-        return (
-            tokens, submitTime, tokenTimes, prefillDurationSeconds,
-            turboQuantTokens, affineTelemetry,
-            kvtunerTelemetry, kvarnTelemetry)
     }
 
     /// Greedy candidate generation for exhaustive KVTuner qualification only. This has no
@@ -989,6 +1889,20 @@ struct SwiftEngineDriver: EngineDriver {
     func generate(prompt: [Int], config: RunConfig) async throws -> RunResult {
         let selection = try cacheSelection(config)
         let kind = selection.kind
+        if config.exactPrefixRequest != nil {
+            guard config.specDecode == nil else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "exact prefix cache with speculative decoding")
+            }
+            guard kind == .fp16,
+                selection.affineAttentionMode == .materialize,
+                selection.kvarnAttentionMode == .materialize,
+                selection.kvarnStorageDType == nil
+            else {
+                throw SwiftEngineDriverError.unsupportedConfig(
+                    "exact prefix cache requires scalar compiled dense-half full attention")
+            }
+        }
         if let spec = try Self.specConfig(config) {
             let out = await engine.generateSpec(
                 prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind, spec: spec)
@@ -1011,12 +1925,13 @@ struct SwiftEngineDriver: EngineDriver {
                 tokenTimes: out.tokenTimes,
                 prefillDurationSeconds: out.prefillDurationSeconds)
         }
-        let out = await engine.generate(
+        let out = try await engine.generate(
             prompt: prompt, maxTokens: config.maxTokens, eos: eos,
             kvCache: kind,
             affineAttentionMode: selection.affineAttentionMode,
             kvarnAttentionMode: selection.kvarnAttentionMode,
-            kvarnStorageDType: selection.kvarnStorageDType)
+            kvarnStorageDType: selection.kvarnStorageDType,
+            exactPrefixRequest: config.exactPrefixRequest)
         var counts = ["decode": out.tokens.count]
         if let tq = out.turboQuantTokens {
             // In-graph cached-token count from the quantized cache — the lossy triad's
@@ -1087,13 +2002,19 @@ struct SwiftEngineDriver: EngineDriver {
                 kvarnIngressEngagement(kvarn),
                 uniquingKeysWith: { _, new in new })
         }
+        if let requestStartMetrics = out.requestStartMetrics {
+            counts.merge(
+                exactPrefixEngagement(requestStartMetrics),
+                uniquingKeysWith: { _, new in new })
+        }
         return RunResult(
             tokens: out.tokens,
             engagement: .init(counts),
             acceptanceRate: nil, // plain (non-speculative) decode
             submitTime: out.submitTime,
             tokenTimes: out.tokenTimes,
-            prefillDurationSeconds: out.prefillDurationSeconds)
+            prefillDurationSeconds: out.prefillDurationSeconds,
+            requestStartMetrics: out.requestStartMetrics)
     }
 
     func logprobs(prompt: [Int], config: RunConfig) async throws -> [[Float]] {
@@ -1308,6 +2229,34 @@ func captureCompressedKVAttentionRuntimeSourceSnapshot(
             at: modelPath))
 }
 
+/// Turns the source snapshots sampled around model loading into the path-free identity carried
+/// by the model actor. Disabled caches do not consume an identity even when the same snapshots
+/// were captured for compressed-attention admission.
+func resolveExactPrefixRuntimeIdentitySource(
+    configuration: ExactPrefixCacheConfiguration,
+    sourceBeforeLoad:
+        CompressedKVAttentionRuntimeSourceSnapshot?,
+    sourceAfterLoad:
+        CompressedKVAttentionRuntimeSourceSnapshot?,
+    modelInstanceID: String = UUID().uuidString.lowercased()
+) throws -> ExactPrefixRuntimeIdentitySource? {
+    guard configuration.policy.isEnabled else {
+        return nil
+    }
+    guard let sourceBeforeLoad, let sourceAfterLoad else {
+        throw ExactPrefixRuntimeError.missingRuntimeIdentity
+    }
+    let stableSource = try
+        CompressedKVAttentionRuntimeSourceSnapshot.validateUnchanged(
+            before: sourceBeforeLoad,
+            after: sourceAfterLoad)
+    let admission = try CompressedKVAttentionRuntimeAdmission.load(
+        sourceSnapshot: stableSource)
+    return try ExactPrefixRuntimeIdentitySource(
+        admission: admission,
+        modelInstanceID: modelInstanceID)
+}
+
 func loadSwiftDriver(
     modelPath: String,
     requireKVTunerQualificationIdentity: Bool = false,
@@ -1316,6 +2265,8 @@ func loadSwiftDriver(
     compressedKVAttention: CompressedKVAttentionRequest? = nil,
     compressedKVAttentionExpectedCheckpointContentSHA256:
         String? = nil,
+    exactPrefixCacheConfiguration:
+        ExactPrefixCacheConfiguration = .disabled,
     memoryLimitBytes: Int? = nil,
     memoryCacheLimitBytes: Int =
         KVTunerSensitivityCaptureEnvironment.requiredMemoryCacheLimitBytes
@@ -1342,6 +2293,7 @@ func loadSwiftDriver(
         compressedKVAttention != nil
         || compressedKVAttentionExpectedCheckpointContentSHA256 != nil
         || kvtunerSelection != nil
+        || exactPrefixCacheConfiguration.policy.isEnabled
     let compressedSourceBeforeLoad = requiresCompressedAttentionAdmission
         ? try captureCompressedKVAttentionRuntimeSourceSnapshot(
             modelPath: modelPath)
@@ -1381,14 +2333,18 @@ func loadSwiftDriver(
     }
     let compressedAdmission:
         CompressedKVAttentionRuntimeAdmission?
+    let compressedSourceAfterLoad:
+        CompressedKVAttentionRuntimeSourceSnapshot?
     if let compressedSourceBeforeLoad {
-        let compressedSourceAfterLoad = try
+        let loadedCompressedSourceAfterLoad = try
             captureCompressedKVAttentionRuntimeSourceSnapshot(
                 modelPath: modelPath)
+        compressedSourceAfterLoad =
+            loadedCompressedSourceAfterLoad
         let stableCompressedSource = try
             CompressedKVAttentionRuntimeSourceSnapshot.validateUnchanged(
                 before: compressedSourceBeforeLoad,
-                after: compressedSourceAfterLoad)
+                after: loadedCompressedSourceAfterLoad)
         let admission = try CompressedKVAttentionRuntimeAdmission.load(
             sourceSnapshot: stableCompressedSource)
         _ = try resolveSwiftEngineCacheSelection(
@@ -1402,10 +2358,24 @@ func loadSwiftDriver(
         compressedAdmission = admission
     } else {
         compressedAdmission = nil
+        compressedSourceAfterLoad = nil
     }
+    let exactPrefixRuntimeIdentitySource = try
+        resolveExactPrefixRuntimeIdentitySource(
+            configuration: exactPrefixCacheConfiguration,
+            sourceBeforeLoad: compressedSourceBeforeLoad,
+            sourceAfterLoad: compressedSourceAfterLoad)
     let engine = HarnessEngineActor(
         model: ctx.model,
-        kvtunerRuntimeIdentity: runtimeIdentity)
+        kvtunerRuntimeIdentity: runtimeIdentity,
+        exactPrefixCacheConfiguration:
+            exactPrefixCacheConfiguration,
+        exactPrefixRuntimeIdentitySource:
+            exactPrefixRuntimeIdentitySource)
+    await engine.prepareExactPrefixRuntimeIdentity()
+    if exactPrefixCacheConfiguration.eagerWarmupEnabled {
+        _ = try await engine.performExactPrefixWarmup()
+    }
     return (
         SwiftEngineDriver(
             engine: engine,

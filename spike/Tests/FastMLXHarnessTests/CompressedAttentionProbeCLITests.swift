@@ -306,6 +306,41 @@ final class CompressedAttentionProbeCLITests: XCTestCase {
         XCTAssertEqual(first.tokenizerSHA256, changed.tokenizerSHA256)
     }
 
+    func testTokenizerManifestAuthenticatesStandaloneChatTemplates()
+        throws
+    {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("{\"version\":\"1\"}".utf8).write(
+            to: directory.appendingPathComponent("tokenizer.json"))
+
+        let tokenizerOnly = try ProvenanceCLI.tokenizerManifestSHA256(
+            at: directory.path)
+        try Data("not tokenizer input".utf8).write(
+            to: directory.appendingPathComponent("README.md"))
+        XCTAssertEqual(
+            tokenizerOnly,
+            try ProvenanceCLI.tokenizerManifestSHA256(at: directory.path))
+
+        let jinjaURL = directory.appendingPathComponent("chat_template.jinja")
+        try Data("{{ messages | length }}".utf8).write(to: jinjaURL)
+        let withJinja = try ProvenanceCLI.tokenizerManifestSHA256(
+            at: directory.path)
+        XCTAssertNotEqual(tokenizerOnly, withJinja)
+
+        try Data("{{ messages[0].content }}".utf8).write(to: jinjaURL)
+        let changedJinja = try ProvenanceCLI.tokenizerManifestSHA256(
+            at: directory.path)
+        XCTAssertNotEqual(withJinja, changedJinja)
+
+        let jsonURL = directory.appendingPathComponent("chat_template.json")
+        try Data("{\"chat_template\":\"{{ messages }}\"}".utf8).write(
+            to: jsonURL)
+        XCTAssertNotEqual(
+            changedJinja,
+            try ProvenanceCLI.tokenizerManifestSHA256(at: directory.path))
+    }
+
     func testFullContentCheckpointManifestAuthenticatesSafeShardAliases()
         throws
     {

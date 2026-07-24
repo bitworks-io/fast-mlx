@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-24",
+  "feature": "exact-prefix-session-cache",
+  "classification": "EXACT",
+  "source": {
+    "gitSHA": "ecd2915a0c4cd036169c7865db9dd07df8b68ca8",
+    "binarySHA256": "477ab6b27dc8042bba393c586b069bf70ea4b230aa5d6400447757141e8e2cdf",
+    "sourceStampSHA256": "66292eafa6ad7c008d122c5169e8fb160a10464ae6ee23fcc0b11858c1a93ccc",
+    "verificationReceiptSHA256": "9a5bf6d29247bc68768d4404e80f9dbb4161ece58f3844b1e9a9c2fde75eb814",
+    "verificationRoot": "/Users/llmbench/perf-work/results/exact-prefix-session-cache-ecd2915/clean-verification-v1"
+  },
+  "verification": {
+    "harnessCoreXCTest": {
+      "executed": 584,
+      "failures": 0
+    },
+    "swiftTesting": {
+      "executed": 17,
+      "failures": 0
+    },
+    "fastMLXHarnessTests": {
+      "executed": 140,
+      "failures": 0
+    },
+    "exactPrefixMLXTests": {
+      "executed": 8,
+      "failures": 0
+    },
+    "spikeCoreTests": {
+      "executed": 163,
+      "failures": 0
+    },
+    "releaseBuildSucceeded": true
+  },
+  "criteria": [
+    {
+      "id": "selected-prefix-provenance",
+      "verdict": "PASS",
+      "evidence": "Schema 3 binds every reused prefix to prompt-only or final-context source case, exact token count, and exact token SHA-256; Qwen partial-hit selected cold-commit-A final-context."
+    },
+    {
+      "id": "temperature-zero-byte-identity",
+      "verdict": "PASS",
+      "evidence": "All 11 retained Phi cases and all 11 retained Qwen cases match their cache-off reference output and generated-token hashes."
+    },
+    {
+      "id": "exact-engagement-and-warm-benefit",
+      "verdict": "PASS",
+      "evidence": "Phi and Qwen both pass exact engagement, pressure eviction, template/token reuse, eager warmup, and every strict warm-request-start comparison."
+    },
+    {
+      "id": "bounded-retention",
+      "verdict": "PASS_MODEL_SCOPED",
+      "evidence": "Phi and Qwen remain inside explicit entry, retained-byte, MLX cache, MLX peak, and sampled-footprint limits. Llama is retained as a terminal negative boundary."
+    },
+    {
+      "id": "independent-family-proof",
+      "verdict": "PASS",
+      "evidence": "Qwen3 dense GQA and materially different Phi3 LongRoPE/inert-window geometry independently pass. Llama-3.3-70B is independently measured and rejected on this host."
+    },
+    {
+      "id": "public-default-or-serving-route",
+      "verdict": "NOT_AUTHORIZED",
+      "evidence": "The feature remains disabled by default and scalar-only. No OpenAI-compatible serving route, continuous-batch integration, compressed-cache support, or SSD tier follows."
+    }
+  ],
+  "modelEvidence": {
+    "phi4Mini": {
+      "state": "COMPLETE",
+      "schemaVersion": 3,
+      "promotable": true,
+      "cases": 11,
+      "outputRoot": "/Users/llmbench/perf-work/results/exact-prefix-session-cache-ecd2915/phi4-mini-v2",
+      "evidenceSHA256": "23ae9dae913f00d2bfcc3fb3370910c10044c4ca0c319d5be35d4d9aa5458c0d",
+      "completionSHA256": "9ea32d070570975890695df7f6b5caaa17edd401fbbede7ba0d903be70d99688",
+      "finalizationSHA256": "df3c0e678ed71e3c47db648e2b20577dac45f1bf46ada7b749b14656b8b88478",
+      "launchReceiptSHA256": "5bba1502843759ab886bf077c37a5bf24e920152d3722f9dd04d6da2293d47f5",
+      "exactHitRequestStartImprovementPercent": 36.14,
+      "partialHitRequestStartImprovementPercent": 4.88,
+      "postWarmupHitVsControlImprovementPercent": 27.23,
+      "maxSampledFootprintBytes": 7566578440,
+      "maxRetainedPrefixBytes": 185633120
+    },
+    "qwen3_32B": {
+      "state": "COMPLETE",
+      "schemaVersion": 3,
+      "promotable": true,
+      "cases": 11,
+      "outputRoot": "/Users/llmbench/perf-work/results/exact-prefix-session-cache-ecd2915/qwen3-32b-v2",
+      "evidenceSHA256": "1c19b0b0ded991d4b089c4227da8c550d13f5b552ca25c1365d9ce784942c9be",
+      "completionSHA256": "c166f3b1aa1334dbd1de440edf5fbf3a6e53180bbbf19bde7cfe4d3e864fe369",
+      "finalizationSHA256": "52fe5176cf36b1382acbae50913cdc7dd4235f2ed4e99d39cf00e0b40402bd24",
+      "launchReceiptSHA256": "d032827e4756f4ef1787e6faf62381a008ed0ae84b58d67130b3abb7cc43a83f",
+      "partialHitSourceCaseID": "cold-commit-A",
+      "partialHitSourceKind": "final-context",
+      "partialHitReusedPrefixTokens": 202,
+      "exactHitRequestStartImprovementPercent": 76.67,
+      "partialHitRequestStartImprovementPercent": 29.28,
+      "postWarmupHitVsControlImprovementPercent": 77.0,
+      "maxSampledFootprintBytes": 58312761976,
+      "maxRetainedPrefixBytes": 434169120
+    },
+    "llama3_70B": {
+      "state": "FAILED",
+      "schemaVersion": 3,
+      "promotable": false,
+      "outputFinalized": false,
+      "diagnosticCasesPublished": 11,
+      "outputRoot": "/Users/llmbench/perf-work/results/exact-prefix-session-cache-ecd2915/llama3-70b-v2",
+      "launcherFailureSHA256": "e550e12bd9486fbc0701bc7b86e379d4833634212aa66e960f8d05083f656500",
+      "launcherLogSHA256": "116d185ced4c3cfd5d32517e6a008d2afec04f7c05898612d997519d04475b34",
+      "diagnosticEvidenceSHA256": "a7827f920741612da3b4356169990cc0fd4c26afd7cd556e9b39bec56e68962c",
+      "diagnosticCompletionSHA256": "be9a80f9bbdf759575462bbb811a51acf4b085bb08cdd712af2050cee8683e0e",
+      "statusSHA256": "d2eaded830817a6b6b8dbea4760957dd08cc0f4ec4e7873c62d2f0d480c68d55",
+      "exitStatus": 137,
+      "signal": 9,
+      "configuredMemoryLimitBytes": 103079215104,
+      "maxCaseSampledFootprintBytes": 122953061984,
+      "postRevalidationFootprintBytes": 162584577424,
+      "hostRAMBytes": 137438953472,
+      "diagnosticByteIdentityPassed": true,
+      "diagnosticEngagementPassed": true,
+      "diagnosticWarmBenefitPassed": true,
+      "diagnosticBoundedPassed": false,
+      "rejection": "The process exceeded the explicit proof memory bound and was killed before terminal status and finalization; no diagnostic row can promote."
+    }
+  },
+  "overall": {
+    "verdict": "PASS_MODEL_SCOPED",
+    "promotedModels": [
+      "Qwen3-32B-4bit",
+      "Phi-4-mini-instruct-4bit"
+    ],
+    "rejectedModels": [
+      "Llama-3.3-70B-Instruct-4bit on the measured 128-GiB host"
+    ],
+    "broadDefaultAuthorized": false,
+    "productionServingRouteAuthorized": false,
+    "nextRoadmapItem": "continuous-batching serving route"
+  }
+}

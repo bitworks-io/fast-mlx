@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-23
+Last reviewed: 2026-07-24
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -249,25 +249,58 @@ Machine-readable verification packet SHA-256 is
 This completes the fused compressed-attention engineering gate as model-scoped, explicit-only
 implementation plus negative evidence; it does not authorize a broad/default route.
 
-**Content practice:** `docs/content/` now has 14 dated pieces. Keep writing one dated content piece per
+**Exact prefix/session cache — COMPLETE, MODEL-SCOPED (2026-07-24):** the internal scalar
+request-start path is implemented, disabled by default, and promoted for the authenticated
+Qwen3-32B and Phi-4-mini snapshots. It admits only actor-owned, full-attention dense
+`CompiledKVCache` state with observed native `float16` or `bfloat16` storage. Exact semantic keys
+bind caller isolation, model/tokenizer, prompt/template/tools, KV route, position/architecture
+state, and drafter state. Longest-prefix reuse, success-only publication, mandatory entry/byte
+budgets, eager warmup, separate template/token caches, in-place restore, and
+logical-versus-physical prefill telemetry are verified.
+
+Clean `ecd2915a0c4cd036169c7865db9dd07df8b68ca8` adds schema-v3 proof provenance for the actual
+selected prefix source: prompt-only or final-context source case, token count, and token SHA-256.
+It passes 584 HarnessCore XCTest plus 17 Swift Testing tests off-box; 140/140
+`FastMLXHarnessTests`, 8/8 `ExactPrefixMLXTests`, 163/163 `SpikeCoreTests`, and the Release build.
+Clean verification receipt SHA-256 is
+`9a5bf6d29247bc68768d4404e80f9dbb4161ece58f3844b1e9a9c2fde75eb814`.
+
+Fresh Phi and Qwen outputs each complete 11/11 with byte identity, bounded engagement, and strict
+warm request-start benefit. Qwen's former partial-hit failure now binds the real 202-token
+`cold-commit-A` final context by exact hash/count. Their evidence SHA-256 values are
+`23ae9dae913f00d2bfcc3fb3370910c10044c4ca0c319d5be35d4d9aa5458c0d` and
+`1c19b0b0ded991d4b089c4227da8c550d13f5b552ca25c1365d9ce784942c9be`.
+
+Llama-3.3-70B is a terminal negative on the measured 128-GiB host. Its 11 diagnostic rows were
+byte-identical, engaged, and faster, but max per-case footprint was 122,953,061,984 bytes against
+the explicit 96-GiB proof limit. Full checkpoint revalidation raised process footprint to
+162,584,577,424 bytes, and macOS killed it before terminal status/finalization. Failure SHA-256 is
+`e550e12bd9486fbc0701bc7b86e379d4833634212aa66e960f8d05083f656500`; do not retry unchanged or
+promote its diagnostic rows.
+
+Unsupported compressed, sliding/recurrent/hybrid/MLA, vision/media, speculative, and
+continuous-batch state still fails closed. No public/default flag, production service route, or
+SSD tier follows. Verdict:
+[`2026-07-24-exact-prefix-session-cache.md`](superpowers/verdicts/2026-07-24-exact-prefix-session-cache.md);
+plan:
+[`2026-07-23-exact-prefix-session-cache.md`](superpowers/plans/2026-07-23-exact-prefix-session-cache.md).
+
+**Content practice:** `docs/content/` now has 15 dated pieces. Keep writing one dated content piece per
 notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Exact prefix/session cache + request-start stack** — hot-cache TTFT, positive commit, eager
-   warmup, template/tokenize cache; SSD later. Design over batching/cache ownership.
-   [Task](task-inbox/2026-07-12-exact-prefix-session-cache.md).
-2. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
+1. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
    propagation, dynamic policy boundaries. [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
-3. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
+2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-4. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
+3. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
    porting the L1/L3/L1b/L3b stack. [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-5. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
+4. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
    MLX checkpoints for the Swift loop. [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-6. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
+5. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
    Metal watchdog. [Task](task-inbox/2026-07-14-long-context-metal-watchdog.md).
-7. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
+6. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
    baselines exist. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 
 **Public evidence/community platform — ROADMAP CAPTURED (2026-07-15).** The
@@ -330,6 +363,7 @@ swift run fastmlx-capacity --box m3Ultra512
 # On-box MLX/SpikeCore/engine checks:
 bash spike/scripts/sync_llmbench.sh
 ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:SpikeCoreTests'
+ssh llmbench@192.168.1.252 'cd ~/fast-mlx-spike && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" -skipPackagePluginValidation -only-testing:ExactPrefixMLXTests'
 ```
 
 Models on `llmbench`: `~/perf-work/models/` (Qwen3-32B-4bit and 8-bit staged; the complete,

@@ -35,6 +35,11 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" \
   -skipPackagePluginValidation -only-testing:SpikeCoreTests
 
+# Run in a separate xcodebuild invocation to isolate pointer-keyed MLX compiled state.
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild test -scheme fast-mlx-spike-Package -destination "platform=macOS" \
+  -skipPackagePluginValidation -only-testing:ExactPrefixMLXTests
+
 <fastmlx-harness> verify --model <model> --spec pld --n 120
 <fastmlx-harness> verify --model <model> --spec pld --n 120 --compiled-verify true
 bash scripts/bench_pld_shapes.sh <model> 3 256
@@ -537,3 +542,28 @@ SHA-256 `52d1865b27c78a69d7c2b4c371f1d8d8d3acf346aaafad4b4d329d2bfe238ef8`.
 teacher-forced non-garbage floor pass. The 8K speed gate fails; long-context rows are capacity
 context only; the invalid fp16 task reference makes paired task qualification unavailable.
 Generic-window and broad/default claims remain rejected.
+
+## Exact prefix/session cache model-scoped closure — 2026-07-24
+
+**Story:** a repeated scalar request can reuse the longest exact, actor-owned dense prefix without
+changing temperature-zero output, crossing an isolation boundary, restoring incompatible state, or
+retaining unbounded unified memory.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Exact pure contracts | **PASS** | Clean `ecd2915a0c4cd036169c7865db9dd07df8b68ca8` passes 584 HarnessCore XCTest plus 17 Swift Testing tests. Coverage includes semantic-key isolation, longest-prefix/LRU selection, hard entry/byte budgets, durable pre-allocation eviction, protected-primary skip, success-only publication, corrupt-hit invalidation, template/token cache separation, selected-prefix source provenance, and complete request-start telemetry validation. |
+| Dense snapshot/restore integrity | **PASS** | Focused Xcode `ExactPrefixMLXTests` pass 8/8 on `llmbench`. Native `float16` and `bfloat16` snapshots detach correctly, restore in place, preserve control/cache identities, and fail closed on actual-versus-configured dtype, byte count, layer count, rank, batch, KV-head, head-dimension, and heterogeneous-layer mismatches. |
+| Actor request lifecycle and selected source | **PASS** | The 140/140 clean `FastMLXHarnessTests` include cold commit, exact hit, longer-final-context partial selection, A/B/A isolation, cancellation/error/zero/pad rejection, restore-failure invalidation plus same-request cold recovery, eager warmup, bounded admission, unsupported route rejection, and logical-versus-physical work accounting. Schema 3 binds source case, source kind, token count, and token SHA-256. |
+| Apple regression and build | **PASS** | The synchronized clean suite passes 163/163 `SpikeCoreTests`; the Release build succeeds with `-skipPackagePluginValidation`. Clean binary SHA-256 is `477ab6b27dc8042bba393c586b069bf70ea4b230aa5d6400447757141e8e2cdf`. Verification receipt SHA-256 is `9a5bf6d29247bc68768d4404e80f9dbb4161ece58f3844b1e9a9c2fde75eb814`. |
+| Phi loaded-model acceptance | **PASS / MODEL-SCOPED** | Fresh `phi4-mini-v2` completes 11/11 schema-v3 cases with byte identity, bounded engagement, pressure eviction, warmup/template reuse, and strict warm benefit. Evidence/finalization SHA-256 values are `23ae9dae913f00d2bfcc3fb3370910c10044c4ca0c319d5be35d4d9aa5458c0d` and `df3c0e678ed71e3c47db648e2b20577dac45f1bf46ada7b749b14656b8b88478`. |
+| Qwen loaded-model acceptance | **PASS / MODEL-SCOPED** | Fresh `qwen3-32b-v2` completes 11/11 schema-v3 cases. Its former failure now proves `partial-hit` selected the 202-token `cold-commit-A` final context by exact hash/count and prefetched only the 209-token tail. Evidence/finalization SHA-256 values are `1c19b0b0ded991d4b089c4227da8c550d13f5b552ca25c1365d9ce784942c9be` and `52fe5176cf36b1382acbae50913cdc7dd4235f2ed4e99d39cf00e0b40402bd24`. |
+| Llama loaded-model acceptance | **FAIL / RETAIN NEGATIVE** | Fresh `llama3-70b-v2` published 11 diagnostic rows but exceeded its explicit proof memory bound: max per-case footprint 122,953,061,984 bytes versus 103,079,215,104 configured. Post-run source revalidation raised footprint to 162,584,577,424 bytes on a 137,438,953,472-byte host; macOS killed the process before terminal status/finalization. Failure SHA-256 is `e550e12bd9486fbc0701bc7b86e379d4833634212aa66e960f8d05083f656500`. Diagnostic evidence is non-promotable and must not be retried unchanged. |
+| Focused review and scope boundary | **PASS / INTERNAL ONLY** | Independent code and launcher reviews found no issues. The feature remains disabled by default and scalar-only; compressed, sliding/recurrent/hybrid/MLA, vision/media, speculative, and continuous-batch state rejects. No public API, default, SSD, continuous-batch, or broad-model claim follows. |
+
+Machine-readable criterion mapping:
+[`exact-prefix-session-cache-verification-2026-07-24.json`](superpowers/verdicts/exact-prefix-session-cache-verification-2026-07-24.json),
+SHA-256 `a76dc39f30cd4c213c56a1346b8bb3671002bd63af4158f3b4c83917f7601a53`.
+
+**Overall verdict: PASS, MODEL-SCOPED for Qwen3-32B and Phi-4-mini; Llama-3.3-70B rejected on
+the measured host.** The next safe action is the production continuous-batching serving-route
+gate, not a public/default cache switch or an unchanged Llama retry.
