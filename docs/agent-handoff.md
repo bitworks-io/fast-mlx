@@ -353,6 +353,10 @@ is already available.
   `llmbench@192.168.1.253` instead presents Dropbear 2022.83 with only an RSA host key, not the
   expected macOS OpenSSH Remote Login identity. No key was trusted and no credential or workload
   was sent.
+- **Update 2026-07-25:** the `.253` Mac host now reaches the expected OpenSSH identity and the
+  staged Qwen3-32B-4bit snapshot plus fresh dedicated verification boundary are both
+  authenticated read-only. Keep the historical Dropbear note for the earlier mismatch, but do not
+  treat it as the current blocker.
 - **Next safe action:** correct or confirm the `.253` network/Remote Login mapping, authenticate
   that host read-only, then derive and independently review a fresh desktop-specific 24-hour soak
   packet. Do not copy `.252` paths or its 140-W laptop power contract onto `.253`.
@@ -401,9 +405,10 @@ notable spike, including negative results.
 ## Open Work Queue
 
 1. **Continuous-batching serving route Phase 5** — Phase 4 solo PLD is exact but fails the speed
-   gate and is shelved; product smoke v8 and bounded transport preflight v2 pass. Correct the
-   `.253` host identity, derive and review a fresh host-specific resident soak packet, then finish
-   soak, redaction/provenance proof, final review, and merge only after fresh proof.
+   gate and is shelved; product smoke v8 and bounded transport preflight v2 pass. The `.253` host
+   admission and staged model snapshot are now authenticated; derive and review a fresh
+   host-specific resident soak packet, then finish soak, redaction/provenance proof, final review,
+   and merge only after fresh proof.
    [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
 2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
