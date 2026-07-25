@@ -639,17 +639,19 @@ SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
 This checkpoint is non-promotable and does not replace the required 24-hour resident transport
 soak, final release proof, or merge.
 
-## Phase 5 dedicated M3 Ultra verification v2 — 2026-07-25
+## Phase 5 dedicated M3 Ultra verification v3 — 2026-07-25
 
 **Story:** a dedicated `llmbench@192.168.1.253` Mac host can authenticate the staged
-Qwen3-32B-4bit model tree and complete the fresh source/binary verification boundary without
-reusing v1 or any `.252` artifact.
+Qwen3-32B-4bit model tree and complete a fresh, exact-source-bound binary verification boundary
+without reusing v1, v2, or any `.252` artifact.
 
 | Acceptance criterion | Verdict | Fresh evidence |
 | --- | --- | --- |
 | Read-only host and snapshot admission | **PASS** | `ssh` to `llmbench@192.168.1.253` with the pinned known-host file returns `LLM-256GB.localdomain` on macOS 26.5.2 build 25F84 with Apple M3 Ultra and 274,877,906,944 bytes of memory. The staged model tree `/Users/llmbench/perf-work/models/Qwen3-32B-4bit` contains exactly 12 top-level regular files, 0 symlinks, 0 special files, and 18,445,872,022 total bytes. All receipt-listed file sizes and SHA-256 values match the on-disk files; the model index references exactly four shard files. Receipt SHA-256 is `7853c49616b05e2fd4fa043448959d1c0d6f5a7821967e26cfa80c91865941e5`. |
-| Fresh verification boundary | **PASS** | Fresh output `/Users/llmbench/perf-work/results/continuous-serving-phase5-verify-1c084f3-m3ultra-v2` finishes `PASS` with `status.json` SHA-256 `52bb5a6fbb81a3f236443847c89b25d2740934cc94402a5c097b34c1fb6d499e` and `status.txt` SHA-256 `c26de83abdc9496cd1301470918ec39ecca1cf389ef0ae1c6504da1800d1c431`. The launcher keeps no failure or retain-lock artifact. Xcode tests report 140 `FastMLXHarnessTests`, 194 `SpikeCoreTests`, 51 `SpikeServingAdaptersTests`, and 4 skips; Release build succeeds. Log SHA-256 values are `dbb730d8918ccf941c7d3f40d44560d2ff2fb2859890c05b51f16f2d96159886` for xcode tests and `74df0bac620bebb684c70a929580d5e030410489de5f2a9e413fad2167833822` for the release build. |
+| Historical v2 boundary | **NON-PROMOTABLE / PRESERVED** | V2 passed its test/build commands, but review found that it authenticated only the source stamp and `Package.resolved`, not the complete mutable checkout. It remains unchanged as verification history and is not the source/binary proof used by the soak. |
+| Exact source provenance | **PASS** | Fresh v3 builds from an isolated snapshot authenticated against exactly 527 tracked files. Manifest SHA-256 is `a84b8c9b4de50766c1ec83ed818a4ff76d12128bf77df82a1c831357208bb328`; exact pre/post path sets match, no source symlink is admitted, and identical pre/post verification logs hash to `aa0fde724cd8b17507ed5ec6531a890afaa9369319b208958990fb6131a78f44`. |
+| Fresh verification boundary | **PASS** | Fresh output `/Users/llmbench/perf-work/results/continuous-serving-phase5-verify-1c084f3-m3ultra-v3` finishes `PASS` with no failure, retained lock, active process, or stale lock. `status.json` and `artifacts.sha256` hash to `71c16900032b1b4f5d69afad769891b7f4aaca5677d9fb0b8cbb1f2811515d5f` and `82107f4537c15fdf73fcd28a72d1d4f81ca55eb8db2d64c44afc2729ed88b591`. Xcode tests report 140 `FastMLXHarnessTests`, 194 `SpikeCoreTests`, 51 `SpikeServingAdaptersTests`, and 4 skips; Release succeeds. Xcode and Release logs hash to `d412e19e66a733908066f84068ffec708494f12f1074d956a1db0f56123bf4b1` and `03dc7b9b247d56656eaae2409033c2f1e000fa3cbde97d1415e033499c040b21`; the fresh server binary hashes to `50c50ff42ace01bc714f13f307f72d488b84e43e124b564cecd5c23ca18c7d9c`. |
 
 Machine-readable criterion mapping:
 [`continuous-serving-phase5-verify-2026-07-25.json`](superpowers/verdicts/continuous-serving-phase5-verify-2026-07-25.json)
-SHA-256 `d10a3acb16c899855bf2cf31f12a974aa83c2f61526ad4ad38eb1761e1d89838`.
+SHA-256 `393351a591c67110d80ba8f5fa6028e18b29c2b173bd93678402991e3d493f9d`.
