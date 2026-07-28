@@ -25,7 +25,7 @@ func bench(modelPath: String, prompt: String, maxTokens: Int, runs: Int, engine:
         var ttfts: [Double] = []
 
         for i in 0...runs { // run 0 = warmup, dropped from the average
-            if i > 0 { await actor.resetForNewRun() }
+            if i > 0 { try await actor.resetForNewRun() }
             let salted = "[run-\(i)-\(nonce)] \(prompt)"
             let promptTokens = tokenizer.encode(text: salted)
 

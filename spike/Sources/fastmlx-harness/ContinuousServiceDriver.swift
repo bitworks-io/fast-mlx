@@ -160,6 +160,9 @@ struct ContinuousSwiftServiceDriver: Sendable {
         // MLX peak is process-global and otherwise retains model-load/warmup history. Reset only
         // the counter (not active/cache allocations) so each run's peak describes that burst.
         Memory.peakMemory = 0
+        guard let resourcesBeforeRun = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
         let memoryStart = serviceMemorySample()
         let submittedAt = serviceClockSeconds()
         let handles = try await coordinator.submitBatch(
@@ -245,9 +248,15 @@ struct ContinuousSwiftServiceDriver: Sendable {
                     tokenTimes: times,
                     completedAt: completedAt))
         }
+        guard let completionResources = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
         return ContinuousServiceRunObservation(
             metrics: try measureServiceRun(timelines),
-            operations: summarizeServiceOperations(ticks),
+            operations: summarizeServiceOperations(
+                ticks,
+                speculationStartSnapshot: resourcesBeforeRun.speculation,
+                speculationEndSnapshot: completionResources.speculation),
             memory: try summarizeServiceMemory(memory),
             memorySamples: memory,
             resources: resources,
@@ -280,6 +289,9 @@ struct ContinuousSwiftServiceDriver: Sendable {
         _ = await coordinator.takeExecutionTrace()
         _ = await coordinator.takeTimingTrace()
         Memory.peakMemory = 0
+        guard let resourcesBeforeRun = await coordinator.runtimeResourceSnapshot() else {
+            throw ContinuousServiceDriverError.missingRuntimeResources
+        }
         var memory = [serviceMemorySample()]
         var ticks: [ServiceTickObservation] = []
         let initial = try await coordinator.submitBatch(
@@ -478,7 +490,10 @@ struct ContinuousSwiftServiceDriver: Sendable {
             cancelledPrefixTokens: emittedTokenCount(previousPhase),
             survivorOutputTokens: survivorOutputTokens,
             replacementOutputTokens: replacementTokens.count,
-            operations: summarizeServiceOperations(ticks),
+            operations: summarizeServiceOperations(
+                ticks,
+                speculationStartSnapshot: resourcesBeforeRun.speculation,
+                speculationEndSnapshot: resourcesAtEnd.speculation),
             memory: try summarizeServiceMemory(memory),
             resourcesAtAdmission: resourcesAtAdmission,
             resourcesBeforeCancellation: resourcesBeforeCancellation,
@@ -557,7 +572,7 @@ private func observedServiceTick(
 }
 
 private func collectServiceTokens(
-    _ stream: AsyncThrowingStream<Int, Error>
+    _ stream: ContinuousBatchTokenStream
 ) async throws -> [Int] {
     var tokens: [Int] = []
     for try await token in stream { tokens.append(token) }

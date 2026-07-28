@@ -95,7 +95,7 @@ func equiv(modelPath: String, prompt: String, n: Int, engine: Engine, rounds: In
         let (actor, tokenizer, eosId) = try await loadActor(modelPath: modelPath, engine: engine)
         let promptTokens = tokenizer.encode(text: prompt)
         for round in 0 ..< max(rounds, 1) {
-            if round > 0 { await actor.resetForNewRun() }
+            if round > 0 { try await actor.resetForNewRun() }
             var ids: [Int] = []
             for try await id in await actor.submit(promptTokens: promptTokens, maxTokens: n, eos: eosId) {
                 ids.append(id)

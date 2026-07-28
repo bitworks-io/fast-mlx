@@ -18,6 +18,30 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
     fileprivate let headDimension: Int
     fileprivate let elementBytes: Int
 
+    public var verifiedModelFamily: CompressedKVAttentionModelFamily {
+        modelFamily
+    }
+
+    public var modelConfigurationSHA256: String {
+        modelConfigSHA256
+    }
+
+    public var maximumContextTokens: Int {
+        maxPositionEmbeddings
+    }
+
+    public var verifiedLayerCount: Int {
+        layerCount
+    }
+
+    public var verifiedKeyValueHeadCount: Int {
+        keyValueHeadCount
+    }
+
+    public var verifiedHeadDimension: Int {
+        headDimension
+    }
+
     private struct Configuration: Decodable {
         let modelType: String
         let maxPositionEmbeddings: Int
@@ -173,11 +197,22 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     case decodeBeforeFinalPrefill(BatchRequestID)
     case drainWithoutPendingLookahead(BatchRequestID)
     case pendingLookaheadInBatch(BatchRequestID)
+    case speculativeDrainRequired(BatchRequestID)
+    case speculationStateMismatch(BatchRequestID)
     case invalidBatchMembership([BatchRequestID])
+    case incompatibleDecodeCohort([BatchRequestID])
     case speculationUnsupported
     case cacheLayerMismatch(BatchRequestID, expected: Int, actual: Int)
     case cacheLengthMismatch(BatchRequestID, expected: Int, actual: Int)
     case contextLimitExceeded(BatchRequestID, requested: Int, limit: Int)
+    case requestReservedContextLimitExceeded(
+        BatchRequestID,
+        requested: Int,
+        limit: Int)
+    case requestReservedKVByteLimitExceeded(
+        BatchRequestID,
+        requested: Int,
+        limit: Int)
     case aggregateContextLimitExceeded(requested: Int, limit: Int)
     case aggregateKVByteLimitExceeded(requested: Int, limit: Int)
     case kvByteAccountingOverflow
@@ -190,6 +225,7 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     case unsupportedCompressedBatchCache
     case invalidTokenID(BatchRequestID, Int)
     case positionOverflow(BatchRequestID)
+    case speculationTelemetryOverflow
 }
 
 struct DenseContinuousBatchRuntimeDiagnostics: Equatable {
@@ -215,15 +251,20 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private struct Slot {
+        let incarnation: UUID
         let totalPromptTokens: Int
         let maxOutputTokens: Int
         var processedTokens: Int
         var cachedTokens: Int
+        var emittedTokens: Int
         var prefillComplete: Bool
-        var hasPendingSoloLookahead: Bool
+        let decodeCohort: BatchDecodeCohort
+        var soloPipelineState: BatchSoloPipelineState
+        var pldSession: IncrementalPLDSession?
         var scalarCaches: [any ContinuousScalarKVCache]?
         var stagedToken: MLXArray?
         var scalarStep: Step?
+        var scalarVerifySteps: [Int: Step]
         var scalarTraceCounter: TraceCounter?
     }
 
@@ -234,6 +275,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
 
     private struct BatchState {
         let ids: [BatchRequestID]
+        let incarnations: [UUID]
         let caches: [any ContinuousBatchedKVCache]
         var stagedTokens: MLXArray
         var step: Step?
@@ -253,12 +295,19 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     private let expectedKVHeadDimension: Int
     private let expectedKVElementBytes: Int
     private let maxReservedKVBytes: Int
+    private let soloPLDConfiguration: SpecDecodeConfig?
     private var slots: [BatchRequestID: Slot] = [:]
+    private var speculativePromptTokens: [BatchRequestID: [Int]] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
     private var kvCapacityReservations: [BatchRequestID: Int] = [:]
     private var reservedKVBytes = 0
     private var cacheGeometryCalibrated = false
     private var batch: BatchState?
+    private var speculationRequestedRequests = 0
+    private var speculationDraftedTokens = 0
+    private var speculationAcceptedDraftTokens = 0
+    private var speculationVerificationRounds = 0
+    private var speculationFallbackRounds = 0
 
     package init(
         model: any LanguageModel,
@@ -270,7 +319,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         maxReservedKVBytes: Int? = nil,
         kvCacheKind: KVCacheKind = .fp16,
         affineAttentionMode: AffineKVAttentionMode = .materialize,
-        compressedKVAttentionAdmission: CompressedKVAttentionRuntimeAdmission? = nil
+        compressedKVAttentionAdmission: CompressedKVAttentionRuntimeAdmission? = nil,
+        soloPLDConfiguration: SpecDecodeConfig? = nil
     ) throws {
         guard allocationChunk > 0 else {
             throw DenseContinuousBatchRuntimeError.invalidAllocationChunk(allocationChunk)
@@ -288,6 +338,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard initialDecodeReserve > 0 else {
             throw DenseContinuousBatchRuntimeError.invalidInitialDecodeReserve(
                 initialDecodeReserve)
+        }
+        guard soloPLDConfiguration == nil || kvCacheKind.supportsSpecDecode else {
+            throw DenseContinuousBatchRuntimeError.speculationUnsupported
         }
         let resolvedReservationLimit = maxReservedContextTokens ?? resolvedContextLimit
         guard resolvedReservationLimit > 0 else {
@@ -356,6 +409,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         self.expectedKVHeadDimension = proof.headDimension
         self.expectedKVElementBytes = proof.elementBytes
         self.maxReservedKVBytes = resolvedKVByteLimit
+        self.soloPLDConfiguration = soloPLDConfiguration
     }
 
     convenience init(
@@ -368,6 +422,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         kvCacheKind: KVCacheKind = .fp16,
         affineAttentionMode: AffineKVAttentionMode = .materialize,
         compressedKVAttentionAdmission: CompressedKVAttentionRuntimeAdmission? = nil,
+        soloPLDConfiguration: SpecDecodeConfig? = nil,
         layerCount: Int = 1,
         keyValueHeadCount: Int = 1,
         headDimension: Int = 1,
@@ -398,7 +453,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             maxReservedKVBytes: maxReservedKVBytes,
             kvCacheKind: kvCacheKind,
             affineAttentionMode: affineAttentionMode,
-            compressedKVAttentionAdmission: compressedKVAttentionAdmission)
+            compressedKVAttentionAdmission: compressedKVAttentionAdmission,
+            soloPLDConfiguration: soloPLDConfiguration)
     }
 
     private static func validateCompressedBatchAdmission(
@@ -465,27 +521,20 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
 
     public func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
         var additions: [(BatchRequestID, tokens: Int, capacity: Int)] = []
+        var speculativeAdditions: [BatchRequestID: [Int]] = [:]
         additions.reserveCapacity(admissions.count)
         for admission in admissions {
             let submission = admission.submission
-            guard !submission.requestsSpeculation else {
-                throw DenseContinuousBatchRuntimeError.speculationUnsupported
-            }
-            try validateRequest(
-                id: admission.id,
-                promptTokens: submission.promptTokens,
-                totalPromptTokens: submission.promptTokens.count,
-                maxOutputTokens: submission.maxOutputTokens)
-            let capacity: Int
-            do {
-                capacity = try kvBytePlan.reservedCapacity(
-                    promptTokens: submission.promptTokens.count,
-                    outputTokens: submission.maxOutputTokens)
-            } catch {
-                throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+            let validated = try validateAdmission(admission)
+            if submission.requestsSpeculation {
+                speculativeAdditions[admission.id] = submission.promptTokens
             }
             additions.append(
-                (admission.id, submission.promptTokens.count + submission.maxOutputTokens, capacity))
+                (
+                    admission.id,
+                    validated.requestedTokens,
+                    validated.capacity
+                ))
         }
 
         if !additions.isEmpty {
@@ -515,11 +564,32 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             throw DenseContinuousBatchRuntimeError.aggregateKVByteLimitExceeded(
                 requested: requestedKVBytes, limit: maxReservedKVBytes)
         }
+        let (nextSpeculationRequests, speculationRequestOverflow) =
+            speculationRequestedRequests.addingReportingOverflow(
+                speculativeAdditions.count)
+        guard !speculationRequestOverflow else {
+            throw DenseContinuousBatchRuntimeError.speculationTelemetryOverflow
+        }
         for (id, tokens, capacity) in additions {
             contextReservations[id] = tokens
             kvCapacityReservations[id] = capacity
         }
+        for (id, promptTokens) in speculativeAdditions {
+            speculativePromptTokens[id] = promptTokens
+        }
+        speculationRequestedRequests = nextSpeculationRequests
         reservedKVBytes = requestedKVBytes
+    }
+
+    public func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        let submission = admission.submission
+        _ = try validateAdmission(admission)
+        return try decodeCohort(
+            id: admission.id,
+            promptTokens: submission.promptTokens.count,
+            maxOutputTokens: submission.maxOutputTokens)
     }
 
     public func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
@@ -540,6 +610,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         let endToken = work.startToken + work.tokens.count
         guard work.isFinal == (endToken == work.totalPromptTokens) else {
             throw DenseContinuousBatchRuntimeError.invalidPrefillMetadata(work.id)
+        }
+        if let expectedPrompt = speculativePromptTokens[work.id] {
+            guard expectedPrompt.count == work.totalPromptTokens,
+                Array(expectedPrompt[work.startToken ..< endToken]) == work.tokens
+            else {
+                throw DenseContinuousBatchRuntimeError.invalidPrefillMetadata(work.id)
+            }
         }
 
         var slot: Slot
@@ -562,18 +639,27 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 promptTokens: work.totalPromptTokens,
                 outputTokens: min(work.maxOutputTokens, initialDecodeReserve),
                 id: work.id)
+            let decodeCohort = try decodeCohort(
+                id: work.id,
+                promptTokens: work.totalPromptTokens,
+                maxOutputTokens: work.maxOutputTokens)
             slot = Slot(
+                incarnation: UUID(),
                 totalPromptTokens: work.totalPromptTokens,
                 maxOutputTokens: work.maxOutputTokens,
                 processedTokens: 0,
                 cachedTokens: 0,
+                emittedTokens: 0,
                 prefillComplete: false,
-                hasPendingSoloLookahead: false,
+                decodeCohort: decodeCohort,
+                soloPipelineState: .canonical,
+                pldSession: nil,
                 scalarCaches: cacheFamily.makeScalarCaches(
                     layerCount: layerCount,
                     capacity: capacity),
                 stagedToken: nil,
                 scalarStep: nil,
+                scalarVerifySteps: [:],
                 scalarTraceCounter: nil)
         }
 
@@ -592,8 +678,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         let ids = MLXArray(work.tokens.map(Int32.init)).reshaped([1, work.tokens.count])
         let modelCaches: [any KVCache] = caches.map { $0 }
         let logits = model(ids, cache: modelCaches)
-        let staged = argMax(logits[0..., -1, 0...], axis: -1)
+        let staged = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
+            logits[0..., -1, 0...])
         eval([staged] + caches.flatMap { $0.innerState() })
+        _ = try validatedToken(staged, id: work.id)
 
         try validatePhysicalCacheGeometry(caches)
 
@@ -608,7 +696,21 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.cachedTokens = endToken
         slot.prefillComplete = work.isFinal
         slot.stagedToken = work.isFinal ? staged : nil
+        if work.isFinal,
+            let promptTokens = speculativePromptTokens[work.id],
+            let configuration = soloPLDConfiguration
+        {
+            slot.pldSession = try IncrementalPLDSession(
+                promptTokens: promptTokens,
+                drafter: configuration.drafter,
+                maxDraft: configuration.maxDraft,
+                lookback: configuration.lookback,
+                gate: configuration.gate)
+        }
         slots[work.id] = slot
+        if work.isFinal {
+            speculativePromptTokens[work.id] = nil
+        }
     }
 
     public func decode(_ action: BatchDecodeAction) throws
@@ -616,21 +718,37 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     {
         switch action {
         case .solo(let id, let speculationAllowed):
-            guard !speculationAllowed else {
-                throw DenseContinuousBatchRuntimeError.speculationUnsupported
-            }
             try ensureScalar(id)
-            return [try decodeScalar(id, leavesPendingLookahead: true, synchronously: false)]
+            if speculationAllowed {
+                return [try decodeSpeculativeSolo(id)]
+            }
+            guard slots[id]?.soloPipelineState != .speculative else {
+                throw DenseContinuousBatchRuntimeError.speculativeDrainRequired(id)
+            }
+            let result = try decodeScalar(
+                id,
+                soloPipelineState: .pipelinedLookahead,
+                synchronously: false)
+            try recordCanonicalPLDToken(id: id, token: result.tokens[0])
+            return [result]
 
         case .drainSoloPipeline(let id):
             guard let slot = slots[id] else {
                 throw DenseContinuousBatchRuntimeError.unknownRequest(id)
             }
-            guard slot.hasPendingSoloLookahead else {
+            guard slot.soloPipelineState.requiresDrain else {
                 throw DenseContinuousBatchRuntimeError.drainWithoutPendingLookahead(id)
             }
             try ensureScalar(id)
-            return [try decodeScalar(id, leavesPendingLookahead: false, synchronously: true)]
+            if slot.soloPipelineState == .speculative {
+                return [try drainSpeculativeSolo(id)]
+            }
+            let result = try decodeScalar(
+                id,
+                soloPipelineState: .canonical,
+                synchronously: true)
+            try recordCanonicalPLDToken(id: id, token: result.tokens[0])
+            return [result]
 
         case .batch(let ids, let speculationAllowed):
             guard !speculationAllowed else {
@@ -642,6 +760,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
 
     public func remove(_ id: BatchRequestID) {
         contextReservations[id] = nil
+        speculativePromptTokens[id] = nil
         slots[id] = nil
 
         guard let batch else {
@@ -650,7 +769,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             return
         }
         let removedBatchedRow = batch.ids.contains(id)
-        let hasLiveBatchedRow = batch.ids.contains(where: { slots[$0] != nil })
+        let hasLiveBatchedRow = batch.ids.enumerated().contains {
+            row, physicalID in
+            guard batch.incarnations.indices.contains(row),
+                let currentSlot = slots[physicalID]
+            else {
+                return false
+            }
+            return batch.incarnations[row] == currentSlot.incarnation
+        }
         if !hasLiveBatchedRow {
             self.batch = nil
             pruneKVReservationsToLiveSlots()
@@ -674,16 +801,399 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             maxReservedKVBytes: maxReservedKVBytes)
     }
 
+    func diagnosticScalarLogicalOffset(
+        for id: BatchRequestID
+    ) -> Int? {
+        slots[id]?.scalarCaches?.first?.continuousLogicalOffset
+    }
+
     public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
         ContinuousBatchRuntimeResourceSnapshot(
             kvBytesPerToken: kvBytePlan.bytesPerToken,
             reservedKVBytes: reservedKVBytes,
-            maxReservedKVBytes: maxReservedKVBytes)
+            maxReservedKVBytes: maxReservedKVBytes,
+            speculation: soloPLDConfiguration == nil
+                ? nil
+                : ContinuousBatchRuntimeSpeculationSnapshot(
+                    requestedRequests: speculationRequestedRequests,
+                    activeSessions: slots.values.reduce(into: 0) { count, slot in
+                        if slot.pldSession != nil { count += 1 }
+                    } + speculativePromptTokens.count,
+                    draftedTokens: speculationDraftedTokens,
+                    acceptedDraftTokens: speculationAcceptedDraftTokens,
+                    verificationRounds: speculationVerificationRounds,
+                    fallbackRounds: speculationFallbackRounds))
+    }
+
+    private func decodeSpeculativeSolo(
+        _ id: BatchRequestID
+    ) throws -> ContinuousBatchRuntimeDecodeResult {
+        guard let configuration = soloPLDConfiguration,
+            let slot = slots[id],
+            let session = slot.pldSession
+        else {
+            throw DenseContinuousBatchRuntimeError.speculationUnsupported
+        }
+
+        switch session.cacheInvariant {
+        case .awaitingFirstToken:
+            guard slot.soloPipelineState == .canonical else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+            let result = try decodeScalar(
+                id,
+                soloPipelineState: .pipelinedLookahead,
+                synchronously: false)
+            try recordCanonicalPLDToken(id: id, token: result.tokens[0])
+            return result
+
+        case .pipelined:
+            guard slot.soloPipelineState != .speculative else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+
+        case .speculative:
+            guard slot.soloPipelineState == .speculative else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+        }
+
+        let remaining = slot.maxOutputTokens - slot.emittedTokens
+        guard remaining > 0 else {
+            throw DenseContinuousBatchRuntimeError.contextLimitExceeded(
+                id,
+                requested: slot.totalPromptTokens + slot.emittedTokens + 1,
+                limit: slot.totalPromptTokens + slot.maxOutputTokens)
+        }
+        let maximumDraftTokens = max(0, remaining - 1)
+        let fixedDraftWidth = configuration.compiledVerify
+            && maximumDraftTokens > 0
+            ? min(configuration.maxDraft, maximumDraftTokens)
+            : nil
+        let plan = try session.makeRoundPlan(
+            maximumDraftTokens: maximumDraftTokens,
+            fixedDraftWidth: fixedDraftWidth)
+
+        switch plan {
+        case .plainFromPipeline:
+            let result = try decodeScalar(
+                id,
+                soloPipelineState: .pipelinedLookahead,
+                synchronously: false)
+            try commitPLDFallback(
+                id: id,
+                plan: plan,
+                emittedToken: result.tokens[0])
+            return result
+
+        case .fallbackFromSpeculative:
+            return try decodeSpeculativeFallback(id: id, plan: plan)
+
+        case .verifyPipelined, .verifySpeculative:
+            return try decodeSpeculativeVerification(
+                id: id,
+                plan: plan,
+                compiled: configuration.compiledVerify)
+        }
+    }
+
+    private func decodeSpeculativeFallback(
+        id: BatchRequestID,
+        plan: IncrementalPLDRoundPlan
+    ) throws -> ContinuousBatchRuntimeDecodeResult {
+        guard var slot = slots[id],
+            var session = slot.pldSession,
+            let current = slot.stagedToken,
+            let caches = slot.scalarCaches,
+            case .fallbackFromSpeculative(let plannedLast) = plan,
+            slot.soloPipelineState == .speculative,
+            session.cacheInvariant == .speculative
+        else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        let forwardedLast = try validatedToken(current, id: id)
+        guard forwardedLast == plannedLast else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+
+        let previousCachedTokens = slot.cachedTokens
+        try ensureScalarCapacity(for: id, slot: &slot, additionalTokens: 2)
+        if slot.scalarStep == nil {
+            let traceCounter = TraceCounter()
+            slot.scalarTraceCounter = traceCounter
+            slot.scalarStep = makeScalarStep(
+                caches: caches,
+                counter: traceCounter)
+        }
+        var rollbackFallback = true
+        defer {
+            if rollbackFallback {
+                for cache in caches {
+                    cache.truncate(to: previousCachedTokens)
+                }
+            }
+        }
+        let next = slot.scalarStep!([current])[0]
+        let emitted = try validatedToken(next, id: id)
+        let following = slot.scalarStep!([next])[0]
+        asyncEval(following)
+
+        do {
+            try session.commitFallback(plan, emittedToken: emitted)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        try recordSpeculationTelemetry(fallbackRounds: 1)
+        slot.cachedTokens += 2
+        slot.emittedTokens += 1
+        slot.stagedToken = following
+        slot.soloPipelineState = .pipelinedLookahead
+        slot.pldSession = session
+        slots[id] = slot
+        rollbackFallback = false
+        return ContinuousBatchRuntimeDecodeResult(
+            id: id,
+            tokens: [emitted],
+            finished: false,
+            soloPipelineState: .pipelinedLookahead)
+    }
+
+    private func decodeSpeculativeVerification(
+        id: BatchRequestID,
+        plan: IncrementalPLDRoundPlan,
+        compiled: Bool
+    ) throws -> ContinuousBatchRuntimeDecodeResult {
+        guard var slot = slots[id],
+            var session = slot.pldSession,
+            let current = slot.stagedToken,
+            let caches = slot.scalarCaches
+        else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+
+        let draft: [Int]
+        let verifyInput: [Int]
+        let prefetchedToken: Int?
+        switch plan {
+        case .verifyPipelined(let proposed):
+            guard session.cacheInvariant == .pipelined,
+                slot.soloPipelineState != .speculative
+            else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+            let prefetched = try validatedToken(current, id: id)
+            draft = proposed
+            verifyInput = proposed
+            prefetchedToken = prefetched
+
+        case .verifySpeculative(let plannedLast, let proposed):
+            guard session.cacheInvariant == .speculative,
+                slot.soloPipelineState == .speculative
+            else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+            let forwardedLast = try validatedToken(current, id: id)
+            guard forwardedLast == plannedLast else {
+                throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+            }
+            draft = proposed
+            verifyInput = [plannedLast] + proposed
+            prefetchedToken = nil
+
+        case .plainFromPipeline, .fallbackFromSpeculative:
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        try validateRuntimeTokens(draft, id: id)
+        guard !verifyInput.isEmpty else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+
+        let previousCachedTokens = slot.cachedTokens
+        try ensureScalarCapacity(
+            for: id,
+            slot: &slot,
+            additionalTokens: verifyInput.count)
+        let ids = MLXArray(verifyInput.map(Int32.init))
+            .reshaped([1, verifyInput.count])
+        let verifyArgmax: MLXArray
+        if compiled {
+            if slot.scalarVerifySteps[verifyInput.count] == nil {
+                slot.scalarVerifySteps[verifyInput.count] = makeScalarVerifyStep(
+                    caches: caches,
+                    inputWidth: verifyInput.count)
+            }
+            verifyArgmax = slot.scalarVerifySteps[verifyInput.count]!([ids])[0]
+        } else {
+            let modelCaches: [any KVCache] = caches.map { $0 }
+            let logits = model(ids, cache: modelCaches)
+            verifyArgmax = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
+                logits[0])
+        }
+        var rollbackVerification = true
+        defer {
+            if rollbackVerification {
+                for cache in caches {
+                    cache.truncate(to: previousCachedTokens)
+                }
+            }
+        }
+        let picks = verifyArgmax.asType(.int32)
+            .asArray(Int32.self).map(Int.init)
+        try validateRuntimeTokens(picks, id: id)
+
+        let commit: IncrementalPLDCommit
+        do {
+            commit = try session.commitVerification(
+                plan,
+                prefetchedToken: prefetchedToken,
+                verifyArgmax: picks)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        slot.cachedTokens += verifyInput.count
+        try recordSpeculationTelemetry(
+            draftedTokens: draft.count,
+            acceptedDraftTokens: commit.acceptedDraftTokens,
+            verificationRounds: 1)
+        let keep: Int
+        let bonusArray: MLXArray
+        switch plan {
+        case .verifyPipelined:
+            keep = previousCachedTokens + commit.acceptedDraftTokens
+            bonusArray = commit.acceptedDraftTokens == 0
+                ? current
+                : verifyArgmax[commit.acceptedDraftTokens - 1].reshaped([1])
+
+        case .verifySpeculative:
+            keep = previousCachedTokens + 1 + commit.acceptedDraftTokens
+            bonusArray = verifyArgmax[commit.acceptedDraftTokens].reshaped([1])
+
+        case .plainFromPipeline, .fallbackFromSpeculative:
+            preconditionFailure("verification plan changed during commit")
+        }
+        if keep < slot.cachedTokens {
+            for cache in caches { cache.truncate(to: keep) }
+            slot.cachedTokens = keep
+        }
+        slot.emittedTokens += commit.emittedTokens.count
+        slot.stagedToken = bonusArray
+        slot.soloPipelineState = .speculative
+        slot.pldSession = session
+        slots[id] = slot
+        rollbackVerification = false
+        return ContinuousBatchRuntimeDecodeResult(
+            id: id,
+            tokens: commit.emittedTokens,
+            finished: false,
+            soloPipelineState: .speculative)
+    }
+
+    private func drainSpeculativeSolo(
+        _ id: BatchRequestID
+    ) throws -> ContinuousBatchRuntimeDecodeResult {
+        guard var slot = slots[id],
+            var session = slot.pldSession,
+            let current = slot.stagedToken,
+            let caches = slot.scalarCaches,
+            slot.soloPipelineState == .speculative,
+            session.cacheInvariant == .speculative
+        else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        let forwarded = try validatedToken(current, id: id)
+        do {
+            try session.recordCanonicalDrain(forwardedToken: forwarded)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+
+        try ensureScalarCapacity(for: id, slot: &slot, additionalTokens: 1)
+        if slot.scalarStep == nil {
+            let traceCounter = TraceCounter()
+            slot.scalarTraceCounter = traceCounter
+            slot.scalarStep = makeScalarStep(
+                caches: caches,
+                counter: traceCounter)
+        }
+        let following = slot.scalarStep!([current])[0]
+        eval([following] + caches.flatMap { $0.innerState() })
+
+        slot.cachedTokens += 1
+        slot.stagedToken = following
+        slot.soloPipelineState = .canonical
+        slot.pldSession = session
+        slots[id] = slot
+        return ContinuousBatchRuntimeDecodeResult(
+            id: id,
+            tokens: [],
+            finished: false,
+            soloPipelineState: .canonical)
+    }
+
+    private func recordCanonicalPLDToken(
+        id: BatchRequestID,
+        token: Int
+    ) throws {
+        guard var slot = slots[id], var session = slot.pldSession else {
+            return
+        }
+        do {
+            try session.recordCanonicalToken(token)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        slot.pldSession = session
+        slots[id] = slot
+    }
+
+    private func commitPLDFallback(
+        id: BatchRequestID,
+        plan: IncrementalPLDRoundPlan,
+        emittedToken: Int
+    ) throws {
+        guard var slot = slots[id], var session = slot.pldSession else {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        do {
+            try session.commitFallback(plan, emittedToken: emittedToken)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        try recordSpeculationTelemetry(fallbackRounds: 1)
+        slot.pldSession = session
+        slots[id] = slot
+    }
+
+    private func recordSpeculationTelemetry(
+        draftedTokens: Int = 0,
+        acceptedDraftTokens: Int = 0,
+        verificationRounds: Int = 0,
+        fallbackRounds: Int = 0
+    ) throws {
+        let updates = [
+            (speculationDraftedTokens, draftedTokens),
+            (speculationAcceptedDraftTokens, acceptedDraftTokens),
+            (speculationVerificationRounds, verificationRounds),
+            (speculationFallbackRounds, fallbackRounds),
+        ]
+        var next: [Int] = []
+        next.reserveCapacity(updates.count)
+        for (current, delta) in updates {
+            let (value, overflow) = current.addingReportingOverflow(delta)
+            guard !overflow else {
+                throw DenseContinuousBatchRuntimeError.speculationTelemetryOverflow
+            }
+            next.append(value)
+        }
+        speculationDraftedTokens = next[0]
+        speculationAcceptedDraftTokens = next[1]
+        speculationVerificationRounds = next[2]
+        speculationFallbackRounds = next[3]
     }
 
     private func decodeScalar(
         _ id: BatchRequestID,
-        leavesPendingLookahead: Bool,
+        soloPipelineState: BatchSoloPipelineState,
         synchronously: Bool
     ) throws -> ContinuousBatchRuntimeDecodeResult {
         guard var slot = slots[id] else {
@@ -702,23 +1212,24 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.scalarTraceCounter = traceCounter
             slot.scalarStep = makeScalarStep(caches: slot.scalarCaches!, counter: traceCounter)
         }
+        let emitted = try validatedToken(current, id: id)
         let following = slot.scalarStep!([current])[0]
         if synchronously {
             eval([following] + slot.scalarCaches!.flatMap { $0.innerState() })
         } else {
             asyncEval(following)
         }
-        let emitted = current.item(Int.self)
 
         slot.cachedTokens += 1
+        slot.emittedTokens += 1
         slot.stagedToken = following
-        slot.hasPendingSoloLookahead = leavesPendingLookahead
+        slot.soloPipelineState = soloPipelineState
         slots[id] = slot
         return ContinuousBatchRuntimeDecodeResult(
             id: id,
             tokens: [emitted],
             finished: false,
-            hasPendingSoloLookahead: leavesPendingLookahead)
+            soloPipelineState: soloPipelineState)
     }
 
     private func decodeBatch(_ ids: [BatchRequestID]) throws
@@ -734,9 +1245,16 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             guard slot.prefillComplete else {
                 throw DenseContinuousBatchRuntimeError.decodeBeforeFinalPrefill(id)
             }
-            guard !slot.hasPendingSoloLookahead else {
+            guard !slot.soloPipelineState.requiresDrain else {
                 throw DenseContinuousBatchRuntimeError.pendingLookaheadInBatch(id)
             }
+        }
+        let cohorts = ids.compactMap { slots[$0]?.decodeCohort }
+        guard cohorts.count == ids.count,
+            Set(cohorts).count == 1,
+            ifCaseFixedKVCapacity(cohorts[0]) != nil
+        else {
+            throw DenseContinuousBatchRuntimeError.incompatibleDecodeCohort(ids)
         }
 
         try ensureBatch(ids)
@@ -752,19 +1270,33 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
 
         let current = batch.stagedTokens
-        let following = batch.step!([current])[0]
-        asyncEval(following)
         let emitted = current.asType(.int32).asArray(Int32.self).map(Int.init)
         guard emitted.count == ids.count else {
             throw DenseContinuousBatchRuntimeError.invalidBatchMembership(ids)
         }
+        for (id, token) in zip(ids, emitted) {
+            guard token >= 0, token < vocabularySize else {
+                throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
+            }
+        }
+        let following = batch.step!([current])[0]
+        asyncEval(following)
 
-        for id in ids {
+        for (id, token) in zip(ids, emitted) {
             guard var slot = slots[id] else {
                 throw DenseContinuousBatchRuntimeError.unknownRequest(id)
             }
             slot.cachedTokens += 1
-            slot.hasPendingSoloLookahead = false
+            slot.emittedTokens += 1
+            slot.soloPipelineState = .canonical
+            if var session = slot.pldSession {
+                do {
+                    try session.recordCanonicalToken(token)
+                } catch {
+                    throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+                }
+                slot.pldSession = session
+            }
             slots[id] = slot
         }
         batch.stagedTokens = following
@@ -774,7 +1306,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 id: id,
                 tokens: [token],
                 finished: false,
-                hasPendingSoloLookahead: false)
+                soloPipelineState: .canonical)
         }
     }
 
@@ -791,7 +1323,22 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard let batch, let row = batch.ids.firstIndex(of: id) else {
             throw DenseContinuousBatchRuntimeError.decodeBeforeFinalPrefill(id)
         }
-        let otherLiveRows = batch.ids.filter { $0 != id && slots[$0] != nil }
+        guard batch.incarnations.indices.contains(row),
+            batch.incarnations[row] == slot.incarnation
+        else {
+            throw DenseContinuousBatchRuntimeError.decodeBeforeFinalPrefill(id)
+        }
+        let otherLiveRows = batch.ids.enumerated().compactMap {
+            physicalRow, physicalID -> BatchRequestID? in
+            guard physicalID != id,
+                batch.incarnations.indices.contains(physicalRow),
+                let currentSlot = slots[physicalID],
+                batch.incarnations[physicalRow] == currentSlot.incarnation
+            else {
+                return nil
+            }
+            return physicalID
+        }
         guard otherLiveRows.isEmpty else {
             throw DenseContinuousBatchRuntimeError.invalidBatchMembership([id] + otherLiveRows)
         }
@@ -804,6 +1351,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.scalarCaches = caches
         slot.stagedToken = staged
         slot.scalarStep = nil
+        slot.scalarVerifySteps = [:]
         slot.scalarTraceCounter = nil
         slots[id] = slot
         self.batch = nil
@@ -812,17 +1360,23 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private func ensureBatch(_ ids: [BatchRequestID]) throws {
-        if batch?.ids == ids { return }
+        if let batch,
+            batch.ids == ids,
+            batch.incarnations.count == ids.count,
+            zip(ids, batch.incarnations).allSatisfy({
+                slots[$0.0]?.incarnation == $0.1
+            })
+        {
+            return
+        }
 
         var materialized: [BatchRequestID: MaterializedSlot] = [:]
+        var spilledRows: [BatchRequestID: MaterializedSlot] = [:]
         if let existingBatch = batch {
-            let liveExisting = existingBatch.ids.filter { slots[$0] != nil }
-            guard liveExisting.allSatisfy(ids.contains) else {
-                throw DenseContinuousBatchRuntimeError.invalidBatchMembership(ids)
-            }
-            for id in ids {
-                guard let row = existingBatch.ids.firstIndex(of: id),
-                    let slot = slots[id]
+            for (row, id) in existingBatch.ids.enumerated() {
+                guard let slot = slots[id],
+                    existingBatch.incarnations.indices.contains(row),
+                    existingBatch.incarnations[row] == slot.incarnation
                 else { continue }
                 let caches = try existingBatch.caches.map {
                     try $0.extractContinuous(slot: row)
@@ -830,7 +1384,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 let staged = existingBatch.stagedTokens[row].reshaped([1])
                 eval([staged] + caches.flatMap { $0.innerState() })
                 try validateCacheLengths(caches, id: id, expected: slot.cachedTokens)
-                materialized[id] = MaterializedSlot(caches: caches, stagedToken: staged)
+                let spilled = MaterializedSlot(
+                    caches: caches,
+                    stagedToken: staged)
+                spilledRows[id] = spilled
+                if ids.contains(id) {
+                    materialized[id] = spilled
+                }
             }
         }
 
@@ -851,6 +1411,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             return row
         }
+        guard let expectedCapacity = ifCaseFixedKVCapacity(
+            slots[ids[0]]!.decodeCohort),
+            rows.allSatisfy({ row in
+                row.caches.allSatisfy { $0.capacity == expectedCapacity }
+            })
+        else {
+            throw DenseContinuousBatchRuntimeError.incompatibleDecodeCohort(ids)
+        }
         let lengths = ids.map { slots[$0]!.cachedTokens }
         var caches: [any ContinuousBatchedKVCache] = []
         caches.reserveCapacity(layerCount)
@@ -865,21 +1433,34 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         eval([staged] + caches.flatMap { $0.innerState() })
 
         let traceCounter = TraceCounter()
-        batch = BatchState(
+        let nextBatch = BatchState(
             ids: ids,
+            incarnations: ids.map { slots[$0]!.incarnation },
             caches: caches,
             stagedTokens: staged,
             step: nil,
             traceCounter: traceCounter)
+        for (id, spilled) in spilledRows where !ids.contains(id) {
+            guard var slot = slots[id] else { continue }
+            slot.scalarCaches = spilled.caches
+            slot.stagedToken = spilled.stagedToken
+            slot.scalarStep = nil
+            slot.scalarVerifySteps = [:]
+            slot.scalarTraceCounter = nil
+            slot.soloPipelineState = .canonical
+            slots[id] = slot
+        }
         for id in ids {
             var slot = slots[id]!
             slot.scalarCaches = nil
             slot.stagedToken = nil
             slot.scalarStep = nil
+            slot.scalarVerifySteps = [:]
             slot.scalarTraceCounter = nil
-            slot.hasPendingSoloLookahead = false
+            slot.soloPipelineState = .canonical
             slots[id] = slot
         }
+        batch = nextBatch
         recordPhysicalKVCapacity(caches[0].capacity, for: ids)
         pruneKVReservationsToLiveSlots()
     }
@@ -969,7 +1550,27 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             counter.count += 1
             let input = arguments[0].reshaped([1, 1])
             let logits = model(input, cache: modelCaches)
-            return [argMax(logits[0..., -1, 0...], axis: -1)]
+            return [
+                CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
+                    logits[0..., -1, 0...]),
+            ]
+        }
+        return compile(inputs: state, outputs: state, step)
+    }
+
+    private func makeScalarVerifyStep(
+        caches: [any ContinuousScalarKVCache],
+        inputWidth: Int
+    ) -> Step {
+        let model = self.model
+        let modelCaches: [any KVCache] = caches.map { $0 }
+        let state: [any Updatable] = caches.map { $0 }
+        let step: Step = { arguments in
+            let input = arguments[0].reshaped([1, inputWidth])
+            let logits = model(input, cache: modelCaches)
+            return [
+                CompiledMLXDecoder.greedyTokenOrInvalidSentinel(logits[0]),
+            ]
         }
         return compile(inputs: state, outputs: state, step)
     }
@@ -986,7 +1587,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             counter.count += 1
             let input = arguments[0].reshaped([batchSize, 1])
             let logits = model(input, cache: modelCaches)
-            return [argMax(logits[0..., -1, 0...], axis: -1)]
+            return [
+                CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
+                    logits[0..., -1, 0...]),
+            ]
         }
         return compile(inputs: state, outputs: state, step)
     }
@@ -1014,6 +1618,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         for cache in caches { cache.grow(by: growth) }
         recordPhysicalKVCapacity(caches[0].capacity, for: [id])
         slot.scalarStep = nil
+        slot.scalarVerifySteps = [:]
         slot.scalarTraceCounter = nil
     }
 
@@ -1083,6 +1688,99 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         for token in promptTokens where token < 0 || token >= vocabularySize {
             throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
         }
+    }
+
+    private func validateAdmission(
+        _ admission: ContinuousBatchRuntimeAdmission
+    ) throws -> (requestedTokens: Int, capacity: Int) {
+        let submission = admission.submission
+        if submission.requestsSpeculation, soloPLDConfiguration == nil {
+            throw DenseContinuousBatchRuntimeError.speculationUnsupported
+        }
+        try validateRequest(
+            id: admission.id,
+            promptTokens: submission.promptTokens,
+            totalPromptTokens: submission.promptTokens.count,
+            maxOutputTokens: submission.maxOutputTokens)
+        let (requestedTokens, overflow) =
+            submission.promptTokens.count.addingReportingOverflow(
+                submission.maxOutputTokens)
+        guard !overflow, requestedTokens <= maxReservedContextTokens else {
+            throw DenseContinuousBatchRuntimeError
+                .requestReservedContextLimitExceeded(
+                    admission.id,
+                    requested: overflow ? Int.max : requestedTokens,
+                    limit: maxReservedContextTokens)
+        }
+        let capacity: Int
+        do {
+            capacity = try kvBytePlan.reservedCapacity(
+                promptTokens: submission.promptTokens.count,
+                outputTokens: submission.maxOutputTokens)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+        }
+        let requestKVBytes: Int
+        do {
+            requestKVBytes = try kvBytePlan.transitionEnvelopeBytes(
+                capacities: [capacity])
+        } catch {
+            throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+        }
+        guard requestKVBytes <= maxReservedKVBytes else {
+            throw DenseContinuousBatchRuntimeError
+                .requestReservedKVByteLimitExceeded(
+                    admission.id,
+                    requested: requestKVBytes,
+                    limit: maxReservedKVBytes)
+        }
+        return (requestedTokens, capacity)
+    }
+
+    private func validatedToken(
+        _ token: MLXArray,
+        id: BatchRequestID
+    ) throws -> Int {
+        let value = token.item(Int.self)
+        guard value >= 0, value < vocabularySize else {
+            throw DenseContinuousBatchRuntimeError.invalidTokenID(id, value)
+        }
+        return value
+    }
+
+    private func validateRuntimeTokens(
+        _ tokens: [Int],
+        id: BatchRequestID
+    ) throws {
+        for token in tokens where
+            token < 0 || token >= vocabularySize || Int32(exactly: token) == nil
+        {
+            throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
+        }
+    }
+
+    private func decodeCohort(
+        id: BatchRequestID,
+        promptTokens: Int,
+        maxOutputTokens: Int
+    ) throws -> BatchDecodeCohort {
+        guard maxOutputTokens <= initialDecodeReserve else {
+            return .isolated(id)
+        }
+        return .fixedKVCapacity(
+            try roundedCapacity(
+                promptTokens: promptTokens,
+                outputTokens: maxOutputTokens,
+                id: id))
+    }
+
+    private func ifCaseFixedKVCapacity(
+        _ cohort: BatchDecodeCohort
+    ) -> Int? {
+        guard case .fixedKVCapacity(let capacity) = cohort else {
+            return nil
+        }
+        return capacity
     }
 
     private func roundedCapacity(

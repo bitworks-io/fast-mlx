@@ -5,7 +5,11 @@ let package = Package(
     name: "fast-mlx-spike",
     platforms: [.macOS(.v14)],
     products: [
+        .library(name: "ServingCore", targets: ["ServingCore"]),
+        .library(name: "ServingNIO", targets: ["ServingNIO"]),
+        .library(name: "SpikeServingAdapters", targets: ["SpikeServingAdapters"]),
         .library(name: "SpikeCore", targets: ["SpikeCore"]),
+        .executable(name: "fastmlx-serve", targets: ["fastmlx-serve"]),
         .executable(name: "spike-cli", targets: ["spike-cli"]),
         .executable(name: "fastmlx-harness", targets: ["fastmlx-harness"]),
         .executable(name: "fastmlx-capacity", targets: ["fastmlx-capacity"]),
@@ -15,8 +19,84 @@ let package = Package(
         .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.2"),
     ],
     targets: [
+        // ServingCore is PURE — NO MLX/SpikeCore dependency — so protocol, policy, and
+        // lifecycle contracts remain independently buildable and testable off-box.
+        .target(
+            name: "ServingCore",
+            dependencies: [],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingCoreTests",
+            dependencies: ["ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // ServingNIO owns transport only. Model, tokenizer, and MLX state remain behind
+        // ServingCore contracts and actor-confined adapters.
+        .target(
+            name: "ServingNIO",
+            dependencies: [
+                "ServingCore",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingNIOTests",
+            dependencies: [
+                "ServingCore",
+                "ServingNIO",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "SpikeServingAdapters",
+            dependencies: [
+                "HarnessCore",
+                "ServingCore",
+                "SpikeCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "SpikeServingAdaptersTests",
+            dependencies: [
+                "HarnessCore",
+                "ServingCore",
+                "ServingNIO",
+                "SpikeCore",
+                "SpikeServingAdapters",
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Composition executable: transport-only scripted mode remains available for isolated
+        // tests, while model serving is delegated to actor-confined serving adapters.
+        .executableTarget(
+            name: "fastmlx-serve",
+            dependencies: [
+                "HarnessCore",
+                "ServingCore",
+                "ServingNIO",
+                "SpikeServingAdapters",
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .target(
             name: "SpikeCore",
             dependencies: [

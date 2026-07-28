@@ -16,6 +16,7 @@ SHA without copying machine-local paths or transient output.
 | As a maintainer, I can enter continuous-batching actor integration only after dense cache shapes are exact and compile-stable. | Scalar-aligned merge/append/filter/extract preserves logits, greedy tokens, row identity, and one trace per stable shape; unsupported state layouts fail closed. | 9 focused `BatchedCompiledKVCacheTests`; 29/29 total `SpikeCoreTests` through Xcode; 134 HarnessCore XCTest + 17 Swift Testing tests off-box. | Clean `7b9d709`: Qwen3-32B-4bit B=1/2/4/7/8 fixed+shapeless PASS with zero initial max-logit delta; 64-step B=4/B=8 fixed PASS; `qwen3_moe` rejected before load. | 2026-07-12 | Historical Phase-1 gate; Phase 2 and Phase 3 are closed below. |
 | As an operator, concurrent dense streams can join, leave, and prefill in chunks without changing greedy output or exhausting an unbounded queue. | B1→drain→B2→B1 and B3→B2 remain token/byte exact; decode precedes bounded prefill; queue, per-request context, and aggregate logical context are capped; speculation is rejected locally for this runtime. | 16 scheduler + 10 coordinator pure tests within 145 HarnessCore XCTest + 17 Swift Testing; 12 cache-history-sensitive runtime tests within 41/41 Xcode `SpikeCoreTests`. | Clean `2a5a5f4`: Qwen3-32B-4bit staggered join and middle-cancel probes PASS; Qwen3-4B-4bit chunk-size-1 interleave PASS; zero batched speculation. | 2026-07-12 | Historical Phase-2 gate; byte admission, service frontier, cancellation latency, and soak are closed by Phase 3 below. |
 | As a dense-Qwen service operator, I can select the measured exact policy for an isolated request or a simultaneous burst without hidden queueing, state-poison, cancellation, or resident-memory failure. | Same-workload C=1/2/4/8 frontier selects solo PLD at C=1 and batch-no-spec at C≥2; exact transition/cancellation, conservative byte admission, A/B/A, responsiveness, and the full 24-hour RSS gate pass. | 166 HarnessCore XCTest + 17 Swift Testing tests off-box; 48/48 `SpikeCoreTests` through Xcode; final-SHA real-model probes and fail-closed `qwen3_moe` smoke. | Clean `7a775f6` frontier: batch +45.8%/+58.6%/+74.7% at C=2/4/8; clean `0aed280` soak: 86,412.85 measured seconds, all 33 predicates 3,519/3,519, peak RSS drift 2.2444%. | 2026-07-14 | Explicit probe path only; production routing/API, network disconnect propagation, sampling, non-dense state, other models and hardware remain open. |
+| As a dense-Qwen operator, I can launch the explicit OpenAI-compatible continuous no-spec route and disconnect real clients without corrupting survivors or leaking KV. | HTTP/SSE is bounded and fail-closed; real closes cancel within five seconds; recovery returns to zero within 30 seconds; fixed-capacity cohorts share only internally; exact pairing and resource bounds hold through a full-day C=4 soak. | Clean `d9143ce` route contracts and `1c084f3` exact-source Release boundary: 675 XCTest + 17 Swift Testing off-box; 140 `FastMLXHarnessTests`, 194 `SpikeCoreTests`, 51 `SpikeServingAdaptersTests`, four expected skips, and Release through Xcode. | Canonical 24-hour sibling receipt is terminal `COMPLETE`: 86,420.985839 measured seconds, 10,368 request/evidence rows, 1,728 typed disconnects, 2.398127-second max cancel-to-evidence, 12.019825-second max recovery, 1.000177039 RSS ratio, stable AC/Foundation state, and no process/listener/lock/watchdog/orphan. | 2026-07-28 | Explicit source-locked Qwen3-32B-4bit `continuous-batch-no-spec` temperature-zero text route only. Dynamic PLD, broad-family default, sampling, tools, media, WebSocket, and unauthenticated remote binding remain unavailable. |
 | As a constrained-hardware operator, I can choose a measured KV-capacity tier with quantified loss, while incoherent cells remain unavailable. | Same-weights Qwen3-32B cells bind actual storage, teacher-forced quality, task coherence, runtime, and clean provenance; hard-floor failures reject; every promoted label states capacity versus speed. | 389 HarnessCore XCTest + 17 Swift Testing tests off-box; 30/30 `FastMLXHarnessTests`; 92/92 `SpikeCoreTests`; Release build through Xcode. | Clean `d9071a9` task/KL packet and `f88d26e` runtime packet: Transparent fp16, Balanced K4V2-g64, Max-fit KVTuner, capacity-only KVarN i8; two aggressive cells reject. | 2026-07-18 | Qwen3-32B-4bit on one M5 Max; no lossy speed win, compiled KVarN/fused attention, or broad-model claim. |
 | As an operator, I can qualify a second model family against an exact source-locked checkpoint and tokenizer rather than a mutable cache alias. | Exact public repo/revision, API/tree/per-file identities, full shard contents, tokenizer, index, and Llama geometry authenticate; loaded speed/capacity/quality/task claims remain model-scoped and fail closed independently. | Clean source-lock `dcfbbe3`; loaded speed `c8a56ef`; generalized capacity `3493314`; sealed quality/task `9033725`; strict source, runtime, capacity, sealed-replay, and task evidence contracts. | Source lock PASS; 8K affine speed NEGATIVE; 32K speed HARDWARE-UNAVAILABLE; 32K affine capacity NON-PROMOTABLE; near-128K NOT RUN; long-depth quality NON-PROMOTABLE. | 2026-07-23 | Both first families share Q64/KV8/D128. The independent Phi3 Q24/KV8/D128 follow-on is closed in the next row; Qwen KVTuner is not reusable. |
 | As an operator, I can tell whether compressed attention is portable to a materially different head geometry without mistaking fit or a decode-only win for a safe default. | The exact source-locked Phi3 Q24/KV8/D128 inert-window geometry must pass registry/load/runtime/failure-path proof; generic sliding windows must still reject; speed, capacity, teacher-forced loss, and task-reference admission remain independent gates. | Clean admission `850997e`; loaded evidence `9c542ef`; deep corpus `19cbb8e`; corrected LongRoPE teacher `e29ee4c`; 541 HarnessCore XCTest plus 17 Swift Testing tests off-box; 113/113 `FastMLXHarnessTests`, 157/157 `SpikeCoreTests`, and Release through Xcode. | Source/registry/load PASS; 8K direct speed NEGATIVE; 32K and near-128K capacity NON-PROMOTABLE; affine teacher-forced floor PASS with material loss; fp16 task reference INVALID, so paired affine task refused and no quality tier exists. | 2026-07-23 | Exact checkpoint only. No Phi speed/quality/default tier, no generic sliding-window admission, and no cross-family KVTuner reuse. |
@@ -567,3 +568,119 @@ SHA-256 `a76dc39f30cd4c213c56a1346b8bb3671002bd63af4158f3b4c83917f7601a53`.
 **Overall verdict: PASS, MODEL-SCOPED for Qwen3-32B and Phi-4-mini; Llama-3.3-70B rejected on
 the measured host.** The next safe action is the production continuous-batching serving-route
 gate, not a public/default cache switch or an unchanged Llama retry.
+
+## Continuous serving Phase 3 acceptance pass — 2026-07-24
+
+**Story:** a dense-Qwen operator can explicitly launch one bounded OpenAI-compatible
+`continuous-batch-no-spec` service, disconnect a real client during loaded prefill or shared
+decode, and retain exact survivor/replacement output without cross-capacity batching or leaked
+slots, KV, connections, locks, or processes.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| OpenAI text JSON/SSE and fail-closed scope | **PASS** | Clean `d9143ce24ac084d295e3903443c96aa07c1fe6e7` passes the request/error codecs, embedded-channel and loopback HTTP tests, one `[DONE]` streaming contract, bounded body/publication/auth/shutdown behavior, and sampling/tools/media/invalid-input rejection. |
+| Bounded publication and typed admission | **PASS** | The production adapter uses a bounded suspending delta mailbox. Permanent per-request oversize returns 400; retryable aggregate pressure returns 429. Queue/output/body/trace/resource bounds and cancellation release are covered by the 675 XCTest plus 17 Swift Testing pure suite. Pure log SHA-256 is `e06e4b67a219fa038fdb7fd7c452ba0b5ad473820b6a84b037e183b8dbce9420`. |
+| Clean Apple regression and Release | **PASS** | On `llmbench`, 140/140 `FastMLXHarnessTests`, 176/176 `SpikeCoreTests`, and 30 `SpikeServingAdaptersTests` complete without failures; the two loaded tests skip only because this broad invocation intentionally has no model environment. Release succeeds. Xcode/Release log SHA-256 values are `eb763b849d7d4d53f4d7e094cbe9091c8c620efa1252d84ce09413bc8b7cf937` and `463f331dbd79a0d6f27d2738688839dc70338e9590d32a0c0b12e61b10385324`. |
+| Loaded real-TCP disconnect, survivor parity, and reuse | **PASS** | Fresh v6 executes exactly one selected Qwen3-32B test: 1 passed, 0 failed, 0 skipped in 48 seconds. A real SSE close during chunked prefill and another close of the logically longest same-capacity middle row during shared decode cancel within five seconds. Two survivors and the admitted replacement equal independent scalar controls; B3→B2→B3 shares as required and finishes with zero active requests, coordinator slots, reserved KV bytes, and TCP connections. |
+| Fixed-capacity cohort isolation | **PASS** | The same loaded test runs two simultaneous requests in each of two incompatible fixed-capacity cohorts. Each pair shares internally, the trace never mixes cohorts, all four results equal scalar controls, both cohorts make progress, all shared actions report no speculation, and final reservations are zero. |
+| Clean provenance and process/resource telemetry | **PASS** | The reviewed launcher binds clean source, implementation/test source files, test binary/xctestrun, the exact top-level model file set and runtime-consumed model/tokenizer/checkpoint hashes, absent optional generation config, explicit 96-GiB MLX / 8-GiB cache / 16-GiB aggregate-KV limits, High Power, 140 W AC, and Foundation low-power false/thermal nominal. Generic XCTest PID matching records max RSS 18,231,568 KiB. Artifact and xcresult manifests reauthenticate; no watchdog, retained lock, failure artifact, orphan, harness, serving process, or Xcode process remains. |
+| Dynamic solo-PLD/default routing | **PENDING / NOT PROMOTED** | Phase 3 authorizes only explicit `continuous-batch-no-spec` for the qualified dense-Qwen boundary. Incremental solo PLD, drain ordering, cancellation, exactness, real-HTTP C=1/2/4/8 performance, broad-family support, resident transport soak, final merge, and release remain Phase 4/5 work. |
+
+Fresh loaded root:
+`/Users/llmbench/perf-work/results/continuous-serving-phase3-loaded-capacity-cohort-d9143ce-v6`.
+Launcher, artifact-manifest, xcresult-file-manifest, summary, tests, test-log, preflight, and
+power-profile SHA-256 values are:
+
+- `62af08aeb247e1c932258f7dd2fc005cf2f8cb180a01dc40f9fc3f66ca87917a`
+- `8a540c31cacd79254432ca6e300d5c27b3d3fde1c23f8a8202f3239aefa0ecc9`
+- `0b2ab7a3f2c79a96f8fc57cf02766d7a4fbcf08a98a187c41050b3082a53ecdf`
+- `b23c420a4de8e10518fd3acbb69e154061dd17cae2bcb474fbda75d7394066dd`
+- `bb422d66b3e6530ef3ec6420814b08ec71d8327cfd2e008710f6f447fbca667e`
+- `0a242aa14209452c3480c2906b4e5b4895cc7ff9ed3ba8dd65c83f8858998a16`
+- `2f100e3ea73bdb54b96bf0097bac8366e24fd1cd80140f01a95838f2bcd4880b`
+- `53f7fce6edb9721f0c09e40694dc261d783e7da398a5c36bf2836abc653dfff6`
+
+Machine-readable criterion mapping:
+[`continuous-serving-phase3-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase3-verification-2026-07-24.json),
+SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
+
+**Overall verdict: PASS_PHASE3_EXPLICIT_NO_SPEC.** The exact production no-spec route is ready for
+the next branch phase, not for a dynamic/default or broad-model claim. The next safe action is the
+measured actor-confined solo-PLD policy.
+
+## Continuous serving Phase 4 exactness pass / speed failure — 2026-07-24
+
+**Story:** a dense-Qwen request may use bounded prompt-lookup decoding while it is alone, drain to
+canonical scalar state before sharing the resident batch, preserve exact temperature-zero output,
+and disable all shared speculation. The dynamic route is available only if the identical C=1 HTTP
+workload also improves completion throughput by at least 5%.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Actor-confined incremental PLD contract | **PASS** | Clean `520a106708f4f0d47cf8bc9f08a188078c4915d8` carries bounded draft history, stale-plan rejection, cancellation, outputless drain-before-join ordering, shared-batch speculation rejection, and fail-closed lossy-KV/non-finite behavior. The focused pure slice passes 136/136. |
+| Clean Apple regression and Release | **PASS** | On `.252`, 140/140 `FastMLXHarnessTests`, 194/194 `SpikeCoreTests`, and 50/50 `SpikeServingAdaptersTests` pass with four expected loaded-environment skips; Release and build-for-testing succeed. Xcode, xcresult-manifest, Release, and build-for-testing log SHA-256 values are `227a02fd9e112fd374a0ca6bc67c351c742bfd6869ec524825a796dfe1676b0b`, `103d8b3bd9da2c6b58285d50bd6663c50a4182c6c7acbc9c694a9af1fafba85b`, `7dd06e45a76da0c4df7691877d2f7ad5916b99df5030e4faadb2992f771db7c7`, and `419bf1fc0949b5d894ebcba50c4d49d5721f2d30d00ab43df17aa34f956e9f4c`. |
+| Loaded solo exactness and shared no-spec boundary | **PASS** | Fresh root `/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1` is `COMPLETE`: exactly 1 selected Qwen test passed in 22.459 seconds. Solo PLD engages and equals an independent no-spec control; two shared requests use no-spec decode and both equal control; final requests/slots/reserved KV are zero. |
+| Fresh provenance and resource telemetry | **PASS** | The reviewed launcher binds clean source and Phase 4 files, loaded test binary/xctestrun, exact model/tokenizer/shard hashes, explicit 96/8/16-GiB limits, High Power/140 W AC/Foundation nominal state, PID signatures, heartbeat/log mtime/bytes, and positive RSS. Launcher, artifact-manifest, xcresult-manifest, and test-log SHA-256 values are `8113355209b5f65d33b13922cbcb7de8cfad165c3810ef2a229c2f2ac5b2b6f4`, `7878a01464cd89aae6c083f94119b4869a78c538951599ed45beec1717671b74`, `bf549d33c11e9970e4818fe538068b171544b729350554e7ee4b5ed3d27b9742`, and `8a879074f6460d8d2757fe830861f8bce4072e65b46cd42c03bd06a90d9da2da`. Max XCTest RSS is 18,261,232 KiB; watchdog, lock, and orphans are absent. |
+| Dynamic solo-PLD speed gate | **FAIL / SHELVE** | The same-workload HTTP diagnostic preserves output SHA-256 `e2bd50d…a7270d`, but retained ngram-3 improves C=1 only 21.7851→22.0880 tok/s (+1.3902%) versus +5% required. Bounded ngram-2 improves only 21.8526→22.0981 tok/s (+1.1236%). Dirty/diagnostic logs `4a7bdad7…72a3a` and `a374ec84…22c66` cannot promote; they are sufficient to refuse an unchanged route. |
+| Shipping/default claim boundary | **PASS** | Dynamic PLD remains internal diagnostic machinery, marked `diagnostic-only`, `promotable:false`, and `speedAggregation:forbidden`; the CLI exposes only explicit `continuous-batch-no-spec`. Shared-batch speculation and lossy-KV-plus-PLD remain rejected. |
+| Phase 5 resident production proof | **PARTIAL / HOST BLOCKED** | Clean `24c7df0` product smoke v8 and transport preflight v2 are fresh `COMPLETE`. V2 proves one warmup plus three measured C=4 cycles, 135.580501 measured seconds, 24 evidence rows, four zero-body typed disconnects, ≤0.991962-second cancellation evidence, ≤11.783074-second recovery to zero, bounded MLX/RSS, six stable power samples, exact provenance/redaction, and no watchdog/orphan. A static-reviewed `.252` draft exists but is not launch-ready; the intended host `.253` presents Dropbear rather than the expected macOS OpenSSH identity, and a fresh host-specific packet and review remain required. |
+
+Machine-readable criterion mapping:
+[`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json),
+SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
+
+**Overall verdict: PARTIAL — SHELVE_DYNAMIC_SOLO_PLD_KEEP_EXPLICIT_NO_SPEC.** Correctness,
+exactness, shared-batch safety, provenance, and clean Apple verification pass. The declared speed
+gate fails, so no dynamic/default route is authorized. At this dated checkpoint Phase 5 was the
+next active gate; the 2026-07-28 acceptance section below supersedes that status.
+
+Phase-5 checkpoint verification:
+[`continuous-serving-phase5-preflight-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json).
+SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
+This checkpoint is non-promotable and does not replace the required 24-hour resident transport
+soak, final release proof, or merge.
+
+## Phase 5 dedicated M3 Ultra verification v3 — 2026-07-25
+
+**Story:** a dedicated `llmbench@192.168.1.253` Mac host can authenticate the staged
+Qwen3-32B-4bit model tree and complete a fresh, exact-source-bound binary verification boundary
+without reusing v1, v2, or any `.252` artifact.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Read-only host and snapshot admission | **PASS** | `ssh` to `llmbench@192.168.1.253` with the pinned known-host file returns `LLM-256GB.localdomain` on macOS 26.5.2 build 25F84 with Apple M3 Ultra and 274,877,906,944 bytes of memory. The staged model tree `/Users/llmbench/perf-work/models/Qwen3-32B-4bit` contains exactly 12 top-level regular files, 0 symlinks, 0 special files, and 18,445,872,022 total bytes. All receipt-listed file sizes and SHA-256 values match the on-disk files; the model index references exactly four shard files. Receipt SHA-256 is `7853c49616b05e2fd4fa043448959d1c0d6f5a7821967e26cfa80c91865941e5`. |
+| Historical v2 boundary | **NON-PROMOTABLE / PRESERVED** | V2 passed its test/build commands, but review found that it authenticated only the source stamp and `Package.resolved`, not the complete mutable checkout. It remains unchanged as verification history and is not the source/binary proof used by the soak. |
+| Exact source provenance | **PASS** | Fresh v3 builds from an isolated snapshot authenticated against exactly 527 tracked files. Manifest SHA-256 is `a84b8c9b4de50766c1ec83ed818a4ff76d12128bf77df82a1c831357208bb328`; exact pre/post path sets match, no source symlink is admitted, and identical pre/post verification logs hash to `aa0fde724cd8b17507ed5ec6531a890afaa9369319b208958990fb6131a78f44`. |
+| Fresh verification boundary | **PASS** | Fresh output `/Users/llmbench/perf-work/results/continuous-serving-phase5-verify-1c084f3-m3ultra-v3` finishes `PASS` with no failure, retained lock, active process, or stale lock. `status.json` and `artifacts.sha256` hash to `71c16900032b1b4f5d69afad769891b7f4aaca5677d9fb0b8cbb1f2811515d5f` and `82107f4537c15fdf73fcd28a72d1d4f81ca55eb8db2d64c44afc2729ed88b591`. Xcode tests report 140 `FastMLXHarnessTests`, 194 `SpikeCoreTests`, 51 `SpikeServingAdaptersTests`, and 4 skips; Release succeeds. Xcode and Release logs hash to `d412e19e66a733908066f84068ffec708494f12f1074d956a1db0f56123bf4b1` and `03dc7b9b247d56656eaae2409033c2f1e000fa3cbde97d1415e033499c040b21`; the fresh server binary hashes to `50c50ff42ace01bc714f13f307f72d488b84e43e124b564cecd5c23ca18c7d9c`. |
+
+Machine-readable criterion mapping:
+[`continuous-serving-phase5-verify-2026-07-25.json`](superpowers/verdicts/continuous-serving-phase5-verify-2026-07-25.json)
+SHA-256 `393351a591c67110d80ba8f5fa6028e18b29c2b173bd93678402991e3d493f9d`.
+
+## Continuous serving Phase 5 full-day transport acceptance — 2026-07-28
+
+**Story:** an operator can keep one source-locked Qwen3-32B-4bit model resident behind the
+explicit `continuous-batch-no-spec` HTTP/SSE route for a full day of C=4 traffic, lose one admitted
+client per cycle, and retain exact request/response pairing, bounded cancellation and recovery,
+stable resources and environment, complete provenance, redaction, and terminal cleanup.
+
+| Acceptance criterion | Verdict | Fresh evidence |
+| --- | --- | --- |
+| Exact source, build, model, and tool provenance | **PASS** | Source `1c084f305da83c3ab2e399368b5bd32f14dabd09` reauthenticates against all 527 manifest entries; source manifest and `Package.resolved` SHA-256 values are `a84b8c9b4de50766c1ec83ed818a4ff76d12128bf77df82a1c831357208bb328` and `7fa8102041ba82ae0347f69f17fb439a55c379420a1f2406b900f7d91020269e`. The clean non-profiled Release binary hashes to `f5bfc31fe6cccf8a8aae5cee2c8596052b5a9d594e4ca971df39be4f6ac8a41e`; all 12 model files and 16 runtime tool binaries independently match their sealed receipts. |
+| Fresh terminal prerequisite preflight | **PASS** | V30 is terminal `COMPLETE` after one dropped warmup plus three measured C=4 cycles, 24 schema-2 rows, four typed disconnects, bounded recovery, authenticated artifacts, and a passing sensitive scan. It remains diagnostic and non-promotable by design. Terminal completion, artifacts, authentication, evidence, and sensitive-scan SHA-256 values are `15fef05e5872b6e9627d083e4241420307e8c77c43657f0aab5e093d88c7cd35`, `fcdfcda48f4f58393861e669bfc233e12b77f6dc046af17b1cd05954ed71e0c8`, `9bfa6405f744e33056883526c78980cb3b122622004a843058fa45255f8ad011`, `141364f0112cd29c6d612211a48c28a4a28d14838df515055070eb3fa56e56a5`, and `06a39e68095781de511d9a4995bb1903841bd91a73186f83ee3d27526c1ff9a3`. |
+| Full-day duration and exact accounting | **PASS** | The canonical sibling receipt is `COMPLETE`, terminal, non-diagnostic, and promotable after 86,420.985839 measured seconds against the 86,400-second gate; an independent monotonic witness records 86,420.115586 seconds. Exactly 1 warmup plus 1,727 measured cycles produced 1,728 cycle receipts and 10,368 request/evidence rows. |
+| Request/response pairing and explicit route | **PASS** | Request, response, and request/response-pair multiset digests match at `d2670c02…35e1`, `953dbb54…6e4`, and `9f2f939a…4323`. All schema-2 rows name only `continuous-batch-no-spec`; 8,640 normal responses completed and 1,728 hostile clients produced typed zero-body `clientDisconnected` rows. |
+| Hostile disconnect and recovery | **PASS** | Maximum cancel-to-evidence is 2.398127 seconds against five seconds, with zero violations. Maximum recovery is 12.019825 seconds against 30 seconds, with zero violations. All 1,728 recovery rows complete, and every recovery terminal snapshot reports zero active requests, coordinator slots, and reserved KV bytes. |
+| MLX bounds and RSS drift | **PASS** | MLX active/cache/peak maxima are 20,442,968,648 / 5,527,599,705 / 22,099,490,330 bytes within the declared 96/8-GiB limits. Process RSS moves from a post-warmup 18,165,488 KiB baseline to 18,168,704 KiB maximum, a 1.000177039 ratio against the 1.05 gate. No resource snapshot failed. |
+| Stable power and thermal state | **PASS** | All 291 environment samples retain AC power, Foundation low-power false, no performance warning, no thermal warning, and successful probe commands. |
+| Terminal artifact integrity, redaction, and cleanup | **PASS** | The root receipt intentionally freezes `FINALIZING`, nonterminal, and non-promotable. After exact artifact hashing, terminal scanning, and cleanup, the create-only immutable sibling publishes canonical `COMPLETE`; its receipt and sidecar SHA-256 values are `f910fd570f4fd6d6c1f749dbe16f6d1dfffb8cb7953ebb04cf43aca8b641a608` and `7d5d2fd0cd801a96de7f5a4c8c21f81b0c003cb1060410895e1cece315c5f714`. All 42 manifest entries reauthenticate; the sensitive scan passes with no registered raw value retained; no incoming publisher file, process, listener, held lock, watchdog, or orphan remains. |
+| Product and public claim boundary | **PASS** | Promotion is limited to the explicit temperature-zero text `continuous-batch-no-spec` route for the source-locked Qwen3-32B-4bit boundary on the measured Apple M3 Ultra workload. Dynamic PLD remains shelved; no broad model-family default, shared-batch speculation, sampling, tools, media, WebSocket, unauthenticated remote binding, or speed claim follows. |
+
+Machine-readable criterion mapping:
+[`continuous-serving-phase5-verification-2026-07-28.json`](superpowers/verdicts/continuous-serving-phase5-verification-2026-07-28.json),
+SHA-256 `b1f7bb933e65dfb93c4043d64e1426b1c464b1828edebbcf425eabf6f798e22a`.
+
+**Overall verdict: PASS_PHASE5_PROMOTE_EXPLICIT_NO_SPEC_MODEL_SCOPED.** The explicit,
+model-scoped route is authorized for the measured boundary. Dynamic solo PLD stays shelved. The
+next safe action is the required reviewed closeout commit and `--no-ff` integration, followed by
+absorbed MLA.

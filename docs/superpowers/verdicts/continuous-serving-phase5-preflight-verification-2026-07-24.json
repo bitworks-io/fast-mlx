@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-24",
+  "feature": "continuous-batching-serving-route-phase5-preflight",
+  "classification": "PARTIAL_NON_PROMOTABLE",
+  "source": {
+    "gitSHA": "24c7df0fa0c7f10ddf65a0443e41c7f97abb8e6d",
+    "fastMLXServeBinarySHA256": "9163516d714d6919e0e02c01de43f9a55cec69cf32dfbcad2ac44f4cddf11590",
+    "packageResolvedSHA256": "7fa8102041ba82ae0347f69f17fb439a55c379420a1f2406b900f7d91020269e"
+  },
+  "criteria": [
+    {
+      "id": "admission-before-first-stream-delta",
+      "verdict": "PASS",
+      "evidence": "Clean source 24c7df0 writes the SSE 200 admission head before awaiting the first backend delta and retains typed failure behavior before admission."
+    },
+    {
+      "id": "fresh-product-smoke",
+      "verdict": "PASS",
+      "evidence": "Fresh product smoke v8 completed with seven evidence rows: six complete responses and one zero-body typed clientDisconnected hostile response. It observed three active requests and coordinator slots, then recovered to zero."
+    },
+    {
+      "id": "bounded-transport-preflight",
+      "verdict": "PASS",
+      "evidence": "Fresh preflight v2 completed one dropped warmup and three measured C=4 cycles over 135.580501 measured seconds. Twenty-four schema-2 evidence rows include four zero-body clientDisconnected rows, exact request/response pairing, and JSON recovery after every hostile cycle."
+    },
+    {
+      "id": "disconnect-and-recovery-bounds",
+      "verdict": "PASS",
+      "evidence": "Maximum hostile cancel-to-evidence time was 0.991962 seconds against a five-second limit. Maximum JSON recovery time was 11.783074 seconds against a 30-second limit, and every recovery terminal snapshot had zero active requests and coordinator slots."
+    },
+    {
+      "id": "resource-and-environment-bounds",
+      "verdict": "PASS",
+      "evidence": "Maximum process RSS was 18,171,392 KiB; post-warmup peak/baseline RSS ratio was 1.000028177. Maximum MLX active/cache/peak bytes were 20,375,859,784 / 6,190,803,701 / 22,034,101,786 within explicit 96-GiB memory and 8-GiB cache limits. Six retained samples remained AC, High Power, Foundation low-power false, and nominal."
+    },
+    {
+      "id": "provenance-redaction-and-fresh-output",
+      "verdict": "PASS",
+      "evidence": "Independent reauthentication verified 31 artifact hashes, exact source/binary/package/model/tokenizer/shard identities, canonical evidence and cycle receipts, diagnostic/promotable false bindings, absent prompt/key/body/output sentinels, released lock and port, and no watchdog, failure, or orphan process."
+    },
+    {
+      "id": "resident-24-hour-transport-soak",
+      "verdict": "BLOCKED_EXTERNAL_HOST_IDENTITY",
+      "evidence": "A static-reviewed .252 draft exists but is not launch-ready for the target host. The intended 256-GiB host at 192.168.1.253 still presents Dropbear 2022.83 with only an RSA key rather than the expected macOS OpenSSH Remote Login identity, so no credentials, sync, build, or workload were sent; fresh host-specific derivation and review remain required."
+    }
+  ],
+  "failedPreflightV1": {
+    "state": "TERMINAL_FAILED_BEFORE_SERVER_LAUNCH",
+    "resumable": false,
+    "promotable": false,
+    "rootPreserved": true,
+    "lockRetained": true,
+    "manualFailureReceiptSHA256": "e3f5f307a4e5b13219cf5d5ca5cf5789b039510ceb0416f5f427ae7714e355e8",
+    "manualFailureReceiptSidecarSHA256": "5c26b7c85c2d55a06cb171cd08c41ea5a4d1fc625d6d16cb81be596e87100dc4",
+    "failure": "A zsh local path variable shadowed PATH during power validation; no server, client, or serving evidence started."
+  },
+  "productSmoke": {
+    "state": "COMPLETE",
+    "outputRoot": "/Users/llmbench/perf-work/results/continuous-serving-phase5-product-24c7df0-v8",
+    "manifestSHA256": "a3a7ee613eaa6a9a0acbe70bc1e3df16c2d1210e0e20d67bca06d5aa9fdb634f",
+    "launcherSHA256": "47bfedce423397b78900ff94612373a36dc777488dd682718287758ed21dd874",
+    "clientSHA256": "8d684bf861c7c1bc1b02e251b7108e10ac219de16ba99b1fa9a179d27dd88849",
+    "evidenceSHA256": "0972ceb7f98d95a60d00e360d9a4d03f03a991361930df64b1af3d515be55941",
+    "clientReceiptSHA256": "7ad7041189c98bed532545807cc68206edb8b0d85d379f1a1fa0081c337788de",
+    "verificationArtifactSHA256": "905bc37e5aa853e4ed3c9f7ee7aa08f588895672cdf5514408c1f35e95a77ef2",
+    "completionSHA256": "b386894558aa75bfd8b585e124dad268489c32de5f25d1081c6b53eb5325d833",
+    "artifactsSHA256": "138a8522f56d98dfb408c68f92dd059d7ce0ba6b06bbc3203878fdc4076fc3fa",
+    "evidenceRows": 7,
+    "completedResponses": 6,
+    "typedClientDisconnectedRows": 1,
+    "maximumActiveRequests": 3,
+    "maximumCoordinatorSlots": 3
+  },
+  "transportPreflight": {
+    "state": "COMPLETE",
+    "diagnostic": true,
+    "promotable": false,
+    "qualificationScope": "transport-preflight",
+    "outputRoot": "/Users/llmbench/perf-work/results/continuous-serving-phase5-transport-preflight-24c7df0-v2",
+    "manifestSHA256": "ed4bd96959564be8b794720c37624497e1f215a79411319ed218e1b66a63f82f",
+    "launcherSHA256": "5fd9e49a6571298905f674574d76969c27dc2b8b0f9e9ab3cabcc3becf84f72c",
+    "clientSHA256": "6ab16f239c4bd0c4b963f8ca581db958f583520abf656a60b00d8acb96fceef0",
+    "evidenceSHA256": "d5408bab04aa81e4894f92a79176eb8b2e8044b4acf7abe25dbabc07ca8fe5de",
+    "cycleReceiptSHA256": "dc2c2b33e4f5e037a2aa4199952b1e27bf25828c9f2a367a2d0852176a361d29",
+    "clientReceiptSHA256": "7492b11bae108f1dfe3fdc9b22ece67939cbee6443e0e8cff35bda16f87f8ab0",
+    "verificationArtifactSHA256": "d5e20e46db5796a40c053b1121ab2002c4ed2648330b5299b27402240150381e",
+    "completionSHA256": "b3b04ab393ebb7124499a502f06f9369500f8e9ca920bf68879b63cf3aa348ab",
+    "artifactListSHA256": "9cd9f618cd6dd6097acff44d626f0666d1dea0c00f378d82e0b57d90c739619d",
+    "warmupCycles": 1,
+    "measuredCycles": 3,
+    "measuredSeconds": 135.580501,
+    "cycleReceipts": 4,
+    "evidenceRows": 24,
+    "typedClientDisconnectedRows": 4,
+    "maximumActiveRequests": 4,
+    "maximumCoordinatorSlots": 4,
+    "maximumCancelToEvidenceSeconds": 0.991962,
+    "maximumRecoverySeconds": 11.783074,
+    "maximumProcessRSSKB": 18171392,
+    "postWarmupRSSPeakRatio": 1.0000281770008752,
+    "maximumMLXActiveBytes": 20375859784,
+    "maximumMLXCacheBytes": 6190803701,
+    "maximumMLXPeakBytes": 22034101786,
+    "powerSamples": 6,
+    "watchdog": false,
+    "lockReleased": true,
+    "orphanProcesses": 0
+  },
+  "preparedResidentSoak": {
+    "launched": false,
+    "targetMeasuredSeconds": 86400,
+    "maximumRuntimeSeconds": 93600,
+    "clientSHA256": "81dc2b7fe4d6080a20721fe5729f1084a2d1a384e22f634bbc78c66e45e37dfc",
+    "launcherSHA256": "ad2d5cc592ae79fe579b1e614562f376e389d619b3b13590e5967dae74f2dc46",
+    "manifestSHA256": "5c11ac363d076a440e20183d79fd7b948dee11cc0bce6e4dd083a3ae77282fec",
+    "hostSpecificPacketRequired": true,
+    "externalHostIdentityReady": false
+  },
+  "overall": {
+    "verdict": "PHASE5_PREFLIGHT_PASS_RESIDENT_SOAK_BLOCKED_EXTERNAL_HOST_IDENTITY",
+    "phase5Complete": false,
+    "explicitContinuousNoSpecRouteChanged": false,
+    "residentSoakAuthorized": false,
+    "nextSafeAction": "Correct or confirm the 192.168.1.253 network mapping and macOS Remote Login service, then authenticate the host before deriving and launching a fresh host-specific soak packet."
+  }
+}

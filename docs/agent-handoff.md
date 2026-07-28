@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-24
+Last reviewed: 2026-07-28
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -26,16 +26,24 @@ capacity model by architecture, `SystemProfiler`, `fastmlx-capacity`, PLD framew
 and exact continuous-batching/chunked-prefill engine proof. The currently shipped operator surface
 is the engine, harness, and capacity CLI.
 
-**Not shipped yet:** adaptive native macOS UI/dial, production OpenAI-compatible service route,
+**Integration-ready branch surface:** the explicit, source-locked
+`continuous-batch-no-spec` OpenAI-compatible HTTP/SSE route has passed its model-scoped Phase 5
+gate and is authorized for the required reviewed `--no-ff` integration. Dynamic solo PLD remains
+shelved and is not part of that route.
+
+**Not shipped yet:** adaptive native macOS UI/dial, a broad/default or dynamic serving policy,
 model management, menu-bar controls/metrics, auto-update, website/community surfaces, and
 benchmark publication automation. These are high-priority roadmap work, not current product
-surface. Captures include [`2026-07-18-adaptive-macos-dial-ui.md`](task-inbox/2026-07-18-adaptive-macos-dial-ui.md)
+surface. Captures include
+[`2026-07-18-adaptive-macos-dial-ui.md`](task-inbox/2026-07-18-adaptive-macos-dial-ui.md)
 and [`2026-07-18-website-benchmark-community.md`](task-inbox/2026-07-18-website-benchmark-community.md).
 
 **Major dated outcomes:** TurboQuant v1 was shelved as a dated negative result; PLD was promoted
 as exact for repetition-heavy/echo workloads; Qwen3-32B EAGLE-3 was shelved on byte-identity
-failure; continuous batching was promoted as an exact engine building block but has no production
-API route yet.
+failure; continuous batching was promoted as an exact engine building block, and the feature
+branch's clean explicit no-spec route passed the full-day Phase 5 gate. Dynamic solo PLD remains
+shelved. The remaining release mechanic is the reviewed `--no-ff` integration; absorbed MLA is the
+next engineering item.
 
 **KVarN/asymmetric KV frontier — COMPLETE (2026-07-18):** selected lossy capacity tiers were
 promoted, but no speed tier was proven. Verdict:
@@ -285,22 +293,170 @@ SSD tier follows. Verdict:
 plan:
 [`2026-07-23-exact-prefix-session-cache.md`](superpowers/plans/2026-07-23-exact-prefix-session-cache.md).
 
-**Content practice:** `docs/content/` now has 15 dated pieces. Keep writing one dated content piece per
-notable spike, including negative results.
+**Continuous-batching serving route — PHASE 3 COMPLETE, BRANCH-LOCAL (2026-07-24):** branch
+`codex/continuous-batching-serving-route` now carries the explicit
+`continuous-batch-no-spec` OpenAI-compatible HTTP/SSE route at clean
+`d9143ce24ac084d295e3903443c96aa07c1fe6e7`. The route is additive and preserves scalar defaults.
+It has bounded request bodies, bounded suspending publication, typed 400 versus 429 admission,
+loopback-by-default/authenticated remote binding, actor-confined model ownership, fixed-capacity
+decode cohorts, real disconnect propagation, shutdown cleanup, and honest no-spec telemetry.
+
+Pure verification passes 675 XCTest plus 17 Swift Testing tests. On `llmbench`, clean Xcode
+verification passes 140/140 `FastMLXHarnessTests`, 176/176 `SpikeCoreTests`, and 30
+`SpikeServingAdaptersTests` with the two loaded tests intentionally skipped outside an explicit
+model environment; Release builds both serving binaries. Xcode and Release log SHA-256 values are
+`eb763b849d7d4d53f4d7e094cbe9091c8c620efa1252d84ce09413bc8b7cf937` and
+`463f331dbd79a0d6f27d2738688839dc70338e9590d32a0c0b12e61b10385324`.
+
+The fresh loaded proof is terminal `COMPLETE` at
+`/Users/llmbench/perf-work/results/continuous-serving-phase3-loaded-capacity-cohort-d9143ce-v6`.
+One selected Qwen3-32B test passed in 48 seconds. It closes a real TCP/SSE client during loaded
+prefill and hostile shared decode, proves cancellation within five seconds, exact survivor and
+replacement output, same-capacity B3→B2→B3 reuse, two internally shared but mutually isolated
+fixed-capacity B2 cohorts, no speculation, final zero slots/reserved KV/connections, and explicit
+96-GiB MLX / 8-GiB cache / 16-GiB aggregate-KV limits. Launcher, artifact-manifest,
+xcresult-file-manifest, and test-log SHA-256 values are
+`62af08aeb247e1c932258f7dd2fc005cf2f8cb180a01dc40f9fc3f66ca87917a`,
+`8a540c31cacd79254432ca6e300d5c27b3d3fde1c23f8a8202f3239aefa0ecc9`,
+`0b2ab7a3f2c79a96f8fc57cf02766d7a4fbcf08a98a187c41050b3082a53ecdf`, and
+`0a242aa14209452c3480c2906b4e5b4895cc7ff9ed3ba8dd65c83f8858998a16`.
+The generic XCTest child reached 18,231,568 KiB max RSS; all artifact and xcresult hashes
+reauthenticate, and no lock, watchdog, or orphan remains.
+
+Verification packet:
+[`continuous-serving-phase3-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase3-verification-2026-07-24.json),
+SHA-256 `d99094319c899048bf27db32ed6bfc8e1e836393a71747fb2edfeb03d8ae4702`.
+This is not a dynamic/default or broad-family promotion. At that Phase 3 boundary, Phase 4 still
+had to implement and measure the actor-confined solo-PLD transition; Phase 5 owned the resident
+transport soak, dated public fast-mlx-only verdict/content, final verification, merge, and release
+proof. The operator has authorized routine in-scope downloads and remote bench operations needed
+to continue the roadmap; do not pause for a separate conversational approval when the capability
+is already available.
+
+**Continuous-batching serving route — PHASE 4 COMPLETE, NEGATIVE SPEED VERDICT (2026-07-24):**
+
+- **Objective:** qualify an actor-confined solo-PLD transition without weakening exact
+  temperature-zero or shared-batch contracts.
+- **Current state:** clean `520a106708f4f0d47cf8bc9f08a188078c4915d8` retains the internal
+  incremental session, while the shipping CLI exposes only explicit `continuous-batch-no-spec`.
+  Dynamic PLD is shelved after +1.3902% retained ngram-3 and +1.1236% ngram-2 C=1 gains missed the
+  +5% gate.
+- **Accepted decisions:** keep exactness/cancellation/drain tests; forbid dynamic evidence from
+  promotion or speed aggregation; do not rerun or retune unchanged PLD; reopen only from a bounded
+  profile showing a credible +5% route.
+- **Changed files:** Phase 4 source/tests are committed at `520a106`; dated verdict, criterion
+  packet, plan closure, handoff, and public fast-mlx-only content record the negative disposition.
+- **Verification:** 136 focused pure tests; 140 `FastMLXHarnessTests`; 194 `SpikeCoreTests`; 50
+  `SpikeServingAdaptersTests` with four expected loaded skips; Release/build-for-testing pass.
+  Fresh loaded root
+  `/Users/llmbench/perf-work/results/continuous-serving-phase4-loaded-exact-520a106-v1` is
+  `COMPLETE`: 1/1 in 22.459 seconds, max RSS 18,261,232 KiB, authenticated artifact and xcresult
+  manifests, no watchdog/lock/orphan. Packet
+  [`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json)
+  SHA-256 is `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
+- **Historical blocker:** Phase 5 resident-soak/release proof was still open at this checkpoint.
+  Product smoke v8 and bounded transport preflight v2 passed, while the intended 256-GiB host
+  initially presented the wrong SSH identity. No key was trusted and no credential or workload
+  was sent before the expected OpenSSH identity was authenticated.
+- **Update 2026-07-25:** the `.253` Mac host now reaches the expected OpenSSH identity and the
+  staged Qwen3-32B-4bit snapshot are authenticated. Preserve v2 as non-promotable verification
+  history because it lacked complete source-tree binding. V3 is the canonical fresh verifier:
+  it authenticates an exact 527-file isolated source snapshot, passes 140/194/51 Apple test
+  slices with four expected skips, builds Release, and produces server SHA-256
+  `50c50ff42ace01bc714f13f307f72d488b84e43e124b564cecd5c23ca18c7d9c`.
+  Keep the historical Dropbear note for the earlier mismatch, but do not treat it as the current
+  blocker.
+- **Disposition:** superseded by the authenticated Phase 5 closure below. Preserve every earlier
+  partial, failed, diagnostic, and non-promotable boundary unchanged.
+
+**Continuous-batching serving route — PHASE 5 HISTORICAL PREFLIGHT CHECKPOINT (2026-07-24):**
+
+- Clean `24c7df0fa0c7f10ddf65a0443e41c7f97abb8e6d` exposes an admitted SSE 200 head before
+  awaiting the first backend delta. Product smoke v8 is fresh `COMPLETE` with seven evidence
+  rows: six completed responses and one zero-body typed `clientDisconnected` row; maximum active
+  requests and coordinator slots are three, followed by zero-resource recovery.
+- Transport preflight v2 is fresh `COMPLETE` at
+  `/Users/llmbench/perf-work/results/continuous-serving-phase5-transport-preflight-24c7df0-v2`.
+  It carries one dropped warmup plus three measured C=4 cycles, 135.580501 measured seconds,
+  24 evidence rows, four typed disconnects, maximum cancel-to-evidence 0.991962 seconds, maximum
+  recovery 11.783074 seconds, 18,171,392 KiB maximum RSS, 1.000028177 post-warmup peak/baseline
+  RSS ratio, MLX active/cache/peak within explicit 96/8-GiB limits, six retained AC/High-Power/
+  Foundation-nominal samples, and no watchdog, failure, lock, port, or orphan.
+- Preflight v1 remains terminal before server launch; its immutable sibling manual-failure receipt
+  and sidecar SHA-256 values are
+  `e3f5f307a4e5b13219cf5d5ca5cf5789b039510ceb0416f5f427ae7714e355e8` and
+  `5c26b7c85c2d55a06cb171cd08c41ea5a4d1fc625d6d16cb81be596e87100dc4`.
+  Never resume, overwrite, or promote v1.
+- The independently recomputed preflight manifest, evidence, cycle-receipt, authentication,
+  completion, and artifact-list SHA-256 values are
+  `ed4bd96959564be8b794720c37624497e1f215a79411319ed218e1b66a63f82f`,
+  `d5408bab04aa81e4894f92a79176eb8b2e8044b4acf7abe25dbabc07ca8fe5de`,
+  `dc2c2b33e4f5e037a2aa4199952b1e27bf25828c9f2a367a2d0852176a361d29`,
+  `d5e20e46db5796a40c053b1121ab2002c4ed2648330b5299b27402240150381e`,
+  `b3b04ab393ebb7124499a502f06f9369500f8e9ca920bf68879b63cf3aa348ab`,
+  and `9cd9f618cd6dd6097acff44d626f0666d1dea0c00f378d82e0b57d90c739619d`.
+- The static-reviewed but unlaunched `.252` 24-hour draft packet has client, launcher, and
+  manifest SHA-256
+  values `81dc2b7fe4d6080a20721fe5729f1084a2d1a384e22f634bbc78c66e45e37dfc`,
+  `ad2d5cc592ae79fe579b1e614562f376e389d619b3b13590e5967dae74f2dc46`,
+  and `5c11ac363d076a440e20183d79fd7b948dee11cc0bce6e4dd083a3ae77282fec`.
+  It is `.252`-specific and must remain unlaunched; after `.253` admission, derive fresh paths,
+  desktop power policy, source/binary/model hashes, nonce, and output root.
+- Checkpoint packet:
+  [`continuous-serving-phase5-preflight-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json),
+  SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
+
+**Continuous-batching serving route — PHASE 5 COMPLETE, MODEL-SCOPED PROMOTION (2026-07-28):**
+
+- **Objective:** prove that the explicit `continuous-batch-no-spec` HTTP/SSE route can keep one
+  source-locked Qwen3-32B-4bit model resident for a full day of C=4 traffic with a hostile
+  post-admission disconnect in every cycle, bounded recovery, stable resources/environment, exact
+  provenance, redaction, and terminal cleanup.
+- **Decision:** promote the explicit model-scoped temperature-zero text route. Dynamic solo PLD
+  remains shelved. No broad model-family default, shared-batch speculation, sampling, tools, media,
+  WebSocket, or unauthenticated remote-bind claim follows.
+- **Fresh proof:** canonical boundary
+  `continuous-serving-phase5-transport-soak-1c084f3-m3ultra-v2` is terminal `COMPLETE`,
+  non-diagnostic, and promotable after 86,420.985839 measured seconds. One dropped warmup plus
+  1,727 measured cycles produced 10,368 exactly paired evidence rows: 8,640 completed responses
+  and 1,728 typed zero-body `clientDisconnected` rows. Maximum cancel-to-evidence was 2.398127
+  seconds; maximum recovery was 12.019825 seconds; every recovery ended at zero active requests,
+  coordinator slots, and reserved KV bytes.
+- **Resource/environment proof:** MLX active/cache/peak stayed inside 96/8-GiB bounds. RSS moved
+  from 18,165,488 to 18,168,704 KiB, a 1.000177039 ratio against the 1.05 gate. All 291 samples
+  retained AC power, Foundation low-power false, and no performance or thermal warning.
+- **Provenance/cleanup:** the complete 527-file source snapshot, dependency resolution, clean
+  Release binary, 12-file model, workload/policy/host/tool projections, packet, receipts, and all
+  42 artifact-manifest entries reauthenticate. Terminal sensitive scanning reports no registered
+  raw value retained. No process, listener, held lock, watchdog, incoming publisher file, or orphan
+  remains.
+- **Terminal protocol:** the mutable root receipt intentionally remains `FINALIZING`,
+  nonterminal, and non-promotable. The create-only immutable sibling receipt is canonical only
+  after terminal hashing, scanning, and cleanup; its SHA-256 is
+  `f910fd570f4fd6d6c1f749dbe16f6d1dfffb8cb7953ebb04cf43aca8b641a608`.
+- **Durable proof:** verdict
+  [`2026-07-28-continuous-serving-phase5.md`](superpowers/verdicts/2026-07-28-continuous-serving-phase5.md);
+  verification packet
+  [`continuous-serving-phase5-verification-2026-07-28.json`](superpowers/verdicts/continuous-serving-phase5-verification-2026-07-28.json),
+  SHA-256 `b1f7bb933e65dfb93c4043d64e1426b1c464b1828edebbcf425eabf6f798e22a`.
+- **Next safe action:** complete the required reviewed closeout commit and `--no-ff` integration,
+  then begin absorbed MLA. Reopen Phase 5 only from a new source/binary/model/route/workload or
+  terminal-publication contract; never resume an existing evidence root.
+
+**Content practice:** `docs/content/` now has 17 dated pieces. Keep writing one dated content piece
+per notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Continuous-batching serving route** — production OpenAI-compatible route, real disconnect
-   propagation, dynamic policy boundaries. [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
-2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
+1. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-3. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
+2. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
    porting the L1/L3/L1b/L3b stack. [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-4. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
+3. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
    MLX checkpoints for the Swift loop. [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-5. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
+4. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
    Metal watchdog. [Task](task-inbox/2026-07-14-long-context-metal-watchdog.md).
-6. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
+5. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
    baselines exist. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 
 **Public evidence/community platform — ROADMAP CAPTURED (2026-07-15).** The

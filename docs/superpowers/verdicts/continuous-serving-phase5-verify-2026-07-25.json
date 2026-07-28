@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-25",
+  "feature": "continuous-serving-phase5-verify-1c084f3-m3ultra-v3",
+  "classification": "PASS",
+  "hostAdmission": {
+    "hostName": "LLM-256GB.localdomain",
+    "modelIdentifier": "Mac15,14",
+    "chip": "Apple M3 Ultra",
+    "memoryBytes": 274877906944,
+    "osVersion": "26.5.2",
+    "osBuild": "25F84",
+    "hostKeyFile": "/private/tmp/fast-mlx-253-known-hosts",
+    "snapshotRoot": "/Users/llmbench/perf-work/models/Qwen3-32B-4bit",
+    "receiptSHA256": "7853c49616b05e2fd4fa043448959d1c0d6f5a7821967e26cfa80c91865941e5"
+  },
+  "historicalBoundaries": [
+    {
+      "id": "continuous-serving-phase5-verify-1c084f3-m3ultra-v2",
+      "disposition": "NON_PROMOTABLE_PRESERVED",
+      "reason": "V2 passed its test and build commands but did not authenticate the complete mutable source checkout. It is not the source or binary proof used by the soak."
+    }
+  ],
+  "criteria": [
+    {
+      "id": "read-only-host-and-snapshot-admission",
+      "verdict": "PASS",
+      "evidence": "The pinned known-host file authenticates the Mac host identity, and the staged Qwen3-32B-4bit tree has exactly 12 regular top-level files with zero symlinks or special files. Every listed file size and SHA-256 matches the receipt, the total is 18,445,872,022 bytes, and the index references exactly four shards."
+    },
+    {
+      "id": "fresh-verification-boundary",
+      "verdict": "PASS",
+      "evidence": "V2 is preserved as non-promotable verification history because it lacked the reviewed full-tree source binding. Fresh v3 output /Users/llmbench/perf-work/results/continuous-serving-phase5-verify-1c084f3-m3ultra-v3 finishes PASS with no failure.json, retain-lock.txt, process, or lock. Status and artifact-list SHA-256 values are 71c16900032b1b4f5d69afad769891b7f4aaca5677d9fb0b8cbb1f2811515d5f and 82107f4537c15fdf73fcd28a72d1d4f81ca55eb8db2d64c44afc2729ed88b591."
+    },
+    {
+      "id": "exact-source-provenance",
+      "verdict": "PASS",
+      "evidence": "The v3 launcher builds from an isolated source snapshot authenticated against a 527-file manifest SHA-256 a84b8c9b4de50766c1ec83ed818a4ff76d12128bf77df82a1c831357208bb328. Exact pre/post path sets match, no source symlink is admitted, and the identical pre/post verification log SHA-256 is aa0fde724cd8b17507ed5ec6531a890afaa9369319b208958990fb6131a78f44."
+    },
+    {
+      "id": "apple-regression-and-release",
+      "verdict": "PASS",
+      "evidence": "The v3 launcher reports 140 FastMLXHarnessTests, 194 SpikeCoreTests, 51 SpikeServingAdaptersTests, and 4 skipped tests; Release build succeeded. Xcode and Release log SHA-256 values are d412e19e66a733908066f84068ffec708494f12f1074d956a1db0f56123bf4b1 and 03dc7b9b247d56656eaae2409033c2f1e000fa3cbde97d1415e033499c040b21. Fresh server and harness binary SHA-256 values are 50c50ff42ace01bc714f13f307f72d488b84e43e124b564cecd5c23ca18c7d9c and b7e122de2a9678bb770c56bc4dea17763c80674112a7e5623d531ea15f7cf7b1."
+    }
+  ],
+  "overall": {
+    "verdict": "PASS",
+    "phase5Complete": false,
+    "residentSoakAuthorized": false,
+    "nextSafeAction": "Finish and review the bounded single-pass secret scanner and dedicated-host client, derive the fresh host-specific packet, run one short real C=4 preflight, then launch the reviewed 24-hour soak exactly once."
+  }
+}

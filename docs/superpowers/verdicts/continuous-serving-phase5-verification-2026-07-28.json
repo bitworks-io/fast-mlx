@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-28",
+  "feature": "continuous-batching-serving-route-phase5",
+  "classification": "PASS_PHASE5_PROMOTE_EXPLICIT_NO_SPEC_MODEL_SCOPED",
+  "lane": "EXACT",
+  "source": {
+    "gitSHA": "1c084f305da83c3ab2e399368b5bd32f14dabd09",
+    "sourceManifestSHA256": "a84b8c9b4de50766c1ec83ed818a4ff76d12128bf77df82a1c831357208bb328",
+    "sourceManifestFileCount": 527,
+    "packageResolvedSHA256": "7fa8102041ba82ae0347f69f17fb439a55c379420a1f2406b900f7d91020269e",
+    "releaseServerBinarySHA256": "f5bfc31fe6cccf8a8aae5cee2c8596052b5a9d594e4ca971df39be4f6ac8a41e",
+    "releaseBuildCompletionSHA256": "12bda09f5fac2bdd55ac73a2df2017785858e150bd2653f6bd37782a37600ee8",
+    "releaseBuildStatusSHA256": "0dc5f691c4df988edd2614a273f982241b95bc31a54d30d5fe188dd5073dbb37",
+    "releaseBuildArtifactsSHA256": "217ddd60f2add5f02306dbb635000dc65c81f0ffd0a0fdb7b45faffdb46684ff",
+    "releaseBuildRequestSHA256": "fd26b66e00db4b9ea0436b389224d91d54f6964f820a364b594ee91153e85957",
+    "coverageSettings": {
+      "ENABLE_CODE_COVERAGE": "NO",
+      "CLANG_ENABLE_CODE_COVERAGE": "NO",
+      "CLANG_COVERAGE_MAPPING": "NO",
+      "profileProbeClean": true
+    }
+  },
+  "host": {
+    "modelIdentifier": "Mac15,14",
+    "chip": "Apple M3 Ultra",
+    "memoryBytes": 274877906944,
+    "osVersion": "26.5.2",
+    "osBuild": "25F84",
+    "powerSource": "AC",
+    "foundationLowPower": false,
+    "foundationThermalState": "nominal"
+  },
+  "model": {
+    "id": "qwen3-32b-source-locked",
+    "format": "Qwen3-32B-4bit",
+    "fileCount": 12,
+    "totalBytes": 18445872022,
+    "receiptSHA256": "7853c49616b05e2fd4fa043448959d1c0d6f5a7821967e26cfa80c91865941e5",
+    "projectionSHA256": "88bff381764bea65c7a9c73b799f5b8fd5bf425f6f0db5f15d8bd137c0fb8eff",
+    "allFilesReauthenticated": true
+  },
+  "projections": {
+    "workloadSHA256": "08c092f256c0804ac535b51e769401eef8102b5cd6e60f0146ffbe55ced7a38f",
+    "thermalPolicySHA256": "7b27c4810a3fa1adb9e220160eccbbd9bd873b18eeb76a93d7a88cceb079978f",
+    "toolsSHA256": "4b71a40de50b0f8a00197345a74d89af2751630ae76a768d854a85c604fd94ef",
+    "hostContractSHA256": "62dd4dce626a375d48a2920a35497c5452af76031d1bf852a4fdb02daff67888",
+    "hostAdmissionSHA256": "ade7e0bc8f8abf815fa17f32058b70833c90c327a806ec97d483a690d5499ffe",
+    "metalToolchainSHA256": "969819087ed9704a3d72802bd00fd772bb221c037226776bec04e515def31c38",
+    "toolBinaryCount": 16,
+    "toolBinaryFailures": 0
+  },
+  "prerequisitePreflight": {
+    "id": "continuous-serving-phase5-transport-preflight-1c084f3-m3ultra-v30",
+    "state": "COMPLETE",
+    "diagnostic": true,
+    "promotable": false,
+    "warmupCycles": 1,
+    "measuredCycles": 3,
+    "evidenceRows": 24,
+    "typedDisconnectRows": 4,
+    "rootCompletionSHA256": "e4a5abcd4856fc3da812e663fc09045043e3b28fd4fcc797a3cf97ef8f0447c3",
+    "terminalCompletionSHA256": "15fef05e5872b6e9627d083e4241420307e8c77c43657f0aab5e093d88c7cd35",
+    "terminalCompletionSidecarSHA256": "032abfc92c79fca0f254f04d4fd976378e87d48eff002c0908cc0de2b4295526",
+    "artifactsSHA256": "fcdfcda48f4f58393861e669bfc233e12b77f6dc046af17b1cd05954ed71e0c8",
+    "runtimeProofSHA256": "9bfa6405f744e33056883526c78980cb3b122622004a843058fa45255f8ad011",
+    "evidenceSHA256": "141364f0112cd29c6d612211a48c28a4a28d14838df515055070eb3fa56e56a5",
+    "sensitiveScanSHA256": "06a39e68095781de511d9a4995bb1903841bd91a73186f83ee3d27526c1ff9a3"
+  },
+  "soakPacket": {
+    "id": "continuous-serving-phase5-transport-soak-1c084f3-m3ultra-v2",
+    "clientSHA256": "7479e20287a4bd66fdb034eb50678be75d305ff7510851190bb09b3a48529e14",
+    "launcherSHA256": "9711594769acdabc15c099db702bc8e445c6581ebb93266b5d73540816df0d9e",
+    "manifestSHA256": "17d84fb1ebd851de541ea93ecb42e81eddbad62dc08d67a35b028ada3b3ae8cb",
+    "manifestContractSHA256": "6d6fbce0732aab4e06f12b19ad38bfdc6ef9e36faba3a96fba05d966d218a9bc",
+    "preconditionAuditSHA256": "820b3cd23610d2296d14d889e4099cf8a92b5735b9fef8b0314e6036bc419ed4",
+    "launchEnvelopeSHA256": "ed6bbafc0ad1d0e778ff9a39b1037e44afb22625d7df535809c959e34aacc847",
+    "stagePublisherSHA256": "17c1ae11dd12c28d560226982871d7337c209b3a64eaca5700024f69ac3791c4",
+    "stageAdmissionSHA256": "29bd18001f24d17fb2d22055a6e82529e45bdc8c7ab44f1e46e0d4c7d5f70a83",
+    "stageAdmissionSidecarSHA256": "20c7248feaf321ff0f6d22d1602b4c1e59f4cab7c25680d6e25182162918dd6f",
+    "launchReceiptSHA256": "87742305e848d7f317daf58cfc60d7630107eb631196dd3722c7e82ea1c97077",
+    "launchReceiptSidecarSHA256": "33ae58db50f7e6848f4848bb359c3785cc0561fd7e42fc6bbb6a61c5549e884b"
+  },
+  "soakResult": {
+    "route": "continuous-batch-no-spec",
+    "targetMeasuredSeconds": 86400,
+    "measuredSeconds": 86420.985839,
+    "independentMonotonicWitnessSeconds": 86420.115586,
+    "concurrency": 4,
+    "warmupCycles": 1,
+    "measuredCycles": 1727,
+    "cycleReceipts": 1728,
+    "cycleIndexMinimum": 0,
+    "cycleIndexMaximum": 1727,
+    "requestRows": 10368,
+    "evidenceRows": 10368,
+    "evidenceSchemaVersion": 2,
+    "completedResponses": 8640,
+    "typedClientDisconnectedRows": 1728,
+    "maximumActiveRequests": 4,
+    "maximumCoordinatorSlots": 4,
+    "maximumCancelToEvidenceSeconds": 2.398127,
+    "cancelToEvidenceLimitSeconds": 5,
+    "cancelToEvidenceViolations": 0,
+    "maximumRecoverySeconds": 12.019825,
+    "recoveryLimitSeconds": 30,
+    "recoveryViolations": 0,
+    "recoveryTerminalActiveRequests": 0,
+    "recoveryTerminalCoordinatorSlots": 0,
+    "recoveryTerminalReservedKVBytes": 0,
+    "requestMultisetSHA256": "d2670c02d1adfd649ddd8eae822a4f6103dbed39af1edb176a7bc19e989435e1",
+    "responseMultisetSHA256": "953dbb542caff80465347730f0ae94ee8fc358bd246a1e87dc878a4a398d46e4",
+    "requestResponsePairSHA256": "9f2f939a817b567f1004f4ae3afce4655d4cc223c52f9ffc5d9fb3a69a694323",
+    "evidenceSHA256": "351ab99a43c3fe8c108f5377d557f8e5884966b2636ada4758a4ffdddac50ce7",
+    "cycleReceiptSHA256": "a3ce9f389d40645a0262d22051b7c08b1477be803133f745150493fe0f3047aa",
+    "clientReceiptSHA256": "1205a2b2c5913fd2e05dce7c7651cbba6b6aabc2685e1d4b7de440d832bd174d",
+    "durationWitnessSHA256": "c5ab0df149b89c42d2cf6f764c151923c5466678de1be7fbc8368c9149df1b6c"
+  },
+  "resources": {
+    "mlxMemoryLimitBytes": 103079215104,
+    "mlxCacheLimitBytes": 8589934592,
+    "maximumMLXActiveBytes": 20442968648,
+    "maximumMLXCacheBytes": 5527599705,
+    "maximumMLXPeakBytes": 22099490330,
+    "postWarmupBaselineProcessRSSKiB": 18165488,
+    "maximumProcessRSSKiB": 18168704,
+    "peakToBaselineRSSRatio": 1.000177039,
+    "maximumAllowedPeakToBaselineRSSRatio": 1.05,
+    "failedResourceSnapshots": 0
+  },
+  "environment": {
+    "sampleCount": 291,
+    "minimumElapsedSeconds": 0,
+    "maximumElapsedSeconds": 87299,
+    "allAC": true,
+    "allFoundationLowPowerFalse": true,
+    "performanceWarnings": 0,
+    "thermalWarnings": 0,
+    "commandFailures": 0,
+    "samplesSHA256": "8cdfddc3367b1bd9de2bbf96c5588c6d537fe52aa568e70c664fc66c9824a4f8"
+  },
+  "terminalIntegrity": {
+    "canonicalReceiptStatus": "COMPLETE",
+    "canonicalReceiptTerminal": true,
+    "canonicalReceiptDiagnostic": false,
+    "canonicalReceiptPromotable": true,
+    "canonicalReceiptCompletedUTC": "2026-07-28T06:21:58Z",
+    "canonicalReceiptSHA256": "f910fd570f4fd6d6c1f749dbe16f6d1dfffb8cb7953ebb04cf43aca8b641a608",
+    "canonicalReceiptSidecarSHA256": "7d5d2fd0cd801a96de7f5a4c8c21f81b0c003cb1060410895e1cece315c5f714",
+    "rootReceiptStatus": "FINALIZING",
+    "rootReceiptTerminal": false,
+    "rootReceiptPromotable": false,
+    "rootReceiptSHA256": "5ba9e2a65bd1c68d14599daf8112530d1fcda8b2284069e68ea237fbabb597d7",
+    "artifactManifestEntries": 42,
+    "artifactManifestFailures": 0,
+    "artifactManifestSHA256": "976b846a562e842e28fd9acf789a54cc5f9df2191131a8b82e67072a4d4612ca",
+    "rootFileCountIncludingManifest": 43,
+    "incomingArtifactFiles": 0,
+    "terminalSensitiveScan": "PASS",
+    "rawValuesPersisted": false,
+    "terminalSensitiveScanSHA256": "8e8097d8e589494a72a59629569f367f59fe7fa4deb6181da584b1b160065ca5",
+    "terminalSensitiveScanLogSHA256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "activeProcesses": 0,
+    "activeListeners": 0,
+    "heldLocks": 0,
+    "watchdogs": 0,
+    "orphans": 0
+  },
+  "criteria": [
+    {
+      "id": "exact-source-build-model-and-tool-provenance",
+      "verdict": "PASS",
+      "evidence": "The complete 527-file source snapshot, dependency resolution, clean non-profiled Release binary, 12-file source-locked model, and 16 runtime tool binaries all independently reauthenticate against their sealed hashes."
+    },
+    {
+      "id": "fresh-prerequisite-preflight",
+      "verdict": "PASS",
+      "evidence": "Fresh V30 is terminal COMPLETE and proves the repaired terminal artifact-publication path with one dropped warmup, three measured C=4 cycles, 24 rows, typed hostile disconnects, bounded recovery, clean redaction, and sealed artifacts. It remains diagnostic and non-promotable by design."
+    },
+    {
+      "id": "full-day-duration-and-exact-accounting",
+      "verdict": "PASS",
+      "evidence": "The canonical terminal receipt records 86,420.985839 measured seconds against an 86,400-second gate, independently witnessed at 86,420.115586 seconds. Exactly 1 warmup plus 1,727 measured cycles produced 10,368 request/evidence rows."
+    },
+    {
+      "id": "request-response-pairing-and-route-boundary",
+      "verdict": "PASS",
+      "evidence": "All request, response, and pair multiset digests match. Every schema-2 evidence row names only continuous-batch-no-spec; 8,640 normal responses completed and 1,728 hostile clients produced typed zero-body clientDisconnected rows."
+    },
+    {
+      "id": "hostile-disconnect-and-recovery",
+      "verdict": "PASS",
+      "evidence": "Maximum cancel-to-evidence was 2.398127 seconds against 5 seconds, maximum recovery was 12.019825 seconds against 30 seconds, and every recovery ended with zero active requests, coordinator slots, and reserved KV bytes."
+    },
+    {
+      "id": "resource-and-rss-stability",
+      "verdict": "PASS",
+      "evidence": "MLX active/cache/peak stayed inside the declared 96/8-GiB limits. Process RSS rose from a post-warmup 18,165,488 KiB baseline to 18,168,704 KiB, a 1.000177039 ratio against the 1.05 gate, with zero failed resource snapshots."
+    },
+    {
+      "id": "stable-power-and-thermal-environment",
+      "verdict": "PASS",
+      "evidence": "All 291 environment samples retained AC power, Foundation low-power false, no performance warning, no thermal warning, and successful probe commands."
+    },
+    {
+      "id": "terminal-artifact-integrity-redaction-and-cleanup",
+      "verdict": "PASS",
+      "evidence": "The immutable sibling receipt is canonical COMPLETE, terminal, non-diagnostic, and promotable after artifact hashing, terminal sensitive scanning, and cleanup. All 42 manifested artifacts verify; no incoming file, retained raw value, process, listener, held lock, watchdog, or orphan remains."
+    },
+    {
+      "id": "product-and-public-claim-boundary",
+      "verdict": "PASS",
+      "evidence": "Promotion is limited to the explicit temperature-zero text continuous-batch-no-spec route for the source-locked Qwen3-32B-4bit boundary on the measured Apple M3 Ultra workload. Dynamic PLD, broad model-family defaults, sampling, tools, media, WebSocket, and unauthenticated remote binding are not authorized by this evidence."
+    }
+  ],
+  "overall": {
+    "verdict": "PASS_PHASE5_PROMOTE_EXPLICIT_NO_SPEC_MODEL_SCOPED",
+    "phase5Complete": true,
+    "explicitContinuousBatchNoSpecAuthorized": true,
+    "dynamicSoloPLDAuthorized": false,
+    "broadModelFamilyDefaultAuthorized": false,
+    "releaseMergeAuthorizedAfterLocalCloseoutChecks": true,
+    "nextRoadmapItem": "absorbed MLA"
+  }
+}

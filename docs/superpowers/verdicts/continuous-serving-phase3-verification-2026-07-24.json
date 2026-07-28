@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-07-24",
+  "feature": "continuous-batching-serving-route-phase3",
+  "classification": "EXACT",
+  "source": {
+    "gitSHA": "d9143ce24ac084d295e3903443c96aa07c1fe6e7",
+    "pureVerificationLogSHA256": "e06e4b67a219fa038fdb7fd7c452ba0b5ad473820b6a84b037e183b8dbce9420",
+    "xcodeTestLogSHA256": "eb763b849d7d4d53f4d7e094cbe9091c8c620efa1252d84ce09413bc8b7cf937",
+    "releaseBuildLogSHA256": "463f331dbd79a0d6f27d2738688839dc70338e9590d32a0c0b12e61b10385324",
+    "fastMLXHarnessBinarySHA256": "8c0e64736c55a3b8d2c8fad52e6058728218e204937619b7787684889d112c53",
+    "fastMLXServeBinarySHA256": "2d4372a8dc31bd9ddb163f9eb6809cd2781dc7d695b6ce6c5dd0749e47cde614",
+    "genericXCTestRunSHA256": "7c508412ede370915da5625cfc81436ba1b385a43969efb024210d57c0e56bc3",
+    "loadedTestBinarySHA256": "c4a6ce85f3e13e32624b1130f7b7946200005a9999d179cd09300b29bf7ec92c"
+  },
+  "verification": {
+    "harnessCoreXCTest": {
+      "executed": 675,
+      "failures": 0
+    },
+    "swiftTesting": {
+      "executed": 17,
+      "failures": 0
+    },
+    "fastMLXHarnessTests": {
+      "executed": 140,
+      "failures": 0
+    },
+    "spikeCoreTests": {
+      "executed": 176,
+      "failures": 0
+    },
+    "spikeServingAdaptersTests": {
+      "executed": 30,
+      "skippedWithoutLoadedEnvironment": 2,
+      "failures": 0
+    },
+    "releaseBuildSucceeded": true,
+    "focusedSourceReview": "NO ISSUES",
+    "loadedLauncherReview": "NO ISSUES"
+  },
+  "criteria": [
+    {
+      "id": "openai-text-http-and-sse-contract",
+      "verdict": "PASS",
+      "evidence": "Pure codec, embedded-channel, loopback, bounded-body, auth, error-shape, non-stream, SSE, and shutdown tests pass. Unsupported sampling, tools, media, and malformed requests fail before model admission."
+    },
+    {
+      "id": "bounded-publication-and-admission",
+      "verdict": "PASS",
+      "evidence": "The coordinator uses a bounded suspending mailbox, typed retryable aggregate pressure, permanent oversized-request rejection, bounded traces, and exact cancellation/resource release."
+    },
+    {
+      "id": "loaded-real-tcp-disconnect-and-slot-reuse",
+      "verdict": "PASS",
+      "evidence": "The clean loaded Qwen test closes a real SSE socket during chunked prefill and another during hostile decode, observes cancellation within five seconds, preserves both survivors, admits a same-capacity replacement, and ends with zero active requests, coordinator slots, reserved KV bytes, and TCP connections."
+    },
+    {
+      "id": "fixed-capacity-cohort-exactness",
+      "verdict": "PASS",
+      "evidence": "Two simultaneous requests in each of two incompatible fixed-capacity cohorts share only within their cohort, make progress, and remain token/byte exact to scalar controls. The same-capacity B3-to-B2-to-B3 longest-middle-row compaction is exact, and all shared decode traces disable speculation."
+    },
+    {
+      "id": "clean-apple-build-and-loaded-proof",
+      "verdict": "PASS",
+      "evidence": "Clean source d9143ce passes the Apple Xcode suites and Release build. The fresh loaded proof executes exactly one selected integration test and records one passed, zero failed, zero skipped test in the authenticated xcresult."
+    },
+    {
+      "id": "fresh-provenance-power-and-resource-telemetry",
+      "verdict": "PASS",
+      "evidence": "The launcher binds clean source, source files, test binary/xctestrun, the complete expected top-level model file set and all runtime-consumed model/tokenizer/checkpoint files, explicit 96/8/16 GiB memory/cache/KV limits, High Power mode, 140 W AC, Foundation low-power false/thermal nominal, generic XCTest PID identity, positive max RSS, fresh output, and absence of watchdogs/orphans."
+    },
+    {
+      "id": "dynamic-solo-pld-default",
+      "verdict": "PENDING",
+      "evidence": "Phase 3 proves the explicit continuous-batch-no-spec route only. Incremental actor-confined solo PLD, drain ordering, cancellation, parity, and same-workload HTTP frontier remain Phase 4; no dynamic default is authorized."
+    }
+  ],
+  "loadedEvidence": {
+    "state": "COMPLETE",
+    "outputRoot": "/Users/llmbench/perf-work/results/continuous-serving-phase3-loaded-capacity-cohort-d9143ce-v6",
+    "selectedTest": "LoadedContinuousServingIntegrationTests/testLoadedPrefillAndHostileDecodeDisconnectsPreserveSurvivorsAndReuseSlot()",
+    "testDurationSeconds": 48,
+    "testCount": 1,
+    "passedTests": 1,
+    "failedTests": 0,
+    "skippedTests": 0,
+    "launcherSHA256": "62af08aeb247e1c932258f7dd2fc005cf2f8cb180a01dc40f9fc3f66ca87917a",
+    "loadedXCTestRunSHA256": "09279de18370eb241e628fa1eb8912dae6a96ffdc7766a2e8029e5eb05c8e7d3",
+    "artifactManifestSHA256": "8a540c31cacd79254432ca6e300d5c27b3d3fde1c23f8a8202f3239aefa0ecc9",
+    "xcresultFileManifestSHA256": "0b2ab7a3f2c79a96f8fc57cf02766d7a4fbcf08a98a187c41050b3082a53ecdf",
+    "xcresultSummarySHA256": "b23c420a4de8e10518fd3acbb69e154061dd17cae2bcb474fbda75d7394066dd",
+    "xcresultTestsSHA256": "bb422d66b3e6530ef3ec6420814b08ec71d8327cfd2e008710f6f447fbca667e",
+    "testLogSHA256": "0a242aa14209452c3480c2906b4e5b4895cc7ff9ed3ba8dd65c83f8858998a16",
+    "preflightSHA256": "2f100e3ea73bdb54b96bf0097bac8366e24fd1cd80140f01a95838f2bcd4880b",
+    "powerProfileSHA256": "53f7fce6edb9721f0c09e40694dc261d783e7da398a5c36bf2836abc653dfff6",
+    "maxXCTestRSSKB": 18231568,
+    "maxXCTestRSSBytes": 18669125632,
+    "memoryLimitBytes": 103079215104,
+    "cacheLimitBytes": 8589934592,
+    "maxReservedKVBytes": 17179869184,
+    "watchdog": false,
+    "lockReleased": true,
+    "orphanProcesses": 0
+  },
+  "model": {
+    "launchedModel": "qwen3-32b-source-locked",
+    "runtimeFileSHA256": [
+      {
+        "path": "config.json",
+        "sha256": "61164e05c52435ed08ee11d4ead8833577f7d329d05797fde522f457b80c25dd"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "sha256": "dbe52fe0c696b83058e0ba1458d202105135ae33c602464bde2b406323498fd3"
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+      }
+    ],
+    "generationConfig": "absent-and-file-set-bound",
+    "shardSHA256": [
+      "c37d8ac8663e5bcfb7334889dcba56e3c6b3d7a9b8643a62c5f8b6105765aee1",
+      "2f8fbccad32a2a2f3072ffb8d6adea2790cc0bd84927cc0c44fbaf1d97912867",
+      "4412f7fa42e1419455698d3fe2b3c9557badd36a8a5c3a8d3d2439fc2fa6f0de",
+      "5cdadd1a77ec47b3ea7799255efb7d15431765874963f55a33f71f43386eb619"
+    ]
+  },
+  "overall": {
+    "verdict": "PASS_PHASE3_EXPLICIT_NO_SPEC",
+    "productionContinuousNoSpecRouteAuthorizedForQualifiedDenseQwen": true,
+    "dynamicSoloPLDDefaultAuthorized": false,
+    "broadModelFamilyDefaultAuthorized": false,
+    "nextRoadmapItem": "measured solo-PLD serving policy"
+  }
+}
