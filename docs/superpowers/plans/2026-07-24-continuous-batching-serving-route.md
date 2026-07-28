@@ -1,8 +1,8 @@
 # Production continuous-batching serving route plan
 
 - **Date:** 2026-07-24
-- **Status:** active — Phases 0–4 complete; Phase 5 product smoke and bounded transport preflight
-  pass, while the 24-hour resident soak awaits a correctly identified 256-GiB host
+- **Status:** complete — Phases 0–5 pass for the explicit, model-scoped
+  `continuous-batch-no-spec` route; dynamic solo PLD remains shelved
 - **Owner:** Codex
 - **Branch:** `codex/continuous-batching-serving-route`
 - **Evaluation lane:** EXACT
@@ -354,27 +354,47 @@ SHA-256 `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
 
 ### Phase 5 — production evidence and closure
 
-1. **PARTIAL:** fresh Release product smoke v8 and the hostile C=4 transport preflight v2 are
-   `COMPLETE` and independently authenticated. The preflight carries one dropped warmup plus
-   135.580501 measured seconds, 24 evidence rows, four typed `clientDisconnected` rows, bounded
-   recovery, stable memory, and no watchdog/orphan. The transport-level 24-hour resident soak
-   remains unlaunched.
-2. **PARTIAL:** exact source, binary, dependency, model/tokenizer/checkpoint, workload, redaction,
-   and evidence hashes authenticate for smoke v8 and preflight v2. The prepared soak packet uses
-   incremental evidence scanning, exact request/response pairing, normalized power snapshots, and
-   explicit memory/cache limits; its final host-specific hashes must be reviewed again after the
-   target host is admitted.
-3. Write the dated verdict, public fast-mlx-only content, verification packet, and handoff.
-4. Run focused correctness/security review, diff inspection, relative-link checks, ShellCheck,
-   staged gitleaks, coherent commits with the required trailer, fresh proof, and `--no-ff` merge.
+#### Phase 5 closure — 2026-07-28
 
-Phase-5 checkpoint verification:
-[`continuous-serving-phase5-preflight-verification-2026-07-24.json`](../verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json).
-The intended `192.168.1.253` host currently presents Dropbear 2022.83 with only an RSA host key,
-not the expected macOS OpenSSH Remote Login identity. No key was trusted and no credentials or
-workloads were sent. Correct the network/Remote Login mapping, authenticate the host read-only,
-then derive a fresh host-specific soak packet; do not copy the `.252` laptop paths or 140-W
-charger contract onto a desktop host.
+Phase 5 is complete for the exact source
+`1c084f305da83c3ab2e399368b5bd32f14dabd09`. Product smoke v8, the fresh V30 prerequisite
+preflight, and the one-shot 24-hour C=4 transport soak all pass. Historical failed, partial,
+diagnostic, and non-promotable roots remain preserved and do not contribute promotion evidence.
+
+The canonical soak receipt is terminal `COMPLETE`, non-diagnostic, and promotable after
+86,420.985839 measured seconds. One dropped warmup plus 1,727 measured cycles produced 10,368
+exactly paired schema-2 request/evidence rows: 8,640 completed responses and 1,728 typed zero-body
+`clientDisconnected` rows. Maximum cancel-to-evidence was 2.398127 seconds against five seconds;
+maximum recovery was 12.019825 seconds against 30 seconds. Every recovery ended at zero active
+requests, coordinator slots, and reserved KV bytes.
+
+MLX active/cache/peak stayed within the declared 96/8-GiB bounds. Process RSS moved from a
+post-warmup 18,165,488 KiB baseline to 18,168,704 KiB, a 1.000177039 ratio against the 1.05 gate.
+All 291 environment samples retained AC power, Foundation low-power false, and no performance or
+thermal warning.
+
+The complete 527-file source snapshot, dependency resolution, clean non-profiled Release binary,
+12-file model, workload, policy, host/tool projections, packet, receipts, and 42 artifact-manifest
+entries independently reauthenticate. The final sensitive scan passes without retaining registered
+raw prompt/key/output values. No process, listener, held lock, watchdog, publisher-incoming file,
+or orphan remains.
+
+The mutable root receipt intentionally remains `FINALIZING`, nonterminal, and non-promotable.
+Only the create-only immutable sibling receipt is canonical after terminal hashing, scanning, and
+cleanup. Its SHA-256 is
+`f910fd570f4fd6d6c1f749dbe16f6d1dfffb8cb7953ebb04cf43aca8b641a608`.
+
+Verdict:
+[`2026-07-28-continuous-serving-phase5.md`](../verdicts/2026-07-28-continuous-serving-phase5.md);
+verification packet:
+[`continuous-serving-phase5-verification-2026-07-28.json`](../verdicts/continuous-serving-phase5-verification-2026-07-28.json),
+SHA-256 `b1f7bb933e65dfb93c4043d64e1426b1c464b1828edebbcf425eabf6f798e22a`.
+
+Decision: **PROMOTE the explicit, model-scoped `continuous-batch-no-spec` temperature-zero text
+HTTP/SSE route.** Dynamic solo PLD stays shelved; broad model-family defaults, shared-batch
+speculation, sampling, tools, media, WebSocket, and unauthenticated remote binding remain outside
+this evidence. The required closeout review, staged secret scan, coherent commit, and `--no-ff`
+integration are release mechanics, not additional model/runtime evidence.
 
 ## Proof mapping
 

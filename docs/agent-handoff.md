@@ -1,6 +1,6 @@
 # Agent Handoff
 
-Last reviewed: 2026-07-24
+Last reviewed: 2026-07-28
 
 For the next Codex/Claude Code/human agent. Decision-focused; link durable artifacts instead of
 rediscovering status from chat.
@@ -26,18 +26,24 @@ capacity model by architecture, `SystemProfiler`, `fastmlx-capacity`, PLD framew
 and exact continuous-batching/chunked-prefill engine proof. The currently shipped operator surface
 is the engine, harness, and capacity CLI.
 
-**Not shipped yet:** adaptive native macOS UI/dial, a merged/released OpenAI-compatible service
-route with its measured dynamic policy, model management, menu-bar controls/metrics, auto-update,
-website/community surfaces, and benchmark publication automation. These are high-priority roadmap
-work, not current product surface. Captures include
+**Integration-ready branch surface:** the explicit, source-locked
+`continuous-batch-no-spec` OpenAI-compatible HTTP/SSE route has passed its model-scoped Phase 5
+gate and is authorized for the required reviewed `--no-ff` integration. Dynamic solo PLD remains
+shelved and is not part of that route.
+
+**Not shipped yet:** adaptive native macOS UI/dial, a broad/default or dynamic serving policy,
+model management, menu-bar controls/metrics, auto-update, website/community surfaces, and
+benchmark publication automation. These are high-priority roadmap work, not current product
+surface. Captures include
 [`2026-07-18-adaptive-macos-dial-ui.md`](task-inbox/2026-07-18-adaptive-macos-dial-ui.md)
 and [`2026-07-18-website-benchmark-community.md`](task-inbox/2026-07-18-website-benchmark-community.md).
 
 **Major dated outcomes:** TurboQuant v1 was shelved as a dated negative result; PLD was promoted
 as exact for repetition-heavy/echo workloads; Qwen3-32B EAGLE-3 was shelved on byte-identity
 failure; continuous batching was promoted as an exact engine building block, and the feature
-branch now has a clean, explicit no-spec production route. Solo-PLD routing, final production
-closure, merge, and release remain open.
+branch's clean explicit no-spec route passed the full-day Phase 5 gate. Dynamic solo PLD remains
+shelved. The remaining release mechanic is the reviewed `--no-ff` integration; absorbed MLA is the
+next engineering item.
 
 **KVarN/asymmetric KV frontier — COMPLETE (2026-07-18):** selected lossy capacity tiers were
 promoted, but no speed tier was proven. Verdict:
@@ -348,11 +354,10 @@ is already available.
   manifests, no watchdog/lock/orphan. Packet
   [`continuous-serving-phase4-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase4-verification-2026-07-24.json)
   SHA-256 is `19dc0345b0362af71aea4d503baf804cf0b0ea06ab4c491f6c76b2b14f85edd3`.
-- **Blockers / residual risk:** Phase 5 resident-soak/release proof remains open. Product smoke v8
-  and the bounded transport preflight v2 now pass; the intended 256-GiB host at
-  `llmbench@192.168.1.253` instead presents Dropbear 2022.83 with only an RSA host key, not the
-  expected macOS OpenSSH Remote Login identity. No key was trusted and no credential or workload
-  was sent.
+- **Historical blocker:** Phase 5 resident-soak/release proof was still open at this checkpoint.
+  Product smoke v8 and bounded transport preflight v2 passed, while the intended 256-GiB host
+  initially presented the wrong SSH identity. No key was trusted and no credential or workload
+  was sent before the expected OpenSSH identity was authenticated.
 - **Update 2026-07-25:** the `.253` Mac host now reaches the expected OpenSSH identity and the
   staged Qwen3-32B-4bit snapshot are authenticated. Preserve v2 as non-promotable verification
   history because it lacked complete source-tree binding. V3 is the canonical fresh verifier:
@@ -361,12 +366,10 @@ is already available.
   `50c50ff42ace01bc714f13f307f72d488b84e43e124b564cecd5c23ca18c7d9c`.
   Keep the historical Dropbear note for the earlier mismatch, but do not treat it as the current
   blocker.
-- **Next safe action:** finish the bounded single-pass secret scanner and fresh desktop-specific
-  soak packet, run one short real C=4 preflight, then launch the reviewed 24-hour soak exactly once.
-  Do not copy `.252` paths or its 140-W laptop power contract onto `.253`.
+- **Disposition:** superseded by the authenticated Phase 5 closure below. Preserve every earlier
+  partial, failed, diagnostic, and non-promotable boundary unchanged.
 
-**Continuous-batching serving route — PHASE 5 PREFLIGHT PASS, RESIDENT SOAK BLOCKED
-(2026-07-24):**
+**Continuous-batching serving route — PHASE 5 HISTORICAL PREFLIGHT CHECKPOINT (2026-07-24):**
 
 - Clean `24c7df0fa0c7f10ddf65a0443e41c7f97abb8e6d` exposes an admitted SSE 200 head before
   awaiting the first backend delta. Product smoke v8 is fresh `COMPLETE` with seven evidence
@@ -403,28 +406,57 @@ is already available.
   [`continuous-serving-phase5-preflight-verification-2026-07-24.json`](superpowers/verdicts/continuous-serving-phase5-preflight-verification-2026-07-24.json),
   SHA-256 `53a4d15cb0422129517f047290c28059ec041a4d28ad1dc65819eea3ab4371e7`.
 
-**Content practice:** `docs/content/` now has 16 dated pieces. Keep writing one dated content piece per
-notable spike, including negative results.
+**Continuous-batching serving route — PHASE 5 COMPLETE, MODEL-SCOPED PROMOTION (2026-07-28):**
+
+- **Objective:** prove that the explicit `continuous-batch-no-spec` HTTP/SSE route can keep one
+  source-locked Qwen3-32B-4bit model resident for a full day of C=4 traffic with a hostile
+  post-admission disconnect in every cycle, bounded recovery, stable resources/environment, exact
+  provenance, redaction, and terminal cleanup.
+- **Decision:** promote the explicit model-scoped temperature-zero text route. Dynamic solo PLD
+  remains shelved. No broad model-family default, shared-batch speculation, sampling, tools, media,
+  WebSocket, or unauthenticated remote-bind claim follows.
+- **Fresh proof:** canonical boundary
+  `continuous-serving-phase5-transport-soak-1c084f3-m3ultra-v2` is terminal `COMPLETE`,
+  non-diagnostic, and promotable after 86,420.985839 measured seconds. One dropped warmup plus
+  1,727 measured cycles produced 10,368 exactly paired evidence rows: 8,640 completed responses
+  and 1,728 typed zero-body `clientDisconnected` rows. Maximum cancel-to-evidence was 2.398127
+  seconds; maximum recovery was 12.019825 seconds; every recovery ended at zero active requests,
+  coordinator slots, and reserved KV bytes.
+- **Resource/environment proof:** MLX active/cache/peak stayed inside 96/8-GiB bounds. RSS moved
+  from 18,165,488 to 18,168,704 KiB, a 1.000177039 ratio against the 1.05 gate. All 291 samples
+  retained AC power, Foundation low-power false, and no performance or thermal warning.
+- **Provenance/cleanup:** the complete 527-file source snapshot, dependency resolution, clean
+  Release binary, 12-file model, workload/policy/host/tool projections, packet, receipts, and all
+  42 artifact-manifest entries reauthenticate. Terminal sensitive scanning reports no registered
+  raw value retained. No process, listener, held lock, watchdog, incoming publisher file, or orphan
+  remains.
+- **Terminal protocol:** the mutable root receipt intentionally remains `FINALIZING`,
+  nonterminal, and non-promotable. The create-only immutable sibling receipt is canonical only
+  after terminal hashing, scanning, and cleanup; its SHA-256 is
+  `f910fd570f4fd6d6c1f749dbe16f6d1dfffb8cb7953ebb04cf43aca8b641a608`.
+- **Durable proof:** verdict
+  [`2026-07-28-continuous-serving-phase5.md`](superpowers/verdicts/2026-07-28-continuous-serving-phase5.md);
+  verification packet
+  [`continuous-serving-phase5-verification-2026-07-28.json`](superpowers/verdicts/continuous-serving-phase5-verification-2026-07-28.json),
+  SHA-256 `b1f7bb933e65dfb93c4043d64e1426b1c464b1828edebbcf425eabf6f798e22a`.
+- **Next safe action:** complete the required reviewed closeout commit and `--no-ff` integration,
+  then begin absorbed MLA. Reopen Phase 5 only from a new source/binary/model/route/workload or
+  terminal-publication contract; never resume an existing evidence root.
+
+**Content practice:** `docs/content/` now has 17 dated pieces. Keep writing one dated content piece
+per notable spike, including negative results.
 
 ## Open Work Queue
 
-1. **Continuous-batching serving route Phase 5** — Phase 4 solo PLD is exact but fails the speed
-   gate and is shelved; product smoke v8 and bounded transport preflight v2 pass. The `.253` host
-   admission, staged model snapshot, and exact-source v3 binary boundary are now authenticated.
-   Finish and review the bounded single-pass secret scanner and dedicated-host client, derive the
-   fresh host-specific packet, run one short real C=4 preflight, then launch the reviewed 24-hour
-   soak exactly once. Finish redaction/provenance proof, final review, and merge only after fresh
-   proof.
-   [Task](task-inbox/2026-07-14-continuous-batching-serving-route.md).
-2. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
+1. **Absorbed MLA** — reduce expanded DeepSeek-style cache; Python MLX and Swift GLM code are
    useful oracles. [Task](task-inbox/2026-07-09-absorbed-mla-kv-cache.md).
-3. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
+2. **Sampled-generation foundation -> sampler fusion** — define RNG/distribution contracts before
    porting the L1/L3/L1b/L3b stack. [Task](task-inbox/2026-07-12-sampled-generation-sampler-fusion.md).
-4. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
+3. **Learned/mixed weight-quant sweep** — affine vs official MLX dynamic/DWQ/oQ4e, output ordinary
    MLX checkpoints for the Swift loop. [Task](task-inbox/2026-07-12-learned-weight-quant-frontier.md).
-5. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
+4. **Operability and watchdogs** — large-prefill capacity, runtime admission control, long-context
    Metal watchdog. [Task](task-inbox/2026-07-14-long-context-metal-watchdog.md).
-6. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
+5. **TurboQuant Spike B closure** — bounded second-failure rule after stronger affine/KVarN/fused
    baselines exist. [Task](task-inbox/2026-07-09-turboquant-spike-b-outlier-channels.md).
 
 **Public evidence/community platform — ROADMAP CAPTURED (2026-07-15).** The

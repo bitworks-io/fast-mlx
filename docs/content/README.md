@@ -38,6 +38,7 @@ After each notable spike / investigation / optimization, write one piece here **
 | 2026-07-23 | [The third geometry said no](2026-07-23-the-third-geometry-said-no.md) | Serving big models on Apple Silicon; The optimization dial — quantified precision-loss tuning; Rapid research integration — the flywheel |
 | 2026-07-24 | [An exact prefix cache needs exact provenance](2026-07-24-exact-prefix-cache-needs-exact-provenance.md) | Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel |
 | 2026-07-24 | [Exact speculation was not fast enough](2026-07-24-exact-speculation-was-not-fast-enough.md) | Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel |
+| 2026-07-28 | [The proof did not end when the timer did](2026-07-28-the-proof-did-not-end-when-the-timer-did.md) | Building a high-performance MLX inference engine in Swift; Serving big models on Apple Silicon; Rapid research integration — the flywheel |
 
 ## Candidate whitepaper themes (aggregations)
 
