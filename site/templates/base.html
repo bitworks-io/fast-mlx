@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#08110f">
+    <title>{{title}}</title>
+    <meta name="description" content="{{description}}">
+    <link rel="icon" href="{{root}}assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="{{root}}assets/site.css">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav shell" aria-label="Primary navigation">
+        <a class="brand" href="{{root}}" aria-label="fast-mlx home">
+          <span class="brand-mark" aria-hidden="true">fm</span>
+          <span>fast-mlx</span>
+        </a>
+        <div class="nav-links">
+          <a href="{{root}}process/">The loop</a>
+          <a href="{{root}}methodology/">Methodology</a>
+          <a href="{{root}}research/">Research notes</a>
+        </div>
+      </nav>
+    </header>
+    <main id="content">{{body}}</main>
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <strong>fast-mlx</strong>
+          <p>Evidence-gated MLX inference research in Swift.</p>
+        </div>
+        <div>
+          <p>Published results describe fast-mlx only. Diagnostic and partial evidence never become product claims.</p>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible fast-mlx correctness or operability problem.
+title: "bug: "
+labels: [bug, needs-reproduction]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not use this form for security vulnerabilities. Remove model paths, host identity, API keys, and private evidence before posting.
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Observed and expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the command, public model identifier/revision when safe, route, and smallest input that reproduces the issue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Public-safe environment
+      description: macOS, Swift, MLX, chip family, and memory tier. Do not include a hostname or stable device identifier.
+    validations:
+      required: true
+
+  - type: textarea
+    id: recovery
+    attributes:
+      label: Recovery or workaround
+      description: Explain whether restart, cache removal, route disablement, or rollback restores service.

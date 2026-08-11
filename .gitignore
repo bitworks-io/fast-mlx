@@ -1,0 +1,14 @@
+CLAUDE.local.md
+.agent-reports/
+# Repository-local agent state and machine-owned automation files.
+/.agents/
+/.codex/agents/Explore.toml
+/.harness-sha
+/.tmp-*
+# SwiftPM build artifacts (local `swift test` runs in spike/)
+.build/
+# harness runtime evidence (Task 5): generated per-run, not source
+spike/harness-evidence.jsonl
+spike/*.csv
+# deploy-time git provenance written by private deployment tooling, not source
+spike/.harness-sha

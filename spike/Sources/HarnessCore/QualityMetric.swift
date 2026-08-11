@@ -1,0 +1,262 @@
+import Foundation
+
+/// KL(reference || candidate) in nats, over aligned probability vectors. Clamps for numerical safety.
+public func klDivergence(reference p: [Float], candidate q: [Float]) -> Double {
+    precondition(p.count == q.count)
+    var kl = 0.0
+    for i in p.indices where p[i] > 0 {
+        let qi = max(Double(q[i]), 1e-12); kl += Double(p[i]) * (log(Double(p[i])) - log(qi))
+    }
+    return kl
+}
+
+public protocol QualityMetric: Sendable { var name: String { get }
+    /// Measure candidate-vs-reference over a fixed corpus using the driver's logprobs. Lower = closer to reference.
+    func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double }
+
+/// Per-position KLs between two full-vocab RAW-LOGITS matrices (softmaxed here) — the metric's
+/// inner loop, exposed so the CLI can report per-position detail (p95, aligned-prefix stats)
+/// from the SAME computation the headline median comes from, not a reimplementation.
+public func perPositionKLs(reference: [[Float]], candidate: [[Float]]) -> [Double] {
+    (0..<min(candidate.count, reference.count)).map {
+        klDivergence(reference: softmax(reference[$0]), candidate: softmax(candidate[$0]))
+    }
+}
+
+public struct TeacherForcedTop1Agreement: Equatable, Sendable {
+    public let matches: Int
+    public let scoredPositions: Int
+    public var rate: Double { Double(matches) / Double(scoredPositions) }
+}
+
+/// Context-locked top-1 agreement between candidate and reference distributions. Unlike
+/// comparing the candidate argmax with a natural-document forced token, this directly compares
+/// both models at every identical teacher-forced context, including sampled long-context rows.
+public func teacherForcedTop1Agreement(
+    candidate: [[Float]], reference: [[Float]]
+) throws -> TeacherForcedTop1Agreement {
+    guard candidate.count == reference.count else {
+        throw QualityMetricError.rowCountMismatch(
+            side: "top1", got: candidate.count, expected: reference.count)
+    }
+    guard !candidate.isEmpty else { throw QualityMetricError.noScoredRows }
+    var matches = 0
+    for index in candidate.indices {
+        guard !candidate[index].isEmpty, candidate[index].count == reference[index].count else {
+            throw QualityMetricError.vocabularyMismatch(
+                position: index, candidate: candidate[index].count,
+                reference: reference[index].count)
+        }
+        guard candidate[index].allSatisfy(\.isFinite) else {
+            throw QualityMetricError.nonFiniteLogit(side: "candidate", position: index)
+        }
+        guard reference[index].allSatisfy(\.isFinite) else {
+            throw QualityMetricError.nonFiniteLogit(side: "reference", position: index)
+        }
+        if argmax(candidate[index]) == argmax(reference[index]) { matches += 1 }
+    }
+    return TeacherForcedTop1Agreement(
+        matches: matches, scoredPositions: candidate.count)
+}
+
+/// The metric's median convention (sorted, upper-middle element). Exposed for the same reason.
+public func medianOf(_ values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted(); return sorted[sorted.count / 2]
+}
+
+/// Deterministic quantile: sorted value at index CEIL(q * (n-1)). The ceiling convention is
+/// deliberate for a lossiness instrument: with a divergence tail of exactly (1-q) mass, the
+/// floor index lands on the last easy-token value and reads noise — under-reporting loss at the
+/// exact boundary the statistic exists to catch. Ceiling errs toward reporting divergence.
+/// Empty input yields 0 (mirrors `medianOf`).
+public func quantile(_ values: [Double], _ q: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let index = min(Int((Double(sorted.count - 1) * q).rounded(.up)), sorted.count - 1)
+    return sorted[max(index, 0)]
+}
+
+/// Tail-aware headline for LONG-CONTEXT entries: per-entry tail quantile (default p95), median
+/// across entries. Over natural long text, the per-position KL median sits BELOW the
+/// same-weights noise floor — easy function-word tokens that both quants agree on dominate it —
+/// while KV-quant divergence is a tail phenomenon (first lossy run: pooled p95 0.69 nats vs
+/// median 6e-5). A median headline would therefore report a lossy KV cache as indistinguishable
+/// from lossless at exactly the context lengths where its loss accrues; the tail headline is
+/// the number that captures it. Short prompts keep their median headline (`medianOf`).
+public func longContextTailKL(perEntryKLs: [[Double]], q: Double = 0.95) -> Double {
+    medianOf(perEntryKLs.map { quantile($0, q) })
+}
+
+public enum QualityMetricError: Error, CustomStringConvertible, Sendable {
+    /// The reference generated no tokens for a prompt: zero scoreable positions. Reporting
+    /// "0.0" here would be a vacuous pass, so the metric refuses instead.
+    case emptyContinuation(prompt: [Int])
+    /// A driver returned a different number of teacher-forced rows than forced positions —
+    /// it is not fulfilling the contract, and a silently truncated score would lie.
+    case rowCountMismatch(side: String, got: Int, expected: Int)
+    case vocabularyMismatch(position: Int, candidate: Int, reference: Int)
+    case nonFiniteLogit(side: String, position: Int)
+    case noScoredRows
+    public var description: String {
+        switch self {
+        case .emptyContinuation(let prompt):
+            return "reference produced an empty continuation for prompt \(prompt) — no positions to score"
+        case .rowCountMismatch(let side, let got, let expected):
+            return "\(side) returned \(got) teacher-forced rows for \(expected) forced positions"
+        case .vocabularyMismatch(let position, let candidate, let reference):
+            return "top1 row \(position) has candidate vocab \(candidate), reference vocab \(reference)"
+        case .nonFiniteLogit(let side, let position):
+            return "\(side) top1 row \(position) contains a non-finite logit"
+        case .noScoredRows:
+            return "top1 agreement has no teacher-forced rows to score"
+        }
+    }
+}
+
+/// One teacher-forced scoring pass: the REFERENCE's greedy continuation is generated once,
+/// then BOTH drivers score that same continuation position-by-position. Every row therefore
+/// compares distributions over IDENTICAL context — the context-locked basis both the KL and
+/// perplexity metrics are defined on. (Free-running comparison compared diverged contexts:
+/// 33x distortion on the first real dial point, and no signal at all at 2-bit.)
+public struct TeacherForcedScores: Sendable {
+    public let continuation: [Int]        // the reference's greedy tokens (may end with eos)
+    public let candidateRows: [[Float]]   // full-vocab raw logits, one row per forced position
+    public let referenceRows: [[Float]]
+}
+
+/// `referenceConfig` (default: same as `config`) lets the CANDIDATE run a lossy feature the
+/// reference must not — e.g. a `kvQuant` tier the reference engine has no notion of. The
+/// reference side always scores at its own baseline; candidate-only knobs never leak into it.
+public func teacherForcedScores(
+    driver: EngineDriver, reference: EngineDriver, prompt: [Int], config: RunConfig,
+    referenceConfig: RunConfig? = nil
+) async throws -> TeacherForcedScores {
+    let refConfig = referenceConfig ?? config
+    let continuation = try await reference.generate(prompt: prompt, config: refConfig).tokens
+    guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
+    let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, config: config)
+    guard c.count == continuation.count else {
+        throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: continuation.count)
+    }
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, config: refConfig)
+    guard r.count == continuation.count else {
+        throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: continuation.count)
+    }
+    return TeacherForcedScores(continuation: continuation, candidateRows: c, referenceRows: r)
+}
+
+/// Like `TeacherForcedScores` but for an EXPLICIT continuation scored at a bounded, sampled
+/// subset of positions — the long-context path. Instead of generating a short continuation and
+/// forcing it, a long-context corpus entry is teacher-forced AGAINST ITSELF (its own tokenized
+/// text is the continuation, wikitext-perplexity style): this is what makes a >=4K-token entry
+/// meaningful — quantization loss accrues with context, so the signal lives deep in the
+/// sequence, not in a handful of positions appended to a long prompt.
+public struct TeacherForcedScoresAtPositions: Sendable {
+    public let positions: [Int]           // ascending indices into `continuation`
+    public let forcedTokens: [Int]        // continuation[p] for each scored position p
+    public let candidateRows: [[Float]]   // full-vocab raw logits, one row per position
+    public let referenceRows: [[Float]]
+}
+
+/// `referenceConfig` as on `teacherForcedScores`: candidate-only knobs (e.g. `kvQuant`)
+/// never leak to the reference side.
+public func teacherForcedScoresAtSampledPositions(
+    driver: EngineDriver, reference: EngineDriver,
+    prompt: [Int], continuation: [Int], positions: [Int], config: RunConfig,
+    referenceConfig: RunConfig? = nil
+) async throws -> TeacherForcedScoresAtPositions {
+    guard !continuation.isEmpty else { throw QualityMetricError.emptyContinuation(prompt: prompt) }
+    let c = try await driver.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: config)
+    guard c.count == positions.count else {
+        throw QualityMetricError.rowCountMismatch(side: "candidate", got: c.count, expected: positions.count)
+    }
+    let r = try await reference.logprobs(prompt: prompt, forcedContinuation: continuation, atPositions: positions, config: referenceConfig ?? config)
+    guard r.count == positions.count else {
+        throw QualityMetricError.rowCountMismatch(side: "reference", got: r.count, expected: positions.count)
+    }
+    return TeacherForcedScoresAtPositions(
+        positions: positions,
+        forcedTokens: positions.map { continuation[$0] },
+        candidateRows: c, referenceRows: r)
+}
+
+/// Median per-position KL of the candidate's next-token distribution vs the reference's,
+/// TEACHER-FORCED on the reference's greedy continuation: all N positions are context-locked
+/// by construction, so every position contributes a meaningful sample (no divergence
+/// starvation, no diverged-context distortion).
+public struct KLDivergenceMetric: QualityMetric {
+    public let name = "kl_median"; public init() {}
+    public func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double {
+        var kls: [Double] = []
+        for p in prompts {
+            let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: p, config: config)
+            kls.append(contentsOf: perPositionKLs(reference: s.referenceRows, candidate: s.candidateRows))
+        }
+        return medianOf(kls)
+    }
+}
+// MARK: - Perplexity (Layer 2, same teacher-forced pass as KL)
+
+/// Mean negative log-likelihood in NATS of `tokens[i]` under softmax(rows[i]).
+/// Rows are raw logits (shift-invariant): NLL_i = logSumExp(row) - row[token_i].
+public func meanNLL(rows: [[Float]], tokens: [Int]) -> Double {
+    precondition(rows.count == tokens.count, "one forced token per scored row")
+    precondition(!rows.isEmpty, "no positions to score")
+    var total = 0.0
+    for (row, tok) in zip(rows, tokens) {
+        precondition(row.indices.contains(tok), "forced token id \(tok) outside vocab \(row.count)")
+        let m = Double(row.max() ?? 0)
+        let logZ = m + log(row.reduce(0.0) { $0 + exp(Double($1) - m) })
+        total += logZ - Double(row[tok])
+    }
+    return total / Double(rows.count)
+}
+
+/// Pooled teacher-forced perplexities: exp(total NLL / total forced positions) across all
+/// prompts, for candidate and reference from the SAME forward pass (same forced continuation).
+public struct PerplexityPair: Sendable {
+    public let candidate: Double
+    public let reference: Double
+    public init(candidate: Double, reference: Double) {
+        self.candidate = candidate; self.reference = reference
+    }
+    /// The dial's instrument: relative ppl delta, gate "<= 1%" i.e. 0.01. 0 = parity;
+    /// negative = candidate assigns the reference's continuation HIGHER likelihood.
+    public var relativeDelta: Double { (candidate - reference) / reference }
+}
+
+public func teacherForcedPerplexities(
+    driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig
+) async throws -> PerplexityPair {
+    var candTotal = 0.0, refTotal = 0.0, positions = 0
+    for p in prompts {
+        let s = try await teacherForcedScores(driver: driver, reference: reference, prompt: p, config: config)
+        let n = Double(s.continuation.count)
+        candTotal += meanNLL(rows: s.candidateRows, tokens: s.continuation) * n
+        refTotal += meanNLL(rows: s.referenceRows, tokens: s.continuation) * n
+        positions += s.continuation.count
+    }
+    return PerplexityPair(
+        candidate: exp(candTotal / Double(positions)),
+        reference: exp(refTotal / Double(positions)))
+}
+
+/// Relative perplexity delta of the candidate vs the reference over the reference's greedy
+/// continuation (teacher-forced, pooled across prompts). Lower = closer; the dial gates on 1%.
+public struct PerplexityMetric: QualityMetric {
+    public let name = "ppl_delta"; public init() {}
+    public func measure(driver: EngineDriver, reference: EngineDriver, prompts: [[Int]], config: RunConfig) async throws -> Double {
+        try await teacherForcedPerplexities(driver: driver, reference: reference, prompts: prompts, config: config).relativeDelta
+    }
+}
+
+func softmax(_ x: [Float]) -> [Float] { let m = x.max() ?? 0; let e = x.map { expf($0 - m) }; let s = e.reduce(0,+); return e.map { $0/s } }
+
+private func argmax(_ values: [Float]) -> Int {
+    var best = 0
+    for index in values.indices.dropFirst() where values[index] > values[best] {
+        best = index
+    }
+    return best
+}

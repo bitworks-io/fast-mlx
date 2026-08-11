@@ -1,0 +1,57 @@
+name: Inference research proposal
+description: Propose a paper, technique, or measured bottleneck for the fast-mlx improvement loop.
+title: "research: "
+labels: [research, needs-design]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A proposal becomes implementation work only after its comparable baseline, correctness boundary, and proof plan are explicit.
+
+  - type: textarea
+    id: user-outcome
+    attributes:
+      label: User or operator outcome
+      description: Who benefits, what should become possible, and why it matters.
+    validations:
+      required: true
+
+  - type: textarea
+    id: sources
+    attributes:
+      label: Pinned sources
+      description: Link the paper, official implementation, release, or reproducible observation. Include versions or revisions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis and baseline
+      description: State the expected gain and the exact source/model/workload/route that makes the comparison fair.
+    validations:
+      required: true
+
+  - type: textarea
+    id: failures
+    attributes:
+      label: Failure and recovery paths
+      description: Cover correctness, quality, resource, security, unsupported-shape, cancellation, and rollback boundaries that apply.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proof
+    attributes:
+      label: Acceptance and proof plan
+      description: List the failing contract, focused tests, regression suites, measurements, and promotion/shelving rule.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: public-boundary
+    attributes:
+      label: Public boundary
+      options:
+        - label: The proposal does not include credentials, private host/model paths, raw private evidence, or competitor performance claims.
+          required: true

@@ -1,0 +1,53 @@
+name: Public source quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  public-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Run publication tests
+        run: python3 -m unittest discover -s scripts/tests -v
+
+      - name: Build and validate the site
+        run: |
+          python3 scripts/build_public_site.py --output "$RUNNER_TEMP/fast-mlx-site"
+          python3 scripts/validate_public_site.py "$RUNNER_TEMP/fast-mlx-site"
+
+      - name: Validate exported repository boundary
+        run: |
+          if [[ -f public/public-repository.json ]]; then
+            python3 scripts/export_public_repository.py \
+              --output "$RUNNER_TEMP/fast-mlx-public"
+            python3 scripts/validate_public_repository.py \
+              "$RUNNER_TEMP/fast-mlx-public"
+          else
+            python3 scripts/validate_public_repository.py .
+          fi
+
+  pure-swift-targets:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ServingCore, HarnessCore, ProofControl]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Build dependency-free target
+        run: swift build --package-path spike --target "${{ matrix.target }}"
