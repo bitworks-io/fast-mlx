@@ -102,6 +102,15 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("python3 scripts/validate_public_repository.py .", workflow)
         self.assertNotIn("Engineering checkout detected", workflow)
 
+    def test_public_quality_workflow_uses_swift_6_3_capable_macos_runner(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/quality.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("runs-on: macos-26", workflow)
+        self.assertNotIn("runs-on: macos-15", workflow)
+        self.assertIn("swift --version", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

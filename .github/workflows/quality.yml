@@ -40,7 +40,7 @@ jobs:
           fi
 
   pure-swift-targets:
-    runs-on: macos-15
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +48,9 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Report Swift toolchain
+        run: swift --version
 
       - name: Build dependency-free target
         run: swift build --package-path spike --target "${{ matrix.target }}"
