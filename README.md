@@ -84,19 +84,25 @@ building. These surfaces are discoverability metadata for public milestones and 
 boundaries; they do not grant runtime authority, publish new benchmark claims, or replace the
 capability/evidence review gates.
 
+[`/research/index.json`](https://bitworks-io.github.io/fast-mlx/research/index.json) and
+[`/research/feed.atom`](https://bitworks-io.github.io/fast-mlx/research/feed.atom) are generated
+from the seven explicitly reviewed notes in `site/publications.json`. Each research-feed entry
+contains only pinned titles, dates, themes, summaries, and canonical article links—never article
+bodies, external intake, scripts, trackers, or a build-time network request.
+
 [`/sitemap.xml`](https://bitworks-io.github.io/fast-mlx/sitemap.xml) inventories only the reviewed
 human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/robots.txt) points
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of those seventeen reviewed HTML pages also publishes one self-referential absolute canonical
-URL and a reviewed Open Graph description. The seven research notes alone use article metadata; the
-seven product/index pages and three benchmark-detail pages remain website objects, while `404.html`
-and machine-readable endpoints publish neither. Benchmark-detail pages are immutable views of
-already-reviewed capability highlights; they do not create new evidence, authority, ranking, or
-recomputation. A single same-origin 1200×630 preview image is retained as an exact hash-pinned
-static asset: no remote image, analytics request, live lookup, new benchmark claim, or runtime
-authority is introduced by a shared-link preview.
+Each of the 29 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+reviewed Open Graph description. The seven research notes alone use article metadata; the seven
+product/index pages, three benchmark-detail pages, and twelve release-detail pages remain website
+objects, while `404.html` and machine-readable endpoints publish neither. Detail pages are immutable
+views of already-reviewed evidence or release-ledger entries; they do not create new evidence,
+authority, ranking, or recomputation. A single same-origin 1200×630 preview image is retained as an
+exact hash-pinned static asset: no remote image, analytics request, live lookup, new benchmark
+claim, or runtime authority is introduced by a shared-link preview.
 
 Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 [CONTRIBUTING.md](CONTRIBUTING.md) for the research-to-release workflow.

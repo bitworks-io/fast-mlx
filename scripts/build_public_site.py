@@ -94,6 +94,7 @@ SOCIAL_CARD_SHA256 = (
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
 SOCIAL_CARD_HEIGHT = 630
+MAX_PUBLICATION_MANIFEST_BYTES = 1_048_576
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "process/",
@@ -162,6 +163,33 @@ def read_json(path: Path) -> object:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"cannot read {path}: {exc}")
+
+
+def read_bounded_regular_json(path: Path, label: str, max_bytes: int) -> object:
+    """Read one local JSON authority only after its filesystem boundary is sealed."""
+
+    if path.is_symlink() or not path.is_file():
+        fail(f"{label} is missing, not a file, or a symlink")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        fail(f"cannot stat {label}: {exc}")
+    if size > max_bytes:
+        fail(f"{label} exceeds the {max_bytes}-byte limit")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        fail(f"cannot read {label}: {exc}")
+    if len(raw) > max_bytes:
+        fail(f"{label} exceeds the {max_bytes}-byte limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"{label} is not UTF-8: {exc}")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        fail(f"cannot parse {label}: {exc}")
 
 
 def prepare_output(output: Path, repository_root: Path) -> None:
@@ -579,8 +607,16 @@ def load_release_catalog(repository_root: Path) -> Dict[str, object]:
 
 def load_articles(repository_root: Path) -> List[Article]:
     manifest_path = repository_root / "site/publications.json"
-    manifest = read_json(manifest_path)
-    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1:
+    manifest = require_exact_keys(
+        read_bounded_regular_json(
+            manifest_path,
+            "site/publications.json",
+            MAX_PUBLICATION_MANIFEST_BYTES,
+        ),
+        {"schemaVersion", "policy", "articles"},
+        "site/publications.json",
+    )
+    if manifest.get("schemaVersion") != 1:
         fail("site/publications.json must use schemaVersion 1")
     if manifest.get("policy") != "fast-mlx-owned-results-only":
         fail("publication policy must remain fast-mlx-owned-results-only")
@@ -591,9 +627,12 @@ def load_articles(repository_root: Path) -> List[Article]:
     seen_sources: set[str] = set()
     seen_slugs: set[str] = set()
     articles: List[Article] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            fail(f"article entry {index} is not an object")
+    for index, raw_entry in enumerate(entries):
+        entry = require_exact_keys(
+            raw_entry,
+            {"source", "slug", "status", "reviewedAt"},
+            f"article entry {index}",
+        )
         source_name = entry.get("source")
         slug = entry.get("slug")
         reviewed_at = entry.get("reviewedAt")
@@ -923,6 +962,16 @@ def render_head_metadata(
         f'<meta property="og:description" content="{html.escape(description, quote=True)}">',
         '<meta property="og:site_name" content="fast-mlx">',
     ]
+    if public_path == "research/" or re.fullmatch(
+        r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
+    ):
+        current_file = public_path + "index.html"
+        research_feed_href = relative_href(current_file, "research/feed.atom")
+        tags.append(
+            '<link rel="alternate" type="application/atom+xml" '
+            'title="fast-mlx reviewed research" '
+            f'href="{html.escape(research_feed_href, quote=True)}">'
+        )
     if article_section is not None:
         tags.append(
             f'<meta property="article:section" content="{html.escape(article_section, quote=True)}">'
@@ -1139,6 +1188,76 @@ def render_release_feed(release_index: Dict[str, object]) -> str:
         ET.SubElement(entry, atom("summary")).text = (
             str(release["summary"]) + " Boundary: " + str(release["scope"])
         )
+
+    ET.indent(feed, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(feed, encoding="unicode", short_empty_elements=True)
+    )
+
+
+def render_research_feed(articles: Sequence[Article]) -> str:
+    """Render reviewed research metadata as a deterministic text-only Atom feed."""
+
+    ordered_articles = sorted(
+        articles,
+        key=lambda article: (article.reviewed_at, article.date, article.slug),
+        reverse=True,
+    )
+    if not ordered_articles:
+        fail("research feed requires at least one reviewed article")
+
+    ET.register_namespace("", ATOM_NAMESPACE)
+    atom = lambda name: f"{{{ATOM_NAMESPACE}}}{name}"
+    feed = ET.Element(atom("feed"))
+    ET.SubElement(feed, atom("title")).text = "fast-mlx reviewed research"
+    ET.SubElement(feed, atom("id")).text = PUBLIC_SITE_URL + "research/"
+    ET.SubElement(feed, atom("updated")).text = (
+        ordered_articles[0].reviewed_at + "T00:00:00Z"
+    )
+    author = ET.SubElement(feed, atom("author"))
+    ET.SubElement(author, atom("name")).text = "fast-mlx contributors"
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "self",
+            "type": "application/atom+xml",
+            "href": PUBLIC_SITE_URL + "research/feed.atom",
+        },
+    )
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "alternate",
+            "type": "text/html",
+            "href": PUBLIC_SITE_URL + "research/",
+        },
+    )
+
+    for article in ordered_articles:
+        canonical = PUBLIC_SITE_URL + article.public_path
+        entry = ET.SubElement(feed, atom("entry"))
+        ET.SubElement(entry, atom("title")).text = article.title
+        ET.SubElement(entry, atom("id")).text = canonical
+        ET.SubElement(entry, atom("published")).text = (
+            article.date + "T00:00:00Z"
+        )
+        ET.SubElement(entry, atom("updated")).text = (
+            article.reviewed_at + "T00:00:00Z"
+        )
+        ET.SubElement(entry, atom("category"), {"term": article.theme})
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {
+                "rel": "alternate",
+                "type": "text/html",
+                "href": canonical,
+            },
+        )
+        ET.SubElement(entry, atom("summary")).text = article.summary
 
     ET.indent(feed, space="  ")
     return (
@@ -1715,7 +1834,11 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     cards = [
         '<section class="page-hero shell"><p class="eyebrow">Research notes</p>'
         '<h1>What the measurements changed.</h1>'
-        '<p class="lede">Dated fast-mlx investigations, including negative results. Each note is a scoped historical result, not a timeless performance guarantee.</p></section>',
+        '<p class="lede">Dated fast-mlx investigations, including negative results. Each note is a scoped historical result, not a timeless performance guarantee.</p>'
+        '<div class="hero-actions">'
+        '<a class="button primary" href="index.json">Read the research JSON</a>'
+        '<a class="button secondary" href="feed.atom" type="application/atom+xml">Subscribe to reviewed research</a>'
+        '</div></section>',
         '<section class="section shell"><div class="research-grid">',
     ]
     for article in articles:
@@ -1787,6 +1910,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         ],
     }
     write_page(output, "research/index.json", json.dumps(public_index, indent=2, ensure_ascii=False))
+    write_page(output, "research/feed.atom", render_research_feed(articles))
     write_page(
         output,
         "sitemap.xml",
@@ -1822,6 +1946,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         + "\n"
         "- /releases/index.json: machine-readable release ledger\n"
         "- /releases/feed.atom: Atom feed of reviewed public milestones\n"
+        "- /research/feed.atom: Atom feed of reviewed research notes\n"
         "- /sitemap.xml: reviewed human-facing page inventory\n"
         "- /robots.txt: crawl policy and sitemap location\n"
         "- /research/: dated technical notes\n\n"

@@ -17,6 +17,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
 - the reviewed public release ledger in `site/releases.json`, which generates `/releases/`,
   `/releases/index.json`, and the static `/releases/feed.atom` subscription surface for milestone
   discovery only;
+- the reviewed research manifest in `site/publications.json`, which generates `/research/`,
+  `/research/index.json`, and the static text-only `/research/feed.atom` subscription surface;
 - deterministic `/sitemap.xml` and `/robots.txt` outputs derived only from reviewed human-facing
   routes, with no machine endpoint or unpublished note admitted;
 - only the research notes listed in `site/publications.json`; and
@@ -62,16 +64,23 @@ ingestion, or publication authority. Neither surface approves a model, launches 
 public Apache-2.0 source boundaries, or creates benchmark evidence beyond the reviewed note and
 capability manifests.
 
+The reviewed research feed follows [Atom 1.0](https://datatracker.ietf.org/doc/html/rfc4287) and is
+derived independently from the exact publication manifest and pinned note metadata. Stable entry
+IDs are the same-origin canonical article URLs; publication and review dates are normalized to UTC
+midnight; summaries are XML-escaped text; and article bodies are never embedded. Validation
+reconstructs both the research JSON and feed from its own reviewed catalog, so jointly edited output
+files cannot authorize a new note, identity, link, ordering, or claim.
+
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
-seven reviewed product/index pages, the three benchmark-detail pages, and the seven explicitly
-published research notes; it excludes JSON contracts, the Atom feed, LLM text surfaces, assets, and
-the 404 page. The benchmark-detail pages are immutable views of already-reviewed capability
-highlights, not new evidence, authority, ranking, or recomputation. The builder performs no
-submission or network request, and validation rejects route drift, non-UTF-8 or oversized content,
-DTD/entity declarations, symlinks, and non-regular files.
+seven reviewed product/index pages, three benchmark-detail pages, twelve release-detail pages, and
+seven explicitly published research notes; it excludes JSON contracts, both Atom feeds, LLM text
+surfaces, assets, and the 404 page. Detail pages are immutable views of already-reviewed capability
+highlights or release-ledger entries, not new evidence, authority, ranking, or recomputation. The
+builder performs no submission or network request, and validation rejects route drift, non-UTF-8 or
+oversized content, DTD/entity declarations, symlinks, and non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-seventeen-page set. The validator independently pins every page's route, title, description, object
+29-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and

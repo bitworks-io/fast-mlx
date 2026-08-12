@@ -73,6 +73,8 @@ SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
 SOCIAL_CARD_HEIGHT = 630
 MAX_RELEASE_FEED_BYTES = 1_048_576
+MAX_RESEARCH_FEED_BYTES = 1_048_576
+MAX_RESEARCH_INDEX_BYTES = 1_048_576
 MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
 CORE_PUBLIC_PAGE_PATHS = (
@@ -170,6 +172,27 @@ REVIEWED_ARTICLE_PATHS = (
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
 )
+REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/the-proof-did-not-end-when-the-timer-did/": (
+        "2026-07-28",
+        "2026-08-06",
+    ),
+    "research/the-fastest-request-wasnt-the-fastest-service/": (
+        "2026-07-14",
+        "2026-08-11",
+    ),
+    "research/lossless-wasnt-byte-identical/": ("2026-07-12", "2026-08-06"),
+    "research/when-zero-speculation-costs-two-percent/": (
+        "2026-07-11",
+        "2026-08-06",
+    ),
+    "research/turboquant-exact-math-still-lost/": (
+        "2026-07-09",
+        "2026-08-06",
+    ),
+    "research/trusting-the-instrument/": ("2026-07-09", "2026-08-06"),
+    "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
+}
 REVIEWED_RELEASE_INDEX_BYTES = 11_513
 REVIEWED_RELEASE_INDEX_SHA256 = (
     "ed8d08eb0b615e1be5c26a2bbcbea1e02ee7f8d4e75ad345a39e4432d517cd8d"
@@ -379,6 +402,28 @@ REVIEWED_PAGE_METADATA: Dict[
         "The optimization dial — quantified precision-loss tuning",
     ),
 }
+
+
+def reviewed_research_articles() -> Tuple[Dict[str, str], ...]:
+    """Return the independently pinned public metadata for reviewed research."""
+
+    records: List[Dict[str, str]] = []
+    for public_path in REVIEWED_ARTICLE_PATHS:
+        title, summary, page_type, theme = REVIEWED_PAGE_METADATA[public_path]
+        if page_type != "article" or theme is None or not title.endswith(" — fast-mlx"):
+            raise ValueError(f"incomplete reviewed research metadata for {public_path}")
+        date, reviewed_at = REVIEWED_ARTICLE_DATES[public_path]
+        records.append(
+            {
+                "title": title[: -len(" — fast-mlx")],
+                "date": date,
+                "theme": theme,
+                "summary": summary,
+                "path": public_path,
+                "reviewedAt": reviewed_at,
+            }
+        )
+    return tuple(records)
 SITEMAP_ARTICLE_PATH = re.compile(r"research/[a-z0-9]+(?:-[a-z0-9]+)*/")
 HTML_LIKE_SUFFIXES = {".html", ".htm"}
 PUBLIC_PATH = re.compile(
@@ -428,6 +473,7 @@ class HeadMetadataCollector(html.parser.HTMLParser):
         super().__init__()
         self.canonicals: List[str] = []
         self.properties: Dict[str, List[str]] = {}
+        self.atom_links: List[Dict[str, str]] = []
         self.metadata_outside_head = False
         self.invalid_head_structure = False
         self._in_head = False
@@ -457,12 +503,17 @@ class HeadMetadataCollector(html.parser.HTMLParser):
             for token in (attributes.get("rel") or "").split()
         }
         is_canonical = tag == "link" and "canonical" in rel_tokens
+        is_atom = (
+            tag == "link"
+            and "alternate" in rel_tokens
+            and attributes.get("type") == "application/atom+xml"
+        )
         property_name = attributes.get("property") if tag == "meta" else None
         is_social = isinstance(property_name, str) and (
             property_name.casefold().startswith("og:")
             or property_name.casefold().startswith("article:")
         )
-        if not is_canonical and not is_social:
+        if not is_canonical and not is_social and not is_atom:
             return
         if not self._in_head:
             self.metadata_outside_head = True
@@ -473,6 +524,18 @@ class HeadMetadataCollector(html.parser.HTMLParser):
             content = attributes.get("content")
             self.properties.setdefault(property_name, []).append(
                 content if isinstance(content, str) else ""
+            )
+        if is_atom:
+            self.atom_links.append(
+                {
+                    key: value if isinstance(value, str) else ""
+                    for key, value in (
+                        ("rel", attributes.get("rel")),
+                        ("type", attributes.get("type")),
+                        ("title", attributes.get("title")),
+                        ("href", attributes.get("href")),
+                    )
+                }
             )
 
     def handle_endtag(self, tag: str) -> None:
@@ -691,6 +754,76 @@ class BenchmarkDetailCollector(html.parser.HTMLParser):
                 self.sections.append(self._current)
                 self._current = None
 
+        if self._element_stack:
+            if self._element_stack[-1][0] == tag:
+                self._element_stack.pop()
+            else:
+                for position in range(len(self._element_stack) - 1, -1, -1):
+                    if self._element_stack[position][0] == tag:
+                        del self._element_stack[position:]
+                        break
+
+
+class ResearchCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_json_action = False
+        self.atom_actions: List[Dict[str, object]] = []
+        self._active_atom_action: Optional[Dict[str, object]] = None
+        self._element_stack: List[Tuple[str, bool]] = []
+
+    @staticmethod
+    def _suppresses_visibility(
+        tag: str, attributes: Dict[str, Optional[str]]
+    ) -> bool:
+        return (
+            tag in {"details", "dialog"}
+            or "hidden" in attributes
+            or "inert" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        names = [name for name, _value in attrs]
+        attributes = dict(attrs)
+        suppresses_visibility = self._suppresses_visibility(tag, attributes)
+        if tag == "a" and attributes.get("href") == "index.json":
+            self.has_json_action = True
+        if (
+            tag == "a"
+            and attributes.get("href") == "feed.atom"
+            and attributes.get("type") == "application/atom+xml"
+        ):
+            self._active_atom_action = {
+                "attributes": attributes,
+                "text_parts": [],
+                "visible": (
+                    len(names) == len(set(names))
+                    and not suppresses_visibility
+                    and not any(item[1] for item in self._element_stack)
+                ),
+            }
+        elif self._active_atom_action is not None and suppresses_visibility:
+            self._active_atom_action["visible"] = False
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, suppresses_visibility))
+
+    def handle_data(self, data: str) -> None:
+        if self._active_atom_action is not None:
+            parts = self._active_atom_action["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_atom_action is not None:
+            parts = self._active_atom_action.pop("text_parts")
+            self._active_atom_action["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.atom_actions.append(self._active_atom_action)
+            self._active_atom_action = None
         if self._element_stack:
             if self._element_stack[-1][0] == tag:
                 self._element_stack.pop()
@@ -1351,6 +1484,124 @@ def validate_release_feed(site: Path, release_index: Dict[str, object]) -> List[
     return failures
 
 
+def render_expected_research_index() -> Dict[str, object]:
+    """Recreate the exact reviewed research JSON contract independently."""
+
+    return {
+        "schemaVersion": 1,
+        "project": "fast-mlx",
+        "claimBoundary": "fast-mlx-owned-results-only",
+        "articles": [dict(article) for article in reviewed_research_articles()],
+    }
+
+
+def render_expected_research_feed() -> str:
+    """Recreate the one canonical reviewed-research Atom document."""
+
+    articles = sorted(
+        reviewed_research_articles(),
+        key=lambda article: (
+            article["reviewedAt"],
+            article["date"],
+            article["path"],
+        ),
+        reverse=True,
+    )
+    ET.register_namespace("", ATOM_NAMESPACE)
+    atom = lambda name: f"{{{ATOM_NAMESPACE}}}{name}"
+    feed = ET.Element(atom("feed"))
+    ET.SubElement(feed, atom("title")).text = "fast-mlx reviewed research"
+    ET.SubElement(feed, atom("id")).text = PUBLIC_SITE_URL + "research/"
+    ET.SubElement(feed, atom("updated")).text = (
+        articles[0]["reviewedAt"] + "T00:00:00Z"
+    )
+    author = ET.SubElement(feed, atom("author"))
+    ET.SubElement(author, atom("name")).text = "fast-mlx contributors"
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "self",
+            "type": "application/atom+xml",
+            "href": PUBLIC_SITE_URL + "research/feed.atom",
+        },
+    )
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "alternate",
+            "type": "text/html",
+            "href": PUBLIC_SITE_URL + "research/",
+        },
+    )
+    for article in articles:
+        canonical = PUBLIC_SITE_URL + article["path"]
+        entry = ET.SubElement(feed, atom("entry"))
+        ET.SubElement(entry, atom("title")).text = article["title"]
+        ET.SubElement(entry, atom("id")).text = canonical
+        ET.SubElement(entry, atom("published")).text = (
+            article["date"] + "T00:00:00Z"
+        )
+        ET.SubElement(entry, atom("updated")).text = (
+            article["reviewedAt"] + "T00:00:00Z"
+        )
+        ET.SubElement(entry, atom("category"), {"term": article["theme"]})
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {
+                "rel": "alternate",
+                "type": "text/html",
+                "href": canonical,
+            },
+        )
+        ET.SubElement(entry, atom("summary")).text = article["summary"]
+    ET.indent(feed, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(feed, encoding="unicode", short_empty_elements=True)
+        + "\n"
+    )
+
+
+def validate_research_feed(site: Path) -> List[str]:
+    failures: List[str] = []
+    feed_path = site / "research/feed.atom"
+    if feed_path.is_symlink() or not feed_path.is_file():
+        return ["research/feed.atom must be a regular non-symlink file"]
+    try:
+        feed_size = feed_path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat research/feed.atom: {exc}"]
+    if feed_size > MAX_RESEARCH_FEED_BYTES:
+        return ["research/feed.atom exceeds the 1048576-byte limit"]
+    try:
+        raw_feed = feed_path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read research/feed.atom: {exc}"]
+    if len(raw_feed) > MAX_RESEARCH_FEED_BYTES:
+        return ["research/feed.atom exceeds the 1048576-byte limit"]
+    try:
+        feed_text = raw_feed.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"research/feed.atom is not UTF-8: {exc}"]
+    upper_feed = feed_text.upper()
+    if "<!DOCTYPE" in upper_feed or "<!ENTITY" in upper_feed:
+        return ["research/feed.atom contains a forbidden XML declaration"]
+    try:
+        feed = ET.fromstring(feed_text)
+    except ET.ParseError as exc:
+        return [f"invalid research/feed.atom: {exc}"]
+    if feed.tag != f"{{{ATOM_NAMESPACE}}}feed":
+        failures.append("research/feed.atom is not an Atom 1.0 feed")
+    if feed_text != render_expected_research_feed():
+        failures.append(
+            "research/feed.atom does not match the reviewed research catalog"
+        )
+    return failures
+
+
 def render_expected_sitemap(article_paths: Sequence[str]) -> str:
     """Recreate the one canonical sitemap accepted by the Pages validator."""
 
@@ -1525,6 +1776,35 @@ def expected_social_properties(
     return properties
 
 
+def expected_atom_links(relative: str, public_path: Optional[str]) -> List[Dict[str, str]]:
+    links: List[Dict[str, str]] = []
+    if public_path == "research/" or (
+        isinstance(public_path, str)
+        and SITEMAP_ARTICLE_PATH.fullmatch(public_path) is not None
+    ):
+        links.append(
+            {
+                "rel": "alternate",
+                "type": "application/atom+xml",
+                "title": "fast-mlx reviewed research",
+                "href": relative_href(relative, "research/feed.atom"),
+            }
+        )
+    current_dir = posixpath.dirname(relative)
+    root_prefix = "../" * len(
+        [part for part in current_dir.split("/") if part]
+    )
+    links.append(
+        {
+            "rel": "alternate",
+            "type": "application/atom+xml",
+            "title": "fast-mlx reviewed releases",
+            "href": root_prefix + "releases/feed.atom",
+        }
+    )
+    return links
+
+
 def validate_reviewed_head_metadata(site: Path) -> List[str]:
     failures: List[str] = []
     expected_files = {
@@ -1565,6 +1845,7 @@ def validate_reviewed_head_metadata(site: Path) -> List[str]:
             or collector.metadata_outside_head
             or collector.canonicals != [canonical]
             or collector.properties != expected_properties
+            or collector.atom_links != expected_atom_links(relative, public_path)
         ):
             failures.append(f"{relative} metadata does not match reviewed contract")
 
@@ -1581,10 +1862,41 @@ def validate_reviewed_head_metadata(site: Path) -> List[str]:
                 or collector.metadata_outside_head
                 or collector.canonicals
                 or collector.properties
+                or collector.atom_links != expected_atom_links("404.html", None)
             ):
                 failures.append(
                     "404.html must not publish canonical or social metadata"
                 )
+    return failures
+
+
+def validate_research_page(site: Path) -> List[str]:
+    research_path = site / "research/index.html"
+    if research_path.is_symlink() or not research_path.is_file():
+        return []
+    collector = ResearchCollector()
+    try:
+        collector.feed(research_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"cannot parse research/index.html: {exc}"]
+    failures: List[str] = []
+    if not collector.has_json_action:
+        failures.append("research/index.html does not link to research/index.json")
+    expected_atom_attributes = {
+        "class": "button secondary",
+        "href": "feed.atom",
+        "type": "application/atom+xml",
+    }
+    if (
+        len(collector.atom_actions) != 1
+        or collector.atom_actions[0].get("attributes") != expected_atom_attributes
+        or collector.atom_actions[0].get("text")
+        != "Subscribe to reviewed research"
+        or collector.atom_actions[0].get("visible") is not True
+    ):
+        failures.append(
+            "research/index.html does not expose the reviewed research subscription action"
+        )
     return failures
 
 
@@ -2209,6 +2521,7 @@ def validate(site: Path) -> List[str]:
         ],
         "research/index.html",
         "research/index.json",
+        "research/feed.atom",
         "sitemap.xml",
         "robots.txt",
         "assets/site.css",
@@ -2226,6 +2539,7 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_reviewed_stylesheet(site))
     failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
+    failures.extend(validate_research_page(site))
 
     expected_benchmark_cards = reviewed_benchmark_cards()
 
@@ -2240,48 +2554,101 @@ def validate(site: Path) -> List[str]:
     if release_index is not None:
         failures.extend(validate_release_detail_pages(site, release_index))
 
-    research_index: Optional[Dict[str, object]] = None
-    sitemap_article_paths: List[str] = []
-    index_path = site / "research/index.json"
-    if index_path.is_file():
-        try:
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            failures.append(f"invalid research/index.json: {exc}")
-        else:
-            if not isinstance(index, dict):
-                failures.append("research/index.json is not an object")
-            else:
-                research_index = index
-                if index.get("schemaVersion") != 1:
-                    failures.append("research/index.json does not use schemaVersion 1")
-                articles = index.get("articles", [])
-                if not isinstance(articles, list) or not articles:
-                    failures.append("research/index.json has no articles")
-                else:
-                    seen_article_paths: set[str] = set()
-                    for article in articles:
-                        path = article.get("path") if isinstance(article, dict) else None
-                        if (
-                            not isinstance(path, str)
-                            or not SITEMAP_ARTICLE_PATH.fullmatch(path)
-                            or path in seen_article_paths
-                        ):
-                            failures.append(
-                                f"invalid or duplicate article path in index entry: {path!r}"
-                            )
-                            continue
-                        seen_article_paths.add(path)
-                        sitemap_article_paths.append(path)
-                        if not (site / path / "index.html").is_file():
-                            failures.append(
-                                f"missing article page for index entry: {path!r}"
-                            )
+    feed_path = site / "research/feed.atom"
+    if feed_path.exists() or feed_path.is_symlink():
+        failures.extend(validate_research_feed(site))
 
-                    if tuple(sitemap_article_paths) != REVIEWED_ARTICLE_PATHS:
+    research_index: Optional[Dict[str, object]] = None
+    index_path = site / "research/index.json"
+    if index_path.is_symlink() or not index_path.is_file():
+        if index_path.exists() or index_path.is_symlink():
+            failures.append(
+                "research/index.json must be a regular non-symlink file"
+            )
+    else:
+        try:
+            index_size = index_path.stat().st_size
+        except OSError as exc:
+            failures.append(f"cannot stat research/index.json: {exc}")
+        else:
+            if index_size > MAX_RESEARCH_INDEX_BYTES:
+                failures.append(
+                    "research/index.json exceeds the 1048576-byte limit"
+                )
+            else:
+                try:
+                    raw_index = index_path.read_bytes()
+                except OSError as exc:
+                    failures.append(f"cannot read research/index.json: {exc}")
+                else:
+                    if len(raw_index) > MAX_RESEARCH_INDEX_BYTES:
                         failures.append(
-                            "research/index.json does not match reviewed article routes"
+                            "research/index.json exceeds the 1048576-byte limit"
                         )
+                    else:
+                        try:
+                            index_text = raw_index.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            failures.append(
+                                f"research/index.json is not UTF-8: {exc}"
+                            )
+                        else:
+                            try:
+                                index = json.loads(index_text)
+                            except json.JSONDecodeError as exc:
+                                failures.append(f"invalid research/index.json: {exc}")
+                            else:
+                                if not isinstance(index, dict):
+                                    failures.append(
+                                        "research/index.json is not an object"
+                                    )
+                                else:
+                                    research_index = index
+                                    if index.get("schemaVersion") != 1:
+                                        failures.append(
+                                            "research/index.json does not use schemaVersion 1"
+                                        )
+                                    articles = index.get("articles", [])
+                                    if not isinstance(articles, list) or not articles:
+                                        failures.append(
+                                            "research/index.json has no articles"
+                                        )
+                                    else:
+                                        seen_article_paths: set[str] = set()
+                                        sitemap_article_paths: List[str] = []
+                                        for article in articles:
+                                            path = (
+                                                article.get("path")
+                                                if isinstance(article, dict)
+                                                else None
+                                            )
+                                            if (
+                                                not isinstance(path, str)
+                                                or not SITEMAP_ARTICLE_PATH.fullmatch(path)
+                                                or path in seen_article_paths
+                                            ):
+                                                failures.append(
+                                                    "invalid or duplicate article path in "
+                                                    f"index entry: {path!r}"
+                                                )
+                                                continue
+                                            seen_article_paths.add(path)
+                                            sitemap_article_paths.append(path)
+                                            if not (site / path / "index.html").is_file():
+                                                failures.append(
+                                                    "missing article page for index entry: "
+                                                    f"{path!r}"
+                                                )
+                                        if tuple(sitemap_article_paths) != REVIEWED_ARTICLE_PATHS:
+                                            failures.append(
+                                                "research/index.json does not match "
+                                                "reviewed article routes"
+                                            )
+                                    if index != render_expected_research_index():
+                                        failures.append(
+                                            "research/index.json does not match the "
+                                            "reviewed research catalog"
+                                        )
 
     sitemap_path = site / "sitemap.xml"
     if sitemap_path.exists() or sitemap_path.is_symlink():

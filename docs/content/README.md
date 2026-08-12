@@ -18,4 +18,6 @@ described in the article. It is not a current universal performance guarantee.
 - [The proof did not end when the timer did](2026-07-28-the-proof-did-not-end-when-the-timer-did.md)
 
 `site/publications.json` is the fail-closed publication manifest. A note must be explicitly added
-there and pass the site/public-repository validators before it can appear on GitHub Pages.
+there and pass the site/public-repository validators before it can appear on GitHub Pages. The same
+reviewed metadata generates the text-only `/research/feed.atom` subscription surface; article
+bodies, scripts, trackers, external intake, and build-time network requests never enter that feed.
