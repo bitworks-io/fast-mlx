@@ -108,6 +108,13 @@ REVIEWED_BENCHMARK_PUBLIC_PATHS = (
     "benchmarks/continuous-batch-c2-throughput/",
     "benchmarks/http-sse-operational-soak/",
 )
+RELEASE_DETAIL_PUBLIC_PATH = re.compile(
+    r"releases/[a-z0-9]+(?:-[a-z0-9]+)*/"
+)
+RELEASE_DETAIL_DESCRIPTION = (
+    "A reviewed fast-mlx public milestone with its exact commit, shipped surfaces, "
+    "and unchanged claim boundary."
+)
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -899,6 +906,7 @@ def render_head_metadata(
             r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
         )
         and public_path not in REVIEWED_BENCHMARK_PUBLIC_PATHS
+        and not RELEASE_DETAIL_PUBLIC_PATH.fullmatch(public_path)
     ):
         fail(f"invalid metadata public path: {public_path!r}")
     canonical = PUBLIC_SITE_URL + public_path
@@ -1003,6 +1011,9 @@ def render_release_catalog(
                 f'<p>{html.escape(str(release["summary"]))}</p>',
                 f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(release["scope"]))}</p>',
                 '<div class="release-links">',
+                '<a class="text-link" href="'
+                + html.escape(str(release["id"]), quote=True)
+                + '/">Open reviewed checkpoint →</a>',
                 f'<a class="text-link" href="{html.escape(str(release["sourceUrl"]), quote=True)}" rel="noreferrer">Inspect commit {html.escape(commit[:12])} →</a>',
             ]
         )
@@ -1014,6 +1025,59 @@ def render_release_catalog(
         body.extend(['</div>', '</article>', '</li>'])
     body.extend(['</ol>', '</section>'])
     return "\n".join(body), public_index
+
+
+def release_detail_title(release: Dict[str, object]) -> str:
+    return f'{release["title"]} — fast-mlx release'
+
+
+def render_release_detail(release: Dict[str, object]) -> str:
+    """Render one immutable view of a reviewed release-ledger entry."""
+
+    identifier = str(release["id"])
+    commit = str(release["publicCommit"])
+    published_at = str(release["publishedAt"])
+    category = str(release["category"])
+    public_path = f"releases/{identifier}/"
+    body = [
+        '<section class="page-hero shell benchmark-detail release-detail" '
+        'data-release-detail '
+        f'data-release-id="{html.escape(identifier, quote=True)}" '
+        f'data-public-commit="{html.escape(commit, quote=True)}">',
+        '<div class="card-topline">',
+        f'<span class="status-badge status-released">{html.escape(str(release["state"]).upper())}</span>',
+        f'<time datetime="{html.escape(published_at, quote=True)}">{html.escape(published_at[:10])}</time>',
+        '</div>',
+        f'<p class="release-category">{html.escape(RELEASE_CATEGORY_LABELS[category])}</p>',
+        f'<h1>{html.escape(str(release["title"]))}</h1>',
+        f'<p class="lede">{html.escape(str(release["summary"]))}</p>',
+        '<p class="scope-note"><strong>Boundary:</strong> '
+        + html.escape(str(release["scope"]))
+        + '</p>',
+        '<div class="release-links">',
+        '<a class="button primary" href="https://github.com/bitworks-io/fast-mlx/commit/'
+        + html.escape(commit, quote=True)
+        + '" rel="noreferrer">Inspect commit '
+        + html.escape(commit[:12])
+        + ' →</a>',
+    ]
+    for link in release["publicLinks"]:
+        href = relative_href(public_path + "index.html", str(link["path"]))
+        body.append(
+            f'<a href="{html.escape(href, quote=True)}">{html.escape(str(link["label"]))} →</a>'
+        )
+    body.extend(
+        [
+            '<a class="button secondary" href="../">Back to all reviewed releases</a>',
+            '</div>',
+            '<div class="scope-note">',
+            '<strong>Static release boundary.</strong> This page does not create a new release, measurement, ranking, runtime, model, acquisition, or publication authority.',
+            ' <a href="../../methodology/">Read the public methodology →</a>',
+            '</div>',
+            '</section>',
+        ]
+    )
+    return "\n".join(body)
 
 
 def render_release_feed(release_index: Dict[str, object]) -> str:
@@ -1064,11 +1128,7 @@ def render_release_feed(release_index: Dict[str, object]) -> str:
             {
                 "rel": "alternate",
                 "type": "text/html",
-                "href": (
-                    PUBLIC_SITE_URL
-                    + "releases/#release-"
-                    + str(release["id"])
-                ),
+                "href": PUBLIC_SITE_URL + "releases/" + str(release["id"]) + "/",
             },
         )
         ET.SubElement(
@@ -1088,7 +1148,9 @@ def render_release_feed(release_index: Dict[str, object]) -> str:
 
 
 def render_sitemap(
-    articles: Sequence[Article], highlights: Sequence[Dict[str, object]]
+    articles: Sequence[Article],
+    highlights: Sequence[Dict[str, object]],
+    releases: Sequence[Dict[str, object]],
 ) -> str:
     """Render canonical human-facing routes without inventing crawl metadata."""
 
@@ -1097,6 +1159,7 @@ def render_sitemap(
     public_paths = [
         *CORE_PUBLIC_PAGE_PATHS,
         *[f'benchmarks/{highlight["id"]}/' for highlight in highlights],
+        *[f'releases/{release["id"]}/' for release in releases],
         *[article.public_path for article in articles],
     ]
     if len(public_paths) != len(set(public_paths)):
@@ -1462,9 +1525,9 @@ def render_home_current_cycle(
             + html.escape(str(latest["scope"]))
             + "</p>",
             '<div class="release-links">',
-            '<a class="text-link" href="releases/#release-'
+            '<a class="text-link" href="releases/'
             + html.escape(latest_id, quote=True)
-            + '">Inspect the latest reviewed milestone →</a>',
+            + '/">Inspect the latest reviewed milestone →</a>',
             '<a href="https://github.com/bitworks-io/fast-mlx/commit/'
             + html.escape(commit, quote=True)
             + '" rel="noreferrer">Inspect commit '
@@ -1632,6 +1695,22 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         json.dumps(release_index, indent=2, ensure_ascii=False),
     )
     write_page(output, "releases/feed.atom", render_release_feed(release_index))
+    for release in release_index["releases"]:
+        identifier = str(release["id"])
+        public_path = f"releases/{identifier}/"
+        write_page(
+            output,
+            public_path + "index.html",
+            render_template(
+                template,
+                release_detail_title(release),
+                RELEASE_DETAIL_DESCRIPTION,
+                "../../",
+                render_release_detail(release),
+                "releases",
+                public_path=public_path,
+            ),
+        )
 
     cards = [
         '<section class="page-hero shell"><p class="eyebrow">Research notes</p>'
@@ -1711,11 +1790,19 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "sitemap.xml",
-        render_sitemap(articles, capability_index["performanceHighlights"]),
+        render_sitemap(
+            articles,
+            capability_index["performanceHighlights"],
+            release_index["releases"],
+        ),
     )
     benchmark_detail_lines = "\n".join(
         f'- /benchmarks/{highlight["id"]}/: {highlight["label"]}'
         for highlight in capability_index["performanceHighlights"]
+    )
+    release_detail_lines = "\n".join(
+        f'- /releases/{release["id"]}/: {release["title"]}'
+        for release in release_index["releases"]
     )
     write_page(
         output,
@@ -1731,6 +1818,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         + benchmark_detail_lines
         + "\n"
         "- /releases/: reviewed public milestones and unchanged boundaries\n"
+        + release_detail_lines
+        + "\n"
         "- /releases/index.json: machine-readable release ledger\n"
         "- /releases/feed.atom: Atom feed of reviewed public milestones\n"
         "- /sitemap.xml: reviewed human-facing page inventory\n"

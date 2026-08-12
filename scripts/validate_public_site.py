@@ -65,9 +65,9 @@ SITE_STYLESHEET_PATH = "assets/site.css"
 SITE_STYLESHEET_SHA256 = (
     "5601429bd64b6dbd58da20c10f7f8116f27774a285d574152795435b0522ea81"
 )
-REVIEWED_HOME_PAGE_BYTES = 8_978
+REVIEWED_HOME_PAGE_BYTES = 8_970
 REVIEWED_HOME_PAGE_SHA256 = (
-    "06aca0b0d34e609aa0c2e301fcd5dfddb1b73d585e31f96e8782c33db1bcc561"
+    "ed462144222ec990c7625e815840ea3e124d685cf393be3c95d57379be6d0cca"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -170,6 +170,76 @@ REVIEWED_ARTICLE_PATHS = (
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
 )
+REVIEWED_RELEASE_INDEX_BYTES = 10_403
+REVIEWED_RELEASE_INDEX_SHA256 = (
+    "a2d72c8350c4bbe4ae38537f316074c371d689a4e28f7edf271526e96d0f01c4"
+)
+REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    ("reviewed-benchmark-detail-permalinks", "Publish benchmark detail permalinks"),
+    ("reviewed-home-current-cycle", "Show current reviewed cycle"),
+    ("reviewed-social-metadata", "Publish reviewed social metadata"),
+    ("reviewed-sitemap-discovery", "Publish reviewed sitemap discovery"),
+    ("reviewed-release-atom-feed", "Publish reviewed release Atom feed"),
+    ("reviewed-release-ledger", "Publish reviewed release ledger"),
+    ("public-benchmark-explorer", "Publish reviewed benchmark explorer"),
+    ("same-commit-pages-quality-gate", "Gate Pages deployment on public quality"),
+    ("capabilities-and-evidence", "Publish capabilities and evidence"),
+    ("compatible-hosted-swift-runner", "Use compatible GitHub macOS runner"),
+    ("initial-public-release", "Initial public release"),
+)
+REVIEWED_RELEASE_PATHS = tuple(
+    f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
+)
+REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "reviewed-benchmark-detail-permalinks": (
+        4_734,
+        "dd310a3a15581b7179c994e593e77728f70c027710de8624115a95d892ace6c9",
+    ),
+    "reviewed-home-current-cycle": (
+        4_562,
+        "ac9c90ea49182204c262ce41eb5503a1e03ac33adef9ad3dbde7f3360e712aa4",
+    ),
+    "reviewed-social-metadata": (
+        4_460,
+        "06baa3625b39348f89edb9b8ef1085822b33fb57b2c5d1f8cc96d7dd8265f95d",
+    ),
+    "reviewed-sitemap-discovery": (
+        4_480,
+        "dff5949a0fe6f614377f6914fcc82158f00475f1452123150878dd03ac61ed9b",
+    ),
+    "reviewed-release-atom-feed": (
+        4_390,
+        "2a7d9a26ab1eaa3271331fcab535b23035aea6bbd62e1e80a8c3f444b95c2db5",
+    ),
+    "reviewed-release-ledger": (
+        4_375,
+        "6044e202ebac4559844f3be856c49fe1233f40c4ec9c40256fabccd1b5d8a80b",
+    ),
+    "public-benchmark-explorer": (
+        4_438,
+        "148737ddd76f1fbc2a61fc54c69c42e02aab4a792fb3306ae2cd59492c8849f8",
+    ),
+    "same-commit-pages-quality-gate": (
+        4_411,
+        "c98e2a0e93b799d65ed9e3c06dd69ac68317a6e49faadb3209f065373b5339a4",
+    ),
+    "capabilities-and-evidence": (
+        4_462,
+        "3fc920bac108020314a04b86a96ef2875eeb187f11abbc3e0b8cfc957486467d",
+    ),
+    "compatible-hosted-swift-runner": (
+        4_329,
+        "c3285b90b77ba453a3052f8d2162c8c750b8877e1e0194c53f9ccabece181b64",
+    ),
+    "initial-public-release": (
+        4_385,
+        "d0ff2efcd7b92690c2053baf4a8a8d82ae3439f897ac74a76c0510bf7275a831",
+    ),
+}
+RELEASE_DETAIL_DESCRIPTION = (
+    "A reviewed fast-mlx public milestone with its exact commit, shipped surfaces, "
+    "and unchanged claim boundary."
+)
 HTML_VOID_ELEMENTS = {
     "area",
     "base",
@@ -243,6 +313,18 @@ REVIEWED_PAGE_METADATA: Dict[
         "website",
         None,
     ),
+    **{
+        path: (
+            f"{title} — fast-mlx release",
+            RELEASE_DETAIL_DESCRIPTION,
+            "website",
+            None,
+        )
+        for path, title in (
+            (f"releases/{identifier}/", title)
+            for identifier, title in REVIEWED_RELEASE_IDENTITIES
+        )
+    },
     "research/": (
         "Research notes — fast-mlx",
         "Dated fast-mlx investigations and measured negative results.",
@@ -702,6 +784,115 @@ class ReleaseCollector(html.parser.HTMLParser):
             self._current_card = None
 
 
+class ReleaseDetailCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections: List[Dict[str, object]] = []
+        self.page_h1_count = 0
+        self.page_links: List[str] = []
+        self.scripts: List[Optional[str]] = []
+        self.text_parts: List[str] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._section_depth = 0
+        self._element_stack: List[Tuple[str, bool]] = []
+
+    @staticmethod
+    def _suppresses_visibility(
+        tag: str, attributes: Dict[str, Optional[str]]
+    ) -> bool:
+        return (
+            tag in {"details", "dialog"}
+            or "hidden" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        names = [name for name, _value in attrs]
+        attributes = dict(attrs)
+        duplicate_attributes = len(names) != len(set(names))
+        suppresses_visibility = self._suppresses_visibility(tag, attributes)
+
+        if tag == "h1":
+            self.page_h1_count += 1
+        if tag == "a" and attributes.get("href"):
+            self.page_links.append(str(attributes["href"]))
+        if tag == "script":
+            self.scripts.append(attributes.get("src"))
+
+        if tag == "section" and "data-release-detail" in attributes:
+            if self._current is None:
+                self._current = {
+                    "id": attributes.get("data-release-id"),
+                    "publicCommit": attributes.get("data-public-commit"),
+                    "datetime": None,
+                    "links": [],
+                    "text_parts": [],
+                    "h1Count": 0,
+                    "hasDuplicateAttributes": duplicate_attributes,
+                    "hasVisibilitySuppressor": suppresses_visibility
+                    or any(item[1] for item in self._element_stack),
+                    "hasNestedDetail": False,
+                }
+                self._section_depth = 1
+            else:
+                self._current["hasNestedDetail"] = True
+                self._section_depth += 1
+        elif self._current is not None and tag == "section":
+            self._section_depth += 1
+
+        if self._current is not None:
+            if duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if suppresses_visibility:
+                self._current["hasVisibilitySuppressor"] = True
+            if tag == "h1":
+                self._current["h1Count"] = int(self._current["h1Count"]) + 1
+            elif tag == "time":
+                self._current["datetime"] = attributes.get("datetime")
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, suppresses_visibility))
+
+    def handle_data(self, data: str) -> None:
+        self.text_parts.append(data)
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        self.text_parts.append(" ")
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(" ")
+        if self._current is not None and tag == "section":
+            self._section_depth -= 1
+            if self._section_depth == 0:
+                parts = self._current.pop("text_parts")
+                self._current["text"] = (
+                    " ".join("".join(parts).split())
+                    if isinstance(parts, list)
+                    else ""
+                )
+                self.sections.append(self._current)
+                self._current = None
+
+        if self._element_stack:
+            if self._element_stack[-1][0] == tag:
+                self._element_stack.pop()
+            else:
+                for position in range(len(self._element_stack) - 1, -1, -1):
+                    if self._element_stack[position][0] == tag:
+                        del self._element_stack[position:]
+                        break
+
+
 class HomeCurrentCycleCollector(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -920,11 +1111,20 @@ def load_release_index(site: Path) -> Tuple[Optional[Dict[str, object]], List[st
     failures: List[str] = []
     release_index_path = site / "releases/index.json"
     try:
-        release_index = json.loads(release_index_path.read_text(encoding="utf-8"))
+        raw_release_index = release_index_path.read_bytes()
     except OSError as exc:
         return None, [f"cannot read releases/index.json: {exc}"]
+    if (
+        len(raw_release_index) != REVIEWED_RELEASE_INDEX_BYTES
+        or hashlib.sha256(raw_release_index).hexdigest() != REVIEWED_RELEASE_INDEX_SHA256
+    ):
+        failures.append("releases/index.json does not match the reviewed release ledger")
+    try:
+        release_index = json.loads(raw_release_index.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        return None, [*failures, f"releases/index.json is not UTF-8: {exc}"]
     except json.JSONDecodeError as exc:
-        return None, [f"invalid releases/index.json: {exc}"]
+        return None, [*failures, f"invalid releases/index.json: {exc}"]
 
     failures.extend(key_failures(release_index, RELEASE_INDEX_KEYS, "releases/index.json"))
     if not isinstance(release_index, dict):
@@ -967,6 +1167,13 @@ def load_release_index(site: Path) -> Tuple[Optional[Dict[str, object]], List[st
     if not isinstance(releases, list) or not releases:
         failures.append("releases/index.json has no releases")
     else:
+        identities = tuple(
+            (release.get("id"), release.get("title"))
+            for release in releases
+            if isinstance(release, dict)
+        )
+        if identities != REVIEWED_RELEASE_IDENTITIES:
+            failures.append("releases/index.json does not match reviewed release identities")
         seen_ids: set[str] = set()
         seen_commits: set[str] = set()
         previous_timestamp: Optional[dt.datetime] = None
@@ -1072,8 +1279,9 @@ def render_expected_release_feed(release_index: Dict[str, object]) -> str:
                 "type": "text/html",
                 "href": (
                     PUBLIC_SITE_URL
-                    + "releases/#release-"
+                    + "releases/"
                     + str(release["id"])
+                    + "/"
                 ),
             },
         )
@@ -1146,6 +1354,7 @@ def render_expected_sitemap(article_paths: Sequence[str]) -> str:
     for public_path in (
         *CORE_PUBLIC_PAGE_PATHS,
         *REVIEWED_BENCHMARK_PATHS,
+        *REVIEWED_RELEASE_PATHS,
         *article_paths,
     ):
         url = ET.SubElement(sitemap, f"{{{SITEMAP_NAMESPACE}}}url")
@@ -1471,6 +1680,11 @@ def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[
         source_url = release.get("sourceUrl")
         if not isinstance(source_url, str) or source_url not in actual_links:
             failures.append(f"release page card {identifier!r} has the wrong source link")
+        expected_detail_href = str(identifier) + "/"
+        if expected_detail_href not in actual_links:
+            failures.append(
+                f"release page card {identifier!r} has the wrong release detail link"
+            )
         for raw_link in release.get("publicLinks", []):
             if not isinstance(raw_link, dict):
                 continue
@@ -1621,9 +1835,9 @@ def validate_home_current_cycle(
     expected_source = latest.get("sourceUrl")
     if not isinstance(expected_source, str) or expected_source not in actual_links:
         failures.append("home current-cycle latest release has the wrong source link")
-    expected_anchor = "releases/#release-" + str(latest.get("id", ""))
-    if expected_anchor not in actual_links:
-        failures.append("home current-cycle latest release has the wrong ledger link")
+    expected_release_detail = "releases/" + str(latest.get("id", "")) + "/"
+    if expected_release_detail not in actual_links:
+        failures.append("home current-cycle latest release has the wrong detail link")
     for expected_link, label in (
         ("capabilities/", "capability"),
         ("research/", "research"),
@@ -1830,6 +2044,143 @@ def validate_benchmark_detail_pages(site: Path) -> List[str]:
     return failures
 
 
+def validate_release_detail_pages(
+    site: Path, release_index: Dict[str, object]
+) -> List[str]:
+    failures: List[str] = []
+    release_root = site / "releases"
+    expected_entries = {"index.html", "index.json", "feed.atom"} | {
+        identifier for identifier, _title in REVIEWED_RELEASE_IDENTITIES
+    }
+    if release_root.is_symlink() or not release_root.is_dir():
+        return ["releases must be a regular non-symlink directory"]
+    try:
+        actual_entries = {entry.name for entry in release_root.iterdir()}
+    except OSError as exc:
+        return [f"cannot inspect release detail routes: {exc}"]
+    for extra in sorted(actual_entries - expected_entries):
+        failures.append(f"unexpected release route outside reviewed set: {extra}")
+
+    releases = release_index.get("releases")
+    expected_releases = releases if isinstance(releases, list) else []
+    expected_by_id = {
+        release["id"]: release
+        for release in expected_releases
+        if isinstance(release, dict) and isinstance(release.get("id"), str)
+    }
+    expected_order = tuple(
+        release.get("id") for release in expected_releases if isinstance(release, dict)
+    )
+    if expected_order != tuple(identifier for identifier, _title in REVIEWED_RELEASE_IDENTITIES):
+        failures.append("release detail pages do not match reviewed release identities")
+
+    for identifier, _title in REVIEWED_RELEASE_IDENTITIES:
+        relative = f"releases/{identifier}/index.html"
+        directory = site / "releases" / identifier
+        path = directory / "index.html"
+        if directory.is_symlink() or not directory.is_dir():
+            failures.append(
+                f"release detail route {identifier!r} must be a regular non-symlink directory"
+            )
+            continue
+        if path.is_symlink() or not path.is_file():
+            failures.append(f"{relative} must be a regular non-symlink file")
+            continue
+        release = expected_by_id.get(identifier)
+        if release is None:
+            continue
+
+        try:
+            raw_detail = path.read_bytes()
+        except OSError as exc:
+            failures.append(f"cannot read {relative}: {exc}")
+            continue
+        expected_size, expected_sha256 = REVIEWED_RELEASE_DETAIL_SEALS[identifier]
+        if (
+            len(raw_detail) != expected_size
+            or hashlib.sha256(raw_detail).hexdigest() != expected_sha256
+        ):
+            failures.append(
+                f"release detail {identifier!r} does not match the reviewed page seal"
+            )
+        try:
+            detail_text = raw_detail.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            failures.append(f"cannot parse {relative}: {exc}")
+            continue
+        collector = ReleaseDetailCollector()
+        try:
+            collector.feed(detail_text)
+        except Exception as exc:
+            failures.append(f"cannot parse {relative}: {exc}")
+            continue
+        if len(collector.sections) != 1:
+            failures.append(
+                f"release detail {identifier!r} must contain exactly one detail section"
+            )
+            continue
+
+        detail = collector.sections[0]
+        commit = str(release.get("publicCommit", ""))
+        category = str(release.get("category", ""))
+        release_links = release.get("publicLinks")
+        public_links = release_links if isinstance(release_links, list) else []
+        expected_text = " ".join(
+            [
+                str(release.get("state", "")).upper(),
+                str(release.get("publishedAt", ""))[:10],
+                RELEASE_CATEGORY_LABELS.get(category, ""),
+                str(release.get("title", "")),
+                str(release.get("summary", "")),
+                "Boundary:",
+                str(release.get("scope", "")),
+                "Inspect commit",
+                commit[:12],
+                "→",
+                *[
+                    str(link.get("label", "")) + " →"
+                    for link in public_links
+                    if isinstance(link, dict)
+                ],
+                "Back to all reviewed releases",
+                "Static release boundary. This page does not create a new release, measurement, ranking, runtime, model, acquisition, or publication authority.",
+                "Read the public methodology →",
+            ]
+        )
+        expected_text = " ".join(expected_text.split())
+        expected_links = [str(release.get("sourceUrl", ""))]
+        expected_links.extend(
+            relative_href(relative, str(link["path"]))
+            for link in public_links
+            if isinstance(link, dict) and isinstance(link.get("path"), str)
+        )
+        expected_links.extend(["../", "../../methodology/"])
+
+        if detail.get("id") != identifier:
+            failures.append(f"release detail {identifier!r} has the wrong id")
+        if detail.get("publicCommit") != release.get("publicCommit"):
+            failures.append(f"release detail {identifier!r} has the wrong commit")
+        if detail.get("datetime") != release.get("publishedAt"):
+            failures.append(f"release detail {identifier!r} has the wrong timestamp")
+        if detail.get("text") != expected_text:
+            failures.append(f"release detail {identifier!r} has drifted reviewed text")
+        if detail.get("links") != expected_links:
+            failures.append(f"release detail {identifier!r} has the wrong action links")
+        if (
+            detail.get("h1Count") != 1
+            or collector.page_h1_count != 1
+            or detail.get("hasNestedDetail")
+        ):
+            failures.append(f"release detail {identifier!r} has the wrong heading structure")
+        if detail.get("hasDuplicateAttributes"):
+            failures.append(f"release detail {identifier!r} has duplicate attributes")
+        if detail.get("hasVisibilitySuppressor"):
+            failures.append(f"release detail {identifier!r} is hidden")
+        if collector.scripts:
+            failures.append(f"release detail {identifier!r} must not load scripts")
+    return failures
+
+
 def validate(site: Path) -> List[str]:
     failures: List[str] = []
     site = site.resolve()
@@ -1847,6 +2198,10 @@ def validate(site: Path) -> List[str]:
         "releases/index.html",
         "releases/index.json",
         "releases/feed.atom",
+        *[
+            f"releases/{identifier}/index.html"
+            for identifier, _title in REVIEWED_RELEASE_IDENTITIES
+        ],
         "research/index.html",
         "research/index.json",
         "sitemap.xml",
@@ -1877,6 +2232,8 @@ def validate(site: Path) -> List[str]:
         failures.extend(validate_release_page(site, release_index))
     if release_index is not None and (site / "releases/feed.atom").is_file():
         failures.extend(validate_release_feed(site, release_index))
+    if release_index is not None:
+        failures.extend(validate_release_detail_pages(site, release_index))
 
     research_index: Optional[Dict[str, object]] = None
     sitemap_article_paths: List[str] = []

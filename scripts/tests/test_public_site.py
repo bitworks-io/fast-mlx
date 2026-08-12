@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import html.parser
 import json
 import shutil
@@ -371,7 +372,7 @@ class PublicSiteTests(unittest.TestCase):
             self.assertIn(latest["scope"], page)
             self.assertIn(latest["publishedAt"][:10], page)
             self.assertIn(
-                'href="releases/#release-' + latest["id"] + '"', page
+                'href="releases/' + latest["id"] + '/"', page
             )
             self.assertIn(
                 "https://github.com/bitworks-io/fast-mlx/commit/"
@@ -601,6 +602,9 @@ class PublicSiteTests(unittest.TestCase):
             output = Path(directory) / "site"
             output.mkdir()
             articles = build_public_site.build_site(REPOSITORY_ROOT, output)
+            releases = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
             build_public_site.scan_generated_output(output)
             self.assertEqual(len(articles), 7)
             self.assertEqual(validate_public_site.validate(output), [])
@@ -725,6 +729,7 @@ class PublicSiteTests(unittest.TestCase):
                     "https://github.com/bitworks-io/fast-mlx/commit/"
                     + release["publicCommit"],
                 )
+                self.assertIn(f'href="{release["id"]}/"', page)
             self.assertIn(
                 '<a href="../releases/" aria-current="page">Releases</a>', page
             )
@@ -732,6 +737,286 @@ class PublicSiteTests(unittest.TestCase):
             llms = (output / "llms.txt").read_text(encoding="utf-8")
             self.assertIn("/releases/", llms)
             self.assertIn("/releases/index.json", llms)
+
+    def test_release_detail_pages_are_generated_from_reviewed_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            source = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
+            ledger = (output / "releases/index.html").read_text(encoding="utf-8")
+            sitemap = (output / "sitemap.xml").read_text(encoding="utf-8")
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+
+            for release in source["releases"]:
+                identifier = release["id"]
+                public_path = f"releases/{identifier}/"
+                detail_path = output / public_path / "index.html"
+                self.assertTrue(
+                    detail_path.is_file(),
+                    f"missing reviewed release detail page: {public_path}",
+                )
+                detail = detail_path.read_text(encoding="utf-8")
+                self.assertIn(
+                    "data-release-detail "
+                    f'data-release-id="{identifier}" '
+                    f'data-public-commit="{release["publicCommit"]}"',
+                    detail,
+                )
+                self.assertIn(release["state"].upper(), detail)
+                self.assertIn(
+                    build_public_site.RELEASE_CATEGORY_LABELS[release["category"]],
+                    detail,
+                )
+                self.assertIn(
+                    f'<time datetime="{release["publishedAt"]}">'
+                    f'{release["publishedAt"][:10]}</time>',
+                    detail,
+                )
+                for field in ("title", "summary", "scope"):
+                    self.assertIn(html.escape(release[field]), detail)
+                self.assertIn(
+                    "https://github.com/bitworks-io/fast-mlx/commit/"
+                    + release["publicCommit"],
+                    detail,
+                )
+                for link in release["publicLinks"]:
+                    href = build_public_site.relative_href(
+                        public_path + "index.html", link["path"]
+                    )
+                    self.assertIn(
+                        f'href="{html.escape(href, quote=True)}"', detail
+                    )
+                    self.assertIn(html.escape(link["label"]), detail)
+                self.assertIn(
+                    'href="../">Back to all reviewed releases</a>', detail
+                )
+                self.assertIn(
+                    "This page does not create a new release, measurement, ranking, "
+                    "runtime, model, acquisition, or publication authority.",
+                    detail,
+                )
+                self.assertEqual(detail.count("<h1>"), 1)
+                self.assertNotIn("<script", detail)
+                self.assertIn(f'href="{identifier}/"', ledger)
+                self.assertIn(
+                    "https://bitworks-io.github.io/fast-mlx/" + public_path,
+                    sitemap,
+                )
+                self.assertIn(f"- /{public_path}:", llms)
+
+    def test_validator_rejects_release_detail_contract_drift(self) -> None:
+        identifier = "reviewed-benchmark-detail-permalinks"
+        source = json.loads(
+            (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+        )
+        release = source["releases"][0]
+        public_path = f"releases/{identifier}/"
+        first_link = release["publicLinks"][0]
+        first_href = build_public_site.relative_href(
+            public_path + "index.html", first_link["path"]
+        )
+        mutations = (
+            (
+                f'data-release-id="{identifier}"',
+                'data-release-id="unreviewed-release"',
+                f"release detail '{identifier}' has the wrong id",
+            ),
+            (
+                f'data-public-commit="{release["publicCommit"]}"',
+                'data-public-commit="0000000000000000000000000000000000000000"',
+                f"release detail '{identifier}' has the wrong commit",
+            ),
+            (
+                html.escape(release["summary"]),
+                "Publishes an unreviewed automatic release surface.",
+                f"release detail '{identifier}' has drifted reviewed text",
+            ),
+            (
+                html.escape(release["scope"]),
+                "Runtime and model authority granted as the default.",
+                f"release detail '{identifier}' has drifted reviewed text",
+            ),
+            (
+                "https://github.com/bitworks-io/fast-mlx/commit/"
+                + release["publicCommit"],
+                "https://github.com/bitworks-io/fast-mlx/commit/"
+                + "0" * 40,
+                f"release detail '{identifier}' has the wrong action links",
+            ),
+            (
+                f'<a href="{html.escape(first_href, quote=True)}">'
+                f'{html.escape(first_link["label"])} →</a>',
+                '<a href="../../capabilities/">Changed public link →</a>',
+                f"release detail '{identifier}' has the wrong action links",
+            ),
+            (
+                'href="../">Back to all reviewed releases</a>',
+                'href="../../">Back to all reviewed releases</a>',
+                f"release detail '{identifier}' has the wrong action links",
+            ),
+            (
+                "This page does not create a new release, measurement, ranking, "
+                "runtime, model, acquisition, or publication authority.",
+                "This page creates a new public runtime and benchmark authority.",
+                f"release detail '{identifier}' has drifted reviewed text",
+            ),
+            (
+                '<section class="page-hero shell benchmark-detail release-detail" ',
+                '<section class="page-hero shell benchmark-detail release-detail" hidden ',
+                f"release detail '{identifier}' is hidden",
+            ),
+            (
+                "</body>",
+                '<script src="../../assets/benchmark-explorer.js"></script></body>',
+                f"release detail '{identifier}' must not load scripts",
+            ),
+            (
+                f'<meta property="og:title" content="{release["title"]} — fast-mlx release">',
+                '<meta property="og:title" content="Unreviewed release — fast-mlx release">',
+                f"releases/{identifier}/index.html metadata does not match reviewed contract",
+            ),
+            (
+                "</main>",
+                "<p>This release proves live runtime launchability, model admission, "
+                "and production benchmark authority.</p></main>",
+                f"release detail '{identifier}' does not match the reviewed page seal",
+            ),
+            (
+                "</main>",
+                '<img src="../../assets/favicon.svg" onerror="alert(1)"></main>',
+                f"release detail '{identifier}' does not match the reviewed page seal",
+            ),
+        )
+        for before, after, expected_failure in mutations:
+            with self.subTest(expected_failure=expected_failure), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / "releases" / identifier / "index.html"
+                page = path.read_text(encoding="utf-8")
+                self.assertIn(before, page)
+                path.write_text(page.replace(before, after, 1), encoding="utf-8")
+                self.assertIn(expected_failure, validate_public_site.validate(output))
+
+    def test_validator_rejects_missing_extra_and_symlink_release_details(self) -> None:
+        cases = ("missing", "extra", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                detail = (
+                    output
+                    / "releases/reviewed-benchmark-detail-permalinks/index.html"
+                )
+                if case == "missing":
+                    detail.unlink()
+                    expected = (
+                        "missing required file: "
+                        "releases/reviewed-benchmark-detail-permalinks/index.html"
+                    )
+                elif case == "extra":
+                    extra = output / "releases/unreviewed-release"
+                    extra.mkdir()
+                    (extra / "index.html").write_text(
+                        detail.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    expected = (
+                        "unexpected release route outside reviewed set: "
+                        "unreviewed-release"
+                    )
+                else:
+                    external = root / "external-release-detail.html"
+                    external.write_text(
+                        detail.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    detail.unlink()
+                    detail.symlink_to(external)
+                    expected = (
+                        "releases/reviewed-benchmark-detail-permalinks/index.html "
+                        "must be a regular non-symlink file"
+                    )
+                self.assertIn(expected, validate_public_site.validate(output))
+
+    def test_validator_rejects_joint_release_index_and_detail_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            index_path = output / "releases/index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            release = index["releases"][0]
+            original_summary = release["summary"]
+            changed_summary = original_summary + " Unreviewed automatic authority."
+            release["summary"] = changed_summary
+            index_path.write_text(
+                json.dumps(index, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            for relative in (
+                "releases/index.html",
+                f"releases/{release['id']}/index.html",
+                "releases/feed.atom",
+            ):
+                path = output / relative
+                page = path.read_text(encoding="utf-8")
+                self.assertIn(original_summary, page)
+                path.write_text(
+                    page.replace(original_summary, changed_summary, 1),
+                    encoding="utf-8",
+                )
+
+            self.assertIn(
+                "releases/index.json does not match the reviewed release ledger",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_requires_exact_release_detail_links_from_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            path = output / "releases/index.html"
+            page = path.read_text(encoding="utf-8")
+            path.write_text(
+                page.replace(
+                    'href="reviewed-benchmark-detail-permalinks/"',
+                    'href="../capabilities/"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "release page card 'reviewed-benchmark-detail-permalinks' "
+                "has the wrong release detail link",
+                validate_public_site.validate(output),
+            )
+
+    def test_release_detail_pages_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, first)
+            build_public_site.build_site(REPOSITORY_ROOT, second)
+            releases = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
+
+            for release in releases["releases"]:
+                relative = Path("releases") / release["id"] / "index.html"
+                self.assertEqual(
+                    (first / relative).read_bytes(),
+                    (second / relative).read_bytes(),
+                )
 
     def test_release_atom_feed_is_generated_from_reviewed_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -818,8 +1103,9 @@ class PublicSiteTests(unittest.TestCase):
                     {
                         "rel": "alternate",
                         "type": "text/html",
-                        "href": "https://bitworks-io.github.io/fast-mlx/releases/#release-"
-                        + release["id"],
+                        "href": "https://bitworks-io.github.io/fast-mlx/releases/"
+                        + release["id"]
+                        + "/",
                     },
                 )
                 self.assertEqual(
@@ -850,6 +1136,9 @@ class PublicSiteTests(unittest.TestCase):
             sitemap_text = sitemap_path.read_text(encoding="utf-8")
             sitemap = ET.fromstring(sitemap_text)
             namespace = "http://www.sitemaps.org/schemas/sitemap/0.9"
+            releases = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
             expected_paths = [
                 "",
                 "process/",
@@ -861,6 +1150,10 @@ class PublicSiteTests(unittest.TestCase):
                 "benchmarks/pld-echo-throughput/",
                 "benchmarks/continuous-batch-c2-throughput/",
                 "benchmarks/http-sse-operational-soak/",
+                *[
+                    f"releases/{release['id']}/"
+                    for release in releases["releases"]
+                ],
                 *[article.public_path for article in articles],
             ]
             expected_urls = [
@@ -881,7 +1174,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 17)
+            self.assertEqual(len(expected_urls), 28)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -902,6 +1195,9 @@ class PublicSiteTests(unittest.TestCase):
             output = Path(directory) / "site"
             output.mkdir()
             articles = build_public_site.build_site(REPOSITORY_ROOT, output)
+            releases = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
 
             expected: dict[str, tuple[str, str, str, str | None]] = {
                 "": (
@@ -958,13 +1254,24 @@ class PublicSiteTests(unittest.TestCase):
                     "website",
                     None,
                 ),
-                "research/": (
-                    "Research notes — fast-mlx",
-                    "Dated fast-mlx investigations and measured negative results.",
-                    "website",
-                    None,
-                ),
             }
+            expected.update(
+                {
+                    f"releases/{release['id']}/": (
+                        f"{release['title']} — fast-mlx release",
+                        build_public_site.RELEASE_DETAIL_DESCRIPTION,
+                        "website",
+                        None,
+                    )
+                    for release in releases["releases"]
+                }
+            )
+            expected["research/"] = (
+                "Research notes — fast-mlx",
+                "Dated fast-mlx investigations and measured negative results.",
+                "website",
+                None,
+            )
             expected.update(
                 {
                     article.public_path: (
@@ -977,7 +1284,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 17)
+            self.assertEqual(len(expected), 28)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )
