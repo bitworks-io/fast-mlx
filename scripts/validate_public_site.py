@@ -21,6 +21,7 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN OPENSSH" + " PRIVATE KEY",
     "BEGIN RSA" + " PRIVATE KEY",
 )
+CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelved"}
 
 
 class LinkCollector(html.parser.HTMLParser):
@@ -56,6 +57,19 @@ def resolve_target(site: Path, page: Path, raw_link: str) -> Optional[Path]:
     return target.resolve()
 
 
+def validate_evidence_path(site: Path, raw_path: object, label: str) -> List[str]:
+    if not isinstance(raw_path, str) or not raw_path:
+        return [f"{label} has an invalid evidence path: {raw_path!r}"]
+    target = (site / raw_path / "index.html").resolve()
+    try:
+        target.relative_to(site)
+    except ValueError:
+        return [f"{label} evidence path escapes site root: {raw_path!r}"]
+    if not target.is_file():
+        return [f"{label} evidence page is missing: {raw_path!r}"]
+    return []
+
+
 def validate(site: Path) -> List[str]:
     failures: List[str] = []
     site = site.resolve()
@@ -63,6 +77,8 @@ def validate(site: Path) -> List[str]:
         "index.html",
         "process/index.html",
         "methodology/index.html",
+        "capabilities/index.html",
+        "capabilities/index.json",
         "research/index.html",
         "research/index.json",
         "assets/site.css",
@@ -91,6 +107,94 @@ def validate(site: Path) -> List[str]:
                     path = article.get("path") if isinstance(article, dict) else None
                     if not isinstance(path, str) or not (site / path / "index.html").is_file():
                         failures.append(f"missing article page for index entry: {path!r}")
+
+    capability_index_path = site / "capabilities/index.json"
+    if capability_index_path.is_file():
+        try:
+            capability_index = json.loads(
+                capability_index_path.read_text(encoding="utf-8")
+            )
+        except json.JSONDecodeError as exc:
+            failures.append(f"invalid capabilities/index.json: {exc}")
+        else:
+            if capability_index.get("schemaVersion") != 1:
+                failures.append("capabilities/index.json does not use schemaVersion 1")
+            if capability_index.get("project") != "fast-mlx":
+                failures.append("capabilities/index.json has the wrong project")
+            if capability_index.get("claimBoundary") != "fast-mlx-owned-results-only":
+                failures.append("capabilities/index.json has the wrong claim boundary")
+
+            status_definitions = capability_index.get("statusDefinitions")
+            definition_ids = {
+                item.get("id")
+                for item in status_definitions
+                if isinstance(item, dict)
+            } if isinstance(status_definitions, list) else set()
+            if definition_ids != CAPABILITY_STATUSES:
+                failures.append("capabilities/index.json has incomplete status definitions")
+
+            capabilities = capability_index.get("capabilities")
+            if not isinstance(capabilities, list) or not capabilities:
+                failures.append("capabilities/index.json has no capabilities")
+            else:
+                seen_capability_ids: set[str] = set()
+                for position, capability in enumerate(capabilities):
+                    label = f"capability index entry {position}"
+                    if not isinstance(capability, dict):
+                        failures.append(f"{label} is not an object")
+                        continue
+                    identifier = capability.get("id")
+                    if not isinstance(identifier, str) or identifier in seen_capability_ids:
+                        failures.append(f"{label} has an invalid or duplicate id")
+                    else:
+                        seen_capability_ids.add(identifier)
+                    if capability.get("status") not in CAPABILITY_STATUSES:
+                        failures.append(f"{label} has an unknown status")
+                    evidence = capability.get("evidence")
+                    if not isinstance(evidence, list) or not evidence:
+                        failures.append(f"{label} has no evidence")
+                    else:
+                        for evidence_position, record in enumerate(evidence):
+                            raw_path = record.get("path") if isinstance(record, dict) else None
+                            failures.extend(
+                                validate_evidence_path(
+                                    site,
+                                    raw_path,
+                                    f"{label} evidence {evidence_position}",
+                                )
+                            )
+
+            highlights = capability_index.get("performanceHighlights")
+            if not isinstance(highlights, list) or not highlights:
+                failures.append("capabilities/index.json has no performance highlights")
+            else:
+                seen_highlight_ids: set[str] = set()
+                for position, highlight in enumerate(highlights):
+                    label = f"performance highlight entry {position}"
+                    if not isinstance(highlight, dict):
+                        failures.append(f"{label} is not an object")
+                        continue
+                    identifier = highlight.get("id")
+                    if not isinstance(identifier, str) or identifier in seen_highlight_ids:
+                        failures.append(f"{label} has an invalid or duplicate id")
+                    else:
+                        seen_highlight_ids.add(identifier)
+                    if highlight.get("decision") not in {"promoted-scoped", "shelved"}:
+                        failures.append(f"{label} has an unknown decision")
+                    for key in (
+                        "metric",
+                        "label",
+                        "model",
+                        "hardware",
+                        "workload",
+                        "date",
+                        "caveat",
+                    ):
+                        if not isinstance(highlight.get(key), str) or not highlight[key].strip():
+                            failures.append(f"{label} has an empty {key}")
+                    evidence = highlight.get("evidence")
+                    raw_path = evidence.get("path") if isinstance(evidence, dict) else None
+                    failures.extend(validate_evidence_path(site, raw_path, label))
 
     for path in site.rglob("*"):
         if path.is_symlink():

@@ -12,6 +12,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
 - the pinned vendored MLX Swift LM fork with its upstream license and provenance;
 - public repository documentation and contribution controls;
 - the static website source and its deterministic builder;
+- the status-aware capability inventory in `site/capabilities.json`, whose evidence slugs must
+  resolve to reviewed published notes;
 - only the research notes listed in `site/publications.json`; and
 - GitHub Actions that validate source/site boundaries and deploy GitHub Pages.
 
@@ -36,9 +38,11 @@ research → design → test-first implementation → verification → review
 ```
 
 The exporter refuses files outside its manifest. The site builder refuses unlisted articles and
-known private markers. A release owner reviews the generated diff and secret scan before creating a
-public commit. Failed or incomplete measurements may be retained privately, but they cannot become
-published benchmark claims.
+known private markers. Capability cards require an explicit state and scope. Numeric highlights also
+require the exact model, hardware, workload, date, decision, caveat, and one published evidence slug;
+arbitrary source or local artifact paths are not accepted. A release owner reviews the generated diff
+and secret scan before creating a public commit. Failed or incomplete measurements may be retained
+privately, but they cannot become published benchmark claims.
 
 ## Creating a candidate projection
 

@@ -3,7 +3,8 @@
 **Whitepaper themes:** Building a high-performance MLX inference engine in Swift; Rapid
 research integration — the flywheel
 
-At one request, our fastest exact path was prompt-lookup decoding. Qwen3-32B-4bit generated
+On an Apple M5 Max at one request, our fastest exact path was prompt-lookup decoding.
+Qwen3-32B-4bit generated
 28.30 tokens per second with PLD, versus 26.72 through the new continuous-batching runtime.
 If we had optimized the request in front of us, the decision would have been easy: keep PLD.
 

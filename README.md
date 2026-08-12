@@ -4,6 +4,10 @@
 It uses Apple's MLX framework to test inference ideas, measure their real quality and performance
 effects, and keep only the capabilities that survive explicit correctness and operational gates.
 
+**Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
+[capabilities and evidence](https://bitworks-io.github.io/fast-mlx/capabilities/) ·
+[research notes](https://bitworks-io.github.io/fast-mlx/research/)
+
 The project is built around a guarded improvement loop:
 
 1. research a concrete inference technique;

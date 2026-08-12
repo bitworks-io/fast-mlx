@@ -51,6 +51,7 @@ REQUIRED_PATHS: Tuple[str, ...] = (
     "PUBLICATION.md",
     ".github/workflows/pages.yml",
     ".github/workflows/quality.yml",
+    "site/capabilities.json",
     "site/publications.json",
     "scripts/build_public_site.py",
     "scripts/validate_public_site.py",

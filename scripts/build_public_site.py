@@ -38,6 +38,35 @@ ORDERED_ITEM = re.compile(r"^\d+\.\s+(.+)$")
 HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 CODE_SPAN = re.compile(r"`([^`]+)`")
+SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+WHITEPAPER_THEME = re.compile(
+    r"^(?:>\s*)?\*\*Whitepaper themes?:\*\*\s*(.*)$", re.IGNORECASE
+)
+
+CAPABILITY_STATUS_DEFINITIONS: Tuple[Tuple[str, str, str], ...] = (
+    (
+        "implemented",
+        "Implemented",
+        "The public source and regression contracts exist; this is not automatically a supported default.",
+    ),
+    (
+        "promoted-scoped",
+        "Promoted · scoped",
+        "A bounded route or result crossed its stated evidence gates only for the named scope.",
+    ),
+    (
+        "experimental",
+        "Experimental",
+        "The surface is active research and has not earned a production support claim.",
+    ),
+    (
+        "shelved",
+        "Shelved",
+        "The dated result remains useful evidence, but the capability is not the current production route.",
+    ),
+)
+CAPABILITY_STATUSES = {item[0] for item in CAPABILITY_STATUS_DEFINITIONS}
+HIGHLIGHT_DECISIONS = {"promoted-scoped", "shelved"}
 
 
 @dataclass(frozen=True)
@@ -135,6 +164,29 @@ def plain_text(markdown: str) -> str:
     return value
 
 
+def find_whitepaper_theme_block(lines: Sequence[str]) -> Optional[Tuple[int, int, str]]:
+    """Return the half-open line span and joined value for a wrapped theme paragraph."""
+
+    for start, line in enumerate(lines):
+        match = WHITEPAPER_THEME.match(line.strip())
+        if not match:
+            continue
+        values = [match.group(1).strip()] if match.group(1).strip() else []
+        end = start + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if (
+                not stripped
+                or stripped.startswith(("#", ">", "- ", "* ", "```", "|"))
+                or re.match(r"^\d+\.\s", stripped)
+            ):
+                break
+            values.append(stripped)
+            end += 1
+        return start, end, plain_text(" ".join(values))
+    return None
+
+
 def infer_metadata(source: Path, text: str) -> Tuple[str, str, str, str, str]:
     metadata, body = strip_front_matter(text)
     title = metadata.get("title", "")
@@ -150,20 +202,18 @@ def infer_metadata(source: Path, text: str) -> Tuple[str, str, str, str, str]:
     except ValueError:
         fail(f"article has invalid ISO date: {source}: {date}")
 
+    lines = body.splitlines()
+    theme_block = find_whitepaper_theme_block(lines)
     theme = metadata.get("whitepaper_theme", "")
     if not theme:
-        theme_match = re.search(
-            r"^(?:>\s*)?\*\*Whitepaper themes?:\*\*\s*(.+)$",
-            body,
-            flags=re.MULTILINE | re.IGNORECASE,
-        )
-        theme = plain_text(theme_match.group(1)) if theme_match else "Inference research"
+        theme = theme_block[2] if theme_block else "Inference research"
 
-    lines = body.splitlines()
     paragraphs: List[str] = []
     current: List[str] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         stripped = line.strip()
+        if theme_block and theme_block[0] <= index < theme_block[1]:
+            continue
         if not stripped:
             if current:
                 paragraphs.append(" ".join(current))
@@ -176,8 +226,6 @@ def infer_metadata(source: Path, text: str) -> Tuple[str, str, str, str, str]:
             continue
         if re.match(r"^\d+\.\s", stripped):
             continue
-        if "Whitepaper theme" in stripped:
-            continue
         current.append(stripped)
     if current:
         paragraphs.append(" ".join(current))
@@ -187,6 +235,138 @@ def infer_metadata(source: Path, text: str) -> Tuple[str, str, str, str, str]:
     if len(summary) > 220:
         summary = summary[:217].rsplit(" ", 1)[0] + "…"
     return title, date, theme, summary, body
+
+
+def require_exact_keys(value: object, required: set[str], label: str) -> Dict[str, object]:
+    if not isinstance(value, dict):
+        fail(f"{label} is not an object")
+    keys = set(value)
+    if keys != required:
+        missing = sorted(required - keys)
+        extra = sorted(keys - required)
+        fail(f"{label} keys differ from schema; missing={missing} extra={extra}")
+    return value
+
+
+def require_text(entry: Dict[str, object], key: str, label: str) -> str:
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
+        fail(f"{label} has an empty or non-string {key}")
+    return value.strip()
+
+
+def require_iso_date(entry: Dict[str, object], key: str, label: str) -> str:
+    value = require_text(entry, key, label)
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:
+        fail(f"{label} {key} is not an ISO date")
+    return value
+
+
+def load_capability_catalog(
+    repository_root: Path, published_slugs: Iterable[str]
+) -> Dict[str, object]:
+    """Load the strict public capability contract and bind it to reviewed article slugs."""
+
+    manifest_path = repository_root / "site/capabilities.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        fail("site/capabilities.json is missing, not a file, or a symlink")
+    catalog = require_exact_keys(
+        read_json(manifest_path),
+        {
+            "schemaVersion",
+            "policy",
+            "claimBoundary",
+            "updatedAt",
+            "capabilities",
+            "performanceHighlights",
+        },
+        "site/capabilities.json",
+    )
+    if catalog.get("schemaVersion") != 1:
+        fail("site/capabilities.json must use schemaVersion 1")
+    if catalog.get("policy") != "fast-mlx-owned-results-only":
+        fail("capability policy must remain fast-mlx-owned-results-only")
+    if catalog.get("claimBoundary") != "fast-mlx-owned-results-only":
+        fail("capability claim boundary must remain fast-mlx-owned-results-only")
+    require_iso_date(catalog, "updatedAt", "site/capabilities.json")
+
+    serialized = json.dumps(catalog, ensure_ascii=False)
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in serialized.casefold():
+            fail(f"capability catalog contains private marker {marker!r}")
+
+    published = set(published_slugs)
+    capabilities = catalog.get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities:
+        fail("capability catalog must contain at least one capability")
+    seen_ids: set[str] = set()
+    for index, raw_entry in enumerate(capabilities):
+        label = f"capability entry {index}"
+        entry = require_exact_keys(
+            raw_entry,
+            {"id", "name", "status", "summary", "scope", "evidenceSlugs"},
+            label,
+        )
+        identifier = require_text(entry, "id", label)
+        if not SLUG.fullmatch(identifier) or identifier in seen_ids:
+            fail(f"{label} has an invalid or duplicate id")
+        seen_ids.add(identifier)
+        require_text(entry, "name", label)
+        require_text(entry, "summary", label)
+        require_text(entry, "scope", label)
+        status = require_text(entry, "status", label)
+        if status not in CAPABILITY_STATUSES:
+            fail(f"{label} has unknown status {status!r}")
+        evidence_slugs = entry.get("evidenceSlugs")
+        if (
+            not isinstance(evidence_slugs, list)
+            or not evidence_slugs
+            or any(not isinstance(slug, str) or not SLUG.fullmatch(slug) for slug in evidence_slugs)
+            or len(set(evidence_slugs)) != len(evidence_slugs)
+        ):
+            fail(f"{label} has invalid evidenceSlugs")
+        unavailable = sorted(set(evidence_slugs) - published)
+        if unavailable:
+            fail(f"{label} cites unpublished evidence: {unavailable}")
+
+    highlights = catalog.get("performanceHighlights")
+    if not isinstance(highlights, list) or not highlights:
+        fail("capability catalog must contain at least one performance highlight")
+    seen_highlight_ids: set[str] = set()
+    for index, raw_entry in enumerate(highlights):
+        label = f"performance highlight {index}"
+        entry = require_exact_keys(
+            raw_entry,
+            {
+                "id",
+                "metric",
+                "label",
+                "model",
+                "hardware",
+                "workload",
+                "date",
+                "decision",
+                "caveat",
+                "evidenceSlug",
+            },
+            label,
+        )
+        identifier = require_text(entry, "id", label)
+        if not SLUG.fullmatch(identifier) or identifier in seen_highlight_ids:
+            fail(f"{label} has an invalid or duplicate id")
+        seen_highlight_ids.add(identifier)
+        for key in ("metric", "label", "model", "hardware", "workload", "caveat"):
+            require_text(entry, key, label)
+        require_iso_date(entry, "date", label)
+        decision = require_text(entry, "decision", label)
+        if decision not in HIGHLIGHT_DECISIONS:
+            fail(f"{label} has unknown decision {decision!r}")
+        evidence_slug = require_text(entry, "evidenceSlug", label)
+        if not SLUG.fullmatch(evidence_slug) or evidence_slug not in published:
+            fail(f"{label} cites unpublished evidence {evidence_slug!r}")
+    return catalog
 
 
 def load_articles(repository_root: Path) -> List[Article]:
@@ -337,6 +517,7 @@ def heading_id(value: str) -> str:
 
 def render_markdown(body: str, article_routes: Dict[str, str], current_file: str) -> str:
     lines = body.splitlines()
+    theme_block = find_whitepaper_theme_block(lines)
     inline = InlineRenderer(article_routes, current_file)
     output: List[str] = []
     paragraph: List[str] = []
@@ -351,6 +532,14 @@ def render_markdown(body: str, article_routes: Dict[str, str], current_file: str
     while index < len(lines):
         line = lines[index]
         stripped = line.strip()
+
+        if theme_block and index == theme_block[0]:
+            flush_paragraph()
+            output.append(
+                f'<p class="eyebrow">{inline("**Whitepaper themes:** " + theme_block[2])}</p>'
+            )
+            index = theme_block[1]
+            continue
         if not stripped:
             flush_paragraph()
             index += 1
@@ -385,13 +574,6 @@ def render_markdown(body: str, article_routes: Dict[str, str], current_file: str
             output.append(
                 f'<h{level} id="{heading_id(title)}">{inline(title)}</h{level}>'
             )
-            index += 1
-            continue
-
-        if re.match(r"^(?:>\s*)?\*\*Whitepaper themes?:\*\*", stripped, re.IGNORECASE):
-            flush_paragraph()
-            value = stripped.lstrip("> ")
-            output.append(f'<p class="eyebrow">{inline(value)}</p>')
             index += 1
             continue
 
@@ -454,12 +636,29 @@ def render_markdown(body: str, article_routes: Dict[str, str], current_file: str
     return "\n".join(output)
 
 
-def render_template(template: str, title: str, description: str, root: str, body: str) -> str:
+def render_template(
+    template: str,
+    title: str,
+    description: str,
+    root: str,
+    body: str,
+    current_page: str = "",
+) -> str:
+    nav_root = html.escape(root, quote=True)
+
+    def nav_link(page: str, label: str) -> str:
+        current = ' aria-current="page"' if current_page == page else ""
+        return f'<a href="{nav_root}{page}/"{current}>{label}</a>'
+
     replacements = {
         "{{title}}": html.escape(title),
         "{{description}}": html.escape(description, quote=True),
         "{{root}}": root,
         "{{body}}": body.replace("{{root}}", root),
+        "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
+        "{{process_nav}}": nav_link("process", "The loop"),
+        "{{methodology_nav}}": nav_link("methodology", "Methodology"),
+        "{{research_nav}}": nav_link("research", "Research notes"),
     }
     rendered = template
     for token, value in replacements.items():
@@ -475,8 +674,131 @@ def write_page(output: Path, relative_file: str, contents: str) -> None:
     destination.write_text(contents.rstrip() + "\n", encoding="utf-8")
 
 
+def render_capability_catalog(
+    catalog: Dict[str, object], articles: Sequence[Article]
+) -> Tuple[str, Dict[str, object]]:
+    article_by_slug = {article.slug: article for article in articles}
+
+    def evidence(slug: str) -> Dict[str, str]:
+        article = article_by_slug[slug]
+        return {
+            "slug": article.slug,
+            "title": article.title,
+            "path": article.public_path,
+            "reviewedAt": article.reviewed_at,
+        }
+
+    capabilities: List[Dict[str, object]] = []
+    for raw_entry in catalog["capabilities"]:
+        entry = dict(raw_entry)
+        evidence_slugs = entry.pop("evidenceSlugs")
+        entry["evidence"] = [evidence(slug) for slug in evidence_slugs]
+        capabilities.append(entry)
+
+    highlights: List[Dict[str, object]] = []
+    for raw_entry in catalog["performanceHighlights"]:
+        entry = dict(raw_entry)
+        evidence_slug = entry.pop("evidenceSlug")
+        entry["evidence"] = evidence(evidence_slug)
+        highlights.append(entry)
+
+    status_definitions = [
+        {"id": identifier, "label": label, "description": description}
+        for identifier, label, description in CAPABILITY_STATUS_DEFINITIONS
+    ]
+    public_index: Dict[str, object] = {
+        "schemaVersion": 1,
+        "project": "fast-mlx",
+        "claimBoundary": catalog["claimBoundary"],
+        "updatedAt": catalog["updatedAt"],
+        "statusDefinitions": status_definitions,
+        "capabilities": capabilities,
+        "performanceHighlights": highlights,
+    }
+
+    status_by_id = {item[0]: item[1] for item in CAPABILITY_STATUS_DEFINITIONS}
+    body: List[str] = [
+        '<section class="page-hero shell capability-hero">',
+        '<p class="eyebrow">Capabilities &amp; evidence</p>',
+        '<h1>See what exists—and what each claim actually covers.</h1>',
+        '<p class="lede">A generated inventory of fast-mlx source, scoped decisions, and measured results. Every evidence link resolves to a reviewed public note; source presence alone is never treated as production support.</p>',
+        '<div class="hero-actions">',
+        '<a class="button primary" href="https://github.com/bitworks-io/fast-mlx#first-run" rel="noreferrer">Run the scripted server</a>',
+        '<a class="button secondary" href="https://github.com/bitworks-io/fast-mlx" rel="noreferrer">Inspect the source</a>',
+        '</div>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="measured-heading">',
+        '<div class="section-heading"><p class="eyebrow">Measured highlights</p><h2 id="measured-heading">Useful numbers, attached to their boundaries.</h2><p class="section-intro">These are dated fast-mlx results—not cross-model, cross-hardware, or future-version guarantees.</p></div>',
+        '<div class="evidence-grid">',
+    ]
+    for highlight in highlights:
+        evidence_record = highlight["evidence"]
+        href = relative_href("capabilities/index.html", evidence_record["path"])
+        body.extend(
+            [
+                '<article class="evidence-card">',
+                f'<div class="card-topline"><span class="status-badge status-{html.escape(highlight["decision"])}">{html.escape(status_by_id[highlight["decision"]].upper())}</span><time datetime="{html.escape(highlight["date"], quote=True)}">{html.escape(highlight["date"])}</time></div>',
+                f'<div class="metric">{html.escape(highlight["metric"])}</div>',
+                f'<h3>{html.escape(highlight["label"])}</h3>',
+                '<dl class="evidence-context">',
+                f'<div><dt>Model</dt><dd>{html.escape(highlight["model"])}</dd></div>',
+                f'<div><dt>Hardware</dt><dd>{html.escape(highlight["hardware"])}</dd></div>',
+                f'<div><dt>Workload</dt><dd>{html.escape(highlight["workload"])}</dd></div>',
+                '</dl>',
+                f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(highlight["caveat"])}</p>',
+                f'<a class="text-link" href="{html.escape(href, quote=True)}">Read the measured note →</a>',
+                '</article>',
+            ]
+        )
+    body.extend(
+        [
+            '</div>',
+            '</section>',
+            '<section class="section shell" aria-labelledby="inventory-heading">',
+            '<div class="section-heading"><p class="eyebrow">Current inventory</p><h2 id="inventory-heading">Capabilities carry state, scope, and evidence.</h2></div>',
+            '<ul class="status-legend" aria-label="Capability status definitions">',
+        ]
+    )
+    for definition in status_definitions:
+        body.append(
+            f'<li><span class="status-badge status-{html.escape(definition["id"])}">{html.escape(definition["label"].upper())}</span><p>{html.escape(definition["description"])}</p></li>'
+        )
+    body.extend(['</ul>', '<div class="capability-grid">'])
+    for capability in capabilities:
+        body.extend(
+            [
+                '<article class="capability-card">',
+                f'<span class="status-badge status-{html.escape(capability["status"])}">{html.escape(status_by_id[capability["status"]].upper())}</span>',
+                f'<h3>{html.escape(capability["name"])}</h3>',
+                f'<p>{html.escape(capability["summary"])}</p>',
+                f'<p class="scope-note"><strong>Scope:</strong> {html.escape(capability["scope"])}</p>',
+                '<div class="evidence-links" aria-label="Published evidence">',
+            ]
+        )
+        for record in capability["evidence"]:
+            href = relative_href("capabilities/index.html", record["path"])
+            body.append(
+                f'<a href="{html.escape(href, quote=True)}">{html.escape(record["title"])} →</a>'
+            )
+        body.extend(['</div>', '</article>'])
+    body.extend(
+        [
+            '</div>',
+            '</section>',
+            '<section class="section shell callout capability-callout" aria-labelledby="machine-heading">',
+            '<p class="eyebrow">Machine-readable contract</p>',
+            '<h2 id="machine-heading">Agents can inspect the same bounded inventory.</h2>',
+            '<p>The generated JSON mirrors this page and includes resolved public evidence paths. The build refuses unknown states, missing scope, and unpublished evidence slugs.</p>',
+            '<a class="text-link" href="index.json">Open capabilities/index.json →</a>',
+            '</section>',
+        ]
+    )
+    return "\n".join(body), public_index
+
+
 def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
+    catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
     template = (repository_root / "site/templates/base.html").read_text(encoding="utf-8")
     assets = repository_root / "site/assets"
     validate_asset_tree(assets)
@@ -511,8 +833,27 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             f"{name}/index.html",
-            render_template(template, title, description, "../", fragment),
+            render_template(template, title, description, "../", fragment, name),
         )
+
+    capability_body, capability_index = render_capability_catalog(catalog, articles)
+    write_page(
+        output,
+        "capabilities/index.html",
+        render_template(
+            template,
+            "Capabilities & evidence — fast-mlx",
+            "A status-aware inventory of fast-mlx features and scoped measured results.",
+            "../",
+            capability_body,
+            "capabilities",
+        ),
+    )
+    write_page(
+        output,
+        "capabilities/index.json",
+        json.dumps(capability_index, indent=2, ensure_ascii=False),
+    )
 
     cards = [
         '<section class="page-hero shell"><p class="eyebrow">Research notes</p>'
@@ -539,6 +880,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "Dated fast-mlx investigations and measured negative results.",
             "../",
             "\n".join(cards),
+            "research",
         ),
     )
 
@@ -564,6 +906,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
                 article.summary,
                 "../../",
                 article_body,
+                "research",
             ),
         )
 
@@ -592,6 +935,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "## Core pages\n"
         "- /process/: research-to-publication loop\n"
         "- /methodology/: correctness and claim boundaries\n"
+        "- /capabilities/: status-aware feature and evidence inventory\n"
+        "- /capabilities/index.json: machine-readable capability contract\n"
         "- /research/: dated technical notes\n\n"
         "## Published notes\n"
         + "\n".join(f"- /{article.public_path}: {article.title}" for article in articles),
