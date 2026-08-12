@@ -115,6 +115,8 @@ h3 { line-height: 1.2; letter-spacing: -.02em; }
 .status-promoted-scoped { color: var(--accent); border-color: rgba(185, 255, 101, .55); background: rgba(185, 255, 101, .08); }
 .status-experimental { color: var(--warning); border-color: rgba(255, 211, 122, .55); background: rgba(255, 211, 122, .08); }
 .status-shelved { color: #c8b8dc; border-color: rgba(200, 184, 220, .46); background: rgba(200, 184, 220, .08); }
+.status-released { color: var(--accent-2); border-color: rgba(110, 231, 193, .55); background: rgba(110, 231, 193, .08); }
+.status-gated { color: var(--warning); border-color: rgba(255, 211, 122, .62); background: rgba(255, 211, 122, .1); }
 .status-legend { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; margin-bottom: 2rem; padding: 0; list-style: none; }
 .status-legend > li { padding: 1rem; border-top: 1px solid var(--line); }
 .status-legend p { margin: .7rem 0 0; color: var(--muted); font-size: .82rem; line-height: 1.45; }
@@ -124,6 +126,60 @@ h3 { line-height: 1.2; letter-spacing: -.02em; }
 .evidence-links { display: grid; gap: .35rem; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 .evidence-links a { color: var(--accent-2); font-size: .88rem; text-underline-offset: 3px; }
 .capability-callout { margin-top: 2rem; }
+
+.release-hero { padding-bottom: 4rem; }
+.release-boundary { border-top-color: rgba(255, 211, 122, .42); background: linear-gradient(180deg, rgba(255, 211, 122, .045), transparent 72%); }
+.release-boundary .section-heading { max-width: 860px; }
+.release-boundary .status-badge { margin-bottom: .95rem; }
+.release-list { display: grid; gap: 1rem; margin: 0; padding: 0; list-style: none; counter-reset: release; }
+.release-list > li { counter-increment: release; }
+.release-card {
+  position: relative;
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+  padding: 1.35rem 1.35rem 1.45rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(13, 26, 23, .9);
+}
+.release-card::before {
+  content: counter(release, decimal-leading-zero);
+  position: absolute;
+  top: 1.35rem;
+  right: 1.35rem;
+  color: rgba(168, 183, 170, .34);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .78rem;
+  font-weight: 800;
+}
+.release-card .card-topline { padding-right: 3.2rem; }
+.release-card h3 { max-width: 820px; margin: .15rem 0 0; font-size: clamp(1.45rem, 2.8vw, 2.35rem); }
+.release-card > p:not(.release-category):not(.scope-note) { max-width: 820px; margin: 0; color: #d3ddd3; }
+.release-category {
+  width: fit-content;
+  margin: .2rem 0 0;
+  padding: .28rem .5rem;
+  border: 1px solid rgba(110, 231, 193, .32);
+  border-radius: 6px;
+  color: var(--accent-2);
+  background: rgba(110, 231, 193, .07);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .7rem;
+  font-weight: 800;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.release-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem 1rem;
+  align-items: center;
+  padding-top: .95rem;
+  border-top: 1px solid var(--line);
+}
+.release-links a { color: var(--accent-2); font-size: .9rem; text-underline-offset: 3px; }
+.release-links .text-link { color: var(--accent); }
 
 .research-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin-top: 2rem; }
 .note-card { display: flex; flex-direction: column; min-height: 300px; padding: 1.35rem; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
@@ -262,6 +318,10 @@ html.benchmark-enhanced [data-benchmark-reset]:focus-visible {
   .footer-grid { grid-template-columns: 1fr; }
   .legend div { grid-template-columns: 1fr; gap: .25rem; }
   .capability-grid, .status-legend { grid-template-columns: 1fr; }
+  .release-card { padding: 1rem; }
+  .release-card::before { position: static; order: -2; }
+  .release-card .card-topline { align-items: flex-start; flex-direction: column; padding-right: 0; }
+  .release-links { display: grid; align-items: start; }
   html.benchmark-enhanced .benchmark-controls,
   html.benchmark-enhanced [data-benchmark-controls] {
     grid-template-columns: 1fr;

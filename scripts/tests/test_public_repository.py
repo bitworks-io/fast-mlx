@@ -27,6 +27,12 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
 
         self.assertIn("missing required public file: site/capabilities.json", failures)
 
+    def test_release_ledger_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        self.assertIn("missing required public file: site/releases.json", failures)
+
     def test_benchmark_runtime_fixture_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             failures = validate_public_repository.validate(Path(directory))
@@ -83,7 +89,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
                     failures,
                 )
 
-    def test_public_manifest_exports_license_notice_and_validator_test(self) -> None:
+    def test_public_manifest_exports_license_notice_release_ledger_and_validator_test(self) -> None:
         manifest_path = REPOSITORY_ROOT / "public/public-repository.json"
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -92,20 +98,30 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
                 for entry in manifest["files"]
                 if isinstance(entry, dict) and isinstance(entry.get("destination"), str)
             }
+            site_tree_exports_releases = any(
+                entry.get("source") == "site"
+                and entry.get("destination") == "site"
+                and "releases.json" not in entry.get("exclude", [])
+                for entry in manifest.get("trees", [])
+                if isinstance(entry, dict)
+            )
         else:
             destinations = {
                 path
                 for path in (
                     "LICENSE",
                     "NOTICE",
+                    "site/releases.json",
                     "scripts/tests/test_public_repository.py",
                     "scripts/tests/benchmark_explorer_node_test.js",
                 )
                 if (REPOSITORY_ROOT / path).is_file()
             }
+            site_tree_exports_releases = "site/releases.json" in destinations
 
         self.assertIn("LICENSE", destinations)
         self.assertIn("NOTICE", destinations)
+        self.assertTrue(site_tree_exports_releases)
         self.assertIn("scripts/tests/test_public_repository.py", destinations)
         self.assertIn("scripts/tests/benchmark_explorer_node_test.js", destinations)
 

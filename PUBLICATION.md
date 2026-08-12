@@ -14,6 +14,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
 - the static website source and its deterministic builder;
 - the status-aware capability inventory in `site/capabilities.json`, whose evidence slugs must
   resolve to reviewed published notes;
+- the reviewed public release ledger in `site/releases.json`, which generates `/releases/` and
+  `/releases/index.json` for milestone discovery only;
 - only the research notes listed in `site/publications.json`; and
 - GitHub Actions that validate source/site boundaries and deploy GitHub Pages.
 
@@ -49,6 +51,11 @@ change visibility only: they do not execute benchmarks, convert units, aggregate
 configurations, or introduce a second machine-readable contract. Site validation requires every
 rendered result to keep its exact metric, model, hardware, workload, date, decision, caveat, and
 published evidence link attached.
+
+The release ledger is also read-only site data. Its entries point readers to public commits and
+reviewed surfaces, and its current-boundary entry remains explicitly gated. It does not approve a
+model, launch a runtime, change public Apache-2.0 source boundaries, or create benchmark evidence
+beyond the reviewed note and capability manifests.
 
 GitHub Pages is downstream of the complete `Public source quality` workflow. It accepts only a
 successful `push` run for `main`, checks out the same validated commit, and exposes no independent

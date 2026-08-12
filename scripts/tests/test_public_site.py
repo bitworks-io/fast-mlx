@@ -55,6 +55,58 @@ class PublicSiteTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
+    @staticmethod
+    def release_manifest() -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "project": "fast-mlx",
+            "policy": "reviewed-public-releases-only",
+            "claimBoundary": "fast-mlx-owned-results-only",
+            "updatedAt": "2026-08-11",
+            "currentBoundary": {
+                "id": "runtime-model-promotion",
+                "label": "Runtime and model promotion",
+                "state": "gated",
+                "summary": "Reviewed source does not grant runtime authority.",
+                "evidence": {
+                    "label": "Read the methodology",
+                    "path": "methodology/",
+                },
+            },
+            "releases": [
+                {
+                    "id": "newer-release",
+                    "title": "Newer reviewed release",
+                    "publishedAt": "2026-08-11T22:00:00-05:00",
+                    "category": "product",
+                    "state": "released",
+                    "summary": "Adds a bounded public surface.",
+                    "scope": "No runtime or benchmark authority changes.",
+                    "publicCommit": "1" * 40,
+                    "publicLinks": [
+                        {"label": "Open capabilities", "path": "capabilities/"}
+                    ],
+                },
+                {
+                    "id": "older-release",
+                    "title": "Older reviewed release",
+                    "publishedAt": "2026-08-11T21:00:00-05:00",
+                    "category": "foundation",
+                    "state": "released",
+                    "summary": "Establishes the public foundation.",
+                    "scope": "Only reviewed public source is included.",
+                    "publicCommit": "2" * 40,
+                    "publicLinks": [],
+                },
+            ],
+        }
+
+    @staticmethod
+    def write_release_manifest(root: Path, manifest: dict[str, object]) -> None:
+        path = root / "site/releases.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
     def test_manifest_is_explicit_and_bounded(self) -> None:
         manifest = json.loads(
             (REPOSITORY_ROOT / "site/publications.json").read_text(encoding="utf-8")
@@ -79,6 +131,92 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(catalog["claimBoundary"], "fast-mlx-owned-results-only")
         self.assertEqual(len(catalog["capabilities"]), 6)
         self.assertEqual(len(catalog["performanceHighlights"]), 3)
+
+    def test_release_manifest_is_explicit_newest_first_and_non_circular(self) -> None:
+        catalog = build_public_site.load_release_catalog(REPOSITORY_ROOT)
+        self.assertEqual(catalog["schemaVersion"], 1)
+        self.assertEqual(catalog["project"], "fast-mlx")
+        self.assertEqual(catalog["policy"], "reviewed-public-releases-only")
+        self.assertEqual(catalog["claimBoundary"], "fast-mlx-owned-results-only")
+        self.assertEqual(catalog["currentBoundary"]["state"], "gated")
+        commits = [entry["publicCommit"] for entry in catalog["releases"]]
+        self.assertEqual(
+            commits,
+            [
+                "555514986cdd17ca921c9d9607a92d6248734fdd",
+                "3894c324dc69baf428b9fe54d1770a234467dfbd",
+                "a39393451848eedc62e035ddee5ef00d0364ca62",
+                "a701708fe55311b7ea61db957bf37573f5530ce4",
+                "51a99af2b11f42e036f88346a4b8873b71f675d5",
+            ],
+        )
+        self.assertEqual(len(commits), len(set(commits)))
+
+    def test_invalid_release_contract_is_refused(self) -> None:
+        mutations = {
+            "unknown top-level key": lambda manifest: manifest.update({"private": True}),
+            "wrong project": lambda manifest: manifest.update({"project": "other"}),
+            "wrong policy": lambda manifest: manifest.update({"policy": "automatic"}),
+            "wrong claim boundary": lambda manifest: manifest.update(
+                {"claimBoundary": "all-results"}
+            ),
+            "unreviewed boundary state": lambda manifest: manifest["currentBoundary"].update(
+                {"state": "promoted"}
+            ),
+            "unknown release category": lambda manifest: manifest["releases"][0].update(
+                {"category": "benchmark-winner"}
+            ),
+            "unreleased release": lambda manifest: manifest["releases"][0].update(
+                {"state": "draft"}
+            ),
+            "short commit": lambda manifest: manifest["releases"][0].update(
+                {"publicCommit": "deadbeef"}
+            ),
+            "naive timestamp": lambda manifest: manifest["releases"][0].update(
+                {"publishedAt": "2026-08-11T22:00:00"}
+            ),
+            "external public path": lambda manifest: manifest["releases"][0][
+                "publicLinks"
+            ][0].update({"path": "https://example.invalid/private"}),
+            "traversing public path": lambda manifest: manifest["releases"][0][
+                "publicLinks"
+            ][0].update({"path": ".." + "/" + "private" + "/"}),
+            "private marker": lambda manifest: manifest["releases"][0].update(
+                {"scope": "/" + "Users" + "/example/private"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = self.release_manifest()
+                mutate(manifest)
+                self.write_release_manifest(root, manifest)
+                with self.assertRaises(SystemExit):
+                    build_public_site.load_release_catalog(root)
+
+    def test_duplicate_or_out_of_order_release_contract_is_refused(self) -> None:
+        mutations = {
+            "duplicate id": lambda manifest: manifest["releases"][1].update(
+                {"id": manifest["releases"][0]["id"]}
+            ),
+            "duplicate commit": lambda manifest: manifest["releases"][1].update(
+                {"publicCommit": manifest["releases"][0]["publicCommit"]}
+            ),
+            "duplicate link": lambda manifest: manifest["releases"][0][
+                "publicLinks"
+            ].append(dict(manifest["releases"][0]["publicLinks"][0])),
+            "not newest first": lambda manifest: manifest["releases"][1].update(
+                {"publishedAt": "2026-08-11T23:00:00-05:00"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = self.release_manifest()
+                mutate(manifest)
+                self.write_release_manifest(root, manifest)
+                with self.assertRaises(SystemExit):
+                    build_public_site.load_release_catalog(root)
 
     def test_unpublished_capability_evidence_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -191,6 +329,122 @@ class PublicSiteTests(unittest.TestCase):
                     f"missing required file: {missing}",
                     validate_public_site.validate(output),
                 )
+
+    def test_release_surface_is_generated_from_reviewed_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            source = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
+            public_index = json.loads(
+                (output / "releases/index.json").read_text(encoding="utf-8")
+            )
+            page = (output / "releases/index.html").read_text(encoding="utf-8")
+
+            self.assertEqual(public_index["schemaVersion"], 1)
+            self.assertEqual(public_index["project"], "fast-mlx")
+            self.assertEqual(
+                public_index["policy"], "reviewed-public-releases-only"
+            )
+            self.assertEqual(
+                public_index["claimBoundary"], "fast-mlx-owned-results-only"
+            )
+            self.assertEqual(public_index["currentBoundary"], source["currentBoundary"])
+            self.assertEqual(len(public_index["releases"]), len(source["releases"]))
+            self.assertEqual(
+                [entry["publicCommit"] for entry in public_index["releases"]],
+                [entry["publicCommit"] for entry in source["releases"]],
+            )
+            self.assertIn("Reviewed releases", page)
+            self.assertIn("GATED", page)
+            self.assertIn(
+                'data-boundary-id="runtime-model-promotion" data-boundary-state="gated"',
+                page,
+            )
+            self.assertEqual(
+                page.count('class="release-card"'), len(source["releases"])
+            )
+            for release in source["releases"]:
+                self.assertIn(f'data-release-id="{release["id"]}"', page)
+                self.assertIn(
+                    f'data-public-commit="{release["publicCommit"]}"', page
+                )
+                self.assertIn(release["title"], page)
+                self.assertIn(release["summary"], page)
+                self.assertIn(release["scope"], page)
+                self.assertIn(
+                    "https://github.com/bitworks-io/fast-mlx/commit/"
+                    + release["publicCommit"],
+                    page,
+                )
+                self.assertEqual(
+                    public_index["releases"][source["releases"].index(release)][
+                        "sourceUrl"
+                    ],
+                    "https://github.com/bitworks-io/fast-mlx/commit/"
+                    + release["publicCommit"],
+                )
+            self.assertIn(
+                '<a href="../releases/" aria-current="page">Releases</a>', page
+            )
+            self.assertEqual(page.count('aria-current="page"'), 1)
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn("/releases/", llms)
+            self.assertIn("/releases/index.json", llms)
+
+    def test_validator_requires_release_outputs(self) -> None:
+        for missing in ("releases/index.html", "releases/index.json"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                (output / missing).unlink()
+                self.assertIn(
+                    f"missing required file: {missing}",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_release_page_commit_outside_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page_path = output / "releases/index.html"
+            page = page_path.read_text(encoding="utf-8")
+            page_path.write_text(
+                page.replace(
+                    'data-public-commit="555514986cdd17ca921c9d9607a92d6248734fdd"',
+                    'data-public-commit="0000000000000000000000000000000000000000"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "release page card set does not match release ledger",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_rejects_release_json_route_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            index_path = output / "releases/index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index["releases"][0]["publicLinks"][0]["path"] = "private/"
+            index_path.write_text(json.dumps(index), encoding="utf-8")
+            failures = validate_public_site.validate(output)
+            self.assertTrue(
+                any(
+                    failure.startswith("release ledger")
+                    or "release page" in failure
+                    for failure in failures
+                ),
+                failures,
+            )
 
     def test_benchmark_explorer_is_generated_from_reviewed_highlights(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -557,6 +811,18 @@ class PublicSiteTests(unittest.TestCase):
 
             with self.assertRaises(SystemExit):
                 build_public_site.load_capability_catalog(root, {"published-note"})
+
+    def test_release_manifest_symlink_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            external = root / "external.json"
+            external.write_text(json.dumps(self.release_manifest()), encoding="utf-8")
+            manifest = root / "site/releases.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.symlink_to(external)
+
+            with self.assertRaises(SystemExit):
+                build_public_site.load_release_catalog(root)
 
     def test_article_manifest_cannot_traverse_out_of_content_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

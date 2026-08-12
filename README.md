@@ -7,6 +7,7 @@ effects, and keep only the capabilities that survive explicit correctness and op
 **Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
 [capabilities and evidence](https://bitworks-io.github.io/fast-mlx/capabilities/) ·
 [reviewed benchmark explorer](https://bitworks-io.github.io/fast-mlx/benchmarks/) ·
+[reviewed releases](https://bitworks-io.github.io/fast-mlx/releases/) ·
 [research notes](https://bitworks-io.github.io/fast-mlx/research/)
 
 The project is built around a guarded improvement loop:
@@ -73,6 +74,12 @@ The [research-note library](docs/content/README.md) records the investigation ar
 hypotheses and useful failures. The public website is generated from an explicit reviewed manifest;
 unreviewed operator evidence, machine-local paths, private competitor analysis, and partial runs are
 excluded from both the site and the public repository projection.
+
+The release page and
+[`/releases/index.json`](https://bitworks-io.github.io/fast-mlx/releases/index.json) are generated
+from `site/releases.json`, a reviewed public release ledger. It is discoverability metadata for
+public milestones and unchanged boundaries; it does not grant runtime authority, publish new
+benchmark claims, or replace the capability/evidence review gates.
 
 Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 [CONTRIBUTING.md](CONTRIBUTING.md) for the research-to-release workflow.

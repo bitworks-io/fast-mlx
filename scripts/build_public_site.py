@@ -67,6 +67,19 @@ CAPABILITY_STATUS_DEFINITIONS: Tuple[Tuple[str, str, str], ...] = (
 )
 CAPABILITY_STATUSES = {item[0] for item in CAPABILITY_STATUS_DEFINITIONS}
 HIGHLIGHT_DECISIONS = {"promoted-scoped", "shelved"}
+RELEASE_CATEGORIES = {"foundation", "operations", "product"}
+RELEASE_CATEGORY_LABELS = {
+    "foundation": "Foundation",
+    "operations": "Operations",
+    "product": "Product",
+}
+COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+RELEASE_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})"
+)
+PUBLIC_PATH = re.compile(
+    r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
+)
 
 
 @dataclass(frozen=True)
@@ -371,6 +384,134 @@ def load_capability_catalog(
     return catalog
 
 
+def require_release_timestamp(
+    entry: Dict[str, object], key: str, label: str
+) -> Tuple[str, dt.datetime]:
+    value = require_text(entry, key, label)
+    if not RELEASE_TIMESTAMP.fullmatch(value):
+        fail(f"{label} {key} is not an offset-aware release timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail(f"{label} {key} is not an offset-aware release timestamp")
+    if parsed.utcoffset() is None:
+        fail(f"{label} {key} is not an offset-aware release timestamp")
+    return value, parsed
+
+
+def require_public_link(value: object, label: str) -> Dict[str, str]:
+    link = require_exact_keys(value, {"label", "path"}, label)
+    link_label = require_text(link, "label", label)
+    path = require_text(link, "path", label)
+    if not PUBLIC_PATH.fullmatch(path):
+        fail(f"{label} has an invalid public path")
+    return {"label": link_label, "path": path}
+
+
+def load_release_catalog(repository_root: Path) -> Dict[str, object]:
+    """Load the strict reviewed public-release ledger without consulting Git or the network."""
+
+    manifest_path = repository_root / "site/releases.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        fail("site/releases.json is missing, not a file, or a symlink")
+    catalog = require_exact_keys(
+        read_json(manifest_path),
+        {
+            "schemaVersion",
+            "project",
+            "policy",
+            "claimBoundary",
+            "updatedAt",
+            "currentBoundary",
+            "releases",
+        },
+        "site/releases.json",
+    )
+    if catalog.get("schemaVersion") != 1:
+        fail("site/releases.json must use schemaVersion 1")
+    if catalog.get("project") != "fast-mlx":
+        fail("release project must remain fast-mlx")
+    if catalog.get("policy") != "reviewed-public-releases-only":
+        fail("release policy must remain reviewed-public-releases-only")
+    if catalog.get("claimBoundary") != "fast-mlx-owned-results-only":
+        fail("release claim boundary must remain fast-mlx-owned-results-only")
+    require_iso_date(catalog, "updatedAt", "site/releases.json")
+
+    serialized = json.dumps(catalog, ensure_ascii=False)
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in serialized.casefold():
+            fail(f"release catalog contains private marker {marker!r}")
+
+    boundary = require_exact_keys(
+        catalog.get("currentBoundary"),
+        {"id", "label", "state", "summary", "evidence"},
+        "current release boundary",
+    )
+    boundary_id = require_text(boundary, "id", "current release boundary")
+    if not SLUG.fullmatch(boundary_id):
+        fail("current release boundary has an invalid id")
+    require_text(boundary, "label", "current release boundary")
+    require_text(boundary, "summary", "current release boundary")
+    if require_text(boundary, "state", "current release boundary") != "gated":
+        fail("current release boundary state must remain gated")
+    require_public_link(boundary.get("evidence"), "current release boundary evidence")
+
+    releases = catalog.get("releases")
+    if not isinstance(releases, list) or not releases:
+        fail("release catalog must contain at least one release")
+    seen_ids: set[str] = set()
+    seen_commits: set[str] = set()
+    previous_timestamp: Optional[dt.datetime] = None
+    for index, raw_entry in enumerate(releases):
+        label = f"release entry {index}"
+        entry = require_exact_keys(
+            raw_entry,
+            {
+                "id",
+                "title",
+                "publishedAt",
+                "category",
+                "state",
+                "summary",
+                "scope",
+                "publicCommit",
+                "publicLinks",
+            },
+            label,
+        )
+        identifier = require_text(entry, "id", label)
+        if not SLUG.fullmatch(identifier) or identifier in seen_ids:
+            fail(f"{label} has an invalid or duplicate id")
+        seen_ids.add(identifier)
+        for key in ("title", "summary", "scope"):
+            require_text(entry, key, label)
+        category = require_text(entry, "category", label)
+        if category not in RELEASE_CATEGORIES:
+            fail(f"{label} has unknown category {category!r}")
+        if require_text(entry, "state", label) != "released":
+            fail(f"{label} is not explicitly released")
+        _timestamp, parsed_timestamp = require_release_timestamp(
+            entry, "publishedAt", label
+        )
+        if previous_timestamp is not None and parsed_timestamp >= previous_timestamp:
+            fail("release entries are not strictly newest-first")
+        previous_timestamp = parsed_timestamp
+        commit = require_text(entry, "publicCommit", label)
+        if not COMMIT_SHA.fullmatch(commit) or commit in seen_commits:
+            fail(f"{label} has an invalid or duplicate publicCommit")
+        seen_commits.add(commit)
+        links = entry.get("publicLinks")
+        if not isinstance(links, list):
+            fail(f"{label} publicLinks is not a list")
+        seen_paths: set[str] = set()
+        for link_index, raw_link in enumerate(links):
+            link = require_public_link(raw_link, f"{label} public link {link_index}")
+            if link["path"] in seen_paths:
+                fail(f"{label} has a duplicate public link path")
+            seen_paths.add(link["path"])
+    return catalog
+
+
 def load_articles(repository_root: Path) -> List[Article]:
     manifest_path = repository_root / "site/publications.json"
     manifest = read_json(manifest_path)
@@ -660,6 +801,7 @@ def render_template(
         "{{body}}": body.replace("{{root}}", root),
         "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
         "{{benchmarks_nav}}": nav_link("benchmarks", "Benchmarks"),
+        "{{releases_nav}}": nav_link("releases", "Releases"),
         "{{process_nav}}": nav_link("process", "The loop"),
         "{{methodology_nav}}": nav_link("methodology", "Methodology"),
         "{{research_nav}}": nav_link("research", "Research notes"),
@@ -677,6 +819,92 @@ def write_page(output: Path, relative_file: str, contents: str) -> None:
     destination = output / relative_file
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(contents.rstrip() + "\n", encoding="utf-8")
+
+
+def render_release_catalog(
+    catalog: Dict[str, object]
+) -> Tuple[str, Dict[str, object]]:
+    boundary = dict(catalog["currentBoundary"])
+    boundary["evidence"] = dict(boundary["evidence"])
+    releases: List[Dict[str, object]] = []
+    for raw_entry in catalog["releases"]:
+        entry = dict(raw_entry)
+        entry["publicLinks"] = [dict(link) for link in entry["publicLinks"]]
+        entry["sourceUrl"] = (
+            "https://github.com/bitworks-io/fast-mlx/commit/"
+            f"{entry['publicCommit']}"
+        )
+        releases.append(entry)
+
+    public_index: Dict[str, object] = {
+        "schemaVersion": 1,
+        "project": "fast-mlx",
+        "policy": catalog["policy"],
+        "claimBoundary": catalog["claimBoundary"],
+        "updatedAt": catalog["updatedAt"],
+        "currentBoundary": boundary,
+        "releases": releases,
+    }
+
+    boundary_evidence = boundary["evidence"]
+    boundary_href = relative_href(
+        "releases/index.html", str(boundary_evidence["path"])
+    )
+    body: List[str] = [
+        '<section class="page-hero shell release-hero">',
+        '<p class="eyebrow">Reviewed releases</p>',
+        '<h1>See what shipped—and what it still does not prove.</h1>',
+        '<p class="lede">A generated, newest-first ledger of fast-mlx public milestones. Every entry names the exact public commit, the user-facing surface, and the boundary that stayed in force.</p>',
+        '<div class="hero-actions">',
+        '<a class="button primary" href="index.json">Read the release JSON</a>',
+        '<a class="button secondary" href="https://github.com/bitworks-io/fast-mlx/commits/main" rel="noreferrer">Inspect public history</a>',
+        '</div>',
+        '</section>',
+        '<section class="section shell release-boundary" aria-labelledby="release-boundary-heading" data-release-boundary '
+        f'data-boundary-id="{html.escape(str(boundary["id"]), quote=True)}" '
+        f'data-boundary-state="{html.escape(str(boundary["state"]), quote=True)}">',
+        '<div class="section-heading">',
+        '<p class="eyebrow">Current boundary</p>',
+        f'<span class="status-badge status-gated">{html.escape(str(boundary["state"]).upper())}</span>',
+        f'<h2 id="release-boundary-heading">{html.escape(str(boundary["label"]))}</h2>',
+        f'<p class="section-intro">{html.escape(str(boundary["summary"]))}</p>',
+        f'<a class="text-link" href="{html.escape(boundary_href, quote=True)}">{html.escape(str(boundary_evidence["label"]))} →</a>',
+        '</div>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="release-ledger-heading">',
+        '<div class="section-heading"><p class="eyebrow">Public history</p><h2 id="release-ledger-heading">One reviewed commit at a time.</h2><p class="section-intro">Operational hardening and product surfaces appear together because both determine what users can trust.</p></div>',
+        '<ol class="release-list">',
+    ]
+    for release in releases:
+        category = str(release["category"])
+        commit = str(release["publicCommit"])
+        published_at = str(release["publishedAt"])
+        body.extend(
+            [
+                '<li>',
+                '<article class="release-card" '
+                f'data-release-id="{html.escape(str(release["id"]), quote=True)}" '
+                f'data-public-commit="{html.escape(commit, quote=True)}">',
+                '<div class="card-topline">',
+                f'<span class="status-badge status-released">{html.escape(str(release["state"]).upper())}</span>',
+                f'<time datetime="{html.escape(published_at, quote=True)}">{html.escape(published_at[:10])}</time>',
+                '</div>',
+                f'<p class="release-category">{html.escape(RELEASE_CATEGORY_LABELS[category])}</p>',
+                f'<h3>{html.escape(str(release["title"]))}</h3>',
+                f'<p>{html.escape(str(release["summary"]))}</p>',
+                f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(release["scope"]))}</p>',
+                '<div class="release-links">',
+                f'<a class="text-link" href="{html.escape(str(release["sourceUrl"]), quote=True)}" rel="noreferrer">Inspect commit {html.escape(commit[:12])} →</a>',
+            ]
+        )
+        for link in release["publicLinks"]:
+            href = relative_href("releases/index.html", str(link["path"]))
+            body.append(
+                f'<a href="{html.escape(href, quote=True)}">{html.escape(str(link["label"]))} →</a>'
+            )
+        body.extend(['</div>', '</article>', '</li>'])
+    body.extend(['</ol>', '</section>'])
+    return "\n".join(body), public_index
 
 
 def render_capability_catalog(
@@ -904,6 +1132,7 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
 def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
     catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
+    release_catalog = load_release_catalog(repository_root)
     template = (repository_root / "site/templates/base.html").read_text(encoding="utf-8")
     assets = repository_root / "site/assets"
     validate_asset_tree(assets)
@@ -974,6 +1203,24 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "benchmarks",
             '<script src="../assets/benchmark-explorer.js" defer></script>',
         ),
+    )
+    release_body, release_index = render_release_catalog(release_catalog)
+    write_page(
+        output,
+        "releases/index.html",
+        render_template(
+            template,
+            "Releases — fast-mlx",
+            "A reviewed ledger of fast-mlx public milestones, exact commits, shipped surfaces, and unchanged boundaries.",
+            "../",
+            release_body,
+            "releases",
+        ),
+    )
+    write_page(
+        output,
+        "releases/index.json",
+        json.dumps(release_index, indent=2, ensure_ascii=False),
     )
 
     cards = [
@@ -1059,6 +1306,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /capabilities/: status-aware feature and evidence inventory\n"
         "- /capabilities/index.json: machine-readable capability contract\n"
         "- /benchmarks/: filterable reviewed performance evidence\n"
+        "- /releases/: reviewed public milestones and unchanged boundaries\n"
+        "- /releases/index.json: machine-readable release ledger\n"
         "- /research/: dated technical notes\n\n"
         "## Published notes\n"
         + "\n".join(f"- /{article.public_path}: {article.title}" for article in articles),

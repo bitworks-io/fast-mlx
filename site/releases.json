@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "project": "fast-mlx",
+  "policy": "reviewed-public-releases-only",
+  "claimBoundary": "fast-mlx-owned-results-only",
+  "updatedAt": "2026-08-11",
+  "currentBoundary": {
+    "id": "runtime-model-promotion",
+    "label": "Runtime and model promotion",
+    "state": "gated",
+    "summary": "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
+    "evidence": {
+      "label": "Read the methodology",
+      "path": "methodology/"
+    }
+  },
+  "releases": [
+    {
+      "id": "public-benchmark-explorer",
+      "title": "Publish reviewed benchmark explorer",
+      "publishedAt": "2026-08-11T22:55:26-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a no-recompute filterable view of the three reviewed fast-mlx performance highlights.",
+      "scope": "Filtering changes visibility only; every result retains its workload, date, decision, caveat, and evidence.",
+      "publicCommit": "555514986cdd17ca921c9d9607a92d6248734fdd",
+      "publicLinks": [
+        {
+          "label": "Open the benchmark explorer",
+          "path": "benchmarks/"
+        },
+        {
+          "label": "Read the machine contract",
+          "path": "capabilities/index.json"
+        }
+      ]
+    },
+    {
+      "id": "same-commit-pages-quality-gate",
+      "title": "Gate Pages deployment on public quality",
+      "publishedAt": "2026-08-11T22:09:13-05:00",
+      "category": "operations",
+      "state": "released",
+      "summary": "Makes Pages a same-commit downstream job of the public-boundary and complete pure-Swift quality matrix.",
+      "scope": "This hardens deployment eligibility and provenance; it does not change inference behavior or grant runtime authority.",
+      "publicCommit": "3894c324dc69baf428b9fe54d1770a234467dfbd",
+      "publicLinks": [
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        }
+      ]
+    },
+    {
+      "id": "capabilities-and-evidence",
+      "title": "Publish capabilities and evidence",
+      "publishedAt": "2026-08-11T21:27:03-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a status-aware capability inventory and a machine-readable contract for reviewed fast-mlx evidence.",
+      "scope": "Implemented, scoped-promoted, experimental, and shelved states remain distinct; source presence is not a support claim.",
+      "publicCommit": "a39393451848eedc62e035ddee5ef00d0364ca62",
+      "publicLinks": [
+        {
+          "label": "Open capabilities and evidence",
+          "path": "capabilities/"
+        },
+        {
+          "label": "Read the capability JSON",
+          "path": "capabilities/index.json"
+        }
+      ]
+    },
+    {
+      "id": "compatible-hosted-swift-runner",
+      "title": "Use compatible GitHub macOS runner",
+      "publishedAt": "2026-08-11T17:48:34-05:00",
+      "category": "operations",
+      "state": "released",
+      "summary": "Selects a hosted macOS image that can parse the pinned Swift 6.3 dependency manifest and reports its toolchain.",
+      "scope": "This is a hosted-CI compatibility correction only; no application source or inference route changed.",
+      "publicCommit": "a701708fe55311b7ea61db957bf37573f5530ce4",
+      "publicLinks": []
+    },
+    {
+      "id": "initial-public-release",
+      "title": "Initial public release",
+      "publishedAt": "2026-08-11T17:40:23-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Establishes the history-free Apache-2.0 source projection and deterministic evidence-site sources.",
+      "scope": "The projection excludes private operator state, failed evidence, machine-local paths, models, caches, and benchmark roots.",
+      "publicCommit": "51a99af2b11f42e036f88346a4b8873b71f675d5",
+      "publicLinks": [
+        {
+          "label": "Open fast-mlx",
+          "path": "index.html"
+        },
+        {
+          "label": "Read the research notes",
+          "path": "research/"
+        }
+      ]
+    }
+  ]
+}
