@@ -65,9 +65,9 @@ SITE_STYLESHEET_PATH = "assets/site.css"
 SITE_STYLESHEET_SHA256 = (
     "5601429bd64b6dbd58da20c10f7f8116f27774a285d574152795435b0522ea81"
 )
-REVIEWED_HOME_PAGE_BYTES = 8_970
+REVIEWED_HOME_PAGE_BYTES = 9_002
 REVIEWED_HOME_PAGE_SHA256 = (
-    "ed462144222ec990c7625e815840ea3e124d685cf393be3c95d57379be6d0cca"
+    "5fb708346e2b4775e2524c7774b650ce714b7b10524806c7fea8f9d29807a4c0"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -170,11 +170,12 @@ REVIEWED_ARTICLE_PATHS = (
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
 )
-REVIEWED_RELEASE_INDEX_BYTES = 10_403
+REVIEWED_RELEASE_INDEX_BYTES = 11_513
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "a2d72c8350c4bbe4ae38537f316074c371d689a4e28f7edf271526e96d0f01c4"
+    "ed8d08eb0b615e1be5c26a2bbcbea1e02ee7f8d4e75ad345a39e4432d517cd8d"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    ("reviewed-release-detail-permalinks", "Publish reviewed release detail permalinks"),
     ("reviewed-benchmark-detail-permalinks", "Publish benchmark detail permalinks"),
     ("reviewed-home-current-cycle", "Show current reviewed cycle"),
     ("reviewed-social-metadata", "Publish reviewed social metadata"),
@@ -191,6 +192,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "reviewed-release-detail-permalinks": (
+        4_632,
+        "6ccf62e9fee163c777251f8a1f0a41f32d6054824cf98a566d47dd4298d96973",
+    ),
     "reviewed-benchmark-detail-permalinks": (
         4_734,
         "dd310a3a15581b7179c994e593e77728f70c027710de8624115a95d892ace6c9",

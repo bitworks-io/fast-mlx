@@ -167,34 +167,34 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "reviewed-benchmark-detail-permalinks",
-                "title": "Publish benchmark detail permalinks",
-                "publishedAt": "2026-08-12T05:07:19-05:00",
+                "id": "reviewed-release-detail-permalinks",
+                "title": "Publish reviewed release detail permalinks",
+                "publishedAt": "2026-08-12T06:16:29-05:00",
                 "category": "product",
                 "state": "released",
                 "summary": (
-                    "Adds stable detail pages for the three reviewed fast-mlx "
-                    "benchmark highlights."
+                    "Adds immutable detail pages for each reviewed fast-mlx release "
+                    "checkpoint."
                 ),
                 "scope": (
-                    "Immutable reviewed-result views only; no new measurement, ranking, "
-                    "recomputation, competitor comparison, runtime/model/acquisition/"
-                    "publication authority, or positive absorbed-MLA admission."
+                    "Static reviewed-release detail views only; no new measurement, "
+                    "ranking, recomputation, external ingestion, tracking, automatic-"
+                    "publication authority, runtime/model/acquisition authority, or "
+                    "positive absorbed-MLA admission."
                 ),
-                "publicCommit": "b91ed46e1d88bfadb984b81162165e386d3445b0",
+                "publicCommit": "acaaa522f3b45b34a24c39a1f227534c835331ce",
                 "publicLinks": [
-                    {"label": "Open the benchmark explorer", "path": "benchmarks/"},
                     {
-                        "label": "Read the PLD result",
-                        "path": "benchmarks/pld-echo-throughput/",
+                        "label": "Open reviewed releases",
+                        "path": "releases/",
                     },
                     {
-                        "label": "Read the continuous-batch result",
-                        "path": "benchmarks/continuous-batch-c2-throughput/",
+                        "label": "Open newest release detail",
+                        "path": "releases/reviewed-benchmark-detail-permalinks/",
                     },
                     {
-                        "label": "Read the service-soak result",
-                        "path": "benchmarks/http-sse-operational-soak/",
+                        "label": "Read the release JSON",
+                        "path": "releases/index.json",
                     },
                 ],
             },
@@ -203,6 +203,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "acaaa522f3b45b34a24c39a1f227534c835331ce",
                 "b91ed46e1d88bfadb984b81162165e386d3445b0",
                 "9e0c1a159ee5e458573bae67f323915220eb9b90",
                 "1903e76609cc444bdacfaa5d0472804900dbd13c",
@@ -809,7 +810,7 @@ class PublicSiteTests(unittest.TestCase):
                 self.assertIn(f"- /{public_path}:", llms)
 
     def test_validator_rejects_release_detail_contract_drift(self) -> None:
-        identifier = "reviewed-benchmark-detail-permalinks"
+        identifier = "reviewed-release-detail-permalinks"
         source = json.loads(
             (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
         )
@@ -986,14 +987,14 @@ class PublicSiteTests(unittest.TestCase):
             page = path.read_text(encoding="utf-8")
             path.write_text(
                 page.replace(
-                    'href="reviewed-benchmark-detail-permalinks/"',
+                    'href="reviewed-release-detail-permalinks/"',
                     'href="../capabilities/"',
                     1,
                 ),
                 encoding="utf-8",
             )
             self.assertIn(
-                "release page card 'reviewed-benchmark-detail-permalinks' "
+                "release page card 'reviewed-release-detail-permalinks' "
                 "has the wrong release detail link",
                 validate_public_site.validate(output),
             )
@@ -1174,7 +1175,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 28)
+            self.assertEqual(len(expected_urls), 29)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1284,7 +1285,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 28)
+            self.assertEqual(len(expected), 29)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

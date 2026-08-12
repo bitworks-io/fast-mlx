@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "reviewed-release-detail-permalinks",
+      "title": "Publish reviewed release detail permalinks",
+      "publishedAt": "2026-08-12T06:16:29-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds immutable detail pages for each reviewed fast-mlx release checkpoint.",
+      "scope": "Static reviewed-release detail views only; no new measurement, ranking, recomputation, external ingestion, tracking, automatic-publication authority, runtime/model/acquisition authority, or positive absorbed-MLA admission.",
+      "publicCommit": "acaaa522f3b45b34a24c39a1f227534c835331ce",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        },
+        {
+          "label": "Open newest release detail",
+          "path": "releases/reviewed-benchmark-detail-permalinks/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "reviewed-benchmark-detail-permalinks",
       "title": "Publish benchmark detail permalinks",
       "publishedAt": "2026-08-12T05:07:19-05:00",
