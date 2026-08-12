@@ -27,6 +27,12 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN RSA" + " PRIVATE KEY",
 )
 CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelved"}
+CAPABILITY_STATUS_LABELS = {
+    "implemented": "Implemented",
+    "promoted-scoped": "Promoted · scoped",
+    "experimental": "Experimental",
+    "shelved": "Shelved",
+}
 HIGHLIGHT_DECISION_LABELS = {
     "promoted-scoped": "Promoted · scoped",
     "shelved": "Shelved",
@@ -55,6 +61,14 @@ SOCIAL_CARD_ALT = (
 SOCIAL_CARD_SHA256 = (
     "aa4eaaa35a0dc2280752aab92e6731300e63d272cc5ba6340e0b626f5be610e0"
 )
+SITE_STYLESHEET_PATH = "assets/site.css"
+SITE_STYLESHEET_SHA256 = (
+    "5601429bd64b6dbd58da20c10f7f8116f27774a285d574152795435b0522ea81"
+)
+REVIEWED_HOME_PAGE_BYTES = 8_945
+REVIEWED_HOME_PAGE_SHA256 = (
+    "27482181f5561faf2af25a895d39769d3500c1d3918b41596a4acef5132c7587"
+)
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
 SOCIAL_CARD_HEIGHT = 630
@@ -79,6 +93,22 @@ REVIEWED_ARTICLE_PATHS = (
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
 )
+HTML_VOID_ELEMENTS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 REVIEWED_PAGE_METADATA: Dict[
     str, Tuple[str, str, str, Optional[str]]
 ] = {
@@ -447,6 +477,106 @@ class ReleaseCollector(html.parser.HTMLParser):
             ) if isinstance(text_parts, list) else ""
             self.cards.append(self._current_card)
             self._current_card = None
+
+
+class HomeCurrentCycleCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections: List[Dict[str, object]] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._section_depth = 0
+        self._element_stack: List[
+            Tuple[str, Dict[str, Optional[str]], bool]
+        ] = []
+
+    @staticmethod
+    def _suppresses_visibility(attributes: Dict[str, Optional[str]]) -> bool:
+        classes = set((attributes.get("class") or "").split())
+        aria_hidden = (attributes.get("aria-hidden") or "").casefold()
+        return (
+            "hidden" in attributes
+            or aria_hidden == "true"
+            or "style" in attributes
+            or "benchmark-controls" in classes
+            or "data-benchmark-controls" in attributes
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        names = [name for name, _value in attrs]
+        has_duplicate_attributes = len(names) != len(set(names))
+        attributes = dict(attrs)
+        if tag == "section" and "data-current-cycle" in attributes:
+            if self._current is not None:
+                self.sections.append(self._current)
+            self._current = {
+                "sectionAttributes": attributes,
+                "ancestry": list(self._element_stack),
+                "hasDuplicateAttributes": has_duplicate_attributes,
+                "hasVisibilitySuppressor": self._suppresses_visibility(attributes),
+                "latestReleaseId": attributes.get("data-latest-release-id"),
+                "boundaryId": attributes.get("data-boundary-id"),
+                "boundaryState": attributes.get("data-boundary-state"),
+                "time": None,
+                "links": [],
+                "statusCounts": [],
+                "text_parts": [],
+                "inventoryRole": None,
+                "listItemCount": 0,
+            }
+            self._section_depth = 1
+        elif self._current is not None:
+            if has_duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if self._suppresses_visibility(attributes):
+                self._current["hasVisibilitySuppressor"] = True
+            if tag == "section":
+                self._section_depth += 1
+            if tag == "time":
+                self._current["time"] = attributes.get("datetime")
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+            if "data-capability-status" in attributes:
+                counts = self._current["statusCounts"]
+                if isinstance(counts, list):
+                    counts.append(
+                        (
+                            attributes.get("data-capability-status"),
+                            attributes.get("data-count"),
+                        )
+                    )
+            classes = set((attributes.get("class") or "").split())
+            if "capability-list" in classes:
+                self._current["inventoryRole"] = attributes.get("role")
+            if attributes.get("role") == "listitem":
+                count = self._current["listItemCount"]
+                self._current["listItemCount"] = (
+                    count + 1 if isinstance(count, int) else 1
+                )
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, attributes, has_duplicate_attributes))
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            text_parts = self._current["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "section" and self._current is not None:
+            self._section_depth -= 1
+            if self._section_depth == 0:
+                text_parts = self._current.pop("text_parts")
+                self._current["text"] = " ".join(
+                    "".join(text_parts).split()
+                ) if isinstance(text_parts, list) else ""
+                self.sections.append(self._current)
+                self._current = None
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                del self._element_stack[index:]
+                break
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -899,6 +1029,35 @@ def validate_social_card(site: Path) -> List[str]:
     return []
 
 
+def validate_reviewed_stylesheet(site: Path) -> List[str]:
+    path = site / SITE_STYLESHEET_PATH
+    if path.is_symlink() or not path.is_file():
+        return [f"{SITE_STYLESHEET_PATH} must be a regular non-symlink file"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read {SITE_STYLESHEET_PATH}: {exc}"]
+    if hashlib.sha256(raw).hexdigest() != SITE_STYLESHEET_SHA256:
+        return [f"{SITE_STYLESHEET_PATH} does not match the reviewed stylesheet"]
+    return []
+
+
+def validate_reviewed_home_page(site: Path) -> List[str]:
+    path = site / "index.html"
+    if path.is_symlink() or not path.is_file():
+        return ["index.html must be a regular non-symlink file"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read index.html: {exc}"]
+    if (
+        len(raw) != REVIEWED_HOME_PAGE_BYTES
+        or hashlib.sha256(raw).hexdigest() != REVIEWED_HOME_PAGE_SHA256
+    ):
+        return ["index.html does not match the reviewed home page"]
+    return []
+
+
 def expected_social_properties(
     public_path: str,
     metadata: Tuple[str, str, str, Optional[str]],
@@ -1098,6 +1257,206 @@ def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[
     return failures
 
 
+def validate_home_current_cycle(
+    site: Path,
+    release_index: Dict[str, object],
+    capability_index: Dict[str, object],
+    research_index: Dict[str, object],
+) -> List[str]:
+    failures: List[str] = []
+    collector = HomeCurrentCycleCollector()
+    try:
+        collector.feed((site / "index.html").read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"cannot parse index.html current cycle: {exc}"]
+    if len(collector.sections) != 1:
+        return ["index.html must contain exactly one home current-cycle section"]
+
+    current = collector.sections[0]
+    releases = release_index.get("releases")
+    latest = releases[0] if isinstance(releases, list) and releases else None
+    boundary = release_index.get("currentBoundary")
+    capabilities = capability_index.get("capabilities")
+    articles = research_index.get("articles")
+    if not isinstance(latest, dict) or not isinstance(boundary, dict):
+        return failures
+    if not isinstance(capabilities, list) or not isinstance(articles, list):
+        return failures
+
+    expected_section_attributes = {
+        "class": "section shell split",
+        "aria-labelledby": "current-cycle-heading",
+        "data-current-cycle": None,
+        "data-latest-release-id": latest.get("id"),
+        "data-boundary-id": boundary.get("id"),
+        "data-boundary-state": boundary.get("state"),
+    }
+    if current.get("sectionAttributes") != expected_section_attributes:
+        failures.append(
+            "home current-cycle section attributes do not match the reviewed contract"
+        )
+    expected_ancestry = [
+        ("html", {"lang": "en"}, False),
+        ("body", {}, False),
+        ("main", {"id": "content"}, False),
+    ]
+    if current.get("ancestry") != expected_ancestry:
+        failures.append(
+            "home current-cycle section ancestry does not match the reviewed contract"
+        )
+    if current.get("hasDuplicateAttributes") is not False:
+        failures.append("home current-cycle section contains duplicate attributes")
+    if current.get("hasVisibilitySuppressor") is not False:
+        failures.append("home current-cycle section contains a visibility suppressor")
+
+    if current.get("latestReleaseId") != latest.get("id"):
+        failures.append(
+            "home current-cycle latest release does not match releases/index.json"
+        )
+    if current.get("boundaryId") != boundary.get("id"):
+        failures.append(
+            "home current-cycle boundary id does not match releases/index.json"
+        )
+    if current.get("boundaryState") != boundary.get("state"):
+        failures.append(
+            "home current-cycle boundary state does not match releases/index.json"
+        )
+    if current.get("time") != latest.get("publishedAt"):
+        failures.append(
+            "home current-cycle timestamp does not match releases/index.json"
+        )
+
+    text = current.get("text")
+    normalized_text = text if isinstance(text, str) else ""
+    latest_text = (
+        ("state", str(latest.get("state", "")).upper()),
+        ("date", str(latest.get("publishedAt", ""))[:10]),
+        ("title", latest.get("title")),
+        ("summary", latest.get("summary")),
+        ("scope", latest.get("scope")),
+    )
+    for label, value in latest_text:
+        if isinstance(value, str) and " ".join(value.split()) not in normalized_text:
+            failures.append(f"home current-cycle latest release does not bind {label}")
+    for label, value in (
+        ("label", boundary.get("label")),
+        ("summary", boundary.get("summary")),
+    ):
+        if isinstance(value, str) and " ".join(value.split()) not in normalized_text:
+            failures.append(f"home current-cycle boundary has the wrong {label}")
+
+    expected_capability_text = f"{len(capabilities)} reviewed capabilities"
+    if expected_capability_text not in normalized_text:
+        failures.append(
+            "home current-cycle capability count does not match capabilities/index.json"
+        )
+    expected_research_text = f"{len(articles)} published research notes"
+    if expected_research_text not in normalized_text:
+        failures.append(
+            "home current-cycle research count does not match research/index.json"
+        )
+    expected_release_text = f"{len(releases)} reviewed releases"
+    if expected_release_text not in normalized_text:
+        failures.append(
+            "home current-cycle release count does not match releases/index.json"
+        )
+
+    expected_status_counts = {
+        status: sum(
+            isinstance(capability, dict) and capability.get("status") == status
+            for capability in capabilities
+        )
+        for status in CAPABILITY_STATUSES
+    }
+    actual_status_counts: Dict[str, int] = {}
+    raw_status_counts = current.get("statusCounts")
+    if isinstance(raw_status_counts, list):
+        for raw_status, raw_count in raw_status_counts:
+            if (
+                not isinstance(raw_status, str)
+                or raw_status in actual_status_counts
+                or not isinstance(raw_count, str)
+            ):
+                actual_status_counts = {}
+                break
+            try:
+                actual_status_counts[raw_status] = int(raw_count)
+            except ValueError:
+                actual_status_counts = {}
+                break
+    if actual_status_counts != expected_status_counts:
+        failures.append(
+            "home current-cycle capability status counts do not match capabilities/index.json"
+        )
+
+    links = current.get("links")
+    actual_links = links if isinstance(links, list) else []
+    expected_source = latest.get("sourceUrl")
+    if not isinstance(expected_source, str) or expected_source not in actual_links:
+        failures.append("home current-cycle latest release has the wrong source link")
+    expected_anchor = "releases/#release-" + str(latest.get("id", ""))
+    if expected_anchor not in actual_links:
+        failures.append("home current-cycle latest release has the wrong ledger link")
+    for expected_link, label in (
+        ("capabilities/", "capability"),
+        ("research/", "research"),
+        ("releases/", "release"),
+    ):
+        if expected_link not in actual_links:
+            failures.append(f"home current-cycle has the wrong {label} inventory link")
+    evidence = boundary.get("evidence")
+    expected_evidence = evidence.get("path") if isinstance(evidence, dict) else None
+    if not isinstance(expected_evidence, str) or expected_evidence not in actual_links:
+        failures.append(
+            "home current-cycle boundary evidence link does not match releases/index.json"
+        )
+    if current.get("inventoryRole") != "list" or current.get("listItemCount") != 4:
+        failures.append("home current-cycle evidence inventory is not an accessible list")
+
+    status_text = "; ".join(
+        f"{expected_status_counts[status]} {CAPABILITY_STATUS_LABELS[status].casefold()}"
+        for status in (
+            "implemented",
+            "promoted-scoped",
+            "experimental",
+            "shelved",
+        )
+    )
+    expected_text = " ".join(
+        [
+            "Current reviewed cycle",
+            str(latest.get("state", "")).upper(),
+            str(latest.get("publishedAt", ""))[:10],
+            str(latest.get("title", "")),
+            str(latest.get("summary", "")),
+            "Boundary:",
+            str(latest.get("scope", "")),
+            "Inspect the latest reviewed milestone →",
+            "Inspect commit",
+            str(latest.get("publicCommit", ""))[:12],
+            "→",
+            expected_capability_text,
+            status_text,
+            "Inspect capability states →",
+            expected_research_text,
+            "Dated investigations preserve promoted, shelved, rejected, and diagnostic outcomes.",
+            "Read the evidence trail →",
+            expected_release_text,
+            "Each public milestone names its exact commit and unchanged claim boundary.",
+            "Follow the release ledger →",
+            str(boundary.get("state", "")).upper(),
+            str(boundary.get("label", "")),
+            str(boundary.get("summary", "")),
+            str(evidence.get("label", "")) if isinstance(evidence, dict) else "",
+            "→",
+        ]
+    )
+    expected_text = " ".join(expected_text.split())
+    if normalized_text != expected_text:
+        failures.append("home current-cycle text does not match reviewed indexes")
+    return failures
+
+
 def validate(site: Path) -> List[str]:
     failures: List[str] = []
     site = site.resolve()
@@ -1127,6 +1486,8 @@ def validate(site: Path) -> List[str]:
             failures.append(f"missing required file: {relative}")
 
     failures.extend(validate_social_card(site))
+    failures.extend(validate_reviewed_stylesheet(site))
+    failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
 
     expected_benchmark_cards: Dict[str, Dict[str, str]] = {}
@@ -1140,6 +1501,7 @@ def validate(site: Path) -> List[str]:
     if release_index is not None and (site / "releases/feed.atom").is_file():
         failures.extend(validate_release_feed(site, release_index))
 
+    research_index: Optional[Dict[str, object]] = None
     sitemap_article_paths: List[str] = []
     index_path = site / "research/index.json"
     if index_path.is_file():
@@ -1150,9 +1512,10 @@ def validate(site: Path) -> List[str]:
         else:
             if not isinstance(index, dict):
                 failures.append("research/index.json is not an object")
-            elif index.get("schemaVersion") != 1:
-                failures.append("research/index.json does not use schemaVersion 1")
             else:
+                research_index = index
+                if index.get("schemaVersion") != 1:
+                    failures.append("research/index.json does not use schemaVersion 1")
                 articles = index.get("articles", [])
                 if not isinstance(articles, list) or not articles:
                     failures.append("research/index.json has no articles")
@@ -1188,6 +1551,7 @@ def validate(site: Path) -> List[str]:
     if robots_path.exists() or robots_path.is_symlink():
         failures.extend(validate_robots(site))
 
+    capability_index: Optional[Dict[str, object]] = None
     capability_index_path = site / "capabilities/index.json"
     if capability_index_path.is_file():
         try:
@@ -1419,6 +1783,21 @@ def validate(site: Path) -> List[str]:
                 failures.append("benchmark explorer has no hidden status empty state")
             if not collector.has_script:
                 failures.append("benchmark explorer does not load its reviewed script")
+
+    if (
+        release_index is not None
+        and capability_index is not None
+        and research_index is not None
+        and (site / "index.html").is_file()
+    ):
+        failures.extend(
+            validate_home_current_cycle(
+                site,
+                release_index,
+                capability_index,
+                research_index,
+            )
+        )
 
     for path in site.rglob("*"):
         if path.is_symlink():

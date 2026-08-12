@@ -1333,6 +1333,104 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
     return "\n".join(body)
 
 
+def render_home_current_cycle(
+    catalog: Dict[str, object],
+    articles: Sequence[Article],
+    release_catalog: Dict[str, object],
+) -> str:
+    """Render the home-page snapshot from reviewed public manifests only."""
+
+    capabilities = catalog["capabilities"]
+    releases = release_catalog["releases"]
+    latest = releases[0]
+    boundary = release_catalog["currentBoundary"]
+    boundary_evidence = boundary["evidence"]
+    status_counts = {
+        status: sum(capability["status"] == status for capability in capabilities)
+        for status in CAPABILITY_STATUSES
+    }
+    status_labels = {
+        status: label for status, label, _description in CAPABILITY_STATUS_DEFINITIONS
+    }
+    published_at = str(latest["publishedAt"])
+    commit = str(latest["publicCommit"])
+    latest_id = str(latest["id"])
+
+    status_summary = "; ".join(
+        '<span data-capability-status="'
+        + html.escape(status, quote=True)
+        + '" data-count="'
+        + str(status_counts[status])
+        + '">'
+        + str(status_counts[status])
+        + " "
+        + html.escape(status_labels[status].casefold())
+        + "</span>"
+        for status, _label, _description in CAPABILITY_STATUS_DEFINITIONS
+    )
+
+    return "\n".join(
+        [
+            '<section class="section shell split" aria-labelledby="current-cycle-heading" '
+            'data-current-cycle data-latest-release-id="'
+            + html.escape(latest_id, quote=True)
+            + '" data-boundary-id="'
+            + html.escape(str(boundary["id"]), quote=True)
+            + '" data-boundary-state="'
+            + html.escape(str(boundary["state"]), quote=True)
+            + '">',
+            '<div>',
+            '<p class="eyebrow">Current reviewed cycle</p>',
+            '<div class="card-topline"><span class="status-badge status-released">RELEASED</span> '
+            f'<time datetime="{html.escape(published_at, quote=True)}">{html.escape(published_at[:10])}</time></div>',
+            f'<h2 id="current-cycle-heading">{html.escape(str(latest["title"]))}</h2>',
+            f'<p>{html.escape(str(latest["summary"]))}</p>',
+            '<p class="scope-note"><strong>Boundary:</strong> '
+            + html.escape(str(latest["scope"]))
+            + "</p>",
+            '<div class="release-links">',
+            '<a class="text-link" href="releases/#release-'
+            + html.escape(latest_id, quote=True)
+            + '">Inspect the latest reviewed milestone →</a>',
+            '<a href="https://github.com/bitworks-io/fast-mlx/commit/'
+            + html.escape(commit, quote=True)
+            + '" rel="noreferrer">Inspect commit '
+            + html.escape(commit[:12])
+            + " →</a>",
+            '</div>',
+            '</div>',
+            '<div class="capability-list" role="list" aria-label="Current reviewed evidence inventory">',
+            '<article role="listitem">',
+            f'<h3>{len(capabilities)} reviewed capabilities</h3>',
+            f'<p>{status_summary}</p>',
+            '<a class="text-link" href="capabilities/">Inspect capability states →</a>',
+            '</article>',
+            '<article role="listitem">',
+            f'<h3>{len(articles)} published research notes</h3>',
+            '<p>Dated investigations preserve promoted, shelved, rejected, and diagnostic outcomes.</p>',
+            '<a class="text-link" href="research/">Read the evidence trail →</a>',
+            '</article>',
+            '<article role="listitem">',
+            f'<h3>{len(releases)} reviewed releases</h3>',
+            '<p>Each public milestone names its exact commit and unchanged claim boundary.</p>',
+            '<a class="text-link" href="releases/">Follow the release ledger →</a>',
+            '</article>',
+            '<article role="listitem">',
+            f'<span class="status-badge status-gated">{html.escape(str(boundary["state"]).upper())}</span>',
+            f'<h3>{html.escape(str(boundary["label"]))}</h3>',
+            f'<p>{html.escape(str(boundary["summary"]))}</p>',
+            '<a class="text-link" href="'
+            + html.escape(str(boundary_evidence["path"]), quote=True)
+            + '">'
+            + html.escape(str(boundary_evidence["label"]))
+            + " →</a>",
+            '</article>',
+            '</div>',
+            '</section>',
+        ]
+    )
+
+
 def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
     catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
@@ -1343,6 +1441,12 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     shutil.copytree(assets, output / "assets", dirs_exist_ok=True)
 
     home = (repository_root / "site/fragments/home.html").read_text(encoding="utf-8")
+    if home.count("{{current_cycle}}") != 1:
+        fail("site/fragments/home.html must contain exactly one current-cycle slot")
+    home = home.replace(
+        "{{current_cycle}}",
+        render_home_current_cycle(catalog, articles, release_catalog),
+    )
     write_page(
         output,
         "index.html",

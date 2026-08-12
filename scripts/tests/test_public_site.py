@@ -310,6 +310,279 @@ class PublicSiteTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     build_public_site.load_capability_catalog(root, {"published-note"})
 
+    def test_home_current_cycle_summary_is_generated_from_reviewed_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            capabilities = json.loads(
+                (REPOSITORY_ROOT / "site/capabilities.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            publications = json.loads(
+                (REPOSITORY_ROOT / "site/publications.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            releases = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
+            page = (output / "index.html").read_text(encoding="utf-8")
+            latest = releases["releases"][0]
+            boundary = releases["currentBoundary"]
+            status_counts = {
+                status: sum(
+                    capability["status"] == status
+                    for capability in capabilities["capabilities"]
+                )
+                for status in (
+                    "promoted-scoped",
+                    "implemented",
+                    "experimental",
+                    "shelved",
+                )
+            }
+
+            self.assertIn(
+                'data-current-cycle data-latest-release-id="'
+                + latest["id"]
+                + '" data-boundary-id="'
+                + boundary["id"]
+                + '" data-boundary-state="gated"',
+                page,
+            )
+            self.assertIn(latest["title"], page)
+            self.assertIn(latest["summary"], page)
+            self.assertIn(latest["scope"], page)
+            self.assertIn(latest["publishedAt"][:10], page)
+            self.assertIn(
+                'href="releases/#release-' + latest["id"] + '"', page
+            )
+            self.assertIn(
+                "https://github.com/bitworks-io/fast-mlx/commit/"
+                + latest["publicCommit"],
+                page,
+            )
+            self.assertIn(boundary["label"], page)
+            self.assertIn(boundary["summary"], page)
+            self.assertIn('href="methodology/"', page)
+            self.assertIn(
+                f'{len(capabilities["capabilities"])} reviewed capabilities', page
+            )
+            self.assertIn(
+                f'{len(publications["articles"])} published research notes', page
+            )
+            self.assertIn(
+                f'{len(releases["releases"])} reviewed releases', page
+            )
+            self.assertIn(
+                'class="capability-list" role="list" '
+                'aria-label="Current reviewed evidence inventory"',
+                page,
+            )
+            self.assertEqual(page.count('role="listitem"'), 4)
+            self.assertIn("</span>; <span", page)
+            for status, count in status_counts.items():
+                self.assertIn(
+                    f'data-capability-status="{status}" data-count="{count}"', page
+                )
+
+    def test_validator_rejects_home_current_cycle_tampering(self) -> None:
+        releases = json.loads(
+            (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+        )
+        latest = releases["releases"][0]
+        mutations = (
+            (
+                "boundary state",
+                'data-boundary-state="gated"',
+                'data-boundary-state="promoted"',
+                "home current-cycle boundary state does not match releases/index.json",
+            ),
+            (
+                "release scope",
+                latest["scope"],
+                "Runtime and model authority granted as the default.",
+                "home current-cycle latest release does not bind scope",
+            ),
+            (
+                "additive authority claim",
+                latest["scope"],
+                latest["scope"]
+                + " Runtime and model authority granted as the default.",
+                "home current-cycle text does not match reviewed indexes",
+            ),
+            (
+                "visible boundary state",
+                ">GATED</span>",
+                ">PROMOTED</span>",
+                "home current-cycle text does not match reviewed indexes",
+            ),
+            (
+                "hidden section",
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" hidden ',
+                "home current-cycle section attributes do not match the reviewed contract",
+            ),
+            (
+                "aria-hidden section",
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" aria-hidden="true" ',
+                "home current-cycle section attributes do not match the reviewed contract",
+            ),
+            (
+                "inline-hidden section",
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" style="display:none" ',
+                "home current-cycle section attributes do not match the reviewed contract",
+            ),
+            (
+                "duplicate section class",
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                '<section class="benchmark-controls" class="section shell split" aria-labelledby="current-cycle-heading" ',
+                "home current-cycle section contains duplicate attributes",
+            ),
+            (
+                "duplicate inventory role",
+                '<div class="capability-list" role="list" ',
+                '<div class="capability-list" role="presentation" role="list" ',
+                "home current-cycle section contains duplicate attributes",
+            ),
+            (
+                "hidden inventory",
+                '<div class="capability-list" role="list" ',
+                '<div class="capability-list" role="list" hidden ',
+                "home current-cycle section contains a visibility suppressor",
+            ),
+            (
+                "aria-hidden card",
+                '<article role="listitem">\n<h3>6 reviewed capabilities</h3>',
+                '<article role="listitem" aria-hidden="true">\n'
+                '<h3>6 reviewed capabilities</h3>',
+                "home current-cycle section contains a visibility suppressor",
+            ),
+            (
+                "known hidden class",
+                '<div class="capability-list" role="list" ',
+                '<div class="capability-list benchmark-controls" role="list" ',
+                "home current-cycle section contains a visibility suppressor",
+            ),
+            (
+                "hidden ancestor wrapper",
+                '<section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                '<div hidden><section class="section shell split" aria-labelledby="current-cycle-heading" ',
+                "home current-cycle section ancestry does not match the reviewed contract",
+            ),
+            (
+                "hidden main ancestor",
+                '<main id="content">',
+                '<main id="content" hidden>',
+                "home current-cycle section ancestry does not match the reviewed contract",
+            ),
+            (
+                "nested section bypass",
+                '</div>\n</section>\n\n<section class="section shell" '
+                'aria-labelledby="loop-heading">',
+                '</div>\n<section></section><p>Runtime and model authority granted '
+                'as the default.</p></section>\n\n<section class="section shell" '
+                'aria-labelledby="loop-heading">',
+                "home current-cycle text does not match reviewed indexes",
+            ),
+            (
+                "commit link",
+                "https://github.com/bitworks-io/fast-mlx/commit/"
+                + latest["publicCommit"],
+                "https://github.com/bitworks-io/fast-mlx/commit/" + "0" * 40,
+                "home current-cycle latest release has the wrong source link",
+            ),
+            (
+                "capability count",
+                'data-capability-status="implemented" data-count="3"',
+                'data-capability-status="implemented" data-count="99"',
+                "home current-cycle capability status counts do not match capabilities/index.json",
+            ),
+            (
+                "research count",
+                "7 published research notes",
+                "99 published research notes",
+                "home current-cycle research count does not match research/index.json",
+            ),
+        )
+        for label, original, replacement, expected_failure in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                home_path = output / "index.html"
+                page = home_path.read_text(encoding="utf-8")
+                self.assertEqual(page.count(original), 1)
+                home_path.write_text(
+                    page.replace(original, replacement, 1), encoding="utf-8"
+                )
+                self.assertIn(expected_failure, validate_public_site.validate(output))
+
+    def test_validator_rejects_home_current_cycle_stylesheet_visibility_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            stylesheet = output / "assets/site.css"
+            stylesheet.write_text(
+                stylesheet.read_text(encoding="utf-8")
+                + "\n[data-current-cycle] { display: none; }\n",
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "assets/site.css does not match the reviewed stylesheet",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_rejects_home_current_cycle_page_level_visibility_tampering(self) -> None:
+        mutations = (
+            (
+                "inline style rule",
+                "</head>",
+                "<style>[data-current-cycle]{display:none}</style></head>",
+            ),
+            (
+                "additional stylesheet",
+                "</head>",
+                '<link rel="stylesheet" href="assets/extra.css"></head>',
+            ),
+            (
+                "closed details wrapper",
+                '<p class="eyebrow">Current reviewed cycle</p>',
+                '<details><summary></summary><p class="eyebrow">Current reviewed cycle</p>',
+            ),
+            (
+                "closed dialog wrapper",
+                '<p class="eyebrow">Current reviewed cycle</p>',
+                '<dialog><p class="eyebrow">Current reviewed cycle</p>',
+            ),
+            (
+                "inert inventory",
+                '<div class="capability-list" role="list" ',
+                '<div class="capability-list" role="list" inert ',
+            ),
+        )
+        for label, original, replacement in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                home_path = output / "index.html"
+                page = home_path.read_text(encoding="utf-8")
+                self.assertEqual(page.count(original), 1)
+                home_path.write_text(
+                    page.replace(original, replacement, 1), encoding="utf-8"
+                )
+                self.assertIn(
+                    "index.html does not match the reviewed home page",
+                    validate_public_site.validate(output),
+                )
+
     def test_build_is_complete_and_links_are_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
