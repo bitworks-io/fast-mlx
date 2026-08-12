@@ -17,6 +17,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
 - the reviewed public release ledger in `site/releases.json`, which generates `/releases/`,
   `/releases/index.json`, and the static `/releases/feed.atom` subscription surface for milestone
   discovery only;
+- deterministic `/sitemap.xml` and `/robots.txt` outputs derived only from reviewed human-facing
+  routes, with no machine endpoint or unpublished note admitted;
 - only the research notes listed in `site/publications.json`; and
 - GitHub Actions that validate source/site boundaries and deploy GitHub Pages.
 
@@ -59,6 +61,12 @@ feed is generated from those same entries without a build-time network request, 
 ingestion, or publication authority. Neither surface approves a model, launches a runtime, changes
 public Apache-2.0 source boundaries, or creates benchmark evidence beyond the reviewed note and
 capability manifests.
+
+The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
+seven reviewed product/index pages and the seven explicitly published research notes; it excludes
+JSON contracts, the Atom feed, LLM text surfaces, assets, and the 404 page. The builder performs no
+submission or network request, and validation rejects route drift, non-UTF-8 or oversized content,
+DTD/entity declarations, symlinks, and non-regular files.
 
 GitHub Pages is downstream of the complete `Public source quality` workflow. It accepts only a
 successful `push` run for `main`, checks out the same validated commit, and exposes no independent

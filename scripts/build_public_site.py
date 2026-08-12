@@ -79,7 +79,17 @@ RELEASE_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})"
 )
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
+CORE_PUBLIC_PAGE_PATHS = (
+    "",
+    "process/",
+    "methodology/",
+    "capabilities/",
+    "benchmarks/",
+    "releases/",
+    "research/",
+)
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -983,6 +993,39 @@ def render_release_feed(release_index: Dict[str, object]) -> str:
     )
 
 
+def render_sitemap(articles: Sequence[Article]) -> str:
+    """Render canonical human-facing routes without inventing crawl metadata."""
+
+    ET.register_namespace("", SITEMAP_NAMESPACE)
+    sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
+    public_paths = [
+        *CORE_PUBLIC_PAGE_PATHS,
+        *[article.public_path for article in articles],
+    ]
+    if len(public_paths) != len(set(public_paths)):
+        fail("reviewed sitemap routes are not unique")
+    for public_path in public_paths:
+        url = ET.SubElement(sitemap, f"{{{SITEMAP_NAMESPACE}}}url")
+        ET.SubElement(url, f"{{{SITEMAP_NAMESPACE}}}loc").text = (
+            PUBLIC_SITE_URL + public_path
+        )
+    ET.indent(sitemap, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(sitemap, encoding="unicode", short_empty_elements=True)
+    )
+
+
+def render_robots() -> str:
+    """Render the exact public crawl policy and canonical sitemap locator."""
+
+    return (
+        "User-agent: *\n"
+        "Allow: /\n"
+        f"Sitemap: {PUBLIC_SITE_URL}sitemap.xml"
+    )
+
+
 def render_capability_catalog(
     catalog: Dict[str, object], articles: Sequence[Article]
 ) -> Tuple[str, Dict[str, object]]:
@@ -1372,6 +1415,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         ],
     }
     write_page(output, "research/index.json", json.dumps(public_index, indent=2, ensure_ascii=False))
+    write_page(output, "sitemap.xml", render_sitemap(articles))
     write_page(
         output,
         "llms.txt",
@@ -1386,11 +1430,13 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /releases/: reviewed public milestones and unchanged boundaries\n"
         "- /releases/index.json: machine-readable release ledger\n"
         "- /releases/feed.atom: Atom feed of reviewed public milestones\n"
+        "- /sitemap.xml: reviewed human-facing page inventory\n"
+        "- /robots.txt: crawl policy and sitemap location\n"
         "- /research/: dated technical notes\n\n"
         "## Published notes\n"
         + "\n".join(f"- /{article.public_path}: {article.title}" for article in articles),
     )
-    write_page(output, "robots.txt", "User-agent: *\nAllow: /\n")
+    write_page(output, "robots.txt", render_robots())
     write_page(
         output,
         "404.html",

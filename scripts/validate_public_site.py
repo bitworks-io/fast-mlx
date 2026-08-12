@@ -43,8 +43,30 @@ RELEASE_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})"
 )
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
 MAX_RELEASE_FEED_BYTES = 1_048_576
+MAX_SITEMAP_BYTES = 1_048_576
+MAX_ROBOTS_BYTES = 4_096
+CORE_PUBLIC_PAGE_PATHS = (
+    "",
+    "process/",
+    "methodology/",
+    "capabilities/",
+    "benchmarks/",
+    "releases/",
+    "research/",
+)
+REVIEWED_ARTICLE_PATHS = (
+    "research/the-proof-did-not-end-when-the-timer-did/",
+    "research/the-fastest-request-wasnt-the-fastest-service/",
+    "research/lossless-wasnt-byte-identical/",
+    "research/when-zero-speculation-costs-two-percent/",
+    "research/turboquant-exact-math-still-lost/",
+    "research/trusting-the-instrument/",
+    "research/the-wall-that-wasnt/",
+)
+SITEMAP_ARTICLE_PATH = re.compile(r"research/[a-z0-9]+(?:-[a-z0-9]+)*/")
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -604,6 +626,89 @@ def validate_release_feed(site: Path, release_index: Dict[str, object]) -> List[
     return failures
 
 
+def render_expected_sitemap(article_paths: Sequence[str]) -> str:
+    """Recreate the one canonical sitemap accepted by the Pages validator."""
+
+    ET.register_namespace("", SITEMAP_NAMESPACE)
+    sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
+    for public_path in (*CORE_PUBLIC_PAGE_PATHS, *article_paths):
+        url = ET.SubElement(sitemap, f"{{{SITEMAP_NAMESPACE}}}url")
+        ET.SubElement(url, f"{{{SITEMAP_NAMESPACE}}}loc").text = (
+            PUBLIC_SITE_URL + public_path
+        )
+    ET.indent(sitemap, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(sitemap, encoding="unicode", short_empty_elements=True)
+        + "\n"
+    )
+
+
+def validate_sitemap(site: Path) -> List[str]:
+    failures: List[str] = []
+    sitemap_path = site / "sitemap.xml"
+    if sitemap_path.is_symlink() or not sitemap_path.is_file():
+        return ["sitemap.xml must be a regular non-symlink file"]
+    try:
+        sitemap_size = sitemap_path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat sitemap.xml: {exc}"]
+    if sitemap_size > MAX_SITEMAP_BYTES:
+        return ["sitemap.xml exceeds the 1048576-byte limit"]
+    try:
+        raw_sitemap = sitemap_path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read sitemap.xml: {exc}"]
+    if len(raw_sitemap) > MAX_SITEMAP_BYTES:
+        return ["sitemap.xml exceeds the 1048576-byte limit"]
+    try:
+        sitemap_text = raw_sitemap.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"sitemap.xml is not UTF-8: {exc}"]
+    upper_sitemap = sitemap_text.upper()
+    if "<!DOCTYPE" in upper_sitemap or "<!ENTITY" in upper_sitemap:
+        return ["sitemap.xml contains a forbidden XML declaration"]
+    try:
+        sitemap = ET.fromstring(sitemap_text)
+    except ET.ParseError as exc:
+        return [f"invalid sitemap.xml: {exc}"]
+    if sitemap.tag != f"{{{SITEMAP_NAMESPACE}}}urlset":
+        failures.append("sitemap.xml is not a Sitemap protocol urlset")
+    if sitemap_text != render_expected_sitemap(REVIEWED_ARTICLE_PATHS):
+        failures.append("sitemap.xml does not match reviewed public routes")
+    return failures
+
+
+def validate_robots(site: Path) -> List[str]:
+    robots_path = site / "robots.txt"
+    if robots_path.is_symlink() or not robots_path.is_file():
+        return ["robots.txt must be a regular non-symlink file"]
+    try:
+        robots_size = robots_path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat robots.txt: {exc}"]
+    if robots_size > MAX_ROBOTS_BYTES:
+        return ["robots.txt exceeds the 4096-byte limit"]
+    try:
+        raw_robots = robots_path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read robots.txt: {exc}"]
+    if len(raw_robots) > MAX_ROBOTS_BYTES:
+        return ["robots.txt exceeds the 4096-byte limit"]
+    try:
+        robots_text = raw_robots.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"robots.txt is not UTF-8: {exc}"]
+    expected = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        f"Sitemap: {PUBLIC_SITE_URL}sitemap.xml\n"
+    )
+    if robots_text != expected:
+        return ["robots.txt does not match the canonical crawl policy"]
+    return []
+
+
 def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[str]:
     failures: List[str] = []
     release_path = site / "releases/index.html"
@@ -729,6 +834,8 @@ def validate(site: Path) -> List[str]:
         "releases/feed.atom",
         "research/index.html",
         "research/index.json",
+        "sitemap.xml",
+        "robots.txt",
         "assets/site.css",
         "assets/benchmark-explorer.js",
         "assets/favicon.svg",
@@ -750,6 +857,7 @@ def validate(site: Path) -> List[str]:
     if release_index is not None and (site / "releases/feed.atom").is_file():
         failures.extend(validate_release_feed(site, release_index))
 
+    sitemap_article_paths: List[str] = []
     index_path = site / "research/index.json"
     if index_path.is_file():
         try:
@@ -757,16 +865,45 @@ def validate(site: Path) -> List[str]:
         except json.JSONDecodeError as exc:
             failures.append(f"invalid research/index.json: {exc}")
         else:
-            if index.get("schemaVersion") != 1:
+            if not isinstance(index, dict):
+                failures.append("research/index.json is not an object")
+            elif index.get("schemaVersion") != 1:
                 failures.append("research/index.json does not use schemaVersion 1")
-            articles = index.get("articles", [])
-            if not isinstance(articles, list) or not articles:
-                failures.append("research/index.json has no articles")
             else:
-                for article in articles:
-                    path = article.get("path") if isinstance(article, dict) else None
-                    if not isinstance(path, str) or not (site / path / "index.html").is_file():
-                        failures.append(f"missing article page for index entry: {path!r}")
+                articles = index.get("articles", [])
+                if not isinstance(articles, list) or not articles:
+                    failures.append("research/index.json has no articles")
+                else:
+                    seen_article_paths: set[str] = set()
+                    for article in articles:
+                        path = article.get("path") if isinstance(article, dict) else None
+                        if (
+                            not isinstance(path, str)
+                            or not SITEMAP_ARTICLE_PATH.fullmatch(path)
+                            or path in seen_article_paths
+                        ):
+                            failures.append(
+                                f"invalid or duplicate article path in index entry: {path!r}"
+                            )
+                            continue
+                        seen_article_paths.add(path)
+                        sitemap_article_paths.append(path)
+                        if not (site / path / "index.html").is_file():
+                            failures.append(
+                                f"missing article page for index entry: {path!r}"
+                            )
+
+                    if tuple(sitemap_article_paths) != REVIEWED_ARTICLE_PATHS:
+                        failures.append(
+                            "research/index.json does not match reviewed article routes"
+                        )
+
+    sitemap_path = site / "sitemap.xml"
+    if sitemap_path.exists() or sitemap_path.is_symlink():
+        failures.extend(validate_sitemap(site))
+    robots_path = site / "robots.txt"
+    if robots_path.exists() or robots_path.is_symlink():
+        failures.extend(validate_robots(site))
 
     capability_index_path = site / "capabilities/index.json"
     if capability_index_path.is_file():

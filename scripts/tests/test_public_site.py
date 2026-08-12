@@ -144,6 +144,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "35e751a0a867d187014251b519eebbb17291fd88",
                 "195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
                 "555514986cdd17ca921c9d9607a92d6248734fdd",
                 "3894c324dc69baf428b9fe54d1770a234467dfbd",
@@ -503,6 +504,221 @@ class PublicSiteTests(unittest.TestCase):
                 self.assertIn(f'id="release-{release["id"]}"', release_page)
             llms = (output / "llms.txt").read_text(encoding="utf-8")
             self.assertIn("/releases/feed.atom", llms)
+
+    def test_site_discovery_contract_is_generated_from_reviewed_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            articles = build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            sitemap_path = output / "sitemap.xml"
+            sitemap_text = sitemap_path.read_text(encoding="utf-8")
+            sitemap = ET.fromstring(sitemap_text)
+            namespace = "http://www.sitemaps.org/schemas/sitemap/0.9"
+            expected_paths = [
+                "",
+                "process/",
+                "methodology/",
+                "capabilities/",
+                "benchmarks/",
+                "releases/",
+                "research/",
+                *[article.public_path for article in articles],
+            ]
+            expected_urls = [
+                "https://bitworks-io.github.io/fast-mlx/" + path
+                for path in expected_paths
+            ]
+
+            self.assertTrue(
+                sitemap_text.startswith('<?xml version="1.0" encoding="utf-8"?>')
+            )
+            self.assertEqual(sitemap.tag, f"{{{namespace}}}urlset")
+            self.assertEqual(
+                [
+                    element.text
+                    for element in sitemap.findall(
+                        f"{{{namespace}}}url/{{{namespace}}}loc"
+                    )
+                ],
+                expected_urls,
+            )
+            self.assertEqual(len(expected_urls), 14)
+            self.assertNotIn("index.json", sitemap_text)
+            self.assertNotIn("feed.atom", sitemap_text)
+            self.assertNotIn("llms.txt", sitemap_text)
+            self.assertNotIn("404.html", sitemap_text)
+
+            self.assertEqual(
+                (output / "robots.txt").read_text(encoding="utf-8"),
+                "User-agent: *\n"
+                "Allow: /\n"
+                "Sitemap: https://bitworks-io.github.io/fast-mlx/sitemap.xml\n",
+            )
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn("/sitemap.xml", llms)
+            self.assertIn("/robots.txt", llms)
+
+    def test_site_discovery_contract_is_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, first)
+            build_public_site.build_site(REPOSITORY_ROOT, second)
+
+            self.assertEqual(
+                (first / "sitemap.xml").read_bytes(),
+                (second / "sitemap.xml").read_bytes(),
+            )
+            self.assertEqual(
+                (first / "robots.txt").read_bytes(),
+                (second / "robots.txt").read_bytes(),
+            )
+
+    def test_validator_rejects_joint_index_and_sitemap_route_drift(self) -> None:
+        for mutation in ("omit", "substitute"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                index_path = output / "research/index.json"
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                articles = index["articles"]
+                original_path = articles[-1]["path"]
+
+                if mutation == "omit":
+                    articles.pop()
+                else:
+                    substituted_path = "research/unreviewed-note/"
+                    articles[-1]["path"] = substituted_path
+                    substituted_page = output / substituted_path / "index.html"
+                    substituted_page.parent.mkdir(parents=True)
+                    substituted_page.write_bytes(
+                        (output / original_path / "index.html").read_bytes()
+                    )
+
+                article_paths = [article["path"] for article in articles]
+                index_path.write_text(
+                    json.dumps(index, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                (output / "sitemap.xml").write_text(
+                    validate_public_site.render_expected_sitemap(article_paths),
+                    encoding="utf-8",
+                )
+
+                self.assertIn(
+                    "research/index.json does not match reviewed article routes",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_discovery_contract_tampering(self) -> None:
+        mutations = (
+            (
+                "sitemap route",
+                "sitemap.xml",
+                lambda text: text.replace(
+                    "https://bitworks-io.github.io/fast-mlx/process/",
+                    "https://example.invalid/unreviewed/",
+                    1,
+                ),
+                "sitemap.xml does not match reviewed public routes",
+            ),
+            (
+                "sitemap DTD",
+                "sitemap.xml",
+                lambda text: text.replace(
+                    "?>",
+                    '?>\n<!DOCTYPE urlset [<!ENTITY injected "not-reviewed">]>',
+                    1,
+                ),
+                "sitemap.xml contains a forbidden XML declaration",
+            ),
+            (
+                "sitemap size",
+                "sitemap.xml",
+                lambda _text: " " * 1_048_577,
+                "sitemap.xml exceeds the 1048576-byte limit",
+            ),
+            (
+                "robots sitemap",
+                "robots.txt",
+                lambda text: text.replace(
+                    "https://bitworks-io.github.io/fast-mlx/sitemap.xml",
+                    "https://example.invalid/sitemap.xml",
+                    1,
+                ),
+                "robots.txt does not match the canonical crawl policy",
+            ),
+            (
+                "robots size",
+                "robots.txt",
+                lambda _text: " " * 4_097,
+                "robots.txt exceeds the 4096-byte limit",
+            ),
+        )
+        for label, relative, mutate, expected in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / relative
+                original = path.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(mutated, original)
+                path.write_text(mutated, encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
+    def test_validator_rejects_discovery_contract_symlinks_before_read(self) -> None:
+        for relative in ("sitemap.xml", "robots.txt"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / relative
+                external = root / ("external-" + relative)
+                external.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                path.unlink()
+                path.symlink_to(external)
+
+                self.assertIn(
+                    f"{relative} must be a regular non-symlink file",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_non_utf8_discovery_contract(self) -> None:
+        for relative, expected in (
+            ("sitemap.xml", "sitemap.xml is not UTF-8"),
+            ("robots.txt", "robots.txt is not UTF-8"),
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                (output / relative).write_bytes(b"\xff\xfe\xfd")
+
+                self.assertTrue(
+                    any(
+                        failure.startswith(expected)
+                        for failure in validate_public_site.validate(output)
+                    )
+                )
+
+    def test_validator_requires_discovery_contract_outputs(self) -> None:
+        for missing in ("sitemap.xml", "robots.txt"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                (output / missing).unlink()
+                self.assertIn(
+                    f"missing required file: {missing}",
+                    validate_public_site.validate(output),
+                )
 
     def test_release_atom_feed_is_deterministic_and_xml_safe(self) -> None:
         manifest = self.release_manifest()

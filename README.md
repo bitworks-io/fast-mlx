@@ -84,6 +84,11 @@ building. These surfaces are discoverability metadata for public milestones and 
 boundaries; they do not grant runtime authority, publish new benchmark claims, or replace the
 capability/evidence review gates.
 
+[`/sitemap.xml`](https://bitworks-io.github.io/fast-mlx/sitemap.xml) inventories only the reviewed
+human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/robots.txt) points
+crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
+an external-content intake path, or a second publication authority.
+
 Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 [CONTRIBUTING.md](CONTRIBUTING.md) for the research-to-release workflow.
 

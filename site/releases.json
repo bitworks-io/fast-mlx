@@ -16,6 +16,22 @@
   },
   "releases": [
     {
+      "id": "reviewed-release-atom-feed",
+      "title": "Publish reviewed release Atom feed",
+      "publishedAt": "2026-08-12T00:19:55-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Publishes a deterministic Atom 1.0 subscription feed derived only from the reviewed release ledger.",
+      "scope": "Static reviewed-release discoverability only; no external ingestion, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "35e751a0a867d187014251b519eebbb17291fd88",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        }
+      ]
+    },
+    {
       "id": "reviewed-release-ledger",
       "title": "Publish reviewed release ledger",
       "publishedAt": "2026-08-11T23:44:55-05:00",
