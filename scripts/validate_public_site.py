@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html.parser
 import json
 import posixpath
@@ -45,6 +46,18 @@ RELEASE_TIMESTAMP = re.compile(
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
+SOCIAL_CARD_PATH = "assets/social-card.png"
+SOCIAL_CARD_URL = PUBLIC_SITE_URL + SOCIAL_CARD_PATH
+SOCIAL_CARD_ALT = (
+    "Abstract emerald data loop connecting research, implementation, testing, "
+    "and verified release checkpoints."
+)
+SOCIAL_CARD_SHA256 = (
+    "aa4eaaa35a0dc2280752aab92e6731300e63d272cc5ba6340e0b626f5be610e0"
+)
+SOCIAL_CARD_BYTES = 1_011_297
+SOCIAL_CARD_WIDTH = 1_200
+SOCIAL_CARD_HEIGHT = 630
 MAX_RELEASE_FEED_BYTES = 1_048_576
 MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
@@ -66,7 +79,96 @@ REVIEWED_ARTICLE_PATHS = (
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
 )
+REVIEWED_PAGE_METADATA: Dict[
+    str, Tuple[str, str, str, Optional[str]]
+] = {
+    "": (
+        "fast-mlx — evidence-gated MLX inference",
+        "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+        "website",
+        None,
+    ),
+    "process/": (
+        "The improvement loop — fast-mlx",
+        "How fast-mlx turns research into reviewed, testable inference capabilities.",
+        "website",
+        None,
+    ),
+    "methodology/": (
+        "Methodology — fast-mlx",
+        "The correctness, comparability, and public-claim boundaries behind fast-mlx results.",
+        "website",
+        None,
+    ),
+    "capabilities/": (
+        "Capabilities & evidence — fast-mlx",
+        "A status-aware inventory of fast-mlx features and scoped measured results.",
+        "website",
+        None,
+    ),
+    "benchmarks/": (
+        "Benchmark explorer — fast-mlx",
+        "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
+        "website",
+        None,
+    ),
+    "releases/": (
+        "Releases — fast-mlx",
+        "A reviewed ledger of fast-mlx public milestones, exact commits, shipped surfaces, and unchanged boundaries.",
+        "website",
+        None,
+    ),
+    "research/": (
+        "Research notes — fast-mlx",
+        "Dated fast-mlx investigations and measured negative results.",
+        "website",
+        None,
+    ),
+    "research/the-proof-did-not-end-when-the-timer-did/": (
+        "The proof did not end when the timer did — fast-mlx",
+        "A short benchmark can show that continuous batching works. It cannot show that an HTTP service keeps cleaning up after disappearing clients for a full day.",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Serving big models on Apple Silicon; Rapid research integration — the flywheel",
+    ),
+    "research/the-fastest-request-wasnt-the-fastest-service/": (
+        "The fastest request wasn't the fastest service — fast-mlx",
+        "On an Apple M5 Max at one request, our fastest exact path was prompt-lookup decoding. Qwen3-32B-4bit generated 28.30 tokens per second with PLD, versus 26.72 through the new continuous-batching runtime. If we had…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel",
+    ),
+    "research/lossless-wasnt-byte-identical/": (
+        "“Lossless” wasn't byte-identical: the speculative decoder that failed at generated index seven — fast-mlx",
+        "EAGLE-3 looked like the trained speculative decoder we had been waiting for. A public Qwen3-32B checkpoint matched our production-size target. The draft head was only one decoder layer. Its published algorithm was…",
+        "article",
+        "Rapid research integration — the flywheel; Building a high-performance MLX engine in Swift",
+    ),
+    "research/when-zero-speculation-costs-two-percent/": (
+        "When zero speculation costs 2%: making a 2× decoder safe to leave on — fast-mlx",
+        "Prompt-lookup decoding had already given us the result every inference team wants: nearly twice the decode throughput, with byte-identical output. On a repetition-heavy agent prompt, Qwen3-32B-4bit rose from about 28…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel",
+    ),
+    "research/turboquant-exact-math-still-lost/": (
+        "We implemented Google's TurboQuant exactly, matched the paper's error tables — and it still lost to plain 4-bit quantization — fast-mlx",
+        "The KV cache is the memory bill for long context. On Qwen3-32B, every token you keep costs 256 KiB of fp16 keys and values — 64 layers × 8 KV heads × 128 dims × 2 tensors. At a 24K-token context that's 6 GB per…",
+        "article",
+        "The optimization dial — quantified precision-loss tuning; Building a high-performance MLX engine in Swift",
+    ),
+    "research/trusting-the-instrument/": (
+        "Who measures the measurer? Auditing a precision-loss harness that was quietly lying — fast-mlx",
+        "fast-mlx's product isn't raw speed — it's a dial: turn up the compression, and see exactly how much accuracy you trade. That promise lives or dies on one thing — the instrument that produces the \"how much accuracy\"…",
+        "article",
+        "The optimization dial — quantified precision-loss tuning",
+    ),
+    "research/the-wall-that-wasnt/": (
+        "The 7K wall that wasn't: jetsam forensics, a quadratic allocator, and the statistic hiding in the tail — fast-mlx",
+        "Our precision-loss harness had just been hardened — teacher-forced KL, perplexity, a versioned corpus, provenance records. Then it hit a wall: any measurement past roughly 7,000 tokens of context died with a SIGKILL…",
+        "article",
+        "The optimization dial — quantified precision-loss tuning",
+    ),
+}
 SITEMAP_ARTICLE_PATH = re.compile(r"research/[a-z0-9]+(?:-[a-z0-9]+)*/")
+HTML_LIKE_SUFFIXES = {".html", ".htm"}
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -107,6 +209,63 @@ class LinkCollector(html.parser.HTMLParser):
         for key, value in attrs:
             if key == attribute and value:
                 self.links.append(value)
+
+
+class HeadMetadataCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.canonicals: List[str] = []
+        self.properties: Dict[str, List[str]] = {}
+        self.metadata_outside_head = False
+        self.invalid_head_structure = False
+        self._in_head = False
+        self._head_seen = False
+        self._body_started = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag == "head":
+            if self._head_seen or self._body_started:
+                self.invalid_head_structure = True
+                self._in_head = False
+            else:
+                self._head_seen = True
+                self._in_head = True
+            return
+        if tag == "body":
+            self._body_started = True
+            self._in_head = False
+        attribute_names = [name.casefold() for name, _value in attrs]
+        if tag in {"link", "meta"} and len(attribute_names) != len(
+            set(attribute_names)
+        ):
+            self.invalid_head_structure = True
+        attributes = dict(attrs)
+        rel_tokens = {
+            token.casefold()
+            for token in (attributes.get("rel") or "").split()
+        }
+        is_canonical = tag == "link" and "canonical" in rel_tokens
+        property_name = attributes.get("property") if tag == "meta" else None
+        is_social = isinstance(property_name, str) and (
+            property_name.casefold().startswith("og:")
+            or property_name.casefold().startswith("article:")
+        )
+        if not is_canonical and not is_social:
+            return
+        if not self._in_head:
+            self.metadata_outside_head = True
+        if is_canonical:
+            href = attributes.get("href")
+            self.canonicals.append(href if isinstance(href, str) else "")
+        if is_social and isinstance(property_name, str):
+            content = attributes.get("content")
+            self.properties.setdefault(property_name, []).append(
+                content if isinstance(content, str) else ""
+            )
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "head":
+            self._in_head = False
 
 
 class BenchmarkCollector(html.parser.HTMLParser):
@@ -709,6 +868,126 @@ def validate_robots(site: Path) -> List[str]:
     return []
 
 
+def validate_social_card(site: Path) -> List[str]:
+    path = site / SOCIAL_CARD_PATH
+    if path.is_symlink() or not path.is_file():
+        return [f"{SOCIAL_CARD_PATH} must be a regular non-symlink file"]
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat {SOCIAL_CARD_PATH}: {exc}"]
+    if size != SOCIAL_CARD_BYTES:
+        return [f"{SOCIAL_CARD_PATH} has the wrong byte count"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read {SOCIAL_CARD_PATH}: {exc}"]
+    if len(raw) != SOCIAL_CARD_BYTES:
+        return [f"{SOCIAL_CARD_PATH} has the wrong byte count"]
+    if hashlib.sha256(raw).hexdigest() != SOCIAL_CARD_SHA256:
+        return [f"{SOCIAL_CARD_PATH} has the wrong SHA-256"]
+    if (
+        raw[:8] != b"\x89PNG\r\n\x1a\n"
+        or raw[8:12] != (13).to_bytes(4, "big")
+        or raw[12:16] != b"IHDR"
+        or int.from_bytes(raw[16:20], "big") != SOCIAL_CARD_WIDTH
+        or int.from_bytes(raw[20:24], "big") != SOCIAL_CARD_HEIGHT
+        or raw[24] != 8
+        or raw[25] != 2
+    ):
+        return [f"{SOCIAL_CARD_PATH} is not the reviewed 1200x630 RGB PNG"]
+    return []
+
+
+def expected_social_properties(
+    public_path: str,
+    metadata: Tuple[str, str, str, Optional[str]],
+) -> Dict[str, List[str]]:
+    title, description, page_type, article_section = metadata
+    canonical = PUBLIC_SITE_URL + public_path
+    properties = {
+        "og:title": [title],
+        "og:type": [page_type],
+        "og:image": [SOCIAL_CARD_URL],
+        "og:image:width": [str(SOCIAL_CARD_WIDTH)],
+        "og:image:height": [str(SOCIAL_CARD_HEIGHT)],
+        "og:image:alt": [SOCIAL_CARD_ALT],
+        "og:url": [canonical],
+        "og:description": [description],
+        "og:site_name": ["fast-mlx"],
+    }
+    if page_type == "article":
+        if article_section is None:
+            raise ValueError(f"incomplete reviewed article metadata for {public_path}")
+        properties["article:section"] = [article_section]
+    elif article_section is not None:
+        raise ValueError(f"article metadata attached to core page {public_path}")
+    return properties
+
+
+def validate_reviewed_head_metadata(site: Path) -> List[str]:
+    failures: List[str] = []
+    expected_files = {
+        (public_path + "index.html") if public_path else "index.html": public_path
+        for public_path in REVIEWED_PAGE_METADATA
+    }
+    allowed_html_files = set(expected_files) | {"404.html"}
+    actual_html_files = {
+        path.relative_to(site).as_posix()
+        for path in site.rglob("*")
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and path.suffix.casefold() in HTML_LIKE_SUFFIXES
+        )
+    }
+    for relative in sorted(actual_html_files - allowed_html_files):
+        failures.append(
+            f"unexpected HTML page outside the reviewed route set: {relative}"
+        )
+
+    for relative, public_path in expected_files.items():
+        path = site / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        collector = HeadMetadataCollector()
+        try:
+            collector.feed(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            failures.append(f"cannot parse {relative} metadata: {exc}")
+            continue
+        canonical = PUBLIC_SITE_URL + public_path
+        expected_properties = expected_social_properties(
+            public_path, REVIEWED_PAGE_METADATA[public_path]
+        )
+        if (
+            collector.invalid_head_structure
+            or collector.metadata_outside_head
+            or collector.canonicals != [canonical]
+            or collector.properties != expected_properties
+        ):
+            failures.append(f"{relative} metadata does not match reviewed contract")
+
+    not_found = site / "404.html"
+    if not_found.is_file() and not not_found.is_symlink():
+        collector = HeadMetadataCollector()
+        try:
+            collector.feed(not_found.read_text(encoding="utf-8"))
+        except Exception as exc:
+            failures.append(f"cannot parse 404.html metadata: {exc}")
+        else:
+            if (
+                collector.invalid_head_structure
+                or collector.metadata_outside_head
+                or collector.canonicals
+                or collector.properties
+            ):
+                failures.append(
+                    "404.html must not publish canonical or social metadata"
+                )
+    return failures
+
+
 def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[str]:
     failures: List[str] = []
     release_path = site / "releases/index.html"
@@ -839,12 +1118,16 @@ def validate(site: Path) -> List[str]:
         "assets/site.css",
         "assets/benchmark-explorer.js",
         "assets/favicon.svg",
+        SOCIAL_CARD_PATH,
         "llms.txt",
         ".nojekyll",
     ]
     for relative in required:
         if not (site / relative).is_file():
             failures.append(f"missing required file: {relative}")
+
+    failures.extend(validate_social_card(site))
+    failures.extend(validate_reviewed_head_metadata(site))
 
     expected_benchmark_cards: Dict[str, Dict[str, str]] = {}
 
@@ -1143,6 +1426,8 @@ def validate(site: Path) -> List[str]:
             continue
         if not path.is_file():
             continue
+        if path.relative_to(site).as_posix() == SOCIAL_CARD_PATH:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -1153,7 +1438,7 @@ def validate(site: Path) -> List[str]:
                 failures.append(
                     f"private marker {marker!r} in {path.relative_to(site)}"
                 )
-        if path.suffix != ".html":
+        if path.suffix.casefold() not in HTML_LIKE_SUFFIXES:
             continue
         collector = LinkCollector()
         try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html.parser
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,27 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import build_public_site  # noqa: E402
 import validate_public_site  # noqa: E402
+
+
+class HeadMetadataCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.canonicals: list[str] = []
+        self.properties: dict[str, list[str]] = {}
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = dict(attrs)
+        if tag == "link" and attributes.get("rel") == "canonical":
+            href = attributes.get("href")
+            if href is not None:
+                self.canonicals.append(href)
+        if tag == "meta" and attributes.get("property"):
+            name = attributes["property"]
+            content = attributes.get("content")
+            if content is not None:
+                self.properties.setdefault(name, []).append(content)
 
 
 class PublicSiteTests(unittest.TestCase):
@@ -144,6 +167,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "df2b067391cec755cb9ec0e6f87097b8c8d6537a",
                 "35e751a0a867d187014251b519eebbb17291fd88",
                 "195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
                 "555514986cdd17ca921c9d9607a92d6248734fdd",
@@ -558,6 +582,317 @@ class PublicSiteTests(unittest.TestCase):
             llms = (output / "llms.txt").read_text(encoding="utf-8")
             self.assertIn("/sitemap.xml", llms)
             self.assertIn("/robots.txt", llms)
+
+    def test_reviewed_pages_publish_exact_social_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            articles = build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            expected: dict[str, tuple[str, str, str, str | None]] = {
+                "": (
+                    "fast-mlx — evidence-gated MLX inference",
+                    "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+                    "website",
+                    None,
+                ),
+                "process/": (
+                    "The improvement loop — fast-mlx",
+                    "How fast-mlx turns research into reviewed, testable inference capabilities.",
+                    "website",
+                    None,
+                ),
+                "methodology/": (
+                    "Methodology — fast-mlx",
+                    "The correctness, comparability, and public-claim boundaries behind fast-mlx results.",
+                    "website",
+                    None,
+                ),
+                "capabilities/": (
+                    "Capabilities & evidence — fast-mlx",
+                    "A status-aware inventory of fast-mlx features and scoped measured results.",
+                    "website",
+                    None,
+                ),
+                "benchmarks/": (
+                    "Benchmark explorer — fast-mlx",
+                    "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
+                    "website",
+                    None,
+                ),
+                "releases/": (
+                    "Releases — fast-mlx",
+                    "A reviewed ledger of fast-mlx public milestones, exact commits, shipped surfaces, and unchanged boundaries.",
+                    "website",
+                    None,
+                ),
+                "research/": (
+                    "Research notes — fast-mlx",
+                    "Dated fast-mlx investigations and measured negative results.",
+                    "website",
+                    None,
+                ),
+            }
+            expected.update(
+                {
+                    article.public_path: (
+                        f"{article.title} — fast-mlx",
+                        article.summary,
+                        "article",
+                        article.theme,
+                    )
+                    for article in articles
+                }
+            )
+
+            self.assertEqual(len(expected), 14)
+            self.assertEqual(
+                tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
+            )
+            image_url = (
+                "https://bitworks-io.github.io/fast-mlx/assets/social-card.png"
+            )
+            image_alt = (
+                "Abstract emerald data loop connecting research, implementation, "
+                "testing, and verified release checkpoints."
+            )
+            for public_path, (
+                title,
+                description,
+                page_type,
+                section,
+            ) in expected.items():
+                with self.subTest(public_path=public_path):
+                    page = output / public_path / "index.html"
+                    collector = HeadMetadataCollector()
+                    collector.feed(page.read_text(encoding="utf-8"))
+                    canonical = "https://bitworks-io.github.io/fast-mlx/" + public_path
+                    self.assertEqual(collector.canonicals, [canonical])
+                    self.assertEqual(collector.properties["og:title"], [title])
+                    self.assertEqual(collector.properties["og:type"], [page_type])
+                    self.assertEqual(collector.properties["og:image"], [image_url])
+                    self.assertEqual(collector.properties["og:image:width"], ["1200"])
+                    self.assertEqual(collector.properties["og:image:height"], ["630"])
+                    self.assertEqual(collector.properties["og:image:alt"], [image_alt])
+                    self.assertEqual(collector.properties["og:url"], [canonical])
+                    self.assertEqual(
+                        collector.properties["og:description"], [description]
+                    )
+                    self.assertEqual(
+                        collector.properties["og:site_name"], ["fast-mlx"]
+                    )
+                    if page_type == "article":
+                        self.assertEqual(
+                            collector.properties["article:section"], [section]
+                        )
+                    else:
+                        self.assertFalse(
+                            any(
+                                property_name.startswith("article:")
+                                for property_name in collector.properties
+                            )
+                        )
+
+            self.assertTrue((output / "assets/social-card.png").is_file())
+            not_found = HeadMetadataCollector()
+            not_found.feed((output / "404.html").read_text(encoding="utf-8"))
+            self.assertEqual(not_found.canonicals, [])
+            self.assertEqual(not_found.properties, {})
+
+    def test_validator_rejects_social_metadata_tampering(self) -> None:
+        def move_metadata_into_body(text: str) -> str:
+            start = text.index('    <link rel="canonical"')
+            last_tag = '<meta property="og:site_name" content="fast-mlx">'
+            end = text.index(last_tag, start) + len(last_tag)
+            block = text[start:end]
+            without_metadata = text[:start] + text[end:]
+            return without_metadata.replace(
+                "  <body>", f"  <body>\n    <head>\n{block}\n    </head>", 1
+            )
+
+        mutations = (
+            (
+                "off-origin canonical",
+                "index.html",
+                lambda text: text.replace(
+                    "https://bitworks-io.github.io/fast-mlx/",
+                    "https://example.invalid/unreviewed/",
+                    1,
+                ),
+                "index.html metadata does not match reviewed contract",
+            ),
+            (
+                "metadata in second head after body",
+                "index.html",
+                move_metadata_into_body,
+                "index.html metadata does not match reviewed contract",
+            ),
+            (
+                "off-origin social URL",
+                "process/index.html",
+                lambda text: text.replace(
+                    'property="og:url" content="https://bitworks-io.github.io/fast-mlx/process/"',
+                    'property="og:url" content="https://example.invalid/process/"',
+                    1,
+                ),
+                "process/index.html metadata does not match reviewed contract",
+            ),
+            (
+                "duplicate title",
+                "methodology/index.html",
+                lambda text: text.replace(
+                    '<meta property="og:title"',
+                    '<meta property="og:title" content="Unreviewed duplicate">\n    '
+                    '<meta property="og:title"',
+                    1,
+                ),
+                "methodology/index.html metadata does not match reviewed contract",
+            ),
+            (
+                "article authority on core page",
+                "capabilities/index.html",
+                lambda text: text.replace(
+                    '<meta property="og:site_name" content="fast-mlx">',
+                    '<meta property="og:site_name" content="fast-mlx">\n    '
+                    '<meta property="article:section" content="Unreviewed">',
+                    1,
+                ),
+                "capabilities/index.html metadata does not match reviewed contract",
+            ),
+            (
+                "metadata on not found",
+                "404.html",
+                lambda text: text.replace(
+                    '<meta name="description" content="The requested fast-mlx page was not found.">',
+                    '<meta name="description" content="The requested fast-mlx page was not found.">\n    '
+                    '<link rel="canonical" href="https://bitworks-io.github.io/fast-mlx/404.html">',
+                    1,
+                ),
+                "404.html must not publish canonical or social metadata",
+            ),
+            (
+                "canonical rel token and case bypass on not found",
+                "404.html",
+                lambda text: text.replace(
+                    '<meta name="description" content="The requested fast-mlx page was not found.">',
+                    '<meta name="description" content="The requested fast-mlx page was not found.">\n    '
+                    '<link rel="stylesheet CANONICAL" href="https://bitworks-io.github.io/fast-mlx/404.html">',
+                    1,
+                ),
+                "404.html must not publish canonical or social metadata",
+            ),
+            (
+                "duplicate canonical attribute bypass on not found",
+                "404.html",
+                lambda text: text.replace(
+                    '<meta name="description" content="The requested fast-mlx page was not found.">',
+                    '<meta name="description" content="The requested fast-mlx page was not found.">\n    '
+                    '<link rel="canonical" rel="stylesheet" '
+                    'href="https://bitworks-io.github.io/fast-mlx/404.html">',
+                    1,
+                ),
+                "404.html must not publish canonical or social metadata",
+            ),
+            (
+                "duplicate social property bypass on not found",
+                "404.html",
+                lambda text: text.replace(
+                    '<meta name="description" content="The requested fast-mlx page was not found.">',
+                    '<meta name="description" content="The requested fast-mlx page was not found.">\n    '
+                    '<meta property="og:title" property="not-og" content="Unreviewed">',
+                    1,
+                ),
+                "404.html must not publish canonical or social metadata",
+            ),
+        )
+        for label, relative, mutate, expected in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / relative
+                original = path.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(mutated, original)
+                path.write_text(mutated, encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            unexpected = output / "research/unreviewed-note/index.html"
+            unexpected.parent.mkdir(parents=True)
+            unexpected.write_bytes((output / "index.html").read_bytes())
+            self.assertIn(
+                "unexpected HTML page outside the reviewed route set: "
+                "research/unreviewed-note/index.html",
+                validate_public_site.validate(output),
+            )
+
+        for relative in ("assets/unreviewed.HTML", "assets/unreviewed.htm"):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                unexpected = output / relative
+                unexpected.write_bytes((output / "index.html").read_bytes())
+                self.assertIn(
+                    "unexpected HTML page outside the reviewed route set: " + relative,
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_social_card_tampering(self) -> None:
+        for mutation, expected in (
+            (
+                lambda raw: raw[:-1] + bytes([raw[-1] ^ 1]),
+                "assets/social-card.png has the wrong SHA-256",
+            ),
+            (
+                lambda raw: raw + b"oversized",
+                "assets/social-card.png has the wrong byte count",
+            ),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                card = output / "assets/social-card.png"
+                raw = card.read_bytes()
+                card.write_bytes(mutation(raw))
+                self.assertIn(expected, validate_public_site.validate(output))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            card = output / "assets/social-card.png"
+            external = root / "social-card.png"
+            external.write_bytes(card.read_bytes())
+            card.unlink()
+            card.symlink_to(external)
+            self.assertIn(
+                "assets/social-card.png must be a regular non-symlink file",
+                validate_public_site.validate(output),
+            )
+
+    def test_builder_rejects_unreviewed_social_card_source(self) -> None:
+        for mutation, expected in (
+            (
+                lambda raw: raw[:-1] + bytes([raw[-1] ^ 1]),
+                "wrong SHA-256",
+            ),
+            (lambda raw: raw + b"oversized", "wrong byte count"),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                assets = Path(directory) / "assets"
+                shutil.copytree(REPOSITORY_ROOT / "site/assets", assets)
+                card = assets / "social-card.png"
+                raw = card.read_bytes()
+                card.write_bytes(mutation(raw))
+                with self.assertRaisesRegex(SystemExit, expected):
+                    build_public_site.validate_asset_tree(assets)
 
     def test_site_discovery_contract_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

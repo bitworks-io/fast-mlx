@@ -68,6 +68,15 @@ JSON contracts, the Atom feed, LLM text surfaces, assets, and the 404 page. The 
 submission or network request, and validation rejects route drift, non-UTF-8 or oversized content,
 DTD/entity declarations, symlinks, and non-regular files.
 
+Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
+fourteen-page set. The validator independently pins every page's route, title, description, object
+type, and research-note section instead of accepting generated HTML or `research/index.json` as
+authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
+notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and
+SHA-256-pinned, and `404.html`, JSON, Atom, sitemap, robots, LLM text, and asset endpoints cannot
+become metadata objects. These tags neither create a search-indexing guarantee nor widen benchmark,
+model, acquisition, runtime, or publication authority.
+
 GitHub Pages is downstream of the complete `Public source quality` workflow. It accepts only a
 successful `push` run for `main`, checks out the same validated commit, and exposes no independent
 manual deployment path. The reusable workflow repeats the event and branch check before building.

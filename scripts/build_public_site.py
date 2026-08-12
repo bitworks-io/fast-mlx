@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import html
 import json
 import os
@@ -81,6 +82,18 @@ RELEASE_TIMESTAMP = re.compile(
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
+SOCIAL_CARD_PATH = "assets/social-card.png"
+SOCIAL_CARD_URL = PUBLIC_SITE_URL + SOCIAL_CARD_PATH
+SOCIAL_CARD_ALT = (
+    "Abstract emerald data loop connecting research, implementation, testing, "
+    "and verified release checkpoints."
+)
+SOCIAL_CARD_SHA256 = (
+    "aa4eaaa35a0dc2280752aab92e6731300e63d272cc5ba6340e0b626f5be610e0"
+)
+SOCIAL_CARD_BYTES = 1_011_297
+SOCIAL_CARD_WIDTH = 1_200
+SOCIAL_CARD_HEIGHT = 630
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "process/",
@@ -161,6 +174,33 @@ def validate_asset_tree(assets: Path) -> None:
             fail(f"site asset is a symlink: {path.relative_to(assets)}")
         if not path.is_file() and not path.is_dir():
             fail(f"site asset is not a regular file or directory: {path.relative_to(assets)}")
+    validate_social_card(assets / "social-card.png", "site social card")
+
+
+def validate_social_card(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        fail(f"{label} is missing, not a regular file, or a symlink")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        fail(f"cannot stat {label}: {exc}")
+    if size != SOCIAL_CARD_BYTES:
+        fail(f"{label} has the wrong byte count")
+    raw = path.read_bytes()
+    if len(raw) != SOCIAL_CARD_BYTES:
+        fail(f"{label} has the wrong byte count")
+    if hashlib.sha256(raw).hexdigest() != SOCIAL_CARD_SHA256:
+        fail(f"{label} has the wrong SHA-256")
+    if (
+        raw[:8] != b"\x89PNG\r\n\x1a\n"
+        or raw[8:12] != (13).to_bytes(4, "big")
+        or raw[12:16] != b"IHDR"
+        or int.from_bytes(raw[16:20], "big") != SOCIAL_CARD_WIDTH
+        or int.from_bytes(raw[20:24], "big") != SOCIAL_CARD_HEIGHT
+        or raw[24] != 8
+        or raw[25] != 2
+    ):
+        fail(f"{label} is not the reviewed 1200x630 RGB PNG")
 
 
 def strip_front_matter(text: str) -> Tuple[Dict[str, str], str]:
@@ -800,6 +840,9 @@ def render_template(
     body: str,
     current_page: str = "",
     page_script: str = "",
+    *,
+    public_path: Optional[str] = None,
+    article_section: Optional[str] = None,
 ) -> str:
     nav_root = html.escape(root, quote=True)
 
@@ -810,6 +853,12 @@ def render_template(
     replacements = {
         "{{title}}": html.escape(title),
         "{{description}}": html.escape(description, quote=True),
+        "{{head_metadata}}": render_head_metadata(
+            title,
+            description,
+            public_path,
+            article_section=article_section,
+        ),
         "{{root}}": root,
         "{{body}}": body.replace("{{root}}", root),
         "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
@@ -826,6 +875,42 @@ def render_template(
     if re.search(r"{{[a-zA-Z0-9_]+}}", rendered):
         fail(f"template contains an unresolved token for {title}")
     return rendered
+
+
+def render_head_metadata(
+    title: str,
+    description: str,
+    public_path: Optional[str],
+    *,
+    article_section: Optional[str],
+) -> str:
+    if public_path is None:
+        if article_section is not None:
+            fail("article metadata requires a reviewed public path")
+        return ""
+    if public_path not in CORE_PUBLIC_PAGE_PATHS and not re.fullmatch(
+        r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
+    ):
+        fail(f"invalid metadata public path: {public_path!r}")
+    canonical = PUBLIC_SITE_URL + public_path
+    page_type = "article" if article_section is not None else "website"
+    tags = [
+        f'<link rel="canonical" href="{html.escape(canonical, quote=True)}">',
+        f'<meta property="og:title" content="{html.escape(title, quote=True)}">',
+        f'<meta property="og:type" content="{page_type}">',
+        f'<meta property="og:image" content="{SOCIAL_CARD_URL}">',
+        f'<meta property="og:image:width" content="{SOCIAL_CARD_WIDTH}">',
+        f'<meta property="og:image:height" content="{SOCIAL_CARD_HEIGHT}">',
+        f'<meta property="og:image:alt" content="{html.escape(SOCIAL_CARD_ALT, quote=True)}">',
+        f'<meta property="og:url" content="{html.escape(canonical, quote=True)}">',
+        f'<meta property="og:description" content="{html.escape(description, quote=True)}">',
+        '<meta property="og:site_name" content="fast-mlx">',
+    ]
+    if article_section is not None:
+        tags.append(
+            f'<meta property="article:section" content="{html.escape(article_section, quote=True)}">'
+        )
+    return "\n    ".join(tags)
 
 
 def write_page(output: Path, relative_file: str, contents: str) -> None:
@@ -1267,6 +1352,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
             "",
             home,
+            public_path="",
         ),
     )
 
@@ -1286,7 +1372,15 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             f"{name}/index.html",
-            render_template(template, title, description, "../", fragment, name),
+            render_template(
+                template,
+                title,
+                description,
+                "../",
+                fragment,
+                name,
+                public_path=f"{name}/",
+            ),
         )
 
     capability_body, capability_index = render_capability_catalog(catalog, articles)
@@ -1300,6 +1394,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "../",
             capability_body,
             "capabilities",
+            public_path="capabilities/",
         ),
     )
     write_page(
@@ -1321,6 +1416,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             benchmark_body,
             "benchmarks",
             '<script src="../assets/benchmark-explorer.js" defer></script>',
+            public_path="benchmarks/",
         ),
     )
     release_body, release_index = render_release_catalog(release_catalog)
@@ -1334,6 +1430,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "../",
             release_body,
             "releases",
+            public_path="releases/",
         ),
     )
     write_page(
@@ -1369,6 +1466,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "../",
             "\n".join(cards),
             "research",
+            public_path="research/",
         ),
     )
 
@@ -1395,6 +1493,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
                 "../../",
                 article_body,
                 "research",
+                public_path=article.public_path,
+                article_section=article.theme,
             ),
         )
 
@@ -1453,10 +1553,13 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
 
 
 def scan_generated_output(output: Path) -> None:
+    validate_social_card(output / SOCIAL_CARD_PATH, "generated social card")
     for path in output.rglob("*"):
         if path.is_symlink():
             fail(f"generated site contains a symlink: {path}")
         if not path.is_file():
+            continue
+        if path.relative_to(output).as_posix() == SOCIAL_CARD_PATH:
             continue
         text = path.read_text(encoding="utf-8")
         for marker in PRIVATE_MARKERS:

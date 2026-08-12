@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "reviewed-sitemap-discovery",
+      "title": "Publish reviewed sitemap discovery",
+      "publishedAt": "2026-08-12T01:07:47-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Publishes one deterministic sitemap and robots locator for the exact reviewed human-facing route set.",
+      "scope": "Crawl discovery only; no search submission, indexing guarantee, external ingestion, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "df2b067391cec755cb9ec0e6f87097b8c8d6537a",
+      "publicLinks": [
+        {
+          "label": "Open the research library",
+          "path": "research/"
+        },
+        {
+          "label": "Read the methodology",
+          "path": "methodology/"
+        }
+      ]
+    },
+    {
       "id": "reviewed-release-atom-feed",
       "title": "Publish reviewed release Atom feed",
       "publishedAt": "2026-08-12T00:19:55-05:00",
