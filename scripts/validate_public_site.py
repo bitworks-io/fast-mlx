@@ -10,6 +10,7 @@ import json
 import posixpath
 import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
@@ -41,6 +42,9 @@ SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RELEASE_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})"
 )
+ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
+MAX_RELEASE_FEED_BYTES = 1_048_576
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -187,6 +191,8 @@ class ReleaseCollector(html.parser.HTMLParser):
         }
         self.cards: List[Dict[str, object]] = []
         self.has_json_link = False
+        self.has_atom_link = False
+        self.has_atom_action = False
         self._in_boundary = False
         self._current_card: Optional[Dict[str, object]] = None
 
@@ -200,6 +206,7 @@ class ReleaseCollector(html.parser.HTMLParser):
         elif tag == "article" and "release-card" in classes:
             self._current_card = {
                 "id": attributes.get("data-release-id"),
+                "anchor": attributes.get("id"),
                 "publicCommit": attributes.get("data-public-commit"),
                 "datetime": None,
                 "links": [],
@@ -209,6 +216,20 @@ class ReleaseCollector(html.parser.HTMLParser):
 
         if tag == "a" and attributes.get("href") == "index.json":
             self.has_json_link = True
+        if (
+            tag == "a"
+            and attributes.get("href") == "feed.atom"
+            and attributes.get("type") == "application/atom+xml"
+        ):
+            self.has_atom_action = True
+        if (
+            tag == "link"
+            and attributes.get("rel") == "alternate"
+            and attributes.get("type") == "application/atom+xml"
+            and attributes.get("title") == "fast-mlx reviewed releases"
+            and attributes.get("href") == "../releases/feed.atom"
+        ):
+            self.has_atom_link = True
         if self._in_boundary and tag == "a" and attributes.get("href"):
             links = self.boundary["links"]
             if isinstance(links, list):
@@ -468,6 +489,121 @@ def load_release_index(site: Path) -> Tuple[Optional[Dict[str, object]], List[st
     return release_index, failures
 
 
+def render_expected_release_feed(release_index: Dict[str, object]) -> str:
+    """Recreate the one canonical Atom document accepted by the Pages validator."""
+
+    ET.register_namespace("", ATOM_NAMESPACE)
+    atom = lambda name: f"{{{ATOM_NAMESPACE}}}{name}"
+    feed = ET.Element(atom("feed"))
+    ET.SubElement(feed, atom("title")).text = "fast-mlx reviewed releases"
+    ET.SubElement(feed, atom("id")).text = PUBLIC_SITE_URL + "releases/"
+    releases = release_index["releases"]
+    ET.SubElement(feed, atom("updated")).text = str(releases[0]["publishedAt"])
+    author = ET.SubElement(feed, atom("author"))
+    ET.SubElement(author, atom("name")).text = "fast-mlx contributors"
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "self",
+            "type": "application/atom+xml",
+            "href": PUBLIC_SITE_URL + "releases/feed.atom",
+        },
+    )
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "alternate",
+            "type": "text/html",
+            "href": PUBLIC_SITE_URL + "releases/",
+        },
+    )
+    for release in releases:
+        entry = ET.SubElement(feed, atom("entry"))
+        ET.SubElement(entry, atom("title")).text = str(release["title"])
+        ET.SubElement(entry, atom("id")).text = (
+            "urn:fast-mlx:public-commit:" + str(release["publicCommit"])
+        )
+        ET.SubElement(entry, atom("published")).text = str(release["publishedAt"])
+        ET.SubElement(entry, atom("updated")).text = str(release["publishedAt"])
+        ET.SubElement(
+            entry, atom("category"), {"term": str(release["category"])}
+        )
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {
+                "rel": "alternate",
+                "type": "text/html",
+                "href": (
+                    PUBLIC_SITE_URL
+                    + "releases/#release-"
+                    + str(release["id"])
+                ),
+            },
+        )
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {"rel": "via", "href": str(release["sourceUrl"])},
+        )
+        ET.SubElement(entry, atom("summary")).text = (
+            str(release["summary"]) + " Boundary: " + str(release["scope"])
+        )
+    ET.indent(feed, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(feed, encoding="unicode", short_empty_elements=True)
+        + "\n"
+    )
+
+
+def validate_release_feed(site: Path, release_index: Dict[str, object]) -> List[str]:
+    failures: List[str] = []
+    feed_path = site / "releases/feed.atom"
+    if feed_path.is_symlink() or not feed_path.is_file():
+        return ["releases/feed.atom must be a regular non-symlink file"]
+    try:
+        feed_size = feed_path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat releases/feed.atom: {exc}"]
+    if feed_size > MAX_RELEASE_FEED_BYTES:
+        return ["releases/feed.atom exceeds the 1048576-byte limit"]
+    try:
+        raw_feed = feed_path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read releases/feed.atom: {exc}"]
+    if len(raw_feed) > MAX_RELEASE_FEED_BYTES:
+        return ["releases/feed.atom exceeds the 1048576-byte limit"]
+    try:
+        feed_text = raw_feed.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"releases/feed.atom is not UTF-8: {exc}"]
+    upper_feed = feed_text.upper()
+    if "<!DOCTYPE" in upper_feed or "<!ENTITY" in upper_feed:
+        return ["releases/feed.atom contains a forbidden XML declaration"]
+    try:
+        feed = ET.fromstring(feed_text)
+    except ET.ParseError as exc:
+        return [f"invalid releases/feed.atom: {exc}"]
+    if feed.tag != f"{{{ATOM_NAMESPACE}}}feed":
+        failures.append("releases/feed.atom is not an Atom 1.0 feed")
+
+    releases = release_index.get("releases")
+    if not isinstance(releases, list) or not releases:
+        return failures
+    if not all(isinstance(release, dict) for release in releases):
+        return failures
+    try:
+        expected_feed = render_expected_release_feed(release_index)
+    except (KeyError, IndexError, TypeError):
+        return failures
+    if feed_text != expected_feed:
+        failures.append("releases/feed.atom does not match releases/index.json")
+    return failures
+
+
 def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[str]:
     failures: List[str] = []
     release_path = site / "releases/index.html"
@@ -479,6 +615,10 @@ def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[
 
     if not collector.has_json_link:
         failures.append("releases/index.html does not link to releases/index.json")
+    if not collector.has_atom_link:
+        failures.append("releases/index.html does not advertise releases/feed.atom")
+    if not collector.has_atom_action:
+        failures.append("releases/index.html does not link to releases/feed.atom")
 
     boundary = release_index.get("currentBoundary")
     if isinstance(boundary, dict):
@@ -525,6 +665,8 @@ def validate_release_page(site: Path, release_index: Dict[str, object]) -> List[
         if release is None:
             continue
         commit = release.get("publicCommit")
+        if card.get("anchor") != "release-" + str(identifier):
+            failures.append(f"release page card {identifier!r} has the wrong anchor")
         if card.get("publicCommit") != commit:
             message = "release page card set does not match release ledger"
             if message not in failures:
@@ -584,6 +726,7 @@ def validate(site: Path) -> List[str]:
         "benchmarks/index.html",
         "releases/index.html",
         "releases/index.json",
+        "releases/feed.atom",
         "research/index.html",
         "research/index.json",
         "assets/site.css",
@@ -604,6 +747,8 @@ def validate(site: Path) -> List[str]:
         failures.extend(release_failures)
     if release_index is not None and (site / "releases/index.html").is_file():
         failures.extend(validate_release_page(site, release_index))
+    if release_index is not None and (site / "releases/feed.atom").is_file():
+        failures.extend(validate_release_feed(site, release_index))
 
     index_path = site / "research/index.json"
     if index_path.is_file():

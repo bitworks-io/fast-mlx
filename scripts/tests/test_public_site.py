@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -143,6 +144,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
                 "555514986cdd17ca921c9d9607a92d6248734fdd",
                 "3894c324dc69baf428b9fe54d1770a234467dfbd",
                 "a39393451848eedc62e035ddee5ef00d0364ca62",
@@ -395,8 +397,198 @@ class PublicSiteTests(unittest.TestCase):
             self.assertIn("/releases/", llms)
             self.assertIn("/releases/index.json", llms)
 
+    def test_release_atom_feed_is_generated_from_reviewed_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            source = json.loads(
+                (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+            )
+            public_index = json.loads(
+                (output / "releases/index.json").read_text(encoding="utf-8")
+            )
+            feed_path = output / "releases/feed.atom"
+            feed_text = feed_path.read_text(encoding="utf-8")
+            feed = ET.fromstring(feed_text)
+            atom_namespace = "http://www.w3.org/2005/Atom"
+            atom = lambda name: f"{{{atom_namespace}}}{name}"
+
+            self.assertTrue(feed_text.startswith('<?xml version="1.0" encoding="utf-8"?>'))
+            self.assertEqual(feed.tag, atom("feed"))
+            self.assertEqual(feed.findtext(atom("title")), "fast-mlx reviewed releases")
+            self.assertEqual(
+                feed.findtext(atom("id")),
+                "https://bitworks-io.github.io/fast-mlx/releases/",
+            )
+            self.assertEqual(
+                feed.findtext(atom("updated")), source["releases"][0]["publishedAt"]
+            )
+            self.assertEqual(
+                feed.findtext(f"{atom('author')}/{atom('name')}"),
+                "fast-mlx contributors",
+            )
+            feed_links = {
+                link.attrib["rel"]: link.attrib
+                for link in feed.findall(atom("link"))
+            }
+            self.assertEqual(
+                feed_links["self"],
+                {
+                    "rel": "self",
+                    "type": "application/atom+xml",
+                    "href": "https://bitworks-io.github.io/fast-mlx/releases/feed.atom",
+                },
+            )
+            self.assertEqual(
+                feed_links["alternate"],
+                {
+                    "rel": "alternate",
+                    "type": "text/html",
+                    "href": "https://bitworks-io.github.io/fast-mlx/releases/",
+                },
+            )
+
+            entries = feed.findall(atom("entry"))
+            self.assertEqual(len(entries), len(source["releases"]))
+            for entry, release, public_release in zip(
+                entries, source["releases"], public_index["releases"]
+            ):
+                self.assertEqual(
+                    entry.findtext(atom("id")),
+                    "urn:fast-mlx:public-commit:" + release["publicCommit"],
+                )
+                self.assertEqual(entry.findtext(atom("title")), release["title"])
+                self.assertEqual(
+                    entry.findtext(atom("published")), release["publishedAt"]
+                )
+                self.assertEqual(
+                    entry.findtext(atom("updated")), release["publishedAt"]
+                )
+                self.assertEqual(
+                    entry.find(atom("category")).attrib, {"term": release["category"]}
+                )
+                self.assertEqual(
+                    entry.findtext(atom("summary")),
+                    release["summary"] + " Boundary: " + release["scope"],
+                )
+                links = {
+                    link.attrib["rel"]: link.attrib
+                    for link in entry.findall(atom("link"))
+                }
+                self.assertEqual(
+                    links["alternate"],
+                    {
+                        "rel": "alternate",
+                        "type": "text/html",
+                        "href": "https://bitworks-io.github.io/fast-mlx/releases/#release-"
+                        + release["id"],
+                    },
+                )
+                self.assertEqual(
+                    links["via"],
+                    {"rel": "via", "href": public_release["sourceUrl"]},
+                )
+
+            release_page = (output / "releases/index.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                'rel="alternate" type="application/atom+xml" '
+                'title="fast-mlx reviewed releases" href="../releases/feed.atom"',
+                release_page,
+            )
+            for release in source["releases"]:
+                self.assertIn(f'id="release-{release["id"]}"', release_page)
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn("/releases/feed.atom", llms)
+
+    def test_release_atom_feed_is_deterministic_and_xml_safe(self) -> None:
+        manifest = self.release_manifest()
+        manifest["releases"][0]["title"] = "Reviewed <release> & result"
+        manifest["releases"][0]["summary"] = "Keeps A < B & B > C."
+        manifest["releases"][0]["scope"] = 'No "ambient" authority & no <HTML>.'
+        _body, release_index = build_public_site.render_release_catalog(manifest)
+
+        first = build_public_site.render_release_feed(release_index)
+        second = build_public_site.render_release_feed(release_index)
+        self.assertEqual(first, second)
+        self.assertNotIn("<release>", first)
+        self.assertNotIn("<HTML>", first)
+        self.assertIn("Reviewed &lt;release&gt; &amp; result", first)
+        self.assertIn("Keeps A &lt; B &amp; B &gt; C.", first)
+
+        atom = lambda name: f"{{http://www.w3.org/2005/Atom}}{name}"
+        entry = ET.fromstring(first).find(atom("entry"))
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.findtext(atom("title")), "Reviewed <release> & result")
+        self.assertEqual(
+            entry.findtext(atom("summary")),
+            'Keeps A < B & B > C. Boundary: No "ambient" authority & no <HTML>.',
+        )
+
+    def test_validator_rejects_release_atom_tampering(self) -> None:
+        mutations = (
+            (
+                "entry identity",
+                lambda text: text.replace(
+                    "urn:fast-mlx:public-commit:195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
+                    "urn:fast-mlx:public-commit:0000000000000000000000000000000000000000",
+                    1,
+                ),
+                "releases/feed.atom does not match releases/index.json",
+            ),
+            (
+                "XML declaration",
+                lambda text: text.replace(
+                    "?>",
+                    "?>\n<!DOCTYPE feed [<!ENTITY injected \"not-reviewed\">]>",
+                    1,
+                ),
+                "releases/feed.atom contains a forbidden XML declaration",
+            ),
+            (
+                "size limit",
+                lambda _text: " " * 1_048_577,
+                "releases/feed.atom exceeds the 1048576-byte limit",
+            ),
+        )
+        for label, mutate, expected in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                feed_path = output / "releases/feed.atom"
+                original = feed_path.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(mutated, original)
+                feed_path.write_text(mutated, encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
+    def test_validator_rejects_release_atom_symlink_before_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            feed_path = output / "releases/feed.atom"
+            external = root / "external.atom"
+            external.write_text(feed_path.read_text(encoding="utf-8"), encoding="utf-8")
+            feed_path.unlink()
+            feed_path.symlink_to(external)
+
+            self.assertIn(
+                "releases/feed.atom must be a regular non-symlink file",
+                validate_public_site.validate(output),
+            )
+
     def test_validator_requires_release_outputs(self) -> None:
-        for missing in ("releases/index.html", "releases/index.json"):
+        for missing in (
+            "releases/index.html",
+            "releases/index.json",
+            "releases/feed.atom",
+        ):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "site"
                 output.mkdir()

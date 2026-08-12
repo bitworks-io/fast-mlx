@@ -17,6 +17,7 @@ import posixpath
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -77,6 +78,8 @@ COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})"
 )
+ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
+PUBLIC_SITE_URL = "https://bitworks-io.github.io/fast-mlx/"
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -857,6 +860,7 @@ def render_release_catalog(
         '<p class="lede">A generated, newest-first ledger of fast-mlx public milestones. Every entry names the exact public commit, the user-facing surface, and the boundary that stayed in force.</p>',
         '<div class="hero-actions">',
         '<a class="button primary" href="index.json">Read the release JSON</a>',
+        '<a class="button secondary" href="feed.atom" type="application/atom+xml">Subscribe to reviewed releases</a>',
         '<a class="button secondary" href="https://github.com/bitworks-io/fast-mlx/commits/main" rel="noreferrer">Inspect public history</a>',
         '</div>',
         '</section>',
@@ -883,6 +887,7 @@ def render_release_catalog(
             [
                 '<li>',
                 '<article class="release-card" '
+                f'id="release-{html.escape(str(release["id"]), quote=True)}" '
                 f'data-release-id="{html.escape(str(release["id"]), quote=True)}" '
                 f'data-public-commit="{html.escape(commit, quote=True)}">',
                 '<div class="card-topline">',
@@ -905,6 +910,77 @@ def render_release_catalog(
         body.extend(['</div>', '</article>', '</li>'])
     body.extend(['</ol>', '</section>'])
     return "\n".join(body), public_index
+
+
+def render_release_feed(release_index: Dict[str, object]) -> str:
+    """Render a deterministic Atom 1.0 feed from the reviewed public release index."""
+
+    ET.register_namespace("", ATOM_NAMESPACE)
+    atom = lambda name: f"{{{ATOM_NAMESPACE}}}{name}"
+    feed = ET.Element(atom("feed"))
+    ET.SubElement(feed, atom("title")).text = "fast-mlx reviewed releases"
+    ET.SubElement(feed, atom("id")).text = PUBLIC_SITE_URL + "releases/"
+    releases = release_index["releases"]
+    ET.SubElement(feed, atom("updated")).text = str(releases[0]["publishedAt"])
+    author = ET.SubElement(feed, atom("author"))
+    ET.SubElement(author, atom("name")).text = "fast-mlx contributors"
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "self",
+            "type": "application/atom+xml",
+            "href": PUBLIC_SITE_URL + "releases/feed.atom",
+        },
+    )
+    ET.SubElement(
+        feed,
+        atom("link"),
+        {
+            "rel": "alternate",
+            "type": "text/html",
+            "href": PUBLIC_SITE_URL + "releases/",
+        },
+    )
+
+    for release in releases:
+        entry = ET.SubElement(feed, atom("entry"))
+        ET.SubElement(entry, atom("title")).text = str(release["title"])
+        ET.SubElement(entry, atom("id")).text = (
+            "urn:fast-mlx:public-commit:" + str(release["publicCommit"])
+        )
+        ET.SubElement(entry, atom("published")).text = str(release["publishedAt"])
+        ET.SubElement(entry, atom("updated")).text = str(release["publishedAt"])
+        ET.SubElement(
+            entry, atom("category"), {"term": str(release["category"])}
+        )
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {
+                "rel": "alternate",
+                "type": "text/html",
+                "href": (
+                    PUBLIC_SITE_URL
+                    + "releases/#release-"
+                    + str(release["id"])
+                ),
+            },
+        )
+        ET.SubElement(
+            entry,
+            atom("link"),
+            {"rel": "via", "href": str(release["sourceUrl"])},
+        )
+        ET.SubElement(entry, atom("summary")).text = (
+            str(release["summary"]) + " Boundary: " + str(release["scope"])
+        )
+
+    ET.indent(feed, space="  ")
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        + ET.tostring(feed, encoding="unicode", short_empty_elements=True)
+    )
 
 
 def render_capability_catalog(
@@ -1222,6 +1298,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "releases/index.json",
         json.dumps(release_index, indent=2, ensure_ascii=False),
     )
+    write_page(output, "releases/feed.atom", render_release_feed(release_index))
 
     cards = [
         '<section class="page-hero shell"><p class="eyebrow">Research notes</p>'
@@ -1308,6 +1385,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /benchmarks/: filterable reviewed performance evidence\n"
         "- /releases/: reviewed public milestones and unchanged boundaries\n"
         "- /releases/index.json: machine-readable release ledger\n"
+        "- /releases/feed.atom: Atom feed of reviewed public milestones\n"
         "- /research/: dated technical notes\n\n"
         "## Published notes\n"
         + "\n".join(f"- /{article.public_path}: {article.title}" for article in articles),

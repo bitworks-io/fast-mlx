@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-11",
+  "updatedAt": "2026-08-12",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "reviewed-release-ledger",
+      "title": "Publish reviewed release ledger",
+      "publishedAt": "2026-08-11T23:44:55-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds one generated human and machine-readable history of reviewed public milestones.",
+      "scope": "The ledger is discoverability metadata only; it creates no runtime, model, benchmark, or release authority.",
+      "publicCommit": "195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "public-benchmark-explorer",
       "title": "Publish reviewed benchmark explorer",

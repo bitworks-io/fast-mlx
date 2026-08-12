@@ -75,11 +75,14 @@ hypotheses and useful failures. The public website is generated from an explicit
 unreviewed operator evidence, machine-local paths, private competitor analysis, and partial runs are
 excluded from both the site and the public repository projection.
 
-The release page and
-[`/releases/index.json`](https://bitworks-io.github.io/fast-mlx/releases/index.json) are generated
-from `site/releases.json`, a reviewed public release ledger. It is discoverability metadata for
-public milestones and unchanged boundaries; it does not grant runtime authority, publish new
-benchmark claims, or replace the capability/evidence review gates.
+The release page,
+[`/releases/index.json`](https://bitworks-io.github.io/fast-mlx/releases/index.json), and
+[`/releases/feed.atom`](https://bitworks-io.github.io/fast-mlx/releases/feed.atom) are generated
+from `site/releases.json`, a reviewed public release ledger. The Atom feed is a static subscription
+surface for the same newest-first entries; it performs no network fetch or external ingestion while
+building. These surfaces are discoverability metadata for public milestones and unchanged
+boundaries; they do not grant runtime authority, publish new benchmark claims, or replace the
+capability/evidence review gates.
 
 Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 [CONTRIBUTING.md](CONTRIBUTING.md) for the research-to-release workflow.
