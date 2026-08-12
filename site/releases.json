@@ -16,6 +16,34 @@
   },
   "releases": [
     {
+      "id": "reviewed-benchmark-detail-permalinks",
+      "title": "Publish benchmark detail permalinks",
+      "publishedAt": "2026-08-12T05:07:19-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds stable detail pages for the three reviewed fast-mlx benchmark highlights.",
+      "scope": "Immutable reviewed-result views only; no new measurement, ranking, recomputation, competitor comparison, runtime/model/acquisition/publication authority, or positive absorbed-MLA admission.",
+      "publicCommit": "b91ed46e1d88bfadb984b81162165e386d3445b0",
+      "publicLinks": [
+        {
+          "label": "Open the benchmark explorer",
+          "path": "benchmarks/"
+        },
+        {
+          "label": "Read the PLD result",
+          "path": "benchmarks/pld-echo-throughput/"
+        },
+        {
+          "label": "Read the continuous-batch result",
+          "path": "benchmarks/continuous-batch-c2-throughput/"
+        },
+        {
+          "label": "Read the service-soak result",
+          "path": "benchmarks/http-sse-operational-soak/"
+        }
+      ]
+    },
+    {
       "id": "reviewed-home-current-cycle",
       "title": "Show current reviewed cycle",
       "publishedAt": "2026-08-12T03:55:31-05:00",

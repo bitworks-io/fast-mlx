@@ -166,25 +166,35 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "reviewed-home-current-cycle",
-                "title": "Show current reviewed cycle",
-                "publishedAt": "2026-08-12T03:55:31-05:00",
+                "id": "reviewed-benchmark-detail-permalinks",
+                "title": "Publish benchmark detail permalinks",
+                "publishedAt": "2026-08-12T05:07:19-05:00",
                 "category": "product",
                 "state": "released",
                 "summary": (
-                    "Adds a manifest-derived home-page snapshot of the latest reviewed "
-                    "release, exact evidence inventory, and gated runtime/model boundary."
+                    "Adds stable detail pages for the three reviewed fast-mlx "
+                    "benchmark highlights."
                 ),
                 "scope": (
-                    "Static reviewed-manifest presentation only; no external ingestion, "
-                    "benchmark recomputation, tracking, publication authority, runtime/model "
-                    "promotion, or positive absorbed-MLA admission."
+                    "Immutable reviewed-result views only; no new measurement, ranking, "
+                    "recomputation, competitor comparison, runtime/model/acquisition/"
+                    "publication authority, or positive absorbed-MLA admission."
                 ),
-                "publicCommit": "9e0c1a159ee5e458573bae67f323915220eb9b90",
+                "publicCommit": "b91ed46e1d88bfadb984b81162165e386d3445b0",
                 "publicLinks": [
-                    {"label": "Open fast-mlx", "path": "index.html"},
-                    {"label": "Inspect capability states", "path": "capabilities/"},
-                    {"label": "Read reviewed releases", "path": "releases/"},
+                    {"label": "Open the benchmark explorer", "path": "benchmarks/"},
+                    {
+                        "label": "Read the PLD result",
+                        "path": "benchmarks/pld-echo-throughput/",
+                    },
+                    {
+                        "label": "Read the continuous-batch result",
+                        "path": "benchmarks/continuous-batch-c2-throughput/",
+                    },
+                    {
+                        "label": "Read the service-soak result",
+                        "path": "benchmarks/http-sse-operational-soak/",
+                    },
                 ],
             },
         )
@@ -192,6 +202,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "b91ed46e1d88bfadb984b81162165e386d3445b0",
                 "9e0c1a159ee5e458573bae67f323915220eb9b90",
                 "1903e76609cc444bdacfaa5d0472804900dbd13c",
                 "df2b067391cec755cb9ec0e6f87097b8c8d6537a",
