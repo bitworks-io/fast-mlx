@@ -166,24 +166,25 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "reviewed-social-metadata",
-                "title": "Publish reviewed social metadata",
-                "publishedAt": "2026-08-12T02:08:02-05:00",
+                "id": "reviewed-home-current-cycle",
+                "title": "Show current reviewed cycle",
+                "publishedAt": "2026-08-12T03:55:31-05:00",
                 "category": "product",
                 "state": "released",
                 "summary": (
-                    "Adds exact self-canonical and Open Graph presentation metadata "
-                    "to the fourteen reviewed human-facing pages."
+                    "Adds a manifest-derived home-page snapshot of the latest reviewed "
+                    "release, exact evidence inventory, and gated runtime/model boundary."
                 ),
                 "scope": (
-                    "Presentation and crawl-discovery metadata only; no tracking, "
-                    "indexing guarantee, benchmark evidence, runtime authority, or "
-                    "positive absorbed-MLA admission."
+                    "Static reviewed-manifest presentation only; no external ingestion, "
+                    "benchmark recomputation, tracking, publication authority, runtime/model "
+                    "promotion, or positive absorbed-MLA admission."
                 ),
-                "publicCommit": "1903e76609cc444bdacfaa5d0472804900dbd13c",
+                "publicCommit": "9e0c1a159ee5e458573bae67f323915220eb9b90",
                 "publicLinks": [
                     {"label": "Open fast-mlx", "path": "index.html"},
-                    {"label": "Read the methodology", "path": "methodology/"},
+                    {"label": "Inspect capability states", "path": "capabilities/"},
+                    {"label": "Read reviewed releases", "path": "releases/"},
                 ],
             },
         )
@@ -191,6 +192,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "9e0c1a159ee5e458573bae67f323915220eb9b90",
                 "1903e76609cc444bdacfaa5d0472804900dbd13c",
                 "df2b067391cec755cb9ec0e6f87097b8c8d6537a",
                 "35e751a0a867d187014251b519eebbb17291fd88",
