@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: public-source-quality-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   public-boundary:
     runs-on: ubuntu-latest
@@ -54,3 +58,12 @@ jobs:
 
       - name: Build dependency-free target
         run: swift build --package-path spike --target "${{ matrix.target }}"
+
+  pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [public-boundary, pure-swift-targets]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/pages.yml

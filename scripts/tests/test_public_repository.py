@@ -117,6 +117,81 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertNotIn("runs-on: macos-15", workflow)
         self.assertIn("swift --version", workflow)
 
+    def test_pages_deployment_is_called_after_complete_main_quality(self) -> None:
+        pages = (REPOSITORY_ROOT / ".github/workflows/pages.yml").read_text(
+            encoding="utf-8"
+        )
+        quality = (REPOSITORY_ROOT / ".github/workflows/quality.yml").read_text(
+            encoding="utf-8"
+        )
+
+        trigger_block = pages.split("on:\n", 1)[1].split("\npermissions:", 1)[0]
+
+        self.assertEqual(trigger_block.strip(), "workflow_call:")
+        self.assertNotIn("workflow_run:", pages)
+        self.assertNotIn("workflow_dispatch:", pages)
+        self.assertIn("group: public-source-quality-${{ github.ref }}", quality)
+        self.assertIn("cancel-in-progress: true", quality)
+        pages_job = quality.split("\n  pages:\n", 1)[1]
+        self.assertIn("needs: [public-boundary, pure-swift-targets]", pages_job)
+        self.assertIn("github.event_name == 'push'", pages_job)
+        self.assertIn("github.ref == 'refs/heads/main'", pages_job)
+        self.assertIn("uses: ./.github/workflows/pages.yml", pages_job)
+        self.assertIn("contents: read", pages_job)
+        self.assertIn("pages: write", pages_job)
+        self.assertIn("id-token: write", pages_job)
+
+    def test_pages_jobs_use_least_privilege_and_eligible_concurrency(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/pages.yml").read_text(
+            encoding="utf-8"
+        )
+        before_jobs, jobs = workflow.split("\njobs:\n", 1)
+        build, deploy = jobs.split("\n  deploy:\n", 1)
+
+        self.assertEqual(
+            before_jobs.split("\npermissions:\n", 1)[1].split("\n\n", 1)[0].strip(),
+            "contents: read",
+        )
+        self.assertIn("permissions:\n      contents: read\n      pages: read", build)
+        self.assertIn(
+            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+            build,
+        )
+        self.assertNotIn("pages: write", build)
+        self.assertNotIn("id-token: write", build)
+        self.assertNotIn("\nconcurrency:\n", before_jobs)
+        self.assertIn(
+            "permissions:\n      pages: write\n      id-token: write",
+            deploy,
+        )
+        self.assertIn(
+            "if: github.event_name == 'push' && github.ref == 'refs/heads/main'",
+            deploy,
+        )
+        self.assertIn(
+            "concurrency:\n      group: github-pages\n      cancel-in-progress: true",
+            deploy,
+        )
+        self.assertNotIn("workflow_run", workflow)
+
+    def test_pages_actions_use_reviewed_node_24_revisions(self) -> None:
+        workflow = (REPOSITORY_ROOT / ".github/workflows/pages.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0",
+            workflow,
+        )
+        self.assertIn(
+            "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0",
+            workflow,
+        )
+        self.assertIn(
+            "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0",
+            workflow,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
