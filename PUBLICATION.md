@@ -63,13 +63,15 @@ public Apache-2.0 source boundaries, or creates benchmark evidence beyond the re
 capability manifests.
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
-seven reviewed product/index pages and the seven explicitly published research notes; it excludes
-JSON contracts, the Atom feed, LLM text surfaces, assets, and the 404 page. The builder performs no
+seven reviewed product/index pages, the three benchmark-detail pages, and the seven explicitly
+published research notes; it excludes JSON contracts, the Atom feed, LLM text surfaces, assets, and
+the 404 page. The benchmark-detail pages are immutable views of already-reviewed capability
+highlights, not new evidence, authority, ranking, or recomputation. The builder performs no
 submission or network request, and validation rejects route drift, non-UTF-8 or oversized content,
 DTD/entity declarations, symlinks, and non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-fourteen-page set. The validator independently pins every page's route, title, description, object
+seventeen-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and

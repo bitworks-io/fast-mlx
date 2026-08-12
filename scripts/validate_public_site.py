@@ -84,6 +84,83 @@ CORE_PUBLIC_PAGE_PATHS = (
     "releases/",
     "research/",
 )
+REVIEWED_BENCHMARK_HIGHLIGHTS: Tuple[Dict[str, object], ...] = (
+    {
+        "id": "pld-echo-throughput",
+        "metric": "+100.5%",
+        "label": "Repetition-heavy solo PLD, 28.28 → 56.70 tok/s",
+        "model": "Qwen3-32B-4bit",
+        "hardware": "Apple M5 Max",
+        "workload": (
+            "Preamble-then-echo; 256 generated tokens; three post-warmup runs; "
+            "temperature zero"
+        ),
+        "date": "2026-07-11",
+        "decision": "shelved",
+        "caveat": (
+            "The 120-token streams were byte-identical, but dynamic PLD is not the "
+            "current production route and remains disabled inside shared batches."
+        ),
+        "evidence": {
+            "slug": "when-zero-speculation-costs-two-percent",
+            "title": "When zero speculation costs 2%: making a 2× decoder safe to leave on",
+            "path": "research/when-zero-speculation-costs-two-percent/",
+            "reviewedAt": "2026-08-06",
+        },
+    },
+    {
+        "id": "continuous-batch-c2-throughput",
+        "metric": "+45.8%",
+        "label": "Aggregate C=2 service rate, 29.29 → 42.70 tok/s",
+        "model": "Qwen3-32B-4bit",
+        "hardware": "Apple M5 Max",
+        "workload": (
+            "Paired simultaneous burst; one warmup dropped; three measured Release "
+            "repetitions; temperature zero"
+        ),
+        "date": "2026-07-14",
+        "decision": "promoted-scoped",
+        "caveat": (
+            "The narrow dense-Qwen crossover starts at concurrency two for this "
+            "workload. No automatic router, sampled route, or broad default was "
+            "established."
+        ),
+        "evidence": {
+            "slug": "the-fastest-request-wasnt-the-fastest-service",
+            "title": "The fastest request wasn't the fastest service",
+            "path": "research/the-fastest-request-wasnt-the-fastest-service/",
+            "reviewedAt": "2026-08-11",
+        },
+    },
+    {
+        "id": "http-sse-operational-soak",
+        "metric": "24 h",
+        "label": "HTTP/SSE service soak with 10,368 paired request/evidence rows",
+        "model": "Qwen3-32B-4bit",
+        "hardware": "Apple M3 Ultra",
+        "workload": (
+            "C=4 continuous-batch-no-spec; 1,727 measured cycles; ordinary streams "
+            "plus pre-body disconnects"
+        ),
+        "date": "2026-07-28",
+        "decision": "promoted-scoped",
+        "caveat": (
+            "This qualifies transport, cancellation, recovery, resources, and "
+            "terminal evidence for the measured route. It is explicitly not a "
+            "throughput result."
+        ),
+        "evidence": {
+            "slug": "the-proof-did-not-end-when-the-timer-did",
+            "title": "The proof did not end when the timer did",
+            "path": "research/the-proof-did-not-end-when-the-timer-did/",
+            "reviewedAt": "2026-08-06",
+        },
+    },
+)
+REVIEWED_BENCHMARK_PATHS = tuple(
+    f'benchmarks/{highlight["id"]}/'
+    for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
+)
 REVIEWED_ARTICLE_PATHS = (
     "research/the-proof-did-not-end-when-the-timer-did/",
     "research/the-fastest-request-wasnt-the-fastest-service/",
@@ -139,6 +216,24 @@ REVIEWED_PAGE_METADATA: Dict[
     "benchmarks/": (
         "Benchmark explorer — fast-mlx",
         "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
+        "website",
+        None,
+    ),
+    "benchmarks/pld-echo-throughput/": (
+        "Repetition-heavy solo PLD, 28.28 → 56.70 tok/s — fast-mlx benchmark evidence",
+        "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
+        "website",
+        None,
+    ),
+    "benchmarks/continuous-batch-c2-throughput/": (
+        "Aggregate C=2 service rate, 29.29 → 42.70 tok/s — fast-mlx benchmark evidence",
+        "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
+        "website",
+        None,
+    ),
+    "benchmarks/http-sse-operational-soak/": (
+        "HTTP/SSE service soak with 10,368 paired request/evidence rows — fast-mlx benchmark evidence",
+        "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
         "website",
         None,
     ),
@@ -389,6 +484,134 @@ class BenchmarkCollector(html.parser.HTMLParser):
             self._current_option = None
         elif tag == "select":
             self._current_select = None
+
+
+class BenchmarkDetailCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections: List[Dict[str, object]] = []
+        self.page_h1_count = 0
+        self.page_links: List[str] = []
+        self.scripts: List[Optional[str]] = []
+        self.text_parts: List[str] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._section_depth = 0
+        self._field_tag: Optional[str] = None
+        self._field_parts: List[str] = []
+        self._element_stack: List[Tuple[str, bool]] = []
+
+    @staticmethod
+    def _suppresses_visibility(
+        tag: str, attributes: Dict[str, Optional[str]]
+    ) -> bool:
+        return (
+            tag in {"details", "dialog"}
+            or "hidden" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        names = [name for name, _value in attrs]
+        attributes = dict(attrs)
+        duplicate_attributes = len(names) != len(set(names))
+        suppresses_visibility = self._suppresses_visibility(tag, attributes)
+
+        if tag == "h1":
+            self.page_h1_count += 1
+        if tag == "a" and attributes.get("href"):
+            self.page_links.append(str(attributes["href"]))
+        if tag == "script":
+            self.scripts.append(attributes.get("src"))
+
+        if tag == "section" and "data-benchmark-detail" in attributes:
+            if self._current is None:
+                self._current = {
+                    "id": attributes.get("data-highlight-id"),
+                    "datetime": None,
+                    "links": [],
+                    "terms": [],
+                    "values": [],
+                    "text_parts": [],
+                    "h1Count": 0,
+                    "dlCount": 0,
+                    "hasDuplicateAttributes": duplicate_attributes,
+                    "hasVisibilitySuppressor": suppresses_visibility
+                    or any(item[1] for item in self._element_stack),
+                    "hasNestedDetail": False,
+                }
+                self._section_depth = 1
+            else:
+                self._current["hasNestedDetail"] = True
+                self._section_depth += 1
+        elif self._current is not None and tag == "section":
+            self._section_depth += 1
+
+        if self._current is not None:
+            if duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if suppresses_visibility:
+                self._current["hasVisibilitySuppressor"] = True
+            if tag == "h1":
+                self._current["h1Count"] = int(self._current["h1Count"]) + 1
+            elif tag == "time":
+                self._current["datetime"] = attributes.get("datetime")
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+            elif tag == "dl":
+                self._current["dlCount"] = int(self._current["dlCount"]) + 1
+            elif tag in {"dt", "dd"}:
+                self._field_tag = tag
+                self._field_parts = []
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, suppresses_visibility))
+
+    def handle_data(self, data: str) -> None:
+        self.text_parts.append(data)
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+        if self._field_tag is not None:
+            self._field_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        self.text_parts.append(" ")
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(" ")
+        if self._current is not None and tag == self._field_tag:
+            key = "terms" if tag == "dt" else "values"
+            values = self._current[key]
+            if isinstance(values, list):
+                values.append(" ".join("".join(self._field_parts).split()))
+            self._field_tag = None
+            self._field_parts = []
+
+        if self._current is not None and tag == "section":
+            self._section_depth -= 1
+            if self._section_depth == 0:
+                parts = self._current.pop("text_parts")
+                self._current["text"] = (
+                    " ".join("".join(parts).split())
+                    if isinstance(parts, list)
+                    else ""
+                )
+                self.sections.append(self._current)
+                self._current = None
+
+        if self._element_stack:
+            if self._element_stack[-1][0] == tag:
+                self._element_stack.pop()
+            else:
+                for position in range(len(self._element_stack) - 1, -1, -1):
+                    if self._element_stack[position][0] == tag:
+                        del self._element_stack[position:]
+                        break
 
 
 class ReleaseCollector(html.parser.HTMLParser):
@@ -920,7 +1143,11 @@ def render_expected_sitemap(article_paths: Sequence[str]) -> str:
 
     ET.register_namespace("", SITEMAP_NAMESPACE)
     sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
-    for public_path in (*CORE_PUBLIC_PAGE_PATHS, *article_paths):
+    for public_path in (
+        *CORE_PUBLIC_PAGE_PATHS,
+        *REVIEWED_BENCHMARK_PATHS,
+        *article_paths,
+    ):
         url = ET.SubElement(sitemap, f"{{{SITEMAP_NAMESPACE}}}url")
         ET.SubElement(url, f"{{{SITEMAP_NAMESPACE}}}loc").text = (
             PUBLIC_SITE_URL + public_path
@@ -1457,6 +1684,152 @@ def validate_home_current_cycle(
     return failures
 
 
+def reviewed_benchmark_cards() -> Dict[str, Dict[str, str]]:
+    cards: Dict[str, Dict[str, str]] = {}
+    for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS:
+        identifier = str(highlight["id"])
+        evidence = highlight["evidence"]
+        if not isinstance(evidence, dict):
+            raise ValueError(f"reviewed benchmark {identifier!r} has invalid evidence")
+        cards[identifier] = {
+            **{
+                key: str(highlight[key])
+                for key in (
+                    "metric",
+                    "label",
+                    "model",
+                    "hardware",
+                    "workload",
+                    "date",
+                    "decision",
+                    "caveat",
+                )
+            },
+            "detail": f"{identifier}/",
+            "evidence": f'../{str(evidence["path"]).rstrip("/")}/',
+        }
+    return cards
+
+
+def validate_benchmark_detail_pages(site: Path) -> List[str]:
+    failures: List[str] = []
+    benchmark_root = site / "benchmarks"
+    expected_entries = {"index.html"} | {
+        str(highlight["id"]) for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
+    }
+    if benchmark_root.is_symlink() or not benchmark_root.is_dir():
+        return ["benchmarks must be a regular non-symlink directory"]
+    try:
+        actual_entries = {entry.name for entry in benchmark_root.iterdir()}
+    except OSError as exc:
+        return [f"cannot inspect benchmark detail routes: {exc}"]
+    for extra in sorted(actual_entries - expected_entries):
+        failures.append(f"unexpected benchmark route outside reviewed set: {extra}")
+
+    for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS:
+        identifier = str(highlight["id"])
+        relative = f"benchmarks/{identifier}/index.html"
+        directory = site / "benchmarks" / identifier
+        path = directory / "index.html"
+        if directory.is_symlink() or not directory.is_dir():
+            failures.append(
+                f"benchmark detail route {identifier!r} must be a regular non-symlink directory"
+            )
+            continue
+        if path.is_symlink() or not path.is_file():
+            failures.append(f"{relative} must be a regular non-symlink file")
+            continue
+
+        collector = BenchmarkDetailCollector()
+        try:
+            collector.feed(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            failures.append(f"cannot parse {relative}: {exc}")
+            continue
+        if len(collector.sections) != 1:
+            failures.append(
+                f"benchmark detail {identifier!r} must contain exactly one detail section"
+            )
+            continue
+
+        detail = collector.sections[0]
+        evidence = highlight["evidence"]
+        if not isinstance(evidence, dict):
+            failures.append(f"reviewed benchmark {identifier!r} has invalid evidence")
+            continue
+        decision = str(highlight["decision"])
+        expected_text = " ".join(
+            [
+                "Reviewed benchmark evidence",
+                HIGHLIGHT_DECISION_LABELS[decision].upper(),
+                str(highlight["date"]),
+                str(highlight["metric"]),
+                str(highlight["label"]),
+                "One reviewed fast-mlx result, shown with the context and boundary that made it admissible.",
+                "Model",
+                str(highlight["model"]),
+                "Hardware",
+                str(highlight["hardware"]),
+                "Workload",
+                str(highlight["workload"]),
+                "Boundary:",
+                str(highlight["caveat"]),
+                "Read",
+                str(evidence["title"]),
+                "Back to all reviewed results",
+            ]
+        )
+        expected_text = " ".join(expected_text.split())
+        evidence_href = f'../../{str(evidence["path"]).rstrip("/")}/'
+        expected_fields = [
+            ("Model", str(highlight["model"])),
+            ("Hardware", str(highlight["hardware"])),
+            ("Workload", str(highlight["workload"])),
+        ]
+        actual_fields = list(zip(detail.get("terms", []), detail.get("values", [])))
+
+        if detail.get("id") != identifier:
+            failures.append(f"benchmark detail {identifier!r} has the wrong id")
+        if detail.get("datetime") != highlight["date"]:
+            failures.append(f"benchmark detail {identifier!r} has the wrong date")
+        if detail.get("text") != expected_text:
+            failures.append(f"benchmark detail {identifier!r} has drifted reviewed text")
+        if actual_fields != expected_fields or detail.get("dlCount") != 1:
+            failures.append(f"benchmark detail {identifier!r} has the wrong context fields")
+        if detail.get("links") != [evidence_href, "../"]:
+            failures.append(f"benchmark detail {identifier!r} has the wrong action links")
+        if (
+            detail.get("h1Count") != 1
+            or collector.page_h1_count != 1
+            or detail.get("hasNestedDetail")
+        ):
+            failures.append(f"benchmark detail {identifier!r} has the wrong heading structure")
+        if detail.get("hasDuplicateAttributes"):
+            failures.append(f"benchmark detail {identifier!r} has duplicate attributes")
+        if detail.get("hasVisibilitySuppressor"):
+            failures.append(f"benchmark detail {identifier!r} is hidden")
+        if collector.scripts:
+            failures.append(f"benchmark detail {identifier!r} must not load scripts")
+
+        page_text = " ".join("".join(collector.text_parts).split())
+        expected_boundary = (
+            "Claim boundary A permalink is not a broader performance claim. "
+            "This page does not normalize, rank, aggregate, or recompute results. "
+            "It performs no unit conversion, interpolation, competitor comparison, "
+            "live benchmark execution, or authority transition. "
+            "Read the measurement methodology →"
+        )
+        if expected_boundary not in page_text:
+            failures.append(
+                f"benchmark detail {identifier!r} has the wrong claim boundary"
+            )
+        if collector.page_links.count("../../methodology/") != 2:
+            failures.append(
+                f"benchmark detail {identifier!r} has the wrong methodology link"
+            )
+    return failures
+
+
 def validate(site: Path) -> List[str]:
     failures: List[str] = []
     site = site.resolve()
@@ -1467,6 +1840,10 @@ def validate(site: Path) -> List[str]:
         "capabilities/index.html",
         "capabilities/index.json",
         "benchmarks/index.html",
+        *[
+            f'benchmarks/{highlight["id"]}/index.html'
+            for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
+        ],
         "releases/index.html",
         "releases/index.json",
         "releases/feed.atom",
@@ -1490,7 +1867,7 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
 
-    expected_benchmark_cards: Dict[str, Dict[str, str]] = {}
+    expected_benchmark_cards = reviewed_benchmark_cards()
 
     release_index: Optional[Dict[str, object]] = None
     if (site / "releases/index.json").is_file():
@@ -1612,6 +1989,10 @@ def validate(site: Path) -> List[str]:
             if not isinstance(highlights, list) or not highlights:
                 failures.append("capabilities/index.json has no performance highlights")
             else:
+                if highlights != list(REVIEWED_BENCHMARK_HIGHLIGHTS):
+                    failures.append(
+                        "capabilities/index.json performance highlights do not match reviewed benchmark highlights"
+                    )
                 seen_highlight_ids: set[str] = set()
                 for position, highlight in enumerate(highlights):
                     label = f"performance highlight entry {position}"
@@ -1639,30 +2020,6 @@ def validate(site: Path) -> List[str]:
                     evidence = highlight.get("evidence")
                     raw_path = evidence.get("path") if isinstance(evidence, dict) else None
                     failures.extend(validate_evidence_path(site, raw_path, label))
-                    expected_fields = {
-                        key: highlight.get(key)
-                        for key in (
-                            "metric",
-                            "label",
-                            "model",
-                            "hardware",
-                            "workload",
-                            "date",
-                            "decision",
-                            "caveat",
-                        )
-                    }
-                    if (
-                        isinstance(identifier, str)
-                        and all(isinstance(value, str) for value in expected_fields.values())
-                        and expected_fields["decision"] in HIGHLIGHT_DECISION_LABELS
-                        and isinstance(raw_path, str)
-                    ):
-                        expected_benchmark_cards[identifier] = {
-                            **expected_fields,
-                            "evidence": f"../{raw_path.rstrip('/')}/",
-                        }
-
     benchmark_path = site / "benchmarks/index.html"
     if benchmark_path.is_file():
         collector = BenchmarkCollector()
@@ -1736,9 +2093,20 @@ def validate(site: Path) -> List[str]:
                     if message not in failures:
                         failures.append(message)
                 links = card.get("links")
+                if not isinstance(links, list) or expected["detail"] not in links:
+                    failures.append(
+                        f"benchmark explorer card {identifier!r} has the wrong detail link"
+                    )
                 if not isinstance(links, list) or expected["evidence"] not in links:
                     failures.append(
                         f"benchmark explorer card {identifier!r} has the wrong evidence"
+                    )
+                if isinstance(links, list) and links != [
+                    expected["detail"],
+                    expected["evidence"],
+                ]:
+                    failures.append(
+                        f"benchmark explorer card {identifier!r} has unexpected action links"
                     )
             expected_options = {
                 "model": [("", "All models")]
@@ -1783,6 +2151,8 @@ def validate(site: Path) -> List[str]:
                 failures.append("benchmark explorer has no hidden status empty state")
             if not collector.has_script:
                 failures.append("benchmark explorer does not load its reviewed script")
+
+    failures.extend(validate_benchmark_detail_pages(site))
 
     if (
         release_index is not None

@@ -103,6 +103,11 @@ CORE_PUBLIC_PAGE_PATHS = (
     "releases/",
     "research/",
 )
+REVIEWED_BENCHMARK_PUBLIC_PATHS = (
+    "benchmarks/pld-echo-throughput/",
+    "benchmarks/continuous-batch-c2-throughput/",
+    "benchmarks/http-sse-operational-soak/",
+)
 PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
 )
@@ -888,8 +893,12 @@ def render_head_metadata(
         if article_section is not None:
             fail("article metadata requires a reviewed public path")
         return ""
-    if public_path not in CORE_PUBLIC_PAGE_PATHS and not re.fullmatch(
-        r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
+    if (
+        public_path not in CORE_PUBLIC_PAGE_PATHS
+        and not re.fullmatch(
+            r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
+        )
+        and public_path not in REVIEWED_BENCHMARK_PUBLIC_PATHS
     ):
         fail(f"invalid metadata public path: {public_path!r}")
     canonical = PUBLIC_SITE_URL + public_path
@@ -1078,13 +1087,16 @@ def render_release_feed(release_index: Dict[str, object]) -> str:
     )
 
 
-def render_sitemap(articles: Sequence[Article]) -> str:
+def render_sitemap(
+    articles: Sequence[Article], highlights: Sequence[Dict[str, object]]
+) -> str:
     """Render canonical human-facing routes without inventing crawl metadata."""
 
     ET.register_namespace("", SITEMAP_NAMESPACE)
     sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
     public_paths = [
         *CORE_PUBLIC_PAGE_PATHS,
+        *[f'benchmarks/{highlight["id"]}/' for highlight in highlights],
         *[article.public_path for article in articles],
     ]
     if len(public_paths) != len(set(public_paths)):
@@ -1313,7 +1325,10 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
                 f'<div><dt>Workload</dt><dd>{html.escape(str(highlight["workload"]))}</dd></div>',
                 '</dl>',
                 f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(highlight["caveat"]))}</p>',
+                '<div class="evidence-links" aria-label="Benchmark evidence links">',
+                f'<a class="text-link" href="{html.escape(str(highlight["id"]), quote=True)}/">Open reviewed result →</a>',
                 f'<a class="text-link" href="{html.escape(href, quote=True)}">Read {html.escape(str(evidence_record["title"]))} →</a>',
+                '</div>',
                 '</article>',
             ]
         )
@@ -1331,6 +1346,64 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
         ]
     )
     return "\n".join(body)
+
+
+def benchmark_detail_title(highlight: Dict[str, object]) -> str:
+    return f'{highlight["label"]} — fast-mlx benchmark evidence'
+
+
+def benchmark_detail_description() -> str:
+    return (
+        "A reviewed fast-mlx benchmark result with its exact model, hardware, "
+        "workload, decision, caveat, and evidence."
+    )
+
+
+def render_benchmark_detail(highlight: Dict[str, object]) -> str:
+    """Render one immutable view of an already-reviewed performance highlight."""
+
+    status_by_id = {item[0]: item[1] for item in CAPABILITY_STATUS_DEFINITIONS}
+    identifier = str(highlight["id"])
+    decision = str(highlight["decision"])
+    evidence_record = highlight["evidence"]
+    evidence_href = relative_href(
+        f"benchmarks/{identifier}/index.html", str(evidence_record["path"])
+    )
+    return "\n".join(
+        [
+            '<section class="page-hero shell benchmark-detail" '
+            'data-benchmark-detail data-highlight-id="'
+            + html.escape(identifier, quote=True)
+            + '">',
+            '<p class="eyebrow">Reviewed benchmark evidence</p>',
+            '<div class="card-topline">'
+            f'<span class="status-badge status-{html.escape(decision, quote=True)}">'
+            f'{html.escape(status_by_id[decision].upper())}</span>'
+            f'<time datetime="{html.escape(str(highlight["date"]), quote=True)}">'
+            f'{html.escape(str(highlight["date"]))}</time>'
+            '</div>',
+            f'<div class="metric">{html.escape(str(highlight["metric"]))}</div>',
+            f'<h1>{html.escape(str(highlight["label"]))}</h1>',
+            '<p class="lede">One reviewed fast-mlx result, shown with the context and boundary that made it admissible.</p>',
+            '<dl class="evidence-context">',
+            f'<div><dt>Model</dt><dd>{html.escape(str(highlight["model"]))}</dd></div>',
+            f'<div><dt>Hardware</dt><dd>{html.escape(str(highlight["hardware"]))}</dd></div>',
+            f'<div><dt>Workload</dt><dd>{html.escape(str(highlight["workload"]))}</dd></div>',
+            '</dl>',
+            f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(highlight["caveat"]))}</p>',
+            '<div class="hero-actions">',
+            f'<a class="button primary" href="{html.escape(evidence_href, quote=True)}">Read {html.escape(str(evidence_record["title"]))}</a>',
+            '<a class="button secondary" href="../">Back to all reviewed results</a>',
+            '</div>',
+            '</section>',
+            '<section class="section shell callout benchmark-callout" aria-labelledby="benchmark-detail-boundary-heading">',
+            '<p class="eyebrow">Claim boundary</p>',
+            '<h2 id="benchmark-detail-boundary-heading">A permalink is not a broader performance claim.</h2>',
+            '<p>This page does not normalize, rank, aggregate, or recompute results. It performs no unit conversion, interpolation, competitor comparison, live benchmark execution, or authority transition.</p>',
+            '<a class="text-link" href="../../methodology/">Read the measurement methodology →</a>',
+            '</section>',
+        ]
+    )
 
 
 def render_home_current_cycle(
@@ -1523,6 +1596,22 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             public_path="benchmarks/",
         ),
     )
+    for highlight in capability_index["performanceHighlights"]:
+        identifier = str(highlight["id"])
+        public_path = f"benchmarks/{identifier}/"
+        write_page(
+            output,
+            public_path + "index.html",
+            render_template(
+                template,
+                benchmark_detail_title(highlight),
+                benchmark_detail_description(),
+                "../../",
+                render_benchmark_detail(highlight),
+                "benchmarks",
+                public_path=public_path,
+            ),
+        )
     release_body, release_index = render_release_catalog(release_catalog)
     write_page(
         output,
@@ -1619,7 +1708,15 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         ],
     }
     write_page(output, "research/index.json", json.dumps(public_index, indent=2, ensure_ascii=False))
-    write_page(output, "sitemap.xml", render_sitemap(articles))
+    write_page(
+        output,
+        "sitemap.xml",
+        render_sitemap(articles, capability_index["performanceHighlights"]),
+    )
+    benchmark_detail_lines = "\n".join(
+        f'- /benchmarks/{highlight["id"]}/: {highlight["label"]}'
+        for highlight in capability_index["performanceHighlights"]
+    )
     write_page(
         output,
         "llms.txt",
@@ -1631,6 +1728,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /capabilities/: status-aware feature and evidence inventory\n"
         "- /capabilities/index.json: machine-readable capability contract\n"
         "- /benchmarks/: filterable reviewed performance evidence\n"
+        + benchmark_detail_lines
+        + "\n"
         "- /releases/: reviewed public milestones and unchanged boundaries\n"
         "- /releases/index.json: machine-readable release ledger\n"
         "- /releases/feed.atom: Atom feed of reviewed public milestones\n"

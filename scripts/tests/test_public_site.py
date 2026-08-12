@@ -847,6 +847,9 @@ class PublicSiteTests(unittest.TestCase):
                 "benchmarks/",
                 "releases/",
                 "research/",
+                "benchmarks/pld-echo-throughput/",
+                "benchmarks/continuous-batch-c2-throughput/",
+                "benchmarks/http-sse-operational-soak/",
                 *[article.public_path for article in articles],
             ]
             expected_urls = [
@@ -867,7 +870,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 14)
+            self.assertEqual(len(expected_urls), 17)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -920,6 +923,24 @@ class PublicSiteTests(unittest.TestCase):
                     "website",
                     None,
                 ),
+                "benchmarks/pld-echo-throughput/": (
+                    "Repetition-heavy solo PLD, 28.28 → 56.70 tok/s — fast-mlx benchmark evidence",
+                    "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
+                    "website",
+                    None,
+                ),
+                "benchmarks/continuous-batch-c2-throughput/": (
+                    "Aggregate C=2 service rate, 29.29 → 42.70 tok/s — fast-mlx benchmark evidence",
+                    "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
+                    "website",
+                    None,
+                ),
+                "benchmarks/http-sse-operational-soak/": (
+                    "HTTP/SSE service soak with 10,368 paired request/evidence rows — fast-mlx benchmark evidence",
+                    "A reviewed fast-mlx benchmark result with its exact model, hardware, workload, decision, caveat, and evidence.",
+                    "website",
+                    None,
+                ),
                 "releases/": (
                     "Releases — fast-mlx",
                     "A reviewed ledger of fast-mlx public milestones, exact commits, shipped surfaces, and unchanged boundaries.",
@@ -945,7 +966,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 14)
+            self.assertEqual(len(expected), 17)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )
@@ -1544,6 +1565,200 @@ class PublicSiteTests(unittest.TestCase):
             llms = (output / "llms.txt").read_text(encoding="utf-8")
             self.assertIn("/benchmarks/", llms)
             self.assertIn("/capabilities/index.json", explorer)
+
+    def test_benchmark_detail_pages_are_generated_from_reviewed_highlights(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            capabilities = json.loads(
+                (output / "capabilities/index.json").read_text(encoding="utf-8")
+            )
+            explorer = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            sitemap = (output / "sitemap.xml").read_text(encoding="utf-8")
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            decision_labels = {
+                "promoted-scoped": "PROMOTED · SCOPED",
+                "shelved": "SHELVED",
+            }
+
+            for highlight in capabilities["performanceHighlights"]:
+                identifier = highlight["id"]
+                public_path = f"benchmarks/{identifier}/"
+                detail_path = output / public_path / "index.html"
+                self.assertTrue(
+                    detail_path.is_file(),
+                    f"missing reviewed benchmark detail page: {public_path}",
+                )
+                detail = detail_path.read_text(encoding="utf-8")
+                self.assertIn(
+                    f'data-benchmark-detail data-highlight-id="{identifier}"', detail
+                )
+                for field in (
+                    "metric",
+                    "label",
+                    "model",
+                    "hardware",
+                    "workload",
+                    "date",
+                    "caveat",
+                ):
+                    self.assertIn(html.escape(highlight[field]), detail)
+                self.assertIn(decision_labels[highlight["decision"]], detail)
+                self.assertIn(
+                    f'<time datetime="{highlight["date"]}">{highlight["date"]}</time>',
+                    detail,
+                )
+                self.assertIn(
+                    f'href="../../{highlight["evidence"]["path"]}"', detail
+                )
+                self.assertIn('href="../">Back to all reviewed results</a>', detail)
+                self.assertIn(
+                    "This page does not normalize, rank, aggregate, or recompute results.",
+                    detail,
+                )
+                self.assertEqual(detail.count("<h1>"), 1)
+                self.assertNotIn("benchmark-explorer.js", detail)
+                self.assertIn(f'href="{identifier}/"', explorer)
+                self.assertIn(
+                    "https://bitworks-io.github.io/fast-mlx/" + public_path,
+                    sitemap,
+                )
+                self.assertIn(f"- /{public_path}:", llms)
+
+    def test_validator_rejects_benchmark_detail_contract_drift(self) -> None:
+        identifier = "pld-echo-throughput"
+        mutations = (
+            (
+                'data-highlight-id="pld-echo-throughput"',
+                'data-highlight-id="unreviewed-result"',
+                f"benchmark detail '{identifier}' has the wrong id",
+            ),
+            (
+                '<div class="metric">+100.5%</div>',
+                '<div class="metric">+999%</div>',
+                f"benchmark detail '{identifier}' has drifted reviewed text",
+            ),
+            (
+                '<div><dt>Model</dt><dd>Qwen3-32B-4bit</dd></div>',
+                '<div><dt>Model</dt><dd>Unreviewed model</dd></div>',
+                f"benchmark detail '{identifier}' has the wrong context fields",
+            ),
+            (
+                'href="../../research/when-zero-speculation-costs-two-percent/"',
+                'href="../../research/the-wall-that-wasnt/"',
+                f"benchmark detail '{identifier}' has the wrong action links",
+            ),
+            (
+                'href="../../methodology/"',
+                'href="../../capabilities/"',
+                f"benchmark detail '{identifier}' has the wrong methodology link",
+            ),
+            (
+                "This page does not normalize, rank, aggregate, or recompute results.",
+                "This page establishes a ranked production result.",
+                f"benchmark detail '{identifier}' has the wrong claim boundary",
+            ),
+            (
+                '<section class="page-hero shell benchmark-detail" ',
+                '<section class="page-hero shell benchmark-detail" hidden ',
+                f"benchmark detail '{identifier}' is hidden",
+            ),
+            (
+                "</body>",
+                '<script src="../../assets/benchmark-explorer.js"></script></body>',
+                f"benchmark detail '{identifier}' must not load scripts",
+            ),
+        )
+        for before, after, expected_failure in mutations:
+            with self.subTest(expected_failure=expected_failure), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / "benchmarks" / identifier / "index.html"
+                page = path.read_text(encoding="utf-8")
+                self.assertIn(before, page)
+                path.write_text(page.replace(before, after, 1), encoding="utf-8")
+                self.assertIn(expected_failure, validate_public_site.validate(output))
+
+    def test_validator_rejects_missing_extra_and_symlink_benchmark_details(self) -> None:
+        cases = ("missing", "extra", "symlink")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                detail = output / "benchmarks/pld-echo-throughput/index.html"
+                if case == "missing":
+                    detail.unlink()
+                    expected = (
+                        "missing required file: "
+                        "benchmarks/pld-echo-throughput/index.html"
+                    )
+                elif case == "extra":
+                    extra = output / "benchmarks/unreviewed-result"
+                    extra.mkdir()
+                    (extra / "index.html").write_text(
+                        detail.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+                    expected = "unexpected benchmark route outside reviewed set: unreviewed-result"
+                else:
+                    detail.unlink()
+                    detail.symlink_to("../continuous-batch-c2-throughput/index.html")
+                    expected = (
+                        "benchmarks/pld-echo-throughput/index.html must be a regular "
+                        "non-symlink file"
+                    )
+                self.assertIn(expected, validate_public_site.validate(output))
+
+    def test_validator_rejects_joint_benchmark_index_and_page_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            index_path = output / "capabilities/index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            index["performanceHighlights"][0]["metric"] = "+999%"
+            index_path.write_text(
+                json.dumps(index, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            for relative in (
+                "benchmarks/index.html",
+                "benchmarks/pld-echo-throughput/index.html",
+            ):
+                path = output / relative
+                page = path.read_text(encoding="utf-8")
+                path.write_text(
+                    page.replace(">+100.5%<", ">+999%<", 1), encoding="utf-8"
+                )
+
+            self.assertIn(
+                "capabilities/index.json performance highlights do not match reviewed benchmark highlights",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_requires_exact_benchmark_detail_links_from_explorer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            path = output / "benchmarks/index.html"
+            page = path.read_text(encoding="utf-8")
+            path.write_text(
+                page.replace(
+                    'href="http-sse-operational-soak/"',
+                    'href="../capabilities/"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "benchmark explorer card 'http-sse-operational-soak' has the wrong detail link",
+                validate_public_site.validate(output),
+            )
 
     def test_benchmark_explorer_progressive_enhancement_is_bounded(self) -> None:
         script = (

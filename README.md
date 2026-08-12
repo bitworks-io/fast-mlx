@@ -89,10 +89,12 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of those fourteen reviewed HTML pages also publishes one self-referential absolute canonical
+Each of those seventeen reviewed HTML pages also publishes one self-referential absolute canonical
 URL and a reviewed Open Graph description. The seven research notes alone use article metadata; the
-seven product/index pages remain website objects, while `404.html` and machine-readable endpoints
-publish neither. A single same-origin 1200×630 preview image is retained as an exact hash-pinned
+seven product/index pages and three benchmark-detail pages remain website objects, while `404.html`
+and machine-readable endpoints publish neither. Benchmark-detail pages are immutable views of
+already-reviewed capability highlights; they do not create new evidence, authority, ranking, or
+recomputation. A single same-origin 1200×630 preview image is retained as an exact hash-pinned
 static asset: no remote image, analytics request, live lookup, new benchmark claim, or runtime
 authority is introduced by a shared-link preview.
 
