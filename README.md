@@ -6,6 +6,7 @@ effects, and keep only the capabilities that survive explicit correctness and op
 
 **Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
 [capabilities and evidence](https://bitworks-io.github.io/fast-mlx/capabilities/) ·
+[reviewed benchmark explorer](https://bitworks-io.github.io/fast-mlx/benchmarks/) ·
 [research notes](https://bitworks-io.github.io/fast-mlx/research/)
 
 The project is built around a guarded improvement loop:

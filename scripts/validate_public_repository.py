@@ -55,6 +55,7 @@ REQUIRED_PATHS: Tuple[str, ...] = (
     "site/publications.json",
     "scripts/build_public_site.py",
     "scripts/validate_public_site.py",
+    "scripts/tests/benchmark_explorer_node_test.js",
     "spike/Package.swift",
     "spike/Sources/fastmlx-serve/FastMLXServe.swift",
     "spike/Tests/ServingCoreTests/FastMLXServeArgumentsTests.swift",

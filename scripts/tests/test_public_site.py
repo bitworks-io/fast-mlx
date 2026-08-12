@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -107,6 +108,18 @@ class PublicSiteTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     build_public_site.load_capability_catalog(root, {"published-note"})
 
+    def test_whitespace_padded_capability_values_are_refused(self) -> None:
+        for key in ("id", "decision", "evidenceSlug"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = self.capability_manifest()
+                manifest["performanceHighlights"][0][key] = (
+                    " " + manifest["performanceHighlights"][0][key]
+                )
+                self.write_capability_manifest(root, manifest)
+                with self.assertRaises(SystemExit):
+                    build_public_site.load_capability_catalog(root, {"published-note"})
+
     def test_build_is_complete_and_links_are_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
@@ -176,6 +189,277 @@ class PublicSiteTests(unittest.TestCase):
                 (output / missing).unlink()
                 self.assertIn(
                     f"missing required file: {missing}",
+                    validate_public_site.validate(output),
+                )
+
+    def test_benchmark_explorer_is_generated_from_reviewed_highlights(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            catalog = json.loads(
+                (REPOSITORY_ROOT / "site/capabilities.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            explorer = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+
+            self.assertIn("Benchmark explorer", explorer)
+            self.assertEqual(
+                explorer.count('class="benchmark-result"'),
+                len(catalog["performanceHighlights"]),
+            )
+            for highlight in catalog["performanceHighlights"]:
+                self.assertIn(
+                    f'data-highlight-id="{highlight["id"]}"',
+                    explorer,
+                )
+                for field in (
+                    "metric",
+                    "label",
+                    "model",
+                    "hardware",
+                    "workload",
+                    "date",
+                    "caveat",
+                ):
+                    self.assertIn(highlight[field], explorer)
+
+            self.assertIn('name="model"', explorer)
+            self.assertIn('name="hardware"', explorer)
+            self.assertIn('name="decision"', explorer)
+            self.assertIn('data-benchmark-count aria-live="polite"', explorer)
+            self.assertIn('data-benchmark-empty hidden role="status"', explorer)
+            self.assertIn('data-benchmark-reset type="reset"', explorer)
+            self.assertIn("JavaScript is optional", explorer)
+            self.assertIn(
+                '<a href="../benchmarks/" aria-current="page">Benchmarks</a>',
+                explorer,
+            )
+            self.assertEqual(explorer.count('aria-current="page"'), 1)
+            self.assertIn(
+                '<script src="../assets/benchmark-explorer.js" defer></script>',
+                explorer,
+            )
+            self.assertNotIn('class="benchmark-result" hidden', explorer)
+
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn("/benchmarks/", llms)
+            self.assertIn("/capabilities/index.json", explorer)
+
+    def test_benchmark_explorer_progressive_enhancement_is_bounded(self) -> None:
+        script = (
+            REPOSITORY_ROOT / "site/assets/benchmark-explorer.js"
+        ).read_text(encoding="utf-8")
+        stylesheet = (REPOSITORY_ROOT / "site/assets/site.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('classList.add("benchmark-enhanced")', script)
+        self.assertIn("URLSearchParams", script)
+        self.assertIn("history.replaceState", script)
+        self.assertIn("card.hidden", script)
+        self.assertIn("textContent", script)
+        self.assertNotIn("innerHTML", script)
+        self.assertNotIn("fetch(", script)
+        self.assertNotIn("localStorage", script)
+        self.assertIn(".benchmark-controls", stylesheet)
+        self.assertIn("html.benchmark-enhanced .benchmark-controls", stylesheet)
+
+    def test_benchmark_explorer_escapes_catalog_text(self) -> None:
+        hostile = 'Model "quoted" <script>alert(1)</script>'
+        rendered = build_public_site.render_benchmark_explorer(
+            [
+                {
+                    "id": "safe-highlight",
+                    "metric": '<img src=x onerror="alert(1)">',
+                    "label": "Bounded result <only>",
+                    "model": hostile,
+                    "hardware": "Hardware & fixture",
+                    "workload": "Synthetic > transcript",
+                    "date": "2026-08-11",
+                    "decision": "promoted-scoped",
+                    "caveat": "No <broad> claim.",
+                    "evidence": {
+                        "path": "research/reviewed-note/",
+                        "title": "Reviewed <note>",
+                    },
+                }
+            ]
+        )
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("<img ", rendered)
+        self.assertNotIn("<broad>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", rendered)
+        self.assertIn("Hardware &amp; fixture", rendered)
+        self.assertIn('data-model="Model &quot;quoted&quot; &lt;script&gt;', rendered)
+
+    def test_benchmark_explorer_runtime_state_is_bounded(self) -> None:
+        completed = subprocess.run(
+            [
+                "node",
+                str(REPOSITORY_ROOT / "scripts/tests/benchmark_explorer_node_test.js"),
+                str(REPOSITORY_ROOT / "site/assets/benchmark-explorer.js"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("benchmark explorer runtime checks passed", completed.stdout)
+
+    def test_validator_requires_benchmark_explorer_outputs(self) -> None:
+        for missing in ("benchmarks/index.html", "assets/benchmark-explorer.js"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                (output / missing).unlink()
+                self.assertIn(
+                    f"missing required file: {missing}",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_benchmark_card_outside_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            explorer_path = output / "benchmarks/index.html"
+            explorer = explorer_path.read_text(encoding="utf-8")
+            explorer_path.write_text(
+                explorer.replace(
+                    'data-highlight-id="pld-echo-throughput"',
+                    'data-highlight-id="private-diagnostic"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertIn(
+                "benchmark explorer card set does not match performance highlights",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_requires_exact_benchmark_card_evidence(self) -> None:
+        catalog = json.loads(
+            (REPOSITORY_ROOT / "site/capabilities.json").read_text(encoding="utf-8")
+        )
+        highlight = max(
+            catalog["performanceHighlights"], key=lambda entry: entry["date"]
+        )
+        evidence_href = f'../research/{highlight["evidenceSlug"]}/'
+        mutations = {
+            "metric": (
+                f'<div class="metric">{highlight["metric"]}</div>',
+                '<div class="metric">removed metric</div>',
+            ),
+            "label": (
+                f'<h3>{highlight["label"]}</h3>',
+                '<h3>removed label</h3>',
+            ),
+            "model": (
+                f'<div><dt>Model</dt><dd>{highlight["model"]}</dd></div>',
+                '<div><dt>Model</dt><dd>removed model</dd></div>',
+            ),
+            "hardware": (
+                f'<div><dt>Hardware</dt><dd>{highlight["hardware"]}</dd></div>',
+                '<div><dt>Hardware</dt><dd>removed hardware</dd></div>',
+            ),
+            "workload": (
+                f'<div><dt>Workload</dt><dd>{highlight["workload"]}</dd></div>',
+                '<div><dt>Workload</dt><dd>removed workload</dd></div>',
+            ),
+            "date": (
+                f'<time datetime="{highlight["date"]}">{highlight["date"]}</time>',
+                '<time datetime="1900-01-01">1900-01-01</time>',
+            ),
+            "caveat": (
+                '<p class="scope-note"><strong>Boundary:</strong> '
+                f'{highlight["caveat"]}</p>',
+                '<p class="scope-note"><strong>Boundary:</strong> removed caveat</p>',
+            ),
+            "evidence": (
+                f'<a class="text-link" href="{evidence_href}">',
+                '<a class="text-link" href="../capabilities/">',
+            ),
+        }
+
+        for field, (before, after) in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                explorer_path = output / "benchmarks/index.html"
+                explorer = explorer_path.read_text(encoding="utf-8")
+                self.assertIn(before, explorer)
+                explorer_path.write_text(
+                    explorer.replace(before, after, 1), encoding="utf-8"
+                )
+                self.assertIn(
+                    f"benchmark explorer card '{highlight['id']}' has the wrong {field}",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_requires_exact_benchmark_filter_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            explorer_path = output / "benchmarks/index.html"
+            explorer = explorer_path.read_text(encoding="utf-8")
+            explorer_path.write_text(
+                explorer.replace(
+                    '<option value="Apple M3 Ultra">Apple M3 Ultra</option>',
+                    '<option value="Private host">Private host</option>',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "benchmark explorer hardware options do not match performance highlights",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_preserves_benchmark_no_js_and_live_semantics(self) -> None:
+        mutations = (
+            (
+                '<article class="benchmark-result" role="listitem"',
+                '<article class="benchmark-result" hidden role="listitem"',
+                "benchmark explorer card 'http-sse-operational-soak' is hidden before enhancement",
+            ),
+            (
+                'data-benchmark-count aria-live="polite"',
+                "data-benchmark-count",
+                "benchmark explorer has no live result count",
+            ),
+            (
+                'data-benchmark-empty hidden role="status"',
+                'data-benchmark-empty role="status"',
+                "benchmark explorer has no hidden status empty state",
+            ),
+            (
+                'data-benchmark-empty hidden role="status"',
+                "data-benchmark-empty hidden",
+                "benchmark explorer has no hidden status empty state",
+            ),
+        )
+        for before, after, expected_failure in mutations:
+            with self.subTest(expected_failure=expected_failure), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                explorer_path = output / "benchmarks/index.html"
+                explorer = explorer_path.read_text(encoding="utf-8")
+                self.assertIn(before, explorer)
+                explorer_path.write_text(
+                    explorer.replace(before, after, 1), encoding="utf-8"
+                )
+                self.assertIn(
+                    expected_failure,
                     validate_public_site.validate(output),
                 )
 

@@ -44,6 +44,12 @@ arbitrary source or local artifact paths are not accepted. A release owner revie
 and secret scan before creating a public commit. Failed or incomplete measurements may be retained
 privately, but they cannot become published benchmark claims.
 
+The benchmark explorer is a read-only view of those same reviewed numeric highlights. Its filters
+change visibility only: they do not execute benchmarks, convert units, aggregate results, rank
+configurations, or introduce a second machine-readable contract. Site validation requires every
+rendered result to keep its exact metric, model, hardware, workload, date, decision, caveat, and
+published evidence link attached.
+
 GitHub Pages is downstream of the complete `Public source quality` workflow. It accepts only a
 successful `push` run for `main`, checks out the same validated commit, and exposes no independent
 manual deployment path. The reusable workflow repeats the event and branch check before building.

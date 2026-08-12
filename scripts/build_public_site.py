@@ -252,7 +252,9 @@ def require_text(entry: Dict[str, object], key: str, label: str) -> str:
     value = entry.get(key)
     if not isinstance(value, str) or not value.strip():
         fail(f"{label} has an empty or non-string {key}")
-    return value.strip()
+    if value != value.strip():
+        fail(f"{label} {key} contains surrounding whitespace")
+    return value
 
 
 def require_iso_date(entry: Dict[str, object], key: str, label: str) -> str:
@@ -643,6 +645,7 @@ def render_template(
     root: str,
     body: str,
     current_page: str = "",
+    page_script: str = "",
 ) -> str:
     nav_root = html.escape(root, quote=True)
 
@@ -656,9 +659,11 @@ def render_template(
         "{{root}}": root,
         "{{body}}": body.replace("{{root}}", root),
         "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
+        "{{benchmarks_nav}}": nav_link("benchmarks", "Benchmarks"),
         "{{process_nav}}": nav_link("process", "The loop"),
         "{{methodology_nav}}": nav_link("methodology", "Methodology"),
         "{{research_nav}}": nav_link("research", "Research notes"),
+        "{{page_script}}": page_script,
     }
     rendered = template
     for token, value in replacements.items():
@@ -796,6 +801,106 @@ def render_capability_catalog(
     return "\n".join(body), public_index
 
 
+def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
+    status_by_id = {item[0]: item[1] for item in CAPABILITY_STATUS_DEFINITIONS}
+
+    def options(values: Iterable[str], all_label: str) -> str:
+        rendered = [f'<option value="">{html.escape(all_label)}</option>']
+        for value in sorted(set(values), key=str.casefold):
+            escaped = html.escape(value, quote=True)
+            rendered.append(f'<option value="{escaped}">{html.escape(value)}</option>')
+        return "".join(rendered)
+
+    model_options = options(
+        (str(highlight["model"]) for highlight in highlights), "All models"
+    )
+    hardware_options = options(
+        (str(highlight["hardware"]) for highlight in highlights), "All hardware"
+    )
+    decision_options = ['<option value="">All decisions</option>']
+    for decision in sorted(
+        {str(highlight["decision"]) for highlight in highlights},
+        key=lambda value: status_by_id[value].casefold(),
+    ):
+        decision_options.append(
+            f'<option value="{html.escape(decision, quote=True)}">'
+            f'{html.escape(status_by_id[decision])}</option>'
+        )
+
+    total = len(highlights)
+    body: List[str] = [
+        '<section class="page-hero shell benchmark-hero">',
+        '<p class="eyebrow">Benchmark explorer</p>',
+        '<h1>Compare the result, then read its boundary.</h1>',
+        '<p class="lede">Filter fast-mlx’s reviewed measurements by model, hardware, or decision. Every result keeps its workload, date, caveat, and evidence attached; these are not cross-system or future-version guarantees.</p>',
+        '<div class="hero-actions">',
+        '<a class="button secondary" href="../methodology/">Read the methodology</a>',
+        '<a class="button secondary" href="../capabilities/index.json">Inspect the source contract</a>',
+        '</div>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="benchmark-results-heading">',
+        '<div class="section-heading"><p class="eyebrow">Reviewed fast-mlx evidence only</p><h2 id="benchmark-results-heading">Scope travels with every number.</h2><p class="section-intro">Filters change only what is visible. They do not recompute, normalize, rank, or combine measurements.</p></div>',
+        '<form class="benchmark-controls" data-benchmark-controls aria-label="Filter benchmark evidence" action="./" method="get">',
+        '<div><label for="benchmark-model">Model</label><select id="benchmark-model" name="model">'
+        + model_options
+        + '</select></div>',
+        '<div><label for="benchmark-hardware">Hardware</label><select id="benchmark-hardware" name="hardware">'
+        + hardware_options
+        + '</select></div>',
+        '<div><label for="benchmark-decision">Decision</label><select id="benchmark-decision" name="decision">'
+        + "".join(decision_options)
+        + '</select></div>',
+        '<button class="button secondary benchmark-reset" data-benchmark-reset type="reset">Clear filters</button>',
+        '</form>',
+        '<noscript><p class="benchmark-noscript">JavaScript is optional. All reviewed results remain visible below; interactive filters are unavailable.</p></noscript>',
+        f'<p class="benchmark-count" data-benchmark-count aria-live="polite">Showing {total} of {total} reviewed results.</p>',
+        '<div class="benchmark-results" data-benchmark-results role="list">',
+    ]
+    for highlight in sorted(
+        highlights, key=lambda entry: str(entry["date"]), reverse=True
+    ):
+        evidence_record = highlight["evidence"]
+        href = relative_href("benchmarks/index.html", evidence_record["path"])
+        decision = str(highlight["decision"])
+        body.extend(
+            [
+                '<article class="benchmark-result" role="listitem" '
+                f'data-benchmark-card data-highlight-id="{html.escape(str(highlight["id"]), quote=True)}" '
+                f'data-model="{html.escape(str(highlight["model"]), quote=True)}" '
+                f'data-hardware="{html.escape(str(highlight["hardware"]), quote=True)}" '
+                f'data-decision="{html.escape(decision, quote=True)}">',
+                '<div class="card-topline">'
+                f'<span class="status-badge status-{html.escape(decision, quote=True)}">{html.escape(status_by_id[decision].upper())}</span>'
+                f'<time datetime="{html.escape(str(highlight["date"]), quote=True)}">{html.escape(str(highlight["date"]))}</time>'
+                '</div>',
+                f'<div class="metric">{html.escape(str(highlight["metric"]))}</div>',
+                f'<h3>{html.escape(str(highlight["label"]))}</h3>',
+                '<dl class="evidence-context">',
+                f'<div><dt>Model</dt><dd>{html.escape(str(highlight["model"]))}</dd></div>',
+                f'<div><dt>Hardware</dt><dd>{html.escape(str(highlight["hardware"]))}</dd></div>',
+                f'<div><dt>Workload</dt><dd>{html.escape(str(highlight["workload"]))}</dd></div>',
+                '</dl>',
+                f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(highlight["caveat"]))}</p>',
+                f'<a class="text-link" href="{html.escape(href, quote=True)}">Read {html.escape(str(evidence_record["title"]))} →</a>',
+                '</article>',
+            ]
+        )
+    body.extend(
+        [
+            '</div>',
+            '<div class="benchmark-empty" data-benchmark-empty hidden role="status"><h3>No reviewed results match those filters.</h3><p>Clear the filters to return to the complete evidence set.</p><a class="text-link" href="./">Reset the benchmark explorer →</a></div>',
+            '</section>',
+            '<section class="section shell callout benchmark-callout" aria-labelledby="benchmark-boundary-heading">',
+            '<p class="eyebrow">Claim boundary</p>',
+            '<h2 id="benchmark-boundary-heading">This explorer never manufactures a comparison.</h2>',
+            '<p>It presents only the reviewed entries already published in the fast-mlx capability contract. It performs no unit conversion, interpolation, aggregation, competitor comparison, or live benchmark execution.</p>',
+            '<a class="text-link" href="../capabilities/">See the complete capability inventory →</a>',
+            '</section>',
+        ]
+    )
+    return "\n".join(body)
+
+
 def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
     catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
@@ -853,6 +958,22 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         output,
         "capabilities/index.json",
         json.dumps(capability_index, indent=2, ensure_ascii=False),
+    )
+    benchmark_body = render_benchmark_explorer(
+        capability_index["performanceHighlights"]
+    )
+    write_page(
+        output,
+        "benchmarks/index.html",
+        render_template(
+            template,
+            "Benchmark explorer — fast-mlx",
+            "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
+            "../",
+            benchmark_body,
+            "benchmarks",
+            '<script src="../assets/benchmark-explorer.js" defer></script>',
+        ),
     )
 
     cards = [
@@ -937,6 +1058,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /methodology/: correctness and claim boundaries\n"
         "- /capabilities/: status-aware feature and evidence inventory\n"
         "- /capabilities/index.json: machine-readable capability contract\n"
+        "- /benchmarks/: filterable reviewed performance evidence\n"
         "- /research/: dated technical notes\n\n"
         "## Published notes\n"
         + "\n".join(f"- /{article.public_path}: {article.title}" for article in articles),

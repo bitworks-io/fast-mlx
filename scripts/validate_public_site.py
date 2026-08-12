@@ -8,7 +8,7 @@ import html.parser
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
 
@@ -22,6 +22,11 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN RSA" + " PRIVATE KEY",
 )
 CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelved"}
+HIGHLIGHT_DECISION_LABELS = {
+    "promoted-scoped": "Promoted · scoped",
+    "shelved": "Shelved",
+}
+BENCHMARK_FILTER_NAMES = ("model", "hardware", "decision")
 
 
 class LinkCollector(html.parser.HTMLParser):
@@ -36,6 +41,99 @@ class LinkCollector(html.parser.HTMLParser):
         for key, value in attrs:
             if key == attribute and value:
                 self.links.append(value)
+
+
+class BenchmarkCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cards: List[Dict[str, object]] = []
+        self.options: Dict[str, List[Dict[str, Optional[str]]]] = {
+            name: [] for name in BENCHMARK_FILTER_NAMES
+        }
+        self.has_controls = False
+        self.has_count = False
+        self.has_empty_state = False
+        self.has_script = False
+        self._current_card: Optional[Dict[str, object]] = None
+        self._current_select: Optional[str] = None
+        self._current_option: Optional[Dict[str, object]] = None
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        if tag == "article" and "benchmark-result" in classes:
+            self._current_card = {
+                "id": attributes.get("data-highlight-id"),
+                "model": attributes.get("data-model"),
+                "hardware": attributes.get("data-hardware"),
+                "decision": attributes.get("data-decision"),
+                "hidden": "hidden" in attributes,
+                "datetime": None,
+                "links": [],
+                "text_parts": [],
+            }
+        elif self._current_card is not None:
+            if tag == "time":
+                self._current_card["datetime"] = attributes.get("datetime")
+            elif tag == "a" and attributes.get("href"):
+                links = self._current_card["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+
+        if tag == "select" and attributes.get("name") in self.options:
+            self._current_select = attributes["name"]
+        elif tag == "option" and self._current_select is not None:
+            self._current_option = {
+                "value": attributes.get("value"),
+                "text_parts": [],
+            }
+        if tag == "form" and "data-benchmark-controls" in attributes:
+            self.has_controls = True
+        if (
+            "data-benchmark-count" in attributes
+            and attributes.get("aria-live") == "polite"
+        ):
+            self.has_count = True
+        if (
+            "data-benchmark-empty" in attributes
+            and "hidden" in attributes
+            and attributes.get("role") == "status"
+        ):
+            self.has_empty_state = True
+        if (
+            tag == "script"
+            and attributes.get("src") == "../assets/benchmark-explorer.js"
+        ):
+            self.has_script = True
+
+    def handle_data(self, data: str) -> None:
+        if self._current_card is not None:
+            text_parts = self._current_card["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+        if self._current_option is not None:
+            text_parts = self._current_option["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "article" and self._current_card is not None:
+            text_parts = self._current_card.pop("text_parts")
+            self._current_card["text"] = " ".join(
+                "".join(text_parts).split()
+            ) if isinstance(text_parts, list) else ""
+            self.cards.append(self._current_card)
+            self._current_card = None
+        if tag == "option" and self._current_option is not None:
+            text_parts = self._current_option.pop("text_parts")
+            self._current_option["text"] = " ".join(
+                "".join(text_parts).split()
+            ) if isinstance(text_parts, list) else ""
+            if self._current_select is not None:
+                self.options[self._current_select].append(self._current_option)
+            self._current_option = None
+        elif tag == "select":
+            self._current_select = None
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -79,9 +177,11 @@ def validate(site: Path) -> List[str]:
         "methodology/index.html",
         "capabilities/index.html",
         "capabilities/index.json",
+        "benchmarks/index.html",
         "research/index.html",
         "research/index.json",
         "assets/site.css",
+        "assets/benchmark-explorer.js",
         "assets/favicon.svg",
         "llms.txt",
         ".nojekyll",
@@ -89,6 +189,8 @@ def validate(site: Path) -> List[str]:
     for relative in required:
         if not (site / relative).is_file():
             failures.append(f"missing required file: {relative}")
+
+    expected_benchmark_cards: Dict[str, Dict[str, str]] = {}
 
     index_path = site / "research/index.json"
     if index_path.is_file():
@@ -195,6 +297,150 @@ def validate(site: Path) -> List[str]:
                     evidence = highlight.get("evidence")
                     raw_path = evidence.get("path") if isinstance(evidence, dict) else None
                     failures.extend(validate_evidence_path(site, raw_path, label))
+                    expected_fields = {
+                        key: highlight.get(key)
+                        for key in (
+                            "metric",
+                            "label",
+                            "model",
+                            "hardware",
+                            "workload",
+                            "date",
+                            "decision",
+                            "caveat",
+                        )
+                    }
+                    if (
+                        isinstance(identifier, str)
+                        and all(isinstance(value, str) for value in expected_fields.values())
+                        and expected_fields["decision"] in HIGHLIGHT_DECISION_LABELS
+                        and isinstance(raw_path, str)
+                    ):
+                        expected_benchmark_cards[identifier] = {
+                            **expected_fields,
+                            "evidence": f"../{raw_path.rstrip('/')}/",
+                        }
+
+    benchmark_path = site / "benchmarks/index.html"
+    if benchmark_path.is_file():
+        collector = BenchmarkCollector()
+        try:
+            collector.feed(benchmark_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            failures.append(f"cannot parse benchmarks/index.html: {exc}")
+        else:
+            actual_ids = [card.get("id") for card in collector.cards]
+            if (
+                len(actual_ids) != len(set(actual_ids))
+                or set(actual_ids) != set(expected_benchmark_cards)
+            ):
+                failures.append(
+                    "benchmark explorer card set does not match performance highlights"
+                )
+            expected_order = [
+                identifier
+                for identifier, _entry in sorted(
+                    expected_benchmark_cards.items(),
+                    key=lambda item: item[1]["date"],
+                    reverse=True,
+                )
+            ]
+            if (
+                len(actual_ids) == len(set(actual_ids))
+                and set(actual_ids) == set(expected_benchmark_cards)
+                and actual_ids != expected_order
+            ):
+                failures.append(
+                    "benchmark explorer cards are not ordered by descending evidence date"
+                )
+            for card in collector.cards:
+                identifier = card.get("id")
+                expected = expected_benchmark_cards.get(
+                    identifier if isinstance(identifier, str) else ""
+                )
+                if expected is None:
+                    continue
+                if card.get("hidden"):
+                    failures.append(
+                        f"benchmark explorer card {identifier!r} is hidden before enhancement"
+                    )
+                for key in ("model", "hardware", "decision"):
+                    if card.get(key) != expected[key]:
+                        failures.append(
+                            f"benchmark explorer card {identifier!r} has the wrong {key}"
+                        )
+                card_text = card.get("text")
+                normalized_text = card_text if isinstance(card_text, str) else ""
+                for key in (
+                    "metric",
+                    "label",
+                    "model",
+                    "hardware",
+                    "workload",
+                    "date",
+                    "caveat",
+                ):
+                    normalized_expected = " ".join(expected[key].split())
+                    if normalized_expected not in normalized_text:
+                        message = (
+                            f"benchmark explorer card {identifier!r} has the wrong {key}"
+                        )
+                        if message not in failures:
+                            failures.append(message)
+                if card.get("datetime") != expected["date"]:
+                    message = (
+                        f"benchmark explorer card {identifier!r} has the wrong date"
+                    )
+                    if message not in failures:
+                        failures.append(message)
+                links = card.get("links")
+                if not isinstance(links, list) or expected["evidence"] not in links:
+                    failures.append(
+                        f"benchmark explorer card {identifier!r} has the wrong evidence"
+                    )
+            expected_options = {
+                "model": [("", "All models")]
+                + [
+                    (value, value)
+                    for value in sorted(
+                        {entry["model"] for entry in expected_benchmark_cards.values()},
+                        key=str.casefold,
+                    )
+                ],
+                "hardware": [("", "All hardware")]
+                + [
+                    (value, value)
+                    for value in sorted(
+                        {entry["hardware"] for entry in expected_benchmark_cards.values()},
+                        key=str.casefold,
+                    )
+                ],
+                "decision": [("", "All decisions")]
+                + [
+                    (value, HIGHLIGHT_DECISION_LABELS[value])
+                    for value in sorted(
+                        {entry["decision"] for entry in expected_benchmark_cards.values()},
+                        key=lambda value: HIGHLIGHT_DECISION_LABELS[value].casefold(),
+                    )
+                ],
+            }
+            for name, expected in expected_options.items():
+                actual = [
+                    (option.get("value"), option.get("text"))
+                    for option in collector.options[name]
+                ]
+                if actual != expected:
+                    failures.append(
+                        f"benchmark explorer {name} options do not match performance highlights"
+                    )
+            if not collector.has_controls:
+                failures.append("benchmark explorer has no filter controls")
+            if not collector.has_count:
+                failures.append("benchmark explorer has no live result count")
+            if not collector.has_empty_state:
+                failures.append("benchmark explorer has no hidden status empty state")
+            if not collector.has_script:
+                failures.append("benchmark explorer does not load its reviewed script")
 
     for path in site.rglob("*"):
         if path.is_symlink():

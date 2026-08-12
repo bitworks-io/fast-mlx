@@ -27,6 +27,15 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
 
         self.assertIn("missing required public file: site/capabilities.json", failures)
 
+    def test_benchmark_runtime_fixture_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        self.assertIn(
+            "missing required public file: scripts/tests/benchmark_explorer_node_test.js",
+            failures,
+        )
+
     def test_project_license_must_match_official_apache_2_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
@@ -90,6 +99,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
                     "LICENSE",
                     "NOTICE",
                     "scripts/tests/test_public_repository.py",
+                    "scripts/tests/benchmark_explorer_node_test.js",
                 )
                 if (REPOSITORY_ROOT / path).is_file()
             }
@@ -97,6 +107,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("LICENSE", destinations)
         self.assertIn("NOTICE", destinations)
         self.assertIn("scripts/tests/test_public_repository.py", destinations)
+        self.assertIn("scripts/tests/benchmark_explorer_node_test.js", destinations)
 
     def test_public_quality_workflow_validates_engineering_export_or_public_checkout(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/quality.yml").read_text(
