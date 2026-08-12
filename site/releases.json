@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "reviewed-social-metadata",
+      "title": "Publish reviewed social metadata",
+      "publishedAt": "2026-08-12T02:08:02-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds exact self-canonical and Open Graph presentation metadata to the fourteen reviewed human-facing pages.",
+      "scope": "Presentation and crawl-discovery metadata only; no tracking, indexing guarantee, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "1903e76609cc444bdacfaa5d0472804900dbd13c",
+      "publicLinks": [
+        {
+          "label": "Open fast-mlx",
+          "path": "index.html"
+        },
+        {
+          "label": "Read the methodology",
+          "path": "methodology/"
+        }
+      ]
+    },
+    {
       "id": "reviewed-sitemap-discovery",
       "title": "Publish reviewed sitemap discovery",
       "publishedAt": "2026-08-12T01:07:47-05:00",
