@@ -148,7 +148,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 9_343
 REVIEWED_HOME_PAGE_SHA256 = (
-    "a6486910fc68efca6e03e85b76792a950fc9377ecc72ba14463652505d562c6d"
+    "b4f7e37acf94dfc8509fd9acaab620b42df3b7aba9541ef0f31c5c068ecd51b4"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -169,7 +169,7 @@ REVIEWED_QUICKSTART_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 18_473
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "d513f3d63bbb07241d4fbbe32f781d82e99c83bfb4ee2ecf211e63be076472e0"
+    "550a8aff64e4a7e3b0e65f836a10a1f3dea39997bc6b6b497fae765cac4f4a02"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 13_817
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -335,7 +335,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "6 reviewed capabilities",
     "3 measured proof points",
-    "7 published research notes",
+    "8 published research notes",
     "14 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -429,6 +429,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/the-repository-that-could-reproduce-itself/",
     "research/the-proof-did-not-end-when-the-timer-did/",
     "research/the-fastest-request-wasnt-the-fastest-service/",
     "research/lossless-wasnt-byte-identical/",
@@ -438,6 +439,10 @@ REVIEWED_ARTICLE_PATHS = (
     "research/the-wall-that-wasnt/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/the-repository-that-could-reproduce-itself/": (
+        "2026-08-14",
+        "2026-08-14",
+    ),
     "research/the-proof-did-not-end-when-the-timer-did/": (
         "2026-07-28",
         "2026-08-06",
@@ -654,6 +659,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/the-repository-that-could-reproduce-itself/": (
+        "The repository that could reproduce itself — but could not publish itself — fast-mlx",
+        "A public source release is easy to mistake for a directory copy.",
+        "article",
+        "Rapid research integration — the flywheel; Building a high-performance MLX inference engine in Swift",
     ),
     "research/the-proof-did-not-end-when-the-timer-did/": (
         "The proof did not end when the timer did — fast-mlx",

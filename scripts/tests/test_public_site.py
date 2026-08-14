@@ -139,12 +139,21 @@ class PublicSiteTests(unittest.TestCase):
         )
         self.assertEqual(manifest["schemaVersion"], 1)
         self.assertEqual(manifest["policy"], "fast-mlx-owned-results-only")
-        self.assertEqual(len(manifest["articles"]), 7)
+        self.assertEqual(len(manifest["articles"]), 8)
         self.assertEqual(
-            len({entry["source"] for entry in manifest["articles"]}), 7
+            len({entry["source"] for entry in manifest["articles"]}), 8
         )
         self.assertEqual(
-            len({entry["slug"] for entry in manifest["articles"]}), 7
+            len({entry["slug"] for entry in manifest["articles"]}), 8
+        )
+        self.assertEqual(
+            manifest["articles"][-1],
+            {
+                "source": "docs/content/2026-08-14-the-repository-that-could-reproduce-itself.md",
+                "slug": "the-repository-that-could-reproduce-itself",
+                "status": "published",
+                "reviewedAt": "2026-08-14",
+            },
         )
 
     def test_capability_manifest_is_explicit_and_evidence_backed(self) -> None:
@@ -525,7 +534,7 @@ class PublicSiteTests(unittest.TestCase):
             ),
             (
                 "research count",
-                "7 published research notes",
+                "8 published research notes",
                 "99 published research notes",
                 "home current-cycle research count does not match research/index.json",
             ),
@@ -813,13 +822,13 @@ class PublicSiteTests(unittest.TestCase):
                 (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
             )
             build_public_site.scan_generated_output(output)
-            self.assertEqual(len(articles), 7)
+            self.assertEqual(len(articles), 8)
             self.assertEqual(validate_public_site.validate(output), [])
 
             public_index = json.loads(
                 (output / "research/index.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(public_index["articles"]), 7)
+            self.assertEqual(len(public_index["articles"]), 8)
             self.assertEqual(
                 public_index["claimBoundary"], "fast-mlx-owned-results-only"
             )
@@ -1563,7 +1572,7 @@ class PublicSiteTests(unittest.TestCase):
             )
 
             entries = feed.findall(atom("entry"))
-            self.assertEqual(len(entries), 21)
+            self.assertEqual(len(entries), 22)
             self.assertEqual(len(entries), len(expected_updates))
             self.assertEqual(
                 len({entry.findtext(atom("id")) for entry in entries}),
@@ -1679,7 +1688,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 39)
+            self.assertEqual(len(expected_urls), 40)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1811,7 +1820,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 39)
+            self.assertEqual(len(expected), 40)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )
@@ -3105,8 +3114,8 @@ class PublicSiteTests(unittest.TestCase):
             build_public_site.build_site(REPOSITORY_ROOT, output)
             path = output / "research/index.html"
             page = path.read_text(encoding="utf-8")
-            first = 'data-research-path="research/the-proof-did-not-end-when-the-timer-did/"'
-            second = 'data-research-path="research/the-fastest-request-wasnt-the-fastest-service/"'
+            first = 'data-research-path="research/the-repository-that-could-reproduce-itself/"'
+            second = 'data-research-path="research/the-proof-did-not-end-when-the-timer-did/"'
             self.assertIn(first, page)
             self.assertIn(second, page)
             page = page.replace(first, "__FIRST_RESEARCH_PATH__", 1)
@@ -3123,27 +3132,27 @@ class PublicSiteTests(unittest.TestCase):
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" hidden role="listitem" data-research-card',
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" style="display:none" role="listitem" data-research-card',
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" aria-hidden="true" role="listitem" data-research-card',
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" inert role="listitem" data-research-card',
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
             ),
             (
                 '<div class="research-grid" data-research-results role="list">',
                 '<div class="research-grid" data-research-results role="list" hidden>',
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
             ),
             (
                 '<h2>The proof did not end when the timer did</h2>',
@@ -3237,7 +3246,7 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
             self.assertIn(
-                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' has drifted reviewed text",
+                "research archive card 'research/the-repository-that-could-reproduce-itself/' has drifted reviewed text",
                 failures,
             )
 

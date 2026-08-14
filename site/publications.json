@@ -43,6 +43,12 @@
       "slug": "the-proof-did-not-end-when-the-timer-did",
       "status": "published",
       "reviewedAt": "2026-08-06"
+    },
+    {
+      "source": "docs/content/2026-08-14-the-repository-that-could-reproduce-itself.md",
+      "slug": "the-repository-that-could-reproduce-itself",
+      "status": "published",
+      "reviewedAt": "2026-08-14"
     }
   ]
 }
