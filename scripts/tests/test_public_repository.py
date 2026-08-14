@@ -60,6 +60,15 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             failures,
         )
 
+    def test_current_status_contract_test_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        self.assertIn(
+            "missing required public file: scripts/tests/test_public_status.py",
+            failures,
+        )
+
     def test_project_license_must_match_official_apache_2_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
@@ -131,6 +140,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
                     "NOTICE",
                     "site/releases.json",
                     "scripts/tests/test_public_repository.py",
+                    "scripts/tests/test_public_status.py",
                     "scripts/tests/benchmark_explorer_node_test.js",
                 )
                 if (REPOSITORY_ROOT / path).is_file()
@@ -141,6 +151,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("NOTICE", destinations)
         self.assertTrue(site_tree_exports_releases)
         self.assertIn("scripts/tests/test_public_repository.py", destinations)
+        self.assertIn("scripts/tests/test_public_status.py", destinations)
         self.assertIn("scripts/tests/benchmark_explorer_node_test.js", destinations)
 
     def test_public_quality_workflow_validates_engineering_export_or_public_checkout(self) -> None:

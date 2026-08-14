@@ -69,9 +69,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_330
+REVIEWED_HOME_PAGE_BYTES = 9_369
 REVIEWED_HOME_PAGE_SHA256 = (
-    "719c6f1bbbaa85b322a0bd8c1bfcf90cd00178e10020e7925967bf64aaf2e9fd"
+    "829c736961ea9bed7acf0f4e3a9e4dd334695d5b9a34fc52f3ee7422c0198df9"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -83,9 +83,14 @@ MAX_RESEARCH_INDEX_BYTES = 1_048_576
 MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
 MAX_QUICKSTART_BYTES = 131_072
-REVIEWED_QUICKSTART_PAGE_BYTES = 9_752
+MAX_STATUS_BYTES = 131_072
+REVIEWED_QUICKSTART_PAGE_BYTES = 9_794
 REVIEWED_QUICKSTART_PAGE_SHA256 = (
-    "f2d653ed8350e39e1fc6fb0a0206abf40998f5260f8ee520090c5738fcbeaae2"
+    "c9c990104fe7573d0f84683362c010c3a6945c13423d12dc9c4fd6058bd5506b"
+)
+REVIEWED_STATUS_PAGE_BYTES = 17_876
+REVIEWED_STATUS_PAGE_SHA256 = (
+    "dcf587ab7bdc94ac3d237314c7db4786ea14f1c4398b26c928cd37c965823dc7"
 )
 REVIEWED_QUICKSTART_COMMANDS: Tuple[Tuple[str, str], ...] = (
     (
@@ -148,9 +153,82 @@ QUICKSTART_ALLOWED_TAGS = {
     "span",
     "strong",
 }
+STATUS_ALLOWED_TAGS = {
+    "a",
+    "article",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "h1",
+    "h2",
+    "h3",
+    "li",
+    "p",
+    "section",
+    "span",
+    "strong",
+    "time",
+    "ul",
+}
+REVIEWED_STATUS_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
+    ("openai-http-sse-serving", "promoted-scoped"),
+    ("exact-continuous-batching", "promoted-scoped"),
+    ("prompt-lookup-decoding", "shelved"),
+    ("exact-cache-lifecycle-controls", "implemented"),
+    ("quality-measurement-harness", "implemented"),
+    ("capacity-proof-control-tools", "implemented"),
+)
+REVIEWED_STATUS_COUNTS: Tuple[Tuple[str, str], ...] = (
+    ("implemented", "3"),
+    ("promoted-scoped", "2"),
+    ("experimental", "0"),
+    ("shelved", "1"),
+)
+REVIEWED_STATUS_LINKS = (
+    "../quickstart/",
+    "../methodology/",
+    "../capabilities/",
+    "../benchmarks/",
+    "../research/",
+    "../releases/",
+    "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../research/the-fastest-request-wasnt-the-fastest-service/",
+    "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../research/when-zero-speculation-costs-two-percent/",
+    "../research/the-fastest-request-wasnt-the-fastest-service/",
+    "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../research/trusting-the-instrument/",
+    "../research/the-wall-that-wasnt/",
+    "../research/the-wall-that-wasnt/",
+    "../research/lossless-wasnt-byte-identical/",
+    "../benchmarks/pld-echo-throughput/",
+    "../research/when-zero-speculation-costs-two-percent/",
+    "../benchmarks/continuous-batch-c2-throughput/",
+    "../research/the-fastest-request-wasnt-the-fastest-service/",
+    "../benchmarks/http-sse-operational-soak/",
+    "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../releases/reviewed-research-atom-feed/",
+    "https://github.com/bitworks-io/fast-mlx/commit/1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
+    "../methodology/",
+    "../capabilities/index.json",
+    "../releases/index.json",
+    "../research/index.json",
+)
+REVIEWED_STATUS_TEXT = (
+    "Current state, not a roadmap.",
+    "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
+    "6 reviewed capabilities",
+    "3 measured proof points",
+    "7 published research notes",
+    "13 reviewed release records",
+    "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
+    "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
+)
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "quickstart/",
+    "status/",
     "process/",
     "methodology/",
     "capabilities/",
@@ -289,56 +367,56 @@ REVIEWED_RELEASE_PATHS = tuple(
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "reviewed-research-atom-feed": (
-        4_666,
-        "e9224ceaf6510d7a1829c6cd69d716b88ce0ad7e97742e87bb62e702a80e200b",
+        4_711,
+        "20d338fb30c2d72c964c845cf3d6464f0d75e9b430f5bd4207de45a47321ce01",
     ),
     "reviewed-release-detail-permalinks": (
-        4_636,
-        "305546c9159b7260eb1f800c4984d2bd90e0aafb8ee14647a4e1755b16a88f5d",
+        4_681,
+        "aee1a7f0e90a446f118788a14a4b9f5160c2b45082de0959912fd6af4a88a0f7",
     ),
     "reviewed-benchmark-detail-permalinks": (
-        4_738,
-        "367762f5f7914d6ec762b08097bcba2f398ab89c173dd8f0f235f4447027a13e",
+        4_783,
+        "b1e96b23008349d98482ed2c83bf2cd63f2343198f3798e81ea3abb8fed1009c",
     ),
     "reviewed-home-current-cycle": (
-        4_566,
-        "853e502c5a0728df422aad0a024619dcd40f34dbb9f2d526d0f25f6c2c546b98",
+        4_611,
+        "8c90ddabb53b9c75b762724dc7266a7a56676a3347480ca714ca4b13fc71bfc2",
     ),
     "reviewed-social-metadata": (
-        4_464,
-        "848380033e250cf5ff0c37515eecc6e10f6dbc7bff4b72ba03a43bcf56749c61",
+        4_509,
+        "366ee6115901d9ac8e6f0372891ebac339b95e52740a23fc1332defe46400d68",
     ),
     "reviewed-sitemap-discovery": (
-        4_484,
-        "1d4254e002b1cff000aa46dc59d405109e2c6d334cdd228a26043c52ec8efb27",
+        4_529,
+        "15063f88c7b763c33bf093eba93bbf28a9937021f7d158e11c1f52188e04bc0b",
     ),
     "reviewed-release-atom-feed": (
-        4_394,
-        "a2302c5f943bb02921068947630d60ee1919ab292196f9164d1dbb48dadea946",
+        4_439,
+        "2f007a8c0b7f7250f74dbf4f195b972d1663aa6b50a25260ceaab21e9f5a1ece",
     ),
     "reviewed-release-ledger": (
-        4_379,
-        "2895a216809dbcdfb43ab57f46628e26506d26a62eff083dc8f8775b98e742c0",
+        4_424,
+        "c076f33c846036cea883574b37c3e946814b8e201af889524f8312573af62ef2",
     ),
     "public-benchmark-explorer": (
-        4_442,
-        "9e5abb266d124a23fd1bb1ae9e176b1de3dd48b48cf148a31c64fc238a22d58b",
+        4_487,
+        "02e741116de24e6e0a9891007a1199a9d59dc5c59e315ccf4c2a002d8afae530",
     ),
     "same-commit-pages-quality-gate": (
-        4_415,
-        "265d77607f2241c5f1faf9ac740df616cc4245cf4d8780371aa84cff3db6280a",
+        4_460,
+        "e4fc85daca6cfde589010a992b8b1018d568afca14d962994fc129d3c72be25c",
     ),
     "capabilities-and-evidence": (
-        4_466,
-        "4660b5eb90ea87018cd079e8beb89e124bef1458424ca649de859734d092cf6f",
+        4_511,
+        "0ab647211aca7e0a5eb0ed5b355ca3bcda09dd77630267b8febf0cf792793c4c",
     ),
     "compatible-hosted-swift-runner": (
-        4_333,
-        "da9d7948394bf65b2f15599126b8db4910b2e53c75bc4976b9db3966565f684c",
+        4_378,
+        "3172866d91b6f8180bf79e3cb98fff1ae1f83410addbfaa2d7e1bad90ae3d2eb",
     ),
     "initial-public-release": (
-        4_389,
-        "b670567d35e2369a9fa328fcb10e37bb0bbcaba69503e4b0da8fd61abb1e95fb",
+        4_434,
+        "88355644c60cbb1064d6f3cfaa6f65842292b058559c9185557b62288ab071e7",
     ),
 }
 RELEASE_DETAIL_DESCRIPTION = (
@@ -373,6 +451,12 @@ REVIEWED_PAGE_METADATA: Dict[
     "quickstart/": (
         "Operator quickstart — fast-mlx",
         "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
+        "website",
+        None,
+    ),
+    "status/": (
+        "Current status — fast-mlx",
+        "A manifest-derived view of fast-mlx capabilities, measured proof points, reviewed releases, research, and unchanged authority boundaries.",
         "website",
         None,
     ),
@@ -752,6 +836,153 @@ class QuickstartCollector(html.parser.HTMLParser):
                     commands.append(self._active_command)
             self._active_command = None
 
+        if self._current is not None and tag not in HTML_VOID_ELEMENTS:
+            self._root_depth -= 1
+            if self._root_depth == 0:
+                text_parts = self._current.pop("text_parts")
+                self._current["text"] = (
+                    " ".join("".join(text_parts).split())
+                    if isinstance(text_parts, list)
+                    else ""
+                )
+                self.roots.append(self._current)
+                self._current = None
+
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                del self._element_stack[index:]
+                break
+
+
+class StatusPageCollector(html.parser.HTMLParser):
+    """Collect the immutable, static contract inside the reviewed status root."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.roots: List[Dict[str, object]] = []
+        self.root_count = 0
+        self.page_h1_count = 0
+        self.scripts: List[Optional[str]] = []
+        self.inline_style_count = 0
+        self.stylesheet_links: List[Optional[str]] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._root_depth = 0
+        self._element_stack: List[
+            Tuple[str, Dict[str, Optional[str]], bool]
+        ] = []
+
+    @staticmethod
+    def _suppresses_visibility(attributes: Dict[str, Optional[str]]) -> bool:
+        classes = set((attributes.get("class") or "").split())
+        return (
+            "hidden" in attributes
+            or "inert" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+            or bool(classes & {"benchmark-controls", "research-controls"})
+            or "data-benchmark-controls" in attributes
+            or "data-research-controls" in attributes
+        )
+
+    def handle_starttag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        names = [name for name, _value in attrs]
+        has_duplicate_attributes = len(names) != len(set(names))
+        attributes = dict(attrs)
+        if tag == "h1":
+            self.page_h1_count += 1
+        elif tag == "script":
+            self.scripts.append(attributes.get("src"))
+        elif tag == "style":
+            self.inline_style_count += 1
+        elif tag == "link" and "stylesheet" in {
+            token.casefold() for token in (attributes.get("rel") or "").split()
+        }:
+            self.stylesheet_links.append(attributes.get("href"))
+
+        started_root = False
+        if tag == "div" and "data-status-page" in attributes:
+            self.root_count += 1
+            if self._current is None:
+                self._current = {
+                    "rootAttributes": attributes,
+                    "ancestry": list(self._element_stack),
+                    "hasDuplicateAttributes": has_duplicate_attributes,
+                    "hasVisibilitySuppressor": self._suppresses_visibility(attributes),
+                    "forbiddenTags": [],
+                    "statusCounts": [],
+                    "capabilities": [],
+                    "highlights": [],
+                    "links": [],
+                    "h1Count": 0,
+                    "text_parts": [],
+                }
+                self._root_depth = 1
+                started_root = True
+
+        if self._current is not None:
+            if has_duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if self._suppresses_visibility(attributes):
+                self._current["hasVisibilitySuppressor"] = True
+            if (
+                tag not in STATUS_ALLOWED_TAGS
+                or any(name.casefold().startswith("on") for name in names)
+            ):
+                forbidden = self._current["forbiddenTags"]
+                if isinstance(forbidden, list):
+                    forbidden.append(tag)
+            if tag == "h1":
+                count = self._current["h1Count"]
+                self._current["h1Count"] = count + 1 if isinstance(count, int) else 1
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+            if "data-status-count" in attributes:
+                counts = self._current["statusCounts"]
+                if isinstance(counts, list):
+                    counts.append(
+                        (
+                            attributes.get("data-status-count"),
+                            attributes.get("data-count"),
+                            attributes,
+                        )
+                    )
+            if "data-status-capability" in attributes:
+                capabilities = self._current["capabilities"]
+                if isinstance(capabilities, list):
+                    capabilities.append(
+                        (
+                            attributes.get("data-status-capability"),
+                            attributes.get("data-capability-state"),
+                            attributes,
+                        )
+                    )
+            if "data-status-highlight" in attributes:
+                highlights = self._current["highlights"]
+                if isinstance(highlights, list):
+                    highlights.append(
+                        (
+                            attributes.get("data-status-highlight"),
+                            attributes.get("data-highlight-decision"),
+                            attributes,
+                        )
+                    )
+            if tag not in HTML_VOID_ELEMENTS and not started_root:
+                self._root_depth += 1
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, attributes, has_duplicate_attributes))
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            text_parts = self._current["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
         if self._current is not None and tag not in HTML_VOID_ELEMENTS:
             self._root_depth -= 1
             if self._root_depth == 0:
@@ -2457,7 +2688,138 @@ def validate_quickstart_page(site: Path) -> List[str]:
     return failures
 
 
-def validate_quickstart_navigation(site: Path) -> List[str]:
+def validate_status_page(site: Path) -> List[str]:
+    failures: List[str] = []
+    path = site / "status/index.html"
+    if path.is_symlink() or not path.is_file():
+        return ["status/index.html must be a regular non-symlink file"]
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat status/index.html: {exc}"]
+    if size > MAX_STATUS_BYTES:
+        return ["status/index.html exceeds the 131072-byte limit"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read status/index.html: {exc}"]
+    if len(raw) > MAX_STATUS_BYTES:
+        return ["status/index.html exceeds the 131072-byte limit"]
+    if (
+        len(raw) != REVIEWED_STATUS_PAGE_BYTES
+        or hashlib.sha256(raw).hexdigest() != REVIEWED_STATUS_PAGE_SHA256
+    ):
+        failures.append("status/index.html does not match the reviewed page seal")
+    try:
+        page = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"status/index.html is not UTF-8: {exc}"]
+
+    collector = StatusPageCollector()
+    try:
+        collector.feed(page)
+        collector.close()
+    except Exception as exc:
+        return [f"cannot parse status/index.html: {exc}"]
+    if collector._current is not None:
+        failures.append("status/index.html has an incomplete content root")
+    if collector.root_count != 1 or len(collector.roots) != 1:
+        failures.append("status/index.html must contain exactly one complete status root")
+        return failures
+
+    root = collector.roots[0]
+    expected_root_attributes = {
+        "data-status-page": None,
+        "data-latest-release-id": "reviewed-research-atom-feed",
+        "data-boundary-id": "runtime-model-promotion",
+        "data-boundary-state": "gated",
+    }
+    if root.get("rootAttributes") != expected_root_attributes:
+        failures.append("status page root attributes do not match reviewed contract")
+    expected_ancestry = [
+        ("html", {"lang": "en"}, False),
+        ("body", {}, False),
+        ("main", {"id": "content"}, False),
+    ]
+    if root.get("ancestry") != expected_ancestry:
+        failures.append("status page root ancestry does not match reviewed contract")
+    if root.get("hasDuplicateAttributes"):
+        failures.append("status page contains duplicate attributes")
+    if root.get("hasVisibilitySuppressor"):
+        failures.append("status page contains a visibility suppressor")
+    if root.get("forbiddenTags"):
+        failures.append("status page contains an interactive or executable tag")
+    if root.get("h1Count") != 1 or collector.page_h1_count != 1:
+        failures.append("status page must contain exactly one h1")
+    if collector.scripts or collector.inline_style_count:
+        failures.append("status page must not contain scripts or inline styles")
+    if collector.stylesheet_links != ["../assets/site.css"]:
+        failures.append("status page must load only the reviewed stylesheet")
+
+    counts = root.get("statusCounts")
+    actual_counts: List[Tuple[object, object]] = []
+    if isinstance(counts, list):
+        for status, count, attributes in counts:
+            if attributes != {
+                "data-status-count": status,
+                "data-count": count,
+            }:
+                failures.append(
+                    f"status summary {status!r} attributes do not match reviewed contract"
+                )
+            actual_counts.append((status, count))
+    if tuple(actual_counts) != REVIEWED_STATUS_COUNTS:
+        failures.append("status summary counts do not match reviewed contract")
+
+    capabilities = root.get("capabilities")
+    actual_capabilities: List[Tuple[object, object]] = []
+    if isinstance(capabilities, list):
+        for identifier, state, attributes in capabilities:
+            if attributes != {
+                "class": "capability-card",
+                "data-status-capability": identifier,
+                "data-capability-state": state,
+            }:
+                failures.append(
+                    f"status capability {identifier!r} attributes do not match reviewed contract"
+                )
+            actual_capabilities.append((identifier, state))
+    if tuple(actual_capabilities) != REVIEWED_STATUS_CAPABILITIES:
+        failures.append("status capability set does not match reviewed contract")
+
+    expected_highlights = tuple(
+        (highlight["id"], highlight["decision"])
+        for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
+    )
+    highlights = root.get("highlights")
+    actual_highlights: List[Tuple[object, object]] = []
+    if isinstance(highlights, list):
+        for identifier, decision, attributes in highlights:
+            if attributes != {
+                "class": "evidence-card",
+                "data-status-highlight": identifier,
+                "data-highlight-decision": decision,
+            }:
+                failures.append(
+                    f"status highlight {identifier!r} attributes do not match reviewed contract"
+                )
+            actual_highlights.append((identifier, decision))
+    if tuple(actual_highlights) != expected_highlights:
+        failures.append("status highlight set does not match reviewed contract")
+    if root.get("links") != list(REVIEWED_STATUS_LINKS):
+        failures.append("status page links do not match reviewed contract")
+
+    text = root.get("text")
+    normalized_text = text if isinstance(text, str) else ""
+    for required_text in REVIEWED_STATUS_TEXT:
+        if " ".join(required_text.split()) not in normalized_text:
+            failures.append(f"status page is missing reviewed text: {required_text!r}")
+    return failures
+
+
+def validate_primary_navigation_link(
+    site: Path, *, label: str, link_text: str, public_path: str
+) -> List[str]:
     failures: List[str] = []
     reviewed_files = [
         (public_path + "index.html") if public_path else "index.html"
@@ -2471,7 +2833,7 @@ def validate_quickstart_navigation(site: Path) -> List[str]:
         try:
             page = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
-            failures.append(f"cannot inspect {relative} quickstart navigation: {exc}")
+            failures.append(f"cannot inspect {relative} {label} navigation: {exc}")
             continue
         collector = PrimaryNavigationCollector()
         try:
@@ -2487,7 +2849,7 @@ def validate_quickstart_navigation(site: Path) -> List[str]:
             or len(collector.navs) != 1
         ):
             failures.append(
-                f"{relative} quickstart navigation does not match reviewed contract"
+                f"{relative} {label} navigation does not match reviewed contract"
             )
             continue
         nav = collector.navs[0]
@@ -2503,15 +2865,15 @@ def validate_quickstart_navigation(site: Path) -> List[str]:
             or nav.get("hasDuplicateAttributes")
         ):
             failures.append(
-                f"{relative} quickstart navigation does not match reviewed contract"
+                f"{relative} {label} navigation does not match reviewed contract"
             )
             continue
         current_dir = posixpath.dirname(relative)
         depth = len([part for part in current_dir.split("/") if part])
         expected_attributes: Dict[str, Optional[str]] = {
-            "href": "../" * depth + "quickstart/"
+            "href": "../" * depth + public_path
         }
-        if relative == "quickstart/index.html":
+        if relative == public_path + "index.html":
             expected_attributes["aria-current"] = "page"
         expected_link_ancestry = [
             *expected_nav_ancestry,
@@ -2523,21 +2885,39 @@ def validate_quickstart_navigation(site: Path) -> List[str]:
             ("div", {"class": "nav-links"}, False),
         ]
         links = nav.get("links")
-        quickstart_links = [
+        matching_links = [
             link
             for link in links
-            if isinstance(link, dict) and link.get("text") == "Quickstart"
+            if isinstance(link, dict) and link.get("text") == link_text
         ] if isinstance(links, list) else []
         if (
-            len(quickstart_links) != 1
-            or quickstart_links[0].get("attributes") != expected_attributes
-            or quickstart_links[0].get("ancestry") != expected_link_ancestry
-            or quickstart_links[0].get("hasNestedTag")
+            len(matching_links) != 1
+            or matching_links[0].get("attributes") != expected_attributes
+            or matching_links[0].get("ancestry") != expected_link_ancestry
+            or matching_links[0].get("hasNestedTag")
         ):
             failures.append(
-                f"{relative} quickstart navigation does not match reviewed contract"
+                f"{relative} {label} navigation does not match reviewed contract"
             )
     return failures
+
+
+def validate_quickstart_navigation(site: Path) -> List[str]:
+    return validate_primary_navigation_link(
+        site,
+        label="quickstart",
+        link_text="Quickstart",
+        public_path="quickstart/",
+    )
+
+
+def validate_status_navigation(site: Path) -> List[str]:
+    return validate_primary_navigation_link(
+        site,
+        label="status",
+        link_text="Status",
+        public_path="status/",
+    )
 
 
 def validate_research_explorer_script(site: Path) -> List[str]:
@@ -3487,6 +3867,7 @@ def validate(site: Path) -> List[str]:
     required = [
         "index.html",
         "quickstart/index.html",
+        "status/index.html",
         "process/index.html",
         "methodology/index.html",
         "capabilities/index.html",
@@ -3524,10 +3905,12 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_social_card(site))
     failures.extend(validate_reviewed_stylesheet(site))
     failures.extend(validate_quickstart_page(site))
+    failures.extend(validate_status_page(site))
     failures.extend(validate_research_explorer_script(site))
     failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
     failures.extend(validate_quickstart_navigation(site))
+    failures.extend(validate_status_navigation(site))
     failures.extend(validate_research_page(site))
 
     expected_benchmark_cards = reviewed_benchmark_cards()

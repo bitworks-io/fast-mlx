@@ -6,6 +6,7 @@ effects, and keep only the capabilities that survive explicit correctness and op
 
 **Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
 [operator quickstart](https://bitworks-io.github.io/fast-mlx/quickstart/) ·
+[current status](https://bitworks-io.github.io/fast-mlx/status/) ·
 [capabilities and evidence](https://bitworks-io.github.io/fast-mlx/capabilities/) ·
 [reviewed benchmark explorer](https://bitworks-io.github.io/fast-mlx/benchmarks/) ·
 [reviewed releases](https://bitworks-io.github.io/fast-mlx/releases/) ·
@@ -37,6 +38,11 @@ are published.
 The engine is still experimental. A capability appearing in source does not make it a supported
 default: the project distinguishes implemented, verified, promoted, shelved, and diagnostic-only
 states.
+
+The generated [current-status dashboard](https://bitworks-io.github.io/fast-mlx/status/) collects
+those reviewed feature states, measured proof points, release records, research counts, and the
+unchanged runtime/model boundary in one static page. It is a present-state reader, not a roadmap,
+live telemetry surface, benchmark runner, or second source of publication authority.
 
 ## First run
 
@@ -107,8 +113,8 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 31 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
-reviewed Open Graph description. The seven research notes alone use article metadata; the eight
+Each of the 32 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+reviewed Open Graph description. The seven research notes alone use article metadata; the nine
 product/index pages, three benchmark-detail pages, and thirteen release-detail pages remain website
 objects, while `404.html` and machine-readable endpoints publish neither. Detail pages are immutable
 views of already-reviewed evidence or release-ledger entries; they do not create new evidence,

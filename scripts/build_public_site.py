@@ -98,6 +98,7 @@ MAX_PUBLICATION_MANIFEST_BYTES = 1_048_576
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "quickstart/",
+    "status/",
     "process/",
     "methodology/",
     "capabilities/",
@@ -914,6 +915,7 @@ def render_template(
         "{{root}}": root,
         "{{body}}": body.replace("{{root}}", root),
         "{{quickstart_nav}}": nav_link("quickstart", "Quickstart"),
+        "{{status_nav}}": nav_link("status", "Status"),
         "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
         "{{benchmarks_nav}}": nav_link("benchmarks", "Benchmarks"),
         "{{releases_nav}}": nav_link("releases", "Releases"),
@@ -1889,6 +1891,220 @@ def render_home_current_cycle(
     )
 
 
+def render_status_page(
+    catalog: Dict[str, object],
+    articles: Sequence[Article],
+    release_catalog: Dict[str, object],
+) -> str:
+    """Render one static current-state reader from reviewed public manifests."""
+
+    article_by_slug = {article.slug: article for article in articles}
+    capabilities = catalog["capabilities"]
+    highlights = catalog["performanceHighlights"]
+    releases = release_catalog["releases"]
+    latest = releases[0]
+    boundary = release_catalog["currentBoundary"]
+    boundary_evidence = boundary["evidence"]
+    status_labels = {
+        status: label for status, label, _description in CAPABILITY_STATUS_DEFINITIONS
+    }
+    status_counts = {
+        status: sum(capability["status"] == status for capability in capabilities)
+        for status in CAPABILITY_STATUSES
+    }
+    status_summary = "; ".join(
+        '<span data-status-count="'
+        + html.escape(status, quote=True)
+        + '" data-count="'
+        + str(status_counts[status])
+        + '">'
+        + str(status_counts[status])
+        + " "
+        + html.escape(status_labels[status].casefold())
+        + "</span>"
+        for status, _label, _description in CAPABILITY_STATUS_DEFINITIONS
+    )
+    latest_id = str(latest["id"])
+    latest_commit = str(latest["publicCommit"])
+    latest_published_at = str(latest["publishedAt"])
+
+    body: List[str] = [
+        '<div data-status-page data-latest-release-id="'
+        + html.escape(latest_id, quote=True)
+        + '" data-boundary-id="'
+        + html.escape(str(boundary["id"]), quote=True)
+        + '" data-boundary-state="'
+        + html.escape(str(boundary["state"]), quote=True)
+        + '">',
+        '<section class="page-hero shell status-hero">',
+        '<p class="eyebrow">Reviewed current state</p>',
+        '<h1>Know what fast-mlx can do today—and where the proof stops.</h1>',
+        '<p class="lede">Current state, not a roadmap. This dashboard is generated from reviewed capability, release, and research manifests; it does not create new measurement, performance, model, runtime, acquisition, or publication authority.</p>',
+        '<div class="hero-actions">',
+        '<a class="button primary" href="../quickstart/">Run the model-free quickstart</a>',
+        '<a class="button secondary" href="../methodology/">Read the evidence rules</a>',
+        '</div>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="status-summary-heading">',
+        '<div class="section-heading"><p class="eyebrow">At a glance</p><h2 id="status-summary-heading">One bounded view of the reviewed public record.</h2><p class="section-intro">Counts describe the manifests below, not broad model support or future commitments.</p></div>',
+        '<div class="capability-list" role="list" aria-label="Reviewed status summary">',
+        '<article role="listitem">',
+        f'<h3>{len(capabilities)} reviewed capabilities</h3>',
+        f'<p>{status_summary}</p>',
+        '<a class="text-link" href="../capabilities/">Inspect the complete capability contract →</a>',
+        '</article>',
+        '<article role="listitem">',
+        f'<h3>{len(highlights)} measured proof points</h3>',
+        '<p>Every number retains its model, hardware, workload, decision, caveat, and evidence.</p>',
+        '<a class="text-link" href="../benchmarks/">Explore the reviewed measurements →</a>',
+        '</article>',
+        '<article role="listitem">',
+        f'<h3>{len(articles)} published research notes</h3>',
+        '<p>Dated investigations preserve promoted, shelved, rejected, and diagnostic outcomes.</p>',
+        '<a class="text-link" href="../research/">Read the evidence trail →</a>',
+        '</article>',
+        '<article role="listitem">',
+        f'<h3>{len(releases)} reviewed release records</h3>',
+        '<p>The ledger keeps exact public commits and unchanged claim boundaries attached.</p>',
+        '<a class="text-link" href="../releases/">Open the release ledger →</a>',
+        '</article>',
+        '</div>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="status-capabilities-heading">',
+        '<div class="section-heading"><p class="eyebrow">Feature set</p><h2 id="status-capabilities-heading">State and scope travel with every capability.</h2><p class="section-intro">Implemented means source and regression contracts exist. Promoted results remain explicitly scoped; shelved work stays visible as a decision, not a default.</p></div>',
+        '<ul class="status-legend" aria-label="Capability status definitions">',
+    ]
+    for status, label, description in CAPABILITY_STATUS_DEFINITIONS:
+        body.append(
+            f'<li><span class="status-badge status-{html.escape(status)}">{html.escape(label.upper())}</span><p>{html.escape(description)}</p></li>'
+        )
+    body.extend(['</ul>', '<div class="capability-grid">'])
+    for capability in capabilities:
+        status = str(capability["status"])
+        body.extend(
+            [
+                '<article class="capability-card" data-status-capability="'
+                + html.escape(str(capability["id"]), quote=True)
+                + '" data-capability-state="'
+                + html.escape(status, quote=True)
+                + '">',
+                f'<span class="status-badge status-{html.escape(status)}">{html.escape(status_labels[status].upper())}</span>',
+                f'<h3>{html.escape(str(capability["name"]))}</h3>',
+                f'<p>{html.escape(str(capability["summary"]))}</p>',
+                f'<p class="scope-note"><strong>Scope:</strong> {html.escape(str(capability["scope"]))}</p>',
+                '<div class="evidence-links" aria-label="Published evidence">',
+            ]
+        )
+        for evidence_slug in capability["evidenceSlugs"]:
+            article = article_by_slug[str(evidence_slug)]
+            body.append(
+                '<a href="../'
+                + html.escape(article.public_path, quote=True)
+                + '">'
+                + html.escape(article.title)
+                + " →</a>"
+            )
+        body.extend(['</div>', '</article>'])
+    body.extend(
+        [
+            '</div>',
+            '</section>',
+            '<section class="section shell" aria-labelledby="status-performance-heading">',
+            '<div class="section-heading"><p class="eyebrow">Measured value</p><h2 id="status-performance-heading">Performance claims keep their boundaries attached.</h2><p class="section-intro">These are dated fast-mlx measurements, not cross-model, cross-hardware, competitor, or future-version guarantees.</p></div>',
+            '<div class="evidence-grid">',
+        ]
+    )
+    for highlight in highlights:
+        identifier = str(highlight["id"])
+        decision = str(highlight["decision"])
+        article = article_by_slug[str(highlight["evidenceSlug"])]
+        body.extend(
+            [
+                '<article class="evidence-card" data-status-highlight="'
+                + html.escape(identifier, quote=True)
+                + '" data-highlight-decision="'
+                + html.escape(decision, quote=True)
+                + '">',
+                '<div class="card-topline">'
+                f'<span class="status-badge status-{html.escape(decision)}">{html.escape(status_labels[decision].upper())}</span>'
+                f'<time datetime="{html.escape(str(highlight["date"]), quote=True)}">{html.escape(str(highlight["date"]))}</time>'
+                '</div>',
+                f'<div class="metric">{html.escape(str(highlight["metric"]))}</div>',
+                f'<h3>{html.escape(str(highlight["label"]))}</h3>',
+                '<dl class="evidence-context">',
+                f'<div><dt>Model</dt><dd>{html.escape(str(highlight["model"]))}</dd></div>',
+                f'<div><dt>Hardware</dt><dd>{html.escape(str(highlight["hardware"]))}</dd></div>',
+                f'<div><dt>Workload</dt><dd>{html.escape(str(highlight["workload"]))}</dd></div>',
+                '</dl>',
+                f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(highlight["caveat"]))}</p>',
+                '<div class="evidence-links" aria-label="Measured evidence links">',
+                '<a class="text-link" href="../benchmarks/'
+                + html.escape(identifier, quote=True)
+                + '/">Open the reviewed result →</a>',
+                '<a class="text-link" href="../'
+                + html.escape(article.public_path, quote=True)
+                + '">Read '
+                + html.escape(article.title)
+                + " →</a>",
+                '</div>',
+                '</article>',
+            ]
+        )
+    body.extend(
+        [
+            '</div>',
+            '</section>',
+            '<section class="section shell split" aria-labelledby="status-release-heading">',
+            '<div>',
+            '<p class="eyebrow">Latest reviewed release record</p>',
+            '<div class="card-topline"><span class="status-badge status-released">'
+            + html.escape(str(latest["state"]).upper())
+            + '</span> <time datetime="'
+            + html.escape(latest_published_at, quote=True)
+            + '">'
+            + html.escape(latest_published_at[:10])
+            + '</time></div>',
+            f'<h2 id="status-release-heading">{html.escape(str(latest["title"]))}</h2>',
+            f'<p>{html.escape(str(latest["summary"]))}</p>',
+            f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(latest["scope"]))}</p>',
+            '<div class="release-links">',
+            '<a class="text-link" href="../releases/'
+            + html.escape(latest_id, quote=True)
+            + '/">Inspect this reviewed milestone →</a>',
+            '<a href="https://github.com/bitworks-io/fast-mlx/commit/'
+            + html.escape(latest_commit, quote=True)
+            + '" rel="noreferrer">Inspect commit '
+            + html.escape(latest_commit[:12])
+            + " →</a>",
+            '</div>',
+            '</div>',
+            '<article class="callout">',
+            f'<span class="status-badge status-gated">{html.escape(str(boundary["state"]).upper())}</span>',
+            f'<h3>{html.escape(str(boundary["label"]))}</h3>',
+            f'<p>{html.escape(str(boundary["summary"]))}</p>',
+            '<a class="text-link" href="../'
+            + html.escape(str(boundary_evidence["path"]), quote=True)
+            + '">'
+            + html.escape(str(boundary_evidence["label"]))
+            + " →</a>",
+            '</article>',
+            '</section>',
+            '<section class="section shell callout" aria-labelledby="status-contract-heading">',
+            '<p class="eyebrow">Machine-readable source</p>',
+            '<h2 id="status-contract-heading">Inspect the exact records behind this view.</h2>',
+            '<p>The capability, release, and research indexes remain the machine-readable contracts. This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.</p>',
+            '<div class="hero-actions">',
+            '<a class="text-link" href="../capabilities/index.json">Capabilities JSON →</a>',
+            '<a class="text-link" href="../releases/index.json">Releases JSON →</a>',
+            '<a class="text-link" href="../research/index.json">Research JSON →</a>',
+            '</div>',
+            '</section>',
+            '</div>',
+        ]
+    )
+    return "\n".join(body)
+
+
 def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
     catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
@@ -1915,6 +2131,20 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "",
             home,
             public_path="",
+        ),
+    )
+
+    write_page(
+        output,
+        "status/index.html",
+        render_template(
+            template,
+            "Current status — fast-mlx",
+            "A manifest-derived view of fast-mlx capabilities, measured proof points, reviewed releases, research, and unchanged authority boundaries.",
+            "../",
+            render_status_page(catalog, articles, release_catalog),
+            "status",
+            public_path="status/",
         ),
     )
 
@@ -2129,6 +2359,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "Evidence-gated Swift/MLX inference research for Apple Silicon.\n\n"
         "## Core pages\n"
         "- /quickstart/: model-free HTTP/SSE operator quickstart\n"
+        "- /status/: reviewed current-state dashboard\n"
         "- /process/: research-to-publication loop\n"
         "- /methodology/: correctness and claim boundaries\n"
         "- /capabilities/: status-aware feature and evidence inventory\n"

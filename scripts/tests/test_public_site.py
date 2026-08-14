@@ -1641,6 +1641,7 @@ class PublicSiteTests(unittest.TestCase):
             expected_paths = [
                 "",
                 "quickstart/",
+                "status/",
                 "process/",
                 "methodology/",
                 "capabilities/",
@@ -1674,7 +1675,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 31)
+            self.assertEqual(len(expected_urls), 32)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1709,6 +1710,12 @@ class PublicSiteTests(unittest.TestCase):
                 "quickstart/": (
                     "Operator quickstart — fast-mlx",
                     "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
+                    "website",
+                    None,
+                ),
+                "status/": (
+                    "Current status — fast-mlx",
+                    "A manifest-derived view of fast-mlx capabilities, measured proof points, reviewed releases, research, and unchanged authority boundaries.",
                     "website",
                     None,
                 ),
@@ -1790,7 +1797,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 31)
+            self.assertEqual(len(expected), 32)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

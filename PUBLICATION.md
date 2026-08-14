@@ -21,6 +21,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
   `/research/index.json`, and the static text-only `/research/feed.atom` subscription surface;
 - the static `/quickstart/` operator path for the model-free HTTP/JSON and HTTP/SSE smoke,
   capacity planning entry point, and explicit loaded-serving boundary;
+- the static `/status/` current-state dashboard derived from the same reviewed capability,
+  release, and research manifests, with no future-roadmap or authority effect;
 - the static text-only `/feed.atom` subscription surface, which combines only those reviewed
   release and research records without becoming another source manifest;
 - deterministic `/sitemap.xml` and `/robots.txt` outputs derived only from reviewed human-facing
@@ -61,6 +63,13 @@ configurations, or introduce a second machine-readable contract. Site validation
 rendered result to keep its exact metric, model, hardware, workload, date, decision, caveat, and
 published evidence link attached.
 
+The current-status dashboard is a static reader over those already-reviewed records. It presents
+capability state counts, the complete scoped feature set, all measured highlights, the latest
+reviewed release record, research/release inventory counts, and the current gated runtime/model
+boundary. It performs no live lookup, recomputation, ranking, ingestion, future commitment, or
+authority transition; exact output sealing prevents jointly drifted rendered claims from becoming
+their own source of truth.
+
 The research archive is another read-only progressive-enhancement surface. Search covers only the
 reviewed title, summary, and exact published theme; theme selection uses the exact catalog value,
 and article order remains date/slug descending. All cards stay visible without JavaScript. The
@@ -90,7 +99,7 @@ ordered by their timezone-aware reviewed timestamps. It introduces no external i
 publication, benchmark recomputation, ranking, runtime action, or authority transition.
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
-eight reviewed product/index pages, three benchmark-detail pages, thirteen release-detail pages,
+nine reviewed product/index pages, three benchmark-detail pages, thirteen release-detail pages,
 and seven explicitly published research notes; it excludes JSON contracts, all three Atom feeds,
 LLM text surfaces, assets, and the 404 page. Detail pages are immutable views of already-reviewed
 capability highlights or release-ledger entries, not new evidence, authority, ranking, or
@@ -98,7 +107,7 @@ recomputation. The builder performs no submission or network request, and valida
 drift, non-UTF-8 or oversized content, DTD/entity declarations, symlinks, and non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-31-page set. The validator independently pins every page's route, title, description, object
+32-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and
