@@ -49,7 +49,94 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     needs: build
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
+
+  verify-publication:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact deployed source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      - name: Rebuild and validate exact publication subject
+        run: |
+          python3 scripts/build_public_site.py \
+            --output "$RUNNER_TEMP/fast-mlx-receipt-site"
+          python3 scripts/validate_public_site.py \
+            "$RUNNER_TEMP/fast-mlx-receipt-site"
+
+      - name: Verify deployed bytes and write typed receipt
+        id: publication_verifier
+        env:
+          DEPLOYMENT_URL: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          python3 scripts/verify_public_deployment.py \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --site "$RUNNER_TEMP/fast-mlx-receipt-site" \
+            --deployment-url "$DEPLOYMENT_URL" \
+            --commit-sha "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/fast-mlx-publication-receipt.json"
+
+      - name: Independently validate PASS publication receipt
+        id: pass_receipt_validation
+        if: ${{ !cancelled() && steps.publication_verifier.outcome == 'success' }}
+        run: |
+          python3 scripts/validate_public_deployment_receipt.py \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --site "$RUNNER_TEMP/fast-mlx-receipt-site" \
+            --receipt "$RUNNER_TEMP/fast-mlx-publication-receipt.json" \
+            --commit-sha "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --require-result PASS
+          echo 'validated=true' >> "$GITHUB_OUTPUT"
+
+      - name: Independently validate FAIL publication receipt
+        id: fail_receipt_validation
+        if: ${{ !cancelled() && steps.publication_verifier.outcome == 'failure' }}
+        run: |
+          python3 scripts/validate_public_deployment_receipt.py \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --site "$RUNNER_TEMP/fast-mlx-receipt-site" \
+            --receipt "$RUNNER_TEMP/fast-mlx-publication-receipt.json" \
+            --commit-sha "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --require-result FAIL
+          echo 'validated=true' >> "$GITHUB_OUTPUT"
+
+      - name: Preserve publication receipt
+        if: >-
+          ${{ !cancelled() &&
+              (steps.pass_receipt_validation.outputs.validated == 'true' ||
+               steps.fail_receipt_validation.outputs.validated == 'true') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: public-deployment-receipt-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fast-mlx-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 9
+          overwrite: false
+          include-hidden-files: false
+          archive: true

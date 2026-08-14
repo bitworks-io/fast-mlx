@@ -69,6 +69,18 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             failures,
         )
 
+    def test_post_deploy_receipt_contract_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        for path in (
+            "scripts/verify_public_deployment.py",
+            "scripts/validate_public_deployment_receipt.py",
+            "scripts/tests/test_public_deployment.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f"missing required public file: {path}", failures)
+
     def test_project_license_must_match_official_apache_2_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)
@@ -139,6 +151,9 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
                     "LICENSE",
                     "NOTICE",
                     "site/releases.json",
+                    "scripts/verify_public_deployment.py",
+                    "scripts/validate_public_deployment_receipt.py",
+                    "scripts/tests/test_public_deployment.py",
                     "scripts/tests/test_public_repository.py",
                     "scripts/tests/test_public_status.py",
                     "scripts/tests/benchmark_explorer_node_test.js",
@@ -150,6 +165,9 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("LICENSE", destinations)
         self.assertIn("NOTICE", destinations)
         self.assertTrue(site_tree_exports_releases)
+        self.assertIn("scripts/verify_public_deployment.py", destinations)
+        self.assertIn("scripts/validate_public_deployment_receipt.py", destinations)
+        self.assertIn("scripts/tests/test_public_deployment.py", destinations)
         self.assertIn("scripts/tests/test_public_repository.py", destinations)
         self.assertIn("scripts/tests/test_public_status.py", destinations)
         self.assertIn("scripts/tests/benchmark_explorer_node_test.js", destinations)

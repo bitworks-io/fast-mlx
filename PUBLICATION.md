@@ -131,6 +131,21 @@ manual deployment path. The reusable workflow repeats the event and branch check
 A site build therefore cannot publish while the public-boundary or Swift quality jobs for the same
 commit are failing or still in progress.
 
+After Pages deploys, the same reusable workflow checks out the exact triggering SHA again, rebuilds
+and validates the publication subject, and compares bounded HTTPS observations from the fixed
+`https://bitworks-io.github.io/fast-mlx/` origin with those exact bytes. Two consecutive complete
+matching cohorts are required. The verifier writes one canonical typed `PASS` or `FAIL` receipt;
+an independent offline validator must accept the matching result before the workflow can retain the
+single receipt artifact. A valid `FAIL` receipt keeps the workflow red and is diagnostic only.
+
+The receipt records content equality for its bounded observation cohorts, not permanent serving
+state or GitHub's internal deployment identity. It contains ten literal false authority flags and
+cannot approve a model, admit absorbed MLA, authorize execution or containment, ingest evidence,
+publish another change, promote a benchmark, or roll back an already deployed site. Cancellation
+and concurrency are liveness controls only. Release sealing remains a separate authenticated,
+read-only audit of the exact run attempt, complete seven-job set, deployment status, artifact
+digest, receipt identity, and public commit.
+
 ## Creating a candidate projection
 
 From a committed engineering checkpoint:
