@@ -99,6 +99,15 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             failures,
         )
 
+    def test_license_page_source_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        self.assertIn(
+            "missing required public file: site/fragments/license.html",
+            failures,
+        )
+
     def test_current_status_contract_test_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             failures = validate_public_repository.validate(Path(directory))

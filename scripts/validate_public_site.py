@@ -146,9 +146,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_343
+REVIEWED_HOME_PAGE_BYTES = 9_403
 REVIEWED_HOME_PAGE_SHA256 = (
-    "b4f7e37acf94dfc8509fd9acaab620b42df3b7aba9541ef0f31c5c068ecd51b4"
+    "71638ad65abfa043ff8855754162b07f46ef610bdc4e95a0a9d16a961e310ddc"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -160,12 +160,17 @@ MAX_RESEARCH_INDEX_BYTES = 1_048_576
 MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
 MAX_QUICKSTART_BYTES = 131_072
+MAX_LICENSE_PAGE_BYTES = 131_072
 MAX_STATUS_BYTES = 131_072
 MAX_CAPABILITY_CATALOG_BYTES = 131_072
 MAX_CAPABILITY_DETAIL_BYTES = 131_072
 REVIEWED_QUICKSTART_PAGE_BYTES = 9_794
 REVIEWED_QUICKSTART_PAGE_SHA256 = (
     "c9c990104fe7573d0f84683362c010c3a6945c13423d12dc9c4fd6058bd5506b"
+)
+REVIEWED_LICENSE_PAGE_BYTES = 7_323
+REVIEWED_LICENSE_PAGE_SHA256 = (
+    "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
 REVIEWED_STATUS_PAGE_BYTES = 18_473
 REVIEWED_STATUS_PAGE_SHA256 = (
@@ -343,6 +348,7 @@ REVIEWED_STATUS_TEXT = (
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "quickstart/",
+    "license/",
     "status/",
     "process/",
     "methodology/",
@@ -576,6 +582,12 @@ REVIEWED_PAGE_METADATA: Dict[
     "quickstart/": (
         "Operator quickstart — fast-mlx",
         "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
+        "website",
+        None,
+    ),
+    "license/": (
+        "Apache-2.0 license — fast-mlx",
+        "Commercial-use, proprietary-extension, redistribution, notice, patent, trademark, and third-party boundaries for the fast-mlx public source.",
         "website",
         None,
     ),
@@ -2998,6 +3010,34 @@ def validate_quickstart_page(site: Path) -> List[str]:
     return failures
 
 
+def validate_license_page(site: Path) -> List[str]:
+    path = site / "license/index.html"
+    if path.is_symlink() or not path.is_file():
+        return ["license/index.html must be a regular non-symlink file"]
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat license/index.html: {exc}"]
+    if size > MAX_LICENSE_PAGE_BYTES:
+        return ["license/index.html exceeds the 131072-byte limit"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read license/index.html: {exc}"]
+    if len(raw) > MAX_LICENSE_PAGE_BYTES:
+        return ["license/index.html exceeds the 131072-byte limit"]
+    if (
+        len(raw) != REVIEWED_LICENSE_PAGE_BYTES
+        or hashlib.sha256(raw).hexdigest() != REVIEWED_LICENSE_PAGE_SHA256
+    ):
+        return ["license/index.html does not match the reviewed page seal"]
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"license/index.html is not UTF-8: {exc}"]
+    return []
+
+
 def validate_status_page(site: Path) -> List[str]:
     failures: List[str] = []
     path = site / "status/index.html"
@@ -4454,6 +4494,7 @@ def validate(site: Path) -> List[str]:
     required = [
         "index.html",
         "quickstart/index.html",
+        "license/index.html",
         "status/index.html",
         "process/index.html",
         "methodology/index.html",
@@ -4496,6 +4537,7 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_social_card(site))
     failures.extend(validate_reviewed_stylesheet(site))
     failures.extend(validate_quickstart_page(site))
+    failures.extend(validate_license_page(site))
     failures.extend(validate_status_page(site))
     failures.extend(validate_research_explorer_script(site))
     failures.extend(validate_reviewed_home_page(site))

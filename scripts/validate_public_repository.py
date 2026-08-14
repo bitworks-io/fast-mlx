@@ -58,6 +58,7 @@ REQUIRED_PATHS: Tuple[str, ...] = (
     "site/publications.json",
     "site/releases.json",
     "site/fragments/quickstart.html",
+    "site/fragments/license.html",
     "scripts/export_public_repository.py",
     "scripts/build_public_site.py",
     "scripts/validate_public_site.py",

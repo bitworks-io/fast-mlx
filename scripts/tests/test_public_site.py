@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -706,6 +707,117 @@ class PublicSiteTests(unittest.TestCase):
             )
             self.assertEqual(metadata.properties["og:type"], ["website"])
             self.assertEqual(validate_public_site.validate(output), [])
+
+    def test_apache_license_page_is_generated_for_commercial_evaluators(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            license_path = output / "license/index.html"
+            self.assertTrue(
+                license_path.is_file(),
+                "missing reviewed license page: license/index.html",
+            )
+            page = license_path.read_text(encoding="utf-8")
+            self.assertIn("data-license-page", page)
+            self.assertEqual(page.count("<h1>"), 1)
+            for required_text in (
+                "Apache License 2.0",
+                "Commercial use",
+                "Proprietary extensions",
+                "Redistributing fast-mlx",
+                "modified files",
+                "patent license",
+                "trademark rights",
+                "Third-party works",
+                "not legal advice",
+            ):
+                with self.subTest(required_text=required_text):
+                    self.assertIn(required_text, page)
+            for href in (
+                "https://github.com/bitworks-io/fast-mlx/blob/main/LICENSE",
+                "https://github.com/bitworks-io/fast-mlx/blob/main/NOTICE",
+                "https://www.apache.org/licenses/LICENSE-2.0",
+                "https://www.apache.org/foundation/license-faq.html",
+            ):
+                self.assertIn(f'href="{href}"', page)
+            self.assertNotIn("<script", page)
+
+            home = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn('href="license/">License</a>', home)
+            self.assertIn(
+                'href="../license/">Share this orientation</a>', page
+            )
+
+            sitemap = (output / "sitemap.xml").read_text(encoding="utf-8")
+            self.assertIn(
+                "https://bitworks-io.github.io/fast-mlx/license/", sitemap
+            )
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn(
+                "- /license/: Apache-2.0 commercial-use and redistribution orientation",
+                llms,
+            )
+
+            metadata = HeadMetadataCollector()
+            metadata.feed(page)
+            self.assertEqual(
+                metadata.canonicals,
+                ["https://bitworks-io.github.io/fast-mlx/license/"],
+            )
+            self.assertEqual(metadata.properties["og:type"], ["website"])
+            self.assertEqual(validate_public_site.validate(output), [])
+
+    def test_validator_rejects_license_page_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            license_path = output / "license/index.html"
+            page = license_path.read_text(encoding="utf-8")
+            self.assertEqual(page.count("<h3>Commercial use</h3>"), 1)
+            license_path.write_text(
+                page.replace(
+                    "<h3>Commercial use</h3>",
+                    "<h3>Unreviewed permission</h3>",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "license/index.html does not match the reviewed page seal",
+                validate_public_site.validate(output),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            (output / "license/index.html").unlink()
+            failures = validate_public_site.validate(output)
+            self.assertIn("missing required file: license/index.html", failures)
+            self.assertIn(
+                "license/index.html must be a regular non-symlink file", failures
+            )
+
+    def test_license_page_size_cap_precedes_content_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            license_path = site / "license/index.html"
+            license_path.parent.mkdir(parents=True)
+            with license_path.open("wb") as handle:
+                handle.truncate(validate_public_site.MAX_LICENSE_PAGE_BYTES + 1)
+
+            with mock.patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("oversized license page was read"),
+            ):
+                self.assertEqual(
+                    validate_public_site.validate_license_page(site),
+                    ["license/index.html exceeds the 131072-byte limit"],
+                )
 
     def test_validator_rejects_quickstart_contract_and_visibility_drift(self) -> None:
         mutations = (
@@ -1651,6 +1763,7 @@ class PublicSiteTests(unittest.TestCase):
             expected_paths = [
                 "",
                 "quickstart/",
+                "license/",
                 "status/",
                 "process/",
                 "methodology/",
@@ -1689,7 +1802,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 40)
+            self.assertEqual(len(expected_urls), 41)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1724,6 +1837,12 @@ class PublicSiteTests(unittest.TestCase):
                 "quickstart/": (
                     "Operator quickstart — fast-mlx",
                     "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
+                    "website",
+                    None,
+                ),
+                "license/": (
+                    "Apache-2.0 license — fast-mlx",
+                    "Commercial-use, proprietary-extension, redistribution, notice, patent, trademark, and third-party boundaries for the fast-mlx public source.",
                     "website",
                     None,
                 ),
@@ -1821,7 +1940,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 40)
+            self.assertEqual(len(expected), 41)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

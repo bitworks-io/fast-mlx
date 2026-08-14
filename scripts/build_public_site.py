@@ -98,6 +98,7 @@ MAX_PUBLICATION_MANIFEST_BYTES = 1_048_576
 CORE_PUBLIC_PAGE_PATHS = (
     "",
     "quickstart/",
+    "license/",
     "status/",
     "process/",
     "methodology/",
@@ -2262,6 +2263,11 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
         ),
         (
+            "license",
+            "Apache-2.0 license — fast-mlx",
+            "Commercial-use, proprietary-extension, redistribution, notice, patent, trademark, and third-party boundaries for the fast-mlx public source.",
+        ),
+        (
             "process",
             "The improvement loop — fast-mlx",
             "How fast-mlx turns research into reviewed, testable inference capabilities.",
@@ -2487,6 +2493,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "Evidence-gated Swift/MLX inference research for Apple Silicon.\n\n"
         "## Core pages\n"
         "- /quickstart/: model-free HTTP/SSE operator quickstart\n"
+        "- /license/: Apache-2.0 commercial-use and redistribution orientation\n"
         "- /status/: reviewed current-state dashboard\n"
         "- /process/: research-to-publication loop\n"
         "- /methodology/: correctness and claim boundaries\n"
