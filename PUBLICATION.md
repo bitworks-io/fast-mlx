@@ -81,11 +81,11 @@ publication, benchmark recomputation, ranking, runtime action, or authority tran
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
 seven reviewed product/index pages, three benchmark-detail pages, thirteen release-detail pages,
-and seven explicitly published research notes; it excludes JSON contracts, all three Atom feeds, LLM text
-surfaces, assets, and the 404 page. Detail pages are immutable views of already-reviewed capability
-highlights or release-ledger entries, not new evidence, authority, ranking, or recomputation. The
-builder performs no submission or network request, and validation rejects route drift, non-UTF-8 or
-oversized content, DTD/entity declarations, symlinks, and non-regular files.
+and seven explicitly published research notes; it excludes JSON contracts, all three Atom feeds,
+LLM text surfaces, assets, and the 404 page. Detail pages are immutable views of already-reviewed
+capability highlights or release-ledger entries, not new evidence, authority, ranking, or
+recomputation. The builder performs no submission or network request, and validation rejects route
+drift, non-UTF-8 or oversized content, DTD/entity declarations, symlinks, and non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
 30-page set. The validator independently pins every page's route, title, description, object

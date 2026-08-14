@@ -1331,7 +1331,9 @@ class PublicSiteTests(unittest.TestCase):
                 feed_text.startswith('<?xml version="1.0" encoding="utf-8"?>')
             )
             self.assertEqual(feed.tag, atom("feed"))
-            self.assertEqual(feed.findtext(atom("title")), "fast-mlx reviewed updates")
+            self.assertEqual(
+                feed.findtext(atom("title")), "fast-mlx reviewed updates"
+            )
             self.assertEqual(
                 feed.findtext(atom("id")),
                 "https://bitworks-io.github.io/fast-mlx/",
@@ -2046,6 +2048,282 @@ class PublicSiteTests(unittest.TestCase):
         )
         self.assertIsNone(entry.find(atom("content")))
 
+    def test_reviewed_updates_atom_feed_is_deterministic_text_only_and_xml_safe(
+        self,
+    ) -> None:
+        reviewed_date = max(
+            article["reviewedAt"]
+            for article in validate_public_site.reviewed_research_articles()
+        )
+        manifest = self.release_manifest()
+        manifest["releases"] = [manifest["releases"][0]]
+        manifest["releases"][0]["title"] = "Reviewed <release> & result"
+        manifest["releases"][0]["summary"] = "Keeps A < B & B > C."
+        manifest["releases"][0]["publishedAt"] = (
+            reviewed_date + "T00:30:00+14:00"
+        )
+        _body, release_index = build_public_site.render_release_catalog(manifest)
+        article = build_public_site.Article(
+            source=Path("docs/content/2026-08-10-reviewed-note.md"),
+            source_name="docs/content/2026-08-10-reviewed-note.md",
+            slug="reviewed-note",
+            title="Reviewed <note> & result",
+            date="2026-08-10",
+            theme="Exact research",
+            summary="A reviewed summary with A < B & no body content.",
+            reviewed_at=reviewed_date,
+            body="This body must not enter the combined feed. <script>alert(1)</script>",
+        )
+
+        first = build_public_site.render_reviewed_updates_feed(
+            release_index, [article]
+        )
+        second = build_public_site.render_reviewed_updates_feed(
+            release_index, [article]
+        )
+        self.assertEqual(first, second)
+        self.assertNotIn("<release>", first)
+        self.assertNotIn("<note>", first)
+        self.assertNotIn("This body must not enter the combined feed", first)
+        self.assertNotIn("<script>", first)
+        self.assertIn("Reviewed &lt;release&gt; &amp; result", first)
+        self.assertIn("Reviewed &lt;note&gt; &amp; result", first)
+
+        atom = lambda name: f"{{http://www.w3.org/2005/Atom}}{name}"
+        entries = ET.fromstring(first).findall(atom("entry"))
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(
+            [entry.find(atom("category")).attrib for entry in entries],
+            [{"term": "research"}, {"term": "release"}],
+        )
+        self.assertEqual(
+            [entry.findtext(atom("updated")) for entry in entries],
+            [
+                reviewed_date + "T00:00:00Z",
+                reviewed_date + "T00:30:00+14:00",
+            ],
+        )
+        self.assertTrue(
+            all(entry.find(atom("content")) is None for entry in entries)
+        )
+
+        expected = validate_public_site.render_expected_reviewed_updates_feed(
+            release_index
+        )
+        expected_entries = ET.fromstring(expected).findall(atom("entry"))
+        self.assertEqual(
+            expected_entries[0].find(atom("category")).attrib,
+            {"term": "research"},
+        )
+        self.assertNotEqual(
+            expected_entries[0].findtext(atom("id")),
+            "urn:fast-mlx:public-commit:"
+            + manifest["releases"][0]["publicCommit"],
+        )
+
+    def test_validator_rejects_reviewed_updates_atom_tampering(self) -> None:
+        atom = lambda name: f"{{http://www.w3.org/2005/Atom}}{name}"
+
+        def mutate_entries(text: str, mutation: str) -> str:
+            feed = ET.fromstring(text)
+            entries = feed.findall(atom("entry"))
+            self.assertGreaterEqual(len(entries), 2)
+            if mutation == "omit":
+                feed.remove(entries[0])
+            elif mutation == "reorder":
+                feed.remove(entries[0])
+                feed.remove(entries[1])
+                feed.append(entries[1])
+                feed.append(entries[0])
+            elif mutation == "duplicate":
+                feed.append(
+                    ET.fromstring(ET.tostring(entries[0], encoding="unicode"))
+                )
+            else:
+                self.fail(f"unknown reviewed updates mutation: {mutation}")
+            ET.register_namespace("", "http://www.w3.org/2005/Atom")
+            ET.indent(feed, space="  ")
+            return (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                + ET.tostring(feed, encoding="unicode", short_empty_elements=True)
+                + "\n"
+            )
+
+        mismatch = (
+            "feed.atom does not match the reviewed release and research catalogs"
+        )
+        mutations = (
+            (
+                "entry identity",
+                lambda text: text.replace(
+                    "urn:fast-mlx:public-commit:"
+                    "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
+                    "urn:fast-mlx:public-commit:"
+                    "0000000000000000000000000000000000000000",
+                    1,
+                ),
+                mismatch,
+            ),
+            ("missing entry", lambda text: mutate_entries(text, "omit"), mismatch),
+            (
+                "reordered entries",
+                lambda text: mutate_entries(text, "reorder"),
+                mismatch,
+            ),
+            (
+                "duplicate entry",
+                lambda text: mutate_entries(text, "duplicate"),
+                mismatch,
+            ),
+            (
+                "active content",
+                lambda text: text.replace(
+                    "</entry>",
+                    '<content type="html">&lt;script&gt;alert(1)&lt;/script&gt;'
+                    "</content>\n  </entry>",
+                    1,
+                ),
+                mismatch,
+            ),
+            (
+                "XML declaration",
+                lambda text: text.replace(
+                    "?>",
+                    '?>\n<!DOCTYPE feed [<!ENTITY injected "not-reviewed">]>',
+                    1,
+                ),
+                "feed.atom contains a forbidden XML declaration",
+            ),
+            (
+                "size limit",
+                lambda _text: " " * 1_048_577,
+                "feed.atom exceeds the 1048576-byte limit",
+            ),
+            (
+                "malformed XML",
+                lambda text: text.replace("</feed>", "", 1),
+                "invalid feed.atom:",
+            ),
+        )
+        for label, mutate, expected in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                feed_path = output / "feed.atom"
+                original = feed_path.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(mutated, original)
+                feed_path.write_text(mutated, encoding="utf-8")
+                failures = validate_public_site.validate(output)
+                if expected.endswith(":"):
+                    self.assertTrue(
+                        any(failure.startswith(expected) for failure in failures),
+                        failures,
+                    )
+                else:
+                    self.assertIn(expected, failures)
+
+    def test_validator_rejects_reviewed_updates_non_utf8_and_symlink_before_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            (output / "feed.atom").write_bytes(b"\xff\xfe\xfd")
+            self.assertTrue(
+                any(
+                    failure.startswith("feed.atom is not UTF-8")
+                    for failure in validate_public_site.validate(output)
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            feed_path = output / "feed.atom"
+            external = root / "external-reviewed-updates.atom"
+            external.write_text(
+                feed_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            feed_path.unlink()
+            feed_path.symlink_to(external)
+            self.assertIn(
+                "feed.atom must be a regular non-symlink file",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_requires_reviewed_updates_feed_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            (output / "feed.atom").unlink()
+            self.assertIn(
+                "missing required file: feed.atom",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_requires_reviewed_updates_feed_discovery_surfaces(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "home metadata",
+                "index.html",
+                lambda text: text.replace(
+                    'title="fast-mlx reviewed updates" href="feed.atom"',
+                    'title="unreviewed updates" href="feed.atom"',
+                    1,
+                ),
+                "index.html metadata does not match reviewed contract",
+            ),
+            (
+                "home action",
+                "index.html",
+                lambda text: text.replace(
+                    '<a class="button secondary" href="feed.atom" ',
+                    '<a class="button secondary" hidden href="feed.atom" ',
+                    1,
+                ),
+                "index.html does not match the reviewed home page",
+            ),
+            (
+                "release action",
+                "releases/index.html",
+                lambda text: text.replace(
+                    '<a class="button secondary" href="../feed.atom" ',
+                    '<a class="button secondary" hidden href="../feed.atom" ',
+                    1,
+                ),
+                "releases/index.html does not expose the reviewed subscription actions",
+            ),
+            (
+                "research action",
+                "research/index.html",
+                lambda text: text.replace(
+                    '<a class="button secondary" href="../feed.atom" ',
+                    '<a class="button secondary" hidden href="../feed.atom" ',
+                    1,
+                ),
+                "research/index.html does not expose the reviewed subscription actions",
+            ),
+        )
+        for label, relative, mutate, expected in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / relative
+                original = path.read_text(encoding="utf-8")
+                mutated = mutate(original)
+                self.assertNotEqual(mutated, original)
+                path.write_text(mutated, encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
     def test_validator_rejects_research_atom_tampering(self) -> None:
         atom = lambda name: f"{{http://www.w3.org/2005/Atom}}{name}"
 
@@ -2190,8 +2468,7 @@ class PublicSiteTests(unittest.TestCase):
                     "Subscribe to reviewed research</a>",
                     1,
                 ),
-                "research/index.html does not expose the reviewed research "
-                "subscription action",
+                "research/index.html does not expose the reviewed subscription actions",
             ),
             (
                 "hidden archive action",
@@ -2201,8 +2478,7 @@ class PublicSiteTests(unittest.TestCase):
                     '<a class="button secondary" hidden href="feed.atom" ',
                     1,
                 ),
-                "research/index.html does not expose the reviewed research "
-                "subscription action",
+                "research/index.html does not expose the reviewed subscription actions",
             ),
         )
         for label, relative, mutate, expected in mutations:
@@ -2245,7 +2521,7 @@ class PublicSiteTests(unittest.TestCase):
                 validate_public_site.validate(output),
             )
 
-    def test_validator_rejects_joint_research_index_and_feed_drift(self) -> None:
+    def test_validator_rejects_joint_research_index_and_feeds_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
             output.mkdir()
@@ -2272,6 +2548,13 @@ class PublicSiteTests(unittest.TestCase):
                 feed.replace(original_summary, changed_summary, 1),
                 encoding="utf-8",
             )
+            combined_path = output / "feed.atom"
+            combined = combined_path.read_text(encoding="utf-8")
+            self.assertIn(original_summary, combined)
+            combined_path.write_text(
+                combined.replace(original_summary, changed_summary, 1),
+                encoding="utf-8",
+            )
 
             failures = validate_public_site.validate(output)
             self.assertIn(
@@ -2280,6 +2563,10 @@ class PublicSiteTests(unittest.TestCase):
             )
             self.assertIn(
                 "research/feed.atom does not match the reviewed research catalog",
+                failures,
+            )
+            self.assertIn(
+                "feed.atom does not match the reviewed release and research catalogs",
                 failures,
             )
 
