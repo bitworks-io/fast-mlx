@@ -1659,6 +1659,78 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
     return "\n".join(body)
 
 
+def research_search_text(article: Article) -> str:
+    """Return the exact public fields searched by the research archive."""
+
+    return " ".join(f"{article.title} {article.summary} {article.theme}".split())
+
+
+def render_research_archive(articles: Sequence[Article]) -> str:
+    """Render reviewed notes with a no-JavaScript-readable filter shell."""
+
+    if not articles:
+        fail("research archive requires at least one reviewed article")
+
+    themes = sorted({article.theme for article in articles}, key=str.casefold)
+    theme_options = ['<option value="">All themes</option>']
+    for theme in themes:
+        theme_options.append(
+            f'<option value="{html.escape(theme, quote=True)}">'
+            f"{html.escape(theme)}</option>"
+        )
+
+    total = len(articles)
+    body: List[str] = [
+        '<section class="page-hero shell"><p class="eyebrow">Research notes</p>',
+        '<h1>What the measurements changed.</h1>',
+        '<p class="lede">Dated fast-mlx investigations, including negative results. Each note is a scoped historical result, not a timeless performance guarantee.</p>',
+        '<div class="hero-actions">',
+        '<a class="button primary" href="index.json">Read the research JSON</a>',
+        '<a class="button secondary" href="feed.atom" type="application/atom+xml">Subscribe to reviewed research</a>',
+        '<a class="button secondary" href="../feed.atom" type="application/atom+xml">Subscribe to all reviewed updates</a>',
+        '</div></section>',
+        '<section class="section shell" aria-labelledby="research-results-heading">',
+        '<div class="section-heading"><p class="eyebrow">Reviewed investigations only</p><h2 id="research-results-heading">Find the evidence trail you need.</h2><p class="section-intro">Search checks only each reviewed note’s title, summary, and published theme. Filters change visibility, never order, evidence, or publication state.</p></div>',
+        '<form class="research-controls" data-research-controls aria-label="Filter reviewed research" action="./" method="get">',
+        '<div><label for="research-query">Search notes</label><input id="research-query" name="q" type="search" maxlength="120" autocomplete="off"></div>',
+        '<div><label for="research-theme">Theme</label><select id="research-theme" name="theme">'
+        + "".join(theme_options)
+        + '</select></div>',
+        '<button class="button secondary research-reset" data-research-reset type="reset">Clear filters</button>',
+        '</form>',
+        '<noscript><p class="research-noscript">JavaScript is optional. All reviewed notes remain visible below; interactive filters are unavailable.</p></noscript>',
+        f'<p class="research-count" data-research-count aria-live="polite" aria-atomic="true">Showing {total} of {total} reviewed notes.</p>',
+        '<div class="research-grid" data-research-results role="list">',
+    ]
+    for article in articles:
+        body.extend(
+            [
+                '<article class="note-card" role="listitem" data-research-card '
+                f'data-research-path="{html.escape(article.public_path, quote=True)}" '
+                f'data-theme="{html.escape(article.theme, quote=True)}" '
+                f'data-search="{html.escape(research_search_text(article), quote=True)}">',
+                f'<div class="meta">{html.escape(article.date)} · {html.escape(article.theme)}</div>',
+                f'<h2>{html.escape(article.title)}</h2>',
+                f'<p>{html.escape(article.summary)}</p>',
+                f'<a href="{html.escape(article.slug, quote=True)}/">Read the note →</a>',
+                '</article>',
+            ]
+        )
+    body.extend(
+        [
+            '</div>',
+            '<div class="research-empty" data-research-empty hidden role="status"><h3>No reviewed notes match those filters.</h3><p>Clear the filters to return to the complete research archive.</p><a class="text-link" href="./">Show all reviewed notes →</a></div>',
+            '</section>',
+            '<section class="section shell callout research-callout" aria-labelledby="research-boundary-heading">',
+            '<p class="eyebrow">Archive boundary</p>',
+            '<h2 id="research-boundary-heading">Filtering never creates evidence.</h2>',
+            '<p>This page presents only notes already admitted by the reviewed publication manifest. It performs no external request, ingestion, ranking, benchmark recomputation, publication action, or authority transition.</p>',
+            '</section>',
+        ]
+    )
+    return "\n".join(body)
+
+
 def benchmark_detail_title(highlight: Dict[str, object]) -> str:
     return f'{highlight["label"]} — fast-mlx benchmark evidence'
 
@@ -1960,27 +2032,6 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             ),
         )
 
-    cards = [
-        '<section class="page-hero shell"><p class="eyebrow">Research notes</p>'
-        '<h1>What the measurements changed.</h1>'
-        '<p class="lede">Dated fast-mlx investigations, including negative results. Each note is a scoped historical result, not a timeless performance guarantee.</p>'
-        '<div class="hero-actions">'
-        '<a class="button primary" href="index.json">Read the research JSON</a>'
-        '<a class="button secondary" href="feed.atom" type="application/atom+xml">Subscribe to reviewed research</a>'
-        '<a class="button secondary" href="../feed.atom" type="application/atom+xml">Subscribe to all reviewed updates</a>'
-        '</div></section>',
-        '<section class="section shell"><div class="research-grid">',
-    ]
-    for article in articles:
-        cards.append(
-            '<article class="note-card">'
-            f'<div class="meta">{html.escape(article.date)} · {html.escape(article.theme)}</div>'
-            f'<h2>{html.escape(article.title)}</h2>'
-            f'<p>{html.escape(article.summary)}</p>'
-            f'<a href="{html.escape(article.slug)}/">Read the note →</a>'
-            "</article>"
-        )
-    cards.append("</div></section>")
     write_page(
         output,
         "research/index.html",
@@ -1989,8 +2040,9 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             "Research notes — fast-mlx",
             "Dated fast-mlx investigations and measured negative results.",
             "../",
-            "\n".join(cards),
+            render_research_archive(articles),
             "research",
+            '<script src="../assets/research-explorer.js" defer></script>',
             public_path="research/",
         ),
     )

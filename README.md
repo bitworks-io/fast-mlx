@@ -90,6 +90,11 @@ from the seven explicitly reviewed notes in `site/publications.json`. Each resea
 contains only pinned titles, dates, themes, summaries, and canonical article links—never article
 bodies, external intake, scripts, trackers, or a build-time network request.
 
+The [research archive](https://bitworks-io.github.io/fast-mlx/research/) progressively adds local
+title/summary/theme search and an exact-theme filter while leaving every reviewed note visible
+without JavaScript. Filter state is bounded and shareable in the URL; it never fetches content,
+reorders notes, stores user data, admits a new article, or creates publication authority.
+
 [`/feed.atom`](https://bitworks-io.github.io/fast-mlx/feed.atom) combines those two reviewed
 streams into one newest-first subscription without making the generated feed a source of truth.
 Entries retain their stable release-commit or canonical-article IDs, carry an explicit release or

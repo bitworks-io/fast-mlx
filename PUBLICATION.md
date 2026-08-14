@@ -59,6 +59,14 @@ configurations, or introduce a second machine-readable contract. Site validation
 rendered result to keep its exact metric, model, hardware, workload, date, decision, caveat, and
 published evidence link attached.
 
+The research archive is another read-only progressive-enhancement surface. Search covers only the
+reviewed title, summary, and exact published theme; theme selection uses the exact catalog value,
+and article order remains date/slug descending. All cards stay visible without JavaScript. The
+bounded local script drops overlong query state, ignores unknown themes, updates only visibility
+and same-page URL state, and performs no fetch, storage, tracking, ingestion, ranking, publication,
+or authority transition. Validation independently pins the card set, order, text, search fields,
+theme options, no-JavaScript state, accessibility controls, and exact script bytes.
+
 The release ledger is also read-only site data. Its entries point readers to public commits and
 reviewed surfaces, and its current-boundary entry remains explicitly gated. The deterministic Atom
 feed is generated from those same entries without a build-time network request, external content

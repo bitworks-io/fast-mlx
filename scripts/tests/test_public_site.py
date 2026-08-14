@@ -2691,6 +2691,342 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
 
+    def test_filterable_research_archive_is_generated_from_reviewed_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            articles = build_public_site.build_site(REPOSITORY_ROOT, output)
+            archive = (output / "research/index.html").read_text(encoding="utf-8")
+
+            self.assertIn(
+                '<form class="research-controls" data-research-controls '
+                'aria-label="Filter reviewed research" action="./" method="get">',
+                archive,
+            )
+            self.assertIn(
+                '<input id="research-query" name="q" type="search" '
+                'maxlength="120" autocomplete="off">',
+                archive,
+            )
+            self.assertIn('<select id="research-theme" name="theme">', archive)
+            self.assertIn('data-research-reset type="reset"', archive)
+            self.assertIn(
+                'data-research-count aria-live="polite" aria-atomic="true"',
+                archive,
+            )
+            self.assertIn(
+                'data-research-empty hidden role="status"',
+                archive,
+            )
+            self.assertIn(
+                '<div class="research-grid" data-research-results role="list">',
+                archive,
+            )
+            self.assertEqual(
+                archive.count('class="note-card" role="listitem" data-research-card'),
+                len(articles),
+            )
+            self.assertNotIn('class="note-card" hidden', archive)
+            self.assertIn("JavaScript is optional", archive)
+            self.assertIn(
+                '<script src="../assets/research-explorer.js" defer></script>',
+                archive,
+            )
+
+            positions = []
+            for article in articles:
+                search_text = " ".join(
+                    f"{article.title} {article.summary} {article.theme}".split()
+                )
+                contract = (
+                    f'data-research-path="{html.escape(article.public_path, quote=True)}" '
+                    f'data-theme="{html.escape(article.theme, quote=True)}" '
+                    f'data-search="{html.escape(search_text, quote=True)}"'
+                )
+                self.assertIn(contract, archive)
+                self.assertIn(
+                    f'<a href="{html.escape(article.slug, quote=True)}/">Read the note →</a>',
+                    archive,
+                )
+                positions.append(archive.index(contract))
+                article_page = (output / article.output_file).read_text(encoding="utf-8")
+                self.assertNotIn("research-explorer.js", article_page)
+            self.assertEqual(positions, sorted(positions))
+
+            themes = sorted({article.theme for article in articles}, key=str.casefold)
+            self.assertIn('<option value="">All themes</option>', archive)
+            for theme in themes:
+                escaped = html.escape(theme, quote=True)
+                self.assertIn(f'<option value="{escaped}">{html.escape(theme)}</option>', archive)
+
+    def test_research_archive_progressive_enhancement_is_bounded(self) -> None:
+        script = (REPOSITORY_ROOT / "site/assets/research-explorer.js").read_text(
+            encoding="utf-8"
+        )
+        stylesheet = (REPOSITORY_ROOT / "site/assets/site.css").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('classList.add("research-enhanced")', script)
+        self.assertIn("MAX_QUERY_LENGTH = 120", script)
+        self.assertIn("if (raw.length > MAX_QUERY_LENGTH)", script)
+        self.assertLess(
+            script.index("if (raw.length > MAX_QUERY_LENGTH)"),
+            script.index('raw.trim().replace(/\\s+/g, " ")'),
+        )
+        self.assertIn("URLSearchParams", script)
+        self.assertIn("history.replaceState", script)
+        self.assertIn("card.hidden", script)
+        self.assertIn("textContent", script)
+        self.assertNotIn("innerHTML", script)
+        self.assertNotIn("fetch(", script)
+        self.assertNotIn("localStorage", script)
+        self.assertNotIn("sessionStorage", script)
+        self.assertNotIn("eval(", script)
+        self.assertIn(".research-controls", stylesheet)
+        self.assertIn("html.research-enhanced .research-controls", stylesheet)
+
+    def test_research_archive_escapes_catalog_text(self) -> None:
+        hostile = build_public_site.Article(
+            source=Path("docs/content/hostile.md"),
+            source_name="docs/content/hostile.md",
+            slug="hostile-note",
+            title='Title "quoted" <script>alert(1)</script>',
+            date="2026-08-13",
+            theme="Theme & <unsafe>",
+            summary='<img src=x onerror="alert(1)"> bounded summary.',
+            reviewed_at="2026-08-13",
+            body="",
+        )
+        rendered = build_public_site.render_research_archive([hostile])
+
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("<img ", rendered)
+        self.assertNotIn("<unsafe>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertIn("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;", rendered)
+        self.assertIn('data-theme="Theme &amp; &lt;unsafe&gt;"', rendered)
+        self.assertIn('data-search="Title &quot;quoted&quot; &lt;script&gt;', rendered)
+
+    def test_research_archive_runtime_state_is_bounded(self) -> None:
+        completed = subprocess.run(
+            [
+                "node",
+                str(REPOSITORY_ROOT / "scripts/tests/benchmark_explorer_node_test.js"),
+                str(REPOSITORY_ROOT / "site/assets/benchmark-explorer.js"),
+                str(REPOSITORY_ROOT / "site/assets/research-explorer.js"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("research explorer runtime checks passed", completed.stdout)
+
+    def test_validator_requires_filterable_research_archive_outputs(self) -> None:
+        for missing in ("research/index.html", "assets/research-explorer.js"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                (output / missing).unlink()
+                self.assertIn(
+                    f"missing required file: {missing}",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_research_archive_catalog_and_order_drift(self) -> None:
+        mutations = (
+            (
+                'data-research-path="research/the-proof-did-not-end-when-the-timer-did/"',
+                'data-research-path="research/unreviewed-diagnostic/"',
+                "research archive card set does not match reviewed research catalog",
+            ),
+            (
+                'data-search="The proof did not end when the timer did ',
+                'data-search="Private diagnostic ',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' has the wrong search text",
+            ),
+            (
+                'data-theme="Building a high-performance MLX inference engine in Swift; Serving big models on Apple Silicon; Rapid research integration — the flywheel"',
+                'data-theme="Unreviewed theme"',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' has the wrong theme",
+            ),
+            (
+                '<option value="The optimization dial — quantified precision-loss tuning">',
+                '<option value="Unreviewed theme">',
+                "research archive theme options do not match reviewed research catalog",
+            ),
+        )
+        for before, after, expected in mutations:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / "research/index.html"
+                page = path.read_text(encoding="utf-8")
+                self.assertIn(before, page)
+                path.write_text(page.replace(before, after, 1), encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            path = output / "research/index.html"
+            page = path.read_text(encoding="utf-8")
+            first = 'data-research-path="research/the-proof-did-not-end-when-the-timer-did/"'
+            second = 'data-research-path="research/the-fastest-request-wasnt-the-fastest-service/"'
+            self.assertIn(first, page)
+            self.assertIn(second, page)
+            page = page.replace(first, "__FIRST_RESEARCH_PATH__", 1)
+            page = page.replace(second, first, 1)
+            page = page.replace("__FIRST_RESEARCH_PATH__", second, 1)
+            path.write_text(page, encoding="utf-8")
+            self.assertIn(
+                "research archive cards are not ordered by descending article date",
+                validate_public_site.validate(output),
+            )
+
+    def test_validator_preserves_research_archive_no_js_and_live_semantics(self) -> None:
+        mutations = (
+            (
+                '<article class="note-card" role="listitem" data-research-card',
+                '<article class="note-card" hidden role="listitem" data-research-card',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<article class="note-card" role="listitem" data-research-card',
+                '<article class="note-card" style="display:none" role="listitem" data-research-card',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<article class="note-card" role="listitem" data-research-card',
+                '<article class="note-card" aria-hidden="true" role="listitem" data-research-card',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<article class="note-card" role="listitem" data-research-card',
+                '<article class="note-card" inert role="listitem" data-research-card',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<div class="research-grid" data-research-results role="list">',
+                '<div class="research-grid" data-research-results role="list" hidden>',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<h2>The proof did not end when the timer did</h2>',
+                '<h2 style="display:none">The proof did not end when the timer did</h2>',
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' is hidden before enhancement",
+            ),
+            (
+                '<button class="button secondary research-reset" data-research-reset type="reset">Clear filters</button>',
+                '',
+                "research archive has no exact visible reset control",
+            ),
+            (
+                'data-research-count aria-live="polite" aria-atomic="true"',
+                'data-research-count aria-atomic="true"',
+                "research archive has no live result count",
+            ),
+            (
+                'data-research-empty hidden role="status"',
+                'data-research-empty role="status"',
+                "research archive has no hidden status empty state",
+            ),
+            (
+                'data-research-empty hidden role="status"',
+                'data-research-empty hidden',
+                "research archive has no hidden status empty state",
+            ),
+        )
+        for before, after, expected in mutations:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / "research/index.html"
+                page = path.read_text(encoding="utf-8")
+                self.assertIn(before, page)
+                path.write_text(page.replace(before, after, 1), encoding="utf-8")
+                self.assertIn(expected, validate_public_site.validate(output))
+
+    def test_validator_requires_research_script_timing_and_placement(self) -> None:
+        script = '<script src="../assets/research-explorer.js" defer></script>'
+        mutations = (
+            '<script src="../assets/research-explorer.js"></script>',
+            None,
+        )
+        for replacement in mutations:
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                path = output / "research/index.html"
+                page = path.read_text(encoding="utf-8")
+                self.assertEqual(page.count(script), 1)
+                if replacement is None:
+                    page = page.replace(script, "", 1).replace(
+                        "</head>", script + "\n  </head>", 1
+                    )
+                else:
+                    page = page.replace(script, replacement, 1)
+                path.write_text(page, encoding="utf-8")
+                self.assertIn(
+                    "research archive does not load only its reviewed script",
+                    validate_public_site.validate(output),
+                )
+
+    def test_validator_rejects_joint_research_index_and_archive_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            index_path = output / "research/index.json"
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+            target = index["articles"][0]
+            original = target["summary"]
+            changed = "Unreviewed automatic publication authority."
+            target["summary"] = changed
+            index_path.write_text(
+                json.dumps(index, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            archive_path = output / "research/index.html"
+            archive = archive_path.read_text(encoding="utf-8")
+            archive_path.write_text(
+                archive.replace(original, changed, 2),
+                encoding="utf-8",
+            )
+            failures = validate_public_site.validate(output)
+            self.assertIn(
+                "research/index.json does not match the reviewed research catalog",
+                failures,
+            )
+            self.assertIn(
+                "research archive card 'research/the-proof-did-not-end-when-the-timer-did/' has drifted reviewed text",
+                failures,
+            )
+
+    def test_validator_rejects_research_explorer_script_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            script = output / "assets/research-explorer.js"
+            script.write_text(
+                script.read_text(encoding="utf-8") + "\n// unreviewed drift\n",
+                encoding="utf-8",
+            )
+            self.assertIn(
+                "assets/research-explorer.js does not match the reviewed script",
+                validate_public_site.validate(output),
+            )
+
     def test_benchmark_explorer_is_generated_from_reviewed_highlights(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
@@ -2995,6 +3331,7 @@ class PublicSiteTests(unittest.TestCase):
                 "node",
                 str(REPOSITORY_ROOT / "scripts/tests/benchmark_explorer_node_test.js"),
                 str(REPOSITORY_ROOT / "site/assets/benchmark-explorer.js"),
+                str(REPOSITORY_ROOT / "site/assets/research-explorer.js"),
             ],
             check=False,
             capture_output=True,

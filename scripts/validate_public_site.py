@@ -63,7 +63,11 @@ SOCIAL_CARD_SHA256 = (
 )
 SITE_STYLESHEET_PATH = "assets/site.css"
 SITE_STYLESHEET_SHA256 = (
-    "5601429bd64b6dbd58da20c10f7f8116f27774a285d574152795435b0522ea81"
+    "4bbcee47b18a8779ff6404eda1884462e5f93324454fb41a3896364c11ae695c"
+)
+RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
+RESEARCH_EXPLORER_SCRIPT_SHA256 = (
+    "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
 REVIEWED_HOME_PAGE_BYTES = 9_259
 REVIEWED_HOME_PAGE_SHA256 = (
@@ -775,7 +779,24 @@ class ResearchCollector(html.parser.HTMLParser):
         super().__init__()
         self.has_json_action = False
         self.atom_actions: List[Dict[str, object]] = []
+        self.cards: List[Dict[str, object]] = []
+        self.theme_options: List[Dict[str, object]] = []
+        self.has_controls = False
+        self.has_query = False
+        self.has_theme_select = False
+        self.has_results = False
+        self.has_count = False
+        self.has_empty_state = False
+        self.reset_actions: List[Dict[str, object]] = []
+        self.scripts: List[Dict[str, object]] = []
+        self.invalid_archive_structure = False
         self._active_atom_action: Optional[Dict[str, object]] = None
+        self._active_reset_action: Optional[Dict[str, object]] = None
+        self._current_card: Optional[Dict[str, object]] = None
+        self._current_theme_option: Optional[Dict[str, object]] = None
+        self._in_controls = False
+        self._in_theme_select = False
+        self._seen_results = False
         self._element_stack: List[Tuple[str, bool]] = []
 
     @staticmethod
@@ -793,6 +814,8 @@ class ResearchCollector(html.parser.HTMLParser):
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         names = [name for name, _value in attrs]
         attributes = dict(attrs)
+        classes = set((attributes.get("class") or "").split())
+        has_duplicates = len(names) != len(set(names))
         suppresses_visibility = self._suppresses_visibility(tag, attributes)
         if tag == "a" and attributes.get("href") == "index.json":
             self.has_json_action = True
@@ -809,12 +832,124 @@ class ResearchCollector(html.parser.HTMLParser):
         elif self._active_atom_action is not None and suppresses_visibility:
             self._active_atom_action["visible"] = False
 
+        if tag == "article" and "data-research-card" in attributes:
+            if self._current_card is not None:
+                self.invalid_archive_structure = True
+            self._current_card = {
+                "path": attributes.get("data-research-path"),
+                "theme": attributes.get("data-theme"),
+                "search": attributes.get("data-search"),
+                "hidden": "hidden" in attributes,
+                "hasVisibilitySuppressor": suppresses_visibility
+                or any(item[1] for item in self._element_stack),
+                "role": attributes.get("role"),
+                "links": [],
+                "text_parts": [],
+            }
+            if "note-card" not in classes or has_duplicates:
+                self.invalid_archive_structure = True
+        elif self._current_card is not None:
+            if suppresses_visibility:
+                self._current_card["hasVisibilitySuppressor"] = True
+            if tag == "a" and attributes.get("href"):
+                links = self._current_card["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+
+        if tag == "form" and "data-research-controls" in attributes:
+            self._in_controls = True
+            self.has_controls = (
+                "research-controls" in classes
+                and attributes.get("aria-label") == "Filter reviewed research"
+                and attributes.get("action") == "./"
+                and attributes.get("method") == "get"
+                and not has_duplicates
+            )
+        if tag == "button" and "data-research-reset" in attributes:
+            self._active_reset_action = {
+                "attributes": attributes,
+                "text_parts": [],
+                "visible": (
+                    self._in_controls
+                    and not has_duplicates
+                    and not suppresses_visibility
+                    and not any(item[1] for item in self._element_stack)
+                ),
+            }
+        elif self._active_reset_action is not None and suppresses_visibility:
+            self._active_reset_action["visible"] = False
+        if tag == "input" and attributes.get("name") == "q":
+            self.has_query = (
+                attributes.get("id") == "research-query"
+                and attributes.get("type") == "search"
+                and attributes.get("maxlength") == "120"
+                and attributes.get("autocomplete") == "off"
+                and not has_duplicates
+            )
+        if tag == "select" and attributes.get("name") == "theme":
+            self._in_theme_select = True
+            self.has_theme_select = (
+                attributes.get("id") == "research-theme" and not has_duplicates
+            )
+        elif tag == "option" and self._in_theme_select:
+            self._current_theme_option = {
+                "value": attributes.get("value"),
+                "text_parts": [],
+            }
+            if has_duplicates:
+                self.invalid_archive_structure = True
+        if (
+            "data-research-results" in attributes
+            and attributes.get("role") == "list"
+            and "research-grid" in classes
+            and not has_duplicates
+        ):
+            self.has_results = True
+            self._seen_results = True
+        if (
+            "data-research-count" in attributes
+            and attributes.get("aria-live") == "polite"
+            and attributes.get("aria-atomic") == "true"
+            and not has_duplicates
+        ):
+            self.has_count = True
+        if (
+            "data-research-empty" in attributes
+            and "hidden" in attributes
+            and attributes.get("role") == "status"
+            and not has_duplicates
+        ):
+            self.has_empty_state = True
+        if tag == "script":
+            self.scripts.append(
+                {
+                    "attributes": attributes,
+                    "afterResults": self._seen_results,
+                    "directBodyChild": bool(
+                        self._element_stack and self._element_stack[-1][0] == "body"
+                    ),
+                    "hasDuplicateAttributes": has_duplicates,
+                }
+            )
+
         if tag not in HTML_VOID_ELEMENTS:
             self._element_stack.append((tag, suppresses_visibility))
 
     def handle_data(self, data: str) -> None:
         if self._active_atom_action is not None:
             parts = self._active_atom_action["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+        if self._active_reset_action is not None:
+            parts = self._active_reset_action["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+        if self._current_card is not None:
+            parts = self._current_card["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+        if self._current_theme_option is not None:
+            parts = self._current_theme_option["text_parts"]
             if isinstance(parts, list):
                 parts.append(data)
 
@@ -826,6 +961,31 @@ class ResearchCollector(html.parser.HTMLParser):
             )
             self.atom_actions.append(self._active_atom_action)
             self._active_atom_action = None
+        if tag == "button" and self._active_reset_action is not None:
+            parts = self._active_reset_action.pop("text_parts")
+            self._active_reset_action["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.reset_actions.append(self._active_reset_action)
+            self._active_reset_action = None
+        if tag == "article" and self._current_card is not None:
+            parts = self._current_card.pop("text_parts")
+            self._current_card["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.cards.append(self._current_card)
+            self._current_card = None
+        if tag == "option" and self._current_theme_option is not None:
+            parts = self._current_theme_option.pop("text_parts")
+            self._current_theme_option["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.theme_options.append(self._current_theme_option)
+            self._current_theme_option = None
+        elif tag == "select" and self._in_theme_select:
+            self._in_theme_select = False
+        if tag == "form" and self._in_controls:
+            self._in_controls = False
         if self._element_stack:
             if self._element_stack[-1][0] == tag:
                 self._element_stack.pop()
@@ -1900,6 +2060,23 @@ def validate_reviewed_stylesheet(site: Path) -> List[str]:
     return []
 
 
+def validate_research_explorer_script(site: Path) -> List[str]:
+    path = site / RESEARCH_EXPLORER_SCRIPT_PATH
+    if path.is_symlink() or not path.is_file():
+        return [
+            f"{RESEARCH_EXPLORER_SCRIPT_PATH} must be a regular non-symlink file"
+        ]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read {RESEARCH_EXPLORER_SCRIPT_PATH}: {exc}"]
+    if hashlib.sha256(raw).hexdigest() != RESEARCH_EXPLORER_SCRIPT_SHA256:
+        return [
+            f"{RESEARCH_EXPLORER_SCRIPT_PATH} does not match the reviewed script"
+        ]
+    return []
+
+
 def validate_reviewed_home_page(site: Path) -> List[str]:
     path = site / "index.html"
     if path.is_symlink() or not path.is_file():
@@ -2051,7 +2228,8 @@ def validate_research_page(site: Path) -> List[str]:
         return []
     collector = ResearchCollector()
     try:
-        collector.feed(research_path.read_text(encoding="utf-8"))
+        research_text = research_path.read_text(encoding="utf-8")
+        collector.feed(research_text)
     except Exception as exc:
         return [f"cannot parse research/index.html: {exc}"]
     failures: List[str] = []
@@ -2081,6 +2259,117 @@ def validate_research_page(site: Path) -> List[str]:
         failures.append(
             "research/index.html does not expose the reviewed subscription actions"
         )
+
+    expected_articles = list(reviewed_research_articles())
+    expected_paths = [article["path"] for article in expected_articles]
+    actual_paths = [card.get("path") for card in collector.cards]
+    if (
+        len(actual_paths) != len(set(actual_paths))
+        or set(actual_paths) != set(expected_paths)
+    ):
+        failures.append(
+            "research archive card set does not match reviewed research catalog"
+        )
+    elif actual_paths != expected_paths:
+        failures.append(
+            "research archive cards are not ordered by descending article date"
+        )
+
+    cards_by_path = {
+        str(card["path"]): card
+        for card in collector.cards
+        if isinstance(card.get("path"), str)
+    }
+    for article in expected_articles:
+        public_path = article["path"]
+        card = cards_by_path.get(public_path)
+        if card is None:
+            continue
+        expected_search = " ".join(
+            f'{article["title"]} {article["summary"]} {article["theme"]}'.split()
+        )
+        if card.get("theme") != article["theme"]:
+            failures.append(f"research archive card {public_path!r} has the wrong theme")
+        if card.get("search") != expected_search:
+            failures.append(
+                f"research archive card {public_path!r} has the wrong search text"
+            )
+        if card.get("hidden") or card.get("hasVisibilitySuppressor"):
+            failures.append(
+                f"research archive card {public_path!r} is hidden before enhancement"
+            )
+        if card.get("role") != "listitem":
+            failures.append(f"research archive card {public_path!r} is not a list item")
+        slug = public_path.split("/")[1]
+        if card.get("links") != [slug + "/"]:
+            failures.append(f"research archive card {public_path!r} has the wrong link")
+        expected_text = " ".join(
+            (
+                f'{article["date"]} · {article["theme"]} {article["title"]} '
+                f'{article["summary"]} Read the note →'
+            ).split()
+        )
+        if card.get("text") != expected_text:
+            failures.append(
+                f"research archive card {public_path!r} has drifted reviewed text"
+            )
+
+    expected_theme_options = [
+        {"value": "", "text": "All themes"},
+        *[
+            {"value": theme, "text": theme}
+            for theme in sorted(
+                {article["theme"] for article in expected_articles}, key=str.casefold
+            )
+        ],
+    ]
+    if collector.theme_options != expected_theme_options:
+        failures.append(
+            "research archive theme options do not match reviewed research catalog"
+        )
+    if not collector.has_controls or not collector.has_query or not collector.has_theme_select:
+        failures.append("research archive has no exact filter controls")
+    if not collector.has_results:
+        failures.append("research archive has no reviewed result list")
+    if not collector.has_count:
+        failures.append("research archive has no live result count")
+    if not collector.has_empty_state:
+        failures.append("research archive has no hidden status empty state")
+    expected_reset_actions = [
+        {
+            "attributes": {
+                "class": "button secondary research-reset",
+                "data-research-reset": None,
+                "type": "reset",
+            },
+            "text": "Clear filters",
+            "visible": True,
+        }
+    ]
+    if collector.reset_actions != expected_reset_actions:
+        failures.append("research archive has no exact visible reset control")
+    expected_scripts = [
+        {
+            "attributes": {
+                "src": "../assets/research-explorer.js",
+                "defer": None,
+            },
+            "afterResults": True,
+            "directBodyChild": True,
+            "hasDuplicateAttributes": False,
+        }
+    ]
+    if collector.scripts != expected_scripts:
+        failures.append("research archive does not load only its reviewed script")
+    if collector.invalid_archive_structure:
+        failures.append("research archive has invalid or duplicate structure")
+    boundary = (
+        "This page presents only notes already admitted by the reviewed publication "
+        "manifest. It performs no external request, ingestion, ranking, benchmark "
+        "recomputation, publication action, or authority transition."
+    )
+    if boundary not in research_text:
+        failures.append("research archive has the wrong claim boundary")
     return failures
 
 
@@ -2741,6 +3030,7 @@ def validate(site: Path) -> List[str]:
         "robots.txt",
         "assets/site.css",
         "assets/benchmark-explorer.js",
+        RESEARCH_EXPLORER_SCRIPT_PATH,
         "assets/favicon.svg",
         SOCIAL_CARD_PATH,
         "llms.txt",
@@ -2752,6 +3042,7 @@ def validate(site: Path) -> List[str]:
 
     failures.extend(validate_social_card(site))
     failures.extend(validate_reviewed_stylesheet(site))
+    failures.extend(validate_research_explorer_script(site))
     failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
     failures.extend(validate_research_page(site))
