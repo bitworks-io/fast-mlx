@@ -1,16 +1,21 @@
 # Public repository and publication boundary
 
-The engineering checkout contains application source alongside machine-local operator material,
-private research, host topology, failed evidence, and agent configuration. It must never be made
-public wholesale.
+The public checkout is the Apache-2.0 source distribution. It is projected from a development
+workspace that also contains machine-local operator material, private research, host topology,
+failed evidence, and agent configuration; that broader workspace must never be made public
+wholesale.
 
 The public `fast-mlx` repository is a fail-closed projection created by
-`scripts/export_public_repository.py` from `public/public-repository.json`. The projection includes:
+`scripts/export_public_repository.py` from `public/public-repository.json`. Both files and the
+exporter contract tests are part of the projection, so a committed public clone can reproduce the
+same reviewed file boundary without access to the broader development workspace. The projection
+includes:
 
 - the project Apache-2.0 `LICENSE` and `NOTICE`;
 - Swift application, library, and test source;
 - the pinned vendored MLX Swift LM fork with its upstream license and provenance;
 - public repository documentation and contribution controls;
+- the fail-closed projection manifest, exporter, and exporter contract tests;
 - the static website source and its deterministic builder;
 - the status-aware capability inventory in `site/capabilities.json`, whose evidence slugs must
   resolve to reviewed published notes;
@@ -148,10 +153,19 @@ digest, receipt identity, and public commit.
 
 ## Creating a candidate projection
 
-From a committed engineering checkpoint:
+From a committed public checkout:
 
 ```sh
 python3 scripts/export_public_repository.py --output /fresh/path/fast-mlx-public
+python3 scripts/validate_public_repository.py /fresh/path/fast-mlx-public
+```
+
+From the broader development workspace, remapped sanitized sources require an explicit mode:
+
+```sh
+python3 scripts/export_public_repository.py \
+  --development-projection \
+  --output /fresh/path/fast-mlx-public
 python3 scripts/validate_public_repository.py /fresh/path/fast-mlx-public
 ```
 
@@ -159,3 +173,13 @@ The output path must be absent or empty. The exporter never initializes Git, com
 deletes an existing checkout. Validation requires the Apache-2.0 `LICENSE` and `NOTICE` without a
 bypass. Repository creation, GitHub ownership, Pages enablement, and branch protection remain
 explicit owner decisions.
+
+The development allowlist exports the reviewed
+`public/public-repository-public.json` identity manifest under the canonical public path
+`public/public-repository.json`; it also maps the one sanitized research-index source to its public
+destination. In a public checkout every manifest source equals its destination, and the exporter
+requires both the complete tracked index and its non-circular path/mode seal to equal the reviewed
+manifest-derived boundary exactly. Any extra, missing, renamed, mode-changed, or remapped tracked
+path refuses reproduction. Development remaps require both the explicit flag and the indexed
+engineering-only identity-manifest source. Both modes read and copy only Git index blobs: no
+fallback, ambient file, working-tree value, or broader development path is accepted.

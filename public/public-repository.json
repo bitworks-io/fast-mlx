@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "publicIndex": {
+    "pathCount": 621,
+    "pathModeSha256": "ccd0ec1a872d7e9cf82f22814dc1616e78cf9f7ef2864b4cf17fc114ebaa30a1"
+  },
+  "files": [
+    {"source": ".gitignore", "destination": ".gitignore"},
+    {"source": "LICENSE", "destination": "LICENSE"},
+    {"source": "NOTICE", "destination": "NOTICE"},
+    {"source": "README.md", "destination": "README.md"},
+    {"source": "CONTRIBUTING.md", "destination": "CONTRIBUTING.md"},
+    {"source": "SECURITY.md", "destination": "SECURITY.md"},
+    {"source": "PUBLICATION.md", "destination": "PUBLICATION.md"},
+    {"source": "public/public-repository.json", "destination": "public/public-repository.json"},
+    {"source": "docs/content/README.md", "destination": "docs/content/README.md"},
+    {"source": "docs/reference/quality-metrics-explained.md", "destination": "docs/reference/quality-metrics-explained.md"},
+    {"source": "scripts/export_public_repository.py", "destination": "scripts/export_public_repository.py"},
+    {"source": "scripts/build_public_site.py", "destination": "scripts/build_public_site.py"},
+    {"source": "scripts/validate_public_site.py", "destination": "scripts/validate_public_site.py"},
+    {"source": "scripts/validate_public_repository.py", "destination": "scripts/validate_public_repository.py"},
+    {"source": "scripts/verify_public_deployment.py", "destination": "scripts/verify_public_deployment.py"},
+    {"source": "scripts/validate_public_deployment_receipt.py", "destination": "scripts/validate_public_deployment_receipt.py"},
+    {"source": "scripts/tests/test_public_deployment.py", "destination": "scripts/tests/test_public_deployment.py"},
+    {"source": "scripts/tests/test_public_repository.py", "destination": "scripts/tests/test_public_repository.py"},
+    {"source": "scripts/tests/test_public_capability_details.py", "destination": "scripts/tests/test_public_capability_details.py"},
+    {"source": "scripts/tests/test_public_export.py", "destination": "scripts/tests/test_public_export.py"},
+    {"source": "scripts/tests/test_public_site.py", "destination": "scripts/tests/test_public_site.py"},
+    {"source": "scripts/tests/test_public_status.py", "destination": "scripts/tests/test_public_status.py"},
+    {"source": "scripts/tests/benchmark_explorer_node_test.js", "destination": "scripts/tests/benchmark_explorer_node_test.js"},
+    {"source": "spike/Package.swift", "destination": "spike/Package.swift"},
+    {"source": "spike/Package.resolved", "destination": "spike/Package.resolved"}
+  ],
+  "trees": [
+    {"source": ".github", "destination": ".github"},
+    {"source": "site", "destination": "site"},
+    {"source": "spike/Sources", "destination": "spike/Sources"},
+    {"source": "spike/Tests", "destination": "spike/Tests"},
+    {
+      "source": "spike/Vendor/mlx-swift-lm",
+      "destination": "spike/Vendor/mlx-swift-lm",
+      "exclude": [".github"]
+    }
+  ]
+}

@@ -130,9 +130,22 @@ Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 
 ## Repository status
 
-This checkout remains the engineering source of truth. A fail-closed export creates the public
-repository from a reviewed allowlist instead of publishing the entire operator workspace or its
-history. GitHub Pages deployment and public-source checks run from the exported repository.
+fast-mlx is published as an Apache-2.0 source distribution through a reviewed, fail-closed
+allowlist. In the public repository, the checkout includes that manifest, exporter, and their
+tests, so a committed clone whose index matches the reviewed manifest can reproduce and validate
+the same public boundary locally. The public identity manifest pins the complete tracked path/mode
+set, so a newly tracked file cannot silently expand a whole-tree allowlist:
+
+```sh
+python3 scripts/export_public_repository.py --output /fresh/path/fast-mlx-public
+python3 scripts/validate_public_repository.py /fresh/path/fast-mlx-public
+```
+
+The destination must be absent or empty and outside this checkout. The exporter reads only Git's
+index; unstaged files and content outside the allowlist cannot enter the candidate. A broader
+development workspace can contain private or operator-only material and must not be published
+wholesale. GitHub Pages deployment and public-source checks run from the projected public
+distribution.
 
 ## License
 

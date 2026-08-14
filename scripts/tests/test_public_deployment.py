@@ -1191,6 +1191,8 @@ class PublicDeploymentBehaviorTests(unittest.TestCase):
 
         class FakeContext:
             def __init__(self) -> None:
+                self.verify_mode = online.ssl.CERT_REQUIRED
+                self.check_hostname = True
                 self.server_hostname: str | None = None
 
             def wrap_socket(
@@ -1252,6 +1254,8 @@ class PublicDeploymentBehaviorTests(unittest.TestCase):
 
         class RecordingContext:
             def __init__(self) -> None:
+                self.verify_mode = online.ssl.CERT_REQUIRED
+                self.check_hostname = True
                 self.tls_entry_timeout: float | None = None
 
             def wrap_socket(
@@ -1319,6 +1323,8 @@ class PublicDeploymentBehaviorTests(unittest.TestCase):
 
         class ScriptedContext:
             def __init__(self) -> None:
+                self.verify_mode = online.ssl.CERT_REQUIRED
+                self.check_hostname = True
                 self.minimum_version: object | None = None
                 self.server_hostname: str | None = None
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -14,6 +16,43 @@ import validate_public_repository  # noqa: E402
 
 
 class PublicRepositoryLicenseTests(unittest.TestCase):
+    def write_identity_fixture(self, repository: Path) -> None:
+        readme = repository / "README.md"
+        manifest = repository / "public/public-repository.json"
+        manifest.parent.mkdir(parents=True)
+        readme.write_text("# Fixture\n", encoding="utf-8")
+
+        entries = {
+            "README.md": "100644",
+            "public/public-repository.json": "100644",
+        }
+        digest = hashlib.sha256()
+        for path in sorted(entries):
+            digest.update(entries[path].encode("ascii"))
+            digest.update(b"\0")
+            digest.update(path.encode("utf-8"))
+            digest.update(b"\0")
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "publicIndex": {
+                        "pathCount": len(entries),
+                        "pathModeSha256": digest.hexdigest(),
+                    },
+                    "files": [
+                        {"source": "README.md", "destination": "README.md"},
+                        {
+                            "source": "public/public-repository.json",
+                            "destination": "public/public-repository.json",
+                        },
+                    ],
+                    "trees": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_project_license_and_notice_are_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             failures = validate_public_repository.validate(Path(directory))
@@ -80,6 +119,343 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 self.assertIn(f"missing required public file: {path}", failures)
+
+    def test_public_projection_toolchain_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        for path in (
+            "public/public-repository.json",
+            "scripts/export_public_repository.py",
+            "scripts/tests/test_public_export.py",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f"missing required public file: {path}", failures)
+
+    def test_engineering_identity_manifest_is_forbidden_in_public_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            manifest = repository / "public/public-repository-public.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text("{}\n", encoding="utf-8")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "forbidden public path exists: public/public-repository-public.json",
+            failures,
+        )
+
+    def test_public_validator_requires_sealed_identity_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            manifest = repository / "public/public-repository.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "files": [],
+                        "trees": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn("public identity manifest requires publicIndex", failures)
+
+    def test_public_validator_accepts_valid_identity_manifest_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertFalse(
+            [failure for failure in failures if failure.startswith("public identity")],
+            failures,
+        )
+
+    def test_public_validator_rejects_extra_candidate_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            (repository / "ambient-extra.txt").write_text("extra\n", encoding="utf-8")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "public identity manifest seal does not match candidate path/mode set",
+            failures,
+        )
+        self.assertIn(
+            "public identity manifest does not cover the exact candidate path set",
+            failures,
+        )
+
+    def test_public_validator_rejects_remapped_identity_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            manifest_path = repository / "public/public-repository.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"][0]["destination"] = "docs/README.md"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "public identity manifest file entry must use identity paths",
+            failures,
+        )
+
+    def test_public_validator_rejects_candidate_mode_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            (repository / "README.md").chmod(0o755)
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "public identity manifest seal does not match candidate path/mode set",
+            failures,
+        )
+
+    def test_public_validator_matches_git_owner_execute_bit_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            (repository / "README.md").chmod(0o645)
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertNotIn(
+            "public identity manifest seal does not match candidate path/mode set",
+            failures,
+        )
+
+    def test_public_validator_rejects_special_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            os.mkfifo(repository / "unexpected-pipe")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn("special file is forbidden: unexpected-pipe", failures)
+
+    def test_public_validator_does_not_skip_nested_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            nested_config = repository / "vendor/.git/config"
+            nested_config.parent.mkdir(parents=True)
+            nested_config.write_text(
+                "BEGIN OPENSSH" + " PRIVATE KEY\n",
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "public identity manifest seal does not match candidate path/mode set",
+            failures,
+        )
+        self.assertIn(
+            "private marker 'BEGIN OPENSSH"
+            + " PRIVATE KEY' in vendor/.git/config",
+            failures,
+        )
+
+    def test_public_validator_rejects_empty_nested_git_metadata_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            (repository / "vendor/.git").mkdir(parents=True)
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn("nested Git metadata is forbidden: vendor/.git", failures)
+
+    def test_public_validator_rejects_private_marker_in_decoded_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            private_relative = "docs/" + "superpowers/verdicts/private.md"
+            private_path = repository / private_relative
+            manifest_path = repository / "public/public-repository.json"
+            private_path.parent.mkdir(parents=True)
+            manifest_path.parent.mkdir(parents=True)
+            private_path.write_text("benign fixture\n", encoding="utf-8")
+            entries = {
+                private_relative: "100644",
+                "public/public-repository.json": "100644",
+            }
+            digest = hashlib.sha256()
+            for path in sorted(entries):
+                digest.update(entries[path].encode("ascii"))
+                digest.update(b"\0")
+                digest.update(path.encode("utf-8"))
+                digest.update(b"\0")
+            manifest = json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "publicIndex": {
+                        "pathCount": len(entries),
+                        "pathModeSha256": digest.hexdigest(),
+                    },
+                    "files": [
+                        {
+                            "source": private_relative,
+                            "destination": private_relative,
+                        },
+                        {
+                            "source": "public/public-repository.json",
+                            "destination": "public/public-repository.json",
+                        },
+                    ],
+                    "trees": [],
+                }
+            ).replace("docs/" + "superpowers", "docs\\/" + "superpowers")
+            manifest_path.write_text(manifest, encoding="utf-8")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "private marker 'docs/"
+            + "superpowers/' in candidate path "
+            + private_relative,
+            failures,
+        )
+
+    def test_public_validator_rejects_article_manifest_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            manifest_path = repository / "public/public-repository.json"
+            publications_path = repository / "site/publications.json"
+            article_path = repository / "docs/content/2026-08-14-note.md"
+            manifest_path.parent.mkdir(parents=True)
+            publications_path.parent.mkdir(parents=True)
+            article_path.parent.mkdir(parents=True)
+            article_path.write_text("# Note\n", encoding="utf-8")
+            publications_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "articles": [
+                            {"source": "docs/content/2026-08-14-note.md"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entries = {
+                "docs/content/2026-08-14-note.md": "100644",
+                "public/public-repository.json": "100644",
+                "site/publications.json": "100644",
+            }
+            digest = hashlib.sha256()
+            for path in sorted(entries):
+                digest.update(entries[path].encode("ascii"))
+                digest.update(b"\0")
+                digest.update(path.encode("utf-8"))
+                digest.update(b"\0")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "publicIndex": {
+                            "pathCount": len(entries),
+                            "pathModeSha256": digest.hexdigest(),
+                        },
+                        "files": [
+                            {
+                                "source": "docs/content/2026-08-14-note.md",
+                                "destination": "docs/content/2026-08-14-note.md",
+                            },
+                            {
+                                "source": "public/public-repository.json",
+                                "destination": "public/public-repository.json",
+                            },
+                            {
+                                "source": "site/publications.json",
+                                "destination": "site/publications.json",
+                            },
+                        ],
+                        "trees": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn(
+            "published article overlaps public identity manifest: "
+            "docs/content/2026-08-14-note.md",
+            failures,
+        )
+
+    def test_public_validator_rejects_article_without_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            publications_path = repository / "site/publications.json"
+            publications_path.parent.mkdir(parents=True)
+            publications_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "articles": [
+                            {
+                                "slug": "missing-source",
+                                "status": "published",
+                                "reviewedAt": "2026-08-14",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn("invalid published article source: None", failures)
+
+    def test_public_validator_rejects_publications_schema_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            publications_path = repository / "site/publications.json"
+            publications_path.parent.mkdir(parents=True)
+            publications_path.write_text(
+                json.dumps({"schemaVersion": 2, "articles": []}),
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertIn("site/publications.json must use schemaVersion 1", failures)
+
+    def test_public_validator_rejects_invalid_utf8_publications(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            publications_path = repository / "site/publications.json"
+            publications_path.parent.mkdir(parents=True)
+            publications_path.write_bytes(b"\xff")
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertTrue(
+            any(
+                failure.startswith("invalid site/publications.json:")
+                for failure in failures
+            ),
+            failures,
+        )
 
     def test_project_license_must_match_official_apache_2_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -168,19 +544,47 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("scripts/verify_public_deployment.py", destinations)
         self.assertIn("scripts/validate_public_deployment_receipt.py", destinations)
         self.assertIn("scripts/tests/test_public_deployment.py", destinations)
+        self.assertIn("public/public-repository.json", destinations)
+        self.assertIn("scripts/export_public_repository.py", destinations)
+        self.assertIn("scripts/tests/test_public_export.py", destinations)
         self.assertIn("scripts/tests/test_public_repository.py", destinations)
         self.assertIn("scripts/tests/test_public_status.py", destinations)
         self.assertIn("scripts/tests/benchmark_explorer_node_test.js", destinations)
 
-    def test_public_quality_workflow_validates_engineering_export_or_public_checkout(self) -> None:
+    def test_public_quality_workflow_validates_checkout_and_reexport(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/quality.yml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("python3 scripts/export_public_repository.py", workflow)
-        self.assertIn('"$RUNNER_TEMP/fast-mlx-public"', workflow)
-        self.assertIn("python3 scripts/validate_public_repository.py .", workflow)
-        self.assertNotIn("Engineering checkout detected", workflow)
+        checkout_validation = "python3 scripts/validate_public_repository.py ."
+        export_command = "python3 scripts/export_public_repository.py"
+        candidate_validation = (
+            "python3 scripts/validate_public_repository.py \\\n"
+            '            "$RUNNER_TEMP/fast-mlx-public"'
+        )
+        public_boundary = workflow.split("\n  public-boundary:\n", 1)[1].split(
+            "\n  pure-swift-targets:\n", 1
+        )[0]
+
+        self.assertIn(
+            '    env:\n      PYTHONDONTWRITEBYTECODE: "1"\n    steps:',
+            public_boundary,
+        )
+        self.assertIn(checkout_validation, public_boundary)
+        self.assertIn(export_command, public_boundary)
+        self.assertIn('"$RUNNER_TEMP/fast-mlx-public"', public_boundary)
+        self.assertIn(candidate_validation, public_boundary)
+        self.assertLess(
+            public_boundary.index(checkout_validation),
+            public_boundary.index(export_command),
+        )
+        self.assertLess(
+            public_boundary.index(export_command),
+            public_boundary.index(candidate_validation),
+        )
+        self.assertNotIn("--development-projection", public_boundary)
+        self.assertNotIn("projection_mode", public_boundary)
+        self.assertNotIn("if [[ -f public/public-repository.json ]]", workflow)
 
     def test_public_quality_workflow_uses_swift_6_3_capable_macos_runner(self) -> None:
         workflow = (REPOSITORY_ROOT / ".github/workflows/quality.yml").read_text(
