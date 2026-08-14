@@ -1,0 +1,102 @@
+<div data-quickstart>
+  <section class="page-hero shell quickstart-hero">
+    <p class="eyebrow">Operator quickstart</p>
+    <h1>From clone to a local chat-completions response.</h1>
+    <p class="lede">
+      Exercise fast-mlx's real HTTP/JSON and HTTP/SSE surface without downloading or loading a
+      model. The scripted backend is a transport smoke: useful, fast to inspect, and deliberately
+      narrower than a model or performance proof.
+    </p>
+    <div class="hero-actions">
+      <a class="button primary" href="https://github.com/bitworks-io/fast-mlx" rel="noreferrer">Open the source</a>
+      <a class="button secondary" href="../capabilities/">Inspect feature states</a>
+    </div>
+  </section>
+
+  <section class="section shell" aria-labelledby="quickstart-prerequisites">
+    <div class="section-heading">
+      <p class="eyebrow">Before you start</p>
+      <h2 id="quickstart-prerequisites">Three local prerequisites.</h2>
+      <p class="section-intro">Use an Apple Silicon Mac, macOS 14 or newer, and Swift 6. No model weights are bundled.</p>
+    </div>
+    <div class="quickstart-requirements" role="list">
+      <article role="listitem"><strong>Apple Silicon Mac</strong><span>The public Swift package targets native MLX-capable Macs.</span></article>
+      <article role="listitem"><strong>macOS 14 or newer</strong><span>The project does not claim support for older macOS releases.</span></article>
+      <article role="listitem"><strong>Swift 6</strong><span>Confirm your active toolchain with <code>swift --version</code>.</span></article>
+    </div>
+  </section>
+
+  <section class="section shell" aria-labelledby="quickstart-steps">
+    <div class="section-heading">
+      <p class="eyebrow">Model-free smoke</p>
+      <h2 id="quickstart-steps">Start the real transport in three steps.</h2>
+      <p class="section-intro">Scripted mode loads no model. It binds to loopback by default and exercises the same POST /v1/chat/completions endpoint used by loaded serving.</p>
+    </div>
+    <ol class="quickstart-steps">
+      <li class="quickstart-step">
+        <div><span>01</span><h3>Clone the public project source</h3><p>fast-mlx is Apache-2.0; retained third-party source keeps its upstream notices.</p></div>
+        <pre><code data-command="clone">git clone https://github.com/bitworks-io/fast-mlx.git
+cd fast-mlx</code></pre>
+      </li>
+      <li class="quickstart-step">
+        <div><span>02</span><h3>Run the scripted server</h3><p>The default address is <code>127.0.0.1:8080</code> and the default scripted model name is <code>fastmlx-scripted</code>. Keep it running, then open another terminal for the requests below.</p></div>
+        <pre><code data-command="serve-scripted">swift run --package-path spike fastmlx-serve --scripted</code></pre>
+      </li>
+      <li class="quickstart-step">
+        <div><span>03</span><h3>Send a JSON completion</h3><p>The current route is temperature zero and accepts n = 1. The response is an <code>application/json</code> chat completion with usage.</p></div>
+        <pre><code data-command="request-json">curl http://127.0.0.1:8080/v1/chat/completions \
+  -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;model&quot;:&quot;fastmlx-scripted&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hello&quot;}],&quot;temperature&quot;:0,&quot;n&quot;:1,&quot;stream&quot;:false}&#x27;</code></pre>
+      </li>
+    </ol>
+  </section>
+
+  <section class="section shell split" aria-labelledby="quickstart-streaming">
+    <div>
+      <p class="eyebrow">Streaming</p>
+      <h2 id="quickstart-streaming">Exercise the SSE contract.</h2>
+      <p>Set <code>stream</code> to true and keep curl's output unbuffered. The response uses <code>text/event-stream</code>, emits chat-completion chunks, includes terminal usage, and ends with <code>data: [DONE]</code>.</p>
+    </div>
+    <pre class="quickstart-command"><code data-command="request-sse">curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H &#x27;content-type: application/json&#x27; \
+  -d &#x27;{&quot;model&quot;:&quot;fastmlx-scripted&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hello&quot;}],&quot;temperature&quot;:0,&quot;n&quot;:1,&quot;stream&quot;:true}&#x27;</code></pre>
+  </section>
+
+  <section class="section shell split" aria-labelledby="quickstart-capacity">
+    <div>
+      <p class="eyebrow">Plan before loading</p>
+      <h2 id="quickstart-capacity">Inspect capacity without starting a service.</h2>
+      <p><code>fastmlx-capacity</code> prints a host profile and catalog-wide capacity table. It is a planning tool, not proof that a model fits, launches, or meets a quality or speed target.</p>
+    </div>
+    <pre class="quickstart-command"><code data-command="capacity">swift run --package-path spike fastmlx-capacity</code></pre>
+  </section>
+
+  <section class="section shell" aria-labelledby="quickstart-loaded">
+    <div class="section-heading">
+      <p class="eyebrow">Loaded serving boundary</p>
+      <h2 id="quickstart-loaded">Read the contract before attaching a model.</h2>
+      <p class="section-intro">Loaded serving requires an absolute model path, an explicit model identity, and explicit memory and cache limits. Inspect the current flags rather than copying an unreviewed machine configuration.</p>
+    </div>
+    <pre class="quickstart-command"><code data-command="serve-help">swift run --package-path spike fastmlx-serve --help</code></pre>
+    <div class="quickstart-proof-grid">
+      <article>
+        <h3>Security defaults</h3>
+        <p>The server binds to loopback by default. A non-loopback bind is refused unless <code>FASTMLX_API_KEY</code> is configured, and configured requests require Bearer authentication.</p>
+      </article>
+      <article>
+        <h3>Current API scope</h3>
+        <p>The reviewed route is temperature zero with <code>n = 1</code>. Unsupported sampling, tool, and structured-response fields are rejected instead of silently ignored.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section shell callout quickstart-boundary" aria-labelledby="quickstart-proof">
+    <p class="eyebrow">Know what passed</p>
+    <h2 id="quickstart-proof">A transport smoke is not a model benchmark.</h2>
+    <p>It proves that the local command can build and exercise the reviewed HTTP request, JSON response, and SSE framing paths in scripted mode. It does not prove model compatibility, output quality, capacity fit, or performance.</p>
+    <div class="hero-actions">
+      <a class="button secondary" href="../benchmarks/">Read scoped benchmark evidence</a>
+      <a class="button secondary" href="../methodology/">Read the comparison methodology</a>
+    </div>
+  </section>
+</div>

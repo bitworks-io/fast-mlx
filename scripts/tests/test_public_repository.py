@@ -51,6 +51,15 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             failures,
         )
 
+    def test_operator_quickstart_source_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            failures = validate_public_repository.validate(Path(directory))
+
+        self.assertIn(
+            "missing required public file: site/fragments/quickstart.html",
+            failures,
+        )
+
     def test_project_license_must_match_official_apache_2_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)

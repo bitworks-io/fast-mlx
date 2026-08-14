@@ -63,15 +63,15 @@ SOCIAL_CARD_SHA256 = (
 )
 SITE_STYLESHEET_PATH = "assets/site.css"
 SITE_STYLESHEET_SHA256 = (
-    "4bbcee47b18a8779ff6404eda1884462e5f93324454fb41a3896364c11ae695c"
+    "70fa7d0023bc818143345cff859982b30ea053a3c91069283773a3a7a035764b"
 )
 RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_259
+REVIEWED_HOME_PAGE_BYTES = 9_330
 REVIEWED_HOME_PAGE_SHA256 = (
-    "8492525f192f78965e75863bd31d148ffc490ae22cc0827217d8ae6f1678bb5e"
+    "719c6f1bbbaa85b322a0bd8c1bfcf90cd00178e10020e7925967bf64aaf2e9fd"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -82,8 +82,75 @@ MAX_REVIEWED_UPDATES_FEED_BYTES = 1_048_576
 MAX_RESEARCH_INDEX_BYTES = 1_048_576
 MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
+MAX_QUICKSTART_BYTES = 131_072
+REVIEWED_QUICKSTART_PAGE_BYTES = 9_752
+REVIEWED_QUICKSTART_PAGE_SHA256 = (
+    "f2d653ed8350e39e1fc6fb0a0206abf40998f5260f8ee520090c5738fcbeaae2"
+)
+REVIEWED_QUICKSTART_COMMANDS: Tuple[Tuple[str, str], ...] = (
+    (
+        "clone",
+        "git clone https://github.com/bitworks-io/fast-mlx.git\ncd fast-mlx",
+    ),
+    (
+        "serve-scripted",
+        "swift run --package-path spike fastmlx-serve --scripted",
+    ),
+    (
+        "request-json",
+        "curl http://127.0.0.1:8080/v1/chat/completions \\\n"
+        "  -H 'content-type: application/json' \\\n"
+        "  -d '{\"model\":\"fastmlx-scripted\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"n\":1,\"stream\":false}'",
+    ),
+    (
+        "request-sse",
+        "curl -N http://127.0.0.1:8080/v1/chat/completions \\\n"
+        "  -H 'content-type: application/json' \\\n"
+        "  -d '{\"model\":\"fastmlx-scripted\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"n\":1,\"stream\":true}'",
+    ),
+    ("capacity", "swift run --package-path spike fastmlx-capacity"),
+    ("serve-help", "swift run --package-path spike fastmlx-serve --help"),
+)
+REVIEWED_QUICKSTART_TEXT = (
+    "Apple Silicon Mac",
+    "macOS 14 or newer",
+    "Swift 6",
+    "Scripted mode loads no model",
+    "open another terminal",
+    "POST /v1/chat/completions",
+    "application/json",
+    "text/event-stream",
+    "FASTMLX_API_KEY",
+    "temperature zero",
+    "n = 1",
+    "No model weights are bundled",
+    "does not prove model compatibility, output quality, capacity fit, or performance",
+)
+REVIEWED_QUICKSTART_LINKS = (
+    "https://github.com/bitworks-io/fast-mlx",
+    "../capabilities/",
+    "../benchmarks/",
+    "../methodology/",
+)
+QUICKSTART_ALLOWED_TAGS = {
+    "a",
+    "article",
+    "code",
+    "div",
+    "h1",
+    "h2",
+    "h3",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "span",
+    "strong",
+}
 CORE_PUBLIC_PAGE_PATHS = (
     "",
+    "quickstart/",
     "process/",
     "methodology/",
     "capabilities/",
@@ -222,56 +289,56 @@ REVIEWED_RELEASE_PATHS = tuple(
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "reviewed-research-atom-feed": (
-        4_662,
-        "7f63e67badb34afc59093898c9b9dce617e7dc208e17cdafa181c8015bbdbdeb",
+        4_666,
+        "e9224ceaf6510d7a1829c6cd69d716b88ce0ad7e97742e87bb62e702a80e200b",
     ),
     "reviewed-release-detail-permalinks": (
-        4_632,
-        "6ccf62e9fee163c777251f8a1f0a41f32d6054824cf98a566d47dd4298d96973",
+        4_636,
+        "305546c9159b7260eb1f800c4984d2bd90e0aafb8ee14647a4e1755b16a88f5d",
     ),
     "reviewed-benchmark-detail-permalinks": (
-        4_734,
-        "dd310a3a15581b7179c994e593e77728f70c027710de8624115a95d892ace6c9",
+        4_738,
+        "367762f5f7914d6ec762b08097bcba2f398ab89c173dd8f0f235f4447027a13e",
     ),
     "reviewed-home-current-cycle": (
-        4_562,
-        "ac9c90ea49182204c262ce41eb5503a1e03ac33adef9ad3dbde7f3360e712aa4",
+        4_566,
+        "853e502c5a0728df422aad0a024619dcd40f34dbb9f2d526d0f25f6c2c546b98",
     ),
     "reviewed-social-metadata": (
-        4_460,
-        "06baa3625b39348f89edb9b8ef1085822b33fb57b2c5d1f8cc96d7dd8265f95d",
+        4_464,
+        "848380033e250cf5ff0c37515eecc6e10f6dbc7bff4b72ba03a43bcf56749c61",
     ),
     "reviewed-sitemap-discovery": (
-        4_480,
-        "dff5949a0fe6f614377f6914fcc82158f00475f1452123150878dd03ac61ed9b",
+        4_484,
+        "1d4254e002b1cff000aa46dc59d405109e2c6d334cdd228a26043c52ec8efb27",
     ),
     "reviewed-release-atom-feed": (
-        4_390,
-        "2a7d9a26ab1eaa3271331fcab535b23035aea6bbd62e1e80a8c3f444b95c2db5",
+        4_394,
+        "a2302c5f943bb02921068947630d60ee1919ab292196f9164d1dbb48dadea946",
     ),
     "reviewed-release-ledger": (
-        4_375,
-        "6044e202ebac4559844f3be856c49fe1233f40c4ec9c40256fabccd1b5d8a80b",
+        4_379,
+        "2895a216809dbcdfb43ab57f46628e26506d26a62eff083dc8f8775b98e742c0",
     ),
     "public-benchmark-explorer": (
-        4_438,
-        "148737ddd76f1fbc2a61fc54c69c42e02aab4a792fb3306ae2cd59492c8849f8",
+        4_442,
+        "9e5abb266d124a23fd1bb1ae9e176b1de3dd48b48cf148a31c64fc238a22d58b",
     ),
     "same-commit-pages-quality-gate": (
-        4_411,
-        "c98e2a0e93b799d65ed9e3c06dd69ac68317a6e49faadb3209f065373b5339a4",
+        4_415,
+        "265d77607f2241c5f1faf9ac740df616cc4245cf4d8780371aa84cff3db6280a",
     ),
     "capabilities-and-evidence": (
-        4_462,
-        "3fc920bac108020314a04b86a96ef2875eeb187f11abbc3e0b8cfc957486467d",
+        4_466,
+        "4660b5eb90ea87018cd079e8beb89e124bef1458424ca649de859734d092cf6f",
     ),
     "compatible-hosted-swift-runner": (
-        4_329,
-        "c3285b90b77ba453a3052f8d2162c8c750b8877e1e0194c53f9ccabece181b64",
+        4_333,
+        "da9d7948394bf65b2f15599126b8db4910b2e53c75bc4976b9db3966565f684c",
     ),
     "initial-public-release": (
-        4_385,
-        "d0ff2efcd7b92690c2053baf4a8a8d82ae3439f897ac74a76c0510bf7275a831",
+        4_389,
+        "b670567d35e2369a9fa328fcb10e37bb0bbcaba69503e4b0da8fd61abb1e95fb",
     ),
 }
 RELEASE_DETAIL_DESCRIPTION = (
@@ -300,6 +367,12 @@ REVIEWED_PAGE_METADATA: Dict[
     "": (
         "fast-mlx — evidence-gated MLX inference",
         "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+        "website",
+        None,
+    ),
+    "quickstart/": (
+        "Operator quickstart — fast-mlx",
+        "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
         "website",
         None,
     ),
@@ -551,6 +624,233 @@ class HeadMetadataCollector(html.parser.HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "head":
             self._in_head = False
+
+
+class QuickstartCollector(html.parser.HTMLParser):
+    """Collect the visible, static contract inside the reviewed quickstart root."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.roots: List[Dict[str, object]] = []
+        self.root_count = 0
+        self.page_h1_count = 0
+        self.scripts: List[Optional[str]] = []
+        self.inline_style_count = 0
+        self.stylesheet_links: List[Optional[str]] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._root_depth = 0
+        self._active_command: Optional[Dict[str, object]] = None
+        self._element_stack: List[
+            Tuple[str, Dict[str, Optional[str]], bool]
+        ] = []
+
+    @staticmethod
+    def _suppresses_visibility(attributes: Dict[str, Optional[str]]) -> bool:
+        classes = set((attributes.get("class") or "").split())
+        return (
+            "hidden" in attributes
+            or "inert" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+            or bool(classes & {"benchmark-controls", "research-controls"})
+            or "data-benchmark-controls" in attributes
+            or "data-research-controls" in attributes
+        )
+
+    def handle_starttag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        names = [name for name, _value in attrs]
+        has_duplicate_attributes = len(names) != len(set(names))
+        attributes = dict(attrs)
+        if tag == "h1":
+            self.page_h1_count += 1
+        elif tag == "script":
+            self.scripts.append(attributes.get("src"))
+        elif tag == "style":
+            self.inline_style_count += 1
+        elif tag == "link" and "stylesheet" in {
+            token.casefold() for token in (attributes.get("rel") or "").split()
+        }:
+            self.stylesheet_links.append(attributes.get("href"))
+
+        started_root = False
+        if tag == "div" and "data-quickstart" in attributes:
+            self.root_count += 1
+            if self._current is None:
+                self._current = {
+                    "rootAttributes": attributes,
+                    "ancestry": list(self._element_stack),
+                    "hasDuplicateAttributes": has_duplicate_attributes,
+                    "hasVisibilitySuppressor": self._suppresses_visibility(attributes),
+                    "forbiddenTags": [],
+                    "commands": [],
+                    "links": [],
+                    "h1Count": 0,
+                    "text_parts": [],
+                }
+                self._root_depth = 1
+                started_root = True
+
+        if self._current is not None:
+            if has_duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if self._suppresses_visibility(attributes):
+                self._current["hasVisibilitySuppressor"] = True
+            if (
+                tag not in QUICKSTART_ALLOWED_TAGS
+                or any(name.casefold().startswith("on") for name in names)
+            ):
+                forbidden = self._current["forbiddenTags"]
+                if isinstance(forbidden, list):
+                    forbidden.append(tag)
+            if tag == "h1":
+                count = self._current["h1Count"]
+                self._current["h1Count"] = count + 1 if isinstance(count, int) else 1
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+            if self._active_command is not None:
+                self._active_command["hasNestedTag"] = True
+            if tag == "code" and "data-command" in attributes:
+                if self._active_command is not None:
+                    self._active_command["hasNestedCommand"] = True
+                else:
+                    self._active_command = {
+                        "id": attributes.get("data-command"),
+                        "attributes": attributes,
+                        "hasNestedTag": False,
+                        "hasNestedCommand": False,
+                        "text_parts": [],
+                    }
+            if tag not in HTML_VOID_ELEMENTS and not started_root:
+                self._root_depth += 1
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, attributes, has_duplicate_attributes))
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            text_parts = self._current["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+        if self._active_command is not None:
+            text_parts = self._active_command["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "code" and self._active_command is not None:
+            text_parts = self._active_command.pop("text_parts")
+            self._active_command["text"] = (
+                "".join(text_parts) if isinstance(text_parts, list) else ""
+            )
+            if self._current is not None:
+                commands = self._current["commands"]
+                if isinstance(commands, list):
+                    commands.append(self._active_command)
+            self._active_command = None
+
+        if self._current is not None and tag not in HTML_VOID_ELEMENTS:
+            self._root_depth -= 1
+            if self._root_depth == 0:
+                text_parts = self._current.pop("text_parts")
+                self._current["text"] = (
+                    " ".join("".join(text_parts).split())
+                    if isinstance(text_parts, list)
+                    else ""
+                )
+                self.roots.append(self._current)
+                self._current = None
+
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                del self._element_stack[index:]
+                break
+
+
+class PrimaryNavigationCollector(html.parser.HTMLParser):
+    """Collect links structurally contained in the primary navigation landmark."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.nav_count = 0
+        self.navs: List[Dict[str, object]] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._depth = 0
+        self._active_link: Optional[Dict[str, object]] = None
+        self._element_stack: List[
+            Tuple[str, Dict[str, Optional[str]], bool]
+        ] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: List[Tuple[str, Optional[str]]]
+    ) -> None:
+        names = [name for name, _value in attrs]
+        has_duplicate_attributes = len(names) != len(set(names))
+        attributes = dict(attrs)
+        started_nav = False
+        if tag == "nav" and attributes.get("aria-label") == "Primary navigation":
+            self.nav_count += 1
+            if self._current is None:
+                self._current = {
+                    "attributes": attributes,
+                    "ancestry": list(self._element_stack),
+                    "hasDuplicateAttributes": has_duplicate_attributes,
+                    "links": [],
+                }
+                self._depth = 1
+                started_nav = True
+
+        if self._current is not None:
+            if has_duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if self._active_link is not None:
+                self._active_link["hasNestedTag"] = True
+            if tag == "a":
+                self._active_link = {
+                    "attributes": attributes,
+                    "ancestry": list(self._element_stack),
+                    "hasNestedTag": False,
+                    "text_parts": [],
+                }
+            if tag not in HTML_VOID_ELEMENTS and not started_nav:
+                self._depth += 1
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, attributes, has_duplicate_attributes))
+
+    def handle_data(self, data: str) -> None:
+        if self._active_link is not None:
+            text_parts = self._active_link["text_parts"]
+            if isinstance(text_parts, list):
+                text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._active_link is not None:
+            text_parts = self._active_link.pop("text_parts")
+            self._active_link["text"] = (
+                " ".join("".join(text_parts).split())
+                if isinstance(text_parts, list)
+                else ""
+            )
+            if self._current is not None:
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(self._active_link)
+            self._active_link = None
+
+        if self._current is not None and tag not in HTML_VOID_ELEMENTS:
+            self._depth -= 1
+            if self._depth == 0:
+                self.navs.append(self._current)
+                self._current = None
+
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] == tag:
+                del self._element_stack[index:]
+                break
 
 
 class BenchmarkCollector(html.parser.HTMLParser):
@@ -2060,6 +2360,186 @@ def validate_reviewed_stylesheet(site: Path) -> List[str]:
     return []
 
 
+def validate_quickstart_page(site: Path) -> List[str]:
+    failures: List[str] = []
+    path = site / "quickstart/index.html"
+    if path.is_symlink() or not path.is_file():
+        return ["quickstart/index.html must be a regular non-symlink file"]
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return [f"cannot stat quickstart/index.html: {exc}"]
+    if size > MAX_QUICKSTART_BYTES:
+        return ["quickstart/index.html exceeds the 131072-byte limit"]
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read quickstart/index.html: {exc}"]
+    if len(raw) > MAX_QUICKSTART_BYTES:
+        return ["quickstart/index.html exceeds the 131072-byte limit"]
+    if (
+        len(raw) != REVIEWED_QUICKSTART_PAGE_BYTES
+        or hashlib.sha256(raw).hexdigest() != REVIEWED_QUICKSTART_PAGE_SHA256
+    ):
+        failures.append("quickstart/index.html does not match the reviewed page seal")
+    try:
+        page = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return [f"quickstart/index.html is not UTF-8: {exc}"]
+
+    collector = QuickstartCollector()
+    try:
+        collector.feed(page)
+        collector.close()
+    except Exception as exc:
+        return [f"cannot parse quickstart/index.html: {exc}"]
+    if collector._current is not None or collector._active_command is not None:
+        failures.append("quickstart/index.html has an incomplete content root")
+    if collector.root_count != 1 or len(collector.roots) != 1:
+        failures.append(
+            "quickstart/index.html must contain exactly one complete quickstart root"
+        )
+        return failures
+
+    root = collector.roots[0]
+    if root.get("rootAttributes") != {"data-quickstart": None}:
+        failures.append("quickstart root attributes do not match reviewed contract")
+    expected_ancestry = [
+        ("html", {"lang": "en"}, False),
+        ("body", {}, False),
+        ("main", {"id": "content"}, False),
+    ]
+    if root.get("ancestry") != expected_ancestry:
+        failures.append("quickstart root ancestry does not match reviewed contract")
+    if root.get("hasDuplicateAttributes"):
+        failures.append("quickstart content contains duplicate attributes")
+    if root.get("hasVisibilitySuppressor"):
+        failures.append("quickstart content contains a visibility suppressor")
+    if root.get("forbiddenTags"):
+        failures.append("quickstart content contains an interactive or executable tag")
+    if (
+        root.get("h1Count") != 1
+        or collector.page_h1_count != 1
+    ):
+        failures.append("quickstart page must contain exactly one h1")
+    if collector.scripts or collector.inline_style_count:
+        failures.append("quickstart page must not contain scripts or inline styles")
+    if collector.stylesheet_links != ["../assets/site.css"]:
+        failures.append("quickstart page must load only the reviewed stylesheet")
+
+    actual_commands: List[Tuple[object, object]] = []
+    commands = root.get("commands")
+    if isinstance(commands, list):
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            identifier = command.get("id")
+            if (
+                command.get("attributes") != {"data-command": identifier}
+                or command.get("hasNestedTag")
+                or command.get("hasNestedCommand")
+            ):
+                failures.append(
+                    f"quickstart command {identifier!r} has invalid structure"
+                )
+            actual_commands.append((identifier, command.get("text")))
+    if tuple(actual_commands) != REVIEWED_QUICKSTART_COMMANDS:
+        failures.append("quickstart commands do not match the reviewed CLI contract")
+    if root.get("links") != list(REVIEWED_QUICKSTART_LINKS):
+        failures.append("quickstart action links do not match the reviewed contract")
+    text = root.get("text")
+    normalized_text = text if isinstance(text, str) else ""
+    for required_text in REVIEWED_QUICKSTART_TEXT:
+        if " ".join(required_text.split()) not in normalized_text:
+            failures.append(
+                f"quickstart page is missing reviewed text: {required_text!r}"
+            )
+    return failures
+
+
+def validate_quickstart_navigation(site: Path) -> List[str]:
+    failures: List[str] = []
+    reviewed_files = [
+        (public_path + "index.html") if public_path else "index.html"
+        for public_path in REVIEWED_PAGE_METADATA
+    ]
+    reviewed_files.append("404.html")
+    for relative in reviewed_files:
+        path = site / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            page = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"cannot inspect {relative} quickstart navigation: {exc}")
+            continue
+        collector = PrimaryNavigationCollector()
+        try:
+            collector.feed(page)
+            collector.close()
+        except Exception as exc:
+            failures.append(f"cannot parse {relative} primary navigation: {exc}")
+            continue
+        if (
+            collector._current is not None
+            or collector._active_link is not None
+            or collector.nav_count != 1
+            or len(collector.navs) != 1
+        ):
+            failures.append(
+                f"{relative} quickstart navigation does not match reviewed contract"
+            )
+            continue
+        nav = collector.navs[0]
+        expected_nav_ancestry = [
+            ("html", {"lang": "en"}, False),
+            ("body", {}, False),
+            ("header", {"class": "site-header"}, False),
+        ]
+        if (
+            nav.get("attributes")
+            != {"class": "nav shell", "aria-label": "Primary navigation"}
+            or nav.get("ancestry") != expected_nav_ancestry
+            or nav.get("hasDuplicateAttributes")
+        ):
+            failures.append(
+                f"{relative} quickstart navigation does not match reviewed contract"
+            )
+            continue
+        current_dir = posixpath.dirname(relative)
+        depth = len([part for part in current_dir.split("/") if part])
+        expected_attributes: Dict[str, Optional[str]] = {
+            "href": "../" * depth + "quickstart/"
+        }
+        if relative == "quickstart/index.html":
+            expected_attributes["aria-current"] = "page"
+        expected_link_ancestry = [
+            *expected_nav_ancestry,
+            (
+                "nav",
+                {"class": "nav shell", "aria-label": "Primary navigation"},
+                False,
+            ),
+            ("div", {"class": "nav-links"}, False),
+        ]
+        links = nav.get("links")
+        quickstart_links = [
+            link
+            for link in links
+            if isinstance(link, dict) and link.get("text") == "Quickstart"
+        ] if isinstance(links, list) else []
+        if (
+            len(quickstart_links) != 1
+            or quickstart_links[0].get("attributes") != expected_attributes
+            or quickstart_links[0].get("ancestry") != expected_link_ancestry
+            or quickstart_links[0].get("hasNestedTag")
+        ):
+            failures.append(
+                f"{relative} quickstart navigation does not match reviewed contract"
+            )
+    return failures
+
+
 def validate_research_explorer_script(site: Path) -> List[str]:
     path = site / RESEARCH_EXPLORER_SCRIPT_PATH
     if path.is_symlink() or not path.is_file():
@@ -3006,6 +3486,7 @@ def validate(site: Path) -> List[str]:
     site = site.resolve()
     required = [
         "index.html",
+        "quickstart/index.html",
         "process/index.html",
         "methodology/index.html",
         "capabilities/index.html",
@@ -3042,9 +3523,11 @@ def validate(site: Path) -> List[str]:
 
     failures.extend(validate_social_card(site))
     failures.extend(validate_reviewed_stylesheet(site))
+    failures.extend(validate_quickstart_page(site))
     failures.extend(validate_research_explorer_script(site))
     failures.extend(validate_reviewed_home_page(site))
     failures.extend(validate_reviewed_head_metadata(site))
+    failures.extend(validate_quickstart_navigation(site))
     failures.extend(validate_research_page(site))
 
     expected_benchmark_cards = reviewed_benchmark_cards()

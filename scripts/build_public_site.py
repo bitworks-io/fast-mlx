@@ -97,6 +97,7 @@ SOCIAL_CARD_HEIGHT = 630
 MAX_PUBLICATION_MANIFEST_BYTES = 1_048_576
 CORE_PUBLIC_PAGE_PATHS = (
     "",
+    "quickstart/",
     "process/",
     "methodology/",
     "capabilities/",
@@ -912,6 +913,7 @@ def render_template(
         ),
         "{{root}}": root,
         "{{body}}": body.replace("{{root}}", root),
+        "{{quickstart_nav}}": nav_link("quickstart", "Quickstart"),
         "{{capabilities_nav}}": nav_link("capabilities", "Capabilities"),
         "{{benchmarks_nav}}": nav_link("benchmarks", "Benchmarks"),
         "{{releases_nav}}": nav_link("releases", "Releases"),
@@ -1918,6 +1920,11 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
 
     for name, title, description in (
         (
+            "quickstart",
+            "Operator quickstart — fast-mlx",
+            "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
+        ),
+        (
             "process",
             "The improvement loop — fast-mlx",
             "How fast-mlx turns research into reviewed, testable inference capabilities.",
@@ -2121,6 +2128,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "# fast-mlx\n\n"
         "Evidence-gated Swift/MLX inference research for Apple Silicon.\n\n"
         "## Core pages\n"
+        "- /quickstart/: model-free HTTP/SSE operator quickstart\n"
         "- /process/: research-to-publication loop\n"
         "- /methodology/: correctness and claim boundaries\n"
         "- /capabilities/: status-aware feature and evidence inventory\n"

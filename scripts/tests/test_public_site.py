@@ -603,6 +603,207 @@ class PublicSiteTests(unittest.TestCase):
                     validate_public_site.validate(output),
                 )
 
+    def test_operator_quickstart_is_generated_from_reviewed_cli_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            quickstart_path = output / "quickstart/index.html"
+            self.assertTrue(
+                quickstart_path.is_file(),
+                "missing reviewed operator quickstart: quickstart/index.html",
+            )
+            page = quickstart_path.read_text(encoding="utf-8")
+            expected_commands = {
+                "clone": (
+                    "git clone https://github.com/bitworks-io/fast-mlx.git\n"
+                    "cd fast-mlx"
+                ),
+                "serve-scripted": (
+                    "swift run --package-path spike fastmlx-serve --scripted"
+                ),
+                "request-json": (
+                    "curl http://127.0.0.1:8080/v1/chat/completions \\\n"
+                    "  -H 'content-type: application/json' \\\n"
+                    "  -d '{\"model\":\"fastmlx-scripted\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"n\":1,\"stream\":false}'"
+                ),
+                "request-sse": (
+                    "curl -N http://127.0.0.1:8080/v1/chat/completions \\\n"
+                    "  -H 'content-type: application/json' \\\n"
+                    "  -d '{\"model\":\"fastmlx-scripted\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"temperature\":0,\"n\":1,\"stream\":true}'"
+                ),
+                "capacity": "swift run --package-path spike fastmlx-capacity",
+                "serve-help": "swift run --package-path spike fastmlx-serve --help",
+            }
+            self.assertIn("data-quickstart", page)
+            self.assertEqual(page.count("<h1>"), 1)
+            for identifier, command in expected_commands.items():
+                with self.subTest(command=identifier):
+                    self.assertIn(
+                        f'<code data-command="{identifier}">{html.escape(command)}</code>',
+                        page,
+                    )
+            for required_text in (
+                "Apple Silicon Mac",
+                "macOS 14 or newer",
+                "Swift 6",
+                "Scripted mode loads no model",
+                "open another terminal",
+                "POST /v1/chat/completions",
+                "application/json",
+                "text/event-stream",
+                "FASTMLX_API_KEY",
+                "temperature zero",
+                "n = 1",
+                "No model weights are bundled",
+                "does not prove model compatibility, output quality, capacity fit, or performance",
+            ):
+                with self.subTest(required_text=required_text):
+                    self.assertIn(required_text, page)
+            for href in (
+                "../capabilities/",
+                "../benchmarks/",
+                "../methodology/",
+                "https://github.com/bitworks-io/fast-mlx",
+            ):
+                self.assertIn(f'href="{href}"', page)
+            self.assertIn(
+                '<a href="../quickstart/" aria-current="page">Quickstart</a>',
+                page,
+            )
+            self.assertNotIn("<script", page)
+
+            home = (output / "index.html").read_text(encoding="utf-8")
+            self.assertIn(
+                '<a class="button primary" href="quickstart/">Run the transport smoke</a>',
+                home,
+            )
+            sitemap = (output / "sitemap.xml").read_text(encoding="utf-8")
+            self.assertIn(
+                "https://bitworks-io.github.io/fast-mlx/quickstart/", sitemap
+            )
+            llms = (output / "llms.txt").read_text(encoding="utf-8")
+            self.assertIn(
+                "- /quickstart/: model-free HTTP/SSE operator quickstart", llms
+            )
+
+            metadata = HeadMetadataCollector()
+            metadata.feed(page)
+            self.assertEqual(
+                metadata.canonicals,
+                ["https://bitworks-io.github.io/fast-mlx/quickstart/"],
+            )
+            self.assertEqual(metadata.properties["og:type"], ["website"])
+            self.assertEqual(validate_public_site.validate(output), [])
+
+    def test_validator_rejects_quickstart_contract_and_visibility_drift(self) -> None:
+        mutations = (
+            (
+                "command drift",
+                "swift run --package-path spike fastmlx-capacity",
+                "swift run --package-path spike fastmlx-capacity --unsafe",
+                "quickstart commands do not match the reviewed CLI contract",
+            ),
+            (
+                "hidden root",
+                "<div data-quickstart>",
+                "<div data-quickstart hidden>",
+                "quickstart content contains a visibility suppressor",
+            ),
+            (
+                "script insertion",
+                "<div data-quickstart>",
+                "<div data-quickstart><script>window.quickstart = true</script>",
+                "quickstart page must not contain scripts or inline styles",
+            ),
+            (
+                "event handler insertion",
+                '<p class="lede">',
+                '<p class="lede" onclick="window.quickstart = true">',
+                "quickstart content contains an interactive or executable tag",
+            ),
+            (
+                "active element insertion",
+                "<div data-quickstart>",
+                '<div data-quickstart><iframe src="https://example.com"></iframe>',
+                "quickstart content contains an interactive or executable tag",
+            ),
+            (
+                "stylesheet hiding class",
+                'class="section shell" aria-labelledby="quickstart-prerequisites"',
+                'class="section shell research-controls" aria-labelledby="quickstart-prerequisites"',
+                "quickstart content contains a visibility suppressor",
+            ),
+            (
+                "proof boundary drift",
+                "does not prove model compatibility, output quality, capacity fit, or performance",
+                "proves model compatibility and performance",
+                "quickstart page is missing reviewed text",
+            ),
+            (
+                "contradictory claim insertion",
+                "does not prove model compatibility, output quality, capacity fit, or performance.",
+                "does not prove model compatibility, output quality, capacity fit, or performance. This proves model compatibility, output quality, capacity fit, and performance.",
+                "quickstart/index.html does not match the reviewed page seal",
+            ),
+        )
+        for label, original, replacement, expected_failure in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                quickstart_path = output / "quickstart/index.html"
+                page = quickstart_path.read_text(encoding="utf-8")
+                self.assertEqual(page.count(original), 1)
+                quickstart_path.write_text(
+                    page.replace(original, replacement, 1), encoding="utf-8"
+                )
+                self.assertTrue(
+                    any(
+                        failure.startswith(expected_failure)
+                        for failure in validate_public_site.validate(output)
+                    )
+                )
+
+    def test_validator_rejects_quickstart_navigation_drift(self) -> None:
+        mutations = (
+            (
+                "href drift",
+                lambda page: page.replace(
+                    '<a href="../quickstart/">Quickstart</a>',
+                    '<a href="../capabilities/">Quickstart</a>',
+                    1,
+                ),
+            ),
+            (
+                "footer substitution",
+                lambda page: page.replace(
+                    '<a href="../quickstart/">Quickstart</a>', "", 1
+                ).replace(
+                    '<a href="../quickstart/">First run</a>',
+                    '<a href="../quickstart/">Quickstart</a>',
+                    1,
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "site"
+                output.mkdir()
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+                process_path = output / "process/index.html"
+                page = process_path.read_text(encoding="utf-8")
+                original = '<a href="../quickstart/">Quickstart</a>'
+                self.assertEqual(page.count(original), 1)
+                mutated = mutate(page)
+                self.assertNotEqual(mutated, page)
+                process_path.write_text(mutated, encoding="utf-8")
+                self.assertIn(
+                    "process/index.html quickstart navigation does not match reviewed contract",
+                    validate_public_site.validate(output),
+                )
+
     def test_build_is_complete_and_links_are_valid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
@@ -1439,6 +1640,7 @@ class PublicSiteTests(unittest.TestCase):
             )
             expected_paths = [
                 "",
+                "quickstart/",
                 "process/",
                 "methodology/",
                 "capabilities/",
@@ -1472,7 +1674,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 30)
+            self.assertEqual(len(expected_urls), 31)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1501,6 +1703,12 @@ class PublicSiteTests(unittest.TestCase):
                 "": (
                     "fast-mlx — evidence-gated MLX inference",
                     "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+                    "website",
+                    None,
+                ),
+                "quickstart/": (
+                    "Operator quickstart — fast-mlx",
+                    "Run fast-mlx's model-free HTTP/JSON and HTTP/SSE transport smoke, inspect capacity, and understand the loaded-serving boundary.",
                     "website",
                     None,
                 ),
@@ -1582,7 +1790,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 30)
+            self.assertEqual(len(expected), 31)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

@@ -5,6 +5,7 @@ It uses Apple's MLX framework to test inference ideas, measure their real qualit
 effects, and keep only the capabilities that survive explicit correctness and operational gates.
 
 **Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
+[operator quickstart](https://bitworks-io.github.io/fast-mlx/quickstart/) ·
 [capabilities and evidence](https://bitworks-io.github.io/fast-mlx/capabilities/) ·
 [reviewed benchmark explorer](https://bitworks-io.github.io/fast-mlx/benchmarks/) ·
 [reviewed releases](https://bitworks-io.github.io/fast-mlx/releases/) ·
@@ -56,7 +57,7 @@ Then, in another terminal:
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"model":"fastmlx-scripted","messages":[{"role":"user","content":"hello"}],"stream":false}'
+  -d '{"model":"fastmlx-scripted","messages":[{"role":"user","content":"hello"}],"temperature":0,"n":1,"stream":false}'
 ```
 
 Loaded-model serving requires a source-locked local model directory and explicit memory, cache,
@@ -106,8 +107,8 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 30 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
-reviewed Open Graph description. The seven research notes alone use article metadata; the seven
+Each of the 31 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+reviewed Open Graph description. The seven research notes alone use article metadata; the eight
 product/index pages, three benchmark-detail pages, and thirteen release-detail pages remain website
 objects, while `404.html` and machine-readable endpoints publish neither. Detail pages are immutable
 views of already-reviewed evidence or release-ledger entries; they do not create new evidence,

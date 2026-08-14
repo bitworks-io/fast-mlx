@@ -19,6 +19,8 @@ The public `fast-mlx` repository is a fail-closed projection created by
   discovery only;
 - the reviewed research manifest in `site/publications.json`, which generates `/research/`,
   `/research/index.json`, and the static text-only `/research/feed.atom` subscription surface;
+- the static `/quickstart/` operator path for the model-free HTTP/JSON and HTTP/SSE smoke,
+  capacity planning entry point, and explicit loaded-serving boundary;
 - the static text-only `/feed.atom` subscription surface, which combines only those reviewed
   release and research records without becoming another source manifest;
 - deterministic `/sitemap.xml` and `/robots.txt` outputs derived only from reviewed human-facing
@@ -88,7 +90,7 @@ ordered by their timezone-aware reviewed timestamps. It introduces no external i
 publication, benchmark recomputation, ranking, runtime action, or authority transition.
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
-seven reviewed product/index pages, three benchmark-detail pages, thirteen release-detail pages,
+eight reviewed product/index pages, three benchmark-detail pages, thirteen release-detail pages,
 and seven explicitly published research notes; it excludes JSON contracts, all three Atom feeds,
 LLM text surfaces, assets, and the 404 page. Detail pages are immutable views of already-reviewed
 capability highlights or release-ledger entries, not new evidence, authority, ranking, or
@@ -96,7 +98,7 @@ recomputation. The builder performs no submission or network request, and valida
 drift, non-UTF-8 or oversized content, DTD/entity declarations, symlinks, and non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-30-page set. The validator independently pins every page's route, title, description, object
+31-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and
