@@ -1,0 +1,8 @@
+fast-mlx
+Copyright 2026 bitworks-io
+
+This product includes software developed by fast-mlx contributors.
+
+Third-party licenses and attribution notices are retained with their respective components and
+test fixtures, including `spike/Vendor/mlx-swift-lm` and
+`spike/Tests/HarnessCoreTests/Fixtures/GSM8K-LICENSE`.

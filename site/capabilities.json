@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "policy": "fast-mlx-owned-results-only",
+  "claimBoundary": "fast-mlx-owned-results-only",
+  "updatedAt": "2026-08-11",
+  "capabilities": [
+    {
+      "id": "openai-http-sse-serving",
+      "name": "OpenAI-compatible HTTP/SSE serving",
+      "status": "promoted-scoped",
+      "summary": "A chat-completions transport with streaming, bounded admission, cancellation, and evidence output.",
+      "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Scripted mode is transport-only, and no model weights are bundled.",
+      "evidenceSlugs": [
+        "the-proof-did-not-end-when-the-timer-did"
+      ]
+    },
+    {
+      "id": "exact-continuous-batching",
+      "name": "Exact continuous batching",
+      "status": "promoted-scoped",
+      "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route.",
+      "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. It is not an automatic router, a sampled-generation route, or a general model-family default.",
+      "evidenceSlugs": [
+        "the-fastest-request-wasnt-the-fastest-service",
+        "the-proof-did-not-end-when-the-timer-did"
+      ]
+    },
+    {
+      "id": "prompt-lookup-decoding",
+      "name": "Prompt-lookup decoding",
+      "status": "shelved",
+      "summary": "Temperature-zero decoding can verify repeated context spans with byte-identical output on the measured repetition-heavy workload.",
+      "scope": "This is a dated solo-path result. Dynamic PLD is not the current production route and remains disabled inside shared continuous batches.",
+      "evidenceSlugs": [
+        "when-zero-speculation-costs-two-percent"
+      ]
+    },
+    {
+      "id": "exact-cache-lifecycle-controls",
+      "name": "Exact cache and lifecycle controls",
+      "status": "implemented",
+      "summary": "Prefix/session-cache primitives, byte-denominated admission, cancellation, recovery, and reservation release are explicit contracts.",
+      "scope": "Source and regression contracts exist. This inventory makes no standalone cache-hit, speedup, or broad architecture claim.",
+      "evidenceSlugs": [
+        "the-fastest-request-wasnt-the-fastest-service",
+        "the-proof-did-not-end-when-the-timer-did"
+      ]
+    },
+    {
+      "id": "quality-measurement-harness",
+      "name": "Quality and exactness measurement harness",
+      "status": "implemented",
+      "summary": "Teacher-forced distribution drift, perplexity, tail behavior, exact replay, task checks, throughput, memory, and soak health share one evidence workflow.",
+      "scope": "Each measurement remains source-, model-, workload-, and instrument-scoped. A metric value is not a universal quality guarantee.",
+      "evidenceSlugs": [
+        "trusting-the-instrument",
+        "the-wall-that-wasnt"
+      ]
+    },
+    {
+      "id": "capacity-proof-control-tools",
+      "name": "Capacity and proof-control tools",
+      "status": "implemented",
+      "summary": "Command-line planning, provenance, and fail-closed evidence controls make resource and identity assumptions inspectable.",
+      "scope": "Planning and comparison tools do not prove that a model fits every Mac, that an artifact is launchable, or that a runtime is contained.",
+      "evidenceSlugs": [
+        "the-wall-that-wasnt",
+        "lossless-wasnt-byte-identical"
+      ]
+    }
+  ],
+  "performanceHighlights": [
+    {
+      "id": "pld-echo-throughput",
+      "metric": "+100.5%",
+      "label": "Repetition-heavy solo PLD, 28.28 → 56.70 tok/s",
+      "model": "Qwen3-32B-4bit",
+      "hardware": "Apple M5 Max",
+      "workload": "Preamble-then-echo; 256 generated tokens; three post-warmup runs; temperature zero",
+      "date": "2026-07-11",
+      "decision": "shelved",
+      "caveat": "The 120-token streams were byte-identical, but dynamic PLD is not the current production route and remains disabled inside shared batches.",
+      "evidenceSlug": "when-zero-speculation-costs-two-percent"
+    },
+    {
+      "id": "continuous-batch-c2-throughput",
+      "metric": "+45.8%",
+      "label": "Aggregate C=2 service rate, 29.29 → 42.70 tok/s",
+      "model": "Qwen3-32B-4bit",
+      "hardware": "Apple M5 Max",
+      "workload": "Paired simultaneous burst; one warmup dropped; three measured Release repetitions; temperature zero",
+      "date": "2026-07-14",
+      "decision": "promoted-scoped",
+      "caveat": "The narrow dense-Qwen crossover starts at concurrency two for this workload. No automatic router, sampled route, or broad default was established.",
+      "evidenceSlug": "the-fastest-request-wasnt-the-fastest-service"
+    },
+    {
+      "id": "http-sse-operational-soak",
+      "metric": "24 h",
+      "label": "HTTP/SSE service soak with 10,368 paired request/evidence rows",
+      "model": "Qwen3-32B-4bit",
+      "hardware": "Apple M3 Ultra",
+      "workload": "C=4 continuous-batch-no-spec; 1,727 measured cycles; ordinary streams plus pre-body disconnects",
+      "date": "2026-07-28",
+      "decision": "promoted-scoped",
+      "caveat": "This qualifies transport, cancellation, recovery, resources, and terminal evidence for the measured route. It is explicitly not a throughput result.",
+      "evidenceSlug": "the-proof-did-not-end-when-the-timer-did"
+    }
+  ]
+}

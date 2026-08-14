@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#08110f">
+    <title>{{title}}</title>
+    <meta name="description" content="{{description}}">
+    {{head_metadata}}
+    <link rel="icon" href="{{root}}assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="{{root}}assets/site.css">
+    <link rel="alternate" type="application/atom+xml" title="fast-mlx reviewed releases" href="{{root}}releases/feed.atom">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav shell" aria-label="Primary navigation">
+        <a class="brand" href="{{root}}" aria-label="fast-mlx home">
+          <span class="brand-mark" aria-hidden="true">fm</span>
+          <span>fast-mlx</span>
+        </a>
+        <div class="nav-links">
+          {{capabilities_nav}}
+          {{benchmarks_nav}}
+          {{releases_nav}}
+          {{process_nav}}
+          {{methodology_nav}}
+          {{research_nav}}
+        </div>
+      </nav>
+    </header>
+    <main id="content">{{body}}</main>
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <div>
+          <strong>fast-mlx</strong>
+          <p>Evidence-gated MLX inference research in Swift.</p>
+          <p><a href="https://github.com/bitworks-io/fast-mlx" rel="noreferrer">Source</a> · <a href="https://github.com/bitworks-io/fast-mlx#first-run" rel="noreferrer">First run</a> · Apache-2.0</p>
+        </div>
+        <div>
+          <p>Published results describe fast-mlx only. Diagnostic and partial evidence never become product claims.</p>
+        </div>
+      </div>
+    </footer>
+    {{page_script}}
+  </body>
+</html>

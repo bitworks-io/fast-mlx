@@ -1,0 +1,282 @@
+{
+  "schemaVersion": 1,
+  "project": "fast-mlx",
+  "policy": "reviewed-public-releases-only",
+  "claimBoundary": "fast-mlx-owned-results-only",
+  "updatedAt": "2026-08-12",
+  "currentBoundary": {
+    "id": "runtime-model-promotion",
+    "label": "Runtime and model promotion",
+    "state": "gated",
+    "summary": "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
+    "evidence": {
+      "label": "Read the methodology",
+      "path": "methodology/"
+    }
+  },
+  "releases": [
+    {
+      "id": "reviewed-research-atom-feed",
+      "title": "Publish reviewed research Atom feed",
+      "publishedAt": "2026-08-12T07:42:12-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a deterministic text-only Atom feed for the seven reviewed fast-mlx research notes.",
+      "scope": "Reviewed research metadata and same-origin article discovery only; no article-body syndication, external ingestion, tracking, automatic-publication authority, new measurement, benchmark claim, runtime/model/acquisition authority, or positive absorbed-MLA admission.",
+      "publicCommit": "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
+      "publicLinks": [
+        {
+          "label": "Subscribe to reviewed research",
+          "path": "research/feed.atom"
+        },
+        {
+          "label": "Browse reviewed research",
+          "path": "research/"
+        },
+        {
+          "label": "Read the research JSON",
+          "path": "research/index.json"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-release-detail-permalinks",
+      "title": "Publish reviewed release detail permalinks",
+      "publishedAt": "2026-08-12T06:16:29-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds immutable detail pages for each reviewed fast-mlx release checkpoint.",
+      "scope": "Static reviewed-release detail views only; no new measurement, ranking, recomputation, external ingestion, tracking, automatic-publication authority, runtime/model/acquisition authority, or positive absorbed-MLA admission.",
+      "publicCommit": "acaaa522f3b45b34a24c39a1f227534c835331ce",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        },
+        {
+          "label": "Open newest release detail",
+          "path": "releases/reviewed-benchmark-detail-permalinks/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-benchmark-detail-permalinks",
+      "title": "Publish benchmark detail permalinks",
+      "publishedAt": "2026-08-12T05:07:19-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds stable detail pages for the three reviewed fast-mlx benchmark highlights.",
+      "scope": "Immutable reviewed-result views only; no new measurement, ranking, recomputation, competitor comparison, runtime/model/acquisition/publication authority, or positive absorbed-MLA admission.",
+      "publicCommit": "b91ed46e1d88bfadb984b81162165e386d3445b0",
+      "publicLinks": [
+        {
+          "label": "Open the benchmark explorer",
+          "path": "benchmarks/"
+        },
+        {
+          "label": "Read the PLD result",
+          "path": "benchmarks/pld-echo-throughput/"
+        },
+        {
+          "label": "Read the continuous-batch result",
+          "path": "benchmarks/continuous-batch-c2-throughput/"
+        },
+        {
+          "label": "Read the service-soak result",
+          "path": "benchmarks/http-sse-operational-soak/"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-home-current-cycle",
+      "title": "Show current reviewed cycle",
+      "publishedAt": "2026-08-12T03:55:31-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a manifest-derived home-page snapshot of the latest reviewed release, exact evidence inventory, and gated runtime/model boundary.",
+      "scope": "Static reviewed-manifest presentation only; no external ingestion, benchmark recomputation, tracking, publication authority, runtime/model promotion, or positive absorbed-MLA admission.",
+      "publicCommit": "9e0c1a159ee5e458573bae67f323915220eb9b90",
+      "publicLinks": [
+        {
+          "label": "Open fast-mlx",
+          "path": "index.html"
+        },
+        {
+          "label": "Inspect capability states",
+          "path": "capabilities/"
+        },
+        {
+          "label": "Read reviewed releases",
+          "path": "releases/"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-social-metadata",
+      "title": "Publish reviewed social metadata",
+      "publishedAt": "2026-08-12T02:08:02-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds exact self-canonical and Open Graph presentation metadata to the fourteen reviewed human-facing pages.",
+      "scope": "Presentation and crawl-discovery metadata only; no tracking, indexing guarantee, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "1903e76609cc444bdacfaa5d0472804900dbd13c",
+      "publicLinks": [
+        {
+          "label": "Open fast-mlx",
+          "path": "index.html"
+        },
+        {
+          "label": "Read the methodology",
+          "path": "methodology/"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-sitemap-discovery",
+      "title": "Publish reviewed sitemap discovery",
+      "publishedAt": "2026-08-12T01:07:47-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Publishes one deterministic sitemap and robots locator for the exact reviewed human-facing route set.",
+      "scope": "Crawl discovery only; no search submission, indexing guarantee, external ingestion, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "df2b067391cec755cb9ec0e6f87097b8c8d6537a",
+      "publicLinks": [
+        {
+          "label": "Open the research library",
+          "path": "research/"
+        },
+        {
+          "label": "Read the methodology",
+          "path": "methodology/"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-release-atom-feed",
+      "title": "Publish reviewed release Atom feed",
+      "publishedAt": "2026-08-12T00:19:55-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Publishes a deterministic Atom 1.0 subscription feed derived only from the reviewed release ledger.",
+      "scope": "Static reviewed-release discoverability only; no external ingestion, benchmark evidence, runtime authority, or positive absorbed-MLA admission.",
+      "publicCommit": "35e751a0a867d187014251b519eebbb17291fd88",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        }
+      ]
+    },
+    {
+      "id": "reviewed-release-ledger",
+      "title": "Publish reviewed release ledger",
+      "publishedAt": "2026-08-11T23:44:55-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds one generated human and machine-readable history of reviewed public milestones.",
+      "scope": "The ledger is discoverability metadata only; it creates no runtime, model, benchmark, or release authority.",
+      "publicCommit": "195963b912ff287fa4f7b7058c08fdd9b75dcd3d",
+      "publicLinks": [
+        {
+          "label": "Open reviewed releases",
+          "path": "releases/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
+      "id": "public-benchmark-explorer",
+      "title": "Publish reviewed benchmark explorer",
+      "publishedAt": "2026-08-11T22:55:26-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a no-recompute filterable view of the three reviewed fast-mlx performance highlights.",
+      "scope": "Filtering changes visibility only; every result retains its workload, date, decision, caveat, and evidence.",
+      "publicCommit": "555514986cdd17ca921c9d9607a92d6248734fdd",
+      "publicLinks": [
+        {
+          "label": "Open the benchmark explorer",
+          "path": "benchmarks/"
+        },
+        {
+          "label": "Read the machine contract",
+          "path": "capabilities/index.json"
+        }
+      ]
+    },
+    {
+      "id": "same-commit-pages-quality-gate",
+      "title": "Gate Pages deployment on public quality",
+      "publishedAt": "2026-08-11T22:09:13-05:00",
+      "category": "operations",
+      "state": "released",
+      "summary": "Makes Pages a same-commit downstream job of the public-boundary and complete pure-Swift quality matrix.",
+      "scope": "This hardens deployment eligibility and provenance; it does not change inference behavior or grant runtime authority.",
+      "publicCommit": "3894c324dc69baf428b9fe54d1770a234467dfbd",
+      "publicLinks": [
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        }
+      ]
+    },
+    {
+      "id": "capabilities-and-evidence",
+      "title": "Publish capabilities and evidence",
+      "publishedAt": "2026-08-11T21:27:03-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a status-aware capability inventory and a machine-readable contract for reviewed fast-mlx evidence.",
+      "scope": "Implemented, scoped-promoted, experimental, and shelved states remain distinct; source presence is not a support claim.",
+      "publicCommit": "a39393451848eedc62e035ddee5ef00d0364ca62",
+      "publicLinks": [
+        {
+          "label": "Open capabilities and evidence",
+          "path": "capabilities/"
+        },
+        {
+          "label": "Read the capability JSON",
+          "path": "capabilities/index.json"
+        }
+      ]
+    },
+    {
+      "id": "compatible-hosted-swift-runner",
+      "title": "Use compatible GitHub macOS runner",
+      "publishedAt": "2026-08-11T17:48:34-05:00",
+      "category": "operations",
+      "state": "released",
+      "summary": "Selects a hosted macOS image that can parse the pinned Swift 6.3 dependency manifest and reports its toolchain.",
+      "scope": "This is a hosted-CI compatibility correction only; no application source or inference route changed.",
+      "publicCommit": "a701708fe55311b7ea61db957bf37573f5530ce4",
+      "publicLinks": []
+    },
+    {
+      "id": "initial-public-release",
+      "title": "Initial public release",
+      "publishedAt": "2026-08-11T17:40:23-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Establishes the history-free Apache-2.0 source projection and deterministic evidence-site sources.",
+      "scope": "The projection excludes private operator state, failed evidence, machine-local paths, models, caches, and benchmark roots.",
+      "publicCommit": "51a99af2b11f42e036f88346a4b8873b71f675d5",
+      "publicLinks": [
+        {
+          "label": "Open fast-mlx",
+          "path": "index.html"
+        },
+        {
+          "label": "Read the research notes",
+          "path": "research/"
+        }
+      ]
+    }
+  ]
+}
