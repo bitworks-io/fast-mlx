@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "reviewed-research-atom-feed",
+      "title": "Publish reviewed research Atom feed",
+      "publishedAt": "2026-08-12T07:42:12-05:00",
+      "category": "product",
+      "state": "released",
+      "summary": "Adds a deterministic text-only Atom feed for the seven reviewed fast-mlx research notes.",
+      "scope": "Reviewed research metadata and same-origin article discovery only; no article-body syndication, external ingestion, tracking, automatic-publication authority, new measurement, benchmark claim, runtime/model/acquisition authority, or positive absorbed-MLA admission.",
+      "publicCommit": "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
+      "publicLinks": [
+        {
+          "label": "Subscribe to reviewed research",
+          "path": "research/feed.atom"
+        },
+        {
+          "label": "Browse reviewed research",
+          "path": "research/"
+        },
+        {
+          "label": "Read the research JSON",
+          "path": "research/index.json"
+        }
+      ]
+    },
+    {
       "id": "reviewed-release-detail-permalinks",
       "title": "Publish reviewed release detail permalinks",
       "publishedAt": "2026-08-12T06:16:29-05:00",

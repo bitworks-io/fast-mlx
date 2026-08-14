@@ -117,7 +117,7 @@ RELEASE_DETAIL_DESCRIPTION = (
     "and unchanged claim boundary."
 )
 PUBLIC_PATH = re.compile(
-    r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
+    r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:atom|html|json))"
 )
 
 

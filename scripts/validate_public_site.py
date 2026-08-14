@@ -65,9 +65,9 @@ SITE_STYLESHEET_PATH = "assets/site.css"
 SITE_STYLESHEET_SHA256 = (
     "5601429bd64b6dbd58da20c10f7f8116f27774a285d574152795435b0522ea81"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_002
+REVIEWED_HOME_PAGE_BYTES = 9_038
 REVIEWED_HOME_PAGE_SHA256 = (
-    "5fb708346e2b4775e2524c7774b650ce714b7b10524806c7fea8f9d29807a4c0"
+    "7f5c72541fcd0cec54697d203dffe8aa3db473e5a41e54c6de73e199c6908552"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -193,11 +193,12 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/trusting-the-instrument/": ("2026-07-09", "2026-08-06"),
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 11_513
+REVIEWED_RELEASE_INDEX_BYTES = 12_645
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "ed8d08eb0b615e1be5c26a2bbcbea1e02ee7f8d4e75ad345a39e4432d517cd8d"
+    "bdba9113d7d336da13d52d32da6446fb9811625bda12b073b5c347acf06abb44"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    ("reviewed-research-atom-feed", "Publish reviewed research Atom feed"),
     ("reviewed-release-detail-permalinks", "Publish reviewed release detail permalinks"),
     ("reviewed-benchmark-detail-permalinks", "Publish benchmark detail permalinks"),
     ("reviewed-home-current-cycle", "Show current reviewed cycle"),
@@ -215,6 +216,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "reviewed-research-atom-feed": (
+        4_662,
+        "7f63e67badb34afc59093898c9b9dce617e7dc208e17cdafa181c8015bbdbdeb",
+    ),
     "reviewed-release-detail-permalinks": (
         4_632,
         "6ccf62e9fee163c777251f8a1f0a41f32d6054824cf98a566d47dd4298d96973",
@@ -427,7 +432,7 @@ def reviewed_research_articles() -> Tuple[Dict[str, str], ...]:
 SITEMAP_ARTICLE_PATH = re.compile(r"research/[a-z0-9]+(?:-[a-z0-9]+)*/")
 HTML_LIKE_SUFFIXES = {".html", ".htm"}
 PUBLIC_PATH = re.compile(
-    r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:html|json))"
+    r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:atom|html|json))"
 )
 RELEASE_INDEX_KEYS = {
     "schemaVersion",

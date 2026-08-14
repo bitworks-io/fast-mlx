@@ -167,34 +167,34 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "reviewed-release-detail-permalinks",
-                "title": "Publish reviewed release detail permalinks",
-                "publishedAt": "2026-08-12T06:16:29-05:00",
+                "id": "reviewed-research-atom-feed",
+                "title": "Publish reviewed research Atom feed",
+                "publishedAt": "2026-08-12T07:42:12-05:00",
                 "category": "product",
                 "state": "released",
                 "summary": (
-                    "Adds immutable detail pages for each reviewed fast-mlx release "
-                    "checkpoint."
+                    "Adds a deterministic text-only Atom feed for the seven reviewed "
+                    "fast-mlx research notes."
                 ),
                 "scope": (
-                    "Static reviewed-release detail views only; no new measurement, "
-                    "ranking, recomputation, external ingestion, tracking, automatic-"
-                    "publication authority, runtime/model/acquisition authority, or "
-                    "positive absorbed-MLA admission."
+                    "Reviewed research metadata and same-origin article discovery only; "
+                    "no article-body syndication, external ingestion, tracking, automatic-"
+                    "publication authority, new measurement, benchmark claim, runtime/"
+                    "model/acquisition authority, or positive absorbed-MLA admission."
                 ),
-                "publicCommit": "acaaa522f3b45b34a24c39a1f227534c835331ce",
+                "publicCommit": "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
                 "publicLinks": [
                     {
-                        "label": "Open reviewed releases",
-                        "path": "releases/",
+                        "label": "Subscribe to reviewed research",
+                        "path": "research/feed.atom",
                     },
                     {
-                        "label": "Open newest release detail",
-                        "path": "releases/reviewed-benchmark-detail-permalinks/",
+                        "label": "Browse reviewed research",
+                        "path": "research/",
                     },
                     {
-                        "label": "Read the release JSON",
-                        "path": "releases/index.json",
+                        "label": "Read the research JSON",
+                        "path": "research/index.json",
                     },
                 ],
             },
@@ -203,6 +203,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
                 "acaaa522f3b45b34a24c39a1f227534c835331ce",
                 "b91ed46e1d88bfadb984b81162165e386d3445b0",
                 "9e0c1a159ee5e458573bae67f323915220eb9b90",
@@ -248,6 +249,9 @@ class PublicSiteTests(unittest.TestCase):
             "traversing public path": lambda manifest: manifest["releases"][0][
                 "publicLinks"
             ][0].update({"path": ".." + "/" + "private" + "/"}),
+            "unsupported machine-readable public path": lambda manifest: manifest[
+                "releases"
+            ][0]["publicLinks"][0].update({"path": "research/feed.xml"}),
             "private marker": lambda manifest: manifest["releases"][0].update(
                 {"scope": "/" + "Users" + "/example/private"}
             ),
@@ -814,7 +818,9 @@ class PublicSiteTests(unittest.TestCase):
         source = json.loads(
             (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
         )
-        release = source["releases"][0]
+        release = next(
+            entry for entry in source["releases"] if entry["id"] == identifier
+        )
         public_path = f"releases/{identifier}/"
         first_link = release["publicLinks"][0]
         first_href = build_public_site.relative_href(
@@ -1297,7 +1303,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 29)
+            self.assertEqual(len(expected_urls), 30)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1407,7 +1413,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 29)
+            self.assertEqual(len(expected), 30)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )
