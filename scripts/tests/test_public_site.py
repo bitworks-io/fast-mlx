@@ -168,34 +168,33 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "reviewed-research-atom-feed",
-                "title": "Publish reviewed research Atom feed",
-                "publishedAt": "2026-08-12T07:42:12-05:00",
-                "category": "product",
+                "id": "self-reproducing-public-source",
+                "title": "Publish self-reproducing public source",
+                "publishedAt": "2026-08-14T07:45:17-05:00",
+                "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Adds a deterministic text-only Atom feed for the seven reviewed "
-                    "fast-mlx research notes."
+                    "Publishes a sealed source projection that can re-export itself "
+                    "byte-for-byte with identical executable modes."
                 ),
                 "scope": (
-                    "Reviewed research metadata and same-origin article discovery only; "
-                    "no article-body syndication, external ingestion, tracking, automatic-"
-                    "publication authority, new measurement, benchmark claim, runtime/"
-                    "model/acquisition authority, or positive absorbed-MLA admission."
+                    "Reviewed public-source reproducibility only; no automatic intake or "
+                    "publication, external ingestion, new measurement, performance claim, "
+                    "runtime/model/acquisition authority, or positive absorbed-MLA admission."
                 ),
-                "publicCommit": "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
+                "publicCommit": "c9ba0341a473dccf219f421efefedf3df3e30e2f",
                 "publicLinks": [
                     {
-                        "label": "Subscribe to reviewed research",
-                        "path": "research/feed.atom",
+                        "label": "See the improvement loop",
+                        "path": "process/",
                     },
                     {
-                        "label": "Browse reviewed research",
-                        "path": "research/",
+                        "label": "Read the methodology",
+                        "path": "methodology/",
                     },
                     {
-                        "label": "Read the research JSON",
-                        "path": "research/index.json",
+                        "label": "Read the release JSON",
+                        "path": "releases/index.json",
                     },
                 ],
             },
@@ -204,6 +203,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "c9ba0341a473dccf219f421efefedf3df3e30e2f",
                 "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
                 "acaaa522f3b45b34a24c39a1f227534c835331ce",
                 "b91ed46e1d88bfadb984b81162165e386d3445b0",
@@ -1563,7 +1563,7 @@ class PublicSiteTests(unittest.TestCase):
             )
 
             entries = feed.findall(atom("entry"))
-            self.assertEqual(len(entries), 20)
+            self.assertEqual(len(entries), 21)
             self.assertEqual(len(entries), len(expected_updates))
             self.assertEqual(
                 len({entry.findtext(atom("id")) for entry in entries}),
@@ -1679,7 +1679,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 38)
+            self.assertEqual(len(expected_urls), 39)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1811,7 +1811,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 38)
+            self.assertEqual(len(expected), 39)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

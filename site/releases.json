@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-12",
+  "updatedAt": "2026-08-14",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,30 @@
     }
   },
   "releases": [
+    {
+      "id": "self-reproducing-public-source",
+      "title": "Publish self-reproducing public source",
+      "publishedAt": "2026-08-14T07:45:17-05:00",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes a sealed source projection that can re-export itself byte-for-byte with identical executable modes.",
+      "scope": "Reviewed public-source reproducibility only; no automatic intake or publication, external ingestion, new measurement, performance claim, runtime/model/acquisition authority, or positive absorbed-MLA admission.",
+      "publicCommit": "c9ba0341a473dccf219f421efefedf3df3e30e2f",
+      "publicLinks": [
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the methodology",
+          "path": "methodology/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "reviewed-research-atom-feed",
       "title": "Publish reviewed research Atom feed",
