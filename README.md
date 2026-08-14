@@ -43,6 +43,8 @@ The generated [current-status dashboard](https://bitworks-io.github.io/fast-mlx/
 those reviewed feature states, measured proof points, release records, research counts, and the
 unchanged runtime/model boundary in one static page. It is a present-state reader, not a roadmap,
 live telemetry surface, benchmark runner, or second source of publication authority.
+Each capability card links to a canonical detail permalink that repeats only the reviewed state,
+scope, evidence paths, and claim boundary for that one record.
 
 ## First run
 
@@ -113,14 +115,15 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 32 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+Each of the 38 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
 reviewed Open Graph description. The seven research notes alone use article metadata; the nine
-product/index pages, three benchmark-detail pages, and thirteen release-detail pages remain website
-objects, while `404.html` and machine-readable endpoints publish neither. Detail pages are immutable
-views of already-reviewed evidence or release-ledger entries; they do not create new evidence,
-authority, ranking, or recomputation. A single same-origin 1200×630 preview image is retained as an
-exact hash-pinned static asset: no remote image, analytics request, live lookup, new benchmark
-claim, or runtime authority is introduced by a shared-link preview.
+product/index pages, six capability-detail pages, three benchmark-detail pages, and thirteen
+release-detail pages remain website objects, while `404.html` and machine-readable endpoints publish
+neither. Detail pages are immutable views of already-reviewed capability records, benchmark
+evidence, or release-ledger entries; they do not create new evidence, support, measurement, runtime,
+model, acquisition, admission, authority, ranking, or recomputation. A single same-origin 1200×630
+preview image is retained as an exact hash-pinned static asset: no remote image, analytics request,
+live lookup, new benchmark claim, or runtime authority is introduced by a shared-link preview.
 
 Read [PUBLICATION.md](PUBLICATION.md) for the public boundary and
 [CONTRIBUTING.md](CONTRIBUTING.md) for the research-to-release workflow.

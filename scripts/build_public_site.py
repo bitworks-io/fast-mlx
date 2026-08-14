@@ -111,6 +111,9 @@ REVIEWED_BENCHMARK_PUBLIC_PATHS = (
     "benchmarks/continuous-batch-c2-throughput/",
     "benchmarks/http-sse-operational-soak/",
 )
+CAPABILITY_DETAIL_PUBLIC_PATH = re.compile(
+    r"capabilities/[a-z0-9]+(?:-[a-z0-9]+)*/"
+)
 RELEASE_DETAIL_PUBLIC_PATH = re.compile(
     r"releases/[a-z0-9]+(?:-[a-z0-9]+)*/"
 )
@@ -948,6 +951,7 @@ def render_head_metadata(
         and not re.fullmatch(
             r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
         )
+        and not CAPABILITY_DETAIL_PUBLIC_PATH.fullmatch(public_path)
         and public_path not in REVIEWED_BENCHMARK_PUBLIC_PATHS
         and not RELEASE_DETAIL_PUBLIC_PATH.fullmatch(public_path)
     ):
@@ -1401,6 +1405,7 @@ def render_reviewed_updates_feed(
 
 def render_sitemap(
     articles: Sequence[Article],
+    capabilities: Sequence[Dict[str, object]],
     highlights: Sequence[Dict[str, object]],
     releases: Sequence[Dict[str, object]],
 ) -> str:
@@ -1410,6 +1415,7 @@ def render_sitemap(
     sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
     public_paths = [
         *CORE_PUBLIC_PAGE_PATHS,
+        *[f'capabilities/{capability["id"]}/' for capability in capabilities],
         *[f'benchmarks/{highlight["id"]}/' for highlight in highlights],
         *[f'releases/{release["id"]}/' for release in releases],
         *[article.public_path for article in articles],
@@ -1529,9 +1535,14 @@ def render_capability_catalog(
         )
     body.extend(['</ul>', '<div class="capability-grid">'])
     for capability in capabilities:
+        detail_href = f'{html.escape(str(capability["id"]), quote=True)}/'
         body.extend(
             [
-                '<article class="capability-card">',
+                '<article class="capability-card" data-capability-card="'
+                + html.escape(str(capability["id"]), quote=True)
+                + '" data-capability-state="'
+                + html.escape(str(capability["status"]), quote=True)
+                + '">',
                 f'<span class="status-badge status-{html.escape(capability["status"])}">{html.escape(status_by_id[capability["status"]].upper())}</span>',
                 f'<h3>{html.escape(capability["name"])}</h3>',
                 f'<p>{html.escape(capability["summary"])}</p>',
@@ -1544,7 +1555,13 @@ def render_capability_catalog(
             body.append(
                 f'<a href="{html.escape(href, quote=True)}">{html.escape(record["title"])} →</a>'
             )
-        body.extend(['</div>', '</article>'])
+        body.extend(
+            [
+                '</div>',
+                f'<a class="text-link" href="{detail_href}">Open capability details →</a>',
+                '</article>',
+            ]
+        )
     body.extend(
         [
             '</div>',
@@ -1558,6 +1575,88 @@ def render_capability_catalog(
         ]
     )
     return "\n".join(body), public_index
+
+
+def capability_detail_title(capability: Dict[str, object]) -> str:
+    return f'{capability["name"]} — fast-mlx capability'
+
+
+def capability_detail_description(capability: Dict[str, object]) -> str:
+    return f'Reviewed fast-mlx capability state and evidence for {capability["name"]}.'
+
+
+def render_capability_detail(capability: Dict[str, object]) -> str:
+    """Render one immutable view of an already-reviewed capability record."""
+
+    status_definitions = {
+        identifier: (label, description)
+        for identifier, label, description in CAPABILITY_STATUS_DEFINITIONS
+    }
+    identifier = str(capability["id"])
+    state = str(capability["status"])
+    status_label, status_description = status_definitions[state]
+    evidence_items: List[str] = []
+    for record in capability["evidence"]:
+        evidence_href = relative_href(
+            f"capabilities/{identifier}/index.html",
+            str(record["path"]),
+        )
+        reviewed_at = str(record["reviewedAt"])
+        evidence_items.extend(
+            [
+                '<li data-capability-evidence="'
+                + html.escape(str(record["path"]), quote=True)
+                + '" data-reviewed-at="'
+                + html.escape(reviewed_at, quote=True)
+                + '">',
+                '<a href="'
+                + html.escape(evidence_href, quote=True)
+                + '">'
+                + html.escape(str(record["title"]))
+                + " →</a>",
+                '<span class="evidence-meta">Path: '
+                + html.escape(str(record["path"]))
+                + " · Reviewed: "
+                + html.escape(reviewed_at)
+                + "</span>",
+                "</li>",
+            ]
+        )
+    return "\n".join(
+        [
+            '<section class="page-hero shell capability-detail" '
+            'data-capability-detail data-capability-id="'
+            + html.escape(identifier, quote=True)
+            + '" data-capability-state="'
+            + html.escape(state, quote=True)
+            + '">',
+            '<p class="eyebrow">Reviewed capability</p>',
+            '<div class="card-topline">'
+            f'<span class="status-badge status-{html.escape(state, quote=True)}">{html.escape(status_label.upper())}</span>'
+            f'<span class="evidence-meta">{html.escape(status_description)}</span>'
+            '</div>',
+            f'<h1>{html.escape(str(capability["name"]))}</h1>',
+            f'<p class="lede">{html.escape(str(capability["summary"]))}</p>',
+            f'<p class="scope-note"><strong>Scope:</strong> {html.escape(str(capability["scope"]))}</p>',
+            '<section class="section capability-evidence" aria-labelledby="capability-evidence-heading">',
+            '<h2 id="capability-evidence-heading">Reviewed evidence</h2>',
+            '<ul class="evidence-list">',
+            *evidence_items,
+            '</ul>',
+            '</section>',
+            '<div class="hero-actions">',
+            '<a class="button secondary" href="../">Back to all capabilities</a>',
+            '<a class="button secondary" href="../index.json">Open capabilities/index.json →</a>',
+            '<a class="button secondary" href="../../methodology/">Read the methodology →</a>',
+            '</div>',
+            '</section>',
+            '<section class="section shell callout capability-callout" aria-labelledby="capability-detail-boundary-heading">',
+            '<p class="eyebrow">Claim boundary</p>',
+            '<h2 id="capability-detail-boundary-heading">A permalink is not new authority.</h2>',
+            '<p>This page creates no broader support, measurement, runtime, model, acquisition, publication, admission, launchability, or containment authority. It only exposes one reviewed capability record and its already-published evidence.</p>',
+            '</section>',
+        ]
+    )
 
 
 def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
@@ -2004,7 +2103,15 @@ def render_status_page(
                 + html.escape(article.title)
                 + " →</a>"
             )
-        body.extend(['</div>', '</article>'])
+        body.extend(
+            [
+                '</div>',
+                '<a class="text-link" href="../capabilities/'
+                + html.escape(str(capability["id"]), quote=True)
+                + '/">Open capability details →</a>',
+                '</article>',
+            ]
+        )
     body.extend(
         [
             '</div>',
@@ -2199,6 +2306,26 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "capabilities/index.json",
         json.dumps(capability_index, indent=2, ensure_ascii=False),
     )
+    for capability in capability_index["capabilities"]:
+        identifier = str(capability["id"])
+        public_path = f"capabilities/{identifier}/"
+        write_page(
+            output,
+            public_path + "index.html",
+            render_template(
+                template,
+                capability_detail_title(capability),
+                capability_detail_description(capability),
+                "../../",
+                render_capability_detail(capability),
+                "capabilities",
+                public_path=public_path,
+            ),
+        )
+    capability_detail_lines = "\n".join(
+        f'- /capabilities/{capability["id"]}/: {capability["name"]}'
+        for capability in capability_index["capabilities"]
+    )
     benchmark_body = render_benchmark_explorer(
         capability_index["performanceHighlights"]
     )
@@ -2340,6 +2467,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "sitemap.xml",
         render_sitemap(
             articles,
+            capability_index["capabilities"],
             capability_index["performanceHighlights"],
             release_index["releases"],
         ),
@@ -2364,6 +2492,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /methodology/: correctness and claim boundaries\n"
         "- /capabilities/: status-aware feature and evidence inventory\n"
         "- /capabilities/index.json: machine-readable capability contract\n"
+        + capability_detail_lines
+        + "\n"
         "- /benchmarks/: filterable reviewed performance evidence\n"
         + benchmark_detail_lines
         + "\n"

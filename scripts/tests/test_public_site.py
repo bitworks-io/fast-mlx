@@ -1648,6 +1648,10 @@ class PublicSiteTests(unittest.TestCase):
                 "benchmarks/",
                 "releases/",
                 "research/",
+                *[
+                    f"capabilities/{capability['id']}/"
+                    for capability in validate_public_site.reviewed_capability_records()
+                ],
                 "benchmarks/pld-echo-throughput/",
                 "benchmarks/continuous-batch-c2-throughput/",
                 "benchmarks/http-sse-operational-soak/",
@@ -1675,7 +1679,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 32)
+            self.assertEqual(len(expected_urls), 38)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1737,6 +1741,16 @@ class PublicSiteTests(unittest.TestCase):
                     "website",
                     None,
                 ),
+                **{
+                    f"capabilities/{capability['id']}/": (
+                        f"{capability['name']} — fast-mlx capability",
+                        "Reviewed fast-mlx capability state and evidence for "
+                        f"{capability['name']}.",
+                        "website",
+                        None,
+                    )
+                    for capability in validate_public_site.reviewed_capability_records()
+                },
                 "benchmarks/": (
                     "Benchmark explorer — fast-mlx",
                     "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
@@ -1797,7 +1811,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 32)
+            self.assertEqual(len(expected), 38)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

@@ -57,6 +57,7 @@ REQUIRED_PATHS: Tuple[str, ...] = (
     "site/fragments/quickstart.html",
     "scripts/build_public_site.py",
     "scripts/validate_public_site.py",
+    "scripts/tests/test_public_capability_details.py",
     "scripts/tests/test_public_status.py",
     "scripts/tests/benchmark_explorer_node_test.js",
     "site/assets/research-explorer.js",

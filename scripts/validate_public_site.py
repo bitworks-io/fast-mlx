@@ -33,6 +33,83 @@ CAPABILITY_STATUS_LABELS = {
     "experimental": "Experimental",
     "shelved": "Shelved",
 }
+CAPABILITY_STATUS_DESCRIPTIONS = {
+    "implemented": (
+        "The public source and regression contracts exist; this is not "
+        "automatically a supported default."
+    ),
+    "promoted-scoped": (
+        "A bounded route or result crossed its stated evidence gates only for the "
+        "named scope."
+    ),
+    "experimental": (
+        "The surface is active research and has not earned a production support "
+        "claim."
+    ),
+    "shelved": (
+        "The dated result remains useful evidence, but the capability is not the "
+        "current production route."
+    ),
+}
+REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
+    {
+        "id": "openai-http-sse-serving",
+        "name": "OpenAI-compatible HTTP/SSE serving",
+        "status": "promoted-scoped",
+        "summary": "A chat-completions transport with streaming, bounded admission, cancellation, and evidence output.",
+        "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Scripted mode is transport-only, and no model weights are bundled.",
+        "evidenceSlugs": ("the-proof-did-not-end-when-the-timer-did",),
+    },
+    {
+        "id": "exact-continuous-batching",
+        "name": "Exact continuous batching",
+        "status": "promoted-scoped",
+        "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route.",
+        "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. It is not an automatic router, a sampled-generation route, or a general model-family default.",
+        "evidenceSlugs": (
+            "the-fastest-request-wasnt-the-fastest-service",
+            "the-proof-did-not-end-when-the-timer-did",
+        ),
+    },
+    {
+        "id": "prompt-lookup-decoding",
+        "name": "Prompt-lookup decoding",
+        "status": "shelved",
+        "summary": "Temperature-zero decoding can verify repeated context spans with byte-identical output on the measured repetition-heavy workload.",
+        "scope": "This is a dated solo-path result. Dynamic PLD is not the current production route and remains disabled inside shared continuous batches.",
+        "evidenceSlugs": ("when-zero-speculation-costs-two-percent",),
+    },
+    {
+        "id": "exact-cache-lifecycle-controls",
+        "name": "Exact cache and lifecycle controls",
+        "status": "implemented",
+        "summary": "Prefix/session-cache primitives, byte-denominated admission, cancellation, recovery, and reservation release are explicit contracts.",
+        "scope": "Source and regression contracts exist. This inventory makes no standalone cache-hit, speedup, or broad architecture claim.",
+        "evidenceSlugs": (
+            "the-fastest-request-wasnt-the-fastest-service",
+            "the-proof-did-not-end-when-the-timer-did",
+        ),
+    },
+    {
+        "id": "quality-measurement-harness",
+        "name": "Quality and exactness measurement harness",
+        "status": "implemented",
+        "summary": "Teacher-forced distribution drift, perplexity, tail behavior, exact replay, task checks, throughput, memory, and soak health share one evidence workflow.",
+        "scope": "Each measurement remains source-, model-, workload-, and instrument-scoped. A metric value is not a universal quality guarantee.",
+        "evidenceSlugs": ("trusting-the-instrument", "the-wall-that-wasnt"),
+    },
+    {
+        "id": "capacity-proof-control-tools",
+        "name": "Capacity and proof-control tools",
+        "status": "implemented",
+        "summary": "Command-line planning, provenance, and fail-closed evidence controls make resource and identity assumptions inspectable.",
+        "scope": "Planning and comparison tools do not prove that a model fits every Mac, that an artifact is launchable, or that a runtime is contained.",
+        "evidenceSlugs": ("the-wall-that-wasnt", "lossless-wasnt-byte-identical"),
+    },
+)
+REVIEWED_CAPABILITY_PATHS = tuple(
+    f'capabilities/{capability["id"]}/' for capability in REVIEWED_CAPABILITIES
+)
 HIGHLIGHT_DECISION_LABELS = {
     "promoted-scoped": "Promoted · scoped",
     "shelved": "Shelved",
@@ -84,14 +161,46 @@ MAX_SITEMAP_BYTES = 1_048_576
 MAX_ROBOTS_BYTES = 4_096
 MAX_QUICKSTART_BYTES = 131_072
 MAX_STATUS_BYTES = 131_072
+MAX_CAPABILITY_CATALOG_BYTES = 131_072
+MAX_CAPABILITY_DETAIL_BYTES = 131_072
 REVIEWED_QUICKSTART_PAGE_BYTES = 9_794
 REVIEWED_QUICKSTART_PAGE_SHA256 = (
     "c9c990104fe7573d0f84683362c010c3a6945c13423d12dc9c4fd6058bd5506b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 17_876
+REVIEWED_STATUS_PAGE_BYTES = 18_499
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "dcf587ab7bdc94ac3d237314c7db4786ea14f1c4398b26c928cd37c965823dc7"
+    "56abcdb8df59c249fe4792314b76596ac42c170119a5bb9817bf516314b69d59"
 )
+REVIEWED_CAPABILITIES_PAGE_BYTES = 13_817
+REVIEWED_CAPABILITIES_PAGE_SHA256 = (
+    "ad8f887a455282a45014de9a10bcdaf811065aa518153cf6d097771094aaf12f"
+)
+REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "openai-http-sse-serving": (
+        5_218,
+        "ee0d20469fb5b850c534ee37e940e5d34562ad61536dff3373238f4b47f47b60",
+    ),
+    "exact-continuous-batching": (
+        5_552,
+        "816aa47d8282e086085f30ca4f771a95d8404b1e3238a7f2822bf9af2e919e42",
+    ),
+    "prompt-lookup-decoding": (
+        5_131,
+        "f73b2ef019334abe92e4a24a8fed6630b8f99d489182f4802d903b5cbb23ec77",
+    ),
+    "exact-cache-lifecycle-controls": (
+        5_566,
+        "20916c9bbd42572fce804ca1aaaef812951af60da307e12aa16bfb1d9885113c",
+    ),
+    "quality-measurement-harness": (
+        5_589,
+        "5af2a4a2b2941368c0b6521de0a18bd2d5bf3fdf33d3a246f616e4065bb523c7",
+    ),
+    "capacity-proof-control-tools": (
+        5_559,
+        "f5b86d209a73f0c20784ea05fe655f970245ac68f5de5a9d90521649bbe98dd9",
+    ),
+}
 REVIEWED_QUICKSTART_COMMANDS: Tuple[Tuple[str, str], ...] = (
     (
         "clone",
@@ -193,15 +302,21 @@ REVIEWED_STATUS_LINKS = (
     "../research/",
     "../releases/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../capabilities/openai-http-sse-serving/",
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../capabilities/exact-continuous-batching/",
     "../research/when-zero-speculation-costs-two-percent/",
+    "../capabilities/prompt-lookup-decoding/",
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../capabilities/exact-cache-lifecycle-controls/",
     "../research/trusting-the-instrument/",
     "../research/the-wall-that-wasnt/",
+    "../capabilities/quality-measurement-harness/",
     "../research/the-wall-that-wasnt/",
     "../research/lossless-wasnt-byte-identical/",
+    "../capabilities/capacity-proof-control-tools/",
     "../benchmarks/pld-echo-throughput/",
     "../research/when-zero-speculation-costs-two-percent/",
     "../benchmarks/continuous-batch-c2-throughput/",
@@ -478,6 +593,15 @@ REVIEWED_PAGE_METADATA: Dict[
         "website",
         None,
     ),
+    **{
+        f'capabilities/{capability["id"]}/': (
+            f'{capability["name"]} — fast-mlx capability',
+            f'Reviewed fast-mlx capability state and evidence for {capability["name"]}.',
+            "website",
+            None,
+        )
+        for capability in REVIEWED_CAPABILITIES
+    },
     "benchmarks/": (
         "Benchmark explorer — fast-mlx",
         "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
@@ -1282,6 +1406,175 @@ class BenchmarkDetailCollector(html.parser.HTMLParser):
                 values.append(" ".join("".join(self._field_parts).split()))
             self._field_tag = None
             self._field_parts = []
+
+        if self._current is not None and tag == "section":
+            self._section_depth -= 1
+            if self._section_depth == 0:
+                parts = self._current.pop("text_parts")
+                self._current["text"] = (
+                    " ".join("".join(parts).split())
+                    if isinstance(parts, list)
+                    else ""
+                )
+                self.sections.append(self._current)
+                self._current = None
+
+        if self._element_stack:
+            if self._element_stack[-1][0] == tag:
+                self._element_stack.pop()
+            else:
+                for position in range(len(self._element_stack) - 1, -1, -1):
+                    if self._element_stack[position][0] == tag:
+                        del self._element_stack[position:]
+                        break
+
+
+class CapabilityCardCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cards: List[Dict[str, object]] = []
+        self._current: Optional[Dict[str, object]] = None
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        if tag == "article" and "data-capability-card" in attributes:
+            self._current = {
+                "id": attributes.get("data-capability-card"),
+                "state": attributes.get("data-capability-state"),
+                "hidden": "hidden" in attributes,
+                "links": [],
+                "text_parts": [],
+            }
+        elif self._current is not None and tag == "a" and attributes.get("href"):
+            links = self._current["links"]
+            if isinstance(links, list):
+                links.append(attributes["href"])
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "article" and self._current is not None:
+            parts = self._current.pop("text_parts")
+            self._current["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.cards.append(self._current)
+            self._current = None
+
+
+class CapabilityDetailCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections: List[Dict[str, object]] = []
+        self.page_h1_count = 0
+        self.page_links: List[str] = []
+        self.scripts: List[Optional[str]] = []
+        self.text_parts: List[str] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._section_depth = 0
+        self._active_evidence: Optional[Dict[str, object]] = None
+        self._element_stack: List[Tuple[str, bool]] = []
+
+    @staticmethod
+    def _suppresses_visibility(
+        tag: str, attributes: Dict[str, Optional[str]]
+    ) -> bool:
+        return (
+            tag in {"details", "dialog"}
+            or "hidden" in attributes
+            or (attributes.get("aria-hidden") or "").casefold() == "true"
+            or "style" in attributes
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        names = [name for name, _value in attrs]
+        attributes = dict(attrs)
+        duplicate_attributes = len(names) != len(set(names))
+        suppresses_visibility = self._suppresses_visibility(tag, attributes)
+
+        if tag == "h1":
+            self.page_h1_count += 1
+        if tag == "a" and attributes.get("href"):
+            self.page_links.append(str(attributes["href"]))
+        if tag == "script":
+            self.scripts.append(attributes.get("src"))
+
+        if tag == "section" and "data-capability-detail" in attributes:
+            if self._current is None:
+                self._current = {
+                    "id": attributes.get("data-capability-id"),
+                    "state": attributes.get("data-capability-state"),
+                    "links": [],
+                    "evidence": [],
+                    "text_parts": [],
+                    "h1Count": 0,
+                    "hasDuplicateAttributes": duplicate_attributes,
+                    "hasVisibilitySuppressor": suppresses_visibility
+                    or any(item[1] for item in self._element_stack),
+                    "hasNestedDetail": False,
+                }
+                self._section_depth = 1
+            else:
+                self._current["hasNestedDetail"] = True
+                self._section_depth += 1
+        elif self._current is not None and tag == "section":
+            self._section_depth += 1
+
+        if self._current is not None:
+            if duplicate_attributes:
+                self._current["hasDuplicateAttributes"] = True
+            if suppresses_visibility:
+                self._current["hasVisibilitySuppressor"] = True
+            if tag == "h1":
+                self._current["h1Count"] = int(self._current["h1Count"]) + 1
+            elif tag == "a" and attributes.get("href"):
+                links = self._current["links"]
+                if isinstance(links, list):
+                    links.append(attributes["href"])
+                if self._active_evidence is not None:
+                    self._active_evidence["href"] = attributes["href"]
+            elif tag == "li" and "data-capability-evidence" in attributes:
+                self._active_evidence = {
+                    "path": attributes.get("data-capability-evidence"),
+                    "reviewedAt": attributes.get("data-reviewed-at"),
+                    "href": None,
+                    "text_parts": [],
+                }
+
+        if tag not in HTML_VOID_ELEMENTS:
+            self._element_stack.append((tag, suppresses_visibility))
+
+    def handle_data(self, data: str) -> None:
+        self.text_parts.append(data)
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+        if self._active_evidence is not None:
+            parts = self._active_evidence["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        self.text_parts.append(" ")
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(" ")
+        if tag == "li" and self._active_evidence is not None:
+            parts = self._active_evidence.pop("text_parts")
+            self._active_evidence["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            if self._current is not None:
+                evidence = self._current["evidence"]
+                if isinstance(evidence, list):
+                    evidence.append(self._active_evidence)
+            self._active_evidence = None
 
         if self._current is not None and tag == "section":
             self._section_depth -= 1
@@ -2466,6 +2759,7 @@ def render_expected_sitemap(article_paths: Sequence[str]) -> str:
     sitemap = ET.Element(f"{{{SITEMAP_NAMESPACE}}}urlset")
     for public_path in (
         *CORE_PUBLIC_PAGE_PATHS,
+        *REVIEWED_CAPABILITY_PATHS,
         *REVIEWED_BENCHMARK_PATHS,
         *REVIEWED_RELEASE_PATHS,
         *article_paths,
@@ -3605,6 +3899,283 @@ def reviewed_benchmark_cards() -> Dict[str, Dict[str, str]]:
     return cards
 
 
+def reviewed_capability_records() -> Tuple[Dict[str, object], ...]:
+    """Recreate reviewed capabilities without trusting generated capabilities/index.json."""
+
+    articles_by_slug = {
+        article["path"].rstrip("/").split("/")[-1]: article
+        for article in reviewed_research_articles()
+    }
+    records: List[Dict[str, object]] = []
+    for capability in REVIEWED_CAPABILITIES:
+        evidence_records: List[Dict[str, str]] = []
+        for slug in capability["evidenceSlugs"]:
+            article = articles_by_slug[str(slug)]
+            evidence_records.append(
+                {
+                    "slug": str(slug),
+                    "title": article["title"],
+                    "path": article["path"],
+                    "reviewedAt": article["reviewedAt"],
+                }
+            )
+        records.append(
+            {
+                "id": str(capability["id"]),
+                "name": str(capability["name"]),
+                "status": str(capability["status"]),
+                "summary": str(capability["summary"]),
+                "scope": str(capability["scope"]),
+                "evidence": evidence_records,
+            }
+        )
+    return tuple(records)
+
+
+def validate_capability_cards(site: Path) -> List[str]:
+    failures: List[str] = []
+    path = site / "capabilities/index.html"
+    if path.is_symlink() or not path.is_file():
+        return ["capabilities/index.html must be a regular non-symlink file"]
+    try:
+        raw_page = path.read_bytes()
+    except OSError as exc:
+        return [f"cannot read capabilities/index.html: {exc}"]
+    if len(raw_page) > MAX_CAPABILITY_CATALOG_BYTES:
+        failures.append("capabilities/index.html exceeds the 131072-byte limit")
+    if (
+        len(raw_page) != REVIEWED_CAPABILITIES_PAGE_BYTES
+        or hashlib.sha256(raw_page).hexdigest()
+        != REVIEWED_CAPABILITIES_PAGE_SHA256
+    ):
+        failures.append(
+            "capabilities/index.html does not match the reviewed page seal"
+        )
+    collector = CapabilityCardCollector()
+    try:
+        collector.feed(raw_page.decode("utf-8"))
+        collector.close()
+    except Exception as exc:
+        return [f"cannot parse capabilities/index.html cards: {exc}"]
+    expected_records = reviewed_capability_records()
+    actual_ids = [card.get("id") for card in collector.cards]
+    expected_ids = [record["id"] for record in expected_records]
+    if actual_ids != expected_ids or len(actual_ids) != len(set(actual_ids)):
+        failures.append("capability card set does not match reviewed capability records")
+    cards_by_id = {
+        str(card["id"]): card
+        for card in collector.cards
+        if isinstance(card.get("id"), str)
+    }
+    for record in expected_records:
+        identifier = str(record["id"])
+        card = cards_by_id.get(identifier)
+        if card is None:
+            continue
+        if card.get("state") != record["status"]:
+            failures.append(f"capability card {identifier!r} has the wrong state")
+        if card.get("hidden"):
+            failures.append(f"capability card {identifier!r} is hidden")
+        text = card.get("text")
+        normalized_text = text if isinstance(text, str) else ""
+        expected_text_bits = [
+            CAPABILITY_STATUS_LABELS[str(record["status"])].upper(),
+            str(record["name"]),
+            str(record["summary"]),
+            "Scope:",
+            str(record["scope"]),
+            *[
+                str(evidence["title"]) + " →"
+                for evidence in record["evidence"]
+                if isinstance(evidence, dict)
+            ],
+            "Open capability details →",
+        ]
+        expected_text = " ".join(" ".join(expected_text_bits).split())
+        if normalized_text != expected_text:
+            failures.append(f"capability card {identifier!r} has drifted reviewed text")
+        expected_links = [
+            relative_href("capabilities/index.html", str(evidence["path"]))
+            for evidence in record["evidence"]
+            if isinstance(evidence, dict)
+        ]
+        expected_links.append(identifier + "/")
+        if card.get("links") != expected_links:
+            failures.append(f"capability card {identifier!r} has the wrong action links")
+    return failures
+
+
+def validate_capability_detail_pages(site: Path) -> List[str]:
+    failures: List[str] = []
+    capability_root = site / "capabilities"
+    expected_entries = {"index.html", "index.json"} | {
+        str(capability["id"]) for capability in REVIEWED_CAPABILITIES
+    }
+    if capability_root.is_symlink() or not capability_root.is_dir():
+        return ["capabilities must be a regular non-symlink directory"]
+    try:
+        actual_entries = {entry.name for entry in capability_root.iterdir()}
+    except OSError as exc:
+        return [f"cannot inspect capability detail routes: {exc}"]
+    for extra in sorted(actual_entries - expected_entries):
+        failures.append(f"unexpected capability route outside reviewed set: {extra}")
+
+    records = reviewed_capability_records()
+    for record in records:
+        identifier = str(record["id"])
+        relative = f"capabilities/{identifier}/index.html"
+        directory = site / "capabilities" / identifier
+        path = directory / "index.html"
+        if directory.is_symlink() or not directory.is_dir():
+            failures.append(
+                f"capability detail route {identifier!r} must be a regular non-symlink directory"
+            )
+            continue
+        if path.is_symlink() or not path.is_file():
+            failures.append(f"{relative} must be a regular non-symlink file")
+            continue
+        try:
+            raw_detail = path.read_bytes()
+        except OSError as exc:
+            failures.append(f"cannot read {relative}: {exc}")
+            continue
+        if len(raw_detail) > MAX_CAPABILITY_DETAIL_BYTES:
+            failures.append(f"{relative} exceeds the 131072-byte limit")
+        expected_size, expected_sha256 = REVIEWED_CAPABILITY_DETAIL_SEALS[identifier]
+        if (
+            len(raw_detail) != expected_size
+            or hashlib.sha256(raw_detail).hexdigest() != expected_sha256
+        ):
+            failures.append(
+                f"capability detail {identifier!r} does not match the reviewed page seal"
+            )
+        try:
+            detail_text = raw_detail.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            failures.append(f"cannot parse {relative}: {exc}")
+            continue
+        collector = CapabilityDetailCollector()
+        try:
+            collector.feed(detail_text)
+            collector.close()
+        except Exception as exc:
+            failures.append(f"cannot parse {relative}: {exc}")
+            continue
+        if len(collector.sections) != 1:
+            failures.append(
+                f"capability detail {identifier!r} must contain exactly one detail section"
+            )
+            continue
+
+        detail = collector.sections[0]
+        state = str(record["status"])
+        expected_text = " ".join(
+            [
+                "Reviewed capability",
+                CAPABILITY_STATUS_LABELS[state].upper(),
+                CAPABILITY_STATUS_DESCRIPTIONS[state],
+                str(record["name"]),
+                str(record["summary"]),
+                "Scope:",
+                str(record["scope"]),
+                "Reviewed evidence",
+                *[
+                    " ".join(
+                        [
+                            str(evidence["title"]),
+                            "→",
+                            "Path:",
+                            str(evidence["path"]),
+                            "·",
+                            "Reviewed:",
+                            str(evidence["reviewedAt"]),
+                        ]
+                    )
+                    for evidence in record["evidence"]
+                    if isinstance(evidence, dict)
+                ],
+                "Back to all capabilities",
+                "Open capabilities/index.json →",
+                "Read the methodology →",
+            ]
+        )
+        expected_text = " ".join(expected_text.split())
+        expected_links = [
+            relative_href(relative, str(evidence["path"]))
+            for evidence in record["evidence"]
+            if isinstance(evidence, dict)
+        ]
+        expected_links.extend(["../", "../index.json", "../../methodology/"])
+        expected_evidence = [
+            {
+                "path": str(evidence["path"]),
+                "reviewedAt": str(evidence["reviewedAt"]),
+                "href": relative_href(relative, str(evidence["path"])),
+                "text": " ".join(
+                    [
+                        str(evidence["title"]),
+                        "→",
+                        "Path:",
+                        str(evidence["path"]),
+                        "·",
+                        "Reviewed:",
+                        str(evidence["reviewedAt"]),
+                    ]
+                ),
+            }
+            for evidence in record["evidence"]
+            if isinstance(evidence, dict)
+        ]
+
+        if detail.get("id") != identifier:
+            failures.append(f"capability detail {identifier!r} has the wrong id")
+        if detail.get("state") != state:
+            failures.append(f"capability detail {identifier!r} has the wrong state")
+        if detail.get("text") != expected_text:
+            failures.append(f"capability detail {identifier!r} has drifted reviewed text")
+        if detail.get("evidence") != expected_evidence:
+            failures.append(f"capability detail {identifier!r} has the wrong evidence")
+        for evidence in expected_evidence:
+            reviewed_at = evidence["reviewedAt"]
+            try:
+                dt.date.fromisoformat(reviewed_at)
+            except ValueError:
+                failures.append(
+                    f"capability detail {identifier!r} has a non-date reviewedAt"
+                )
+            if "T" in reviewed_at:
+                failures.append(
+                    f"capability detail {identifier!r} has a non-date reviewedAt"
+                )
+        if detail.get("links") != expected_links:
+            failures.append(f"capability detail {identifier!r} has the wrong action links")
+        if (
+            detail.get("h1Count") != 1
+            or collector.page_h1_count != 1
+            or detail.get("hasNestedDetail")
+        ):
+            failures.append(f"capability detail {identifier!r} has the wrong heading structure")
+        if detail.get("hasDuplicateAttributes"):
+            failures.append(f"capability detail {identifier!r} has duplicate attributes")
+        if detail.get("hasVisibilitySuppressor"):
+            failures.append(f"capability detail {identifier!r} is hidden")
+        if collector.scripts:
+            failures.append(f"capability detail {identifier!r} must not load scripts")
+        page_text = " ".join("".join(collector.text_parts).split())
+        expected_boundary = (
+            "Claim boundary A permalink is not new authority. "
+            "This page creates no broader support, measurement, runtime, model, "
+            "acquisition, publication, admission, launchability, or containment "
+            "authority. It only exposes one reviewed capability record and its "
+            "already-published evidence."
+        )
+        if expected_boundary not in page_text:
+            failures.append(f"capability detail {identifier!r} has the wrong claim boundary")
+        if collector.page_links.count("../../methodology/") != 2:
+            failures.append(f"capability detail {identifier!r} has the wrong methodology link")
+    return failures
+
+
 def validate_benchmark_detail_pages(site: Path) -> List[str]:
     failures: List[str] = []
     benchmark_root = site / "benchmarks"
@@ -3872,6 +4443,10 @@ def validate(site: Path) -> List[str]:
         "methodology/index.html",
         "capabilities/index.html",
         "capabilities/index.json",
+        *[
+            f'capabilities/{capability["id"]}/index.html'
+            for capability in REVIEWED_CAPABILITIES
+        ],
         "benchmarks/index.html",
         *[
             f'benchmarks/{highlight["id"]}/index.html'
@@ -4068,6 +4643,10 @@ def validate(site: Path) -> List[str]:
             if not isinstance(capabilities, list) or not capabilities:
                 failures.append("capabilities/index.json has no capabilities")
             else:
+                if capabilities != list(reviewed_capability_records()):
+                    failures.append(
+                        "capabilities/index.json capabilities do not match reviewed capability records"
+                    )
                 seen_capability_ids: set[str] = set()
                 for position, capability in enumerate(capabilities):
                     label = f"capability index entry {position}"
@@ -4130,6 +4709,9 @@ def validate(site: Path) -> List[str]:
                     evidence = highlight.get("evidence")
                     raw_path = evidence.get("path") if isinstance(evidence, dict) else None
                     failures.extend(validate_evidence_path(site, raw_path, label))
+    failures.extend(validate_capability_cards(site))
+    failures.extend(validate_capability_detail_pages(site))
+
     benchmark_path = site / "benchmarks/index.html"
     if benchmark_path.is_file():
         collector = BenchmarkCollector()
