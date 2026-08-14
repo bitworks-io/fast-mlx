@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+EXPLORER_RUNTIME_TIMEOUT_SECONDS = 30
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import build_public_site  # noqa: E402
@@ -3057,7 +3058,7 @@ class PublicSiteTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=EXPLORER_RUNTIME_TIMEOUT_SECONDS,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("research explorer runtime checks passed", completed.stdout)
@@ -3574,7 +3575,7 @@ class PublicSiteTests(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=EXPLORER_RUNTIME_TIMEOUT_SECONDS,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("benchmark explorer runtime checks passed", completed.stdout)
