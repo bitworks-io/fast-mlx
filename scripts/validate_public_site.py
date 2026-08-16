@@ -72,6 +72,14 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         ),
     },
     {
+        "id": "deterministic-sampled-generation-foundation",
+        "name": "Deterministic sampled-generation foundation",
+        "status": "implemented",
+        "summary": "A dependency-free CPU oracle defines seeded temperature and top-p token selection with stable counter addressing.",
+        "scope": "Internal HarnessCore foundation only. It is not wired to HTTP requests, the serving scheduler, MLX arrays, models, tokenizers, or automatic entropy, and it makes no performance claim.",
+        "evidenceSlugs": ("sampling-before-serving",),
+    },
+    {
         "id": "prompt-lookup-decoding",
         "name": "Prompt-lookup decoding",
         "status": "shelved",
@@ -148,7 +156,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 9_403
 REVIEWED_HOME_PAGE_SHA256 = (
-    "71638ad65abfa043ff8855754162b07f46ef610bdc4e95a0a9d16a961e310ddc"
+    "8df594116c72c12e174923861d346acd2cabb02d5a98cccccb88594204661cc8"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -172,13 +180,13 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 18_473
+REVIEWED_STATUS_PAGE_BYTES = 19_409
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "550a8aff64e4a7e3b0e65f836a10a1f3dea39997bc6b6b497fae765cac4f4a02"
+    "cea2bb42b902f01982f5882e40610a93940b257221a74b62d833cd0fb0bf34ae"
 )
-REVIEWED_CAPABILITIES_PAGE_BYTES = 13_817
+REVIEWED_CAPABILITIES_PAGE_BYTES = 14_735
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
-    "ad8f887a455282a45014de9a10bcdaf811065aa518153cf6d097771094aaf12f"
+    "c628d10677f4b57c0319896a1cea98da2ea824c784358034146c200ef9b432cd"
 )
 REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "openai-http-sse-serving": (
@@ -188,6 +196,10 @@ REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "exact-continuous-batching": (
         5_552,
         "816aa47d8282e086085f30ca4f771a95d8404b1e3238a7f2822bf9af2e919e42",
+    ),
+    "deterministic-sampled-generation-foundation": (
+        5_292,
+        "a6119c5e3c2925612b639f956ca63f9f14405f01c77d4d4e697b9577175e13a7",
     ),
     "prompt-lookup-decoding": (
         5_131,
@@ -288,13 +300,14 @@ STATUS_ALLOWED_TAGS = {
 REVIEWED_STATUS_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
     ("openai-http-sse-serving", "promoted-scoped"),
     ("exact-continuous-batching", "promoted-scoped"),
+    ("deterministic-sampled-generation-foundation", "implemented"),
     ("prompt-lookup-decoding", "shelved"),
     ("exact-cache-lifecycle-controls", "implemented"),
     ("quality-measurement-harness", "implemented"),
     ("capacity-proof-control-tools", "implemented"),
 )
 REVIEWED_STATUS_COUNTS: Tuple[Tuple[str, str], ...] = (
-    ("implemented", "3"),
+    ("implemented", "4"),
     ("promoted-scoped", "2"),
     ("experimental", "0"),
     ("shelved", "1"),
@@ -311,6 +324,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
     "../capabilities/exact-continuous-batching/",
+    "../research/sampling-before-serving/",
+    "../capabilities/deterministic-sampled-generation-foundation/",
     "../research/when-zero-speculation-costs-two-percent/",
     "../capabilities/prompt-lookup-decoding/",
     "../research/the-fastest-request-wasnt-the-fastest-service/",
@@ -338,9 +353,9 @@ REVIEWED_STATUS_LINKS = (
 REVIEWED_STATUS_TEXT = (
     "Current state, not a roadmap.",
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
-    "6 reviewed capabilities",
+    "7 reviewed capabilities",
     "3 measured proof points",
-    "8 published research notes",
+    "9 published research notes",
     "14 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -435,6 +450,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/sampling-before-serving/",
     "research/the-repository-that-could-reproduce-itself/",
     "research/the-proof-did-not-end-when-the-timer-did/",
     "research/the-fastest-request-wasnt-the-fastest-service/",
@@ -445,6 +461,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/the-wall-that-wasnt/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/sampling-before-serving/": ("2026-08-16", "2026-08-16"),
     "research/the-repository-that-could-reproduce-itself/": (
         "2026-08-14",
         "2026-08-14",
@@ -671,6 +688,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/sampling-before-serving/": (
+        "Sampling before serving: why the random draw needed its own contract — fast-mlx",
+        "Sampled generation sounds like a small change: take logits, apply temperature and top-p, draw a token, and continue. In a serving engine, that “draw a token” step quietly touches request identity, retries,…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel",
     ),
     "research/the-repository-that-could-reproduce-itself/": (
         "The repository that could reproduce itself — but could not publish itself — fast-mlx",

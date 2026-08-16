@@ -49,6 +49,12 @@
       "slug": "the-repository-that-could-reproduce-itself",
       "status": "published",
       "reviewedAt": "2026-08-14"
+    },
+    {
+      "source": "docs/content/2026-08-16-sampling-before-serving.md",
+      "slug": "sampling-before-serving",
+      "status": "published",
+      "reviewedAt": "2026-08-16"
     }
   ]
 }

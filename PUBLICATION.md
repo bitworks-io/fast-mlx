@@ -30,7 +30,7 @@ includes:
   redistribution, notices, patents, trademarks, and separately governed third-party works;
 - the static `/status/` current-state dashboard derived from the same reviewed capability,
   release, and research manifests, with no future-roadmap or authority effect;
-- six static `/capabilities/<id>/` detail permalinks, one per reviewed capability record, with
+- seven static `/capabilities/<id>/` detail permalinks, one per reviewed capability record, with
   exact state, scope, evidence paths, review dates, and unchanged claim boundary;
 - the static text-only `/feed.atom` subscription surface, which combines only those reviewed
   release and research records without becoming another source manifest;
@@ -79,7 +79,7 @@ boundary. It performs no live lookup, recomputation, ranking, ingestion, future 
 authority transition; exact output sealing prevents jointly drifted rendered claims from becoming
 their own source of truth.
 
-Capability detail permalinks are static readers over the exact six reviewed capability records.
+Capability detail permalinks are static readers over the exact seven reviewed capability records.
 Validation reconstructs those records independently from generated `capabilities/index.json`, joins
 them to pinned research-note metadata, and seals every generated detail page byte-for-byte. A
 capability permalink creates no broader support, measurement, runtime, model, acquisition,
@@ -114,8 +114,8 @@ ordered by their timezone-aware reviewed timestamps. It introduces no external i
 publication, benchmark recomputation, ranking, runtime action, or authority transition.
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
-ten reviewed product/index pages, six capability-detail pages, three benchmark-detail pages,
-fourteen release-detail pages, and eight explicitly published research notes; it excludes JSON
+ten reviewed product/index pages, seven capability-detail pages, three benchmark-detail pages,
+fourteen release-detail pages, and nine explicitly published research notes; it excludes JSON
 contracts, all three Atom feeds, LLM text surfaces, assets, and the 404 page. Detail pages are
 immutable views of already-reviewed capability records, capability highlights, or release-ledger
 entries, not new evidence, support, measurement, runtime, model, acquisition, admission, authority,
@@ -124,7 +124,7 @@ rejects route drift, non-UTF-8 or oversized content, DTD/entity declarations, sy
 non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-41-page set. The validator independently pins every page's route, title, description, object
+43-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and

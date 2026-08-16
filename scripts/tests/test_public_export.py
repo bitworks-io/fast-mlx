@@ -146,6 +146,47 @@ class PublicExportTests(unittest.TestCase):
             {"pathCount", "pathModeSha256"},
         )
 
+    def test_sampled_generation_foundation_is_exported_byte_for_byte(self) -> None:
+        development_manifest = json.loads(
+            (REPOSITORY_ROOT / "public/public-repository.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        tree_entries = {
+            entry["source"]: entry
+            for entry in development_manifest["trees"]
+        }
+        source_path = "HarnessCore/Sampling/SamplingContractV1.swift"
+        test_path = "HarnessCoreTests/SamplingContractV1Tests.swift"
+        self.assertNotIn(
+            source_path,
+            tree_entries["spike/Sources"].get("exclude", []),
+        )
+        self.assertNotIn(
+            test_path,
+            tree_entries["spike/Tests"].get("exclude", []),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public"
+            output.mkdir()
+            export_public_repository.export(
+                REPOSITORY_ROOT,
+                output,
+                allow_development_manifest=(
+                    REPOSITORY_ROOT
+                    / "public/public-repository-public.json"
+                ).is_file(),
+            )
+            for relative in (
+                "spike/Sources/HarnessCore/Sampling/SamplingContractV1.swift",
+                "spike/Tests/HarnessCoreTests/SamplingContractV1Tests.swift",
+            ):
+                self.assertEqual(
+                    (output / relative).read_bytes(),
+                    (REPOSITORY_ROOT / relative).read_bytes(),
+                )
+
     def test_export_copies_only_indexed_allowlist_and_published_articles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "source"

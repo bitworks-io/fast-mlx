@@ -115,9 +115,9 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 38 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
-reviewed Open Graph description. The seven research notes alone use article metadata; the nine
-product/index pages, six capability-detail pages, three benchmark-detail pages, and thirteen
+Each of the 43 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+reviewed Open Graph description. The nine research notes alone use article metadata; the ten
+product/index pages, seven capability-detail pages, three benchmark-detail pages, and fourteen
 release-detail pages remain website objects, while `404.html` and machine-readable endpoints publish
 neither. Detail pages are immutable views of already-reviewed capability records, benchmark
 evidence, or release-ledger entries; they do not create new evidence, support, measurement, runtime,

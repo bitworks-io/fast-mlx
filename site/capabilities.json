@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "policy": "fast-mlx-owned-results-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-11",
+  "updatedAt": "2026-08-16",
   "capabilities": [
     {
       "id": "openai-http-sse-serving",
@@ -23,6 +23,16 @@
       "evidenceSlugs": [
         "the-fastest-request-wasnt-the-fastest-service",
         "the-proof-did-not-end-when-the-timer-did"
+      ]
+    },
+    {
+      "id": "deterministic-sampled-generation-foundation",
+      "name": "Deterministic sampled-generation foundation",
+      "status": "implemented",
+      "summary": "A dependency-free CPU oracle defines seeded temperature and top-p token selection with stable counter addressing.",
+      "scope": "Internal HarnessCore foundation only. It is not wired to HTTP requests, the serving scheduler, MLX arrays, models, tokenizers, or automatic entropy, and it makes no performance claim.",
+      "evidenceSlugs": [
+        "sampling-before-serving"
       ]
     },
     {

@@ -179,7 +179,7 @@ class PublicStatusPageTests(unittest.TestCase):
                 ),
                 (
                     "status drift",
-                    'data-status-count="implemented" data-count="3"',
+                    'data-status-count="implemented" data-count="4"',
                     'data-status-count="implemented" data-count="99"',
                     "status/index.html does not match the reviewed page seal",
                 ),

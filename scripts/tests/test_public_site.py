@@ -141,20 +141,20 @@ class PublicSiteTests(unittest.TestCase):
         )
         self.assertEqual(manifest["schemaVersion"], 1)
         self.assertEqual(manifest["policy"], "fast-mlx-owned-results-only")
-        self.assertEqual(len(manifest["articles"]), 8)
+        self.assertEqual(len(manifest["articles"]), 9)
         self.assertEqual(
-            len({entry["source"] for entry in manifest["articles"]}), 8
+            len({entry["source"] for entry in manifest["articles"]}), 9
         )
         self.assertEqual(
-            len({entry["slug"] for entry in manifest["articles"]}), 8
+            len({entry["slug"] for entry in manifest["articles"]}), 9
         )
         self.assertEqual(
             manifest["articles"][-1],
             {
-                "source": "docs/content/2026-08-14-the-repository-that-could-reproduce-itself.md",
-                "slug": "the-repository-that-could-reproduce-itself",
+                "source": "docs/content/2026-08-16-sampling-before-serving.md",
+                "slug": "sampling-before-serving",
                 "status": "published",
-                "reviewedAt": "2026-08-14",
+                "reviewedAt": "2026-08-16",
             },
         )
 
@@ -166,8 +166,75 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(catalog["schemaVersion"], 1)
         self.assertEqual(catalog["policy"], "fast-mlx-owned-results-only")
         self.assertEqual(catalog["claimBoundary"], "fast-mlx-owned-results-only")
-        self.assertEqual(len(catalog["capabilities"]), 6)
+        self.assertEqual(len(catalog["capabilities"]), 7)
         self.assertEqual(len(catalog["performanceHighlights"]), 3)
+
+    def test_sampled_generation_foundation_publication_is_bounded(self) -> None:
+        capability_manifest = json.loads(
+            (REPOSITORY_ROOT / "site/capabilities.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        capability_records = [
+            record
+            for record in capability_manifest["capabilities"]
+            if record["id"] == "deterministic-sampled-generation-foundation"
+        ]
+        self.assertEqual(len(capability_records), 1)
+        self.assertEqual(
+            capability_records[0],
+            {
+                "id": "deterministic-sampled-generation-foundation",
+                "name": "Deterministic sampled-generation foundation",
+                "status": "implemented",
+                "summary": (
+                    "A dependency-free CPU oracle defines seeded temperature and "
+                    "top-p token selection with stable counter addressing."
+                ),
+                "scope": (
+                    "Internal HarnessCore foundation only. It is not wired to HTTP "
+                    "requests, the serving scheduler, MLX arrays, models, tokenizers, "
+                    "or automatic entropy, and it makes no performance claim."
+                ),
+                "evidenceSlugs": ["sampling-before-serving"],
+            },
+        )
+
+        publication_manifest = json.loads(
+            (REPOSITORY_ROOT / "site/publications.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        article_records = [
+            record
+            for record in publication_manifest["articles"]
+            if record["slug"] == "sampling-before-serving"
+        ]
+        self.assertEqual(
+            article_records,
+            [
+                {
+                    "source": "docs/content/2026-08-16-sampling-before-serving.md",
+                    "slug": "sampling-before-serving",
+                    "status": "published",
+                    "reviewedAt": "2026-08-16",
+                }
+            ],
+        )
+        note = (
+            REPOSITORY_ROOT / "docs/content/2026-08-16-sampling-before-serving.md"
+        ).read_text(encoding="utf-8")
+        normalized_note = " ".join(note.split())
+        for required in (
+            "deterministic CPU foundation",
+            "temperature before top-p",
+            "not sampled serving support",
+            "not an MLX device path",
+            "no model or tokenizer claim",
+            "no performance claim",
+            "rejected and non-promotable",
+        ):
+            self.assertIn(required, normalized_note)
 
     def test_release_manifest_is_explicit_newest_first_and_non_circular(self) -> None:
         catalog = build_public_site.load_release_catalog(REPOSITORY_ROOT)
@@ -489,9 +556,9 @@ class PublicSiteTests(unittest.TestCase):
             ),
             (
                 "aria-hidden card",
-                '<article role="listitem">\n<h3>6 reviewed capabilities</h3>',
+                '<article role="listitem">\n<h3>7 reviewed capabilities</h3>',
                 '<article role="listitem" aria-hidden="true">\n'
-                '<h3>6 reviewed capabilities</h3>',
+                '<h3>7 reviewed capabilities</h3>',
                 "home current-cycle section contains a visibility suppressor",
             ),
             (
@@ -530,14 +597,14 @@ class PublicSiteTests(unittest.TestCase):
             ),
             (
                 "capability count",
-                'data-capability-status="implemented" data-count="3"',
+                'data-capability-status="implemented" data-count="4"',
                 'data-capability-status="implemented" data-count="99"',
                 "home current-cycle capability status counts do not match capabilities/index.json",
             ),
             (
                 "research count",
-                "8 published research notes",
-                "99 published research notes",
+                "9 published research notes",
+                "0 published research notes",
                 "home current-cycle research count does not match research/index.json",
             ),
         )
@@ -935,13 +1002,13 @@ class PublicSiteTests(unittest.TestCase):
                 (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
             )
             build_public_site.scan_generated_output(output)
-            self.assertEqual(len(articles), 8)
+            self.assertEqual(len(articles), 9)
             self.assertEqual(validate_public_site.validate(output), [])
 
             public_index = json.loads(
                 (output / "research/index.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(public_index["articles"]), 8)
+            self.assertEqual(len(public_index["articles"]), 9)
             self.assertEqual(
                 public_index["claimBoundary"], "fast-mlx-owned-results-only"
             )
@@ -953,7 +1020,7 @@ class PublicSiteTests(unittest.TestCase):
             self.assertEqual(
                 capabilities["claimBoundary"], "fast-mlx-owned-results-only"
             )
-            self.assertEqual(len(capabilities["capabilities"]), 6)
+            self.assertEqual(len(capabilities["capabilities"]), 7)
             self.assertEqual(len(capabilities["performanceHighlights"]), 3)
             for capability in capabilities["capabilities"]:
                 for evidence in capability["evidence"]:
@@ -1685,7 +1752,7 @@ class PublicSiteTests(unittest.TestCase):
             )
 
             entries = feed.findall(atom("entry"))
-            self.assertEqual(len(entries), 22)
+            self.assertEqual(len(entries), 23)
             self.assertEqual(len(entries), len(expected_updates))
             self.assertEqual(
                 len({entry.findtext(atom("id")) for entry in entries}),
@@ -1802,7 +1869,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 41)
+            self.assertEqual(len(expected_urls), 43)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1940,7 +2007,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 41)
+            self.assertEqual(len(expected), 43)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )
@@ -3234,8 +3301,8 @@ class PublicSiteTests(unittest.TestCase):
             build_public_site.build_site(REPOSITORY_ROOT, output)
             path = output / "research/index.html"
             page = path.read_text(encoding="utf-8")
-            first = 'data-research-path="research/the-repository-that-could-reproduce-itself/"'
-            second = 'data-research-path="research/the-proof-did-not-end-when-the-timer-did/"'
+            first = 'data-research-path="research/sampling-before-serving/"'
+            second = 'data-research-path="research/the-repository-that-could-reproduce-itself/"'
             self.assertIn(first, page)
             self.assertIn(second, page)
             page = page.replace(first, "__FIRST_RESEARCH_PATH__", 1)
@@ -3252,27 +3319,27 @@ class PublicSiteTests(unittest.TestCase):
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" hidden role="listitem" data-research-card',
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
+                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" style="display:none" role="listitem" data-research-card',
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
+                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" aria-hidden="true" role="listitem" data-research-card',
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
+                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" inert role="listitem" data-research-card',
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
+                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
             ),
             (
                 '<div class="research-grid" data-research-results role="list">',
                 '<div class="research-grid" data-research-results role="list" hidden>',
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' is hidden before enhancement",
+                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
             ),
             (
                 '<h2>The proof did not end when the timer did</h2>',
@@ -3366,7 +3433,7 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
             self.assertIn(
-                "research archive card 'research/the-repository-that-could-reproduce-itself/' has drifted reviewed text",
+                "research archive card 'research/sampling-before-serving/' has drifted reviewed text",
                 failures,
             )
 
