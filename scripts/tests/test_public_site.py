@@ -236,6 +236,54 @@ class PublicSiteTests(unittest.TestCase):
         ):
             self.assertIn(required, normalized_note)
 
+        release_manifest = json.loads(
+            (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
+        )
+        release_records = [
+            record
+            for record in release_manifest["releases"]
+            if record["id"] == "deterministic-sampled-generation-foundation"
+        ]
+        self.assertEqual(
+            release_records,
+            [
+                {
+                    "id": "deterministic-sampled-generation-foundation",
+                    "title": "Publish deterministic sampled-generation foundation",
+                    "publishedAt": "2026-08-16T15:25:00-05:00",
+                    "category": "foundation",
+                    "state": "released",
+                    "summary": (
+                        "Publishes the deterministic CPU sampling oracle, exact "
+                        "contract tests, capability page, and technical note."
+                    ),
+                    "scope": (
+                        "Internal deterministic CPU foundation only; no sampled "
+                        "HTTP/SSE serving, request/scheduler integration, MLX/model/"
+                        "tokenizer/automatic-entropy path, fusion, or performance claim."
+                    ),
+                    "publicCommit": "9e1424b62e3d36108992322664af5ed7c82a1298",
+                    "publicLinks": [
+                        {
+                            "label": "Inspect the capability",
+                            "path": (
+                                "capabilities/"
+                                "deterministic-sampled-generation-foundation/"
+                            ),
+                        },
+                        {
+                            "label": "Read the technical note",
+                            "path": "research/sampling-before-serving/",
+                        },
+                        {
+                            "label": "Read the release JSON",
+                            "path": "releases/index.json",
+                        },
+                    ],
+                }
+            ],
+        )
+
     def test_release_manifest_is_explicit_newest_first_and_non_circular(self) -> None:
         catalog = build_public_site.load_release_catalog(REPOSITORY_ROOT)
         self.assertEqual(catalog["schemaVersion"], 1)
@@ -246,29 +294,32 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "self-reproducing-public-source",
-                "title": "Publish self-reproducing public source",
-                "publishedAt": "2026-08-14T07:45:17-05:00",
-                "category": "operations",
+                "id": "deterministic-sampled-generation-foundation",
+                "title": "Publish deterministic sampled-generation foundation",
+                "publishedAt": "2026-08-16T15:25:00-05:00",
+                "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes a sealed source projection that can re-export itself "
-                    "byte-for-byte with identical executable modes."
+                    "Publishes the deterministic CPU sampling oracle, exact contract "
+                    "tests, capability page, and technical note."
                 ),
                 "scope": (
-                    "Reviewed public-source reproducibility only; no automatic intake or "
-                    "publication, external ingestion, new measurement, performance claim, "
-                    "runtime/model/acquisition authority, or positive absorbed-MLA admission."
+                    "Internal deterministic CPU foundation only; no sampled HTTP/SSE "
+                    "serving, request/scheduler integration, MLX/model/tokenizer/"
+                    "automatic-entropy path, fusion, or performance claim."
                 ),
-                "publicCommit": "c9ba0341a473dccf219f421efefedf3df3e30e2f",
+                "publicCommit": "9e1424b62e3d36108992322664af5ed7c82a1298",
                 "publicLinks": [
                     {
-                        "label": "See the improvement loop",
-                        "path": "process/",
+                        "label": "Inspect the capability",
+                        "path": (
+                            "capabilities/"
+                            "deterministic-sampled-generation-foundation/"
+                        ),
                     },
                     {
-                        "label": "Read the methodology",
-                        "path": "methodology/",
+                        "label": "Read the technical note",
+                        "path": "research/sampling-before-serving/",
                     },
                     {
                         "label": "Read the release JSON",
@@ -281,6 +332,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "9e1424b62e3d36108992322664af5ed7c82a1298",
                 "c9ba0341a473dccf219f421efefedf3df3e30e2f",
                 "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",
                 "acaaa522f3b45b34a24c39a1f227534c835331ce",
@@ -1752,7 +1804,7 @@ class PublicSiteTests(unittest.TestCase):
             )
 
             entries = feed.findall(atom("entry"))
-            self.assertEqual(len(entries), 23)
+            self.assertEqual(len(entries), 24)
             self.assertEqual(len(entries), len(expected_updates))
             self.assertEqual(
                 len({entry.findtext(atom("id")) for entry in entries}),
@@ -1869,7 +1921,7 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 43)
+            self.assertEqual(len(expected_urls), 44)
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -2007,7 +2059,7 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 43)
+            self.assertEqual(len(expected), 44)
             self.assertEqual(
                 tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
             )

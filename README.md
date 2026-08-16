@@ -95,7 +95,7 @@ capability/evidence review gates.
 
 [`/research/index.json`](https://bitworks-io.github.io/fast-mlx/research/index.json) and
 [`/research/feed.atom`](https://bitworks-io.github.io/fast-mlx/research/feed.atom) are generated
-from the seven explicitly reviewed notes in `site/publications.json`. Each research-feed entry
+from the nine explicitly reviewed notes in `site/publications.json`. Each research-feed entry
 contains only pinned titles, dates, themes, summaries, and canonical article links—never article
 bodies, external intake, scripts, trackers, or a build-time network request.
 
@@ -115,9 +115,9 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 43 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+Each of the 44 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
 reviewed Open Graph description. The nine research notes alone use article metadata; the ten
-product/index pages, seven capability-detail pages, three benchmark-detail pages, and fourteen
+product/index pages, seven capability-detail pages, three benchmark-detail pages, and fifteen
 release-detail pages remain website objects, while `404.html` and machine-readable endpoints publish
 neither. Detail pages are immutable views of already-reviewed capability records, benchmark
 evidence, or release-ledger entries; they do not create new evidence, support, measurement, runtime,

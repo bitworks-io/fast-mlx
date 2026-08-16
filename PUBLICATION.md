@@ -115,7 +115,7 @@ publication, benchmark recomputation, ranking, runtime action, or authority tran
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
 ten reviewed product/index pages, seven capability-detail pages, three benchmark-detail pages,
-fourteen release-detail pages, and nine explicitly published research notes; it excludes JSON
+fifteen release-detail pages, and nine explicitly published research notes; it excludes JSON
 contracts, all three Atom feeds, LLM text surfaces, assets, and the 404 page. Detail pages are
 immutable views of already-reviewed capability records, capability highlights, or release-ledger
 entries, not new evidence, support, measurement, runtime, model, acquisition, admission, authority,
@@ -124,7 +124,7 @@ rejects route drift, non-UTF-8 or oversized content, DTD/entity declarations, sy
 non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-43-page set. The validator independently pins every page's route, title, description, object
+44-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and

@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-14",
+  "updatedAt": "2026-08-16",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,30 @@
     }
   },
   "releases": [
+    {
+      "id": "deterministic-sampled-generation-foundation",
+      "title": "Publish deterministic sampled-generation foundation",
+      "publishedAt": "2026-08-16T15:25:00-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes the deterministic CPU sampling oracle, exact contract tests, capability page, and technical note.",
+      "scope": "Internal deterministic CPU foundation only; no sampled HTTP/SSE serving, request/scheduler integration, MLX/model/tokenizer/automatic-entropy path, fusion, or performance claim.",
+      "publicCommit": "9e1424b62e3d36108992322664af5ed7c82a1298",
+      "publicLinks": [
+        {
+          "label": "Inspect the capability",
+          "path": "capabilities/deterministic-sampled-generation-foundation/"
+        },
+        {
+          "label": "Read the technical note",
+          "path": "research/sampling-before-serving/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "self-reproducing-public-source",
       "title": "Publish self-reproducing public source",

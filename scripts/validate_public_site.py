@@ -154,9 +154,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_403
+REVIEWED_HOME_PAGE_BYTES = 9_408
 REVIEWED_HOME_PAGE_SHA256 = (
-    "8df594116c72c12e174923861d346acd2cabb02d5a98cccccb88594204661cc8"
+    "3f26aab246fda70b8395516443cc31f4cc19537d0ca10cf78471f0a5c168f127"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -180,9 +180,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 19_409
+REVIEWED_STATUS_PAGE_BYTES = 19_414
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "cea2bb42b902f01982f5882e40610a93940b257221a74b62d833cd0fb0bf34ae"
+    "ea1a70b844e7259c8d2479476fe95496e6b762c0c976431112e36ce1fac4e2e1"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 14_735
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -343,8 +343,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/self-reproducing-public-source/",
-    "https://github.com/bitworks-io/fast-mlx/commit/c9ba0341a473dccf219f421efefedf3df3e30e2f",
+    "../releases/deterministic-sampled-generation-foundation/",
+    "https://github.com/bitworks-io/fast-mlx/commit/9e1424b62e3d36108992322664af5ed7c82a1298",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -356,7 +356,7 @@ REVIEWED_STATUS_TEXT = (
     "7 reviewed capabilities",
     "3 measured proof points",
     "9 published research notes",
-    "14 reviewed release records",
+    "15 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -486,11 +486,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/trusting-the-instrument/": ("2026-07-09", "2026-08-06"),
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 13_733
+REVIEWED_RELEASE_INDEX_BYTES = 14_884
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "523ab892cd87c82d5d99a605f585bbee440e11a159b9d5639732090112114a35"
+    "64ecdaba9b4c4e9974d30e94f6485fcdc80cb8741e5c09b46b0bbfb8441177db"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "deterministic-sampled-generation-foundation",
+        "Publish deterministic sampled-generation foundation",
+    ),
     ("self-reproducing-public-source", "Publish self-reproducing public source"),
     ("reviewed-research-atom-feed", "Publish reviewed research Atom feed"),
     ("reviewed-release-detail-permalinks", "Publish reviewed release detail permalinks"),
@@ -510,6 +514,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "deterministic-sampled-generation-foundation": (
+        4_782,
+        "d475f2b4caa4843ead4bc12295051044523a2328d85dbe00fcf57f8efbc22d13",
+    ),
     "self-reproducing-public-source": (
         4_667,
         "a3264db65e9e6dc78f597cb5e92f3b2860aa69ec61446eb289a90063b1216012",
@@ -3103,7 +3111,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "self-reproducing-public-source",
+        "data-latest-release-id": "deterministic-sampled-generation-foundation",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }
