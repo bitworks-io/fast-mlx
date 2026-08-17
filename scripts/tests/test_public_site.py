@@ -528,6 +528,22 @@ class PublicSiteTests(unittest.TestCase):
                 f'{len(releases["releases"])} reviewed releases', page
             )
             self.assertIn(
+                "The public site shows performance, feature set, and value at a glance.",
+                page,
+            )
+            self.assertIn(
+                "performance, feature set, and value story behind",
+                page,
+            )
+            self.assertIn(
+                "Reviewed throughput, memory, and service-health results stay tied to source, model, and workload identity.",
+                page,
+            )
+            self.assertIn(
+                "OpenAI-compatible serving, continuous batching, exact prefix/session-cache controls, and capacity planning.",
+                page,
+            )
+            self.assertIn(
                 'class="capability-list" role="list" '
                 'aria-label="Current reviewed evidence inventory"',
                 page,
