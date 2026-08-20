@@ -78,7 +78,7 @@ class PublicCapabilityDetailTests(unittest.TestCase):
                     detail,
                 )
                 self.assertIn(f"<h1>{capability['name']}</h1>", detail)
-                self.assertIn(str(capability["summary"]), detail)
+                self.assertIn(html.escape(str(capability["summary"])), detail)
                 self.assertIn(f"<strong>Scope:</strong> {capability['scope']}", detail)
                 self.assertIn(
                     validate_public_site.CAPABILITY_STATUS_DESCRIPTIONS[state],

@@ -4,6 +4,7 @@ import datetime as dt
 import html
 import html.parser
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -141,22 +142,23 @@ class PublicSiteTests(unittest.TestCase):
         )
         self.assertEqual(manifest["schemaVersion"], 1)
         self.assertEqual(manifest["policy"], "fast-mlx-owned-results-only")
-        self.assertEqual(len(manifest["articles"]), 9)
+        article_count = len(manifest["articles"])
         self.assertEqual(
-            len({entry["source"] for entry in manifest["articles"]}), 9
+            len({entry["source"] for entry in manifest["articles"]}), article_count
         )
         self.assertEqual(
-            len({entry["slug"] for entry in manifest["articles"]}), 9
+            len({entry["slug"] for entry in manifest["articles"]}), article_count
         )
         self.assertEqual(
             manifest["articles"][-1],
             {
-                "source": "docs/content/2026-08-16-sampling-before-serving.md",
-                "slug": "sampling-before-serving",
+                "source": "docs/content/2026-08-17-the-checkout-that-couldnt-compile-its-gpu.md",
+                "slug": "the-checkout-that-couldnt-compile-its-gpu",
                 "status": "published",
-                "reviewedAt": "2026-08-16",
+                "reviewedAt": "2026-08-17",
             },
         )
+        self.assertEqual(article_count, 11)
 
     def test_capability_manifest_is_explicit_and_evidence_backed(self) -> None:
         articles = build_public_site.load_articles(REPOSITORY_ROOT)
@@ -166,7 +168,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(catalog["schemaVersion"], 1)
         self.assertEqual(catalog["policy"], "fast-mlx-owned-results-only")
         self.assertEqual(catalog["claimBoundary"], "fast-mlx-owned-results-only")
-        self.assertEqual(len(catalog["capabilities"]), 7)
+        self.assertEqual(len(catalog["capabilities"]), 9)
         self.assertEqual(len(catalog["performanceHighlights"]), 3)
 
     def test_sampled_generation_foundation_publication_is_bounded(self) -> None:
@@ -532,7 +534,7 @@ class PublicSiteTests(unittest.TestCase):
                 page,
             )
             self.assertIn(
-                "performance, feature set, and value story behind",
+                "what is fast, what is shipped, and what remains gated.",
                 page,
             )
             self.assertIn(
@@ -560,6 +562,43 @@ class PublicSiteTests(unittest.TestCase):
             (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
         )
         latest = releases["releases"][0]
+        # Derive the count-bearing home markers from a reference render instead of hard-coding the
+        # numbers: these track the reviewed manifests (implemented was 4→6, reviewed capabilities
+        # 7→9, research notes 9→11, and all will drift again as the loop ships work). Each mutation
+        # subtest only needs a marker present exactly once to prove the seal catches a tampered count,
+        # so extracting the live values from a generator-faithful render stops the test going stale on
+        # every capability or research note that ships. The generator is deterministic on fixed
+        # manifests, so the per-mutation rebuilds below re-emit these exact strings.
+        with tempfile.TemporaryDirectory() as _ref_dir:
+            _ref_output = Path(_ref_dir) / "site"
+            _ref_output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, _ref_output)
+            _ref_home = (_ref_output / "index.html").read_text(encoding="utf-8")
+
+        def _sole_marker(pattern: str) -> str:
+            found = re.findall(pattern, _ref_home)
+            self.assertEqual(
+                len(found), 1, f"expected exactly one home marker for /{pattern}/, got {found}"
+            )
+            return found[0]
+
+        implemented_home_marker = _sole_marker(
+            r'data-capability-status="implemented" data-count="\d+"'
+        )
+        implemented_home_marker_tampered = re.sub(
+            r'data-count="\d+"', 'data-count="99"', implemented_home_marker
+        )
+        # This subtest tampers by injecting a visibility suppressor (aria-hidden) on the article,
+        # NOT by changing the count — the count in the marker is incidental (it just makes the
+        # anchor unique). Preserve the aria-hidden injection; only the count digits are dynamic.
+        reviewed_capabilities_marker = _sole_marker(
+            r'<article role="listitem">\n<h3>\d+ reviewed capabilities</h3>'
+        )
+        reviewed_capabilities_marker_tampered = reviewed_capabilities_marker.replace(
+            '<article role="listitem">', '<article role="listitem" aria-hidden="true">', 1
+        )
+        research_notes_marker = _sole_marker(r"\d+ published research notes")
+        research_notes_marker_tampered = "0 published research notes"
         mutations = (
             (
                 "boundary state",
@@ -624,9 +663,8 @@ class PublicSiteTests(unittest.TestCase):
             ),
             (
                 "aria-hidden card",
-                '<article role="listitem">\n<h3>7 reviewed capabilities</h3>',
-                '<article role="listitem" aria-hidden="true">\n'
-                '<h3>7 reviewed capabilities</h3>',
+                reviewed_capabilities_marker,
+                reviewed_capabilities_marker_tampered,
                 "home current-cycle section contains a visibility suppressor",
             ),
             (
@@ -665,14 +703,14 @@ class PublicSiteTests(unittest.TestCase):
             ),
             (
                 "capability count",
-                'data-capability-status="implemented" data-count="4"',
-                'data-capability-status="implemented" data-count="99"',
+                implemented_home_marker,
+                implemented_home_marker_tampered,
                 "home current-cycle capability status counts do not match capabilities/index.json",
             ),
             (
                 "research count",
-                "9 published research notes",
-                "0 published research notes",
+                research_notes_marker,
+                research_notes_marker_tampered,
                 "home current-cycle research count does not match research/index.json",
             ),
         )
@@ -1070,13 +1108,19 @@ class PublicSiteTests(unittest.TestCase):
                 (REPOSITORY_ROOT / "site/releases.json").read_text(encoding="utf-8")
             )
             build_public_site.scan_generated_output(output)
-            self.assertEqual(len(articles), 9)
+            publications = json.loads(
+                (REPOSITORY_ROOT / "site/publications.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            article_count = len(publications["articles"])
+            self.assertEqual(len(articles), article_count)
             self.assertEqual(validate_public_site.validate(output), [])
 
             public_index = json.loads(
                 (output / "research/index.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(public_index["articles"]), 9)
+            self.assertEqual(len(public_index["articles"]), article_count)
             self.assertEqual(
                 public_index["claimBoundary"], "fast-mlx-owned-results-only"
             )
@@ -1088,7 +1132,15 @@ class PublicSiteTests(unittest.TestCase):
             self.assertEqual(
                 capabilities["claimBoundary"], "fast-mlx-owned-results-only"
             )
-            self.assertEqual(len(capabilities["capabilities"]), 7)
+            reviewed_capabilities = json.loads(
+                (REPOSITORY_ROOT / "site/capabilities.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                len(capabilities["capabilities"]),
+                len(reviewed_capabilities["capabilities"]),
+            )
             self.assertEqual(len(capabilities["performanceHighlights"]), 3)
             for capability in capabilities["capabilities"]:
                 for evidence in capability["evidence"]:
@@ -1820,7 +1872,9 @@ class PublicSiteTests(unittest.TestCase):
             )
 
             entries = feed.findall(atom("entry"))
-            self.assertEqual(len(entries), 24)
+            self.assertEqual(
+                len(expected_updates), len(release_source["releases"]) + len(articles)
+            )
             self.assertEqual(len(entries), len(expected_updates))
             self.assertEqual(
                 len({entry.findtext(atom("id")) for entry in entries}),
@@ -1937,7 +1991,14 @@ class PublicSiteTests(unittest.TestCase):
                 ],
                 expected_urls,
             )
-            self.assertEqual(len(expected_urls), 44)
+            self.assertEqual(
+                len(expected_urls),
+                len(expected_paths[:10])
+                + len(validate_public_site.reviewed_capability_records())
+                + 3
+                + len(releases["releases"])
+                + len(articles),
+            )
             self.assertNotIn("index.json", sitemap_text)
             self.assertNotIn("feed.atom", sitemap_text)
             self.assertNotIn("llms.txt", sitemap_text)
@@ -1964,8 +2025,11 @@ class PublicSiteTests(unittest.TestCase):
 
             expected: dict[str, tuple[str, str, str, str | None]] = {
                 "": (
-                    "fast-mlx — evidence-gated MLX inference",
-                    "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+                    "fast-mlx — a self-improving MLX inference engine",
+                    "A self-improving MLX inference engine for Apple Silicon: an "
+                    "automated loop that researches, tests candidates against exact "
+                    "baselines, and publishes its own results with little human "
+                    "intervention.",
                     "website",
                     None,
                 ),
@@ -2075,9 +2139,13 @@ class PublicSiteTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(len(expected), 44)
+            self.assertEqual(len(expected), len(validate_public_site.REVIEWED_PAGE_METADATA))
+            # Compare the page set rather than dict insertion order: the validator's
+            # REVIEWED_PAGE_METADATA literal is keyed by public path and looked up
+            # (not iterated in an order-sensitive way), so its authoring order is
+            # incidental and drifts independently of the build's article ordering.
             self.assertEqual(
-                tuple(validate_public_site.REVIEWED_PAGE_METADATA), tuple(expected)
+                set(validate_public_site.REVIEWED_PAGE_METADATA), set(expected)
             )
             image_url = (
                 "https://bitworks-io.github.io/fast-mlx/assets/social-card.png"
@@ -3383,31 +3451,45 @@ class PublicSiteTests(unittest.TestCase):
             )
 
     def test_validator_preserves_research_archive_no_js_and_live_semantics(self) -> None:
+        # Derive the first archive card's path from a reference render instead of
+        # hard-coding it: the newest reviewed article occupies the first card and
+        # will keep drifting as the loop publishes work.
+        with tempfile.TemporaryDirectory() as reference_directory:
+            reference_output = Path(reference_directory) / "site"
+            reference_output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, reference_output)
+            reference_index = json.loads(
+                (reference_output / "research/index.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            first_article_path = reference_index["articles"][0]["path"]
+
         mutations = (
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" hidden role="listitem" data-research-card',
-                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
+                f"research archive card {first_article_path!r} is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" style="display:none" role="listitem" data-research-card',
-                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
+                f"research archive card {first_article_path!r} is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" aria-hidden="true" role="listitem" data-research-card',
-                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
+                f"research archive card {first_article_path!r} is hidden before enhancement",
             ),
             (
                 '<article class="note-card" role="listitem" data-research-card',
                 '<article class="note-card" inert role="listitem" data-research-card',
-                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
+                f"research archive card {first_article_path!r} is hidden before enhancement",
             ),
             (
                 '<div class="research-grid" data-research-results role="list">',
                 '<div class="research-grid" data-research-results role="list" hidden>',
-                "research archive card 'research/sampling-before-serving/' is hidden before enhancement",
+                f"research archive card {first_article_path!r} is hidden before enhancement",
             ),
             (
                 '<h2>The proof did not end when the timer did</h2>',
@@ -3491,8 +3573,11 @@ class PublicSiteTests(unittest.TestCase):
 
             archive_path = output / "research/index.html"
             archive = archive_path.read_text(encoding="utf-8")
+            escaped_original = html.escape(original, quote=True)
+            escaped_changed = html.escape(changed, quote=True)
+            self.assertIn(escaped_original, archive)
             archive_path.write_text(
-                archive.replace(original, changed, 2),
+                archive.replace(escaped_original, escaped_changed, 2),
                 encoding="utf-8",
             )
             failures = validate_public_site.validate(output)
@@ -3501,7 +3586,7 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
             self.assertIn(
-                "research archive card 'research/sampling-before-serving/' has drifted reviewed text",
+                f"research archive card {target['path']!r} has drifted reviewed text",
                 failures,
             )
 

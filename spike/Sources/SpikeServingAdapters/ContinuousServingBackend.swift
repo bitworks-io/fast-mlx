@@ -1,6 +1,7 @@
 import Foundation
 
 import HarnessCore
+import MLXLMCommon
 import ServingCore
 import SpikeCore
 
@@ -21,12 +22,23 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     public let queueRetryAfterSeconds: Int
     public let mailboxCapacity: BoundedDeltaMailbox.Capacity
     public let admission: ContinuousServingAdmissionMode
+    /// Wire format the model uses to emit tool calls. Defaults to `.json` (Llama/Qwen-standard);
+    /// the loader overrides it with the model's inferred format (e.g. `.xmlFunction` for qwen3_5)
+    /// so tool calls parse correctly for non-JSON families.
+    public var toolCallFormat: ToolCallFormat
+    /// Legacy tool-thinking workaround: force `enable_thinking:false` when tools are attached and
+    /// the client did not set it. Set for the very old dense Qwen3 the continuous route serves
+    /// (QwenLM/Qwen3 #1817). The agentic qwen3_5 family is served on the scalar route, which leaves
+    /// this off and respects the template default.
+    public var disableThinkingWhenToolsActive: Bool
 
     public init(
         defaultMaximumCompletionTokens: Int,
         queueRetryAfterSeconds: Int,
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
-        admission: ContinuousServingAdmissionMode = .immediateBatchNoSpec
+        admission: ContinuousServingAdmissionMode = .immediateBatchNoSpec,
+        toolCallFormat: ToolCallFormat = .json,
+        disableThinkingWhenToolsActive: Bool = false
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -41,6 +53,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.queueRetryAfterSeconds = queueRetryAfterSeconds
         self.mailboxCapacity = mailboxCapacity
         self.admission = admission
+        self.toolCallFormat = toolCallFormat
+        self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
     }
 }
 
@@ -61,6 +75,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let promptTokens: [Int]
         let maximumCompletionTokens: Int
         let stopStrings: Set<String>
+        let activeTools: [OpenAIToolSpec]
     }
 
     private struct PendingAdmission {
@@ -80,6 +95,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         var generatedTokenCount = 0
         var detokenizer: any ScalarServingDetokenizer
         var stopFilter: ServingStopStringFilter
+        let toolCallProcessor: ToolCallProcessor?
     }
 
     private let launchedModel: String
@@ -123,6 +139,35 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
     }
 
+    /// Reject a request asking for decode controls the greedy-only continuous route can't apply
+    /// (honesty: never accept sampling or penalties the compiled path would silently ignore). A
+    /// policy-validation failure maps to a 400-class error.
+    private static func rejectUnsupportedDecodeControls(
+        _ request: OpenAIChatCompletionRequest
+    ) throws {
+        let policy: ServingSamplingPolicy
+        do {
+            policy = try ServingSamplingPolicy.resolve(from: request)
+        } catch is ServingSamplingPolicyError {
+            throw OpenAIServingError.invalidRequest(
+                "invalid sampling parameters", param: "temperature")
+        }
+        if case .sampled = policy {
+            throw OpenAIServingError.invalidRequest(
+                "sampling (temperature > 0) is not supported on the continuous-batch route; "
+                    + "send temperature 0 for greedy decoding",
+                param: "temperature")
+        }
+        if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
+            || (request.repetitionPenalty ?? 0) != 0
+        {
+            throw OpenAIServingError.invalidRequest(
+                "presence/frequency/repetition penalties are not supported on the continuous-batch "
+                    + "route (no logit processor on the compiled path)",
+                param: "presence_penalty")
+        }
+    }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
@@ -133,8 +178,18 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ContinuousServingBackendError.invalidStopTokenIDs
         }
+        // The continuous-batch route decodes greedily (the compiled step folds argmax); a sampled
+        // request must be REJECTED here, never silently downgraded to greedy — the honesty
+        // invariant. Native sampling is wired on the scalar route (hybrid models, e.g. Qwen3.8).
+        try Self.rejectUnsupportedDecodeControls(request)
 
-        let promptTokens = try codec.render(messages: request.messages)
+        let activeTools = request.activeTools
+        let promptTokens = try codec.render(
+            messages: request.messages,
+            tools: activeTools,
+            enableThinking: request.resolvedEnableThinking(
+                disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive),
+            reasoningEffort: request.reasoningEffort)
         guard !promptTokens.isEmpty else {
             throw ContinuousServingBackendError.emptyRenderedPrompt
         }
@@ -146,7 +201,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             id: ServingRequestID("continuous-\(UUID().uuidString)"),
             promptTokens: promptTokens,
             maximumCompletionTokens: maximumCompletionTokens,
-            stopStrings: modelStopStrings.union(request.stop))
+            stopStrings: modelStopStrings.union(request.stop),
+            activeTools: activeTools)
         switch configuration.admission {
         case .immediateBatchNoSpec:
             let handles = try await submitToCoordinator(
@@ -570,6 +626,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             onCancelWithReason: { [weak self] reason in
                 await self?.cancel(id: id, reason: reason)
             })
+        let toolCallProcessor: ToolCallProcessor? =
+            prepared.activeTools.isEmpty
+            ? nil
+            : ToolCallProcessor(
+                format: configuration.toolCallFormat,
+                tools: prepared.activeTools.compactMap { $0.raw.asObjectSendable })
         requests[id] = ActiveRequest(
             coordinatorID: coordinatorHandle.id,
             promptTokenCount: prepared.promptTokens.count,
@@ -581,7 +643,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             admissionReleased: admissionReducer == nil,
             detokenizer: codec.makeDetokenizer(),
             stopFilter: ServingStopStringFilter(
-                stopStrings: prepared.stopStrings))
+                stopStrings: prepared.stopStrings),
+            toolCallProcessor: toolCallProcessor)
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -621,13 +684,24 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             guard let request = requests[id] else {
                 throw CancellationError()
             }
-            let finishReason: OpenAIChatFinishReason
+            var finishReason: OpenAIChatFinishReason
             if stoppedByString {
                 finishReason = .stop
             } else if request.generatedTokenCount >= request.maximumCompletionTokens {
                 finishReason = .length
             } else {
                 finishReason = .stop
+            }
+            if let processor = request.toolCallProcessor {
+                // Preserve residual buffered text that was not a tool call (see scalar backend).
+                if let residual = processor.processEOS(returnBufferedText: true), !residual.isEmpty {
+                    try await request.mailbox.send(.text(residual))
+                }
+                if !processor.toolCalls.isEmpty {
+                    try await request.mailbox.send(
+                        .toolCalls(openAIToolCalls(from: processor.toolCalls)))
+                    finishReason = .toolCalls
+                }
             }
             try await request.mailbox.send(
                 .completion(
@@ -682,7 +756,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             try Task.checkCancellation()
         }
         if let text = output?.text {
-            try await request.mailbox.send(.text(text))
+            if let processor = request.toolCallProcessor {
+                if let display = processor.processChunk(text), !display.isEmpty {
+                    try await request.mailbox.send(.text(display))
+                }
+            } else {
+                try await request.mailbox.send(.text(text))
+            }
         }
         try Task.checkCancellation()
         return stopped

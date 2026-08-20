@@ -130,6 +130,8 @@ private func collectControl(
         switch delta {
         case .text(let value):
             text += value
+        case .toolCalls:
+            break
         case .completion(let value):
             completion = value
         }

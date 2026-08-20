@@ -2234,8 +2234,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "index.html",
         render_template(
             template,
-            "fast-mlx — evidence-gated MLX inference",
-            "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+            "fast-mlx — a self-improving MLX inference engine",
+            "A self-improving MLX inference engine for Apple Silicon: an automated loop that researches, tests candidates against exact baselines, and publishes its own results with little human intervention.",
             "",
             home,
             public_path="",

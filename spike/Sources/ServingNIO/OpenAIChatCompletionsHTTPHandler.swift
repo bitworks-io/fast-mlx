@@ -449,13 +449,24 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 let result = try await collectNonStreaming(
                     handle: started,
                     maximumBytes: configuration.maximumNonStreamingResponseBytes)
+                // Separate Qwen `<think>…</think>` reasoning from the visible answer (non-streaming).
+                // With `</think>` present, split at it (unchanged). With no `</think>`, thinking was
+                // truncated mid-reasoning: when this request separates reasoning (the SAME per-request
+                // gate the streaming path uses at line ~620), retro-label the whole output as
+                // reasoning_content with empty content — non-streaming parity with the shipped streaming
+                // Option A contract. Separation off leaves a plain answer as verbatim content, unchanged.
+                let split = ReasoningContentSplitter.split(
+                    result.text,
+                    separationActive: started.separatesReasoning)
                 let response = OpenAIChatCompletionResponse(
                     id: started.responseID,
                     created: started.created,
                     model: started.model,
-                    content: result.text,
+                    content: split.content,
                     finishReason: result.completion.finishReason,
-                    usage: result.completion.usage)
+                    usage: result.completion.usage,
+                    toolCalls: result.toolCalls,
+                    reasoningContent: split.reasoning)
                 try await writeJSONResponse(
                     response,
                     keepAlive: keepAlive,
@@ -607,12 +618,59 @@ private extension OpenAIChatCompletionsHTTPHandler {
     ) async throws -> ServingGenerationCompletion {
         var pending: ServingResponseDelta? = first
         var completion: ServingGenerationCompletion?
+        // When the handle separates reasoning, `.text` deltas are partitioned incrementally into
+        // reasoning_content (before the first `</think>`) and content (after) — matching the
+        // non-streaming ReasoningContentSplitter. When nil, the raw-content path below is byte-identical
+        // to before, so a non-separating stream is completely unchanged.
+        var splitter: StreamingReasoningSplitter? =
+            handle.separatesReasoning ? StreamingReasoningSplitter() : nil
+
+        // Emit a reasoning_content chunk then a content chunk for whatever the splitter produced now
+        // (each side may be nil — held-back bytes emit nothing this call).
+        func emitSplit(_ piece: (reasoning: String?, content: String?)) async throws {
+            if let reasoning = piece.reasoning {
+                try await waitUntilWritable(
+                    writabilityGate,
+                    timeout: configuration.backpressureStallTimeout)
+                let chunk = OpenAIChatCompletionChunk(
+                    id: handle.responseID,
+                    created: handle.created,
+                    model: handle.model,
+                    index: 0,
+                    delta: .init(role: nil, content: nil, reasoningContent: reasoning),
+                    finishReason: nil)
+                try await writeBody(
+                    chunk.sseEvent(),
+                    channel: channel,
+                    timeout: configuration.backpressureStallTimeout)
+            }
+            if let content = piece.content {
+                try await waitUntilWritable(
+                    writabilityGate,
+                    timeout: configuration.backpressureStallTimeout)
+                let chunk = OpenAIChatCompletionChunk(
+                    id: handle.responseID,
+                    created: handle.created,
+                    model: handle.model,
+                    index: 0,
+                    delta: .init(role: nil, content: content),
+                    finishReason: nil)
+                try await writeBody(
+                    chunk.sseEvent(),
+                    channel: channel,
+                    timeout: configuration.backpressureStallTimeout)
+            }
+        }
 
         while let event = pending {
             switch event {
             case .text(let text):
                 guard completion == nil else {
                     throw RunError.missingCompletion
+                }
+                if splitter != nil {
+                    try await emitSplit(splitter!.consume(text))
+                    break
                 }
                 try await waitUntilWritable(
                     writabilityGate,
@@ -628,6 +686,64 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     chunk.sseEvent(),
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
+            case .toolCalls(let calls):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                // Emit OpenAI streaming tool-call deltas: a head chunk (id + type + name) then an
+                // arguments chunk (the JSON string as a single fragment). `index` distinguishes
+                // parallel calls. The terminal finish chunk (finish_reason "tool_calls") is sent
+                // by writeSSETerminal from the completion.
+                for (toolIndex, call) in calls.enumerated() {
+                    try await waitUntilWritable(
+                        writabilityGate,
+                        timeout: configuration.backpressureStallTimeout)
+                    let head = OpenAIChatCompletionChunk(
+                        id: handle.responseID,
+                        created: handle.created,
+                        model: handle.model,
+                        index: 0,
+                        delta: .init(
+                            role: nil,
+                            content: nil,
+                            toolCalls: [
+                                OpenAIToolCallDelta(
+                                    index: toolIndex,
+                                    id: call.id,
+                                    type: "function",
+                                    function: .init(name: call.function.name, arguments: nil))
+                            ]),
+                        finishReason: nil)
+                    try await writeBody(
+                        head.sseEvent(),
+                        channel: channel,
+                        timeout: configuration.backpressureStallTimeout)
+                    if !call.function.arguments.isEmpty {
+                        try await waitUntilWritable(
+                            writabilityGate,
+                            timeout: configuration.backpressureStallTimeout)
+                        let argumentsChunk = OpenAIChatCompletionChunk(
+                            id: handle.responseID,
+                            created: handle.created,
+                            model: handle.model,
+                            index: 0,
+                            delta: .init(
+                                role: nil,
+                                content: nil,
+                                toolCalls: [
+                                    OpenAIToolCallDelta(
+                                        index: toolIndex,
+                                        id: nil,
+                                        type: nil,
+                                        function: .init(name: nil, arguments: call.function.arguments))
+                                ]),
+                            finishReason: nil)
+                        try await writeBody(
+                            argumentsChunk.sseEvent(),
+                            channel: channel,
+                            timeout: configuration.backpressureStallTimeout)
+                    }
+                }
             case .completion(let value):
                 guard completion == nil else {
                     throw RunError.missingCompletion
@@ -635,6 +751,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 completion = value
             }
             pending = try await handle.mailbox.next()
+        }
+
+        // Flush any bytes the splitter held back (partial closing tag, trailing whitespace).
+        if splitter != nil {
+            try await emitSplit(splitter!.flush())
         }
 
         guard let completion else {
@@ -646,9 +767,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
     static func collectNonStreaming(
         handle: ServingGenerationHandle,
         maximumBytes: Int
-    ) async throws -> (text: String, completion: ServingGenerationCompletion) {
+    ) async throws -> (text: String, toolCalls: [OpenAIToolCall], completion: ServingGenerationCompletion) {
         var text = ""
         var byteCount = 0
+        var toolCalls: [OpenAIToolCall] = []
         var completion: ServingGenerationCompletion?
         while let event = try await handle.mailbox.next() {
             switch event {
@@ -661,6 +783,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     throw RunError.responseLimitExceeded
                 }
                 text += delta
+            case .toolCalls(let calls):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                toolCalls.append(contentsOf: calls)
             case .completion(let value):
                 guard completion == nil else {
                     throw RunError.missingCompletion
@@ -671,7 +798,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         guard let completion else {
             throw RunError.missingCompletion
         }
-        return (text, completion)
+        return (text, toolCalls, completion)
     }
 
     static func writeSSEHead(

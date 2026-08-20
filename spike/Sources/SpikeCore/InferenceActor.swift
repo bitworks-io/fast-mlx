@@ -1,15 +1,71 @@
 import Foundation
 
+/// Per-request token-selection policy handed to the decoder before a bounded generation.
+///
+/// `.greedy` is argmax (temperature 0 or unspecified) — the default, byte-identical to the
+/// prior behavior. `.sampled` carries the resolved knobs the vendored `TopPSampler` honors
+/// (temperature, top-p, top-k, min-p, seed). This is the runtime-side mirror of ServingCore's
+/// `ServingSamplingPolicy`; the serving adapter bridges one to the other. Repetition/presence/
+/// frequency penalties are modeled separately as `DecoderPenalties` (they compose with greedy or
+/// sampled decode alike).
+public enum DecoderSampling: Equatable, Sendable {
+    case greedy
+    case sampled(temperature: Double, topP: Double, topK: Int?, minP: Double?, seed: Int64?)
+}
+
+/// Per-request logit penalties, applied to the logits BEFORE token selection so they compose with
+/// either greedy or sampled decode. `nil`/zero means no penalty (the default, unchanged behavior).
+/// OpenAI-style `presence`/`frequency` in [-2, 2]; HF-style `repetition` > 0 (1.0 = none). Wired to
+/// the vendored `PenaltyProcessor` via `GenerateParameters.processor()`.
+public struct DecoderPenalties: Equatable, Sendable {
+    public var presencePenalty: Double?
+    public var frequencyPenalty: Double?
+    public var repetitionPenalty: Double?
+
+    public static let none = DecoderPenalties()
+
+    public init(
+        presencePenalty: Double? = nil,
+        frequencyPenalty: Double? = nil,
+        repetitionPenalty: Double? = nil
+    ) {
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.repetitionPenalty = repetitionPenalty
+    }
+
+    /// True when no penalty is requested — the decoder then uses no logit processor (byte-identical
+    /// to the prior behavior). A zero penalty counts as "none" (matches the vendored `processor()`).
+    public var isEmpty: Bool {
+        (presencePenalty ?? 0) == 0 && (frequencyPenalty ?? 0) == 0 && (repetitionPenalty ?? 0) == 0
+    }
+}
+
 /// Abstraction over "one decode step" so the actor's loop is testable without MLX.
 public protocol Decoder {
     /// Prefill the prompt and return the first token id.
     mutating func prefill(_ promptTokens: [Int]) -> Int
-    /// Given the last token, produce the next. (Greedy; temp=0.)
+    /// Given the last token, produce the next.
     mutating func step(last: Int) -> Int
     /// Discard any per-conversation state (e.g. KV cache) so the next `prefill` starts
     /// fresh, without reconstructing the decoder (and re-crossing the actor boundary with
     /// a fresh non-Sendable model reference — see MLXDecoder.reset()).
     mutating func reset()
+    /// Configure token selection for the NEXT generation. The default is a no-op, so a
+    /// decoder that only supports greedy decode (e.g. the compiled path) stays greedy and
+    /// existing conformers need no change. A decoder that ignores a `.sampled` request must
+    /// never be reached by one — the serving layer rejects sampling on unsupported routes
+    /// rather than silently downgrading to greedy.
+    mutating func setSampling(_ sampling: DecoderSampling)
+    /// Configure logit penalties for the NEXT generation (applied before token selection). Default
+    /// no-op, so decoders that don't support penalties are unchanged; the serving layer only routes
+    /// penalized requests to a decoder that honors them.
+    mutating func setPenalties(_ penalties: DecoderPenalties)
+}
+
+extension Decoder {
+    public mutating func setSampling(_ sampling: DecoderSampling) {}
+    public mutating func setPenalties(_ penalties: DecoderPenalties) {}
 }
 
 /// Test double: replays a fixed script.
@@ -103,12 +159,16 @@ public actor InferenceActor {
         promptTokens: [Int],
         maxTokens: Int,
         eos: Int,
+        sampling: DecoderSampling = .greedy,
+        penalties: DecoderPenalties = .none,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
         try await generateBounded(
             promptTokens: promptTokens,
             maxTokens: maxTokens,
             stopTokenIDs: [eos],
+            sampling: sampling,
+            penalties: penalties,
             consume: consume)
     }
 
@@ -117,6 +177,8 @@ public actor InferenceActor {
         promptTokens: [Int],
         maxTokens: Int,
         stopTokenIDs: Set<Int>,
+        sampling: DecoderSampling = .greedy,
+        penalties: DecoderPenalties = .none,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
         guard !promptTokens.isEmpty else {
@@ -134,8 +196,12 @@ public actor InferenceActor {
 
         boundedGenerationActive = true
         decoder.reset()
+        decoder.setSampling(sampling)
+        decoder.setPenalties(penalties)
         defer {
             decoder.reset()
+            decoder.setSampling(.greedy)
+            decoder.setPenalties(.none)
             boundedGenerationActive = false
         }
 

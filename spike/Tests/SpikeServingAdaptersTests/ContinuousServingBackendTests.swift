@@ -47,6 +47,57 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// The continuous-batch route decodes greedily (the compiled step folds argmax). A sampled
+    /// request (temperature > 0) must be REJECTED here, never silently downgraded to greedy — the
+    /// honesty invariant that replaces the removed global `temperature must be 0` guard. Native
+    /// sampling is served on the scalar route used by hybrid models (e.g. Qwen3.8).
+    func testContinuousBatchRouteRejectsSampledRequestInsteadOfSilentGreedy()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        var sampled = request(text: "solo", maxTokens: 2)
+        sampled.temperature = 1.0
+
+        do {
+            _ = try await backend.start(sampled)
+            XCTFail("continuous route must reject a sampled request, not serve it greedily")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequest(_, let param) = error else {
+                XCTFail("expected invalidRequest, got \(error)")
+                await backend.shutdown()
+                return
+            }
+            XCTAssertEqual(param, "temperature")
+        }
+
+        // A penalized request (greedy — temp 0 — but presence_penalty > 0) is ALSO rejected: the
+        // compiled continuous path has no logit processor, so accepting it would be a silent no-op.
+        var penalized = request(text: "solo", maxTokens: 2)
+        penalized.presencePenalty = 1.5
+        do {
+            _ = try await backend.start(penalized)
+            XCTFail("continuous route must reject a penalized request")
+        } catch is OpenAIServingError {
+            // expected
+        }
+        await backend.shutdown()
+    }
+
     func testDynamicAdmissionTwoHeldRequestsExpireAsAtomicBatchNoSpec()
         async throws
     {
@@ -1726,7 +1777,12 @@ private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
     let pieces: [Int: String]
     let renderGate: BlockingRuntimeResourceSnapshotGate?
 
-    func render(messages: [OpenAIChatMessage]) throws -> [Int] {
+    func render(
+        messages: [OpenAIChatMessage],
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?,
+        reasoningEffort: String?
+    ) throws -> [Int] {
         renderGate?.wait()
         guard let text = messages.last?.text,
             let prompt = promptByText[text]

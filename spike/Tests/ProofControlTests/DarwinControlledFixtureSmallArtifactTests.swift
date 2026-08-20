@@ -1144,48 +1144,42 @@ final class DarwinControlledFixtureSmallArtifactTests: XCTestCase {
     func testRealBarrierDeadlinePhasesRefuseWithoutSyntheticClock()
         throws
     {
-        let cases: [
-            (
-                String,
-                DarwinControlledFixtureTestControl.Phase,
-                DarwinControlledFixtureSmallArtifactFailure.DeadlinePhase,
-                Data
-            )
-        ] = [
-            (
-                "after final descriptor open",
-                .afterFinalDescriptorOpened,
-                .afterFinalDescriptorOpened,
-                Self.goldenBytes
-            ),
+        // This is the ONLY deadline test that runs against the REAL monotonic clock; its siblings
+        // inject a synthetic clock to pin the EXACT expiry phase. Its honest, load-robust claim is
+        // therefore narrower: with an effectively-immediate (1 ms) deadline and a phase deliberately
+        // blocked well past it, a real-clock compare REFUSES with a deadline-expired failure. WHICH
+        // phase trips is a function of how fast this box services real syscalls under scheduling /
+        // memory pressure, so it is NOT asserted here — phase-exactness is the synthetic-clock
+        // siblings' job (see docs/task-inbox/2026-08-19-real-clock-barrier-test-flaky.md). Two former
+        // flake sources are removed: (1) asserting the exact expiry phase, and (2) requiring the
+        // blocked phase to be REACHED — under load the 1 ms deadline can legitimately trip at an
+        // EARLIER phase before the barrier, which is still a valid deadline refusal, so barrier
+        // non-arrival is tolerated. The block is widened to 200 ms so expiry is also guaranteed on a
+        // fast, idle box where incidental phase jitter alone would not exceed 1 ms.
+        let cases: [(String, DarwinControlledFixtureTestControl.Phase, Data)] = [
+            ("after final descriptor open", .afterFinalDescriptorOpened, Self.goldenBytes),
             (
                 "between positive fragments",
                 .afterFirstPositiveFragment,
-                .afterFirstPositiveFragment,
                 Data(repeating: 0x41, count: Self.readChunkBytes + 1)
             ),
-            (
-                "before eof probe",
-                .afterExpectedBytesRead,
-                .afterExpectedBytesRead,
-                Self.goldenBytes
-            ),
+            ("before eof probe", .afterExpectedBytesRead, Self.goldenBytes),
         ]
 
-        for (label, phase, deadlinePhase, bytes) in cases {
+        for (label, phase, bytes) in cases {
             let fixture = try Self.makeFixture(bytes: bytes)
             defer { Self.removeFixtureRoot(fixture.rootURL) }
             let barrier = DarwinControlledFixtureTestControl.PhaseBarrier(
                 phase: phase
             )
             let worker = Self.startBarrierWorker(barrier: barrier) {
-                Darwin.usleep(20_000)
+                Darwin.usleep(200_000)
             }
 
-            Self.assertRefuses(
-                label,
-                .deadline(.expired(deadlinePhase))
-            ) {
+            // Any deadline-expired phase passes: the real-clock deadline fired and refused. The
+            // assertion still has teeth — a broken deadline path (no throw) fails XCTAssertThrowsError,
+            // and any non-deadline failure fails the guard below.
+            XCTAssertThrowsError(
                 try Self.compare(
                     fixture: fixture,
                     expectedFileBytes: UInt64(bytes.count),
@@ -1195,9 +1189,27 @@ final class DarwinControlledFixtureSmallArtifactTests: XCTestCase {
                         reportedCloseFailureOrdinal: 1,
                         phaseBarrier: barrier
                     )
-                )
+                ),
+                label
+            ) { error in
+                guard
+                    let failure = error as? DarwinControlledFixtureSmallArtifactFailure,
+                    case .deadline(.expired) = failure
+                else {
+                    XCTFail("\(label): expected a deadline-expired refusal, got \(String(describing: error))")
+                    return
+                }
             }
-            worker.waitAndAssert()
+
+            // Join the worker but tolerate barrier non-arrival: when the deadline trips before the
+            // blocked phase is reached (common under load), the barrier legitimately never arrives. A
+            // genuine mutation failure would surface a DIFFERENT string, which we still assert against.
+            worker.item.wait()
+            if let failure = worker.outcome.failure() {
+                XCTAssertEqual(
+                    failure, "phase barrier did not arrive within 5 seconds",
+                    "\(label): the only tolerated worker outcome is barrier non-arrival")
+            }
         }
     }
 

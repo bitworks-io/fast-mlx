@@ -16,7 +16,10 @@ final class MLXScalarServingTests: XCTestCase {
                 OpenAIChatMessage(role: .system, text: "system text"),
                 OpenAIChatMessage(role: .user, text: "user text"),
                 OpenAIChatMessage(role: .assistant, text: "assistant text"),
-            ])
+            ],
+            tools: [],
+            enableThinking: nil,
+            reasoningEffort: nil)
 
         XCTAssertEqual(tokens, [41, 42])
     }
@@ -147,6 +150,132 @@ final class MLXScalarServingTests: XCTestCase {
         XCTAssertEqual(validated.modelDirectory.path, "/tmp")
         XCTAssertEqual(validated.memoryLimitBytes, 4_096)
         XCTAssertEqual(validated.cacheLimitBytes, 1_024)
+    }
+
+    func testStartupReportMemoryFieldsFragmentRendersSnakeCaseBytes() {
+        let report = ScalarServingModelStartupReport(
+            launchedModel: "fixture",
+            route: .scalarGreedy,
+            memoryLimitBytes: 8,
+            cacheLimitBytes: 4,
+            stopTokenCount: 1,
+            stopStringCount: 0,
+            nativeCacheKinds: [.denseAttention],
+            startupPromptTokenCount: 2,
+            startupGeneratedTokenCount: 1,
+            resetParityVerified: true,
+            mlxActiveBytes: 5_540_000_000,
+            mlxCacheBytes: 1_073_741_824,
+            mlxPeakBytes: 6_000_000_000)
+        XCTAssertEqual(
+            report.memoryFieldsFragment,
+            "mlx_active_bytes=5540000000 mlx_cache_bytes=1073741824 "
+                + "mlx_peak_bytes=6000000000")
+    }
+
+    func testStartupReportMemoryFieldsDefaultToZeroWhenUnspecified() {
+        // Backward-compatible init: existing construction sites that don't pass MLX
+        // memory get a well-defined zero fragment, never a crash or garbage bytes.
+        let report = ScalarServingModelStartupReport(
+            launchedModel: "fixture",
+            route: .scalarGreedy,
+            memoryLimitBytes: 8,
+            cacheLimitBytes: 4,
+            stopTokenCount: 1,
+            stopStringCount: 0,
+            nativeCacheKinds: [.denseAttention],
+            startupPromptTokenCount: 2,
+            startupGeneratedTokenCount: 1,
+            resetParityVerified: true)
+        XCTAssertEqual(
+            report.memoryFieldsFragment,
+            "mlx_active_bytes=0 mlx_cache_bytes=0 mlx_peak_bytes=0")
+    }
+
+    // MARK: - qwen3_5 scalar-route gated-delta kernel viability guard (Dk%32)
+
+    /// VL-wrapped qwen3_5 config with `linear_key_head_dim = 48` — a valid positive-integer geometry the
+    /// gated-delta Metal kernel cannot serve (Dk not divisible by 32). Mirrors the continuous adapter's
+    /// incr-4 fixture, exercised here on the DEFAULT scalar route the family falls back to.
+    private func qwen35UnalignedDkConfigJSON() -> String {
+        #"""
+        {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+         "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+           "vocab_size":248320,"num_hidden_layers":48,"full_attention_interval":4,
+           "num_key_value_heads":8,"head_dim":128,"torch_dtype":"bfloat16",
+           "linear_num_key_heads":16,"linear_num_value_heads":32,
+           "linear_key_head_dim":48,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+        """#
+    }
+
+    /// Same shape with `linear_key_head_dim = 128` (a multiple of 32) — the kernel can serve it, so the
+    /// pre-load guard must NOT fire (the probe returns 128 and 128 % 32 == 0).
+    private func qwen35AlignedDkConfigJSON() -> String {
+        #"""
+        {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+         "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+           "vocab_size":248320,"num_hidden_layers":48,"full_attention_interval":4,
+           "num_key_value_heads":8,"head_dim":128,"torch_dtype":"bfloat16",
+           "linear_num_key_heads":16,"linear_num_value_heads":32,
+           "linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+        """#
+    }
+
+    private func writeConfigDirectory(_ json: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scalar-serving-guard-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try Data(json.utf8).write(
+            to: directory.appendingPathComponent("config.json"))
+        return directory
+    }
+
+    /// Acceptance: a qwen3_5 checkpoint whose Dk is not a multiple of 32 is refused on the scalar route
+    /// BEFORE any weight load — the family's default (un-flagged) path fails closed rather than
+    /// truncating/faulting in the gated-delta Metal kernel at decode.
+    func testScalarQwen35RejectsUnalignedKeyHeadDimBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(qwen35UnalignedDkConfigJSON())
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen3_5-scalar-fallback",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: ScalarServingBackendConfiguration(
+                        defaultMaximumCompletionTokens: 12,
+                        maximumQueuedRequests: 1,
+                        queueRetryAfterSeconds: 1,
+                        mailboxCapacity: .init(maxDeltas: 4, maxBytes: 16 * 1_024))))
+            XCTFail("Dk not divisible by 32 must fail closed before weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .hybridKernelKeyHeadDimUnaligned(48))
+        }
+    }
+
+    /// The pre-load probe reads the qwen3_5 recurrent Dk from config.json without loading weights: 48
+    /// (unaligned) and 128 (aligned) are surfaced exactly; a dense (non-qwen3_5) config and an absent
+    /// config both return nil, so the guard is a strict no-op off the hybrid family.
+    func testScalarQwen35KeyHeadDimProbeIsFamilyScoped() throws {
+        let unaligned = try writeConfigDirectory(qwen35UnalignedDkConfigJSON())
+        defer { try? FileManager.default.removeItem(at: unaligned) }
+        XCTAssertEqual(
+            scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: unaligned), 48)
+
+        let aligned = try writeConfigDirectory(qwen35AlignedDkConfigJSON())
+        defer { try? FileManager.default.removeItem(at: aligned) }
+        XCTAssertEqual(
+            scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: aligned), 128)
+
+        let dense = try writeConfigDirectory(#"{"model_type":"qwen3","num_hidden_layers":4}"#)
+        defer { try? FileManager.default.removeItem(at: dense) }
+        XCTAssertNil(scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: dense))
+
+        let absent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scalar-serving-guard-absent-\(UUID().uuidString)", isDirectory: true)
+        XCTAssertNil(scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: absent))
     }
 }
 

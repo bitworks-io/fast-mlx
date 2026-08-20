@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -158,6 +159,22 @@ class PublicStatusPageTests(unittest.TestCase):
             self.assertEqual(validate_public_site.validate(output), [])
 
             original_page = page
+            # Derive the implemented-count marker from the reviewed page itself rather than
+            # hard-coding the number: the count tracks the manifest (was 4, now 6, will drift again),
+            # and this mutation subtest only needs a marker present exactly once to prove the seal
+            # catches a tampered count. Keeping it count-agnostic stops the test going stale on every
+            # capability that ships.
+            implemented_marker_match = re.search(
+                r'data-status-count="implemented" data-count="\d+"', original_page
+            )
+            self.assertIsNotNone(
+                implemented_marker_match,
+                "status page must expose an implemented data-count marker",
+            )
+            implemented_marker = implemented_marker_match.group(0)
+            implemented_marker_tampered = re.sub(
+                r'data-count="\d+"', 'data-count="99"', implemented_marker
+            )
             mutations = (
                 (
                     "authority insertion",
@@ -179,8 +196,8 @@ class PublicStatusPageTests(unittest.TestCase):
                 ),
                 (
                     "status drift",
-                    'data-status-count="implemented" data-count="4"',
-                    'data-status-count="implemented" data-count="99"',
+                    implemented_marker,
+                    implemented_marker_tampered,
                     "status/index.html does not match the reviewed page seal",
                 ),
             )

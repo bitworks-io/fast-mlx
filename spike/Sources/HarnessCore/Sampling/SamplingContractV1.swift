@@ -1,8 +1,8 @@
 import CryptoKit
 import Foundation
 
-enum SamplingContractFailure: Error, Equatable, Sendable {
-    enum NonFiniteKind: Equatable, Sendable {
+public enum SamplingContractFailure: Error, Equatable, Sendable {
+    public enum NonFiniteKind: Equatable, Sendable {
         case nan
         case positiveInfinity
         case negativeInfinity
@@ -23,31 +23,31 @@ enum SamplingContractFailure: Error, Equatable, Sendable {
     case invalidSelectedTokenIndex(Int)
 }
 
-enum SamplingContractV1 {
-    static let contractVersionTag = "fast-mlx-sampling-contract-v1"
+public enum SamplingContractV1 {
+    public static let contractVersionTag = "fast-mlx-sampling-contract-v1"
     static let randomWordPreimagePrefix = "fast-mlx-sampling-rng-v1\n"
     static let tokenSelectionDomain: UInt32 = 0
     static let maximumVocabularyCount = 262_144
     static let uniformDenominator = 4_503_599_627_370_496.0
 }
 
-struct SamplingSeedV1: Equatable, Sendable {
+public struct SamplingSeedV1: Equatable, Sendable {
     let resolvedSeedBitPattern: UInt64
 
     private init(resolvedSeedBitPattern: UInt64) {
         self.resolvedSeedBitPattern = resolvedSeedBitPattern
     }
 
-    static func callerSupplied(_ seed: Int64) -> SamplingSeedV1 {
+    public static func callerSupplied(_ seed: Int64) -> SamplingSeedV1 {
         SamplingSeedV1(resolvedSeedBitPattern: UInt64(bitPattern: seed))
     }
 }
 
-struct SamplingPolicyV1: Equatable, Sendable {
-    let contractVersionTag: String
-    let temperature: Double
-    let topP: Double
-    let seed: SamplingSeedV1?
+public struct SamplingPolicyV1: Equatable, Sendable {
+    public let contractVersionTag: String
+    public let temperature: Double
+    public let topP: Double
+    public let seed: SamplingSeedV1?
 
     private init(
         contractVersionTag: String,
@@ -61,7 +61,7 @@ struct SamplingPolicyV1: Equatable, Sendable {
         self.seed = seed
     }
 
-    static func greedy() -> SamplingPolicyV1 {
+    public static func greedy() -> SamplingPolicyV1 {
         SamplingPolicyV1(
             contractVersionTag: SamplingContractV1.contractVersionTag,
             temperature: 0.0,
@@ -69,7 +69,7 @@ struct SamplingPolicyV1: Equatable, Sendable {
             seed: nil)
     }
 
-    static func sampled(
+    public static func sampled(
         temperature: Double = 1,
         topP: Double = 1,
         seed: SamplingSeedV1

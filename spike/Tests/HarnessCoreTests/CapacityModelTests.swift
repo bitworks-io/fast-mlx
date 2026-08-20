@@ -29,20 +29,57 @@ final class CapacityModelTests: XCTestCase {
         assertClose(kv / gib, 3.0, "Qwen3-30B-A3B KV@32K")
     }
 
-    /// Qwen3.6-35B-A3B (hybrid-linear): KV @32K ≈ 0.625 GiB, AND ≈4x below the naive
-    /// all-layers-uniform calc (proves the dispatch — not just the class label — matters). Spec §2.2.
+    /// Qwen3.6-35B-A3B (hybrid-linear). The spec §2.2 confirmed number is the GROWING attention term
+    /// alone: KV @32K ≈ 0.625 GiB (20 KiB/tok × 32K), AND ≈4x below the naive all-layers-uniform calc
+    /// (proves the dispatch — not just the class label — matters). The separately-reconciled fixed
+    /// GatedDeltaNet recurrent+conv state (`fixedStateBytes`) is pinned on its own below so the
+    /// spec-confirmed growing term keeps its exact provenance (`kvBytesForContext` adds both).
     func testHybridLinear_Qwen36_35B_KVAt32K_and4xBelowNaive() {
         let m = model("Qwen3.6-35B-A3B")
-        let kv = CapacityModel.kvBytesForContext(m, context: 32768, kvQuant: .fp16, concurrency: 1)
-        assertClose(kv / gib, 0.625, "Qwen3.6-35B-A3B KV@32K")
+        // Spec §2.2 confirmed the growing attention term only; assert it on its own accessor so the
+        // 0.625 GiB reconciliation stays exact independent of the fixed state.
+        let growingKV = CapacityModel.kvBytesPerToken(m, kvQuant: .fp16) * 32768
+        assertClose(growingKV / gib, 0.625, "Qwen3.6-35B-A3B growing KV@32K")
 
-        // Naive: treat every layer as uniform-GQA (ignore the hybrid-linear dispatch entirely).
+        // Fixed per-sequence GatedDeltaNet state, reconciled from the real text_config linear_* geometry
+        // (30 linear layers × 2,146,304 B = conv 49,152 + ssm 2,097,152). Pinned as a constant, not
+        // folded into the spec's growing number.
+        XCTAssertEqual(m.fixedStateBytes, 64_389_120)
+
+        // Naive: treat every layer as uniform-GQA (ignore the hybrid-linear dispatch entirely). Compare
+        // growing-vs-growing so the fixed term stays orthogonal to the dispatch ratio.
         let naive = ModelArchProfile(
             id: "naive-uniform-comparator", modelType: .uniformGQA, nLayers: m.nLayers, nAttnLayers: m.nLayers,
             nKVHeads: m.nKVHeads, headDim: m.headDim, nativeMaxContext: m.nativeMaxContext,
             weightsBytes4bitEstimate: m.weightsBytes4bitEstimate, license: m.license)
-        let naiveKV = CapacityModel.kvBytesForContext(naive, context: 32768, kvQuant: .fp16, concurrency: 1)
-        assertClose(naiveKV / kv, 4.0, "naive/dispatched ratio")
+        let naiveGrowingKV = CapacityModel.kvBytesPerToken(naive, kvQuant: .fp16) * 32768
+        assertClose(naiveGrowingKV / growingKV, 4.0, "naive/dispatched ratio")
+    }
+
+    /// Qwen3.5-9B (hybrid-linear, live hybrid-serving checkpoint): 8 of 32 layers grow a KV cache
+    /// (full_attention_interval 4), nKVHeads 4 × head_dim 256 → 32 KiB/tok → exactly 1.0 GiB @ 32K
+    /// growing, AND 4x below the naive all-32-layers calc. Confirmed from the checkpoint's config.json.
+    /// The 24 linear layers' fixed GatedDeltaNet state is pinned separately below.
+    func testHybridLinear_Qwen35_9B_KVAt32K_and4xBelowNaive() {
+        let m = model("Qwen3.5-9B")
+        XCTAssertTrue(m.isKVDerivable, "Qwen3.5-9B KV must be derivable (nAttnLayers > 0)")
+        // Growing attention term only (kvBytesForContext also adds fixedStateBytes); the spec-confirmed
+        // 1.0 GiB is the growing term, held to tol 0.001 because 8×4×256×2×2 B reconciles exactly.
+        let growingKV = CapacityModel.kvBytesPerToken(m, kvQuant: .fp16) * 32768
+        assertClose(growingKV / gib, 1.0, tolerance: 0.001, "Qwen3.5-9B growing KV@32K")
+
+        // Fixed per-sequence recurrent+conv state (24 linear layers × 2,146,304 B = conv 49,152 + ssm
+        // 2,097,152), reconciled from the checkpoint's config.json linear_* geometry.
+        XCTAssertEqual(m.fixedStateBytes, 51_511_296)
+
+        // Naive: treat every layer as uniform-GQA (ignore the hybrid-linear dispatch entirely). Compare
+        // growing-vs-growing so the fixed term stays orthogonal to the dispatch ratio.
+        let naive = ModelArchProfile(
+            id: "naive-uniform-comparator", modelType: .uniformGQA, nLayers: m.nLayers, nAttnLayers: m.nLayers,
+            nKVHeads: m.nKVHeads, headDim: m.headDim, nativeMaxContext: m.nativeMaxContext,
+            weightsBytes4bitEstimate: m.weightsBytes4bitEstimate, license: m.license)
+        let naiveGrowingKV = CapacityModel.kvBytesPerToken(naive, kvQuant: .fp16) * 32768
+        assertClose(naiveGrowingKV / growingKV, 4.0, "naive/dispatched ratio")
     }
 
     /// Gemma-3-27B (interleaved-SWA): KV @32K ≈ 2.91 GiB (global growth + local-capped fixed term). Spec §2.2.
@@ -71,6 +108,89 @@ final class CapacityModelTests: XCTestCase {
         let perTokenBytes = CapacityModel.kvBytesPerToken(m, kvQuant: .fp16)
         let mib = 1024.0 * 1024.0
         assertClose(perTokenBytes / mib, 4.88, tolerance: 0.05, "DeepSeek-R1 KV/token")
+    }
+
+    // MARK: - dual-geometry SWA (Baichuan-M1): DIFFERENT geometry per layer class + fixed state
+
+    /// Baichuan-M1-14B (`.dualGeometrySWA`): the growing term uses GLOBAL geometry, the window-capped
+    /// term uses SWA geometry (2× the head product), and a per-layer conv state is added on top —
+    /// all three simultaneously. Exact integers hand-computed from the source-verified 14B config
+    /// (docs/task-inbox/2026-08-19-baichuan-m1-dual-geometry-arch-reach.md): 40 layers = 20 global
+    /// (kv 2 × dim 256) + 20 SWA (kv 8 × dim 128), window 8192.
+    private func baichuanM1() -> ModelArchProfile {
+        ModelArchProfile(
+            id: "Baichuan-M1-14B", modelType: .dualGeometrySWA, nLayers: 40, nAttnLayers: 20,
+            nKVHeads: 2, headDim: 256, slidingWindow: 8192, fixedStateBytes: 122_880,
+            nativeMaxContext: 32_768, weightsBytes4bitEstimate: 7 * 1024 * 1024 * 1024,
+            license: "Apache-2.0", swaKVHeads: 8, swaHeadDim: 128)
+    }
+
+    func testDualGeometrySWA_BaichuanM1_growingTermUsesGlobalGeometry() {
+        // 20 global layers × 2 kv × 256 dim × 2 (K+V) × 2 B (fp16) = 40,960 B/token.
+        XCTAssertEqual(CapacityModel.kvBytesPerToken(baichuanM1(), kvQuant: .fp16), 40_960)
+    }
+
+    func testDualGeometrySWA_BaichuanM1_windowCapUsesSWAGeometryNotGlobal() {
+        // 20 SWA layers × 8 kv × 128 dim × 2 (K+V) × 2 B × 8192-token window = 671,088,640 B.
+        let swaCap = CapacityModel.swaFixedLocalBytes(baichuanM1(), kvQuant: .fp16)
+        XCTAssertEqual(swaCap, 671_088_640)
+        // Forcing the GLOBAL head product (512) instead of the SWA product (1024) would halve this to
+        // 335,544,320 B — a 320 MiB/seq PHANTOM-GREEN under-count. Assert the correct term is exactly
+        // 2× that, i.e. the SWA geometry is honored, not silently borrowed from the global layers.
+        XCTAssertEqual(swaCap, 2 * 335_544_320)
+    }
+
+    func testDualGeometrySWA_BaichuanM1_perSequenceAddsAllThreeTerms() {
+        // grow(40,960 × 32768 = 1,342,177,280) + swaCap(671,088,640) + fixedState(122,880).
+        // Unlike .interleavedSWA, the fixed conv state is NOT dropped for this class.
+        let perSeq = CapacityModel.kvBytesForContext(baichuanM1(), context: 32_768, kvQuant: .fp16, concurrency: 1)
+        XCTAssertEqual(perSeq, 2_013_388_800)
+        // concurrency multiplies the whole per-sequence total.
+        let at4 = CapacityModel.kvBytesForContext(baichuanM1(), context: 32_768, kvQuant: .fp16, concurrency: 4)
+        XCTAssertEqual(at4, 4 * 2_013_388_800)
+    }
+
+    /// Asymmetric K/V (mimo_v2_flash shape): K cached at `headDim`, V at a narrower `vHeadDim`, on both
+    /// layer classes. The growing/cap terms size K and V separately (`headDim + vHeadDim`), never
+    /// `2×headDim`. Constructed from the real MiMo-V2-Flash geometry (9 global + 39 SWA, K 192 / V 128).
+    private func mimoV2Flash() -> ModelArchProfile {
+        ModelArchProfile(
+            id: "MiMo-V2-Flash", modelType: .dualGeometrySWA, nLayers: 48, nAttnLayers: 9,
+            nKVHeads: 4, headDim: 192, slidingWindow: 128, fixedStateBytes: 0,
+            nativeMaxContext: 262_144, weightsBytes4bitEstimate: 12 * 1024 * 1024 * 1024,
+            license: "Apache-2.0", swaKVHeads: 8, swaHeadDim: 192,
+            vHeadDim: 128, swaVHeadDim: 128)
+    }
+
+    func testDualGeometrySWA_MimoV2Flash_asymmetricKVSizesKAndVSeparately() {
+        let m = mimoV2Flash()
+        // grow: 9 global × 4 kv × (192 K + 128 V) × 2 B = 23,040 B/token
+        XCTAssertEqual(CapacityModel.kvBytesPerToken(m, kvQuant: .fp16), 23_040)
+        // SWA cap: 39 SWA × 8 kv × (192 + 128) × 2 B × 128 window = 25,559,040 B
+        XCTAssertEqual(CapacityModel.swaFixedLocalBytes(m, kvQuant: .fp16), 25_559_040)
+        // KV@32K/seq = grow(23,040)×32768 + cap(25,559,040) + fixedState(0) = 780,533,760 B;
+        // concurrency multiplies it.
+        XCTAssertEqual(
+            CapacityModel.kvBytesForContext(m, context: 32_768, kvQuant: .fp16, concurrency: 1), 780_533_760)
+        XCTAssertEqual(
+            CapacityModel.kvBytesForContext(m, context: 32_768, kvQuant: .fp16, concurrency: 4), 4 * 780_533_760)
+    }
+
+    /// The `vHeadDim` generalization is NUMBER-PRESERVING for symmetric models: a profile with
+    /// `vHeadDim == nil` and one with `vHeadDim == headDim` produce identical KV bytes (both recover
+    /// `2×headDim`). This is why every existing catalog entry's assertions stayed green.
+    func testKVBytes_vHeadDimNilEqualsExplicitSymmetric() {
+        let base = model("Qwen3-32B")  // uniformGQA, vHeadDim nil
+        let explicitSymmetric = ModelArchProfile(
+            id: base.id, modelType: base.modelType, nLayers: base.nLayers, nAttnLayers: base.nAttnLayers,
+            nKVHeads: base.nKVHeads, headDim: base.headDim, slidingWindow: base.slidingWindow,
+            fixedStateBytes: base.fixedStateBytes, nativeMaxContext: base.nativeMaxContext,
+            weightsBytes4bitEstimate: base.weightsBytes4bitEstimate, license: base.license,
+            vHeadDim: base.headDim)  // explicitly V == K
+        XCTAssertEqual(
+            CapacityModel.kvBytesPerToken(base, kvQuant: .fp16),
+            CapacityModel.kvBytesPerToken(explicitSymmetric, kvQuant: .fp16),
+            "nil vHeadDim must equal explicit vHeadDim == headDim")
     }
 
     // MARK: - §4 effective default context

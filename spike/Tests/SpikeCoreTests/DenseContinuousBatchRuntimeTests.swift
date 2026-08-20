@@ -1779,6 +1779,56 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         }
     }
 
+    func testConfigDerivedProofRejectsVLWrappedHybridAsUnsupportedFamilyNotInvalidConfig() throws {
+        // qwen3_5 ships VL-wrapped: root model_type is "qwen3_5" but the geometry
+        // (max_position_embeddings/vocab_size/num_hidden_layers) lives under text_config.
+        // A valid config for an unsupported family must fail as unsupportedModelFamily —
+        // NOT invalidModelConfiguration — so the continuous→scalar serving fallback, which
+        // keys on unsupportedModelFamily, can engage. Regression for a044970: the strict
+        // Configuration decode used to fail on the absent top-level fields first and mask
+        // the family behind invalidModelConfiguration.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(
+            #"""
+            {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+             "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+             "vocab_size":248320,"num_hidden_layers":32}}
+            """#.utf8
+        ).write(to: directory.appendingPathComponent("config.json"))
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchModelProof.verifying(modelDirectory: directory)) {
+                XCTAssertEqual(
+                    $0 as? DenseContinuousBatchRuntimeError,
+                    .unsupportedModelFamily("qwen3_5"))
+        }
+    }
+
+    func testConfigDerivedProofStillRejectsMalformedQwen3AsInvalidConfig() throws {
+        // The family gate must NOT mask a genuinely broken SUPPORTED config: qwen3 with a
+        // missing required top-level field is invalidModelConfiguration, not a family miss.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(
+            // model_type=qwen3 (supported) but max_position_embeddings absent.
+            #"{"model_type":"qwen3","vocab_size":2048}"#.utf8
+        ).write(to: directory.appendingPathComponent("config.json"))
+
+        XCTAssertThrowsError(
+            try DenseContinuousBatchModelProof.verifying(modelDirectory: directory)) {
+                XCTAssertEqual(
+                    $0 as? DenseContinuousBatchRuntimeError,
+                    .invalidModelConfiguration)
+        }
+    }
+
     func testConfigDerivedProofRejectsPhi3BeforeRuntimeConstruction() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

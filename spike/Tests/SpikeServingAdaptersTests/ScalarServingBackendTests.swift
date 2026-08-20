@@ -1,11 +1,116 @@
 import XCTest
 import os
 
+import MLXLMCommon
 import ServingCore
 import SpikeCore
 @testable import SpikeServingAdapters
 
 final class ScalarServingBackendTests: XCTestCase {
+    // The scalar backend must build its ToolCallProcessor with the model's configured wire format,
+    // not a hardcoded `.json`. A qwen3_5 model emits xmlFunction syntax
+    // (`<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`) which the
+    // JSON parser cannot decode. With `toolCallFormat: .xmlFunction` the call must parse.
+    func testScalarRouteHonorsXMLFunctionToolCallFormat() async throws {
+        let backend = makeBackend(
+            script: [1, 2, 3, 99],
+            pieces: [
+                1: "<tool_call><function=get_weather>",
+                2: "<parameter=city>Paris</parameter>",
+                3: "</function></tool_call>",
+            ],
+            promptTokens: [10],
+            toolCallFormat: .xmlFunction)
+        let handle = try await backend.start(request(maxTokens: 4, tools: [weatherTool]))
+
+        let events = try await collect(handle.mailbox)
+
+        let toolCalls = events.compactMap { event -> [OpenAIToolCall]? in
+            if case .toolCalls(let calls) = event { return calls }
+            return nil
+        }.first
+        let call = try XCTUnwrap(toolCalls?.first, "xmlFunction tool call must be parsed: \(events)")
+        XCTAssertEqual(call.function.name, "get_weather")
+        XCTAssertTrue(call.function.arguments.contains("Paris"), "args: \(call.function.arguments)")
+
+        let finish = events.compactMap { event -> OpenAIChatFinishReason? in
+            if case .completion(let completion) = event { return completion.finishReason }
+            return nil
+        }.first
+        XCTAssertEqual(finish, .toolCalls)
+    }
+
+    // Negative control: the SAME xmlFunction stream under the default `.json` format must NOT
+    // parse as a tool call — proving the format field is actually consumed, not incidental.
+    func testScalarRouteJSONFormatDoesNotParseXMLFunctionStream() async throws {
+        let backend = makeBackend(
+            script: [1, 2, 3, 99],
+            pieces: [
+                1: "<tool_call><function=get_weather>",
+                2: "<parameter=city>Paris</parameter>",
+                3: "</function></tool_call>",
+            ],
+            promptTokens: [10],
+            toolCallFormat: .json)
+        let handle = try await backend.start(request(maxTokens: 4, tools: [weatherTool]))
+
+        let events = try await collect(handle.mailbox)
+
+        let hasToolCalls = events.contains { event in
+            if case .toolCalls = event { return true }
+            return false
+        }
+        XCTAssertFalse(hasToolCalls, "JSON parser must not decode xmlFunction syntax: \(events)")
+    }
+    // Handle plumbing for streaming reasoning separation. The backend must derive
+    // `handle.separatesReasoning` from the family (`thinksByDefault`) folded with the SAME resolved
+    // thinking value it renders the prompt from — so the SSE handler can route a thinks-by-default
+    // stream through the splitter without re-deriving anything.
+    func testHandleSeparatesReasoningWhenFamilyThinksAndThinkingNotOff() async throws {
+        // qwen3_5-class family + client omits enable_thinking (template default = thinking) → separate.
+        let backend = makeBackend(
+            script: [1, 99], pieces: [1: "hi"], promptTokens: [10],
+            thinksByDefault: true)
+        let handle = try await backend.start(request(maxTokens: 2))
+        XCTAssertTrue(handle.separatesReasoning)
+        _ = try await collect(handle.mailbox)
+    }
+
+    func testHandleDoesNotSeparateWhenThinkingExplicitlyOff() async throws {
+        // Same family, but the request turns thinking OFF → a closed empty <think></think> is injected,
+        // nothing is generated to split → passthrough.
+        let backend = makeBackend(
+            script: [1, 99], pieces: [1: "hi"], promptTokens: [10],
+            thinksByDefault: true)
+        let handle = try await backend.start(request(maxTokens: 2, enableThinking: false))
+        XCTAssertFalse(handle.separatesReasoning)
+        _ = try await collect(handle.mailbox)
+    }
+
+    func testHandleDoesNotSeparateWhenFamilyDoesNotThinkByDefault() async throws {
+        // Dense/compiled family (thinksByDefault=false) → never separate, even with thinking on. This is
+        // the conservative default that keeps today's streams byte-identical.
+        let backend = makeBackend(
+            script: [1, 99], pieces: [1: "hi"], promptTokens: [10],
+            thinksByDefault: false)
+        let handle = try await backend.start(request(maxTokens: 2, enableThinking: true))
+        XCTAssertFalse(handle.separatesReasoning)
+        _ = try await collect(handle.mailbox)
+    }
+
+    func testHandleHonorsDisableThinkingWhenToolsActiveConsistencyWithRender() async throws {
+        // The legacy tool workaround forces resolvedEnableThinking=false (tools attached, no explicit
+        // flag). The gate must consume that SAME resolved value the codec renders from, so it does NOT
+        // separate — proving render/gate consistency, not a desync.
+        let backend = makeBackend(
+            script: [1, 99], pieces: [1: "hi"], promptTokens: [10],
+            thinksByDefault: true,
+            disableThinkingWhenToolsActive: true)
+        let handle = try await backend.start(request(maxTokens: 2, tools: [weatherTool]))
+        XCTAssertFalse(handle.separatesReasoning)
+        _ = try await collect(handle.mailbox)
+    }
+
     func testScalarRoutePublishesExactTextUsageAndLength() async throws {
         let backend = makeBackend(
             script: [1, 2, 99],
@@ -289,7 +394,10 @@ private func makeBackend(
         maxDeltas: 4,
         maxBytes: 1_024),
     maximumQueuedRequests: Int = 2,
-    renderCounter: RenderCounter? = nil
+    renderCounter: RenderCounter? = nil,
+    toolCallFormat: ToolCallFormat = .json,
+    thinksByDefault: Bool = false,
+    disableThinkingWhenToolsActive: Bool = false
 ) -> ScalarServingBackend {
     ScalarServingBackend(
         launchedModel: "fixture-model",
@@ -305,12 +413,40 @@ private func makeBackend(
             defaultMaximumCompletionTokens: 8,
             maximumQueuedRequests: maximumQueuedRequests,
             queueRetryAfterSeconds: 2,
-            mailboxCapacity: mailboxCapacity))
+            mailboxCapacity: mailboxCapacity,
+            toolCallFormat: toolCallFormat,
+            disableThinkingWhenToolsActive: disableThinkingWhenToolsActive,
+            thinksByDefault: thinksByDefault))
 }
+
+private let weatherTool = OpenAIToolSpec(
+    name: "get_weather",
+    description: "Look up the weather for a city",
+    parameters: .object([
+        "type": .string("object"),
+        "properties": .object([
+            "city": .object(["type": .string("string")])
+        ]),
+    ]),
+    raw: .object([
+        "type": .string("function"),
+        "function": .object([
+            "name": .string("get_weather"),
+            "description": .string("Look up the weather for a city"),
+            "parameters": .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "city": .object(["type": .string("string")])
+                ]),
+            ]),
+        ]),
+    ]))
 
 private func request(
     maxTokens: Int,
-    stop: [String] = []
+    stop: [String] = [],
+    tools: [OpenAIToolSpec] = [],
+    enableThinking: Bool? = nil
 ) -> OpenAIChatCompletionRequest {
     OpenAIChatCompletionRequest(
         model: "fixture-model",
@@ -321,7 +457,10 @@ private func request(
         temperature: 0,
         choiceCount: 1,
         stream: true,
-        stop: stop)
+        stop: stop,
+        tools: tools,
+        toolChoice: tools.isEmpty ? .none : .auto,
+        enableThinking: enableThinking)
 }
 
 private func collect(
@@ -368,7 +507,12 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
     let pieces: [Int: String]
     let renderCounter: RenderCounter?
 
-    func render(messages: [OpenAIChatMessage]) throws -> [Int] {
+    func render(
+        messages: [OpenAIChatMessage],
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?,
+        reasoningEffort: String?
+    ) throws -> [Int] {
         renderCounter?.increment()
         return promptTokens
     }

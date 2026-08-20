@@ -123,6 +123,78 @@ func runDetail(
     print("contextCeiling:       \(ceiling)")
 }
 
+/// `--sizer`: renders `ModelSizer.report(...)` — the model-sizer moat pillar (llmfit-like:
+/// "given this box's RAM, which quantized builds fit and at what context") — as a readable table,
+/// or as JSON with `--json`. All numbers come straight out of `ModelSizer`/`CapacityModel`; this
+/// function only formats them.
+func runSizerTable(box: SystemProfile, context: Int?, kvQuant: KVQuantTier, concurrency: Int, json: Bool) {
+    let rows = ModelSizer.report(box: box, context: context, kvQuant: kvQuant, concurrency: concurrency)
+
+    if json {
+        print(sizerReportJSON(rows))
+        return
+    }
+
+    print("== Model sizer (MODELED ESTIMATE, not a measured guarantee) ==")
+    print("kvQuant: \(kvQuant.rawValue), concurrency: \(concurrency)")
+    if !box.wiredLimitIsMeasured {
+        print("NOTE: this box's wired-memory limit is ESTIMATED (not read from hardware) — headroom numbers are approximate.")
+    }
+    if !rows.isEmpty && !rows[0].estimateIsMeasured && box.wiredLimitIsMeasured {
+        print("NOTE: \(kvQuant.rawValue) is an ⚠️ EXPERIMENTAL/UNMEASURED placeholder KV tier — treat fit/ceiling numbers as more speculative than usual.")
+    }
+    print("")
+
+    let bitsOrder = weightBitOptionsDefault.sorted()
+    var header = "model".padding(toLength: 26, withPad: " ", startingAt: 0)
+        + "ctx".padding(toLength: 10, withPad: " ", startingAt: 0)
+    for bits in bitsOrder {
+        header += "\(bits)-bit fit".padding(toLength: 12, withPad: " ", startingAt: 0)
+            + "\(bits)-bit maxCtx".padding(toLength: 16, withPad: " ", startingAt: 0)
+    }
+    print(header)
+
+    for model in ModelArchProfile.catalog {
+        guard let first = rows.first(where: { $0.modelID == model.id }) else { continue }
+        var row = model.id.padding(toLength: 26, withPad: " ", startingAt: 0)
+            + "\(first.requestedContext)".padding(toLength: 10, withPad: " ", startingAt: 0)
+        for bits in bitsOrder {
+            guard let fit = rows.first(where: { $0.modelID == model.id && $0.weightBits == bits }) else { continue }
+            row += (fit.fits ? "yes" : "no").padding(toLength: 12, withPad: " ", startingAt: 0)
+                + "\(fit.maxContextThatFits)".padding(toLength: 16, withPad: " ", startingAt: 0)
+        }
+        print(row)
+    }
+}
+
+private let weightBitOptionsDefault = [4, 8]
+
+/// Minimal hand-rolled JSON serializer for `[ModelFit]` (kept local to the CLI rather than adding
+/// a `Codable`/Foundation-JSON dependency onto `HarnessCore`'s `ModelFit`, which the spec defines
+/// as `Equatable, Sendable` only).
+func sizerReportJSON(_ rows: [ModelFit]) -> String {
+    func field(_ key: String, _ value: String) -> String { "\"\(key)\":\(value)" }
+    func str(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+    let objects = rows.map { row -> String in
+        "{"
+            + field("modelID", str(row.modelID)) + ","
+            + field("weightBits", "\(row.weightBits)") + ","
+            + field("weightsBytes", "\(row.weightsBytes)") + ","
+            + field("kvBytesAtContext", "\(row.kvBytesAtContext)") + ","
+            + field("transientPrefillBytes", "\(row.transientPrefillBytes)") + ","
+            + field("totalPeakBytes", "\(row.totalPeakBytes)") + ","
+            + field("fits", "\(row.fits)") + ","
+            + field("maxContextThatFits", "\(row.maxContextThatFits)") + ","
+            + field("requestedContext", "\(row.requestedContext)") + ","
+            + field("classification", str(row.classification.rawValue)) + ","
+            + field("estimateIsMeasured", "\(row.estimateIsMeasured)")
+            + "}"
+    }
+    return "[" + objects.joined(separator: ",") + "]"
+}
+
 // MARK: - arg parsing
 
 func takeValue(for flag: String, in args: inout [String]) -> String? {
@@ -130,6 +202,12 @@ func takeValue(for flag: String, in args: inout [String]) -> String? {
     let value = args[idx + 1]
     args.removeSubrange(idx...(idx + 1))
     return value
+}
+
+func takeFlag(_ flag: String, in args: inout [String]) -> Bool {
+    guard let idx = args.firstIndex(of: flag) else { return false }
+    args.remove(at: idx)
+    return true
 }
 
 /// Resolve `--box` to the profile capacity is computed against. Defaults to the live host; the
@@ -154,19 +232,84 @@ let contextArg = takeValue(for: "--context", in: &args).flatMap { Int($0) }
 let concurrencyArg = takeValue(for: "--concurrency", in: &args).flatMap { Int($0) } ?? 1
 let kvQuantArg = takeValue(for: "--kv-quant", in: &args).flatMap { KVQuantTier(rawValue: $0) } ?? .fp16
 let boxArg = takeValue(for: "--box", in: &args)
+// `--auto`: target the live host via HarnessCore's pure-Swift `SystemProfile.detectHost()`
+// (sysctl RAM/chip + an estimated wired limit) instead of a `--box` preset. `--sizer`: run the
+// model-sizer report instead of the default catalog table / `--model` detail view.
+let autoFlag = takeFlag("--auto", in: &args)
+let sizerFlag = takeFlag("--sizer", in: &args)
+let jsonFlag = takeFlag("--json", in: &args)
+// `--sizer-matrix`: emit `ModelSizer.report(...)` as a schema-tagged `sizer-matrix/v1` artifact
+// (`SizerMatrixArtifact.encodedJSON()`) instead of the table/`--sizer --json` array. This is the
+// data source a later increment's public "which model fits which Mac" sizer page consumes — always
+// JSON, regardless of `--json` (that flag only gates the existing `--sizer` array output).
+let sizerMatrixFlag = takeFlag("--sizer-matrix", in: &args)
+// `--quant-reliability <artifact.json>`: render a per-quant tool-call reliability artifact
+// (`quant-reliability/v1`, produced off-box by `scripts/bench-tool-calling.py --quants`). This is a
+// pure render-and-exit path (no host capacity math), hosted here because the capacity CLI is the
+// MLX-free operator surface — it fails closed on a foreign schema tag or malformed JSON.
+let quantReliabilityPathArg = takeValue(for: "--quant-reliability", in: &args)
+
+// `--quant-reliability` is a pure artifact render: no host introspection, no capacity math. Handle
+// it before probing the host so the output is just the reliability rows (and a clean non-zero exit
+// on a bad/foreign artifact).
+if let path = quantReliabilityPathArg {
+    do {
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        for line in try QuantReliabilityArtifactRenderer.renderLines(from: data) {
+            print(line)
+        }
+        exit(0)
+    } catch let error as QuantReliabilityArtifactRenderer.RenderError {
+        FileHandle.standardError.write("error: \(error.description)\n".data(using: .utf8)!)
+        exit(2)
+    } catch {
+        FileHandle.standardError.write(
+            "error: could not read --quant-reliability file '\(path)': \(error.localizedDescription)\n"
+                .data(using: .utf8)!)
+        exit(2)
+    }
+}
 
 let hostReport = SystemProfiler.probe()
-printHostHeader(hostReport)
+// `--sizer-matrix` is a machine-consumed data source (its artifact promises "always JSON"): keep its
+// stdout pure JSON by suppressing the human host-profile header + the "Capacity computed for" banner,
+// the same clean-surface treatment `--quant-reliability` gets via its early exit above. The host is
+// still probed (the default target is the live host); only the human framing is elided.
+if !sizerMatrixFlag {
+    printHostHeader(hostReport)
+}
 
 // The live host is always profiled + printed above (spec: "understand the system the tool is
 // running on"); `--box` retargets the capacity math to a preset for planning a different box.
-let (targetProfile, targetLabel) = resolveBox(boxArg, hostReport: hostReport)
-if targetLabel != "host" {
-    print("Capacity computed for: \(targetLabel) — \(gibString(targetProfile.totalRAMBytes)) RAM, "
-        + "\(gibString(targetProfile.wiredLimitBytes)) wired — NOT the live host\n")
+// `--auto` retargets it to a fresh `detectHost()` read instead (same host, but sourced from
+// HarnessCore's own minimal sysctl probe rather than the `SystemProfiler.probe()` above, and with
+// an explicitly ESTIMATED wired limit — see `wiredLimitIsMeasured`).
+let targetProfile: SystemProfile
+let targetLabel: String
+if autoFlag {
+    targetProfile = SystemProfile.detectHost()
+    targetLabel = "auto"
+} else {
+    (targetProfile, targetLabel) = resolveBox(boxArg, hostReport: hostReport)
+}
+if !sizerMatrixFlag {
+    if targetLabel == "auto" {
+        print("Capacity computed for: auto-detected host — \(gibString(targetProfile.totalRAMBytes)) RAM, "
+            + "\(gibString(targetProfile.wiredLimitBytes)) wired (ESTIMATED, not measured)\n")
+    } else if targetLabel != "host" {
+        print("Capacity computed for: \(targetLabel) — \(gibString(targetProfile.totalRAMBytes)) RAM, "
+            + "\(gibString(targetProfile.wiredLimitBytes)) wired — NOT the live host\n")
+    }
 }
 
-if let modelID {
+if sizerMatrixFlag {
+    let artifact = SizerMatrixArtifact.build(
+        box: targetProfile, boxLabel: targetLabel, context: contextArg, kvQuant: kvQuantArg,
+        concurrency: concurrencyArg)
+    print(artifact.encodedJSON())
+} else if sizerFlag {
+    runSizerTable(box: targetProfile, context: contextArg, kvQuant: kvQuantArg, concurrency: concurrencyArg, json: jsonFlag)
+} else if let modelID {
     runDetail(
         modelID: modelID, context: contextArg, concurrency: concurrencyArg, kvQuant: kvQuantArg,
         profile: targetProfile)

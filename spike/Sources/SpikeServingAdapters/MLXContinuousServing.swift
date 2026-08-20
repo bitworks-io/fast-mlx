@@ -35,6 +35,17 @@ public enum ContinuousServingModelLoadError: Error, Equatable, Sendable {
     case startupResourceTelemetryUnavailable
     case startupSlotsNotReleased(Int)
     case startupKVBytesNotReleased(Int)
+    /// The requested KV tier passed `selectKVCacheQuant` (runtime-wired) but the continuous runtime does
+    /// not yet build its quantized caches (it hardcodes `kvCacheKind: .fp16`). Guarded so a future
+    /// `runtimeWiredKVTiers` flip cannot silently serve fp16 for a quantized request. Today unreachable.
+    case kvQuantTierConstructionUnavailable(KVQuantTier)
+    /// An admitted qwen3_5 hybrid checkpoint whose linear key head dim (Dk) is not a multiple of 32,
+    /// which the gated-delta Metal kernel requires (`n_per_t = Dk / 32`,
+    /// Vendor/mlx-swift-lm/Libraries/MLXLMCommon/GatedDelta.swift:29). Fails closed on the REAL serving
+    /// path before any weight load, so a bad checkpoint refuses cleanly instead of truncating/faulting
+    /// at decode. Carries the offending Dk. (The proof deliberately does not enforce this — it is shared
+    /// with the fp32 toy runtime tests that use Dk=1 and never invoke the Metal kernel.)
+    case hybridKernelKeyHeadDimUnaligned(Int)
 }
 
 public struct ContinuousServingSoloPLDPolicy:
@@ -105,6 +116,17 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
     public let backendConfiguration: ContinuousServingBackendConfiguration
     public let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
     public let startupMessages: [OpenAIChatMessage]
+    /// Requested KV-cache storage tier. Default `.fp16` — the continuous runtime builds fp16 caches
+    /// unconditionally (`kvCacheKind: .fp16`). A non-fp16 tier is resolved fail-closed at load via
+    /// `selectKVCacheQuant`: a tier the runtime cannot store yet refuses to start rather than silently
+    /// serve fp16 while the fit-check sized for the smaller tier (matches the scalar route).
+    public let kvQuantTier: KVQuantTier
+    /// Opt-in admission of the qwen3_5 hybrid architecture onto this continuous route (operator flag
+    /// `--allow-hybrid-qwen35`). Default `false` — the proof rejects the hybrid family with
+    /// `unsupportedModelFamily` (the executable then falls back to scalar serving). When `true`, it is
+    /// threaded into `DenseContinuousBatchModelProof.verifying` so the proof carries qwen3_5's
+    /// config-hash-pinned `HybridCacheGeometry`, and the cache-layout validator admits `.recurrentState`.
+    public let allowHybridQwen35: Bool
 
     public init(
         launchedModel: String,
@@ -121,7 +143,9 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         traceLimit: Int = 0,
         backendConfiguration: ContinuousServingBackendConfiguration,
         soloPLDPolicy: ContinuousServingSoloPLDPolicy? = nil,
-        startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages
+        startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages,
+        kvQuantTier: KVQuantTier = .fp16,
+        allowHybridQwen35: Bool = false
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -138,6 +162,8 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         self.backendConfiguration = backendConfiguration
         self.soloPLDPolicy = soloPLDPolicy
         self.startupMessages = startupMessages
+        self.kvQuantTier = kvQuantTier
+        self.allowHybridQwen35 = allowHybridQwen35
     }
 }
 
@@ -329,9 +355,26 @@ public func loadContinuousServingModel(
     let configuration = try validateContinuousServingModelLoadConfiguration(
         rawConfiguration)
 
-    // The proof reads and rejects unsupported architecture/geometry before weight loading.
+    // The proof reads and rejects unsupported architecture/geometry before weight loading. With
+    // `allowHybridQwen35` off (default) a qwen3_5 config throws `unsupportedModelFamily` here — the
+    // executable then falls back to scalar serving. With it on, the proof carries qwen3_5's
+    // config-hash-pinned hybrid geometry through instead of throwing (opt-in continuous admission).
     let proof = try DenseContinuousBatchModelProof.verifying(
-        modelDirectory: configuration.modelDirectory)
+        modelDirectory: configuration.modelDirectory,
+        allowHybridQwen35: configuration.allowHybridQwen35)
+
+    // Real-kernel viability guard for the admitted hybrid path. The gated-delta Metal kernel processes
+    // the linear key head dim (Dk) in fixed 32-wide chunks (GatedDelta.swift:29, `n_per_t = Dk / 32`),
+    // so a Dk not divisible by 32 truncates/faults at decode. Refuse the checkpoint HERE — before any
+    // weight load or global Memory mutation — rather than reach the kernel. Deliberately in the real
+    // serving adapter, not the shared proof: the fp32 toy runtime tests admit Dk=1 and never invoke the
+    // Metal kernel, so guarding in the proof would wrongly reject them.
+    if let hybridGeometry = proof.verifiedHybridGeometry,
+        hybridGeometry.recurrent.keyHeadDim % 32 != 0
+    {
+        throw ContinuousServingModelLoadError.hybridKernelKeyHeadDimUnaligned(
+            hybridGeometry.recurrent.keyHeadDim)
+    }
 
     Memory.memoryLimit = configuration.memoryLimitBytes
     Memory.cacheLimit = configuration.cacheLimitBytes
@@ -345,7 +388,24 @@ public func loadContinuousServingModel(
 
     let nativeCacheKinds = classifyScalarServingNativeCaches(
         context.model.newCache(parameters: nil))
-    try validateScalarServingCacheLayout(nativeCacheKinds)
+    // Continuous-route cache-layout admission. `.recurrentState` (the hybrid GatedDeltaNet-linear
+    // layers) is admitted ONLY when the proof certified qwen3_5 hybrid geometry — i.e. the operator
+    // opted in AND the proof carries a `HybridCacheGeometry`. With the flag off this is byte-identical
+    // to the prior `validateScalarServingCacheLayout` call (a hybrid layout still fails closed here).
+    try validateContinuousServingCacheLayout(
+        nativeCacheKinds,
+        hybridAdmitted: proof.verifiedHybridGeometry != nil)
+    // Fail-closed KV-cache tier selection, BEFORE the runtime builds any cache (it hardcodes
+    // `kvCacheKind: .fp16` below). A non-fp16 tier the runtime cannot store yet throws here — the
+    // continuous route refuses to start rather than silently serve fp16 under a smaller-tier-sized
+    // verdict, matching the scalar route. fp16 (default/omitted) resolves to `.fp16`, byte-identical.
+    let kvCacheDecision = try selectKVCacheQuant(
+        requested: configuration.kvQuantTier, nativeKinds: nativeCacheKinds)
+    guard case .fp16 = kvCacheDecision else {
+        // Unreachable today (selection yields only `.fp16`). Defensive: a future `runtimeWiredKVTiers`
+        // flip must not reach the fp16-hardcoded runtime below for a quantized request.
+        throw ContinuousServingModelLoadError.kvQuantTierConstructionUnavailable(configuration.kvQuantTier)
+    }
     let codec = MLXScalarTextCodec(tokenizer: context.tokenizer)
     let stopTokenIDs = try resolveScalarServingStopTokenIDs(
         configuration: context.configuration,
@@ -354,7 +414,11 @@ public func loadContinuousServingModel(
     guard stopStrings.allSatisfy({ !$0.isEmpty }) else {
         throw ContinuousServingModelLoadError.invalidStopStrings
     }
-    let startupPrompt = try codec.render(messages: configuration.startupMessages)
+    let startupPrompt = try codec.render(
+        messages: configuration.startupMessages,
+        tools: [],
+        enableThinking: nil,
+        reasoningEffort: nil)
     guard !startupPrompt.isEmpty else {
         throw ContinuousServingModelLoadError.emptyStartupPrompt
     }
@@ -385,13 +449,16 @@ public func loadContinuousServingModel(
         coordinator: coordinator,
         promptTokens: startupPrompt,
         stopTokenIDs: stopTokenIDs)
+    var backendConfiguration = configuration.backendConfiguration
+    backendConfiguration.toolCallFormat = servingToolCallFormat(
+        inferred: context.configuration.toolCallFormat)
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,
         coordinator: coordinator,
         codec: codec,
         stopTokenIDs: stopTokenIDs,
         modelStopStrings: stopStrings,
-        configuration: configuration.backendConfiguration)
+        configuration: backendConfiguration)
     let scheduler = configuration.coordinatorConfiguration
     let report = ContinuousServingModelStartupReport(
         launchedModel: configuration.launchedModel,

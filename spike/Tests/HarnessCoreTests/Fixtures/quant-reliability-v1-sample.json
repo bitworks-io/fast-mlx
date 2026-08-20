@@ -1,0 +1,26 @@
+{
+  "schema": "quant-reliability/v1",
+  "model": "Qwen3-8B",
+  "quants": [
+    {
+      "repo_id": "org/Qwen3-8B-MLX-4bit",
+      "quant_bits": 4,
+      "reliability": {
+        "cases": 4,
+        "trigger_rate": 1.0,
+        "name_accuracy": 1.0,
+        "arg_validity_rate": 0.5
+      }
+    },
+    {
+      "repo_id": "org/Qwen3-8B-MLX-8bit",
+      "quant_bits": 8,
+      "reliability": {
+        "cases": 4,
+        "trigger_rate": 1.0,
+        "name_accuracy": 1.0,
+        "arg_validity_rate": 1.0
+      }
+    }
+  ]
+}

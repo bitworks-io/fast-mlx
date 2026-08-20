@@ -552,6 +552,23 @@ extension ServingEvidence {
         public let mlxCacheBytes: Int
         public let mlxPeakBytes: Int
 
+        // Measured-vs-modeled drift (fit-checked-serve differentiator #2). Optional and canonically
+        // OMITTED when the sizer produced no prediction (fit-check skipped) — so old snapshots stay
+        // byte-identical. ServingCore stays HarnessCore-free by construction: the serve binary builds
+        // `FitCheckMeasuredReport` from the sizer prediction + the live allocator snapshot and threads
+        // these primitives through. The modeled peak accumulates only under KV load, so a snapshot
+        // captured on a metrics query is the honest "peak-so-far vs modeled" comparison — not a
+        // trivially-conservative startup verdict.
+        public let fitModeledPeakBytes: Int?
+        public let fitMeasuredPeakBytes: Int?
+        public let fitDriftVerdict: String?
+        /// Signed `(measured − modeled) / modeled`. Negative = conservative (safe); may be negative.
+        public let fitDriftFraction: Double?
+        public let fitModeledWeightsBytes: Int?
+        public let fitModeledKVBytes: Int?
+        public let fitModeledTransientBytes: Int?
+        public let fitModeledHeadroomBytes: Int?
+
         public init(
             activeRequests: Int,
             coordinatorSlots: Int,
@@ -559,7 +576,15 @@ extension ServingEvidence {
             maxReservedKVBytes: Int,
             mlxActiveBytes: Int,
             mlxCacheBytes: Int,
-            mlxPeakBytes: Int
+            mlxPeakBytes: Int,
+            fitModeledPeakBytes: Int? = nil,
+            fitMeasuredPeakBytes: Int? = nil,
+            fitDriftVerdict: String? = nil,
+            fitDriftFraction: Double? = nil,
+            fitModeledWeightsBytes: Int? = nil,
+            fitModeledKVBytes: Int? = nil,
+            fitModeledTransientBytes: Int? = nil,
+            fitModeledHeadroomBytes: Int? = nil
         ) throws {
             let values = [
                 ("activeRequests", activeRequests),
@@ -573,6 +598,23 @@ extension ServingEvidence {
             for (field, value) in values {
                 try ServingEvidence.validateNonNegative(value, field: field)
             }
+            // Drift BYTE totals are non-negative when present; the signed fraction is exempt.
+            let optionalByteValues: [(String, Int?)] = [
+                ("fitModeledPeakBytes", fitModeledPeakBytes),
+                ("fitMeasuredPeakBytes", fitMeasuredPeakBytes),
+                ("fitModeledWeightsBytes", fitModeledWeightsBytes),
+                ("fitModeledKVBytes", fitModeledKVBytes),
+                ("fitModeledTransientBytes", fitModeledTransientBytes),
+                ("fitModeledHeadroomBytes", fitModeledHeadroomBytes),
+            ]
+            for (field, value) in optionalByteValues {
+                if let value {
+                    try ServingEvidence.validateNonNegative(value, field: field)
+                }
+            }
+            if let fitDriftFraction {
+                try ServingEvidence.validateFinite(fitDriftFraction, field: "fitDriftFraction")
+            }
             self.activeRequests = activeRequests
             self.coordinatorSlots = coordinatorSlots
             self.reservedKVBytes = reservedKVBytes
@@ -580,6 +622,14 @@ extension ServingEvidence {
             self.mlxActiveBytes = mlxActiveBytes
             self.mlxCacheBytes = mlxCacheBytes
             self.mlxPeakBytes = mlxPeakBytes
+            self.fitModeledPeakBytes = fitModeledPeakBytes
+            self.fitMeasuredPeakBytes = fitMeasuredPeakBytes
+            self.fitDriftVerdict = fitDriftVerdict
+            self.fitDriftFraction = fitDriftFraction
+            self.fitModeledWeightsBytes = fitModeledWeightsBytes
+            self.fitModeledKVBytes = fitModeledKVBytes
+            self.fitModeledTransientBytes = fitModeledTransientBytes
+            self.fitModeledHeadroomBytes = fitModeledHeadroomBytes
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
@@ -590,6 +640,14 @@ extension ServingEvidence {
             case mlxActiveBytes = "mlx_active_bytes"
             case mlxCacheBytes = "mlx_cache_bytes"
             case mlxPeakBytes = "mlx_peak_bytes"
+            case fitModeledPeakBytes = "fit_modeled_peak_bytes"
+            case fitMeasuredPeakBytes = "fit_measured_peak_bytes"
+            case fitDriftVerdict = "fit_drift"
+            case fitDriftFraction = "fit_drift_frac"
+            case fitModeledWeightsBytes = "fit_modeled_weights_bytes"
+            case fitModeledKVBytes = "fit_modeled_kv_bytes"
+            case fitModeledTransientBytes = "fit_modeled_transient_bytes"
+            case fitModeledHeadroomBytes = "fit_modeled_headroom_bytes"
         }
 
         public init(from decoder: Decoder) throws {
@@ -604,7 +662,31 @@ extension ServingEvidence {
                 maxReservedKVBytes: container.decode(Int.self, forKey: .maxReservedKVBytes),
                 mlxActiveBytes: container.decode(Int.self, forKey: .mlxActiveBytes),
                 mlxCacheBytes: container.decode(Int.self, forKey: .mlxCacheBytes),
-                mlxPeakBytes: container.decode(Int.self, forKey: .mlxPeakBytes))
+                mlxPeakBytes: container.decode(Int.self, forKey: .mlxPeakBytes),
+                fitModeledPeakBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitModeledPeakBytes,
+                    field: "fit_modeled_peak_bytes"),
+                fitMeasuredPeakBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitMeasuredPeakBytes,
+                    field: "fit_measured_peak_bytes"),
+                fitDriftVerdict: ServingEvidence.decodeCanonicalOptional(
+                    String.self, from: container, forKey: .fitDriftVerdict,
+                    field: "fit_drift"),
+                fitDriftFraction: ServingEvidence.decodeCanonicalOptional(
+                    Double.self, from: container, forKey: .fitDriftFraction,
+                    field: "fit_drift_frac"),
+                fitModeledWeightsBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitModeledWeightsBytes,
+                    field: "fit_modeled_weights_bytes"),
+                fitModeledKVBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitModeledKVBytes,
+                    field: "fit_modeled_kv_bytes"),
+                fitModeledTransientBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitModeledTransientBytes,
+                    field: "fit_modeled_transient_bytes"),
+                fitModeledHeadroomBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitModeledHeadroomBytes,
+                    field: "fit_modeled_headroom_bytes"))
         }
     }
 
@@ -714,6 +796,14 @@ private extension ServingEvidence {
         }
         guard value >= 0 else {
             throw ValidationError.negativeField(field)
+        }
+    }
+
+    /// Finite but signed — for values whose sign carries meaning (e.g. drift fraction, where
+    /// negative = the run stayed under the modeled peak).
+    static func validateFinite(_ value: Double, field: String) throws {
+        guard value.isFinite else {
+            throw ValidationError.nonfiniteField(field)
         }
     }
 

@@ -394,6 +394,307 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // Streaming reasoning separation (happy path): a thinks-by-default handle
+    // (separatesReasoning=true) routes `.text` deltas through StreamingReasoningSplitter, so the
+    // `<think>` block arrives as delta.reasoning_content and the answer as delta.content — the joined
+    // fields matching the non-streaming ReasoningContentSplitter on the same concatenated output,
+    // across an arbitrary chunking that tears the closing tag.
+    func testStreamingSeparatesReasoningWhenHandleThinksByDefault() async throws {
+        let chunks = ["rea", "soning</th", "ink>ans", "wer"]
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: chunks,
+                    finishReason: .stop,
+                    promptTokens: 3,
+                    completionTokens: 4)
+            ],
+            separatesReasoning: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let events = try sseJSONEvents(from: response.body)
+        var reasoning = "", content = ""
+        for object in events {
+            guard let choices = object["choices"] as? [[String: Any]],
+                let delta = choices.first?["delta"] as? [String: Any] else { continue }
+            if let r = delta["reasoning_content"] as? String { reasoning += r }
+            if let c = delta["content"] as? String { content += c }
+        }
+        // The concatenated fields equal the non-streaming split of the whole output — the parity contract.
+        let expected = ReasoningContentSplitter.split(chunks.joined())
+        XCTAssertEqual(reasoning, expected.reasoning)
+        XCTAssertEqual(content, expected.content)
+        XCTAssertEqual(reasoning, "reasoning")
+        XCTAssertEqual(content, "answer")
+        // The reasoning must never leak into a plain content delta.
+        XCTAssertFalse(response.body.contains(#""content":"rea""#), response.body)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    // Streaming reasoning separation (documented divergence): a thinking stream truncated before it
+    // emits `</think>` yields ALL text as reasoning_content and NO content — streaming cannot
+    // retro-label already-sent reasoning, and by construction those tokens genuinely were reasoning.
+    func testStreamingSeparatedThinkingWithoutCloseIsAllReasoning() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: ["still think", "ing, no close"],
+                    finishReason: .length,
+                    promptTokens: 2,
+                    completionTokens: 4)
+            ],
+            separatesReasoning: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        let events = try sseJSONEvents(from: response.body)
+        var reasoning = "", content = ""
+        for object in events {
+            guard let choices = object["choices"] as? [[String: Any]],
+                let delta = choices.first?["delta"] as? [String: Any] else { continue }
+            if let r = delta["reasoning_content"] as? String { reasoning += r }
+            if let c = delta["content"] as? String { content += c }
+        }
+        XCTAssertEqual(reasoning, "still thinking, no close")
+        XCTAssertEqual(content, "")
+
+        _ = try await channel.finish()
+    }
+
+    // DECISION PIN (fable ruling 2026-08-20,
+    // docs/task-inbox/2026-08-20-streaming-reasoning-truncation-answer-loss.md): a thinking stream that
+    // truncates before `</think>` (finish_reason=length) emits reasoning_content ONLY and an EMPTY
+    // content — BY DESIGN. This matches the OpenAI o-series / DeepSeek reasoning-model contract (reasoning
+    // that consumes the whole max_completion_tokens budget → empty content + finish "length"); it is
+    // LIVE-CONFIRMED on qwen3_5 (its reasoning routinely exceeds a small budget). It is NOT the 7f71f5c
+    // answer-loss class: no answer was generated to lose, and within the thinking family a no-`</think>`
+    // stream is 100% reasoning by construction. Do NOT "fix" this to mirror reasoning into content —
+    // that would fabricate an assistant answer into multi-turn history for every SDK that accumulates
+    // delta.content. This test locks the behavior against a future well-meaning regression.
+    func testTruncatedThinkingStreamEmitsReasoningOnlyWithEmptyContentByDesign() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: ["thinking, ", "still no close tag"],
+                    finishReason: .length,
+                    promptTokens: 2,
+                    completionTokens: 5)
+            ],
+            separatesReasoning: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        let events = try sseJSONEvents(from: response.body)
+        var reasoningDeltas = 0
+        for object in events {
+            guard let choices = object["choices"] as? [[String: Any]],
+                let delta = choices.first?["delta"] as? [String: Any] else { continue }
+            if delta["reasoning_content"] is String { reasoningDeltas += 1 }
+            // No delta may carry a non-null content value — the answer budget was spent on reasoning.
+            if let content = delta["content"], !(content is NSNull) {
+                XCTFail("truncated thinking must not emit content by design; got \(content)")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(reasoningDeltas, 1, response.body)
+        XCTAssertNotNil(response.body.range(of: #""finish_reason":"length""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
+    // Frozen contract + the 7f71f5c answer-loss trap pin: a non-separating stream (separatesReasoning
+    // =false, the default for every family not live-attested as thinks-by-default) is byte-identical to
+    // today — including a stream whose CONTENT begins with the literal text `<think>` and never closes
+    // it. That answer must pass through as delta.content verbatim and NEVER be relabeled as reasoning.
+    func testStreamingNonSeparatingPassesLiteralThinkContentThroughUnchanged() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: ["<think>", "not really reasoning"],
+                    finishReason: .stop,
+                    promptTokens: 2,
+                    completionTokens: 2)
+            ],
+            separatesReasoning: false)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        // The literal-<think> answer survives intact as content; no reasoning_content is ever emitted.
+        XCTAssertNotNil(response.body.range(of: #""content":"<think>""#), response.body)
+        XCTAssertNotNil(response.body.range(of: #""content":"not really reasoning""#), response.body)
+        XCTAssertFalse(response.body.contains("reasoning_content"), response.body)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    // Non-streaming parity with the by-design streaming truncation contract above: a separating request
+    // (separatesReasoning=true) whose thinking truncates before `</think>` (finish_reason=length) must
+    // return the whole output as `reasoning_content` with EMPTY content — matching streaming's Option A,
+    // not the old behavior of retro-labeling raw chain-of-thought as the assistant's answer.
+    func testNonStreamingTruncatedThinkingReturnsReasoningContentAndEmptyContent() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: ["thinking, ", "still no close tag"],
+                    finishReason: .length,
+                    promptTokens: 2,
+                    completionTokens: 5)
+            ],
+            separatesReasoning: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choice = try XCTUnwrap((object["choices"] as? [[String: Any]])?.first)
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        XCTAssertEqual(message["reasoning_content"] as? String, "thinking, still no close tag")
+        // No answer exists (budget spent mid-reasoning): content must be absent/empty, never raw CoT.
+        if let content = message["content"], !(content is NSNull) {
+            XCTAssertEqual(content as? String, "", response.body)
+        }
+        XCTAssertEqual(choice["finish_reason"] as? String, "length", response.body)
+
+        _ = try await channel.finish()
+    }
+
+    // The 7f71f5c answer-loss trap pin, non-streaming side: a NON-separating request
+    // (separatesReasoning=false, the default for every family not live-attested thinks-by-default) is
+    // byte-identical to today — a plain answer with no `</think>` stays verbatim `content`, even one that
+    // literally begins with `<think>` and never closes it. It must NEVER be relabeled reasoning_content.
+    func testNonStreamingNonSeparatingKeepsLiteralThinkAsContent() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completed(
+                    text: ["<think>", "not really reasoning"],
+                    finishReason: .stop,
+                    promptTokens: 2,
+                    completionTokens: 2)
+            ],
+            separatesReasoning: false)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choice = try XCTUnwrap((object["choices"] as? [[String: Any]])?.first)
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        XCTAssertEqual(message["content"] as? String, "<think>not really reasoning", response.body)
+        XCTAssertNil(message["reasoning_content"], response.body)
+
+        _ = try await channel.finish()
+    }
+
+    // Interleave characterization: a separating stream (separatesReasoning=true) that reasons, closes
+    // </think>, then emits a tool call must yield reasoning_content deltas BEFORE the tool-call deltas,
+    // with finish_reason tool_calls — the natural qwen3_5 shape (it closes </think> before tools). The
+    // tool-call delta path itself is untouched by the splitter; only .text deltas route through it.
+    func testStreamingSeparatesReasoningThenEmitsToolCallInOrder() async throws {
+        let backend = ScriptedBackend(
+            scripts: [
+                .completedWithToolCalls(
+                    text: ["let me check</think>"],
+                    toolCalls: [
+                        OpenAIToolCall(
+                            id: "call_0",
+                            function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#))
+                    ],
+                    finishReason: .toolCalls,
+                    promptTokens: 6,
+                    completionTokens: 4)
+            ],
+            separatesReasoning: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        let reasoningRange = try XCTUnwrap(
+            response.body.range(of: #""reasoning_content":"let me check""#), response.body)
+        let toolNameRange = try XCTUnwrap(
+            response.body.range(of: #""name":"get_weather""#), response.body)
+        // Reasoning is separated and precedes the tool call; the answer (there is none) never appears.
+        XCTAssertLessThan(reasoningRange.lowerBound, toolNameRange.lowerBound)
+        XCTAssertNotNil(response.body.range(of: #""finish_reason":"tool_calls""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
+    // AC6: a streaming response with tool calls emits OpenAI tool-call deltas (head + arguments)
+    // and a terminal finish_reason "tool_calls".
+    func testStreamingToolCallsEmitOpenAIDeltasAndToolCallsFinishReason() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completedWithToolCalls(
+                text: [],
+                toolCalls: [
+                    OpenAIToolCall(
+                        id: "call_0",
+                        function: .init(name: "get_product", arguments: #"{"query":"RTX 6000 Ada"}"#))
+                ],
+                finishReason: .toolCalls,
+                promptTokens: 12,
+                completionTokens: 8)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "text/event-stream")
+
+        // Ordering: the tool name arrives before its arguments before the terminal finish.
+        let nameRange = try XCTUnwrap(response.body.range(of: #""name":"get_product""#))
+        let argsRange = try XCTUnwrap(response.body.range(of: "RTX 6000 Ada"))
+        let finishRange = try XCTUnwrap(response.body.range(of: #""finish_reason":"tool_calls""#))
+        let doneRange = try XCTUnwrap(response.body.range(of: "data: [DONE]\n\n"))
+        XCTAssertLessThan(nameRange.lowerBound, argsRange.lowerBound)
+        XCTAssertLessThan(argsRange.lowerBound, finishRange.lowerBound)
+        XCTAssertLessThan(finishRange.lowerBound, doneRange.lowerBound)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        // The head tool-call delta carries the OpenAI streaming shape.
+        let events = try sseJSONEvents(from: response.body)
+        let toolDeltas = events.compactMap { object -> [String: Any]? in
+            let choices = object["choices"] as? [[String: Any]]
+            let delta = choices?.first?["delta"] as? [String: Any]
+            return (delta?["tool_calls"] != nil) ? delta : nil
+        }
+        XCTAssertFalse(toolDeltas.isEmpty, "expected at least one tool_calls delta")
+        let headCall = try XCTUnwrap((toolDeltas.first?["tool_calls"] as? [[String: Any]])?.first)
+        XCTAssertEqual(headCall["index"] as? Int, 0)
+        XCTAssertEqual(headCall["id"] as? String, "call_0")
+        XCTAssertEqual(headCall["type"] as? String, "function")
+        XCTAssertEqual((headCall["function"] as? [String: Any])?["name"] as? String, "get_product")
+
+        // Terminal chunk carries tool_calls finish reason + usage.
+        let terminal = try XCTUnwrap(
+            events.last { object in
+                let choices = object["choices"] as? [[String: Any]]
+                return choices?.first?["finish_reason"] as? String == "tool_calls"
+            })
+        XCTAssertEqual((terminal["usage"] as? [String: Any])?["total_tokens"] as? Int, 20)
+
+        _ = try await channel.finish()
+    }
+
     func testAuthenticationAndBodyBoundsRejectBeforeBackendAdmission() async throws {
         let backend = ScriptedBackend(scripts: [])
         let authLimits = OpenAIChatRequestLimits(
@@ -857,6 +1158,12 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             finishReason: OpenAIChatFinishReason = .stop,
             promptTokens: Int,
             completionTokens: Int)
+        case completedWithToolCalls(
+            text: [String],
+            toolCalls: [OpenAIToolCall],
+            finishReason: OpenAIChatFinishReason,
+            promptTokens: Int,
+            completionTokens: Int)
         case cancelled(ServingCancellationReason)
         case admissionRejected(ServingBackendAdmissionError)
         case held
@@ -872,9 +1179,11 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
     }
 
     private let state: OSAllocatedUnfairLock<State>
+    private let separatesReasoning: Bool
 
-    init(scripts: [Script]) {
+    init(scripts: [Script], separatesReasoning: Bool = false) {
         state = OSAllocatedUnfairLock(initialState: State(scripts: scripts))
+        self.separatesReasoning = separatesReasoning
     }
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
@@ -910,7 +1219,8 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             model: request.model,
             route: .continuousBatchNoSpec,
             mailbox: mailbox,
-            lease: lease)
+            lease: lease,
+            separatesReasoning: separatesReasoning)
 
         if case .admissionRejected(let error) = script {
             throw error
@@ -919,6 +1229,27 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
                 do {
                     for delta in text {
                         try await mailbox.send(.text(delta))
+                    }
+                    try await mailbox.send(
+                        .completion(
+                            ServingGenerationCompletion(
+                                finishReason: finishReason,
+                                usage: OpenAIChatUsage(
+                                    promptTokens: promptTokens,
+                                    completionTokens: completionTokens))))
+                    await mailbox.finish()
+                } catch {
+                    // Cancellation is observed through the lease counter.
+                }
+            }
+        } else if case .completedWithToolCalls(let text, let toolCalls, let finishReason, let promptTokens, let completionTokens) = script {
+            Task {
+                do {
+                    for delta in text {
+                        try await mailbox.send(.text(delta))
+                    }
+                    if !toolCalls.isEmpty {
+                        try await mailbox.send(.toolCalls(toolCalls))
                     }
                     try await mailbox.send(
                         .completion(

@@ -97,6 +97,156 @@ final class MLXContinuousServingTests: XCTestCase {
         }
     }
 
+    // MARK: - qwen3_5 hybrid continuous-route admission (--allow-hybrid-qwen35, incr-3)
+    //
+    // Wiring proof for docs/task-inbox/2026-08-20-hybrid-continuous-serve-path-admission.md: the
+    // config flag is threaded into DenseContinuousBatchModelProof.verifying(allowHybridQwen35:). All
+    // three tests fail at the proof step (config.json only), BEFORE any weight load / global Memory
+    // mutation — no safetensors, tokenizer, or network required.
+
+    /// A VL-wrapped qwen3_5 config with full, valid hybrid geometry (mirrors HybridQwen35ProofArmTests).
+    private func qwen35VLConfigJSON() -> String {
+        #"""
+        {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+         "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+           "vocab_size":248320,"num_hidden_layers":48,"full_attention_interval":4,
+           "num_key_value_heads":8,"head_dim":128,"torch_dtype":"bfloat16",
+           "linear_num_key_heads":16,"linear_num_value_heads":32,
+           "linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+        """#
+    }
+
+    /// Same qwen3_5 family tag, but with `linear_num_value_heads` dropped → the hybrid geometry
+    /// derivation fails closed (invalidModelConfiguration) once the family gate is passed.
+    private func qwen35BrokenGeometryConfigJSON() -> String {
+        #"""
+        {"model_type":"qwen3_5","text_config":{"max_position_embeddings":262144,"vocab_size":248320,
+          "num_hidden_layers":48,"full_attention_interval":4,"num_key_value_heads":8,"head_dim":128,
+          "torch_dtype":"bfloat16","linear_num_key_heads":16,
+          "linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+        """#
+    }
+
+    private func writeConfigDirectory(_ json: String) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "fastmlx-continuous-hybrid-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        try Data(json.utf8)
+            .write(to: directory.appendingPathComponent("config.json"))
+        return directory
+    }
+
+    private func continuousLoadConfiguration(
+        modelDirectory: URL, allowHybridQwen35: Bool
+    ) throws -> ContinuousServingModelLoadConfiguration {
+        ContinuousServingModelLoadConfiguration(
+            launchedModel: "qwen3_5-source-locked",
+            modelDirectory: modelDirectory,
+            memoryLimitBytes: 8_192,
+            cacheLimitBytes: 1_024,
+            maxReservedKVBytes: 4_096,
+            coordinatorConfiguration: try ContinuousBatchConfiguration(
+                maxActiveSlots: 1,
+                maxPrefillSlots: 1,
+                prefillChunkSize: 128,
+                maxQueuedRequests: 1),
+            publicationCapacity: 1,
+            backendConfiguration: ContinuousServingBackendConfiguration(
+                defaultMaximumCompletionTokens: 8,
+                queueRetryAfterSeconds: 1,
+                mailboxCapacity: .init(maxDeltas: 2, maxBytes: 4_096)),
+            allowHybridQwen35: allowHybridQwen35)
+    }
+
+    /// Fallback invariant: WITHOUT the flag, a real qwen3_5 hybrid config is rejected at the proof with
+    /// unsupportedModelFamily before any weight load — exactly the signal the executable's scalar
+    /// fallback keys on, so the flag-OFF behavior is preserved byte-for-byte.
+    func testContinuousLoaderRejectsQwen35HybridWithoutFlagBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(qwen35VLConfigJSON())
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            _ = try await loadContinuousServingModel(
+                configuration: try continuousLoadConfiguration(
+                    modelDirectory: directory, allowHybridQwen35: false))
+            XCTFail("qwen3_5 must be rejected on the continuous route without --allow-hybrid-qwen35")
+        } catch let error as DenseContinuousBatchRuntimeError {
+            XCTAssertEqual(error, .unsupportedModelFamily("qwen3_5"))
+        }
+    }
+
+    /// Wiring proof: the SAME config's proof outcome flips with the flag — OFF rejects at the family
+    /// gate (unsupportedModelFamily), ON passes the family gate and only then fails on the broken
+    /// geometry (invalidModelConfiguration). Both occur at the proof, before weight load. This proves
+    /// the flag is threaded (config → proof call) and is NOT hardcoded either direction.
+    func testAllowHybridQwen35FlagFlipsProofOutcomeBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(qwen35BrokenGeometryConfigJSON())
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        do {
+            _ = try await loadContinuousServingModel(
+                configuration: try continuousLoadConfiguration(
+                    modelDirectory: directory, allowHybridQwen35: false))
+            XCTFail("flag OFF: qwen3_5 must fail at the family gate")
+        } catch let error as DenseContinuousBatchRuntimeError {
+            XCTAssertEqual(error, .unsupportedModelFamily("qwen3_5"))
+        }
+
+        do {
+            _ = try await loadContinuousServingModel(
+                configuration: try continuousLoadConfiguration(
+                    modelDirectory: directory, allowHybridQwen35: true))
+            XCTFail("flag ON: broken hybrid geometry must fail closed at the proof")
+        } catch let error as DenseContinuousBatchRuntimeError {
+            // Passed the family gate (no longer unsupportedModelFamily), then rejected on the
+            // admission-grade geometry derivation — proving the flag admitted qwen3_5 past the gate.
+            XCTAssertEqual(error, .invalidModelConfiguration)
+        }
+    }
+
+    /// The new configuration field round-trips through validation unchanged (both directions).
+    func testAllowHybridQwen35SurvivesConfigurationValidation() throws {
+        for admitted in [false, true] {
+            let validated = try validateContinuousServingModelLoadConfiguration(
+                try continuousLoadConfiguration(
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    allowHybridQwen35: admitted))
+            XCTAssertEqual(validated.allowHybridQwen35, admitted)
+        }
+    }
+
+    /// Same VL-wrapped qwen3_5 shape but linear_key_head_dim = 48 — a valid positive-integer geometry
+    /// (the proof admits it) that the gated-delta Metal kernel cannot serve (Dk not divisible by 32).
+    private func qwen35UnalignedDkConfigJSON() -> String {
+        #"""
+        {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+         "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+           "vocab_size":248320,"num_hidden_layers":48,"full_attention_interval":4,
+           "num_key_value_heads":8,"head_dim":128,"torch_dtype":"bfloat16",
+           "linear_num_key_heads":16,"linear_num_value_heads":32,
+           "linear_key_head_dim":48,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+        """#
+    }
+
+    /// Real-kernel viability guard (incr-4): an admitted hybrid checkpoint whose Dk is not a multiple of
+    /// 32 is refused on the real serving adapter — AFTER the proof admits the geometry, but BEFORE any
+    /// weight load — so a bad checkpoint fails closed instead of truncating/faulting in the gated-delta
+    /// Metal kernel. The guard lives here (not the proof) so the fp32 toy runtime tests (Dk=1) are
+    /// unaffected.
+    func testAllowHybridQwen35RejectsUnalignedKeyHeadDimBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(qwen35UnalignedDkConfigJSON())
+        defer { try? FileManager.default.removeItem(at: directory) }
+        do {
+            _ = try await loadContinuousServingModel(
+                configuration: try continuousLoadConfiguration(
+                    modelDirectory: directory, allowHybridQwen35: true))
+            XCTFail("Dk not divisible by 32 must fail closed before weight load")
+        } catch let error as ContinuousServingModelLoadError {
+            XCTAssertEqual(error, .hybridKernelKeyHeadDimUnaligned(48))
+        }
+    }
+
     func testLoaderConfigurationAcceptsBoundedDenseServingPolicy() throws {
         let configuration = ContinuousServingModelLoadConfiguration(
             launchedModel: "qwen3-source-locked",

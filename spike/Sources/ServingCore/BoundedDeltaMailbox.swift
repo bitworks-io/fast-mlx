@@ -33,12 +33,15 @@ private final class PendingContinuationGate: Sendable {
 
 public enum ServingResponseDelta: Equatable, Sendable {
     case text(String)
+    case toolCalls([OpenAIToolCall])
     case completion(ServingGenerationCompletion)
 
     public var utf8ByteCount: Int {
         switch self {
         case .text(let text):
             return text.utf8.count
+        case .toolCalls:
+            return 0
         case .completion:
             return 0
         }

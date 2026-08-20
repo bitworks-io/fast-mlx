@@ -55,6 +55,18 @@
       "slug": "sampling-before-serving",
       "status": "published",
       "reviewedAt": "2026-08-16"
+    },
+    {
+      "source": "docs/content/2026-08-17-the-tool-call-we-could-prove-without-the-model.md",
+      "slug": "the-tool-call-we-could-prove-without-the-model",
+      "status": "published",
+      "reviewedAt": "2026-08-17"
+    },
+    {
+      "source": "docs/content/2026-08-17-the-checkout-that-couldnt-compile-its-gpu.md",
+      "slug": "the-checkout-that-couldnt-compile-its-gpu",
+      "status": "published",
+      "reviewedAt": "2026-08-17"
     }
   ]
 }

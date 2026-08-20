@@ -1,10 +1,12 @@
 <section class="hero shell">
-  <p class="eyebrow">Swift 6 · Apple Silicon · MLX</p>
-  <h1>Inference that gets better by proving what works.</h1>
+  <p class="eyebrow">Swift 6 · Apple Silicon · MLX · Autonomous improvement loop</p>
+  <h1>A self-improving inference engine that runs its own research loop.</h1>
   <p class="lede">
-    fast-mlx continuously evaluates inference ideas, implements bounded candidates, tests them
-    against exact baselines, and publishes the performance, feature set, and value story behind
-    each result—whether the technique wins or fails.
+    fast-mlx is an automated development-and-testing loop for Apple-Silicon inference. With little
+    human intervention it researches performance and efficiency ideas on a schedule, implements each
+    as a bounded candidate behind a failing contract, tests it against exact baselines, and then
+    reviews, updates, and publishes itself—promoting what wins, shelving what doesn't, and recording
+    the negative results either way.
   </p>
   <div class="hero-actions">
     <a class="button primary" href="{{root}}quickstart/">Run the transport smoke</a>
@@ -26,6 +28,7 @@
   <div class="section-heading">
     <p class="eyebrow">The system</p>
     <h2 id="loop-heading">A closed learning loop, not a benchmark highlight reel.</h2>
+    <p class="section-intro">Agents and automation drive every step; humans set the gates. The loop runs on a schedule, implements and tests candidates against exact baselines on its own, and promotes and publishes only what survives review.</p>
   </div>
   <ol class="loop-grid">
     <li><span>01</span><h3>Research</h3><p>Pin the paper, implementation, workload, and user hypothesis.</p></li>

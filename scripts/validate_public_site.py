@@ -114,6 +114,22 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         "scope": "Planning and comparison tools do not prove that a model fits every Mac, that an artifact is launchable, or that a runtime is contained.",
         "evidenceSlugs": ("the-wall-that-wasnt", "lossless-wasnt-byte-identical"),
     },
+    {
+        "id": "openai-tool-calling",
+        "name": "OpenAI-compatible tool calling",
+        "status": "implemented",
+        "summary": "Function/tool calling on the chat-completions route for the dense Qwen3 family: tools and tool_choice in, OpenAI tool_calls out (streaming and non-streaming), with multi-turn tool results rendered through Qwen3's own chat template.",
+        "scope": "Request/response contract, Hermes tool-call parsing, multi-turn chat-template rendering (verified against the real Qwen3 tokenizer), streaming tool-call deltas, and tool_choice resolution are covered by tests without a model. Verified end-to-end on a live served dense Qwen3-8B locally, and independently validated on a production M5 128GB with dense Qwen3-32B-8bit (correct OpenAI tool_calls, the identity verification gate holding without data leak, and the continuous-batch route engaging under concurrency). Tool requests default thinking off for reliability. Targets dense Qwen3 (8B / 32B); the qwen3_5 hybrid line is out of scope.",
+        "evidenceSlugs": ("the-tool-call-we-could-prove-without-the-model",),
+    },
+    {
+        "id": "model-sizer",
+        "name": "Hardware model sizer",
+        "status": "implemented",
+        "summary": "Given a Mac's RAM, reports which quantized model builds fit and at what context — reusing the capacity memory model — so an operator can choose a build before downloading it.",
+        "scope": "Estimates weight, KV-cache, and prefill memory per model and quantization against a detected or preset machine, plus the largest context that fits. Hand-measured boxes report measured headroom; auto-detected machines report a synthesized wired-memory limit, and every such row is flagged as a modeled estimate, not a measured guarantee.",
+        "evidenceSlugs": ("the-checkout-that-couldnt-compile-its-gpu",),
+    },
 )
 REVIEWED_CAPABILITY_PATHS = tuple(
     f'capabilities/{capability["id"]}/' for capability in REVIEWED_CAPABILITIES
@@ -154,9 +170,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 9_638
+REVIEWED_HOME_PAGE_BYTES = 10_318
 REVIEWED_HOME_PAGE_SHA256 = (
-    "4a62ac0bc9994c07219de69f0d03968b9e9f05e353d289910212f5784086abeb"
+    "f574e8f46d63e87f9338431852b6740a55ef572562bf8545686515c317eeded1"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -180,13 +196,13 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 19_414
+REVIEWED_STATUS_PAGE_BYTES = 21_940
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "ea1a70b844e7259c8d2479476fe95496e6b762c0c976431112e36ce1fac4e2e1"
+    "2f048ac761fe5f161326fd82827d563e49e190bd233d838c36c67ef63d7a3454"
 )
-REVIEWED_CAPABILITIES_PAGE_BYTES = 14_735
+REVIEWED_CAPABILITIES_PAGE_BYTES = 17_224
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
-    "c628d10677f4b57c0319896a1cea98da2ea824c784358034146c200ef9b432cd"
+    "3aba353ea977d78b0e9fdb0a88bc1d9138281c073bad3c0dbfe866f6c5e749f6"
 )
 REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "openai-http-sse-serving": (
@@ -216,6 +232,14 @@ REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "capacity-proof-control-tools": (
         5_559,
         "f5b86d209a73f0c20784ea05fe655f970245ac68f5de5a9d90521649bbe98dd9",
+    ),
+    "openai-tool-calling": (
+        5_778,
+        "b1287b4f9190529756b4d76941092e579118871178ac918d4ade03deb9e6ef33",
+    ),
+    "model-sizer": (
+        5_341,
+        "186f8c1c413ccd1fcd503ccda855538885cdc69f830fa05bb7f4df5ea90e9823",
     ),
 }
 REVIEWED_QUICKSTART_COMMANDS: Tuple[Tuple[str, str], ...] = (
@@ -305,9 +329,11 @@ REVIEWED_STATUS_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
     ("exact-cache-lifecycle-controls", "implemented"),
     ("quality-measurement-harness", "implemented"),
     ("capacity-proof-control-tools", "implemented"),
+    ("openai-tool-calling", "implemented"),
+    ("model-sizer", "implemented"),
 )
 REVIEWED_STATUS_COUNTS: Tuple[Tuple[str, str], ...] = (
-    ("implemented", "4"),
+    ("implemented", "6"),
     ("promoted-scoped", "2"),
     ("experimental", "0"),
     ("shelved", "1"),
@@ -337,6 +363,10 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-wall-that-wasnt/",
     "../research/lossless-wasnt-byte-identical/",
     "../capabilities/capacity-proof-control-tools/",
+    "../research/the-tool-call-we-could-prove-without-the-model/",
+    "../capabilities/openai-tool-calling/",
+    "../research/the-checkout-that-couldnt-compile-its-gpu/",
+    "../capabilities/model-sizer/",
     "../benchmarks/pld-echo-throughput/",
     "../research/when-zero-speculation-costs-two-percent/",
     "../benchmarks/continuous-batch-c2-throughput/",
@@ -353,9 +383,9 @@ REVIEWED_STATUS_LINKS = (
 REVIEWED_STATUS_TEXT = (
     "Current state, not a roadmap.",
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
-    "7 reviewed capabilities",
+    "9 reviewed capabilities",
     "3 measured proof points",
-    "9 published research notes",
+    "11 published research notes",
     "15 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -450,6 +480,8 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/the-tool-call-we-could-prove-without-the-model/",
+    "research/the-checkout-that-couldnt-compile-its-gpu/",
     "research/sampling-before-serving/",
     "research/the-repository-that-could-reproduce-itself/",
     "research/the-proof-did-not-end-when-the-timer-did/",
@@ -485,6 +517,14 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     ),
     "research/trusting-the-instrument/": ("2026-07-09", "2026-08-06"),
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
+    "research/the-tool-call-we-could-prove-without-the-model/": (
+        "2026-08-17",
+        "2026-08-17",
+    ),
+    "research/the-checkout-that-couldnt-compile-its-gpu/": (
+        "2026-08-17",
+        "2026-08-17",
+    ),
 }
 REVIEWED_RELEASE_INDEX_BYTES = 14_884
 REVIEWED_RELEASE_INDEX_SHA256 = (
@@ -599,8 +639,8 @@ REVIEWED_PAGE_METADATA: Dict[
     str, Tuple[str, str, str, Optional[str]]
 ] = {
     "": (
-        "fast-mlx — evidence-gated MLX inference",
-        "A Swift and MLX inference project that continuously researches, tests, and publishes verified capabilities.",
+        "fast-mlx — a self-improving MLX inference engine",
+        "A self-improving MLX inference engine for Apple Silicon: an automated loop that researches, tests candidates against exact baselines, and publishes its own results with little human intervention.",
         "website",
         None,
     ),
@@ -750,6 +790,18 @@ REVIEWED_PAGE_METADATA: Dict[
         "Our precision-loss harness had just been hardened — teacher-forced KL, perplexity, a versioned corpus, provenance records. Then it hit a wall: any measurement past roughly 7,000 tokens of context died with a SIGKILL…",
         "article",
         "The optimization dial — quantified precision-loss tuning",
+    ),
+    "research/the-tool-call-we-could-prove-without-the-model/": (
+        "The tool call we could prove without the model — fast-mlx",
+        "Tool calling looks like a feature you bolt onto a chat server: accept a tools array, let the model emit a function call, hand it back in OpenAI's shape. Most of that machinery already existed in fast-mlx before this…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel; Disciplined proof over convenient claims",
+    ),
+    "research/the-checkout-that-couldnt-compile-its-gpu/": (
+        "The checkout that couldn't compile its own GPU — fast-mlx",
+        "A benchmark nobody can run is not evidence, and an engine nobody can start is not a product. For a stretch, fast-mlx was the second thing: a fresh git clone on a current Mac would build, launch, accept a request, and…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Disciplined proof over convenient claims; Meeting operators where they are",
     ),
 }
 

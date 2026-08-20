@@ -35,6 +35,10 @@ public enum CompressedKVAttentionModelFamily:
     case qwen3
     case llama
     case phi3
+    /// Hybrid-linear family (dense-attention layers interleaved with GatedDeltaNet recurrent layers).
+    /// Used by the continuous-batching hybrid proof; NOT a compressed-attention admission family — the
+    /// compressed-attention revalidation switch fails closed on it.
+    case qwen35 = "qwen3_5"
 }
 
 /// Native floating-point dtype declared by the exact authenticated model configuration. This is
@@ -525,6 +529,10 @@ public struct CompressedKVAttentionRuntimeAdmission:
             expectedIdentity = (.llama, "llama", "LlamaForCausalLM")
         case .phi3:
             expectedIdentity = (.phi3, "phi3", "Phi3ForCausalLM")
+        case .qwen35:
+            // Compressed-attention admission does not support the hybrid-linear family; a durable row
+            // claiming it is invalid here. (The continuous-batching hybrid proof is a distinct path.)
+            throw CompressedKVAttentionRuntimeAdmissionError.unsupportedModelType("qwen3_5")
         }
         guard family == expectedIdentity.family,
             modelType == expectedIdentity.modelType,

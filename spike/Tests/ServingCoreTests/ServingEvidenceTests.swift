@@ -450,6 +450,125 @@ final class ServingEvidenceTests: XCTestCase {
                 mlxCacheBytes: 0,
                 mlxPeakBytes: 0))
     }
+
+    // MARK: - measured-vs-modeled drift fields (fit-checked-serve differentiator #2)
+
+    func testResourceSnapshotFitDriftFieldsRoundTripAndAreAbsentWhenNil() throws {
+        let withDrift = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 1,
+            coordinatorSlots: 1,
+            reservedKVBytes: 2_048,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 6_144,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 9_000,
+            fitModeledPeakBytes: 10_000,
+            fitMeasuredPeakBytes: 9_000,
+            fitDriftVerdict: "conservative",
+            fitDriftFraction: -0.10,
+            fitModeledWeightsBytes: 6_000,
+            fitModeledKVBytes: 2_000,
+            fitModeledTransientBytes: 1_500,
+            fitModeledHeadroomBytes: 500)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(String(data: encoder.encode(withDrift), encoding: .utf8))
+        // Machine contract: flat snake_case keys mirroring FitCheckMeasuredReport.machineReadableFields().
+        XCTAssertTrue(json.contains(#""fit_modeled_peak_bytes":10000"#), json)
+        XCTAssertTrue(json.contains(#""fit_measured_peak_bytes":9000"#), json)
+        XCTAssertTrue(json.contains(#""fit_drift":"conservative""#), json)
+        XCTAssertTrue(json.contains(#""fit_drift_frac":-0.1"#), json)
+        XCTAssertTrue(json.contains(#""fit_modeled_weights_bytes":6000"#), json)
+        XCTAssertTrue(json.contains(#""fit_modeled_kv_bytes":2000"#), json)
+        XCTAssertTrue(json.contains(#""fit_modeled_transient_bytes":1500"#), json)
+        XCTAssertTrue(json.contains(#""fit_modeled_headroom_bytes":500"#), json)
+        XCTAssertEqual(try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self,
+                                                from: Data(json.utf8)), withDrift)
+
+        // Old contract stays byte-compatible: a snapshot with no drift omits every fit_* key.
+        let noDrift = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let plainJSON = try XCTUnwrap(String(data: encoder.encode(noDrift), encoding: .utf8))
+        XCTAssertFalse(plainJSON.contains("fit_"), plainJSON)
+        XCTAssertEqual(try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self,
+                                                from: Data(plainJSON.utf8)), noDrift)
+    }
+
+    func testFitDriftFieldsSurviveTheProductionCanonicalEvidencePath() throws {
+        // The acceptance for differentiator #2: the drift fields must survive the SERIALIZER production
+        // actually uses — ServingEvidence.canonicalJSONData() (the JSONL sink) and decodeCanonicalJSONData
+        // — not just a bare JSONEncoder. This locks the nested ResourceSnapshot's synthesized encode
+        // against a future hand-rolled canonical serializer that would silently drop the new keys.
+        let terminal = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 9_500,
+            fitModeledPeakBytes: 10_000,
+            fitMeasuredPeakBytes: 9_500,
+            fitDriftVerdict: "conservative",
+            fitDriftFraction: -0.05,
+            fitModeledWeightsBytes: 6_000,
+            fitModeledKVBytes: 2_000,
+            fitModeledTransientBytes: 1_500,
+            fitModeledHeadroomBytes: 500)
+        let evidence = try ServingEvidence(
+            request: ServingEvidence.Request(
+                method: "POST",
+                path: "/v1/chat/completions",
+                headers: [],
+                body: Data("{}".utf8),
+                stream: false,
+                messageCount: 1,
+                maxCompletionTokens: 8),
+            response: ServingEvidence.Response(
+                status: 200,
+                durationMilliseconds: 5,
+                chunkCount: 0,
+                body: Data()),
+            resources: .init(admission: .accepted, terminal: terminal))
+
+        let canonical = try evidence.canonicalJSONData()
+        let json = try XCTUnwrap(String(data: canonical, encoding: .utf8))
+        XCTAssertTrue(json.contains(#""fit_modeled_peak_bytes":10000"#), json)
+        XCTAssertTrue(json.contains(#""fit_drift":"conservative""#), json)
+        XCTAssertTrue(json.contains("fit_modeled_kv_bytes"), json)
+        // Full production round-trip preserves the drift-bearing snapshot exactly.
+        XCTAssertEqual(try ServingEvidence.decodeCanonicalJSONData(canonical), evidence)
+    }
+
+    func testResourceSnapshotFitDriftRejectsExplicitNullAndNegativeBytes() throws {
+        // Explicit null for a canonically-omitted drift field is rejected (matches the evidence contract).
+        let explicitNull = Data(#"""
+        {"active_requests":0,"coordinator_slots":0,"reserved_kv_bytes":0,\#
+        "max_reserved_kv_bytes":0,"mlx_active_bytes":0,"mlx_cache_bytes":0,\#
+        "mlx_peak_bytes":0,"fit_modeled_peak_bytes":null}
+        """#.utf8)
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: explicitNull))
+
+        // A drift byte count is a byte total: negative is rejected. (The signed fraction may be negative.)
+        XCTAssertThrowsError(
+            try ServingEvidence.ResourceSnapshot(
+                activeRequests: 0,
+                coordinatorSlots: 0,
+                reservedKVBytes: 0,
+                maxReservedKVBytes: 0,
+                mlxActiveBytes: 0,
+                mlxCacheBytes: 0,
+                mlxPeakBytes: 0,
+                fitModeledPeakBytes: -1))
+    }
 }
 
 private func makeMinimalEvidence() throws -> ServingEvidence {

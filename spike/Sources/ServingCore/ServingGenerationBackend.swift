@@ -57,6 +57,12 @@ public struct ServingGenerationHandle: Sendable {
     public let route: ServingExecutionRoute
     public let mailbox: BoundedDeltaMailbox
     public let lease: ServingRequestLease
+    /// Whether this stream separates reasoning from the visible answer: the streaming SSE handler routes
+    /// its `.text` deltas through `StreamingReasoningSplitter` (reasoning until `</think>`, then content)
+    /// when true, and passes them through as raw `delta.content` (byte-identical to before) when false.
+    /// Derived at admission from `servingSeparatesReasoning(thinksByDefault:resolvedEnableThinking:)`.
+    /// Defaults false so backends/tests that do not separate reasoning compile and behave unchanged.
+    public let separatesReasoning: Bool
 
     public init(
         responseID: String,
@@ -64,7 +70,8 @@ public struct ServingGenerationHandle: Sendable {
         model: String,
         route: ServingExecutionRoute,
         mailbox: BoundedDeltaMailbox,
-        lease: ServingRequestLease
+        lease: ServingRequestLease,
+        separatesReasoning: Bool = false
     ) {
         self.responseID = responseID
         self.created = created
@@ -72,6 +79,7 @@ public struct ServingGenerationHandle: Sendable {
         self.route = route
         self.mailbox = mailbox
         self.lease = lease
+        self.separatesReasoning = separatesReasoning
     }
 }
 

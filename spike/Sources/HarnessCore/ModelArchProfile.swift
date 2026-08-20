@@ -3,7 +3,7 @@ import Foundation
 /// The KV-cache growth pattern class, dispatching the per-token formula (spec §2.1). A single
 /// formula is wrong for 5 of 14 catalog models — off by 4x-71x — so the capacity model switches
 /// on this instead of treating every model as uniform-GQA.
-public enum ArchClass: String, Sendable {
+public enum ArchClass: String, Sendable, CaseIterable {
     /// Every transformer layer runs standard GQA attention and grows its KV cache every token.
     /// `KVCacheSimple`/`StandardKVCache`. Qwen3 dense/MoE, Llama, Mistral, GLM-4.5-Air/4.6, Phi-4,
     /// Qwen3-235B.
@@ -15,6 +15,14 @@ public enum ArchClass: String, Sendable {
     /// A fixed ratio of global (`StandardKVCache`, grows with full context) to local
     /// (`RotatingKVCache`, capped at a sliding window) attention layers, interleaved. Gemma-3.
     case interleavedSWA
+    /// Like `.interleavedSWA` (global growing + local window-capped layers) BUT the two layer
+    /// classes carry DIFFERENT head geometry, AND every layer also holds a fixed recurrent/conv
+    /// state. The growing term uses the global geometry (`nKVHeads`/`headDim` over `nAttnLayers`),
+    /// the window-capped term uses the SWA geometry (`swaKVHeads`/`swaHeadDim` over `nLocalLayers`),
+    /// and `fixedStateBytes` is added on top — all three simultaneously. Neither `.interleavedSWA`
+    /// (one geometry, drops `fixedStateBytes`) nor `.hybridLinear` (drops the window cap) can
+    /// express this. Baichuan-M1 (`baichuan_m1`).
+    case dualGeometrySWA
     /// DeepSeek-V3/R1 as the vendored Swift arch actually caches it today: `kv_b_proj`
     /// decompresses MLA back to per-head K/V *before* the cache write, so the cache holds the
     /// full decompressed per-head geometry, not the compact MLA latent. Huge. (The compact
@@ -65,21 +73,53 @@ public struct ModelArchProfile: Sendable {
     /// Per-head value dim (128 for R1).
     public let mlaVDim: Int?
 
+    // MARK: Dual-geometry SWA (`.dualGeometrySWA` only; nil for every other class)
+    /// KV-head count for the SWA (window-capped) layers when it differs from the global-layer
+    /// `nKVHeads`. `nil` outside `.dualGeometrySWA` (and `swaFixedLocalBytes` falls back to
+    /// `nKVHeads` if unexpectedly nil, matching the vendored runtime's own head-count fallback).
+    public let swaKVHeads: Int?
+    /// Per-head dim for the SWA (window-capped) layers when it differs from the global-layer
+    /// `headDim`. `nil` outside `.dualGeometrySWA` (falls back to `headDim`).
+    public let swaHeadDim: Int?
+    /// Per-head VALUE dim for the GLOBAL layers when K and V are cached at DIFFERENT per-head dims
+    /// (asymmetric attention, e.g. mimo_v2_flash: K at `headDim`, V narrower). `nil` for the common
+    /// symmetric case, where the KV formula's `headDim + (vHeadDim ?? headDim) = 2·headDim` recovers
+    /// the standard `×2` — so every symmetric model's numbers are unchanged.
+    public let vHeadDim: Int?
+    /// Per-head VALUE dim for the SWA (window-capped) layers when it differs from `swaHeadDim`.
+    /// `nil` falls back to `swaHeadDim` (symmetric). Only meaningful for `.dualGeometrySWA`.
+    public let swaVHeadDim: Int?
+
     public init(
         id: String, modelType: ArchClass, nLayers: Int, nAttnLayers: Int, nKVHeads: Int, headDim: Int,
         slidingWindow: Int? = nil, fixedStateBytes: Int = 0, nativeMaxContext: Int,
         weightsBytes4bitEstimate: Int, license: String,
-        mlaHeads: Int? = nil, mlaRopeDim: Int? = nil, mlaNopeDim: Int? = nil, mlaVDim: Int? = nil
+        mlaHeads: Int? = nil, mlaRopeDim: Int? = nil, mlaNopeDim: Int? = nil, mlaVDim: Int? = nil,
+        swaKVHeads: Int? = nil, swaHeadDim: Int? = nil, vHeadDim: Int? = nil, swaVHeadDim: Int? = nil
     ) {
         self.id = id; self.modelType = modelType; self.nLayers = nLayers; self.nAttnLayers = nAttnLayers
         self.nKVHeads = nKVHeads; self.headDim = headDim; self.slidingWindow = slidingWindow
         self.fixedStateBytes = fixedStateBytes; self.nativeMaxContext = nativeMaxContext
         self.weightsBytes4bitEstimate = weightsBytes4bitEstimate; self.license = license
         self.mlaHeads = mlaHeads; self.mlaRopeDim = mlaRopeDim; self.mlaNopeDim = mlaNopeDim; self.mlaVDim = mlaVDim
+        self.swaKVHeads = swaKVHeads; self.swaHeadDim = swaHeadDim
+        self.vHeadDim = vHeadDim; self.swaVHeadDim = swaVHeadDim
     }
 
-    /// Local (rotating/capped) layer count for interleaved-SWA: `nLayers - nAttnLayers`. Meaningless
-    /// (and unused) for every other class.
+    /// K+V per-head dim sum for the GLOBAL layers: `headDim + (vHeadDim ?? headDim)`. Recovers the
+    /// standard `2·headDim` when K and V are symmetric (`vHeadDim == nil`), so symmetric models are
+    /// unchanged; models with a narrower/wider V (asymmetric attention) size their cache honestly.
+    public var kvHeadDimSum: Int { headDim + (vHeadDim ?? headDim) }
+    /// K+V per-head dim sum for the SWA (window-capped) layers: `swaHeadDim + (swaVHeadDim ?? swaHeadDim)`,
+    /// falling back to the global sum when no SWA geometry is set.
+    public var swaKVHeadDimSum: Int {
+        let k = swaHeadDim ?? headDim
+        let v = swaVHeadDim ?? swaHeadDim ?? vHeadDim ?? headDim
+        return k + v
+    }
+
+    /// Local (rotating/capped) layer count for interleaved-SWA and dual-geometry-SWA:
+    /// `nLayers - nAttnLayers`. Meaningless (and unused) for every other class.
     public var nLocalLayers: Int { nLayers - nAttnLayers }
 
     /// Whether this model's TOTAL KV cost is derivable from confirmed config. `false` when the
@@ -106,16 +146,39 @@ public struct ModelArchProfile: Sendable {
             weightsBytes4bitEstimate: Int(15.25 * Double(gib)), license: "Apache-2.0"
         ),
         // hybrid-linear: 10 of 40 layers are GQA attention (interval 4); rest are GatedDeltaNet.
-        // nKVHeads×headDim = 512 reconciles 20 KiB/tok (naive all-40-layers would be 80 KiB/tok —
-        // the 4x the spec calls out). fixedStateBytes = 0: the spec's own KV@32K = 0.625 GiB
-        // reconciles from the attention term ALONE (20 KiB × 32768 = 0.625 GiB exactly), so no
-        // additional recurrent-state term was needed to hit the confirmed number; the true
-        // GatedDeltaNet state cost is not zero, just not separately reconciled here. ⚠️ license
-        // "verify" per spec.
+        // GROWING term: nKVHeads×headDim = 512 reconciles 20 KiB/tok (naive all-40-layers would be
+        // 80 KiB/tok — the 4x the spec calls out); the spec's own KV@32K = 0.625 GiB is this attention
+        // term ALONE (20 KiB × 32768 = 0.625 GiB exactly). FIXED term: the 30 linear layers' per-sequence
+        // GatedDeltaNet recurrent+conv state, previously left at 0 (unreconciled), is now source-verified
+        // from the real config.json text_config (linear_num_key_heads 16, linear_num_value_heads 32,
+        // linear_key_head_dim 128, linear_value_head_dim 128, linear_conv_kernel_dim 4): per_layer =
+        // conv (4−1)·8192·2 = 49,152 + ssm 32·128·128·4 = 2,097,152 = 2,146,304; × 30 linear layers =
+        // 64,389,120 B ≈ 61.41 MiB/seq (identical per-layer to Qwen3.5-9B; only the linear-layer count
+        // differs, 30 vs 24). Attention geometry corrected from the same text_config to the real
+        // num_key_value_heads 2 × head_dim 256 (was 4×128; product 512 unchanged, so KV/tok is identical
+        // — an honesty fix, not a number change). ⚠️ license "verify" per spec.
         ModelArchProfile(
             id: "Qwen3.6-35B-A3B", modelType: .hybridLinear, nLayers: 40, nAttnLayers: 10,
-            nKVHeads: 4, headDim: 128, fixedStateBytes: 0, nativeMaxContext: 262_144,
+            nKVHeads: 2, headDim: 256, fixedStateBytes: 64_389_120, nativeMaxContext: 262_144,
             weightsBytes4bitEstimate: Int(17.5 * Double(gib)), license: "⚠️ verify"
+        ),
+        // hybrid-linear, the live hybrid-serving verification checkpoint
+        // (mlx-community/Qwen3.5-9B-MLX-4bit). Confirmed from its config.json text_config:
+        // 32 layers, layer_types = 8×full_attention + 24×linear_attention (full_attention_interval
+        // 4), so nAttnLayers = 8 (only the full-attention layers grow a KV cache); nKVHeads = 4,
+        // head_dim = 256. GROWING KV/tok = 8 × 4 × 256 × 2 × 2 B(fp16) = 32 KiB/tok → exactly 1.0 GiB @ 32K.
+        // FIXED term: the 24 linear_attention layers carry recurrent conv/SSM state (linear_conv_kernel_dim
+        // 4, 16 key / 32 value heads × 128 dim), source-verified from the checkpoint's config.json and
+        // reconciled against the vendored MambaCache allocation: per_layer = conv (4−1)·8192·2 = 49,152 +
+        // ssm 32·128·128·4 = 2,097,152 = 2,146,304; × 24 linear layers = 51,511,296 B ≈ 49.13 MiB/seq.
+        // Previously 0 (unreconciled); now separately encoded so the off-box catalog matches the live
+        // decoder. ⚠️ This checkpoint is a vision-language model (Qwen3_5ForConditionalGeneration); the
+        // geometry above is the text decoder's and drives text-serving KV. weights estimate ⚠️ approx
+        // (includes the vision tower). nativeMaxContext = 262,144 (max_position_embeddings).
+        ModelArchProfile(
+            id: "Qwen3.5-9B", modelType: .hybridLinear, nLayers: 32, nAttnLayers: 8,
+            nKVHeads: 4, headDim: 256, fixedStateBytes: 51_511_296, nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: Int(5.5 * Double(gib)), license: "⚠️ verify"
         ),
         // nKVHeads×headDim = 1024 reconciles 184 KiB/tok @ 46 layers.
         ModelArchProfile(
@@ -212,6 +275,47 @@ public struct ModelArchProfile: Sendable {
             id: "Ornith-1.0-397B", modelType: .hybridLinear, nLayers: 60, nAttnLayers: 15,
             nKVHeads: 4, headDim: 128, fixedStateBytes: 0, nativeMaxContext: 262_144,
             weightsBytes4bitEstimate: Int(198.5 * Double(gib)), license: "⚠️ MIT (confirm at pull)"
+        ),
+        // dual-geometry-SWA (baichuan_m1), the fit-check coverage entry for this ArchClass.
+        // Geometry audited directly against the real published config (docs/task-inbox/
+        // 2026-08-19-baichuan-m1-dual-geometry-arch-reach.md) and pinned exactly by
+        // `ModelConfigDecoderTests.testBaichuanM1_dualGeometrySWA_realConfig` +
+        // `DualGeometrySWACatalogTests` (decode-drift guard): 40 layers, 20 global (growing) + 20
+        // sliding-window layers; global 2 kv × 256 dim, SWA 8 kv × 128 dim (2x the global product —
+        // NOT symmetric); sliding_window 8192; fixedStateBytes 122,880 (per-layer conv state, both
+        // layer classes); nativeMaxContext 32,768. KV@32K = 2,013,388,800 B (fp16) reconciled exactly.
+        // weightsBytes4bitEstimate is MEASURED from the published mlx-community/Baichuan-M1-14B-
+        // Instruct-4bit artifact (HF safetensors dtype breakdown, 2026-08-20): BF16 452,613,920×2
+        // + U32 1,808,793,600×4 = 8,140,402,240 B = 7.58 GiB.
+        ModelArchProfile(
+            id: "Baichuan-M1-14B", modelType: .dualGeometrySWA, nLayers: 40, nAttnLayers: 20,
+            nKVHeads: 2, headDim: 256, slidingWindow: 8192, fixedStateBytes: 122_880,
+            nativeMaxContext: 32_768,
+            weightsBytes4bitEstimate: Int(7.58 * Double(gib)), license: "Apache-2.0",
+            swaKVHeads: 8, swaHeadDim: 128
+        ),
+        // dual-geometry-SWA with ASYMMETRIC K/V (mimo_v2_flash), the second fit-check coverage entry
+        // for this ArchClass — exercises `vHeadDim`/`swaVHeadDim` (narrower cached V than K) which
+        // Baichuan-M1 (symmetric) does not touch. Geometry audited against the real published config
+        // (docs/task-inbox/2026-08-19-mimo-v2-flash-dual-geometry-vheaddim.md) and pinned exactly by
+        // `ModelConfigDecoderTests.testMimoV2Flash_dualGeometrySWA_asymmetricKV_realConfig` +
+        // `DualGeometrySWACatalogTests`: 48 layers, 9 global (growing, `hybrid_layer_pattern`) + 39
+        // sliding-window layers; global 4 kv, K dim 192 / V dim 128; SWA 8 kv, K dim 192 / V dim 128;
+        // sliding_window 128; fixedStateBytes 0 (no conv/recurrent state); nativeMaxContext 262,144.
+        // KV@32K = 780,533,760 B (fp16) reconciled exactly.
+        // ⚠️ MiMo-V2-Flash is a ~309B-parameter fp8-native MoE, NOT a small model. weightsBytes4bit-
+        // Estimate is MEASURED from the published mlx-community/MiMo-V2-Flash-4bit artifact (HF
+        // safetensors dtype breakdown, 2026-08-20): BF16 9,697,466,816×2 + U32 38,591,135,744×4 +
+        // F32 12,032×4 = 173,759,524,736 B = 161.83 GiB. This EXCEEDS the 128 GB M5's RAM — a
+        // weights-larger-than-RAM (#3b) case — so the fit-check correctly reds it on every current
+        // box; that honest refusal is the differentiator working, not a bug. (An earlier proportional
+        // guess of 17.5 GiB under-counted this by ~9x — the exact phantom-GREEN the fit-check prevents.)
+        ModelArchProfile(
+            id: "MiMo-V2-Flash", modelType: .dualGeometrySWA, nLayers: 48, nAttnLayers: 9,
+            nKVHeads: 4, headDim: 192, slidingWindow: 128, fixedStateBytes: 0,
+            nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: Int(161.83 * Double(gib)), license: "unknown (see model card)",
+            swaKVHeads: 8, swaHeadDim: 192, vHeadDim: 128, swaVHeadDim: 128
         ),
     ]
 }

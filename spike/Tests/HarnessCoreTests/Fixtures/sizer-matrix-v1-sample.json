@@ -1,0 +1,65 @@
+{
+  "schema": "sizer-matrix/v1",
+  "host": {
+    "label": "m5Max128",
+    "ramBytes": 137438953472,
+    "wiredLimitBytes": 123480309760,
+    "wiredLimitIsMeasured": true
+  },
+  "kvQuant": "fp16",
+  "concurrency": 1,
+  "rows": [
+    {
+      "modelID": "Qwen3-8B",
+      "weightBits": 4,
+      "weightsBytes": 4500000000,
+      "kvBytesAtContext": 2000000000,
+      "transientPrefillBytes": 500000000,
+      "totalPeakBytes": 7000000000,
+      "fits": true,
+      "maxContextThatFits": 131072,
+      "requestedContext": 32768,
+      "classification": "green",
+      "estimateIsMeasured": true
+    },
+    {
+      "modelID": "Qwen3-8B",
+      "weightBits": 8,
+      "weightsBytes": 9000000000,
+      "kvBytesAtContext": 2000000000,
+      "transientPrefillBytes": 500000000,
+      "totalPeakBytes": 11500000000,
+      "fits": true,
+      "maxContextThatFits": 65536,
+      "requestedContext": 32768,
+      "classification": "yellow",
+      "estimateIsMeasured": true
+    },
+    {
+      "modelID": "DeepSeek-V3-671B",
+      "weightBits": 4,
+      "weightsBytes": 335000000000,
+      "kvBytesAtContext": 20000000000,
+      "transientPrefillBytes": 4000000000,
+      "totalPeakBytes": 359000000000,
+      "fits": false,
+      "maxContextThatFits": 0,
+      "requestedContext": 32768,
+      "classification": "red",
+      "estimateIsMeasured": true
+    },
+    {
+      "modelID": "DeepSeek-V3-671B",
+      "weightBits": 8,
+      "weightsBytes": 670000000000,
+      "kvBytesAtContext": 20000000000,
+      "transientPrefillBytes": 4000000000,
+      "totalPeakBytes": 694000000000,
+      "fits": false,
+      "maxContextThatFits": 0,
+      "requestedContext": 32768,
+      "classification": "red",
+      "estimateIsMeasured": false
+    }
+  ]
+}

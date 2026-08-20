@@ -34,6 +34,48 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertEqual(request.stop, ["</s>", "<|end|>"])
     }
 
+    func testAcceptsPositiveTemperatureAndDecodesSamplingFields() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"temperature":0.7,"top_p":0.9,"top_k":40,"min_p":0.05,"seed":42}
+        """
+
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+
+        XCTAssertEqual(request.temperature, 0.7)
+        XCTAssertEqual(request.topP, 0.9)
+        XCTAssertEqual(request.topK, 40)
+        XCTAssertEqual(request.minP, 0.05)
+        XCTAssertEqual(request.seed, 42)
+    }
+
+    func testSamplingFieldsAreNilWhenAbsent() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}]}
+        """
+
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+
+        XCTAssertNil(request.temperature)
+        XCTAssertNil(request.topP)
+        XCTAssertNil(request.topK)
+        XCTAssertNil(request.minP)
+        XCTAssertNil(request.seed)
+    }
+
+    func testOutOfRangeTemperatureIsRejectedByPolicyNotDecode() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"temperature":3.0}
+        """
+
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.temperature, 3.0)
+
+        XCTAssertThrowsError(try ServingSamplingPolicy.resolve(from: request)) { error in
+            XCTAssertEqual(
+                error as? ServingSamplingPolicyError, .temperatureOutOfRange(3.0))
+        }
+    }
+
     func testDeprecatedMaxTokensAliasAndConflictBehavior() throws {
         let alias = """
         {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_tokens":7}
@@ -99,16 +141,22 @@ final class OpenAIChatCompletionsTests: XCTestCase {
     func testRejectsUnknownAndUnsupportedFieldsBeforeAdmission() throws {
         let cases: [(String, String?)] = [
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"unknown":true}"#, "unknown"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"temperature":0.1}"#, "temperature"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"temperature":true}"#, "temperature"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_p":0.5}"#, "top_p"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_p":true}"#, "top_p"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_k":0}"#, "top_k"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_k":-1}"#, "top_k"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"min_p":-0.1}"#, "min_p"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"min_p":1.5}"#, "min_p"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"seed":true}"#, "seed"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"n":2}"#, "n"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"tools":[]}"#, "tools"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}"#, "messages.content"),
             (#"{"model":"","messages":[{"role":"user","content":"Hi"}]}"#, "model"),
             (#"{"model":"qwen3-32b","messages":[]}"#, "messages"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"tool","content":"Hi"}]}"#, "messages.role"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"tool","content":"Hi"}]}"#, "messages.tool_call_id"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi","tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]}]}"#, "messages.tool_calls"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"tool_choice":"bogus"}"#, "tool_choice"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"tools":[{"type":"function"}]}"#, "tools[0].function"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stop":["a","b","c","d","e"]}"#, "stop"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stop":""}"#, "stop"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":0}"#, "max_completion_tokens"),

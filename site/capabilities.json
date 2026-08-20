@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "policy": "fast-mlx-owned-results-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-16",
+  "updatedAt": "2026-08-17",
   "capabilities": [
     {
       "id": "openai-http-sse-serving",
@@ -76,6 +76,26 @@
       "evidenceSlugs": [
         "the-wall-that-wasnt",
         "lossless-wasnt-byte-identical"
+      ]
+    },
+    {
+      "id": "openai-tool-calling",
+      "name": "OpenAI-compatible tool calling",
+      "status": "implemented",
+      "summary": "Function/tool calling on the chat-completions route for the dense Qwen3 family: tools and tool_choice in, OpenAI tool_calls out (streaming and non-streaming), with multi-turn tool results rendered through Qwen3's own chat template.",
+      "scope": "Request/response contract, Hermes tool-call parsing, multi-turn chat-template rendering (verified against the real Qwen3 tokenizer), streaming tool-call deltas, and tool_choice resolution are covered by tests without a model. Verified end-to-end on a live served dense Qwen3-8B locally, and independently validated on a production M5 128GB with dense Qwen3-32B-8bit (correct OpenAI tool_calls, the identity verification gate holding without data leak, and the continuous-batch route engaging under concurrency). Tool requests default thinking off for reliability. Targets dense Qwen3 (8B / 32B); the qwen3_5 hybrid line is out of scope.",
+      "evidenceSlugs": [
+        "the-tool-call-we-could-prove-without-the-model"
+      ]
+    },
+    {
+      "id": "model-sizer",
+      "name": "Hardware model sizer",
+      "status": "implemented",
+      "summary": "Given a Mac's RAM, reports which quantized model builds fit and at what context — reusing the capacity memory model — so an operator can choose a build before downloading it.",
+      "scope": "Estimates weight, KV-cache, and prefill memory per model and quantization against a detected or preset machine, plus the largest context that fits. Hand-measured boxes report measured headroom; auto-detected machines report a synthesized wired-memory limit, and every such row is flagged as a modeled estimate, not a measured guarantee.",
+      "evidenceSlugs": [
+        "the-checkout-that-couldnt-compile-its-gpu"
       ]
     }
   ],

@@ -17,9 +17,18 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
     fileprivate let keyValueHeadCount: Int
     fileprivate let headDimension: Int
     fileprivate let elementBytes: Int
+    /// The heterogeneous per-layer cache geometry for the hybrid-linear family (`.qwen35`); `nil` for the
+    /// uniform-KV family (`.qwen3`). Carried in the proof so the config-hash-pinned derivation is proven
+    /// once and never re-derived outside the unforgeable boundary.
+    fileprivate let hybridGeometry: HybridCacheGeometry?
 
     public var verifiedModelFamily: CompressedKVAttentionModelFamily {
         modelFamily
+    }
+
+    /// The hybrid per-layer cache geometry, present iff `verifiedModelFamily == .qwen35`.
+    public var verifiedHybridGeometry: HybridCacheGeometry? {
+        hybridGeometry
     }
 
     public var modelConfigurationSHA256: String {
@@ -40,6 +49,17 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
 
     public var verifiedHeadDimension: Int {
         headDimension
+    }
+
+    /// Minimal lenient decode of just the family tag, so an unsupported family is
+    /// identified before the strict geometry `Configuration` decode (which fails on
+    /// VL-wrapped hybrids whose fields live under `text_config`).
+    private struct ModelTypeProbe: Decodable {
+        let modelType: String
+
+        enum CodingKeys: String, CodingKey {
+            case modelType = "model_type"
+        }
     }
 
     private struct Configuration: Decodable {
@@ -76,7 +96,8 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
         layerCount: Int,
         keyValueHeadCount: Int,
         headDimension: Int,
-        elementBytes: Int
+        elementBytes: Int,
+        hybridGeometry: HybridCacheGeometry? = nil
     ) {
         self.modelFamily = modelFamily
         self.modelConfigHash = modelConfigHash
@@ -90,17 +111,42 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
         self.keyValueHeadCount = keyValueHeadCount
         self.headDimension = headDimension
         self.elementBytes = elementBytes
+        self.hybridGeometry = hybridGeometry
     }
 
     public static func verifying(
         modelDirectory: URL,
-        stableCompressedSource: CompressedKVAttentionRuntimeSourceSnapshot? = nil
+        stableCompressedSource: CompressedKVAttentionRuntimeSourceSnapshot? = nil,
+        allowHybridQwen35: Bool = false
     ) throws -> Self {
         let url = modelDirectory.appendingPathComponent("config.json")
         let data: Data
-        let configuration: Configuration
         do {
             data = try Data(contentsOf: url)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
+        // Determine the family BEFORE the strict geometry decode. A valid config for an
+        // unsupported family must fail as unsupportedModelFamily, not invalidModelConfiguration:
+        // hybrid families (e.g. qwen3_5) ship VL-wrapped with the geometry under `text_config`,
+        // so the strict Configuration decode fails on absent top-level fields first and would
+        // mask the family — defeating the continuous→scalar serving fallback that keys on
+        // unsupportedModelFamily. A config with no readable `model_type` is genuinely broken and
+        // falls through to invalidModelConfiguration below.
+        if let probe = try? JSONDecoder().decode(ModelTypeProbe.self, from: data),
+            probe.modelType != "qwen3"
+        {
+            // Flag-gated hybrid-linear (qwen3_5) admission (design §2.4). OFF by default everywhere, so
+            // the scalar fallback that keys on `unsupportedModelFamily` keeps working; ON, the proof
+            // carries the config-hash-pinned `HybridCacheGeometry`. Any other family still throws here.
+            if probe.modelType == "qwen3_5", allowHybridQwen35 {
+                return try hybridQwen35Proof(
+                    data: data, stableCompressedSource: stableCompressedSource)
+            }
+            throw DenseContinuousBatchRuntimeError.unsupportedModelFamily(probe.modelType)
+        }
+        let configuration: Configuration
+        do {
             configuration = try JSONDecoder().decode(
                 Configuration.self, from: data)
         } catch {
@@ -111,6 +157,7 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
         {
             throw DenseContinuousBatchRuntimeError.compressedBatchSourceProofMismatch
         }
+        // Redundant after the family probe above, kept as defense in depth.
         guard configuration.modelType == "qwen3" else {
             throw DenseContinuousBatchRuntimeError.unsupportedModelFamily(
                 configuration.modelType)
@@ -150,6 +197,67 @@ public struct DenseContinuousBatchModelProof: Sendable, Equatable {
             keyValueHeadCount: keyValueHeadCount,
             headDimension: headDimension,
             elementBytes: elementBytes)
+    }
+
+    /// Build the flag-gated hybrid-linear (`qwen3_5`) proof. Derivation is admission-grade fail-closed
+    /// (any config defect → `invalidModelConfiguration`); the config bytes are hash-pinned exactly as the
+    /// qwen3 path, and the max-context/vocab guards mirror it. The scalar fields (layerCount, kvHeads,
+    /// headDim, elementBytes) come from the derived geometry so there is one authority for them.
+    private static func hybridQwen35Proof(
+        data: Data,
+        stableCompressedSource: CompressedKVAttentionRuntimeSourceSnapshot?
+    ) throws -> Self {
+        let geometry: HybridCacheGeometry
+        do {
+            geometry = try ModelConfigDecoder.qwen35HybridGeometry(configJSON: data)
+        } catch {
+            throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
+        // NOTE: the real gated-delta Metal kernel requires the linear key head dim (Dk) to be a
+        // multiple of 32 (GatedDelta.swift:29, `n_per_t = Dk / 32`), but that check is DELIBERATELY NOT
+        // here. This proof is shared with the toy hybrid runtime tests, which serve a fp32 in-Swift toy
+        // model (no Metal kernel) at Dk=1. The kernel-viability guard therefore lives in the REAL serving
+        // adapter (`loadContinuousServingModel`), which the toy runtime construction bypasses.
+        // max_position_embeddings / vocab_size live under text_config on the VL wrapper (root fallback).
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
+        let textScope = (root["text_config"] as? [String: Any]) ?? [:]
+        func scalar(_ key: String) -> Int? {
+            func asInt(_ v: Any?) -> Int? {
+                if let i = v as? Int { return i }
+                if let n = v as? NSNumber { return Int(exactly: n.doubleValue) }
+                if let d = v as? Double { return Int(exactly: d) }
+                return nil
+            }
+            return asInt(textScope[key]) ?? asInt(root[key])
+        }
+        guard let maxPositionEmbeddings = scalar("max_position_embeddings"),
+            let vocabularySize = scalar("vocab_size"),
+            maxPositionEmbeddings > 0, maxPositionEmbeddings <= Int(Int32.max),
+            vocabularySize > 0, vocabularySize <= Int(Int32.max)
+        else {
+            throw DenseContinuousBatchRuntimeError.invalidModelConfiguration
+        }
+        if let stableCompressedSource,
+            stableCompressedSource.exactModelConfigData != data
+        {
+            throw DenseContinuousBatchRuntimeError.compressedBatchSourceProofMismatch
+        }
+        return Self(
+            modelFamily: .qwen35,
+            modelConfigHash: fnv1a64(data),
+            modelConfigSHA256: sha256Hex(data),
+            checkpointManifestHash: stableCompressedSource?.checkpointManifestHash,
+            checkpointContentSHA256: stableCompressedSource?.checkpointContentSHA256,
+            tokenizerSHA256: stableCompressedSource?.tokenizerSHA256,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            vocabularySize: vocabularySize,
+            layerCount: geometry.map.layerCount,
+            keyValueHeadCount: geometry.dense.kvHeads,
+            headDimension: geometry.dense.headDim,
+            elementBytes: geometry.dense.elementBytes,
+            hybridGeometry: geometry)
     }
 
     static func testing(
@@ -261,7 +369,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         let decodeCohort: BatchDecodeCohort
         var soloPipelineState: BatchSoloPipelineState
         var pldSession: IncrementalPLDSession?
-        var scalarCaches: [any ContinuousScalarKVCache]?
+        // Kind-agnostic rows (S3): dense layers hold `ContinuousScalarKVCache` rows, recurrent
+        // layers hold the vendored `MambaCache` itself. Dense-only members (capacity/truncate/
+        // geometry) are reached by keying off the geometry map's dense layer indices — layer 0
+        // is NOT dense on qwen3_5.
+        var scalarCaches: [any ContinuousScalarRowCache]?
         var stagedToken: MLXArray?
         var scalarStep: Step?
         var scalarVerifySteps: [Int: Step]
@@ -269,14 +381,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private struct MaterializedSlot {
-        let caches: [any ContinuousScalarKVCache]
+        let caches: [any ContinuousScalarRowCache]
         let stagedToken: MLXArray
     }
 
     private struct BatchState {
         let ids: [BatchRequestID]
         let incarnations: [UUID]
-        let caches: [any ContinuousBatchedKVCache]
+        let caches: [any ContinuousBatchedRowCache]
         var stagedTokens: MLXArray
         var step: Step?
         let traceCounter: TraceCounter
@@ -347,6 +459,22 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             throw DenseContinuousBatchRuntimeError.invalidAggregateContextLimit(
                 resolvedReservationLimit)
         }
+        // Hybrid (heterogeneous dense/recurrent) construction guards. Placed BEFORE the
+        // compressed-admission validation so a compressed kind on a hybrid proof reports the
+        // hybrid-incompatibility identity (`.unsupportedCompressedBatchCache`), not the
+        // dense-path `.compressedBatchAdmissionRequired`. Hybrid runs fp16-only (the recurrent
+        // state has no compressed representation), and speculation is physically incompatible
+        // with fixed-size recurrent state (dense KV rows can truncate/rollback; SSM state cannot
+        // rewind), so both are rejected fail-closed at construction.
+        let hybridGeometry = proof.verifiedHybridGeometry
+        if hybridGeometry != nil {
+            guard kvCacheKind == .fp16 else {
+                throw DenseContinuousBatchRuntimeError.unsupportedCompressedBatchCache
+            }
+            guard soloPLDConfiguration == nil else {
+                throw DenseContinuousBatchRuntimeError.speculationUnsupported
+            }
+        }
         try Self.validateCompressedBatchAdmission(
             cacheKind: kvCacheKind,
             proof: proof,
@@ -361,35 +489,51 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 expected: proof.layerCount, actual: layerCount)
         }
         let cacheFamily: ContinuousBatchKVCacheFamily
-        do {
-            cacheFamily = try ContinuousBatchKVCacheFamily(
-                cacheKind: kvCacheKind,
-                layerCount: layerCount,
-                affineAttentionMode: affineAttentionMode)
-        } catch {
-            throw DenseContinuousBatchRuntimeError.unsupportedCompressedBatchCache
-        }
         let kvBytePlan: any ContinuousKVByteAdmissionPlanning
-        do {
-            if let configurations = cacheFamily.affineConfigurations {
-                kvBytePlan = try AffineKVByteAdmissionPlan(
-                    configurations: configurations,
-                    keyValueHeadCount: proof.keyValueHeadCount,
-                    headDimension: proof.headDimension,
-                    metadataScalarBytes: proof.elementBytes,
+        if let hybridGeometry {
+            // Hybrid path: the family is selected from the verified geometry (there is no hybrid
+            // `KVCacheKind`), and admission is charged dense-layers-only per token plus a fixed
+            // per-row recurrent term — never the uniform dense plan, which would over-charge every
+            // token as if all layers grew a KV buffer and starve admission (see HybridKVByteAdmission).
+            cacheFamily = ContinuousBatchKVCacheFamily(hybridGeometry: hybridGeometry)
+            do {
+                kvBytePlan = try HybridKVByteAdmissionPlan(
+                    geometry: hybridGeometry,
                     allocationChunk: allocationChunk,
                     maxContextTokens: resolvedContextLimit)
-            } else {
-                kvBytePlan = try DenseKVByteAdmissionPlan(
-                    layerCount: proof.layerCount,
-                    keyValueHeadCount: proof.keyValueHeadCount,
-                    headDimension: proof.headDimension,
-                    elementBytes: proof.elementBytes,
-                    allocationChunk: allocationChunk,
-                    maxContextTokens: resolvedContextLimit)
+            } catch {
+                throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
             }
-        } catch {
-            throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+        } else {
+            do {
+                cacheFamily = try ContinuousBatchKVCacheFamily(
+                    cacheKind: kvCacheKind,
+                    layerCount: layerCount,
+                    affineAttentionMode: affineAttentionMode)
+            } catch {
+                throw DenseContinuousBatchRuntimeError.unsupportedCompressedBatchCache
+            }
+            do {
+                if let configurations = cacheFamily.affineConfigurations {
+                    kvBytePlan = try AffineKVByteAdmissionPlan(
+                        configurations: configurations,
+                        keyValueHeadCount: proof.keyValueHeadCount,
+                        headDimension: proof.headDimension,
+                        metadataScalarBytes: proof.elementBytes,
+                        allocationChunk: allocationChunk,
+                        maxContextTokens: resolvedContextLimit)
+                } else {
+                    kvBytePlan = try DenseKVByteAdmissionPlan(
+                        layerCount: proof.layerCount,
+                        keyValueHeadCount: proof.keyValueHeadCount,
+                        headDimension: proof.headDimension,
+                        elementBytes: proof.elementBytes,
+                        allocationChunk: allocationChunk,
+                        maxContextTokens: resolvedContextLimit)
+                }
+            } catch {
+                throw DenseContinuousBatchRuntimeError.kvByteAccountingOverflow
+            }
         }
         let resolvedKVByteLimit = maxReservedKVBytes ?? Int.max
         guard resolvedKVByteLimit > 0 else {
@@ -654,7 +798,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 decodeCohort: decodeCohort,
                 soloPipelineState: .canonical,
                 pldSession: nil,
-                scalarCaches: cacheFamily.makeScalarCaches(
+                scalarCaches: cacheFamily.makeScalarRows(
                     layerCount: layerCount,
                     capacity: capacity),
                 stagedToken: nil,
@@ -682,6 +826,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             logits[0..., -1, 0...])
         eval([staged] + caches.flatMap { $0.innerState() })
         _ = try validatedToken(staged, id: work.id)
+
+        // Recurrent-row offsets are DRIVER-maintained: the vendored `ArraysCache.advance` adjusts
+        // only transient lengths/leftPadding and never `BaseKVCache.offset` (S3 finding 3). Prefill
+        // is a commit point, so record the committed count here; downstream merging/extraction
+        // reads it as the row's authoritative logical length. Dense offsets advance inside the
+        // cache update itself and are VALIDATED (not written) by the loop below.
+        commitRecurrentRowOffsets(caches, committed: endToken)
 
         try validatePhysicalCacheGeometry(caches)
 
@@ -791,11 +942,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     func diagnostics() -> DenseContinuousBatchRuntimeDiagnostics {
-        DenseContinuousBatchRuntimeDiagnostics(
+        // Capacity/frontier are dense-KV concepts: key them off the first DENSE layer (layer 0 on
+        // uniform families, the geometry map's first dense index on hybrid — never plain `.first`).
+        let denseBatchCache = batch.flatMap { try? denseBatchedCache(in: $0.caches) }
+        return DenseContinuousBatchRuntimeDiagnostics(
             batchTraceCount: batch?.traceCounter.count ?? 0,
             batchMembership: batch?.ids ?? [],
-            batchCapacity: batch?.caches.first?.capacity,
-            batchPhysicalWrittenEnd: batch?.caches.first?.continuousPhysicalWrittenEnd,
+            batchCapacity: denseBatchCache?.capacity,
+            batchPhysicalWrittenEnd: denseBatchCache?.continuousPhysicalWrittenEnd,
             kvBytesPerToken: kvBytePlan.bytesPerToken,
             reservedKVBytes: reservedKVBytes,
             maxReservedKVBytes: maxReservedKVBytes)
@@ -915,6 +1069,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard forwardedLast == plannedLast else {
             throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
         }
+        // Speculative truncate/rollback is a dense-KV-only operation; hybrid rejects speculation
+        // at construction (recurrent state cannot rewind), so this narrow is defense in depth.
+        let denseCaches = caches.compactMap { $0 as? any ContinuousScalarKVCache }
+        guard denseCaches.count == caches.count else {
+            throw DenseContinuousBatchRuntimeError.speculationUnsupported
+        }
 
         let previousCachedTokens = slot.cachedTokens
         try ensureScalarCapacity(for: id, slot: &slot, additionalTokens: 2)
@@ -928,7 +1088,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var rollbackFallback = true
         defer {
             if rollbackFallback {
-                for cache in caches {
+                for cache in denseCaches {
                     cache.truncate(to: previousCachedTokens)
                 }
             }
@@ -969,6 +1129,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             let caches = slot.scalarCaches
         else {
             throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
+        }
+        // Speculative truncate/rollback is a dense-KV-only operation; hybrid rejects speculation
+        // at construction (recurrent state cannot rewind), so this narrow is defense in depth.
+        let denseCaches = caches.compactMap { $0 as? any ContinuousScalarKVCache }
+        guard denseCaches.count == caches.count else {
+            throw DenseContinuousBatchRuntimeError.speculationUnsupported
         }
 
         let draft: [Int]
@@ -1032,7 +1198,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var rollbackVerification = true
         defer {
             if rollbackVerification {
-                for cache in caches {
+                for cache in denseCaches {
                     cache.truncate(to: previousCachedTokens)
                 }
             }
@@ -1072,7 +1238,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             preconditionFailure("verification plan changed during commit")
         }
         if keep < slot.cachedTokens {
-            for cache in caches { cache.truncate(to: keep) }
+            for cache in denseCaches { cache.truncate(to: keep) }
             slot.cachedTokens = keep
         }
         slot.emittedTokens += commit.emittedTokens.count
@@ -1224,6 +1390,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.emittedTokens += 1
         slot.stagedToken = following
         slot.soloPipelineState = soloPipelineState
+        // Scalar-side of S3 finding 3: dense rows advance their offset in-graph inside `update`, but
+        // a recurrent row's offset is driver-maintained. Commit it from the new `cachedTokens` so a
+        // later rejoin (scalar → batch) validates the row at its true logical length instead of the
+        // frozen prefill offset. No-op for uniform dense families (guarded inside the helper).
+        commitRecurrentRowOffsets(slot.scalarCaches!, committed: slot.cachedTokens)
         slots[id] = slot
         return ContinuousBatchRuntimeDecodeResult(
             id: id,
@@ -1299,6 +1470,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             slots[id] = slot
         }
+        // Batched-side of S3 finding 3: every row advanced by exactly one committed token in
+        // lockstep this step. Dense batched offsets advance in-graph; the recurrent batched rows'
+        // logical offsets are driver-maintained, so advance them here to keep them equal to each
+        // row's `cachedTokens`. Without this, extract at spill/re-merge restores a stale offset and
+        // `validateCacheLengths` throws. No-op for uniform dense families (guarded in the helper).
+        advanceRecurrentBatchedRowOffsets(batch.caches, by: 1)
         batch.stagedTokens = following
         self.batch = batch
         return zip(ids, emitted).map { id, token in
@@ -1343,7 +1520,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             throw DenseContinuousBatchRuntimeError.invalidBatchMembership([id] + otherLiveRows)
         }
 
-        let caches = try batch.caches.map { try $0.extractContinuous(slot: row) }
+        let caches = try batch.caches.map { try $0.extractContinuousRow(slot: row) }
         let staged = batch.stagedTokens[row].reshaped([1])
         eval([staged] + caches.flatMap { $0.innerState() })
         try validateCacheLengths(caches, id: id, expected: slot.cachedTokens)
@@ -1355,7 +1532,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.scalarTraceCounter = nil
         slots[id] = slot
         self.batch = nil
-        recordPhysicalKVCapacity(caches[0].capacity, for: [id])
+        recordPhysicalKVCapacity(try denseScalarCache(in: caches).capacity, for: [id])
         pruneKVReservationsToLiveSlots()
     }
 
@@ -1379,7 +1556,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     existingBatch.incarnations[row] == slot.incarnation
                 else { continue }
                 let caches = try existingBatch.caches.map {
-                    try $0.extractContinuous(slot: row)
+                    try $0.extractContinuousRow(slot: row)
                 }
                 let staged = existingBatch.stagedTokens[row].reshaped([1])
                 eval([staged] + caches.flatMap { $0.innerState() })
@@ -1411,26 +1588,32 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             return row
         }
+        // The fixed-capacity cohort requirement is a dense-KV property: only the growing dense
+        // layers carry a capacity, so check exactly those (recurrent rows are fixed-size by
+        // construction). A wrong-kind row at a dense index fails the check (nil != capacity).
         guard let expectedCapacity = ifCaseFixedKVCapacity(
             slots[ids[0]]!.decodeCohort),
             rows.allSatisfy({ row in
-                row.caches.allSatisfy { $0.capacity == expectedCapacity }
+                denseLayerIndices.allSatisfy { layer in
+                    (row.caches[layer] as? any ContinuousScalarKVCache)?.capacity
+                        == expectedCapacity
+                }
             })
         else {
             throw DenseContinuousBatchRuntimeError.incompatibleDecodeCohort(ids)
         }
         let lengths = ids.map { slots[$0]!.cachedTokens }
-        var caches: [any ContinuousBatchedKVCache] = []
+        var caches: [any ContinuousBatchedRowCache] = []
         caches.reserveCapacity(layerCount)
         for layer in 0 ..< layerCount {
             caches.append(
-                try cacheFamily.merge(
+                try cacheFamily.mergeRow(
                     layer: layer,
                     rows: rows.map { $0.caches[layer] },
                     lengths: lengths))
         }
         let staged = concatenated(rows.map(\.stagedToken), axis: 0)
-        eval([staged] + caches.flatMap { $0.innerState() })
+        eval([staged] + caches.flatMap { $0.modelCache.innerState() })
 
         let traceCounter = TraceCounter()
         let nextBatch = BatchState(
@@ -1461,14 +1644,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slots[id] = slot
         }
         batch = nextBatch
-        recordPhysicalKVCapacity(caches[0].capacity, for: ids)
+        recordPhysicalKVCapacity(try denseBatchedCache(in: caches).capacity, for: ids)
         pruneKVReservationsToLiveSlots()
     }
 
     private func calibrateCacheGeometryIfNeeded() throws {
         guard !cacheGeometryCalibrated else { return }
 
-        let caches = cacheFamily.makeScalarCaches(
+        let caches = cacheFamily.makeScalarRows(
             layerCount: layerCount,
             capacity: 1)
         let modelCaches: [any KVCache] = caches.map { $0 }
@@ -1479,15 +1662,101 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         cacheGeometryCalibrated = true
     }
 
+    /// Layer indices carrying a growing dense KV cache: every layer for the uniform fp16/affine
+    /// families, the verified geometry map's dense set for hybrid. All capacity/geometry
+    /// accounting keys off these — on qwen3_5 (interval 4) layer 0 is RECURRENT, so any
+    /// `caches[0]`/`caches.first` capacity assumption is wrong there.
+    private var denseLayerIndices: [Int] {
+        cacheFamily.hybridGeometry?.map.denseLayerIndices ?? Array(0 ..< layerCount)
+    }
+
+    /// First dense layer index (0 for uniform families). `nil` only for a pure-recurrent map,
+    /// which the hybrid geometry's failable init already rejects — callers still fail closed.
+    private var firstDenseLayerIndex: Int? {
+        guard let hybrid = cacheFamily.hybridGeometry else { return 0 }
+        return hybrid.map.firstDenseLayerIndex
+    }
+
+    /// The first dense scalar row — the authority for per-request KV capacity. Throws (never
+    /// defaults to layer 0) when the dense layer is absent or of the wrong kind.
+    private func denseScalarCache(
+        in caches: [any ContinuousScalarRowCache]
+    ) throws -> any ContinuousScalarKVCache {
+        guard let index = firstDenseLayerIndex,
+            caches.indices.contains(index),
+            let dense = caches[index] as? any ContinuousScalarKVCache
+        else {
+            throw DenseContinuousBatchRuntimeError.noCacheLayers
+        }
+        return dense
+    }
+
+    /// The first dense batched cache — the authority for batch KV capacity/frontier. Throws
+    /// (never defaults to layer 0) when the dense layer is absent or of the wrong kind.
+    private func denseBatchedCache(
+        in caches: [any ContinuousBatchedRowCache]
+    ) throws -> any ContinuousBatchedKVCache {
+        guard let index = firstDenseLayerIndex,
+            caches.indices.contains(index),
+            let dense = caches[index] as? any ContinuousBatchedKVCache
+        else {
+            throw DenseContinuousBatchRuntimeError.noCacheLayers
+        }
+        return dense
+    }
+
+    /// Driver-side maintenance of recurrent-row offsets (S3 finding 3): nothing in the vendored
+    /// model ever advances a `MambaCache`'s `offset`, so the runtime records each commit point
+    /// itself. No-op for uniform dense families.
+    private func commitRecurrentRowOffsets(
+        _ caches: [any ContinuousScalarRowCache], committed: Int
+    ) {
+        guard cacheFamily.hybridGeometry != nil else { return }
+        for cache in caches {
+            if let recurrent = cache as? RecurrentScalarRowCache {
+                recurrent.offset = committed
+            }
+        }
+    }
+
+    /// Driver-side maintenance of BATCHED recurrent-row offsets (S3 finding 3). `decodeBatch`
+    /// commits exactly `delta` tokens per row per step in lockstep; the batched `MambaCache`'s
+    /// logical offsets are never advanced by the model, so the runtime advances them so a later
+    /// extract (spill or churn re-merge) restores each row at its true logical length. No-op for
+    /// uniform dense families.
+    private func advanceRecurrentBatchedRowOffsets(
+        _ caches: [any ContinuousBatchedRowCache], by delta: Int
+    ) {
+        guard cacheFamily.hybridGeometry != nil else { return }
+        for cache in caches {
+            (cache as? BatchedRecurrentStateCache)?.advanceOffsets(by: delta)
+        }
+    }
+
     private func validatePhysicalCacheGeometry(
-        _ caches: [any ContinuousScalarKVCache]
+        _ caches: [any ContinuousScalarRowCache]
     ) throws {
         guard caches.count == layerCount else {
             throw DenseContinuousBatchRuntimeError.modelLayerCountMismatch(
                 expected: layerCount, actual: caches.count)
         }
-        for cache in caches {
-            guard let geometry = cache.continuousKVGeometry else {
+        let hybridMap = cacheFamily.hybridGeometry?.map
+        for (layer, cache) in caches.enumerated() {
+            if let hybridMap, hybridMap.kind(atLayer: layer).isRecurrentState {
+                // A recurrent layer's row must literally BE the vendored `MambaCache`: the model
+                // consumes it via a concrete `cache as? MambaCache` downcast (Qwen35.swift:487,537)
+                // and any other object would run the layer silently stateless, not fail closed.
+                guard cache is RecurrentScalarRowCache else {
+                    throw DenseContinuousBatchRuntimeError.cacheGeometryMismatch(
+                        expectedHeads: expectedKVHeads,
+                        expectedDimension: expectedKVHeadDimension,
+                        actual: [])
+                }
+                continue
+            }
+            guard let dense = cache as? any ContinuousScalarKVCache,
+                let geometry = dense.continuousKVGeometry
+            else {
                 throw DenseContinuousBatchRuntimeError.cacheGeometryMismatch(
                     expectedHeads: expectedKVHeads,
                     expectedDimension: expectedKVHeadDimension,
@@ -1541,9 +1810,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private func makeScalarStep(
-        caches: [any ContinuousScalarKVCache], counter: TraceCounter
+        caches: [any ContinuousScalarRowCache], counter: TraceCounter
     ) -> Step {
         let model = self.model
+        // A scalar row IS the model cache: a dense row is the `CompiledCache` the model updates,
+        // a recurrent row is the vendored `MambaCache` the model consumes via `cache as? MambaCache`
+        // — so the row maps straight to `any KVCache` (no `.modelCache` indirection, unlike the
+        // batched seam whose rows wrap an inner cache).
         let modelCaches: [any KVCache] = caches.map { $0 }
         let state: [any Updatable] = caches.map { $0 }
         let step: Step = { arguments in
@@ -1559,10 +1832,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private func makeScalarVerifyStep(
-        caches: [any ContinuousScalarKVCache],
+        caches: [any ContinuousScalarRowCache],
         inputWidth: Int
     ) -> Step {
         let model = self.model
+        // Scalar rows are model caches directly — see `makeScalarStep`.
         let modelCaches: [any KVCache] = caches.map { $0 }
         let state: [any Updatable] = caches.map { $0 }
         let step: Step = { arguments in
@@ -1576,13 +1850,17 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     }
 
     private func makeBatchStep(
-        caches: [any ContinuousBatchedKVCache],
+        caches: [any ContinuousBatchedRowCache],
         batchSize: Int,
         counter: TraceCounter
     ) -> Step {
         let model = self.model
-        let modelCaches: [any KVCache] = caches.map { $0 }
-        let state: [any Updatable] = caches.map { $0 }
+        // A batched row WRAPS its model cache (dense → self, recurrent → the inner `MambaCache`),
+        // so the model forward and its `Updatable` state must go through `.modelCache`. Mapping the
+        // row directly would hand the model the wrapper — the silent-stateless trap in batch mode —
+        // and does not even conform to `KVCache`.
+        let modelCaches: [any KVCache] = caches.map { $0.modelCache }
+        let state: [any Updatable] = caches.map { $0.modelCache }
         let step: Step = { arguments in
             counter.count += 1
             let input = arguments[0].reshaped([batchSize, 1])
@@ -1598,9 +1876,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     private func ensureScalarCapacity(
         for id: BatchRequestID, slot: inout Slot, additionalTokens: Int
     ) throws {
-        guard let caches = slot.scalarCaches, let capacity = caches.first?.capacity else {
+        guard let caches = slot.scalarCaches else {
             throw DenseContinuousBatchRuntimeError.decodeBeforeFinalPrefill(id)
         }
+        // Capacity is a dense-KV concept: read it from the first DENSE row, never `caches.first`
+        // (layer 0 is recurrent on qwen3_5). Growth still loops every row — `grow(by:)` is a
+        // proven no-op on the fixed-size recurrent state.
+        let capacity = try denseScalarCache(in: caches).capacity
         let required = slot.cachedTokens + additionalTokens
         let requestLimit = min(
             maxContextTokens,
@@ -1616,7 +1898,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         let growth = roundedGrowth(required: required, capacity: capacity)
         for cache in caches { cache.grow(by: growth) }
-        recordPhysicalKVCapacity(caches[0].capacity, for: [id])
+        recordPhysicalKVCapacity(try denseScalarCache(in: caches).capacity, for: [id])
         slot.scalarStep = nil
         slot.scalarVerifySteps = [:]
         slot.scalarTraceCounter = nil
@@ -1636,25 +1918,30 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     id, requested: required, limit: requestLimit)
             }
         }
-        guard let firstCache = batch.caches.first else {
-            throw DenseContinuousBatchRuntimeError.noCacheLayers
-        }
-        let (required, overflow) = firstCache.continuousPhysicalWrittenEnd
+        // Frontier and capacity are dense-KV concepts — read them from the first DENSE batched
+        // layer, never `batch.caches.first` (recurrent on qwen3_5). This mirrors the same
+        // dense-keying already applied at the diagnostics site; a recurrent row's frontier is not
+        // a growing-KV write position. Growth loops every row (`grow(by:)` no-ops the fixed-size
+        // recurrent state); state eval goes through `.modelCache` because a batched row wraps its
+        // model cache rather than being one.
+        let denseCache = try denseBatchedCache(in: batch.caches)
+        let (required, overflow) = denseCache.continuousPhysicalWrittenEnd
             .addingReportingOverflow(additionalTokens)
         guard !overflow, required <= Int(Int32.max) else {
             throw DenseContinuousBatchRuntimeError.positionOverflow(batch.ids[0])
         }
-        guard let capacity = batch.caches.first?.capacity, required > capacity else { return }
+        let capacity = denseCache.capacity
+        guard required > capacity else { return }
 
-        eval([batch.stagedTokens] + batch.caches.flatMap { $0.innerState() })
+        eval([batch.stagedTokens] + batch.caches.flatMap { $0.modelCache.innerState() })
         let growth = roundedGrowth(required: required, capacity: capacity)
         for cache in batch.caches { cache.grow(by: growth) }
-        recordPhysicalKVCapacity(batch.caches[0].capacity, for: batch.ids)
+        recordPhysicalKVCapacity(try denseBatchedCache(in: batch.caches).capacity, for: batch.ids)
         batch.step = nil
     }
 
     private func validateCacheLengths(
-        _ caches: [any ContinuousScalarKVCache],
+        _ caches: [any ContinuousScalarRowCache],
         id: BatchRequestID,
         expected: Int
     ) throws {

@@ -48,34 +48,56 @@ scope, evidence paths, and claim boundary for that one record.
 
 ## First run
 
-Requirements:
+Requirements: an Apple Silicon Mac, macOS 14 or newer, and Xcode or the Xcode command-line tools
+(for the Swift 6 toolchain). Nothing else — the MLX Metal library ships prebuilt in this
+repository (`spike/prebuilt/mlx.metallib`), so you do **not** need to install Apple's Metal
+Toolchain component or build through Xcode. (SwiftPM cannot compile MLX's Metal kernels itself, and
+on macOS 26 the Metal compiler is a separate download; shipping the prebuilt metallib keeps a fresh
+checkout runnable with one command.)
 
-- Apple Silicon Mac;
-- macOS 14 or newer; and
-- Swift 6.
+### Serve a model (one command)
 
-The transport-only backend exercises the public HTTP surface without loading a model:
+```sh
+# fast-mlx fetches the model for you — just name a Hugging Face repo:
+./scripts/serve.sh --model mlx-community/Qwen3-8B-4bit
+```
+
+That builds `fastmlx-serve`, downloads the model on first run (cached afterward), colocates the
+shipped metallib, and serves on `127.0.0.1:8080`. Already have the weights locally? Pass
+`--model-path` instead — it wins over auto-fetch:
+
+```sh
+./scripts/serve.sh --model-path ./my-model-dir --model my-name
+```
+
+`serve.sh` derives sensible MLX memory limits from your machine's RAM — pass explicit
+`--memory-limit-bytes` / `--host` / `--port` to override. Set `FASTMLX_API_KEY` to require Bearer
+auth (mandatory for a non-loopback `--host`).
+
+Call it with the standard OpenAI shape, including tools:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model":"qwen3-8b",
+  "messages":[{"role":"user","content":"Do you have the RTX 6000 Ada in stock?"}],
+  "tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product",
+    "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],
+  "enable_thinking":false
+}'
+```
+
+The assistant replies with an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`); send the
+tool result back as a `{"role":"tool","tool_call_id":…,"content":…}` message to continue.
+
+### Transport-only (no model)
 
 ```sh
 swift run --package-path spike fastmlx-serve --scripted
 ```
 
-Then, in another terminal:
-
-```sh
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"fastmlx-scripted","messages":[{"role":"user","content":"hello"}],"temperature":0,"n":1,"stream":false}'
-```
-
-Loaded-model serving requires a source-locked local model directory and explicit memory, cache,
-and reserved-KV limits. Inspect the exact contract before attempting it:
-
-```sh
-swift run --package-path spike fastmlx-serve --help
-```
-
-No model weights are bundled with this repository.
+No model weights are bundled with this repository. If you change the `mlx-swift` pin in
+`spike/Package.swift`, regenerate the shipped metallib with `scripts/build-metallib.sh` (it
+installs Apple's Metal Toolchain component on first use, no sudo required).
 
 ## Research notes and evidence
 

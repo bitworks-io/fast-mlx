@@ -36,6 +36,34 @@ let package = Package(
             dependencies: ["ServingCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // ServingSamplingBridge is MLX-free: it imports HarnessCore's tested sampling
+        // contract and ServingCore's serving-boundary policy and converts between them.
+        // It lives in its own target so both dependencies stay pure and the bridge
+        // (and its tests) build+run off-box with `swift test`.
+        .target(
+            name: "ServingSamplingBridge",
+            dependencies: ["HarnessCore", "ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingSamplingBridgeTests",
+            dependencies: ["ServingSamplingBridge", "HarnessCore", "ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // ServingSnapshotBridge is MLX-free: it maps ServingCore's native-layout snapshot-reuse
+        // classification onto HarnessCore's cold-plane restore granularity, so a consumer cannot pair
+        // a cache layout with the wrong reuse arithmetic. Own target for the same reason as the
+        // sampling bridge — both pure targets stay dependency-free and this builds+tests off-box.
+        .target(
+            name: "ServingSnapshotBridge",
+            dependencies: ["HarnessCore", "ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ServingSnapshotBridgeTests",
+            dependencies: ["ServingSnapshotBridge", "HarnessCore", "ServingCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         // ServingNIO owns transport only. Model, tokenizer, and MLX state remain behind
         // ServingCore contracts and actor-confined adapters.
         .target(
@@ -95,6 +123,8 @@ let package = Package(
                 "HarnessCore",
                 "ServingCore",
                 "ServingNIO",
+                "ServingSnapshotBridge",
+                "SpikeCore",
                 "SpikeServingAdapters",
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]

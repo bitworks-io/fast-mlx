@@ -86,6 +86,20 @@ public struct CapacityPrediction: Sendable {
     /// first and refuses to return a fit color built on an under-count.
     public let derivable: Bool
     public var totalBytes: Double { weightsBytes + kvBytes + transientPrefillPeakBytes + allocatorHeadroomBytes }
+
+    /// Explicit public memberwise init so callers/tests outside this module can construct a prediction
+    /// (Swift's synthesized memberwise init is internal even for a public struct). Same field order as
+    /// `predictPeakBytes` uses.
+    public init(
+        modelID: String, modelType: ArchClass, nativeMaxContext: Int, context: Int, concurrency: Int,
+        weightsBytes: Double, kvBytes: Double, transientPrefillPeakBytes: Double,
+        allocatorHeadroomBytes: Double, derivable: Bool
+    ) {
+        self.modelID = modelID; self.modelType = modelType; self.nativeMaxContext = nativeMaxContext
+        self.context = context; self.concurrency = concurrency; self.weightsBytes = weightsBytes
+        self.kvBytes = kvBytes; self.transientPrefillPeakBytes = transientPrefillPeakBytes
+        self.allocatorHeadroomBytes = allocatorHeadroomBytes; self.derivable = derivable
+    }
 }
 
 public struct CapacityVerdict: Sendable {
@@ -123,14 +137,22 @@ public enum CapacityModel {
     /// - novelCompressedUnsupported: 0 — out of scope, not derived (spec §8); never fabricated.
     public static func kvBytesPerToken(_ m: ModelArchProfile, kvQuant: KVQuantTier) -> Double {
         let bpe = kvQuant.bytesPerElement
+        // `kvHeadDimSum` = headDim + (vHeadDim ?? headDim): recovers the standard `2·headDim` for the
+        // symmetric case (vHeadDim nil) — every symmetric model's number is unchanged — and sizes K
+        // and V separately for asymmetric attention (e.g. mimo_v2_flash: K 192, V 128).
         switch m.modelType {
         case .uniformGQA:
-            return Double(m.nLayers) * Double(m.nKVHeads) * Double(m.headDim) * 2 * bpe
+            return Double(m.nLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
         case .hybridLinear:
-            return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.headDim) * 2 * bpe
+            return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
         case .interleavedSWA:
             // Global (full-context-growing) layers only; local layers are handled as a fixed cap.
-            return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.headDim) * 2 * bpe
+            return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
+        case .dualGeometrySWA:
+            // Growing term uses the GLOBAL-layer geometry (`nKVHeads`/`kvHeadDimSum` over `nAttnLayers`);
+            // the SWA layers' window-capped term (their own geometry) is folded in by
+            // `kvBytesForContext` via `swaFixedLocalBytes`, not here.
+            return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
         case .mlaAsImplemented:
             let rope = Double(m.mlaRopeDim ?? 0), nope = Double(m.mlaNopeDim ?? 0), v = Double(m.mlaVDim ?? 0)
             let heads = Double(m.mlaHeads ?? 0)
@@ -138,18 +160,32 @@ public enum CapacityModel {
         case .hybridMamba2MoE:
             // Per-attention-layer unit ONLY — nAttnLayers is an unconfirmed sentinel (0) for every
             // catalog member; do not multiply by it and present a fabricated total.
-            return Double(m.nKVHeads) * Double(m.headDim) * 2 * bpe
+            return Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
         case .novelCompressedUnsupported:
             return 0
         }
     }
 
-    /// The fixed (context-independent) per-sequence bytes for interleaved-SWA's local/rotating
-    /// layers, capped at the sliding window rather than growing with context.
+    /// The fixed (context-independent) per-sequence bytes for the local/rotating (window-capped)
+    /// layers, capped at the sliding window rather than growing with context. For `.interleavedSWA`
+    /// the local layers share the single global geometry; for `.dualGeometrySWA` they carry their
+    /// OWN geometry (`swaKVHeads`/`swaHeadDim`) — under-counting this term with the global geometry
+    /// is exactly the phantom-GREEN hazard the fit-check exists to prevent.
     public static func swaFixedLocalBytes(_ m: ModelArchProfile, kvQuant: KVQuantTier) -> Double {
-        guard m.modelType == .interleavedSWA, let window = m.slidingWindow else { return 0 }
+        guard let window = m.slidingWindow else { return 0 }
         let bpe = kvQuant.bytesPerElement
-        return Double(m.nLocalLayers) * Double(m.nKVHeads) * Double(m.headDim) * 2 * bpe * Double(window)
+        switch m.modelType {
+        case .interleavedSWA:
+            // Local layers share the single global geometry; `kvHeadDimSum` = 2·headDim when symmetric.
+            return Double(m.nLocalLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe * Double(window)
+        case .dualGeometrySWA:
+            // Local layers carry their OWN geometry: `swaKVHeads` heads, `swaKVHeadDimSum` K+V dim
+            // (asymmetric-aware). Under-counting this is the phantom-GREEN hazard the fit-check prevents.
+            let kvHeads = m.swaKVHeads ?? m.nKVHeads
+            return Double(m.nLocalLayers) * Double(kvHeads) * Double(m.swaKVHeadDimSum) * bpe * Double(window)
+        default:
+            return 0
+        }
     }
 
     /// The full per-SEQUENCE KV at a given context (growth + any fixed state/local-cap term),
@@ -161,6 +197,13 @@ public enum CapacityModel {
         switch m.modelType {
         case .interleavedSWA:
             perSequence = kvBytesPerToken(m, kvQuant: kvQuant) * Double(context) + swaFixedLocalBytes(m, kvQuant: kvQuant)
+        case .dualGeometrySWA:
+            // All three terms simultaneously: growing (global geometry) + window-capped local (SWA
+            // geometry) + the always-present recurrent/conv fixed state. Unlike `.interleavedSWA`,
+            // `fixedStateBytes` is NOT dropped here (Baichuan-M1 holds a conv state on every layer).
+            perSequence = kvBytesPerToken(m, kvQuant: kvQuant) * Double(context)
+                + swaFixedLocalBytes(m, kvQuant: kvQuant)
+                + Double(m.fixedStateBytes)
         default:
             perSequence = kvBytesPerToken(m, kvQuant: kvQuant) * Double(context) + Double(m.fixedStateBytes)
         }
