@@ -115,7 +115,7 @@ publication, benchmark recomputation, ranking, runtime action, or authority tran
 
 The sitemap and robots outputs are crawl-discovery hints only. Their exact route set contains the
 ten reviewed product/index pages, seven capability-detail pages, three benchmark-detail pages,
-fifteen release-detail pages, and nine explicitly published research notes; it excludes JSON
+fifteen release-detail pages, and one route per explicitly published research note; it excludes JSON
 contracts, all three Atom feeds, LLM text surfaces, assets, and the 404 page. Detail pages are
 immutable views of already-reviewed capability records, capability highlights, or release-ledger
 entries, not new evidence, support, measurement, runtime, model, acquisition, admission, authority,

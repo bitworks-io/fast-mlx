@@ -172,7 +172,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_318
 REVIEWED_HOME_PAGE_SHA256 = (
-    "f574e8f46d63e87f9338431852b6740a55ef572562bf8545686515c317eeded1"
+    "068f775026a241f0f2ab3d0481d04595d9651b3cc15aa511d106fb675967754b"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -198,7 +198,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 21_940
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "2f048ac761fe5f161326fd82827d563e49e190bd233d838c36c67ef63d7a3454"
+    "600c86c7dea27a3e656732a16eabc5898193ad063346d27ee17fe791659e7aa8"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 17_224
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -385,7 +385,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "11 published research notes",
+    "23 published research notes",
     "15 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -480,51 +480,54 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/how-the-autonomous-loop-builds-fast-mlx/",
+    "research/the-state-was-right-the-ledger-was-frozen/",
+    "research/the-bytes-were-derivable-we-refused-anyway/",
+    "research/measuring-the-premise-before-building-the-engine/",
     "research/the-tool-call-we-could-prove-without-the-model/",
     "research/the-checkout-that-couldnt-compile-its-gpu/",
     "research/sampling-before-serving/",
     "research/the-repository-that-could-reproduce-itself/",
     "research/the-proof-did-not-end-when-the-timer-did/",
+    "research/exact-speculation-was-not-fast-enough/",
+    "research/exact-prefix-cache-needs-exact-provenance/",
+    "research/the-third-geometry-said-no/",
+    "research/llama-ran-without-a-speed-tier/",
+    "research/fifteen-times-faster-still-not-fast/",
+    "research/when-smaller-kv-is-not-faster/",
     "research/the-fastest-request-wasnt-the-fastest-service/",
     "research/lossless-wasnt-byte-identical/",
     "research/when-zero-speculation-costs-two-percent/",
+    "research/two-x-for-free-when-the-model-repeats-itself/",
     "research/turboquant-exact-math-still-lost/",
     "research/trusting-the-instrument/",
     "research/the-wall-that-wasnt/",
+    "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/how-the-autonomous-loop-builds-fast-mlx/": ("2026-08-22", "2026-08-22"),
+    "research/the-state-was-right-the-ledger-was-frozen/": ("2026-08-20", "2026-08-22"),
+    "research/the-bytes-were-derivable-we-refused-anyway/": ("2026-08-19", "2026-08-22"),
+    "research/measuring-the-premise-before-building-the-engine/": ("2026-08-19", "2026-08-22"),
+    "research/the-tool-call-we-could-prove-without-the-model/": ("2026-08-17", "2026-08-17"),
+    "research/the-checkout-that-couldnt-compile-its-gpu/": ("2026-08-17", "2026-08-17"),
     "research/sampling-before-serving/": ("2026-08-16", "2026-08-16"),
-    "research/the-repository-that-could-reproduce-itself/": (
-        "2026-08-14",
-        "2026-08-14",
-    ),
-    "research/the-proof-did-not-end-when-the-timer-did/": (
-        "2026-07-28",
-        "2026-08-06",
-    ),
-    "research/the-fastest-request-wasnt-the-fastest-service/": (
-        "2026-07-14",
-        "2026-08-11",
-    ),
+    "research/the-repository-that-could-reproduce-itself/": ("2026-08-14", "2026-08-14"),
+    "research/the-proof-did-not-end-when-the-timer-did/": ("2026-07-28", "2026-08-06"),
+    "research/exact-speculation-was-not-fast-enough/": ("2026-07-24", "2026-08-22"),
+    "research/exact-prefix-cache-needs-exact-provenance/": ("2026-07-24", "2026-08-22"),
+    "research/the-third-geometry-said-no/": ("2026-07-23", "2026-08-22"),
+    "research/llama-ran-without-a-speed-tier/": ("2026-07-23", "2026-08-22"),
+    "research/fifteen-times-faster-still-not-fast/": ("2026-07-21", "2026-08-22"),
+    "research/when-smaller-kv-is-not-faster/": ("2026-07-18", "2026-08-22"),
+    "research/the-fastest-request-wasnt-the-fastest-service/": ("2026-07-14", "2026-08-11"),
     "research/lossless-wasnt-byte-identical/": ("2026-07-12", "2026-08-06"),
-    "research/when-zero-speculation-costs-two-percent/": (
-        "2026-07-11",
-        "2026-08-06",
-    ),
-    "research/turboquant-exact-math-still-lost/": (
-        "2026-07-09",
-        "2026-08-06",
-    ),
+    "research/when-zero-speculation-costs-two-percent/": ("2026-07-11", "2026-08-06"),
+    "research/two-x-for-free-when-the-model-repeats-itself/": ("2026-07-11", "2026-08-22"),
+    "research/turboquant-exact-math-still-lost/": ("2026-07-09", "2026-08-06"),
     "research/trusting-the-instrument/": ("2026-07-09", "2026-08-06"),
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
-    "research/the-tool-call-we-could-prove-without-the-model/": (
-        "2026-08-17",
-        "2026-08-17",
-    ),
-    "research/the-checkout-that-couldnt-compile-its-gpu/": (
-        "2026-08-17",
-        "2026-08-17",
-    ),
+    "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
 REVIEWED_RELEASE_INDEX_BYTES = 14_884
 REVIEWED_RELEASE_INDEX_SHA256 = (
@@ -737,6 +740,42 @@ REVIEWED_PAGE_METADATA: Dict[
         "website",
         None,
     ),
+    "research/how-the-autonomous-loop-builds-fast-mlx/": (
+        "How the autonomous loop builds fast-mlx — fast-mlx",
+        "fast-mlx is an LLM inference engine for Apple Silicon, written in Swift on MLX. It is also an experiment in how an engine gets built: most of the day-to-day engineering — research intake, implementation spikes,…",
+        "article",
+        "Rapid research integration — the flywheel; Disciplined proof over",
+    ),
+    "research/the-state-was-right-the-ledger-was-frozen/": (
+        "The state was right. The ledger was frozen. — fast-mlx",
+        "Continuous batching is how one model serves many users at once: several requests share a single forward pass, their per-request caches stacked side by side, and the engine merges, splits, and re-merges those rows as…",
+        "article",
+        "Serving big models on Apple Silicon",
+    ),
+    "research/the-bytes-were-derivable-we-refused-anyway/": (
+        "The bytes were derivable. We refused anyway. — fast-mlx",
+        "An earlier note — One formula, wrong for a third of the catalog — described the fit-check: the number the engine computes before it loads a model, answering the one operator question that matters on a fixed-memory…",
+        "article",
+        "Serving big models on Apple Silicon",
+    ),
+    "research/measuring-the-premise-before-building-the-engine/": (
+        "Measuring the premise before building the engine — does MoE routing actually cluster? — fast-mlx",
+        "\"Run models larger than your RAM\" is a seductive line to put on a box. For a Mixture-of-Experts model it's even plausible: only a handful of the experts fire on any given token, so — the pitch goes — keep the hot…",
+        "article",
+        "Running models larger than memory — the spike that gates the bet",
+    ),
+    "research/the-tool-call-we-could-prove-without-the-model/": (
+        "The tool call we could prove without the model — fast-mlx",
+        "Tool calling looks like a feature you bolt onto a chat server: accept a tools array, let the model emit a function call, hand it back in OpenAI's shape. Most of that machinery already existed in fast-mlx before this…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel; Disciplined proof over convenient claims",
+    ),
+    "research/the-checkout-that-couldnt-compile-its-gpu/": (
+        "The checkout that couldn't compile its own GPU — fast-mlx",
+        "A benchmark nobody can run is not evidence, and an engine nobody can start is not a product. For a stretch, fast-mlx was the second thing: a fresh git clone on a current Mac would build, launch, accept a request, and…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Disciplined proof over convenient claims; Meeting operators where they are",
+    ),
     "research/sampling-before-serving/": (
         "Sampling before serving: why the random draw needed its own contract — fast-mlx",
         "Sampled generation sounds like a small change: take logits, apply temperature and top-p, draw a token, and continue. In a serving engine, that “draw a token” step quietly touches request identity, retries,…",
@@ -754,6 +793,42 @@ REVIEWED_PAGE_METADATA: Dict[
         "A short benchmark can show that continuous batching works. It cannot show that an HTTP service keeps cleaning up after disappearing clients for a full day.",
         "article",
         "Building a high-performance MLX inference engine in Swift; Serving big models on Apple Silicon; Rapid research integration — the flywheel",
+    ),
+    "research/exact-speculation-was-not-fast-enough/": (
+        "Exact speculation was not fast enough — fast-mlx",
+        "Speculative decoding has an attractive promise: predict several future tokens cheaply, verify them with the target model, and skip some serial decode steps without changing the answer.",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel",
+    ),
+    "research/exact-prefix-cache-needs-exact-provenance/": (
+        "An exact prefix cache needs exact provenance — fast-mlx",
+        "An inference cache can return the right bytes and still report the wrong reason.",
+        "article",
+        "Inference research",
+    ),
+    "research/the-third-geometry-said-no/": (
+        "The third geometry said no — fast-mlx",
+        "The third-family gate was not supposed to reward novelty. Qwen and Llama had already exercised large uniform-GQA shapes, but both shared the same Q64/KV8/D128 attention geometry. A broader product claim needed a…",
+        "article",
+        "Serving big models on Apple Silicon; The optimization dial — quantified precision-loss tuning; Rapid research integration — the flywheel",
+    ),
+    "research/llama-ran-without-a-speed-tier/": (
+        "Llama ran, but it did not earn a speed tier — fast-mlx",
+        "The second-family gate for fast-mlx was deliberately simple: take a materially different popular model family, bind the exact engine source, checkpoint, and tokenizer, then let the same evidence rules decide whether…",
+        "article",
+        "Serving big models on Apple Silicon; The optimization dial — quantified precision-loss tuning; Rapid research integration — the flywheel",
+    ),
+    "research/fifteen-times-faster-still-not-fast/": (
+        "Fifteen times faster still was not fast — fast-mlx",
+        "Compressed KV attention had one clear job: keep the cache compressed while attention reads it. The previous fast-mlx KVarN path saved memory but reconstructed full K/V tensors on the hot path. That made it a useful…",
+        "article",
+        "Building a high-performance MLX inference engine in Swift; The optimization dial — quantified precision-loss tuning; Rapid research integration — the flywheel",
+    ),
+    "research/when-smaller-kv-is-not-faster/": (
+        "When smaller KV is not faster — fast-mlx",
+        "The KVarN/asymmetric KV-cache gate started with a tempting promise: spend fewer bytes on the attention cache, fit far more context, and maybe get a runtime speedup too. That is what the fast-mlx dial exists to…",
+        "article",
+        "The optimization dial — quantified precision-loss tuning; Serving big models on Apple Silicon; Rapid research integration — the flywheel",
     ),
     "research/the-fastest-request-wasnt-the-fastest-service/": (
         "The fastest request wasn't the fastest service — fast-mlx",
@@ -773,6 +848,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "article",
         "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel",
     ),
+    "research/two-x-for-free-when-the-model-repeats-itself/": (
+        "2× for free, when the model repeats itself: prompt-lookup decoding with a byte-identical proof — fast-mlx",
+        "Every LLM speedup we had shipped so far traded something. Quantize the weights, pay in perplexity. Quantize the KV cache, pay in long-context tail divergence — we measured that one to death and shelved it. So the…",
+        "article",
+        "Building a high-performance MLX engine in Swift; Rapid research integration — the flywheel",
+    ),
     "research/turboquant-exact-math-still-lost/": (
         "We implemented Google's TurboQuant exactly, matched the paper's error tables — and it still lost to plain 4-bit quantization — fast-mlx",
         "The KV cache is the memory bill for long context. On Qwen3-32B, every token you keep costs 256 KiB of fp16 keys and values — 64 layers × 8 KV heads × 128 dims × 2 tensors. At a 24K-token context that's 6 GB per…",
@@ -791,17 +872,11 @@ REVIEWED_PAGE_METADATA: Dict[
         "article",
         "The optimization dial — quantified precision-loss tuning",
     ),
-    "research/the-tool-call-we-could-prove-without-the-model/": (
-        "The tool call we could prove without the model — fast-mlx",
-        "Tool calling looks like a feature you bolt onto a chat server: accept a tools array, let the model emit a function call, hand it back in OpenAI's shape. Most of that machinery already existed in fast-mlx before this…",
+    "research/one-formula-wrong-for-a-third-of-the-catalog/": (
+        "One formula, wrong for a third of the catalog: a KV-memory model that refuses to lie — fast-mlx",
+        "We wanted the engine to answer a simple operator question: before you raise a model's context window from 32K toward its maximum, will this Mac actually hold it? Answering it needs one number — how many bytes of KV…",
         "article",
-        "Building a high-performance MLX inference engine in Swift; Rapid research integration — the flywheel; Disciplined proof over convenient claims",
-    ),
-    "research/the-checkout-that-couldnt-compile-its-gpu/": (
-        "The checkout that couldn't compile its own GPU — fast-mlx",
-        "A benchmark nobody can run is not evidence, and an engine nobody can start is not a product. For a stretch, fast-mlx was the second thing: a fresh git clone on a current Mac would build, launch, accept a request, and…",
-        "article",
-        "Building a high-performance MLX inference engine in Swift; Disciplined proof over convenient claims; Meeting operators where they are",
+        "Serving big models on Apple Silicon",
     ),
 }
 

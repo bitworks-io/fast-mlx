@@ -252,7 +252,7 @@ class PublicStatusPageTests(unittest.TestCase):
                 (
                     "publication manifest",
                     "publications.json",
-                    lambda manifest: manifest["articles"].pop(2),
+                    lambda manifest: manifest["articles"].pop(0),
                 ),
             )
             for label, filename, mutate in manifest_mutations:

@@ -152,13 +152,13 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             manifest["articles"][-1],
             {
-                "source": "docs/content/2026-08-17-the-checkout-that-couldnt-compile-its-gpu.md",
-                "slug": "the-checkout-that-couldnt-compile-its-gpu",
+                "source": "docs/content/2026-08-22-how-the-autonomous-loop-builds-fast-mlx.md",
+                "slug": "how-the-autonomous-loop-builds-fast-mlx",
                 "status": "published",
-                "reviewedAt": "2026-08-17",
+                "reviewedAt": "2026-08-22",
             },
         )
-        self.assertEqual(article_count, 11)
+        self.assertEqual(article_count, 23)
 
     def test_capability_manifest_is_explicit_and_evidence_backed(self) -> None:
         articles = build_public_site.load_articles(REPOSITORY_ROOT)
