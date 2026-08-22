@@ -123,8 +123,12 @@ final class ServingLifecyclePolicyTests: XCTestCase {
             .start(route: .continuousBatchNoSpec, requests: [ServingRequestID("solo")]))
     }
 
-    func testAdmissionReducerCancellationDuringHoldAndSoloQueueing() {
-        var reducer = ServingAdmissionReducer(configuration: .init(soloPLDQualified: true))
+    func testAdmissionReducerCancellationDuringHoldAndSoloCapacityQueueing() {
+        var reducer = ServingAdmissionReducer(
+            configuration: .init(
+                soloPLDQualified: true,
+                maximumBatchRequests: 1,
+                maximumQueuedRequests: 1))
 
         XCTAssertEqual(reducer.submit(ServingRequestID("cancelled")), .held([ServingRequestID("cancelled")]))
         XCTAssertEqual(reducer.cancel(ServingRequestID("cancelled")), .removedFromHold([]))
@@ -140,7 +144,7 @@ final class ServingLifecyclePolicyTests: XCTestCase {
         XCTAssertEqual(reducer.executionFinished(requests: [ServingRequestID("solo")]), .held([ServingRequestID("late")]))
     }
 
-    func testAdmissionReducerDoesNotChangeRouteAfterExecutionBegins() {
+    func testAdmissionReducerLetsLateRequestJoinSoloWithoutRewritingOriginRoute() {
         var reducer = ServingAdmissionReducer(configuration: .init(soloPLDQualified: true))
 
         XCTAssertEqual(reducer.submit(ServingRequestID("solo")), .held([ServingRequestID("solo")]))
@@ -148,7 +152,10 @@ final class ServingLifecyclePolicyTests: XCTestCase {
             reducer.coalescingExpired(),
             .start(route: .soloPLD, requests: [ServingRequestID("solo")]))
         XCTAssertEqual(reducer.currentExecutionRoute, .soloPLD)
-        XCTAssertEqual(reducer.submit(ServingRequestID("late")), .queued([ServingRequestID("late")]))
+        XCTAssertEqual(
+            reducer.submit(ServingRequestID("late")),
+            .joinedContinuousBatch(
+                requests: [ServingRequestID("solo"), ServingRequestID("late")]))
         XCTAssertEqual(reducer.currentExecutionRoute, .soloPLD)
         XCTAssertEqual(reducer.coalescingExpired(), .noRouteChange(route: .soloPLD))
     }
@@ -252,7 +259,24 @@ final class ServingLifecyclePolicyTests: XCTestCase {
         XCTAssertEqual(
             solo.coalescingExpired(),
             .start(route: .soloPLD, requests: [ServingRequestID("solo")]))
-        XCTAssertEqual(solo.submit(ServingRequestID("late")), .queued([ServingRequestID("late")]))
+        XCTAssertEqual(
+            solo.submit(ServingRequestID("late")),
+            .joinedContinuousBatch(
+                requests: [ServingRequestID("solo"), ServingRequestID("late")]))
+        XCTAssertEqual(solo.currentExecutionRoute, .soloPLD)
+
+        var soloAtCapacity = ServingAdmissionReducer(
+            configuration: .init(
+                soloPLDQualified: true,
+                maximumBatchRequests: 1,
+                maximumQueuedRequests: 1))
+        XCTAssertEqual(soloAtCapacity.submit(ServingRequestID("solo")), .held([ServingRequestID("solo")]))
+        XCTAssertEqual(
+            soloAtCapacity.coalescingExpired(),
+            .start(route: .soloPLD, requests: [ServingRequestID("solo")]))
+        XCTAssertEqual(
+            soloAtCapacity.submit(ServingRequestID("late")),
+            .queued([ServingRequestID("late")]))
     }
 
     func testContinuousBatchPromotesOldestQueuedRequestAfterPartialCancellation() {
@@ -281,6 +305,55 @@ final class ServingLifecyclePolicyTests: XCTestCase {
         XCTAssertEqual(
             reducer.submit(ServingRequestID("e")),
             .queued([ServingRequestID("d"), ServingRequestID("e")]))
+    }
+
+    func testAdaptiveSoloOriginPromotesOldestQueuedRequestAfterPartialCancellation() {
+        var reducer = ServingAdmissionReducer(
+            configuration: .init(
+                soloPLDQualified: true,
+                maximumBatchRequests: 2,
+                maximumQueuedRequests: 2))
+
+        XCTAssertEqual(reducer.submit(ServingRequestID("solo")), .held([ServingRequestID("solo")]))
+        XCTAssertEqual(
+            reducer.coalescingExpired(),
+            .start(route: .soloPLD, requests: [ServingRequestID("solo")]))
+        XCTAssertEqual(
+            reducer.submit(ServingRequestID("joined")),
+            .joinedContinuousBatch(
+                requests: [ServingRequestID("solo"), ServingRequestID("joined")]))
+        XCTAssertEqual(
+            reducer.submit(ServingRequestID("queued")),
+            .queued([ServingRequestID("queued")]))
+
+        XCTAssertEqual(
+            reducer.cancel(ServingRequestID("solo")),
+            .removedFromExecution(
+                remaining: [ServingRequestID("joined"), ServingRequestID("queued")],
+                replacements: [ServingRequestID("queued")],
+                nextHeld: []))
+        XCTAssertEqual(reducer.currentExecutionRoute, .soloPLD)
+    }
+
+    func testAdaptiveSoloOriginPromotesQueuedCompletionReplacementAsContinuous() {
+        var reducer = ServingAdmissionReducer(
+            configuration: .init(
+                soloPLDQualified: true,
+                maximumBatchRequests: 2,
+                maximumQueuedRequests: 1))
+
+        _ = reducer.submit(ServingRequestID("solo"))
+        _ = reducer.coalescingExpired()
+        _ = reducer.submit(ServingRequestID("joined"))
+        _ = reducer.submit(ServingRequestID("queued"))
+
+        XCTAssertEqual(
+            reducer.executionFinished(requests: [ServingRequestID("solo")]),
+            .continuedExecution(
+                route: .continuousBatchNoSpec,
+                remaining: [ServingRequestID("joined"), ServingRequestID("queued")],
+                replacements: [ServingRequestID("queued")]))
+        XCTAssertEqual(reducer.currentExecutionRoute, .soloPLD)
     }
 
     func testContinuousBatchPromotesOldestQueuedRequestAfterPartialCompletion() {

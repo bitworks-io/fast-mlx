@@ -82,7 +82,7 @@ public struct ServingAdmissionReducer: Equatable, Sendable {
             return .rejected(request: id, reason: .duplicateRequest)
         }
 
-        if currentExecutionRoute == .continuousBatchNoSpec,
+        if canJoinRunningCohort,
             queued.isEmpty,
             executing.count < configuration.maximumBatchRequests
         {
@@ -164,11 +164,11 @@ public struct ServingAdmissionReducer: Equatable, Sendable {
         if executing.isEmpty {
             currentExecutionRoute = nil
             refillHeldFromQueue()
-        } else if let route = currentExecutionRoute {
+        } else if currentExecutionRoute != nil {
             let replacements = refillExecutingFromQueue()
             if !replacements.isEmpty {
                 return .continuedExecution(
-                    route: route,
+                    route: .continuousBatchNoSpec,
                     remaining: executing,
                     replacements: replacements)
             }
@@ -209,7 +209,7 @@ public struct ServingAdmissionReducer: Equatable, Sendable {
     }
 
     private mutating func refillExecutingFromQueue() -> [ServingRequestID] {
-        guard currentExecutionRoute == .continuousBatchNoSpec,
+        guard canJoinRunningCohort,
             !executing.isEmpty,
             executing.count < configuration.maximumBatchRequests,
             !queued.isEmpty
@@ -224,5 +224,11 @@ public struct ServingAdmissionReducer: Equatable, Sendable {
         executing.append(contentsOf: replacements)
         queued.removeFirst(count)
         return replacements
+    }
+
+    private var canJoinRunningCohort: Bool {
+        currentExecutionRoute == .continuousBatchNoSpec
+            || (currentExecutionRoute == .soloPLD
+                && configuration.soloPLDQualified)
     }
 }

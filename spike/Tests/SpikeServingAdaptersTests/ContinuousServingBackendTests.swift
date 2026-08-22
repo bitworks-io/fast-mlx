@@ -538,7 +538,7 @@ final class ContinuousServingBackendTests: XCTestCase {
             "validation must not enqueue a continuation after shutdown snapshots pending admissions")
     }
 
-    func testDynamicAdmissionArrivalAfterSoloPLDQueuesUntilSoloLeaves()
+    func testDynamicAdmissionArrivalAfterSoloPLDJoinsWithoutResubmittingExistingRequest()
         async throws
     {
         let recorder = ContinuousRuntimeRecorder()
@@ -572,6 +572,7 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.diagnosticExpireAdmissionCoalescingWindow()
         let solo = try await soloStart.value
         XCTAssertEqual(solo.route, .soloPLD)
+        let soloConsumer = Task { try? await collect(solo.mailbox) }
 
         try await runUntilDecode(coordinator, recorder: recorder)
         XCTAssertEqual(
@@ -582,30 +583,107 @@ final class ContinuousServingBackendTests: XCTestCase {
             try await backend.start(request(text: "late", maxTokens: 2))
         }
         await waitUntil {
-            await backend.diagnosticQueuedAdmissionRequestCount() == 1
+            await backend.diagnosticExecutingAdmissionRequestCount() == 2
         }
-        let soloCoordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        let late = try await lateStart.value
+        XCTAssertEqual(late.route, .continuousBatchNoSpec)
+        let lateConsumer = Task { try? await collect(late.mailbox) }
+
+        let joinedCoordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
         XCTAssertEqual(
-            soloCoordinatorIDs,
-            [BatchRequestID(1)])
+            joinedCoordinatorIDs,
+            [BatchRequestID(1), BatchRequestID(2)])
+        XCTAssertEqual(
+            recorder.admissionBatchSizes,
+            [1, 1],
+            "late join should physically submit only the new request, not resubmit the solo request")
+
+        do {
+            while recorder.decodeActions.count < 3 {
+                _ = try await coordinator.runOneTick()
+            }
+        } catch {
+            let trace = await coordinator.executionTrace()
+            let snapshots = await coordinator.snapshots()
+            let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+            XCTFail(
+                "adaptive tick failed: \(error); trace=\(trace); snapshots=\(snapshots); coordinatorIDs=\(coordinatorIDs)")
+            _ = await solo.lease.cancel(.clientDisconnected)
+            _ = await late.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            _ = await soloConsumer.value
+            _ = await lateConsumer.value
+            return
+        }
+        XCTAssertEqual(
+            Array(recorder.decodeActions.prefix(3)),
+            [
+                .solo(BatchRequestID(1), speculationAllowed: true),
+                .drainSoloPipeline(BatchRequestID(1)),
+                .batch(
+                    [BatchRequestID(1), BatchRequestID(2)],
+                    speculationAllowed: false),
+            ])
 
         _ = await solo.lease.cancel(.clientDisconnected)
+        _ = await late.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+        _ = await soloConsumer.value
+        _ = await lateConsumer.value
+    }
+
+    func testDynamicAdmissionFailedLateJoinReleasesReservationAndPreservesSolo()
+        async throws
+    {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 2),
+            runtime: AdmissionFailureContinuousRuntime(
+                failureOnAdmission: 2,
+                error: .aggregateKVByteLimitExceeded(
+                    requested: 8_192,
+                    limit: 4_096)),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 16)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "solo": [10],
+                "late": [20],
+            ],
+            pieces: [:],
+            stopTokenIDs: [99])
+
+        let soloStart = Task {
+            try await backend.start(request(text: "solo", maxTokens: 2))
+        }
         await waitUntil {
             await backend.diagnosticPendingAdmissionRequestCount() == 1
         }
-        let afterSoloCancelIDs = await backend.diagnosticCoordinatorRequestIDs()
-        XCTAssertEqual(afterSoloCancelIDs, [])
-
         await backend.diagnosticExpireAdmissionCoalescingWindow()
-        let late = try await lateStart.value
+        let solo = try await soloStart.value
+        XCTAssertEqual(solo.route, .soloPLD)
 
-        XCTAssertEqual(late.route, .soloPLD)
-        let lateCoordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
-        XCTAssertEqual(
-            lateCoordinatorIDs,
-            [BatchRequestID(2)])
+        do {
+            _ = try await backend.start(request(text: "late", maxTokens: 2))
+            XCTFail("Expected the late coordinator admission to fail")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(
+                error,
+                .capacityExceeded(retryAfterSeconds: 2))
+        }
 
-        _ = await late.lease.cancel(.clientDisconnected)
+        let executingAfterFailure =
+            await backend.diagnosticExecutingAdmissionRequestCount()
+        let queuedAfterFailure =
+            await backend.diagnosticQueuedAdmissionRequestCount()
+        let coordinatorIDsAfterFailure =
+            await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertEqual(executingAfterFailure, 1)
+        XCTAssertEqual(queuedAfterFailure, 0)
+        XCTAssertEqual(coordinatorIDsAfterFailure, [BatchRequestID(1)])
+
+        _ = await solo.lease.cancel(.clientDisconnected)
         await backend.shutdown()
     }
 
@@ -1630,6 +1708,7 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
         recorder.record(action)
         let ids: [BatchRequestID]
         let stateAfter: BatchSoloPipelineState
+        let outputlessSpeculativeDrain: Bool
         switch action {
         case .solo(let id, let speculationAllowed):
             guard !speculationAllowed || allowsSpeculation else {
@@ -1639,12 +1718,15 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
             stateAfter = speculationAllowed
                 ? speculativeSoloState
                 : .pipelinedLookahead
+            outputlessSpeculativeDrain = false
         case .drainSoloPipeline(let id):
             guard slots[id]?.soloPipelineState.requiresDrain == true else {
                 throw FixtureContinuousRuntimeError.invalidDrain
             }
             ids = [id]
             stateAfter = .canonical
+            outputlessSpeculativeDrain =
+                slots[id]?.soloPipelineState == .speculative
         case .batch(let batchIDs, let speculationAllowed):
             guard !speculationAllowed || allowsSpeculation else {
                 throw FixtureContinuousRuntimeError.speculation
@@ -1656,11 +1738,21 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
             }
             ids = batchIDs
             stateAfter = .canonical
+            outputlessSpeculativeDrain = false
         }
 
         return try ids.map { id in
             guard var slot = slots[id], slot.ready else {
                 throw FixtureContinuousRuntimeError.decodeBeforeReady
+            }
+            if outputlessSpeculativeDrain {
+                slot.soloPipelineState = .canonical
+                slots[id] = slot
+                return ContinuousBatchRuntimeDecodeResult(
+                    id: id,
+                    tokens: [],
+                    finished: false,
+                    soloPipelineState: .canonical)
             }
             let tokens: [Int]
             let finished: Bool

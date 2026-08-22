@@ -540,7 +540,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
             [
                 .prefill(BatchPrefillSlice(id: handles[0].id, startToken: 0, count: 2)),
                 .prefill(BatchPrefillSlice(id: handles[1].id, startToken: 0, count: 2)),
-                .decode(.solo(handles[1].id, speculationAllowed: true)),
+                .decode(.solo(handles[1].id, speculationAllowed: false)),
                 .prefill(BatchPrefillSlice(id: handles[0].id, startToken: 2, count: 2)),
                 .decode(.drainSoloPipeline(handles[1].id)),
                 .decode(.batch([handles[0].id, handles[1].id], speculationAllowed: false)),
@@ -569,19 +569,19 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
             automaticDrive: false,
             publicationCapacity: 1,
             traceLimit: 64)
-        let handles = try await coordinator.submitBatch([
-            submission([10, 11, 12, 13]),
-            submission([20, 21], speculation: true),
-        ])
+        let short = try await coordinator.submit(
+            submission([20, 21], speculation: true))
 
-        _ = try await coordinator.runOneTick() // both prefill; short becomes ready
-        _ = try await coordinator.runOneTick() // solo(short), then long prefill
-        let blockedShort = await handles[1].tokens.snapshot()
+        _ = try await coordinator.runOneTick() // short prefill
+        _ = try await coordinator.runOneTick() // speculative solo(short)
+        let blockedShort = await short.tokens.snapshot()
         XCTAssertEqual(blockedShort.bufferedTokens, 1)
+
+        let long = try await coordinator.submit(submission([10, 11]))
 
         let drainTask = Task { try await coordinator.runOneTick() }
         for _ in 0 ..< 1_000 {
-            let snapshot = await coordinator.snapshot(for: handles[1].id)
+            let snapshot = await coordinator.snapshot(for: short.id)
             if snapshot?.phase == .decoding(
                 emittedTokens: 1,
                 soloPipelineState: .canonical)
@@ -592,7 +592,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         }
 
         guard
-            let drained = await coordinator.snapshot(for: handles[1].id),
+            let drained = await coordinator.snapshot(for: short.id),
             drained.phase == .decoding(
                 emittedTokens: 1,
                 soloPipelineState: .canonical)
@@ -609,7 +609,7 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         let workRemainsAfterDrain = try await drainTask.value
         XCTAssertTrue(workRemainsAfterDrain)
 
-        var shortIterator = handles[1].tokens.makeAsyncIterator()
+        var shortIterator = short.tokens.makeAsyncIterator()
         let shortToken = try await shortIterator.next()
         XCTAssertEqual(shortToken, 201)
 
@@ -620,12 +620,12 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         }
         XCTAssertTrue(
             operations.contains(
-                .decode(.drainSoloPipeline(handles[1].id))))
+                .decode(.drainSoloPipeline(short.id))))
         XCTAssertTrue(
             operations.contains(
                 .decode(
                     .batch(
-                        [handles[0].id, handles[1].id],
+                        [short.id, long.id],
                         speculationAllowed: false))))
     }
 

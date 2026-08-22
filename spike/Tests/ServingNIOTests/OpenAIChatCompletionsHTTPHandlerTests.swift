@@ -735,6 +735,69 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await oversizedChannel.finish()
     }
 
+    func testConfiguredCompletionLimitAcceptsBoundaryAndRejectsLargerRequests()
+        async throws
+    {
+        let limits = OpenAIChatRequestLimits(
+            maximumBodyBytes: 1_024,
+            maximumCompletionTokens: 8_192)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: limits,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_024,
+            backpressureStallTimeout: .seconds(1))
+
+        for field in ["max_completion_tokens", "max_tokens"] {
+            let acceptedBackend = ScriptedBackend(scripts: [
+                .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+            ])
+            let acceptedChannel = try await makeChannel(
+                backend: acceptedBackend,
+                configuration: configuration)
+            try await writeRequest(
+                acceptedChannel,
+                body: """
+                {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"\(field)":8192,"temperature":0,"stream":false}
+                """)
+            let acceptedResponse = try await collectResponse(
+                from: acceptedChannel)
+            XCTAssertEqual(acceptedResponse.head.status, .ok)
+            XCTAssertEqual(acceptedBackend.snapshot().startCount, 1)
+            _ = try await acceptedChannel.finish()
+
+            let rejectedBackend = ScriptedBackend(scripts: [])
+            let rejectedChannel = try await makeChannel(
+                backend: rejectedBackend,
+                configuration: configuration)
+            try await writeRequest(
+                rejectedChannel,
+                body: """
+                {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"\(field)":8193,"temperature":0,"stream":false}
+                """)
+            let rejectedResponse = try await collectResponse(
+                from: rejectedChannel)
+            XCTAssertEqual(rejectedResponse.head.status, .badRequest)
+            XCTAssertTrue(
+                rejectedResponse.body.contains(
+                    "max_completion_tokens exceeds the configured limit"))
+            XCTAssertEqual(rejectedBackend.snapshot().startCount, 0)
+            _ = try await rejectedChannel.finish()
+        }
+
+        let defaultBackend = ScriptedBackend(scripts: [])
+        let defaultChannel = try await makeChannel(backend: defaultBackend)
+        try await writeRequest(
+            defaultChannel,
+            body: """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":4097,"temperature":0,"stream":false}
+            """)
+        let defaultResponse = try await collectResponse(from: defaultChannel)
+        XCTAssertEqual(defaultResponse.head.status, .badRequest)
+        XCTAssertEqual(defaultBackend.snapshot().startCount, 0)
+        _ = try await defaultChannel.finish()
+    }
+
     func testQueueExhaustionReturnsTyped429WithBoundedRetrySignal() async throws {
         let backend = ScriptedBackend(scripts: [
             .admissionRejected(.queueFull(retryAfterSeconds: 2))

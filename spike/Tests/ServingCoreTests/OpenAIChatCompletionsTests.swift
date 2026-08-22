@@ -104,6 +104,19 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             maximumBodyBytes: 128,
             maximumCompletionTokens: 8)
 
+        XCTAssertEqual(
+            OpenAIChatRequestLimits.productionDefault.maximumCompletionTokens,
+            4_096)
+
+        let boundaryBudget = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":8}
+        """
+        XCTAssertEqual(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(boundaryBudget.utf8),
+                limits: limits).maxCompletionTokens,
+            8)
+
         let oversizedBody = """
         {"model":"qwen3-32b","messages":[{"role":"user","content":"\(String(repeating: "x", count: 128))"}]}
         """

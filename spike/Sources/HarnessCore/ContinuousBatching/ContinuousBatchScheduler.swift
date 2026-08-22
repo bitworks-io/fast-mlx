@@ -438,10 +438,35 @@ public struct ContinuousBatchScheduler: Sendable {
                 )
             }
         } else if let only = selectedDecodeCandidates.first {
-            decode = .solo(
-                only.request.id,
-                speculationAllowed: only.request.requestsSpeculation
-            )
+            let prefillingCompanions = projected.values.reduce(into: 0) { count, slot in
+                guard slot.request.decodeCohort == only.request.decodeCohort else { return }
+                if case .prefilling = slot.phase { count += 1 }
+            }
+            let adaptiveMode = try? AdaptiveSoloSpeculationPolicy(
+                speculationWarmupTicks: 0
+            ).mode(for: .init(
+                decodeCandidates: selectedDecodeCandidates.count,
+                prefillingRequests: prefillingCompanions,
+                queuedRequests: 0,
+                ticksSinceMembershipChange: 0
+            ))
+            let speculationAllowed = only.request.requestsSpeculation
+                && adaptiveMode == .soloSpeculative
+            let pendingSoloDrain: Bool = {
+                guard case .decoding(_, let state) = only.phase else {
+                    return false
+                }
+                return state.requiresDrain
+            }()
+            let companionIsImminent = prefillingCompanions > 0
+            if companionIsImminent, !speculationAllowed, pendingSoloDrain {
+                decode = .drainSoloPipeline(only.request.id)
+            } else {
+                decode = .solo(
+                    only.request.id,
+                    speculationAllowed: speculationAllowed
+                )
+            }
         } else {
             decode = nil
         }

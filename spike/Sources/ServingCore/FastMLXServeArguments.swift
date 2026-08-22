@@ -171,6 +171,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       --scripted.
           --host HOST                 Bind host (default: 127.0.0.1).
           --port PORT                 Bind port (default: 8080; 0 is ephemeral).
+          --max-completion-tokens N   Maximum accepted OpenAI completion budget
+                                      per request (default: 4096).
           --evidence-path PATH        Fresh append-only canonical evidence output.
           --help                      Show this help.
 
@@ -184,6 +186,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     public let model: String
     public let evidencePath: URL?
     public let showHelp: Bool
+    /// Maximum OpenAI completion budget admitted per request. This remains a flat transport limit;
+    /// the model/context fit-check is intentionally a separate serving concern.
+    public let maximumCompletionTokens: Int
     /// Operator-requested served context (`--context N`); `nil` uses the sizer's effective default.
     /// Consumed by the pre-load fit-check, not by backend selection.
     public let requestedContext: Int?
@@ -256,6 +261,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         model: String,
         evidencePath: URL?,
         showHelp: Bool,
+        maximumCompletionTokens: Int = OpenAIChatRequestLimits.productionDefault
+            .maximumCompletionTokens,
         requestedContext: Int? = nil,
         forceServe: Bool = false,
         quantCandidateDirectories: [URL] = [],
@@ -274,6 +281,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.model = model
         self.evidencePath = evidencePath
         self.showHelp = showHelp
+        self.maximumCompletionTokens = maximumCompletionTokens
         self.requestedContext = requestedContext
         self.forceServe = forceServe
         self.quantCandidateDirectories = quantCandidateDirectories
@@ -295,6 +303,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var scripted = false
         var continuousBatchNoSpec = false
         var showHelp = false
+        var maximumCompletionTokens = OpenAIChatRequestLimits.productionDefault
+            .maximumCompletionTokens
         var host = "127.0.0.1"
         var port = 8_080
         var model: String?
@@ -345,6 +355,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidPort
                 }
                 port = parsedPort
+            case "--max-completion-tokens":
+                index += 1
+                maximumCompletionTokens = try strictPositiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
             case "--model":
                 index += 1
                 model = try value(at: index, in: arguments, for: argument)
@@ -446,7 +461,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 port: port,
                 model: model ?? "fastmlx-scripted",
                 evidencePath: evidencePath,
-                showHelp: true)
+                showHelp: true,
+                maximumCompletionTokens: maximumCompletionTokens)
         }
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
@@ -480,6 +496,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     model: model ?? "fastmlx-quant-pick",
                     evidencePath: evidencePath,
                     showHelp: false,
+                    maximumCompletionTokens: maximumCompletionTokens,
                     requestedContext: requestedContext,
                     forceServe: forceServe,
                     quantCandidateDirectories: [],
@@ -500,6 +517,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 model: model ?? "fastmlx-quant-pick",
                 evidencePath: evidencePath,
                 showHelp: false,
+                maximumCompletionTokens: maximumCompletionTokens,
                 requestedContext: requestedContext,
                 forceServe: forceServe,
                 quantCandidateDirectories: quantCandidateDirs,
@@ -536,7 +554,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 port: port,
                 model: launchedModel,
                 evidencePath: evidencePath,
-                showHelp: false)
+                showHelp: false,
+                maximumCompletionTokens: maximumCompletionTokens)
         }
 
         guard continuousBatchNoSpec || hasLoadedModelOptions else {
@@ -609,6 +628,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             model: launchedModel,
             evidencePath: evidencePath,
             showHelp: false,
+            maximumCompletionTokens: maximumCompletionTokens,
             requestedContext: requestedContext,
             forceServe: forceServe,
             quantCandidateDirectories: quantCandidateDirs,
@@ -626,6 +646,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "-h",
         "--host",
         "--port",
+        "--max-completion-tokens",
         "--model",
         "--model-path",
         "--evidence-path",
@@ -664,6 +685,20 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         option: String
     ) throws -> Int {
         guard let value = Int(rawValue), value > 0 else {
+            throw FastMLXServeArgumentError.invalidPositiveInteger(option)
+        }
+        return value
+    }
+
+    private static func strictPositiveInteger(
+        _ rawValue: String,
+        option: String
+    ) throws -> Int {
+        guard !rawValue.isEmpty,
+            rawValue.utf8.allSatisfy({ (48...57).contains($0) }),
+            let value = Int(rawValue),
+            value > 0
+        else {
             throw FastMLXServeArgumentError.invalidPositiveInteger(option)
         }
         return value

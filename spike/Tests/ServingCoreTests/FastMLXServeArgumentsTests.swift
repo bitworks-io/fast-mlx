@@ -10,8 +10,61 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertEqual(arguments.host, "127.0.0.1")
         XCTAssertEqual(arguments.port, 8_080)
         XCTAssertEqual(arguments.model, "fastmlx-scripted")
+        XCTAssertEqual(arguments.maximumCompletionTokens, 4_096)
         XCTAssertNil(arguments.evidencePath)
         XCTAssertFalse(arguments.showHelp)
+    }
+
+    func testMaxCompletionTokensAcceptsStrictPositiveIntegerAndAppearsInUsage() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--max-completion-tokens", "8192",
+        ])
+
+        XCTAssertEqual(arguments.maximumCompletionTokens, 8_192)
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--max-completion-tokens N"))
+    }
+
+    func testMaxCompletionTokensRejectsMissingDuplicateAndNonStrictValues() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--max-completion-tokens",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .missingValue("--max-completion-tokens"))
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--max-completion-tokens", "8",
+                "--max-completion-tokens", "9",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .duplicateOption("--max-completion-tokens"))
+        }
+
+        for rawValue in [
+            "0", "-1", "+1", " 8", "8 ", "1.5", "18446744073709551616",
+        ] {
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse([
+                    "--scripted",
+                    "--max-completion-tokens", rawValue,
+                ]),
+                "expected strict positive-integer rejection for \(rawValue.debugDescription)"
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    .invalidPositiveInteger("--max-completion-tokens"))
+            }
+        }
     }
 
     func testEvidencePathIsExplicitAbsoluteAndFreshnessIsDeferredToStartup() throws {

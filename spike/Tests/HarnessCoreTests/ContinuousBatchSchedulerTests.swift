@@ -234,7 +234,7 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.snapshot(for: id(2))?.phase, .ready)
 
         let second = scheduler.makeTick()
-        XCTAssertEqual(second.decode, .solo(id(2), speculationAllowed: true))
+        XCTAssertEqual(second.decode, .solo(id(2), speculationAllowed: false))
         XCTAssertEqual(
             second.prefills,
             [BatchPrefillSlice(id: id(1), startToken: 4, count: 4)]
@@ -242,14 +242,14 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         XCTAssertEqual(
             second.operations,
             [
-                .decode(.solo(id(2), speculationAllowed: true)),
+                .decode(.solo(id(2), speculationAllowed: false)),
                 .prefill(BatchPrefillSlice(id: id(1), startToken: 4, count: 4)),
             ],
             "decode must be ordered before bounded prefill work"
         )
     }
 
-    func testSoloToBatchJoinRequiresCommittedDrainOnAnEarlierTick() throws {
+    func testSoloToBatchJoinDrainsWhileCompanionPrefills() throws {
         var scheduler = ContinuousBatchScheduler(
             configuration: configuration(active: 2, prefill: 1, chunk: 1))
         try scheduler.submit(request(1, promptTokens: 1, speculation: true))
@@ -266,27 +266,13 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
 
         try scheduler.submit(request(2, promptTokens: 1, speculation: true))
         let prefillingJoiner = try applyNext(&scheduler)
-        XCTAssertEqual(prefillingJoiner.decode, .solo(id(1), speculationAllowed: true))
+        XCTAssertEqual(prefillingJoiner.decode, .drainSoloPipeline(id(1)))
         XCTAssertEqual(prefillingJoiner.admissions, [id(2)])
         XCTAssertEqual(scheduler.snapshot(for: id(2))?.phase, .ready)
-
-        let drain = scheduler.makeTick()
-        XCTAssertEqual(drain.decode, .drainSoloPipeline(id(1)))
-        XCTAssertFalse(
-            drain.operations.contains {
-                if case .decode(.batch) = $0 { return true }
-                return false
-            },
-            "the join tick may drain or batch, never both"
-        )
-        try scheduler.apply(
-            drain,
-            decodeOutcomes: defaultDecodeOutcomes(for: drain)
-        )
         XCTAssertEqual(
             scheduler.snapshot(for: id(1))?.phase,
             .decoding(
-                emittedTokens: 3,
+                emittedTokens: 2,
                 soloPipelineState: .canonical)
         )
 
@@ -329,20 +315,9 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         try scheduler.submit(request(2, promptTokens: 1, speculation: true))
         let join = scheduler.makeTick()
         XCTAssertEqual(join.admissions, [id(2)])
+        XCTAssertEqual(join.decode, .drainSoloPipeline(id(1)))
         try scheduler.apply(
             join,
-            decodeOutcomes: [
-                BatchDecodeOutcome(
-                    id: id(1),
-                    emittedTokenCount: 1,
-                    finished: false,
-                    soloPipelineState: .speculative),
-            ])
-
-        let drain = scheduler.makeTick()
-        XCTAssertEqual(drain.decode, .drainSoloPipeline(id(1)))
-        try scheduler.apply(
-            drain,
             decodeOutcomes: [
                 BatchDecodeOutcome(
                     id: id(1),
@@ -353,11 +328,46 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         XCTAssertEqual(
             scheduler.snapshot(for: id(1))?.phase,
             .decoding(
-                emittedTokens: 4,
+                emittedTokens: 3,
                 soloPipelineState: .canonical))
         XCTAssertEqual(
             scheduler.makeTick().decode,
             .batch([id(1), id(2)], speculationAllowed: false))
+    }
+
+    func testQueuedRequestBehindFullActiveCapacityDoesNotSuppressSoloSpeculation() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 1, prefill: 1, chunk: 1))
+        try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+
+        _ = try applyNext(&scheduler)
+        try scheduler.submit(request(2, promptTokens: 1, speculation: true))
+        let solo = scheduler.makeTick()
+        XCTAssertEqual(solo.admissions, [])
+        XCTAssertEqual(solo.decode, .solo(id(1), speculationAllowed: true))
+    }
+
+    func testPrefillingIncompatibleCohortDoesNotSuppressSoloSpeculation() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 2, prefill: 1, chunk: 1))
+        try scheduler.submit(
+            request(
+                1,
+                promptTokens: 1,
+                speculation: true,
+                decodeCohort: .fixedKVCapacity(16)))
+
+        _ = try applyNext(&scheduler)
+        try scheduler.submit(
+            request(
+                2,
+                promptTokens: 2,
+                speculation: true,
+                decodeCohort: .fixedKVCapacity(32)))
+
+        let solo = scheduler.makeTick()
+        XCTAssertEqual(solo.admissions, [id(2)])
+        XCTAssertEqual(solo.decode, .solo(id(1), speculationAllowed: true))
     }
 
     func testCancellingSpeculativeSoloMakesItsPlannedDrainStale() throws {
@@ -376,19 +386,9 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
                     soloPipelineState: .speculative),
             ])
         try scheduler.submit(request(2, promptTokens: 1, speculation: true))
-        let join = scheduler.makeTick()
-        try scheduler.apply(
-            join,
-            decodeOutcomes: [
-                BatchDecodeOutcome(
-                    id: id(1),
-                    emittedTokenCount: 1,
-                    finished: false,
-                    soloPipelineState: .speculative),
-            ])
-
         let staleDrain = scheduler.makeTick()
         XCTAssertEqual(staleDrain.decode, .drainSoloPipeline(id(1)))
+        XCTAssertEqual(staleDrain.admissions, [id(2)])
         XCTAssertEqual(scheduler.cancel(id(1)).id, id(1))
         try scheduler.submit(request(1, promptTokens: 2, speculation: true))
 
@@ -410,7 +410,7 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
                     actual: staleDrain.sequence))
         }
         XCTAssertEqual(scheduler.snapshot(for: id(1))?.phase, .queued)
-        XCTAssertEqual(scheduler.snapshot(for: id(2))?.phase, .ready)
+        XCTAssertEqual(scheduler.snapshot(for: id(2))?.phase, .queued)
     }
 
     func testSharedDecodeDisablesSpeculationForEverySlot() throws {
@@ -559,7 +559,7 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
 
         try scheduler.submit(request(2, promptTokens: 1, speculation: false))
         let admit = scheduler.makeTick()
-        XCTAssertEqual(admit.decode, .solo(id(1), speculationAllowed: true))
+        XCTAssertEqual(admit.decode, .solo(id(1), speculationAllowed: false))
         try scheduler.apply(
             admit,
             decodeOutcomes: [

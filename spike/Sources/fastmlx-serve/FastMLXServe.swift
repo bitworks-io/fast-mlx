@@ -80,9 +80,12 @@ struct FastMLXServe {
                         Data("fastmlx-serve evidence_failure=\(message)\n".utf8))
                 })
         }
+        let requestLimits = OpenAIChatRequestLimits(
+            maximumBodyBytes: OpenAIChatRequestLimits.productionDefault.maximumBodyBytes,
+            maximumCompletionTokens: arguments.maximumCompletionTokens)
         let configuration = ServingHTTPConfiguration(
             launchedModel: arguments.model,
-            requestLimits: .productionDefault,
+            requestLimits: requestLimits,
             requiredBearerToken: apiKey,
             maximumNonStreamingResponseBytes: 1_048_576,
             backpressureStallTimeout: .seconds(5),
@@ -99,7 +102,9 @@ struct FastMLXServe {
             throw error
         }
 
-        print(prepared.startupLine(localAddress: server.localAddress.description))
+        print(prepared.startupLine(
+            localAddress: server.localAddress.description,
+            maximumCompletionTokens: requestLimits.maximumCompletionTokens))
         print("fastmlx-serve ready=true; press Control-C to stop.")
 
         await waitForShutdownSignal()
@@ -128,11 +133,16 @@ private struct PreparedServingBackend {
     let startupReport: PreparedServingStartupReport?
     let fitDecision: ServingFitDecision?
 
-    func startupLine(localAddress: String) -> String {
+    func startupLine(
+        localAddress: String,
+        maximumCompletionTokens: Int
+    ) -> String {
         guard let startupReport else {
             return """
                 fastmlx-serve mode=\(mode) transport_only=true \
-                model=\(launchedModel) listening=\(localAddress)
+                model=\(launchedModel) \
+                max_completion_tokens_limit=\(maximumCompletionTokens) \
+                listening=\(localAddress)
                 """
         }
         let fit = fitDecision?.machineReadableFields() ?? "fit_check=skipped"
@@ -153,6 +163,7 @@ private struct PreparedServingBackend {
                 startup_prompt_token_count=\(report.startupPromptTokenCount) \
                 startup_generated_token_count=\(report.startupGeneratedTokenCount) \
                 reset_parity_verified=\(report.resetParityVerified) \
+                max_completion_tokens_limit=\(maximumCompletionTokens) \
                 \(report.memoryFieldsFragment) \
                 \(fit) \
                 listening=\(localAddress)
@@ -192,6 +203,7 @@ private struct PreparedServingBackend {
                 solo_pld_lookback=\(soloPLD?.lookback ?? 0) \
                 solo_pld_compiled_verify=\(soloPLD?.compiledVerify ?? false) \
                 model_proof_verified=\(report.modelProofVerified) \
+                max_completion_tokens_limit=\(maximumCompletionTokens) \
                 \(fit) \
                 listening=\(localAddress)
                 """
