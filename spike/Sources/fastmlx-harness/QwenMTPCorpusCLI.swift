@@ -1,0 +1,754 @@
+import CryptoKit
+import Foundation
+import HarnessCore
+import HuggingFace
+import MLX
+import MLXHuggingFace
+@_spi(FastMLXExactMTP) import MLXLLM
+import MLXLMCommon
+import SpikeCore
+import Tokenizers
+
+enum QwenMTPCorpusCLIError: Error, CustomStringConvertible {
+    case usage
+    case evidenceMustBeNewOrEmpty(String)
+    case unexpectedDownloadRequest(id: String, revision: String?)
+    case releaseBuildRequired
+    case cannotCreateEvidence(String)
+
+    var description: String {
+        switch self {
+        case .usage:
+            return "usage: fastmlx-harness qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL> [--profile true|false]"
+        case .evidenceMustBeNewOrEmpty(let path):
+            return "--evidence must name a new or empty JSONL file: \(path)"
+        case .unexpectedDownloadRequest(let id, let revision):
+            return "unexpected exact Qwen MTP artifact request: \(id)@\(revision ?? "nil")"
+        case .releaseBuildRequired:
+            return "--profile true requires a Release build"
+        case .cannotCreateEvidence(let path):
+            return "cannot create evidence parent directory for \(path)"
+        }
+    }
+}
+
+func runQwenMTPCorpus(_ flags: Flags) async throws {
+    let targetPath = try flags.strictString("target", default: "")
+    let drafterPath = try flags.strictString("drafter", default: "")
+    let evidencePath = try flags.strictString("evidence", default: "")
+    guard !targetPath.isEmpty, !drafterPath.isEmpty, !evidencePath.isEmpty else {
+        throw QwenMTPCorpusCLIError.usage
+    }
+    let profileEnabled = try flags.strictBool("profile", default: true)
+    let evidenceURL = URL(fileURLWithPath: evidencePath)
+    try requireNewOrEmptyEvidence(evidenceURL)
+
+    let targetURL = URL(fileURLWithPath: targetPath, isDirectory: true)
+    let drafterURL = URL(fileURLWithPath: drafterPath, isDirectory: true)
+    let downloader = QwenMTPLocalExactRevisionDownloader(target: targetURL, drafter: drafterURL)
+    let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        from: downloader,
+        using: #huggingFaceTokenizerLoader())
+
+    var caseResults: [QwenMTPCorpusCaseResult] = []
+    caseResults.reserveCapacity(QwenMTPCorpusGate.cases.count)
+    for spec in QwenMTPCorpusGate.cases {
+        switch spec.kind {
+        case .cancellationAcceptedDraft:
+            caseResults.append(try runAcceptedDraftCancellationCase(spec, pair: pair))
+        default:
+            caseResults.append(try runStandardCase(spec, pair: pair))
+        }
+    }
+
+    var payload = QwenMTPCorpusEvidencePayload(
+        schemaVersion: QwenMTPCorpusGate.schemaVersion,
+        corpusID: QwenMTPCorpusGate.corpusID,
+        corpusContentHash: QwenMTPCorpusGate.corpusContentHash,
+        binding: runtimeBinding(pair.binding),
+        host: .init(
+            chip: ProvenanceCLI.chipBrand(),
+            ramBytes: ProvenanceCLI.ramBytes(),
+            os: ProvenanceCLI.osVersion()),
+        caseResults: caseResults,
+        correctness: .pass,
+        profile: nil)
+
+    do {
+        _ = try QwenMTPCorpusGate.validate(payload)
+    } catch {
+        let failedPayload = QwenMTPCorpusGate.canonicalCorrectnessFailurePayload(from: payload)
+        try RequiredJSONLWriter.append(resultRecord(failedPayload, targetPath: targetPath), to: evidenceURL)
+        throw error
+    }
+
+    guard profileEnabled else {
+        try RequiredJSONLWriter.append(resultRecord(payload, targetPath: targetPath), to: evidenceURL)
+        return
+    }
+
+    guard qwenMTPCorpusReleaseBuildObserved else {
+        try RequiredJSONLWriter.append(resultRecord(payload, targetPath: targetPath), to: evidenceURL)
+        throw QwenMTPCorpusCLIError.releaseBuildRequired
+    }
+
+    payload.profile = try runQwenMTPProfile(pair: pair)
+    try RequiredJSONLWriter.append(resultRecord(payload, targetPath: targetPath), to: evidenceURL)
+    _ = try QwenMTPCorpusGate.validate(payload)
+}
+
+private var qwenMTPCorpusReleaseBuildObserved: Bool {
+    #if DEBUG
+    false
+    #else
+    true
+    #endif
+}
+
+private func requireNewOrEmptyEvidence(_ url: URL) throws {
+    let manager = FileManager.default
+    let parent = url.deletingLastPathComponent()
+    if !manager.fileExists(atPath: parent.path) {
+        throw QwenMTPCorpusCLIError.cannotCreateEvidence(url.path)
+    }
+    guard manager.fileExists(atPath: url.path) else { return }
+    let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+    guard values.isRegularFile == true, (values.fileSize ?? 0) == 0 else {
+        throw QwenMTPCorpusCLIError.evidenceMustBeNewOrEmpty(url.path)
+    }
+}
+
+private struct QwenMTPLocalExactRevisionDownloader: Downloader {
+    let target: URL
+    let drafter: URL
+
+    func download(
+        id: String,
+        revision: String?,
+        matching patterns: [String],
+        useLatest: Bool,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> URL {
+        guard !useLatest, patterns == ["*.safetensors", "*.json", "*.jinja"] else {
+            throw QwenMTPCorpusCLIError.unexpectedDownloadRequest(id: id, revision: revision)
+        }
+        progressHandler(Progress(totalUnitCount: 1))
+        switch (id, revision) {
+        case (
+            "mlx-community/Qwen3.5-9B-MLX-4bit",
+            "938d8919941c6e7efd3c7150eff7fe9d12afa631"
+        ):
+            return target
+        case (
+            "mlx-community/Qwen3.5-9B-MTP-5bit",
+            "994730d199bff7799aa3ddef33a96723967a3e33"
+        ):
+            return drafter
+        default:
+            throw QwenMTPCorpusCLIError.unexpectedDownloadRequest(id: id, revision: revision)
+        }
+    }
+}
+
+private func runStandardCase(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair
+) throws -> QwenMTPCorpusCaseResult {
+    let parameters = parameters(for: spec)
+    let scalar = try runScalar(
+        spec,
+        pair: pair,
+        parameters: parameters,
+        retainedTokenLimit: QwenMTPCorpusGate.scalarRetainedTokenLimit(forCaseID: spec.id))
+    let mtp: CorpusRun
+    switch spec.kind {
+    case .cancellationRetainedToken:
+        mtp = try runMTPCancelAfterExtraGenerated(
+            spec,
+            pair: pair,
+            parameters: parameters,
+            retainedTokens: 1)
+    default:
+        mtp = try runMTPDrain(spec, pair: pair, parameters: parameters)
+    }
+    return caseResult(spec: spec, scalar: scalar, mtp: mtp)
+}
+
+private func runAcceptedDraftCancellationCase(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair
+) throws -> QwenMTPCorpusCaseResult {
+    let parameters = parameters(for: spec)
+    let mtp = try runMTPCancelAfterAcceptedDraft(spec, pair: pair, parameters: parameters)
+    let scalar = try runScalar(
+        spec,
+        pair: pair,
+        parameters: parameters,
+        retainedTokenLimit: mtp.stopOutcome == .cancelled ? mtp.tokens.count : nil)
+    return caseResult(spec: spec, scalar: scalar, mtp: mtp)
+}
+
+private struct CorpusRun {
+    let promptTokenCount: Int
+    let tokens: [Int]
+    let tokenIDsSHA256: String
+    let decodedBytesSHA256: String
+    let stopOutcome: QwenMTPCorpusStopOutcome
+    let cacheFingerprint: QwenMTPCorpusCacheFingerprint
+    let timing: QwenMTPCorpusTiming
+    let mtpTelemetry: QwenMTPCorpusMTPTelemetry
+    let passthroughReason: String?
+}
+
+private func runScalar(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair,
+    parameters: GenerateParameters,
+    retainedTokenLimit: Int? = nil
+) throws -> CorpusRun {
+    let input = input(for: spec, tokenizer: pair.target.tokenizer)
+    let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
+    let cache = pair.target.model.newCache(parameters: parameters)
+    let wallStart = Date.timeIntervalSinceReferenceDate
+    var iterator = try TokenIterator(
+        input: input,
+        model: pair.target.model,
+        cache: cache,
+        parameters: parameters)
+    let generationStart = Date.timeIntervalSinceReferenceDate
+    var tokens: [Int] = []
+    let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
+        modelConfiguration: pair.target.configuration,
+        tokenizer: pair.target.tokenizer)
+    var stopOutcome: QwenMTPCorpusStopOutcome = .stop
+    while let token = iterator.next() {
+        if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+            iterator.discardGeneratedToken()
+            stopOutcome = .stop
+            break
+        }
+        tokens.append(token)
+        if let retainedTokenLimit, tokens.count >= retainedTokenLimit {
+            stopOutcome = .cancelled
+            break
+        }
+        if tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
+            stopOutcome = .length
+        }
+    }
+    if stopOutcome == .stop, tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
+        stopOutcome = .length
+    }
+    let end = Date.timeIntervalSinceReferenceDate
+    let fingerprint = fingerprintCache(cache)
+    return CorpusRun(
+        promptTokenCount: promptTokenCount,
+        tokens: tokens,
+        tokenIDsSHA256: tokenIDsSHA256(tokens),
+        decodedBytesSHA256: sha256Hex(Data(pair.target.tokenizer.decode(tokenIds: tokens).utf8)),
+        stopOutcome: stopOutcome,
+        cacheFingerprint: fingerprint,
+        timing: .init(
+            promptSeconds: max(iterator.promptPrefillTime, 1e-9),
+            generationSeconds: max(end - generationStart, 1e-9),
+            wallSeconds: max(end - wallStart, 1e-9),
+            e2eSeconds: max(end - wallStart, 1e-9)),
+        mtpTelemetry: .init(
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            rejectedDraftTokens: 0,
+            roundCount: 0,
+            targetModelCallCount: 0,
+            draftModelCallCount: 0,
+            targetVerifiedTokenCount: 0,
+            emittedTokenCount: tokens.count),
+        passthroughReason: nil)
+}
+
+private func runMTPDrain(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair,
+    parameters: GenerateParameters
+) throws -> CorpusRun {
+    let input = input(for: spec, tokenizer: pair.target.tokenizer)
+    let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
+    let cache = pair.target.model.newCache(parameters: parameters)
+    let wallStart = Date.timeIntervalSinceReferenceDate
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: pair.target.model,
+        drafter: pair.drafter.model,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: pair.binding.runtimeBlockSize)
+    let generationStart = Date.timeIntervalSinceReferenceDate
+    var tokens: [Int] = []
+    let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
+        modelConfiguration: pair.target.configuration,
+        tokenizer: pair.target.tokenizer)
+    var stopOutcome: QwenMTPCorpusStopOutcome = .stop
+    while let token = iterator.next() {
+        if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+            iterator.discardGeneratedToken()
+            stopOutcome = .stop
+            break
+        }
+        tokens.append(token)
+        if tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
+            stopOutcome = .length
+        }
+    }
+    iterator.finalizeGeneration()
+    if stopOutcome == .stop, tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
+        stopOutcome = .length
+    }
+    let end = Date.timeIntervalSinceReferenceDate
+    let fingerprint = fingerprintCache(cache)
+    let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
+    return CorpusRun(
+        promptTokenCount: promptTokenCount,
+        tokens: tokens,
+        tokenIDsSHA256: tokenIDsSHA256(tokens),
+        decodedBytesSHA256: sha256Hex(Data(pair.target.tokenizer.decode(tokenIds: tokens).utf8)),
+        stopOutcome: stopOutcome,
+        cacheFingerprint: fingerprint,
+        timing: .init(
+            promptSeconds: max(iterator.promptPrefillTime, 1e-9),
+            generationSeconds: max(end - generationStart, 1e-9),
+            wallSeconds: max(end - wallStart, 1e-9),
+            e2eSeconds: max(end - wallStart, 1e-9)),
+        mtpTelemetry: telemetry,
+        passthroughReason: iterator.passthroughReason)
+}
+
+private func runMTPCancelAfterExtraGenerated(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair,
+    parameters: GenerateParameters,
+    retainedTokens: Int
+) throws -> CorpusRun {
+    let input = input(for: spec, tokenizer: pair.target.tokenizer)
+    let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
+    let cache = pair.target.model.newCache(parameters: parameters)
+    let wallStart = Date.timeIntervalSinceReferenceDate
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: pair.target.model,
+        drafter: pair.drafter.model,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: pair.binding.runtimeBlockSize)
+    let generationStart = Date.timeIntervalSinceReferenceDate
+    var tokens: [Int] = []
+    let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
+        modelConfiguration: pair.target.configuration,
+        tokenizer: pair.target.tokenizer)
+    var stopOutcome: QwenMTPCorpusStopOutcome?
+    while tokens.count < retainedTokens {
+        guard let token = iterator.next() else { break }
+        if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+            iterator.discardGeneratedToken()
+            stopOutcome = .stop
+            break
+        }
+        tokens.append(token)
+    }
+    var discardedExtraGeneratedToken = false
+    if stopOutcome == nil, tokens.count == retainedTokens, iterator.next() != nil {
+        iterator.discardGeneratedToken()
+        discardedExtraGeneratedToken = true
+    }
+    iterator.finalizeGeneration()
+    let end = Date.timeIntervalSinceReferenceDate
+    let fingerprint = fingerprintCache(cache)
+    let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
+    return CorpusRun(
+        promptTokenCount: promptTokenCount,
+        tokens: tokens,
+        tokenIDsSHA256: tokenIDsSHA256(tokens),
+        decodedBytesSHA256: sha256Hex(Data(pair.target.tokenizer.decode(tokenIds: tokens).utf8)),
+        stopOutcome: stopOutcome
+            ?? (tokens.count == retainedTokens && discardedExtraGeneratedToken ? .cancelled : .length),
+        cacheFingerprint: fingerprint,
+        timing: .init(
+            promptSeconds: max(iterator.promptPrefillTime, 1e-9),
+            generationSeconds: max(end - generationStart, 1e-9),
+            wallSeconds: max(end - wallStart, 1e-9),
+            e2eSeconds: max(end - wallStart, 1e-9)),
+        mtpTelemetry: telemetry,
+        passthroughReason: iterator.passthroughReason)
+}
+
+private func runMTPCancelAfterAcceptedDraft(
+    _ spec: QwenMTPCorpusCaseSpec,
+    pair: Qwen35ExactMTPLoadedPair,
+    parameters: GenerateParameters
+) throws -> CorpusRun {
+    let input = input(for: spec, tokenizer: pair.target.tokenizer)
+    let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
+    let cache = pair.target.model.newCache(parameters: parameters)
+    let wallStart = Date.timeIntervalSinceReferenceDate
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: pair.target.model,
+        drafter: pair.drafter.model,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: pair.binding.runtimeBlockSize)
+    let generationStart = Date.timeIntervalSinceReferenceDate
+    var tokens: [Int] = []
+    let safetyCap = max(parameters.maxTokens ?? spec.maxTokens, spec.maxTokens) + 8
+    let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
+        modelConfiguration: pair.target.configuration,
+        tokenizer: pair.target.tokenizer)
+    var stopped = false
+    while tokens.count < safetyCap, iterator.acceptedCount <= 0 {
+        guard let token = iterator.next() else { break }
+        if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
+            iterator.discardGeneratedToken()
+            stopped = true
+            break
+        }
+        tokens.append(token)
+    }
+    let acceptedDraftObserved = iterator.acceptedCount > 0
+    var discardedExtraGeneratedToken = false
+    if acceptedDraftObserved, !stopped, iterator.next() != nil {
+        iterator.discardGeneratedToken()
+        discardedExtraGeneratedToken = true
+    }
+    iterator.finalizeGeneration()
+    let end = Date.timeIntervalSinceReferenceDate
+    let fingerprint = fingerprintCache(cache)
+    let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
+    return CorpusRun(
+        promptTokenCount: promptTokenCount,
+        tokens: tokens,
+        tokenIDsSHA256: tokenIDsSHA256(tokens),
+        decodedBytesSHA256: sha256Hex(Data(pair.target.tokenizer.decode(tokenIds: tokens).utf8)),
+        stopOutcome: acceptedDraftObserved && discardedExtraGeneratedToken
+            ? .cancelled
+            : (stopped ? .stop : .length),
+        cacheFingerprint: fingerprint,
+        timing: .init(
+            promptSeconds: max(iterator.promptPrefillTime, 1e-9),
+            generationSeconds: max(end - generationStart, 1e-9),
+            wallSeconds: max(end - wallStart, 1e-9),
+            e2eSeconds: max(end - wallStart, 1e-9)),
+        mtpTelemetry: telemetry,
+        passthroughReason: iterator.passthroughReason)
+}
+
+private func caseResult(
+    spec: QwenMTPCorpusCaseSpec,
+    scalar: CorpusRun,
+    mtp: CorpusRun
+) -> QwenMTPCorpusCaseResult {
+    let exactness = MTPStreamExactness.compare(candidate: mtp.tokens, baseline: scalar.tokens)
+    let cacheMismatch = firstCacheMismatch(scalar.cacheFingerprint, mtp.cacheFingerprint)
+    return QwenMTPCorpusCaseResult(
+        caseID: spec.id,
+        kind: spec.kind,
+        maxTokens: spec.maxTokens,
+        promptTokenCount: scalar.promptTokenCount,
+        scalarTokenCount: scalar.tokens.count,
+        mtpTokenCount: mtp.tokens.count,
+        scalarTokenIDsSHA256: scalar.tokenIDsSHA256,
+        mtpTokenIDsSHA256: mtp.tokenIDsSHA256,
+        tokenExactness: exactness,
+        scalarDecodedBytesSHA256: scalar.decodedBytesSHA256,
+        mtpDecodedBytesSHA256: mtp.decodedBytesSHA256,
+        scalarStopOutcome: scalar.stopOutcome,
+        mtpStopOutcome: mtp.stopOutcome,
+        scalarCacheFingerprint: scalar.cacheFingerprint,
+        mtpCacheFingerprint: mtp.cacheFingerprint,
+        firstCacheMismatch: cacheMismatch,
+        scalarTiming: scalar.timing,
+        mtpTiming: mtp.timing,
+        mtpTelemetry: mtp.mtpTelemetry,
+        passthroughReason: mtp.passthroughReason)
+}
+
+private func runQwenMTPProfile(pair: Qwen35ExactMTPLoadedPair) throws -> QwenMTPCorpusProfileEvidence {
+    var samples: [QwenMTPCorpusProfileSample] = []
+    samples.reserveCapacity(QwenMTPCorpusGate.profilePlan.caseIDs.count * QwenMTPCorpusGate.profilePlan.totalPairsPerCase)
+    for caseID in QwenMTPCorpusGate.profilePlan.caseIDs {
+        let spec = QwenMTPCorpusGate.cases.first { $0.id == caseID }!
+        for pairIndex in 0..<QwenMTPCorpusGate.profilePlan.totalPairsPerCase {
+            let order = QwenMTPCorpusGate.profilePlan.orders[pairIndex]
+            let parameters = GenerateParameters(maxTokens: 128, temperature: 0)
+            let scalar: CorpusRun
+            let mtp: CorpusRun
+            switch order {
+            case .scalarThenMTP:
+                scalar = try runScalar(spec, pair: pair, parameters: parameters)
+                mtp = try runMTPDrain(spec, pair: pair, parameters: parameters)
+            case .mtpThenScalar:
+                mtp = try runMTPDrain(spec, pair: pair, parameters: parameters)
+                scalar = try runScalar(spec, pair: pair, parameters: parameters)
+            }
+            let scalarTPS = Double(max(scalar.tokens.count, 1)) / scalar.timing.e2eSeconds
+            let mtpTPS = Double(max(mtp.tokens.count, 1)) / mtp.timing.e2eSeconds
+            let decodeRatio = scalar.timing.generationSeconds > 0
+                ? scalar.timing.generationSeconds / mtp.timing.generationSeconds
+                : 0
+            samples.append(.init(
+                caseID: caseID,
+                pairIndex: pairIndex,
+                warmup: pairIndex < QwenMTPCorpusGate.profilePlan.droppedWarmupPairs,
+                order: order,
+                exactness: exactnessEvidence(scalar: scalar, mtp: mtp),
+                scalarTiming: scalar.timing,
+                mtpTiming: mtp.timing,
+                scalarTokensPerSecond: scalarTPS,
+                mtpTokensPerSecond: mtpTPS,
+                decodeOnlyRatio: decodeRatio,
+                e2eRatio: scalarTPS > 0 ? mtpTPS / scalarTPS : 0,
+                mtpTelemetry: mtp.mtpTelemetry,
+                passthroughReason: mtp.passthroughReason))
+        }
+    }
+    return QwenMTPCorpusProfileEvidence(
+        releaseBuildRequired: true,
+        releaseBuildObserved: qwenMTPCorpusReleaseBuildObserved,
+        samples: samples)
+}
+
+private func parameters(for spec: QwenMTPCorpusCaseSpec) -> GenerateParameters {
+    switch spec.kind {
+    case .forcedFallback:
+        GenerateParameters(maxTokens: spec.maxTokens, temperature: 0.7, topP: 0.95, seed: 0x51A7)
+    default:
+        GenerateParameters(maxTokens: spec.maxTokens, temperature: 0)
+    }
+}
+
+private func input(
+    for spec: QwenMTPCorpusCaseSpec,
+    tokenizer: any MLXLMCommon.Tokenizer
+) -> LMInput {
+    let tokens = tokenizer.encode(text: spec.prompt, addSpecialTokens: true)
+        .compactMap(Int32.init(exactly:))
+    return LMInput(tokens: MLXArray(tokens))
+}
+
+private func promptTokenCount(
+    for spec: QwenMTPCorpusCaseSpec,
+    tokenizer: any MLXLMCommon.Tokenizer
+) -> Int {
+    tokenizer.encode(text: spec.prompt, addSpecialTokens: true).count
+}
+
+private func exactnessEvidence(
+    scalar: CorpusRun,
+    mtp: CorpusRun
+) -> QwenMTPCorpusExactnessEvidence {
+    QwenMTPCorpusExactnessEvidence(
+        scalarTokenCount: scalar.tokens.count,
+        mtpTokenCount: mtp.tokens.count,
+        scalarTokenIDsSHA256: scalar.tokenIDsSHA256,
+        mtpTokenIDsSHA256: mtp.tokenIDsSHA256,
+        scalarDecodedBytesSHA256: scalar.decodedBytesSHA256,
+        mtpDecodedBytesSHA256: mtp.decodedBytesSHA256,
+        scalarStopOutcome: scalar.stopOutcome,
+        mtpStopOutcome: mtp.stopOutcome,
+        scalarCacheFingerprint: scalar.cacheFingerprint,
+        mtpCacheFingerprint: mtp.cacheFingerprint,
+        firstCacheMismatch: firstCacheMismatch(scalar.cacheFingerprint, mtp.cacheFingerprint))
+}
+
+private func tokenIDsSHA256(_ tokens: [Int]) -> String {
+    var data = Data()
+    data.reserveCapacity(tokens.count * MemoryLayout<Int64>.size)
+    for token in tokens {
+        var value = Int64(token).littleEndian
+        withUnsafeBytes(of: &value) { bytes in
+            data.append(contentsOf: bytes)
+        }
+    }
+    return sha256Hex(data)
+}
+
+private func mtpTelemetry(
+    from iterator: MTPSpeculativeTokenIterator,
+    emittedTokenCount: Int
+) -> QwenMTPCorpusMTPTelemetry {
+    if let telemetry = iterator.speculativeDecodingTelemetry {
+        return QwenMTPCorpusMTPTelemetry(
+            proposedDraftTokens: telemetry.draftTokenCount,
+            acceptedDraftTokens: telemetry.acceptedDraftTokenCount,
+            rejectedDraftTokens: telemetry.rejectedDraftTokenCount,
+            roundCount: telemetry.roundCount,
+            targetModelCallCount: telemetry.targetModelCallCount,
+            draftModelCallCount: telemetry.draftModelCallCount,
+            targetVerifiedTokenCount: telemetry.targetVerifiedTokenCount,
+            emittedTokenCount: telemetry.emittedTokenCount)
+    }
+    return QwenMTPCorpusMTPTelemetry(
+        proposedDraftTokens: iterator.proposedCount,
+        acceptedDraftTokens: iterator.acceptedCount,
+        rejectedDraftTokens: max(0, iterator.proposedCount - iterator.acceptedCount),
+        roundCount: 0,
+        targetModelCallCount: 0,
+        draftModelCallCount: 0,
+        targetVerifiedTokenCount: 0,
+        emittedTokenCount: emittedTokenCount)
+}
+
+private func buildQwenMTPCorpusStopTokenIds(
+    modelConfiguration: ModelConfiguration,
+    tokenizer: any MLXLMCommon.Tokenizer
+) -> Set<Int> {
+    var stopTokenIds = modelConfiguration.eosTokenIds
+    if let tokenizerEOS = tokenizer.eosTokenId {
+        stopTokenIds.insert(tokenizerEOS)
+    }
+    for token in modelConfiguration.extraEOSTokens {
+        if let id = tokenizer.convertTokenToId(token) {
+            stopTokenIds.insert(id)
+        }
+    }
+    return stopTokenIds
+}
+
+private func fingerprintCache(_ cache: [KVCache]) -> QwenMTPCorpusCacheFingerprint {
+    var hasher = SHA256()
+    var entries: [QwenMTPCorpusCacheLayerFingerprint] = []
+    entries.reserveCapacity(cache.count)
+    for (layerIndex, entry) in cache.enumerated() {
+        let cacheType = String(describing: type(of: entry))
+        let state = entry.state
+        var states: [QwenMTPCorpusCacheStateFingerprint] = []
+        states.reserveCapacity(state.count)
+        var metaHasher = SHA256()
+        for (metaIndex, value) in entry.metaState.enumerated() {
+            update(&metaHasher, "meta=\(metaIndex)")
+            update(&metaHasher, value)
+        }
+        for (stateIndex, array) in state.enumerated() {
+            eval(array)
+            let shape = array.shape
+            let dtype = String(describing: array.dtype)
+            let bytes = array.asData(access: .copy).data
+            let byteDigest = sha256Hex(bytes)
+            states.append(.init(
+                stateIndex: stateIndex,
+                shape: shape,
+                dtype: dtype,
+                byteCount: bytes.count,
+                sha256: byteDigest))
+        }
+        let metaDigest = metaHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        update(&hasher, "layer=\(layerIndex)")
+        update(&hasher, "type=\(cacheType)")
+        update(&hasher, "offset=\(entry.offset)")
+        update(&hasher, "metaState=\(metaDigest)")
+        update(&hasher, "stateCount=\(states.count)")
+        for state in states {
+            update(&hasher, "state=\(state.stateIndex)")
+            update(&hasher, "shape=\(state.shape)")
+            update(&hasher, "dtype=\(state.dtype)")
+            update(&hasher, "bytes=\(state.byteCount)")
+            update(&hasher, "sha256=\(state.sha256)")
+        }
+        entries.append(.init(
+            layerIndex: layerIndex,
+            cacheType: cacheType,
+            offset: entry.offset,
+            metaStateSHA256: metaDigest,
+            stateCount: states.count,
+            states: states))
+    }
+    return QwenMTPCorpusCacheFingerprint(
+        digest: hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+        entries: entries)
+}
+
+private func update(_ hasher: inout SHA256, _ value: String) {
+    hasher.update(data: Data(value.utf8))
+    hasher.update(data: Data([0]))
+}
+
+private func firstCacheMismatch(
+    _ scalar: QwenMTPCorpusCacheFingerprint,
+    _ mtp: QwenMTPCorpusCacheFingerprint
+) -> String? {
+    guard scalar != mtp else { return nil }
+    if scalar.entries.count != mtp.entries.count {
+        return "layerCount scalar=\(scalar.entries.count) mtp=\(mtp.entries.count)"
+    }
+    for (layerIndex, pair) in zip(scalar.entries, mtp.entries).enumerated() {
+        if pair.0.layerIndex != pair.1.layerIndex {
+            return "layer[\(layerIndex)].index scalar=\(pair.0.layerIndex) mtp=\(pair.1.layerIndex)"
+        }
+        if pair.0.cacheType != pair.1.cacheType {
+            return "layer[\(layerIndex)].type scalar=\(pair.0.cacheType) mtp=\(pair.1.cacheType)"
+        }
+        if pair.0.offset != pair.1.offset {
+            return "layer[\(layerIndex)].offset scalar=\(pair.0.offset) mtp=\(pair.1.offset)"
+        }
+        if pair.0.metaStateSHA256 != pair.1.metaStateSHA256 {
+            return "layer[\(layerIndex)].metaState scalar=\(pair.0.metaStateSHA256) mtp=\(pair.1.metaStateSHA256)"
+        }
+        if pair.0.stateCount != pair.1.stateCount || pair.0.states.count != pair.1.states.count {
+            return "layer[\(layerIndex)].stateCount scalar=\(pair.0.states.count) mtp=\(pair.1.states.count)"
+        }
+        for (stateIndex, statePair) in zip(pair.0.states, pair.1.states).enumerated() {
+            if statePair.0.shape != statePair.1.shape {
+                return "layer[\(layerIndex)].state[\(stateIndex)].shape scalar=\(statePair.0.shape) mtp=\(statePair.1.shape)"
+            }
+            if statePair.0.dtype != statePair.1.dtype {
+                return "layer[\(layerIndex)].state[\(stateIndex)].dtype scalar=\(statePair.0.dtype) mtp=\(statePair.1.dtype)"
+            }
+            if statePair.0.byteCount != statePair.1.byteCount {
+                return "layer[\(layerIndex)].state[\(stateIndex)].byteCount scalar=\(statePair.0.byteCount) mtp=\(statePair.1.byteCount)"
+            }
+            if statePair.0.sha256 != statePair.1.sha256 {
+                return "layer[\(layerIndex)].state[\(stateIndex)].sha256 scalar=\(statePair.0.sha256) mtp=\(statePair.1.sha256)"
+            }
+        }
+    }
+    if scalar.digest != mtp.digest {
+        return "digest scalar=\(scalar.digest) mtp=\(mtp.digest)"
+    }
+    return "cache fingerprint mismatch"
+}
+
+private func runtimeBinding(
+    _ binding: Qwen35ExactMTPBinding
+) -> QwenMTPCorpusRuntimeBinding {
+    QwenMTPCorpusRuntimeBinding(
+        targetModelID: binding.targetModelID,
+        drafterModelID: binding.drafterModelID,
+        targetRevision: binding.targetRevision,
+        drafterRevision: binding.drafterRevision,
+        sourceRevision: binding.sourceRevision,
+        blockSize: binding.runtimeBlockSize,
+        maxAcceptedDrafts: binding.maximumAcceptedDraftTokens)
+}
+
+private func resultRecord(
+    _ payload: QwenMTPCorpusEvidencePayload,
+    targetPath: String
+) -> ResultRecord<QwenMTPCorpusEvidencePayload> {
+    let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
+    return ResultRecord(
+        subcommand: "qwen-mtp-corpus",
+        provenance: Provenance(
+            date: ISO8601DateFormatter().string(from: Date()),
+            hardwareChip: ProvenanceCLI.chipBrand(),
+            hardwareRAMBytes: ProvenanceCLI.ramBytes(),
+            hardwareOS: ProvenanceCLI.osVersion(),
+            harnessGitSHA: ProvenanceCLI.harnessGitSHA(),
+            mlxSwiftVersion: ProvenanceCLI.mlxSwiftVersion,
+            referenceMLXVersion: nil,
+            referenceMLXLMVersion: ProvenanceCLI.mlxSwiftLMRevision,
+            modelPath: payload.binding.targetModelID,
+            modelConfigHash: modelConfig.hash,
+            modelCheckpointManifestHash: try? ProvenanceCLI.checkpointManifestHash(at: targetPath),
+            modelQuant: modelConfig.quant,
+            corpusId: QwenMTPCorpusGate.corpusID,
+            corpusContentHash: QwenMTPCorpusGate.corpusContentHash,
+            nonce: UUID().uuidString),
+        payload: payload)
+}

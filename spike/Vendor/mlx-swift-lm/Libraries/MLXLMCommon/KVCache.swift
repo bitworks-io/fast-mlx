@@ -1976,6 +1976,18 @@ package func canPreserveSpeculativeRewindAfterAppend(
 package func checkpointSpeculativePromptCacheForOneTokenReprime(
     _ cache: [KVCache]
 ) -> Bool {
+    checkpointSpeculativePromptCacheBeforeAppend(cache, tokenCount: 1)
+}
+
+/// Snapshot recurrent entries before appending a speculative suffix whose
+/// accepted prefix may need exact replay after restoring the committed
+/// bonus boundary.
+@discardableResult
+package func checkpointSpeculativePromptCacheBeforeAppend(
+    _ cache: [KVCache],
+    tokenCount: Int
+) -> Bool {
+    precondition(tokenCount >= 0)
     let recurrent = cache.compactMap { $0 as? MambaCache }
 
     // The finalizer rewinds the entire hybrid cache atomically. Validate the
@@ -1983,7 +1995,7 @@ package func checkpointSpeculativePromptCacheForOneTokenReprime(
     // caches stop being trimmable when the one-token re-prime reaches their
     // capacity, even if they were still trimmable immediately after prompt
     // prefill.
-    guard canPreserveSpeculativeRewindAfterAppend(cache, tokenCount: 1) else {
+    guard canPreserveSpeculativeRewindAfterAppend(cache, tokenCount: tokenCount) else {
         return false
     }
     guard !recurrent.isEmpty else { return true }
@@ -2012,7 +2024,7 @@ package func checkpointSpeculativePromptCacheForOneTokenReprime(
 package func rewindSpeculativePromptCache(
     _ cache: [KVCache], numTokens: Int
 ) -> Int {
-    guard numTokens == 1,
+    guard numTokens > 0,
         cache.allSatisfy({ entry in
             if entry.isTrimmable {
                 return entry.offset >= numTokens

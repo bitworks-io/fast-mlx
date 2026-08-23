@@ -111,6 +111,16 @@ func testQwen35MTPDraftInstantiatesDedicatedEmbeddingWhenConfigured() throws {
     #expect(sanitized["model.embed_tokens.weight"] == nil)
 }
 
+@Test
+func testQwen35MTPDrafterAdvertisesTwoDraftTokenBlock() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35TextConfiguration.self,
+        from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+
+    #expect(drafter.maximumBlockSize == 3)
+}
+
 @Suite(.serialized)
 struct Qwen35MTPMetalTests {
     @Test
@@ -533,7 +543,7 @@ struct Qwen35MTPMetalTests {
         let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
         let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
 
-        for pattern in [[0, 0], [0, 1], [1, 0], [1, 1]] {
+        for pattern in [[0, 1, 2], [2, 1, 0]] {
             var state = drafter.makeState(parameters: nil)
             var bonus = MLXArray([Int32(4)])
             drafter.prepareDrafterState(
@@ -548,12 +558,14 @@ struct Qwen35MTPMetalTests {
                 let proposal = drafter.draftBlock(
                     target: target, lastToken: bonus,
                     lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
-                    positionDeltas: nil, queryOffset: expectedPosition, blockSize: 2,
+                    positionDeltas: nil, queryOffset: expectedPosition, blockSize: 3,
                     state: &state, sampler: sampler)
                 eval(proposal)
-                #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
+                #expect(proposal.shape == [1, 2])
+                #expect(state.proposalAppended == 1)
+                #expect(state.cache.allSatisfy { $0.offset == expectedPosition + 1 })
 
-                let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+                let verifyHidden = MLXArray.zeros([1, 3, cfg.hiddenSize])
                 let finalToken = MLXArray([Int32(8 + accepted)])
                 drafter.commitDrafterState(
                     target: target, targetHidden: verifyHidden, draftTokens: proposal,
@@ -672,6 +684,32 @@ struct Qwen35MTPMetalTests {
         let rewound = rewindSpeculativePromptCache([attention, recurrent], numTokens: 1)
         #expect(rewound == 1)
         #expect(attention.offset == 2)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+
+        let restored = recurrent.state
+        #expect(restored.count == 2)
+        eval(restored[0], restored[1])
+        #expect(allClose(restored[0], checkpointConv, rtol: 0, atol: 0).item(Bool.self))
+        #expect(allClose(restored[1], checkpointState, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    @Test
+    func testQwen35HybridCacheRewindRestoresCommittedBonusBoundaryForTwoDrafts() {
+        let attention = KVCacheSimple()
+        let keys = MLXArray.zeros([1, 1, 5, 2])
+        _ = attention.update(keys: keys, values: keys)
+
+        let recurrent = MambaCache()
+        let checkpointConv = MLXArray.ones([1, 1, 4])
+        let checkpointState = MLXArray.ones([1, 2, 2, 2])
+        recurrent.saveSpeculativeCheckpoint(
+            convState: checkpointConv, recurrentState: checkpointState, advancedBy: 2)
+        recurrent[0] = MLXArray.zeros([1, 1, 4])
+        recurrent[1] = MLXArray.zeros([1, 2, 2, 2])
+
+        let rewound = rewindSpeculativePromptCache([attention, recurrent], numTokens: 2)
+        #expect(rewound == 2)
+        #expect(attention.offset == 3)
         #expect(!recurrent.hasSpeculativeCheckpoint)
 
         let restored = recurrent.state

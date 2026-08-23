@@ -111,8 +111,8 @@ public struct Qwen35ExactMTPArtifactLock: Equatable, Sendable {
         targetQuantization: Qwen35ExactMTPQuantization,
         drafterQuantization: Qwen35ExactMTPQuantization,
         drafterTensors: [Qwen35ExactMTPTensorDescriptor],
-        runtimeBlockSize: Int = 2,
-        maximumAcceptedDraftTokens: Int = 1
+        runtimeBlockSize: Int = 3,
+        maximumAcceptedDraftTokens: Int = 2
     ) {
         self.sourceRevision = sourceRevision
         self.target = target
@@ -432,10 +432,10 @@ package enum Qwen35ExactMTPAdmission {
             throw Qwen35ExactMTPAdmissionError.unsupportedMTPDepth(
                 role: .drafter, actual: drafterConfig.textConfig.mtpNumHiddenLayers)
         }
-        guard lock.runtimeBlockSize == 2, lock.maximumAcceptedDraftTokens == 1 else {
+        guard lock.runtimeBlockSize == 3, lock.maximumAcceptedDraftTokens == 2 else {
             throw Qwen35ExactMTPAdmissionError.unsupportedBlockSize(lock.runtimeBlockSize)
         }
-        guard let blockSize = drafterConfig.blockSize, blockSize >= 2 else {
+        guard let blockSize = drafterConfig.blockSize, blockSize == lock.runtimeBlockSize else {
             throw Qwen35ExactMTPAdmissionError.unsupportedBlockSize(
                 drafterConfig.blockSize ?? 0)
         }

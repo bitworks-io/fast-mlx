@@ -35,8 +35,8 @@ final class QwenMTPArtifactPreflightTests: XCTestCase {
 
         XCTAssertEqual(result.targetModelID, "mlx-community/Qwen3.5-9B-MLX-4bit")
         XCTAssertEqual(result.drafterModelID, "mlx-community/Qwen3.5-9B-MTP-5bit")
-        XCTAssertEqual(result.runtimeBlockSize, 2)
-        XCTAssertEqual(result.maximumAcceptedDraftTokens, 1)
+        XCTAssertEqual(result.runtimeBlockSize, 3)
+        XCTAssertEqual(result.maximumAcceptedDraftTokens, 2)
     }
 
     func testExactLockedPairPassesForDepthOne() throws {
@@ -49,9 +49,26 @@ final class QwenMTPArtifactPreflightTests: XCTestCase {
 
         XCTAssertEqual(result.targetModelID, fixture.target.identity.modelID)
         XCTAssertEqual(result.drafterModelID, fixture.drafter.identity.modelID)
-        XCTAssertEqual(result.runtimeBlockSize, 2)
-        XCTAssertEqual(result.maximumAcceptedDraftTokens, 1)
+        XCTAssertEqual(result.runtimeBlockSize, 3)
+        XCTAssertEqual(result.maximumAcceptedDraftTokens, 2)
         XCTAssertEqual(result.architecture, fixture.architecture)
+    }
+
+    func testExactLockedPairRejectsUnsupportedBlockSizes() throws {
+        let fixture = Fixture()
+
+        for blockSize in [2, 4] {
+            let config = Fixture.drafterConfig(blockSize: blockSize)
+            let identity = fixture.drafter.identity.withConfigSHA256(sha256Hex(config))
+            XCTAssertThrowsError(try QwenMTPArtifactPreflight.validate(
+                lock: fixture.lock.withDrafterIdentity(identity),
+                target: fixture.target,
+                drafter: fixture.drafter.withIdentity(identity).withConfig(config)
+            )) { error in
+                XCTAssertEqual(error as? QwenMTPArtifactPreflightError,
+                    .unsupportedBlockSize(blockSize))
+            }
+        }
     }
 
     func testIdentityAndConfigDigestsFailClosed() throws {
@@ -336,13 +353,14 @@ private struct Fixture {
     }
 
     static func drafterConfig(
+        blockSize: Int = 3,
         modelType: String = "qwen3_5_mtp",
         hiddenSize: Int = 4096,
         mtpLayers: Int = 1,
         bits: Int = 5
     ) -> Data {
         Data("""
-        {"block_size":3,"model_type":"\(modelType)","quantization":{"bits":\(bits),"group_size":64,"mode":"affine"},"text_config":\(textConfig(hiddenSize: hiddenSize, mtpLayers: mtpLayers))}
+        {"block_size":\(blockSize),"model_type":"\(modelType)","quantization":{"bits":\(bits),"group_size":64,"mode":"affine"},"text_config":\(textConfig(hiddenSize: hiddenSize, mtpLayers: mtpLayers))}
         """.utf8)
     }
 

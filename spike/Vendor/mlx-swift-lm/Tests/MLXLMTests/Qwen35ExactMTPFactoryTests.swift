@@ -28,8 +28,8 @@ func testQwen35ExactMTPKnownArtifactRuntimeMetadata() {
 
     #expect(lock.target.modelID == "mlx-community/Qwen3.5-9B-MLX-4bit")
     #expect(lock.drafter.modelID == "mlx-community/Qwen3.5-9B-MTP-5bit")
-    #expect(lock.runtimeBlockSize == 2)
-    #expect(lock.maximumAcceptedDraftTokens == 1)
+    #expect(lock.runtimeBlockSize == 3)
+    #expect(lock.maximumAcceptedDraftTokens == 2)
     #expect(lock.architecture.mtpDepth == 1)
 }
 
@@ -72,8 +72,8 @@ func testQwen35ExactMTPResolvedAdmissionPassesForSyntheticDepthOnePair() throws 
 
     let evidence = try fixture.admit()
 
-    #expect(evidence.binding.runtimeBlockSize == 2)
-    #expect(evidence.binding.maximumAcceptedDraftTokens == 1)
+    #expect(evidence.binding.runtimeBlockSize == 3)
+    #expect(evidence.binding.maximumAcceptedDraftTokens == 2)
     #expect(evidence.target.tensors == ExactMTPFixture.targetTensors)
     #expect(evidence.drafter.tensors == ExactMTPFixture.drafterTensors)
 }
@@ -186,6 +186,16 @@ func testQwen35ExactMTPInternalValidationRejectsSemanticMutations() throws {
             drafter: fixture.drafterCandidate.withConfig(config))
     }
 
+    for blockSize in [2, 4] {
+        try expectValidationError(.unsupportedBlockSize(blockSize)) {
+            let config = ExactMTPFixture.drafterConfig(blockSize: blockSize)
+            _ = try Qwen35ExactMTPAdmission.validate(
+                lock: fixture.lock.withDrafterConfig(config),
+                target: fixture.targetCandidate,
+                drafter: fixture.drafterCandidate.withConfig(config))
+        }
+    }
+
     try expectValidationError(
         .architectureMismatch(role: .drafter, field: "hidden_size")
     ) {
@@ -249,7 +259,8 @@ func testQwen35ExactMTPAuthorizationCallbackRunsBeforeConstructionAndCanRefuse()
             tokenizerLoader: UnusedTokenizerLoader()
         ) { evidence in
             await callbackProbe.markRan()
-            #expect(evidence.binding.runtimeBlockSize == 2)
+            #expect(evidence.binding.runtimeBlockSize == 3)
+            #expect(evidence.binding.maximumAcceptedDraftTokens == 2)
             throw Refusal()
         }
         Issue.record("expected callback refusal")
@@ -399,7 +410,9 @@ private struct ExactMTPFixture {
                 mtpDepth: 1),
             targetQuantization: .init(bits: 4, groupSize: 64, mode: "affine"),
             drafterQuantization: .init(bits: 5, groupSize: 64, mode: "affine"),
-            drafterTensors: Self.drafterTensors)
+            drafterTensors: Self.drafterTensors,
+            runtimeBlockSize: 3,
+            maximumAcceptedDraftTokens: 2)
 
         try writeConfig(role: .target, data: targetConfig)
         try writeConfig(role: .drafter, data: drafterConfig)
@@ -475,13 +488,14 @@ private struct ExactMTPFixture {
     }
 
     static func drafterConfig(
+        blockSize: Int = 3,
         modelType: String = "qwen3_5_mtp",
         hiddenSize: Int = 4096,
         mtpLayers: Int = 1,
         bits: Int = 5
     ) -> Data {
         Data("""
-        {"block_size":3,"model_type":"\(modelType)","quantization":{"bits":\(bits),"group_size":64,"mode":"affine"},"text_config":\(textConfig(hiddenSize: hiddenSize, mtpLayers: mtpLayers))}
+        {"block_size":\(blockSize),"model_type":"\(modelType)","quantization":{"bits":\(bits),"group_size":64,"mode":"affine"},"text_config":\(textConfig(hiddenSize: hiddenSize, mtpLayers: mtpLayers))}
         """.utf8)
     }
 
@@ -532,7 +546,9 @@ private extension Qwen35ExactMTPArtifactLock {
             architecture: architecture,
             targetQuantization: targetQuantization,
             drafterQuantization: drafterQuantization,
-            drafterTensors: drafterTensors)
+            drafterTensors: drafterTensors,
+            runtimeBlockSize: runtimeBlockSize,
+            maximumAcceptedDraftTokens: maximumAcceptedDraftTokens)
     }
 
     func withDrafterTensorManifest(_ tensors: [Qwen35ExactMTPTensorDescriptor]) -> Self {
@@ -548,7 +564,9 @@ private extension Qwen35ExactMTPArtifactLock {
             architecture: architecture,
             targetQuantization: targetQuantization,
             drafterQuantization: drafterQuantization,
-            drafterTensors: drafterTensors)
+            drafterTensors: drafterTensors,
+            runtimeBlockSize: runtimeBlockSize,
+            maximumAcceptedDraftTokens: maximumAcceptedDraftTokens)
     }
 }
 

@@ -212,7 +212,7 @@ public struct QwenMTPArtifactBinding: Equatable, Sendable {
     public let drafterRevision: String
     public let sourceRevision: String
     public let architecture: QwenMTPArchitecture
-    /// One committed input plus one drafted token. Depth-k remains closed.
+    /// One committed input plus two drafted tokens for the exact block_size=3 row.
     public let runtimeBlockSize: Int
     public let maximumAcceptedDraftTokens: Int
 }
@@ -293,7 +293,7 @@ public enum QwenMTPArtifactPreflight {
         guard drafterDepth == 1 else {
             throw QwenMTPArtifactPreflightError.unsupportedMTPDepth(drafterDepth)
         }
-        guard let declaredBlockSize = drafterConfig.blockSize, declaredBlockSize >= 2 else {
+        guard let declaredBlockSize = drafterConfig.blockSize, declaredBlockSize == 3 else {
             throw QwenMTPArtifactPreflightError.unsupportedBlockSize(drafterConfig.blockSize ?? 0)
         }
 
@@ -354,8 +354,8 @@ public enum QwenMTPArtifactPreflight {
             drafterRevision: drafter.identity.revision,
             sourceRevision: lock.sourceRevision,
             architecture: lock.architecture,
-            runtimeBlockSize: 2,
-            maximumAcceptedDraftTokens: 1)
+            runtimeBlockSize: 3,
+            maximumAcceptedDraftTokens: 2)
     }
 
     /// Architecture-independent digest of the ordered tensor name/dtype/shape contract.

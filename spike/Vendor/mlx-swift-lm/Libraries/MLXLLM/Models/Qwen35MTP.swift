@@ -67,7 +67,7 @@ final class Qwen35MTPPredictor: Module {
 
 package final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: Qwen35TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    public let maximumBlockSize: Int? = 3
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
@@ -165,10 +165,42 @@ package final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
         let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
 
         if let seed = state.seedToken {
+            guard let seedHidden = state.seedHidden else {
+                preconditionFailure("Qwen MTP seed token requires its predictor hidden state")
+            }
             state.seedToken = nil
             state.seedHidden = nil
-            state.proposalAppended = 0
-            return seed
+
+            // Prompt priming and each commit already ran the predictor once
+            // over the last committed target token, so `seed` is the first
+            // draft without another cache append. For k > 1, continue the
+            // same autoregressive predictor walk from that seed/hidden pair.
+            let remainingDrafts = blockSize - 2
+            guard remainingDrafts > 0 else {
+                state.proposalAppended = 0
+                return seed
+            }
+
+            state.proposalAppended = remainingDrafts
+            let tail = draftMTPTokenBlock(
+                targetEmbedTokens: targetEmbedTokens,
+                lmHead: lmHead,
+                inputEmbedding: inputEmbedding,
+                lastToken: seed,
+                lastHidden: seedHidden,
+                queryOffset: state.nextPosition,
+                blockSize: blockSize - 1,
+                sampler: sampler,
+                cache: state.cache
+            ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+                mtp(
+                    inputsEmbeds: inputsEmbeds,
+                    hiddenStates: hiddenStates,
+                    cache: cache,
+                    positionOffset: positionOffset)
+            }
+            state.nextPosition += remainingDrafts
+            return concatenated([seed, tail], axis: 1)
         }
 
         state.proposalAppended = blockSize - 1

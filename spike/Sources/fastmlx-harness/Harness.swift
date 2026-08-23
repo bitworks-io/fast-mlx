@@ -1964,6 +1964,13 @@ struct Harness {
         case "compressed-attention-probe":
             await runCompressedAttentionProbe(
                 Array(arguments.dropFirst(2)))
+        case "qwen-mtp-corpus":
+            do {
+                try await runQwenMTPCorpus(flags)
+            } catch {
+                print("qwen-mtp-corpus FAILED: \(error)")
+                exit(1)
+            }
         case "exact-prefix-proof":
             do {
                 try await runExactPrefixProof(
@@ -2092,6 +2099,8 @@ struct Harness {
                  --memory-limit-bytes <N> --cache-limit-bytes <N> --wired-limit-bytes <N>
                  [--qualification-evidence false] [layout-specific flags]
                                                strict synthetic capture; never dial promotion
+          qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+                 [--profile true|false]       exact Qwen3.5 9B scalar-vs-native-MTP corpus gate
           exact-prefix-proof                  fresh loaded exact request-start proof
                  --model <PATH> --model-id <ID> --source-revision <CHECKPOINT-SHA256>
                  --expected-harness-git-sha <SHA>

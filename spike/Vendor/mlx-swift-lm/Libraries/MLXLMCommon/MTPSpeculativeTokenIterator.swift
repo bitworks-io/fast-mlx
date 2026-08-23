@@ -463,7 +463,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: mainCache, state: verifyState)
         let mainLogits = mainResult.logits
-        mainState = mainResult.state
+        var finalizedMainState = mainResult.state
 
         eval(flatDraftTokens)
         let draftTokensList = flatDraftTokens.asArray(Int.self)
@@ -501,7 +501,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         proposedCount += numDraft
         acceptedCount += accepted
-        lastRoundAccepted = accepted
+        var nextHiddenIndex = accepted
         telemetry.recordRound(
             drafted: numDraft,
             accepted: accepted,
@@ -525,22 +525,37 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         let rejected = numDraft - accepted
-        let trimmed: Int
         if nativeHybridRewind {
-            trimmed =
-                rejected > 0
-                ? rewindSpeculativePromptCache(mainCache, numTokens: rejected)
-                : 0
-            precondition(
-                trimmed == rejected,
-                "Target advertised native speculative rewind, but cache rewind failed")
+            if rejected > 0 {
+                let rewound = rewindSpeculativePromptCache(mainCache, numTokens: numDraft)
+                precondition(
+                    rewound == numDraft,
+                    "Target advertised native speculative rewind, but cache rewind failed")
+                if accepted > 0 {
+                    let acceptedPrefix = draftTokensList.prefix(accepted)
+                    let replayedState = replayAcceptedPrefixAfterHybridRewind(
+                        acceptedPrefix,
+                        baseState: mainResult.state ?? state,
+                        emitDrafterState: true)
+                    precondition(
+                        replayedState != nil,
+                        "Hybrid speculative rewind cannot replay accepted prefix exactly")
+                    finalizedMainState = replayedState
+                    nextHiddenIndex = accepted - 1
+                } else {
+                    trimSharedKVState(&finalizedMainState, numTokens: numDraft)
+                    nextHiddenIndex = 0
+                }
+            }
         } else {
             precondition(
                 !mainCache.contains(where: { $0 is MambaCache }),
                 "Hybrid speculative cache must never use generic KV trimming")
-            trimmed = trimPromptCache(mainCache, numTokens: rejected)
+            let trimmed = trimPromptCache(mainCache, numTokens: rejected)
+            trimSharedKVState(&finalizedMainState, numTokens: trimmed)
         }
-        trimSharedKVState(&mainState, numTokens: trimmed)
+        mainState = finalizedMainState
+        lastRoundAccepted = nextHiddenIndex
 
         // Dynamic cache quantization may convert `.regular` K/V to `.quantized`,
         // at which point the target's emit-hook returns sharedKV: nil and the
@@ -593,6 +608,37 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         quantizeKVCache(&mainCache)
         lastReturnedTokenNeedsFinalCommit = true
         return tokenInt
+    }
+
+    private mutating func replayAcceptedPrefixAfterHybridRewind(
+        _ tokenValues: ArraySlice<Int>,
+        baseState: LMOutput.State,
+        emitDrafterState: Bool
+    ) -> LMOutput.State? {
+        guard !tokenValues.isEmpty else { return baseState }
+        guard checkpointSpeculativePromptCacheBeforeAppend(
+            mainCache, tokenCount: tokenValues.count
+        ) else {
+            return nil
+        }
+
+        var replayTokens = [Int32]()
+        replayTokens.reserveCapacity(tokenValues.count)
+        for token in tokenValues {
+            guard let exact = Int32(exactly: token) else { return nil }
+            replayTokens.append(exact)
+        }
+
+        var replayState = baseState
+        replayState[mtpEmitFlagKey] = emitDrafterState
+        replayState[mtpCacheCheckpointIndexKey] = nil
+        let replayInput = LMInput.Text(tokens: MLXArray(replayTokens))
+        let replayResult = mainModel(
+            replayInput[text: .newAxis], cache: mainCache, state: replayState)
+        if emitDrafterState, replayResult.state == nil {
+            return nil
+        }
+        return replayResult.state ?? baseState
     }
 
     public mutating func next() -> Int? {
@@ -669,22 +715,32 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 }
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    mutating func finalizeGeneration() {
+    public mutating func finalizeGeneration() {
         defer { discardSpeculativePromptCacheCheckpoints(mainCache) }
         let emitted = Swift.min(
             emittedCommittedPendingTokenCount, committedPendingTokenCount)
         let lookahead = committedPendingTokenCount - emitted
         if lookahead > 0 {
-            let rewound: Int
             if mainCache.contains(where: { $0 is MambaCache }) {
-                rewound = rewindSpeculativePromptCache(mainCache, numTokens: lookahead)
+                let rewound = rewindSpeculativePromptCache(
+                    mainCache, numTokens: committedPendingTokenCount)
                 precondition(
-                    rewound == lookahead,
+                    rewound == committedPendingTokenCount,
                     "Hybrid speculative finalization requires an exact recurrent checkpoint")
+                if emitted > 0 {
+                    let replayedState = replayAcceptedPrefixAfterHybridRewind(
+                        pendingTokens.prefix(emitted),
+                        baseState: mainState ?? LMOutput.State(),
+                        emitDrafterState: false)
+                    precondition(
+                        replayedState != nil,
+                        "Hybrid speculative finalization cannot replay retained prefix exactly")
+                    mainState = replayedState
+                }
             } else {
-                rewound = trimPromptCache(mainCache, numTokens: lookahead)
+                let rewound = trimPromptCache(mainCache, numTokens: lookahead)
+                trimSharedKVState(&mainState, numTokens: rewound)
             }
-            trimSharedKVState(&mainState, numTokens: rewound)
         }
 
         guard lastReturnedTokenNeedsFinalCommit else { return }

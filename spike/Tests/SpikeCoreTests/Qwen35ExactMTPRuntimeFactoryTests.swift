@@ -36,7 +36,7 @@ final class Qwen35ExactMTPRuntimeFactoryTests: XCTestCase {
         }
     }
 
-    func testExactDepthOneGreedyTokenAndFinalizedCacheParityWhenConfigured() async throws {
+    func testExactDepthOneArtifactTwoDraftGreedyParityWhenConfigured() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["FAST_MLX_QWEN35_RUN_LIVE_EXACTNESS"] == "1" else {
             throw XCTSkip("live exactness requires FAST_MLX_QWEN35_RUN_LIVE_EXACTNESS=1")
@@ -52,6 +52,8 @@ final class Qwen35ExactMTPRuntimeFactoryTests: XCTestCase {
                 target: URL(fileURLWithPath: targetPath, isDirectory: true),
                 drafter: URL(fileURLWithPath: drafterPath, isDirectory: true)),
             using: #huggingFaceTokenizerLoader())
+        XCTAssertEqual(pair.binding.runtimeBlockSize, 3)
+        XCTAssertEqual(pair.binding.maximumAcceptedDraftTokens, 2)
         let promptTokens = pair.target.tokenizer.encode(
             text: "Continue the exact sequence with one concise answer: 2, 3, 5, 7, 11,")
         let input = LMInput(tokens: MLXArray(promptTokens))
@@ -82,8 +84,8 @@ final class Qwen35ExactMTPRuntimeFactoryTests: XCTestCase {
                 tokenIds: mtp.tokens, skipSpecialTokens: false).utf8),
             Data(pair.target.tokenizer.decode(
                 tokenIds: scalar.tokens, skipSpecialTokens: false).utf8))
-        XCTAssertEqual(mtp.info?.proposedDraftTokens, 7)
-        XCTAssertEqual(mtp.info?.acceptedDraftTokens, mtp.info?.proposedDraftTokens)
+        XCTAssertEqual(mtp.info?.proposedDraftTokens, 10)
+        XCTAssertEqual(mtp.info?.acceptedDraftTokens, 9)
         XCTAssertNil(mtp.info?.passthroughReason)
         try assertCacheEquivalent(scalarCache, mtpCache)
 

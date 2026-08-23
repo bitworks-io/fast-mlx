@@ -65,3 +65,11 @@ func testMTPGenerateUsesBlockSizeDefaultOfFour() {
     // Existence as a compile-time check.
     _ = _callableWithoutBlockSize
 }
+
+@Test
+func testMTPIteratorFinalizeGenerationIsPublicSurface() {
+    func _callable(iterator: inout MTPSpeculativeTokenIterator) {
+        iterator.finalizeGeneration()
+    }
+    _ = _callable
+}

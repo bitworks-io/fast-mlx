@@ -174,8 +174,17 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         let logits = makeLogits(positions: positions)
 
         // Update the mock cache to reflect that `positions` tokens were seen.
-        if let cache, let first = cache.first as? CountingKVCache {
-            first.offset += positions
+        if let cache {
+            for entry in cache {
+                if let counting = entry as? CountingKVCache {
+                    counting.offset += positions
+                } else if let recurrent = entry as? MambaCache {
+                    updateMockMambaCache(
+                        recurrent,
+                        positions: positions,
+                        checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                }
+            }
         }
 
         if !omitDrafterState, state?[mtpEmitFlagKey] ?? false {
@@ -222,6 +231,33 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         perPositionIndex += positions
         return MLXArray(data, [1, positions, vocab])
     }
+
+    private func updateMockMambaCache(
+        _ cache: MambaCache,
+        positions: Int,
+        checkpointAfter: Int?
+    ) {
+        let currentState = cache.state
+        if let first = currentState.first, first.size == 1 {
+            eval(first)
+        }
+        let start = currentState.first.flatMap { first in
+            first.size == 1 ? first.item(Int.self) : nil
+        } ?? 0
+        if let split = checkpointAfter, split > 0, split < positions {
+            cache.saveSpeculativeCheckpoint(
+                convState: mockMambaStateValue(start + split),
+                recurrentState: mockMambaStateValue(start + split),
+                advancedBy: split)
+        }
+        cache.advance(positions)
+        cache[0] = mockMambaStateValue(start + positions)
+        cache[1] = mockMambaStateValue(start + positions)
+    }
+}
+
+private func mockMambaStateValue(_ value: Int) -> MLXArray {
+    MLXArray([Int32(value)])
 }
 
 @Test
@@ -653,6 +689,128 @@ func testRecurrentCacheNeverFallsBackToGenericTrimWithoutNativeRewind() throws {
     #expect(
         iterator.passthroughReason
             == "hybrid cache no longer supports native speculative rewind")
+}
+
+@Test
+func testMTPHybridK2ZeroAcceptanceRestoresCommittedBonusBoundary() throws {
+    try assertMTPHybridK2AcceptanceLeavesScalarEquivalentCache(
+        verifyTokens: [7, 8, 9],
+        expectedAccepted: 0,
+        expectedOffsetAfterRound: 4,
+        expectedEmitted: [5, 7])
+}
+
+@Test
+func testMTPHybridK2PartialAcceptanceReplaysAcceptedPrefix() throws {
+    try assertMTPHybridK2AcceptanceLeavesScalarEquivalentCache(
+        verifyTokens: [5, 7, 9],
+        expectedAccepted: 1,
+        expectedOffsetAfterRound: 5,
+        expectedEmitted: [5, 5, 7])
+}
+
+@Test
+func testMTPHybridK2FullAcceptanceKeepsVerifiedPrefix() throws {
+    try assertMTPHybridK2AcceptanceLeavesScalarEquivalentCache(
+        verifyTokens: [5, 5, 9],
+        expectedAccepted: 2,
+        expectedOffsetAfterRound: 6,
+        expectedEmitted: [5, 5, 5, 9])
+}
+
+@Test
+func testMTPHybridK2FinalizationRewindsUnemittedAcceptedLookahead() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 5, 5, 9, 0])
+    main.maximumNativeTargetCacheRewind = 2
+    let drafter = MockDrafter(draftedTokenValue: 5)
+    let attention = CountingKVCache()
+    let recurrent = MambaCache()
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [attention, recurrent],
+        parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+        blockSize: 3)
+
+    #expect(iterator.next() == 5, "prepare-time bonus")
+    #expect(iterator.next() == 5, "first accepted draft")
+    #expect(attention.offset == 6)
+    #expect(recurrent.offset == 0)
+
+    iterator.finalizeGeneration()
+
+    #expect(attention.offset == 5)
+    #expect(recurrent.offset == 0)
+    for state in recurrent.state {
+        eval(state)
+        #expect(state.item(Int.self) == 5)
+    }
+}
+
+@Test
+func testMTPHybridK2DiscardedAcceptedStopRestoresCommittedBonusBoundary() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 5, 5, 9, 0])
+    main.maximumNativeTargetCacheRewind = 2
+    let drafter = MockDrafter(draftedTokenValue: 5)
+    let attention = CountingKVCache()
+    let recurrent = MambaCache()
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [attention, recurrent],
+        parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+        blockSize: 3)
+
+    #expect(iterator.next() == 5, "prepare-time bonus")
+    #expect(iterator.next() == 5, "accepted draft returned as a stop candidate")
+    iterator.discardGeneratedToken()
+    iterator.finalizeGeneration()
+
+    #expect(attention.offset == 4)
+    #expect(recurrent.offset == 0)
+    for state in recurrent.state {
+        eval(state)
+        #expect(state.item(Int.self) == 4)
+    }
+}
+
+private func assertMTPHybridK2AcceptanceLeavesScalarEquivalentCache(
+    verifyTokens: [Int32],
+    expectedAccepted: Int,
+    expectedOffsetAfterRound: Int,
+    expectedEmitted: [Int]
+) throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5] + verifyTokens + [0])
+    main.maximumNativeTargetCacheRewind = 2
+    let drafter = MockDrafter(draftedTokenValue: 5)
+    let attention = CountingKVCache()
+    let recurrent = MambaCache()
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [attention, recurrent],
+        parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+        blockSize: 3)
+
+    var emitted: [Int] = []
+    while emitted.count < expectedEmitted.count, let token = iterator.next() {
+        emitted.append(token)
+    }
+
+    #expect(emitted == expectedEmitted)
+    #expect(iterator.proposedCount == 2)
+    #expect(iterator.acceptedCount == expectedAccepted)
+    #expect(attention.offset == expectedOffsetAfterRound)
+    #expect(recurrent.offset == 0)
+    let recurrentState = recurrent.state
+    #expect(recurrentState.count == 2)
+    for state in recurrentState {
+        eval(state)
+        #expect(state.item(Int.self) == expectedOffsetAfterRound)
+    }
 }
 
 // MARK: - Pending buffer drain order
