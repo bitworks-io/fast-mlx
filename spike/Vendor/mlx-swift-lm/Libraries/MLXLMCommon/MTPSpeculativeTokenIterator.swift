@@ -119,6 +119,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     // proposedCount` after the stream drains.
     public private(set) var acceptedCount: Int = 0
     public private(set) var proposedCount: Int = 0
+    private var verifierTokenReadbackCount = 0
 
     // Reason recorded the first time sticky-passthrough engaged, or nil if
     // the iterator stayed speculative for the full stream. Surfaced through
@@ -191,9 +192,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             switchToPassthrough(reason: initialPassthroughReason)
         }
 
-        let prefillStart = Date.timeIntervalSinceReferenceDate
+        let prefillStart = ProcessInfo.processInfo.systemUptime
         try prepare(input: input, windowSize: parameters.prefillStepSize)
-        self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
+        self.promptPrefillTime = ProcessInfo.processInfo.systemUptime - prefillStart
     }
 
     /// Prefill the main model with the prompt and, for stateful drafters, prime
@@ -205,12 +206,26 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         var prefillState = LMOutput.State()
         var committedReprimeToken: MLXArray?
         var committedReprimeHidden: MLXArray?
+        var capturedPromptHidden: MLXArray?
         prefillState[mtpEmitFlagKey] = !passthrough
         // Note: `prepare(_:cache:windowSize:)` does not currently thread
         // state through. To prime drafter state we run an explicit follow-up
         // forward call after prefill (one position, the bonus token).
 
-        switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
+        let prepareResult: PrepareResult
+        if !passthrough, drafter.requiresPromptPrefill,
+            let reuseTarget = mainModel as? any MTPPromptHiddenStatePreparingModel,
+            let preparation = try reuseTarget.prepareForMTP(
+                input, cache: mainCache, windowSize: windowSize)
+        {
+            prepareResult = preparation.result
+            capturedPromptHidden = preparation.targetHidden
+        } else {
+            prepareResult = try mainModel.prepare(
+                input, cache: mainCache, windowSize: windowSize)
+        }
+
+        switch prepareResult {
         case .tokens(let tokens):
             y = tokens
             // Final prompt position not yet evaluated -- run one forward to
@@ -293,7 +308,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         if collectPhaseTelemetry {
-            synchronizeTargetPhaseBoundary(state: mainState)
+            synchronizeTargetPhaseBoundary(
+                state: mainState, capturedPromptHidden: capturedPromptHidden)
             telemetry.recordTargetPrefill(
                 seconds: ProcessInfo.processInfo.systemUptime - targetPrefillStart)
         }
@@ -309,9 +325,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             let normalizedPrompt = LMInput.Text(
                 tokens: normalizedPromptTokens,
                 mask: input.text.mask.map { normalizedMTPTokenBatch($0) })
-            let fullPromptState = mainModel(
-                normalizedPrompt, cache: nil, state: prefillState).state
-            if let baseTargetHidden = fullPromptState?[mtpLastHiddenStatesKey],
+            let reusablePromptHidden = capturedPromptHidden.flatMap { hidden in
+                hidden.ndim == 3
+                    && hidden.dim(0) == normalizedPromptTokens.dim(0)
+                    && hidden.dim(1) == normalizedPromptTokens.dim(1)
+                    ? hidden : nil
+            }
+            let baseTargetHidden = reusablePromptHidden
+                ?? mainModel(normalizedPrompt, cache: nil, state: prefillState)
+                    .state?[mtpLastHiddenStatesKey]
+            if let baseTargetHidden,
                 committedReprimeToken == nil || committedReprimeHidden != nil
             {
                 var promptTokens = normalizedPromptTokens
@@ -353,9 +376,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
-    private func synchronizeTargetPhaseBoundary(state: LMOutput.State?) {
+    private func synchronizeTargetPhaseBoundary(
+        state: LMOutput.State?,
+        capturedPromptHidden: MLXArray? = nil
+    ) {
         guard collectPhaseTelemetry else { return }
         var arrays = mainCache.flatMap { $0.state }
+        if let capturedPromptHidden {
+            arrays.append(capturedPromptHidden)
+        }
         if let hidden = state?[mtpLastHiddenStatesKey] {
             arrays.append(hidden)
         }
@@ -532,38 +561,66 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         var finalizedMainState = mainResult.state
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
-
+        let draftTokensList: [Int]
         var accepted = 0
-        var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
-            var logits = mainLogits[0..., verifyStart + i, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let targetToken = sampler.sample(logits: logits)
-            eval(targetToken)
-            let targetTokenValue = targetToken.item(Int.self)
-            processor?.didSample(token: targetToken)
-            pendingTokens.append(targetTokenValue)
-            guard targetTokenValue == draftTokensList[i] else {
-                finalToken = targetToken
-                break
-            }
-            accepted += 1
-        }
+        let emittedFinalToken: MLXArray
+        if processor == nil, sampler is ArgMaxSampler {
+            // Match the ordinary speculative iterator's processor-free path:
+            // select the complete greedy verification block in one operation
+            // and materialize its target token IDs once. The target forward,
+            // acceptance walk, and cache transaction remain unchanged.
+            let verifyLogits = mainLogits[
+                0..., verifyStart ..< (verifyStart + numDraft + 1), 0...
+            ].squeezed(axis: 0)
+            let targetTokens = sampler.sample(logits: verifyLogits)
+            eval(targetTokens, flatDraftTokens)
+            verifierTokenReadbackCount += 1
+            let targetTokensList = targetTokens.asArray(Int.self)
+            draftTokensList = flatDraftTokens.asArray(Int.self)
 
-        // Only the all-accepted path samples the bonus row. On rejection the
-        // mismatching target sample above is already the emitted correction.
-        if finalToken == nil {
-            var logits = mainLogits[0..., verifyStart + accepted, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let bonus = sampler.sample(logits: logits)
-            eval(bonus)
-            processor?.didSample(token: bonus)
-            pendingTokens.append(bonus.item(Int.self))
-            finalToken = bonus
+            while accepted < numDraft,
+                targetTokensList[accepted] == draftTokensList[accepted]
+            {
+                pendingTokens.append(targetTokensList[accepted])
+                accepted += 1
+            }
+            pendingTokens.append(targetTokensList[accepted])
+            emittedFinalToken = targetTokens[accepted ... accepted]
+        } else {
+            eval(flatDraftTokens)
+            draftTokensList = flatDraftTokens.asArray(Int.self)
+
+            var finalToken: MLXArray?
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let targetToken = sampler.sample(logits: logits)
+                eval(targetToken)
+                verifierTokenReadbackCount += 1
+                let targetTokenValue = targetToken.item(Int.self)
+                processor?.didSample(token: targetToken)
+                pendingTokens.append(targetTokenValue)
+                guard targetTokenValue == draftTokensList[i] else {
+                    finalToken = targetToken
+                    break
+                }
+                accepted += 1
+            }
+
+            // Only the all-accepted path samples the bonus row. On rejection
+            // the mismatching target sample above is the emitted correction.
+            if finalToken == nil {
+                var logits = mainLogits[0..., verifyStart + accepted, 0...]
+                logits = processor?.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                verifierTokenReadbackCount += 1
+                processor?.didSample(token: bonus)
+                pendingTokens.append(bonus.item(Int.self))
+                finalToken = bonus
+            }
+            emittedFinalToken = finalToken!
         }
-        let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
 
         if collectPhaseTelemetry {
@@ -897,6 +954,13 @@ extension MTPSpeculativeTokenIterator {
     /// accumulated didSample log).
     @_spi(Testing) public var _processorForTesting: LogitProcessor? {
         processor
+    }
+
+    /// Number of host materializations used to read target-selected tokens
+    /// from speculative verification blocks. Exposed only to regression tests
+    /// so the greedy batched-readback contract remains observable.
+    @_spi(Testing) public var _verifierTokenReadbackCountForTesting: Int {
+        verifierTokenReadbackCount
     }
 }
 

@@ -277,6 +277,61 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         XCTAssertThrowsError(try QwenMTPCorpusGate.validate(incorrect))
     }
 
+    func testPromptHiddenReuseGateAggregatesMeasuredPrimingOnly() throws {
+        var payload = makePayload()
+        payload.profile = makeProfileEvidence(ratioByCase: [:])
+
+        let verdict = try QwenMTPCorpusGate.validatePromptHiddenReuse(payload)
+
+        XCTAssertTrue(verdict.qualified)
+        XCTAssertEqual(
+            verdict.measuredDrafterPromptPrimingSeconds,
+            Double(QwenMTPCorpusGate.profilePlan.caseIDs.count
+                * QwenMTPCorpusGate.profilePlan.measuredPairs) * 0.002,
+            accuracy: 1e-12)
+        XCTAssertEqual(
+            verdict.baselineDrafterPromptPrimingSeconds,
+            QwenMTPCorpusGate.promptHiddenReusePrimingBaselineSeconds)
+        XCTAssertGreaterThanOrEqual(
+            verdict.reductionSeconds,
+            QwenMTPCorpusGate.promptHiddenReuseRequiredReductionSeconds)
+    }
+
+    func testPromptHiddenReuseThresholdIsFailClosedAtEightySecondReduction() {
+        let maximumMeasured =
+            QwenMTPCorpusGate.promptHiddenReusePrimingBaselineSeconds
+            - QwenMTPCorpusGate.promptHiddenReuseRequiredReductionSeconds
+
+        XCTAssertTrue(
+            QwenMTPCorpusGate.promptHiddenReuseVerdict(
+                measuredPrimingSeconds: maximumMeasured).qualified)
+        XCTAssertFalse(
+            QwenMTPCorpusGate.promptHiddenReuseVerdict(
+                measuredPrimingSeconds: maximumMeasured.nextUp).qualified)
+        XCTAssertFalse(
+            QwenMTPCorpusGate.promptHiddenReuseVerdict(
+                measuredPrimingSeconds: .nan).qualified)
+    }
+
+    func testPromptHiddenReuseRequiresAQualifiedProfile() {
+        XCTAssertThrowsError(
+            try QwenMTPCorpusGate.validatePromptHiddenReuse(makePayload())) { error in
+                XCTAssertEqual(
+                    error as? QwenMTPCorpusGateError,
+                    .promptHiddenReuseProfileRequired)
+            }
+
+        var weak = makePayload()
+        weak.profile = makeProfileEvidence(ratioByCase: [:], defaultRatio: 1.07)
+        XCTAssertThrowsError(
+            try QwenMTPCorpusGate.validatePromptHiddenReuse(weak)) { error in
+                guard case QwenMTPCorpusGateError.unqualifiedPerformance = error else {
+                    XCTFail("expected the frozen profile gate to fail first, got \(error)")
+                    return
+                }
+            }
+    }
+
     func testProfileEvidenceRequiresReleaseOnlyContract() {
         let validProfile = makeProfileEvidence(ratioByCase: [:])
 
@@ -289,6 +344,81 @@ final class QwenMTPCorpusGateTests: XCTestCase {
 
             XCTAssertThrowsError(try QwenMTPCorpusGate.validate(payload))
         }
+    }
+
+    func testGreedyBatchedVerificationGateAggregatesMeasuredVerificationOnly() throws {
+        var payload = makePayload()
+        payload.profile = makeProfileEvidence(ratioByCase: [:])
+
+        let verdict = try QwenMTPCorpusGate.validateGreedyBatchedVerification(payload)
+
+        XCTAssertTrue(verdict.qualified)
+        XCTAssertEqual(
+            verdict.measuredTargetVerificationSeconds,
+            Double(QwenMTPCorpusGate.profilePlan.caseIDs.count
+                * QwenMTPCorpusGate.profilePlan.measuredPairs) * 0.006,
+            accuracy: 1e-12)
+        XCTAssertEqual(
+            verdict.baselineTargetVerificationSeconds,
+            QwenMTPCorpusGate.greedyBatchedVerificationBaselineSeconds)
+        XCTAssertGreaterThanOrEqual(
+            verdict.reductionSeconds,
+            QwenMTPCorpusGate.greedyBatchedVerificationRequiredReductionSeconds)
+    }
+
+    func testGreedyBatchedVerificationThresholdIsFailClosedAtFiveSecondReduction() {
+        let maximumMeasured =
+            QwenMTPCorpusGate.greedyBatchedVerificationBaselineSeconds
+            - QwenMTPCorpusGate.greedyBatchedVerificationRequiredReductionSeconds
+
+        XCTAssertTrue(
+            QwenMTPCorpusGate.greedyBatchedVerificationVerdict(
+                measuredVerificationSeconds: maximumMeasured).qualified)
+        XCTAssertFalse(
+            QwenMTPCorpusGate.greedyBatchedVerificationVerdict(
+                measuredVerificationSeconds: maximumMeasured.nextUp).qualified)
+        XCTAssertFalse(
+            QwenMTPCorpusGate.greedyBatchedVerificationVerdict(
+                measuredVerificationSeconds: .nan).qualified)
+    }
+
+    func testGreedyBatchedVerificationRequiresAQualifiedProfile() {
+        XCTAssertThrowsError(
+            try QwenMTPCorpusGate.validateGreedyBatchedVerification(makePayload())) { error in
+                XCTAssertEqual(
+                    error as? QwenMTPCorpusGateError,
+                    .greedyBatchedVerificationProfileRequired)
+            }
+
+        var weak = makePayload()
+        weak.profile = makeProfileEvidence(ratioByCase: [:], defaultRatio: 1.07)
+        XCTAssertThrowsError(
+            try QwenMTPCorpusGate.validateGreedyBatchedVerification(weak)) { error in
+                guard case QwenMTPCorpusGateError.unqualifiedPerformance = error else {
+                    XCTFail("expected the frozen profile gate to fail first, got \(error)")
+                    return
+                }
+            }
+
+        let maximumMeasured =
+            QwenMTPCorpusGate.greedyBatchedVerificationBaselineSeconds
+            - QwenMTPCorpusGate.greedyBatchedVerificationRequiredReductionSeconds
+        var insufficient = makePayload()
+        insufficient.profile = makeProfileEvidence(
+            ratioByCase: [:],
+            targetVerificationSeconds: maximumMeasured
+                / Double(QwenMTPCorpusGate.profilePlan.caseIDs.count
+                    * QwenMTPCorpusGate.profilePlan.measuredPairs)
+                + 0.001)
+        XCTAssertThrowsError(
+            try QwenMTPCorpusGate.validateGreedyBatchedVerification(insufficient)) { error in
+                guard case QwenMTPCorpusGateError
+                    .insufficientGreedyBatchedVerificationReduction = error
+                else {
+                    XCTFail("expected the frozen verifier reduction gate, got \(error)")
+                    return
+                }
+            }
     }
 
     func testCanonicalCorrectnessFailurePayloadDropsProfileBeforeProfiling() {
@@ -384,6 +514,17 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             payload: makePayload())
         let valid = try (record.jsonLine() + "\n").data(using: .utf8).unwrap()
         XCTAssertNoThrow(try QwenMTPCorpusGate.validateJSONL(valid))
+
+        let rejectedRecord = ResultRecord(
+            subcommand: "qwen-mtp-corpus-rejected",
+            provenance: makeProvenance(),
+            payload: makePayload())
+        let rejected = try (rejectedRecord.jsonLine() + "\n").data(using: .utf8).unwrap()
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(rejected)) { error in
+            XCTAssertEqual(
+                error as? QwenMTPCorpusGateError,
+                .wrongSubcommand("qwen-mtp-corpus-rejected"))
+        }
 
         XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(Data("{bad json}\n".utf8)))
 
@@ -504,7 +645,8 @@ final class QwenMTPCorpusGateTests: XCTestCase {
     private func makeProfileEvidence(
         ratioByCase: [String: Double],
         defaultRatio: Double = 1.12,
-        measuredRatioByPair: [Int: Double] = [:]
+        measuredRatioByPair: [Int: Double] = [:],
+        targetVerificationSeconds: Double = 0.006
     ) -> QwenMTPCorpusProfileEvidence {
         var samples: [QwenMTPCorpusProfileSample] = []
         for caseID in QwenMTPCorpusGate.profilePlan.caseIDs {
@@ -514,6 +656,10 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                 let ratio = isWarmup
                     ? defaultRatio
                     : measuredRatioByPair[measuredPairIndex, default: ratioByCase[caseID, default: defaultRatio]]
+                let mtpGenerationSeconds = max(
+                    1.0 / ratio,
+                    targetVerificationSeconds + 0.007)
+                let scalarGenerationSeconds = mtpGenerationSeconds * ratio
                 samples.append(.init(
                     caseID: caseID,
                     pairIndex: pairIndex,
@@ -531,10 +677,18 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                         scalarCacheFingerprint: cacheFingerprint("profile-cache-\(caseID)-\(pairIndex)"),
                         mtpCacheFingerprint: cacheFingerprint("profile-cache-\(caseID)-\(pairIndex)"),
                         firstCacheMismatch: nil),
-                    scalarTiming: .init(promptSeconds: 0.01, generationSeconds: 1.0, wallSeconds: 1.1, e2eSeconds: 1.0),
-                    mtpTiming: .init(promptSeconds: 0.01, generationSeconds: 1.0 / ratio, wallSeconds: 1.1 / ratio, e2eSeconds: 1.0 / ratio),
-                    scalarTokensPerSecond: 128,
-                    mtpTokensPerSecond: 128 * ratio,
+                    scalarTiming: .init(
+                        promptSeconds: 0.01,
+                        generationSeconds: scalarGenerationSeconds,
+                        wallSeconds: scalarGenerationSeconds,
+                        e2eSeconds: scalarGenerationSeconds),
+                    mtpTiming: .init(
+                        promptSeconds: 0.01,
+                        generationSeconds: mtpGenerationSeconds,
+                        wallSeconds: mtpGenerationSeconds,
+                        e2eSeconds: mtpGenerationSeconds),
+                    scalarTokensPerSecond: 128 / scalarGenerationSeconds,
+                    mtpTokensPerSecond: 128 / mtpGenerationSeconds,
                     decodeOnlyRatio: ratio,
                     e2eRatio: ratio,
                     mtpTelemetry: .init(
@@ -547,6 +701,7 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                         targetVerifiedTokenCount: 15,
                         emittedTokenCount: 128),
                     mtpPhaseAttribution: phaseAttribution(
+                        targetVerificationSeconds: targetVerificationSeconds,
                         draftBlockCount: 5,
                         targetVerificationCount: 5),
                     passthroughReason: nil))

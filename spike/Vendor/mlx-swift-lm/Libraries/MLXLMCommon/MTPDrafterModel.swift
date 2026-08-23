@@ -105,6 +105,38 @@ public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
 }
 
+/// Result of an optional target prefill that retains the complete hidden
+/// representation required to prime a native MTP drafter.
+///
+/// `targetHidden` must cover the original prompt in token order with shape
+/// `[batch, promptLength, hiddenSize]`. It is deliberately carried outside
+/// `LMOutput.State` so the full-prompt tensor does not remain resident through
+/// the later autoregressive decode state.
+public struct MTPPromptPreparation {
+    public let result: PrepareResult
+    public let targetHidden: MLXArray
+
+    public init(result: PrepareResult, targetHidden: MLXArray) {
+        self.result = result
+        self.targetHidden = targetHidden
+    }
+}
+
+/// Optional target capability that captures full prompt hidden state during
+/// the target's ordinary prefill instead of requiring a second full replay.
+///
+/// Returning `nil` declines reuse and makes the iterator use its existing
+/// correctness-first replay path. Conformance is intentionally narrow: only
+/// targets that can preserve their normal cache/chunking semantics while
+/// emitting the exact MTP-trained representation should implement it.
+public protocol MTPPromptHiddenStatePreparingModel: LanguageModel {
+    func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> MTPPromptPreparation?
+}
+
 /// Per-stream state for MTP drafters that need their own transient storage.
 ///
 /// The state is intentionally separate from ``LMOutput/State``: `LMOutput`

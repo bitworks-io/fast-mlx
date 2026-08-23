@@ -57,6 +57,8 @@ private final class MockStatefulGreedyDrafter: Module, StatefulMTPDrafterModel {
 
     private(set) var prepareCallCount = 0
     private(set) var draftCallCount = 0
+    private(set) var preparedPromptShape: [Int]?
+    private(set) var preparedHiddenShape: [Int]?
 
     func supportsSpeculation(for _: LMInput) -> Bool { supportsInput }
 
@@ -66,14 +68,16 @@ private final class MockStatefulGreedyDrafter: Module, StatefulMTPDrafterModel {
 
     func prepareDrafterState(
         target _: any LanguageModel,
-        promptTokens _: MLXArray,
-        targetHidden _: MLXArray,
+        promptTokens: MLXArray,
+        targetHidden: MLXArray,
         firstBonus _: MLXArray,
         positionDeltas _: MLXArray?,
         state _: inout MTPDrafterState,
         sampler _: any LogitSampler
     ) {
         prepareCallCount += 1
+        preparedPromptShape = promptTokens.shape
+        preparedHiddenShape = targetHidden.shape
     }
 
     func draftBlock(
@@ -111,7 +115,7 @@ private final class MockStatefulGreedyDrafter: Module, StatefulMTPDrafterModel {
 /// Minimal `LanguageModel` mock that emits MTP state on every call when
 /// `mtpEmitFlagKey` is true. Returns shaped logits and a trimmable KV cache.
 private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider,
-    SpeculativeCacheRewindModel
+    SpeculativeCacheRewindModel, MTPPromptHiddenStatePreparingModel
 {
     var kvHeads: [Int] { [1] }
     var maximumNativeTargetCacheRewind = 0
@@ -125,6 +129,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     /// Exercise the VLM-style prepare path that evaluates the prompt and
     /// returns logits plus continuation state.
     var returnLogitsFromPrepare: Bool = false
+    var capturesPromptHiddenDuringPrepare = false
 
     private(set) var callCount: Int = 0
     private(set) var lastIncomingEmitFlag: Bool? = nil
@@ -153,6 +158,20 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         // Return `.tokens(...)`; the iterator's `prepare` will follow up with
         // a one-position forward call that primes drafter state.
         return .tokens(input.text)
+    }
+
+    func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize _: Int?
+    ) throws -> MTPPromptPreparation? {
+        guard capturesPromptHiddenDuringPrepare else { return nil }
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+        let normalized = LMInput.Text(tokens: normalizedMTPTokenBatch(input.text.tokens))
+        let output = callAsFunction(normalized, cache: cache, state: state)
+        guard let hidden = output.state?[mtpLastHiddenStatesKey] else { return nil }
+        return MTPPromptPreparation(result: .logits(output), targetHidden: hidden)
     }
 
     /// Returns deterministic one-hot logits at each position so a `softmax/
@@ -261,18 +280,27 @@ private func mockMambaStateValue(_ value: Int) -> MLXArray {
 }
 
 @Test
-func testMTPPromptPrimingNormalizesOneDimensionalTokensToBatch() throws {
+func testMTPPromptPrimingReusesNormalizedFullPromptHidden() throws {
     let main = MockMainModel(nextLogitTokens: [0, 0, 5, 0, 0, 0])
+    main.capturesPromptHiddenDuringPrepare = true
     let drafter = MockStatefulGreedyDrafter()
 
-    _ = try MTPSpeculativeTokenIterator(
+    let iterator = try MTPSpeculativeTokenIterator(
         input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
         mainModel: main,
         drafter: drafter,
         parameters: GenerateParameters(maxTokens: 1, temperature: 0),
-        blockSize: 2)
+        blockSize: 2,
+        collectPhaseTelemetry: true)
 
-    #expect(main.receivedTokenShapes == [[1, 3], [1, 3]])
+    #expect(main.receivedTokenShapes == [[1, 3]])
+    #expect(drafter.prepareCallCount == 1)
+    #expect(drafter.preparedPromptShape == [1, 3])
+    #expect(drafter.preparedHiddenShape == [1, 3, 4])
+    let phases = iterator.speculativeDecodingPhaseTelemetry
+    #expect(
+        phases.targetPrefillSeconds + phases.drafterPromptPrimingSeconds
+            <= iterator.promptPrefillTime)
 }
 
 /// Minimal `KVCache` that satisfies the protocol's trimmable interface; the
@@ -390,6 +418,31 @@ func testMTPSpeculateRoundSmokeWithSynthetics() throws {
     #expect(phases.targetVerificationSeconds >= 0)
     // Verify the main model received emit=true on every call after prefill.
     #expect(main.lastIncomingEmitFlag == true)
+}
+
+@Test
+func testMTPGreedyVerificationBatchesTargetTokenReadbackWithoutChangingStream() throws {
+    let main = MockMainModel(nextLogitTokens: [
+        0, 0, 5,
+        5, 5, 5, 9,
+    ])
+    let drafter = MockDrafter(draftedTokenValue: 5)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+        blockSize: 4)
+
+    let tokens = [
+        iterator.next(), iterator.next(), iterator.next(), iterator.next(), iterator.next(),
+    ]
+
+    #expect(tokens == [5, 5, 5, 5, 9])
+    #expect(iterator.proposedCount == 3)
+    #expect(iterator.acceptedCount == 3)
+    #expect(iterator.speculativeDecodingTelemetry?.targetVerifiedTokenCount == 4)
+    #expect(iterator._verifierTokenReadbackCountForTesting == 1)
 }
 
 @Test
@@ -841,10 +894,11 @@ func testMTPIteratorPendingBufferDrainOrder() throws {
     let main = MockMainModel(nextLogitTokens: mainLogitTokens)
     let drafter = MockDrafter(draftedTokenValue: 5)
     let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+    let cache = CountingKVCache()
 
     var iter = try MTPSpeculativeTokenIterator(
-        input: input, mainModel: main, drafter: drafter, mainCache: nil,
-        parameters: GenerateParameters(maxTokens: 8), blockSize: 4
+        input: input, mainModel: main, drafter: drafter, mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 8, temperature: 0), blockSize: 4
     )
 
     let t0 = iter.next()
@@ -858,6 +912,12 @@ func testMTPIteratorPendingBufferDrainOrder() throws {
     // proposedCount = 3 (numDraft); accepted = 2.
     #expect(iter.proposedCount == 3)
     #expect(iter.acceptedCount == 2)
+    #expect(iter._verifierTokenReadbackCountForTesting == 1)
+    #expect(cache.offset == 6, "the correction remains the next uncommitted target input")
+
+    iter.finalizeGeneration()
+
+    #expect(cache.offset == 7, "finalization commits exactly the four retained outputs")
 }
 
 @Test
@@ -973,6 +1033,9 @@ func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
     #expect(t2 == 9, "correction at the first rejected position")
     #expect(iter.proposedCount == 3, "numDraft=3 verify samples expected")
     #expect(iter.acceptedCount == 1, "only draft[0] matched")
+    #expect(
+        iter._verifierTokenReadbackCountForTesting == 2,
+        "a non-nil processor must retain sequential target-token selection")
 
     let log = iter._processorForTesting as? EmissionLog
     #expect(log != nil, "probe processor lost between install and drain")

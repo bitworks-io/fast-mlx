@@ -713,6 +713,50 @@ public struct QwenMTPCorpusProfileVerdict: Codable, Equatable, Sendable {
     }
 }
 
+public struct QwenMTPPromptHiddenReuseVerdict: Codable, Equatable, Sendable {
+    public let qualified: Bool
+    public let measuredDrafterPromptPrimingSeconds: Double
+    public let baselineDrafterPromptPrimingSeconds: Double
+    public let reductionSeconds: Double
+    public let requiredReductionSeconds: Double
+
+    public init(
+        qualified: Bool,
+        measuredDrafterPromptPrimingSeconds: Double,
+        baselineDrafterPromptPrimingSeconds: Double,
+        reductionSeconds: Double,
+        requiredReductionSeconds: Double
+    ) {
+        self.qualified = qualified
+        self.measuredDrafterPromptPrimingSeconds = measuredDrafterPromptPrimingSeconds
+        self.baselineDrafterPromptPrimingSeconds = baselineDrafterPromptPrimingSeconds
+        self.reductionSeconds = reductionSeconds
+        self.requiredReductionSeconds = requiredReductionSeconds
+    }
+}
+
+public struct QwenMTPGreedyBatchedVerificationVerdict: Codable, Equatable, Sendable {
+    public let qualified: Bool
+    public let measuredTargetVerificationSeconds: Double
+    public let baselineTargetVerificationSeconds: Double
+    public let reductionSeconds: Double
+    public let requiredReductionSeconds: Double
+
+    public init(
+        qualified: Bool,
+        measuredTargetVerificationSeconds: Double,
+        baselineTargetVerificationSeconds: Double,
+        reductionSeconds: Double,
+        requiredReductionSeconds: Double
+    ) {
+        self.qualified = qualified
+        self.measuredTargetVerificationSeconds = measuredTargetVerificationSeconds
+        self.baselineTargetVerificationSeconds = baselineTargetVerificationSeconds
+        self.reductionSeconds = reductionSeconds
+        self.requiredReductionSeconds = requiredReductionSeconds
+    }
+}
+
 public struct QwenMTPCorpusGateDecision: Codable, Equatable, Sendable {
     public let correctness: QwenMTPCorpusCorrectnessVerdict
     public let profile: QwenMTPCorpusProfileVerdict?
@@ -738,6 +782,11 @@ public enum QwenMTPCorpusGateError: Error, Equatable, CustomStringConvertible, S
     case invalidProfileSample(index: Int, reason: String)
     case invalidProvenanceModelIdentity
     case unqualifiedPerformance(QwenMTPCorpusProfileVerdict)
+    case promptHiddenReuseProfileRequired
+    case insufficientPromptHiddenReuseReduction(QwenMTPPromptHiddenReuseVerdict)
+    case greedyBatchedVerificationProfileRequired
+    case insufficientGreedyBatchedVerificationReduction(
+        QwenMTPGreedyBatchedVerificationVerdict)
     case malformedJSONL(line: Int)
     case unterminatedJSONL
     case wrongSubcommand(String)
@@ -771,7 +820,27 @@ public enum QwenMTPCorpusGateError: Error, Equatable, CustomStringConvertible, S
         case .invalidProvenanceModelIdentity:
             return "invalid provenance model identity"
         case .unqualifiedPerformance(let verdict):
-            return "unqualified performance: aggregate median \(verdict.aggregatePairedMedian)"
+            let promptSummary = verdict.perPromptMedians
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ",")
+            return "unqualified performance: aggregate=\(verdict.aggregatePairedMedian) "
+                + "firstHalf=\(verdict.chronologicalFirstHalfMedian) "
+                + "secondHalf=\(verdict.chronologicalSecondHalfMedian) "
+                + "belowFloor=\(verdict.perPromptMedianBelowFloorCount) "
+                + "perPrompt=[\(promptSummary)] "
+                + "thresholds=\(verdict.aggregateThreshold)/"
+                + "\(verdict.chronologicalHalfThreshold)/"
+                + "\(verdict.perPromptFloor)"
+        case .promptHiddenReuseProfileRequired:
+            return "prompt-hidden reuse requires complete profile evidence"
+        case .insufficientPromptHiddenReuseReduction(let verdict):
+            return "insufficient prompt-hidden reuse reduction: \(verdict.reductionSeconds) seconds"
+        case .greedyBatchedVerificationProfileRequired:
+            return "greedy batched verification requires complete profile evidence"
+        case .insufficientGreedyBatchedVerificationReduction(let verdict):
+            return "insufficient greedy batched verification reduction: "
+                + "\(verdict.reductionSeconds) seconds"
         case .malformedJSONL(let line):
             return "malformed JSONL at line \(line)"
         case .unterminatedJSONL:
@@ -790,6 +859,10 @@ public enum QwenMTPCorpusGate {
     public static let schemaVersion = 2
     public static let corpusID = "qwen3.5-9b-mtp-consumer-corpus-v1"
     public static let corpusContentHash = "5e3bc2fbb016d5e0"
+    public static let promptHiddenReusePrimingBaselineSeconds = 88.6121
+    public static let promptHiddenReuseRequiredReductionSeconds = 80.0
+    public static let greedyBatchedVerificationBaselineSeconds = 204.43435170891462
+    public static let greedyBatchedVerificationRequiredReductionSeconds = 5.0
 
     public static let requiredBinding = QwenMTPCorpusRuntimeBinding(
         targetModelID: "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -843,6 +916,96 @@ public enum QwenMTPCorpusGate {
             return QwenMTPCorpusGateDecision(correctness: .pass, profile: verdict)
         }
         return QwenMTPCorpusGateDecision(correctness: .pass, profile: nil)
+    }
+
+    /// Apply the optimization-specific promotion gate without changing the
+    /// frozen v2 corpus identity or its general MTP qualification thresholds.
+    public static func evaluatePromptHiddenReuse(
+        _ payload: QwenMTPCorpusEvidencePayload
+    ) throws -> QwenMTPPromptHiddenReuseVerdict {
+        let decision = try validate(payload)
+        guard decision.profile != nil, let profile = payload.profile else {
+            throw QwenMTPCorpusGateError.promptHiddenReuseProfileRequired
+        }
+        let measuredSeconds = profile.samples.lazy
+            .filter { !$0.warmup }
+            .reduce(0) { partial, sample in
+                partial + sample.mtpPhaseAttribution.drafterPromptPrimingSeconds
+            }
+        return promptHiddenReuseVerdict(measuredPrimingSeconds: measuredSeconds)
+    }
+
+    public static func validatePromptHiddenReuse(
+        _ payload: QwenMTPCorpusEvidencePayload
+    ) throws -> QwenMTPPromptHiddenReuseVerdict {
+        let verdict = try evaluatePromptHiddenReuse(payload)
+        guard verdict.qualified else {
+            throw QwenMTPCorpusGateError.insufficientPromptHiddenReuseReduction(verdict)
+        }
+        return verdict
+    }
+
+    static func promptHiddenReuseVerdict(
+        measuredPrimingSeconds: Double
+    ) -> QwenMTPPromptHiddenReuseVerdict {
+        let reductionSeconds =
+            promptHiddenReusePrimingBaselineSeconds - measuredPrimingSeconds
+        let maximumMeasuredSeconds =
+            promptHiddenReusePrimingBaselineSeconds
+            - promptHiddenReuseRequiredReductionSeconds
+        return QwenMTPPromptHiddenReuseVerdict(
+            qualified: measuredPrimingSeconds.isFinite
+                && measuredPrimingSeconds >= 0
+                && measuredPrimingSeconds <= maximumMeasuredSeconds,
+            measuredDrafterPromptPrimingSeconds: measuredPrimingSeconds,
+            baselineDrafterPromptPrimingSeconds: promptHiddenReusePrimingBaselineSeconds,
+            reductionSeconds: reductionSeconds,
+            requiredReductionSeconds: promptHiddenReuseRequiredReductionSeconds)
+    }
+
+    public static func evaluateGreedyBatchedVerification(
+        _ payload: QwenMTPCorpusEvidencePayload
+    ) throws -> QwenMTPGreedyBatchedVerificationVerdict {
+        let decision = try validate(payload)
+        guard decision.profile != nil, let profile = payload.profile else {
+            throw QwenMTPCorpusGateError.greedyBatchedVerificationProfileRequired
+        }
+        let measuredSeconds = profile.samples.lazy
+            .filter { !$0.warmup }
+            .reduce(0) { partial, sample in
+                partial + sample.mtpPhaseAttribution.targetVerificationSeconds
+            }
+        return greedyBatchedVerificationVerdict(
+            measuredVerificationSeconds: measuredSeconds)
+    }
+
+    public static func validateGreedyBatchedVerification(
+        _ payload: QwenMTPCorpusEvidencePayload
+    ) throws -> QwenMTPGreedyBatchedVerificationVerdict {
+        let verdict = try evaluateGreedyBatchedVerification(payload)
+        guard verdict.qualified else {
+            throw QwenMTPCorpusGateError.insufficientGreedyBatchedVerificationReduction(
+                verdict)
+        }
+        return verdict
+    }
+
+    static func greedyBatchedVerificationVerdict(
+        measuredVerificationSeconds: Double
+    ) -> QwenMTPGreedyBatchedVerificationVerdict {
+        let reductionSeconds =
+            greedyBatchedVerificationBaselineSeconds - measuredVerificationSeconds
+        let maximumMeasuredSeconds =
+            greedyBatchedVerificationBaselineSeconds
+            - greedyBatchedVerificationRequiredReductionSeconds
+        return QwenMTPGreedyBatchedVerificationVerdict(
+            qualified: measuredVerificationSeconds.isFinite
+                && measuredVerificationSeconds >= 0
+                && measuredVerificationSeconds <= maximumMeasuredSeconds,
+            measuredTargetVerificationSeconds: measuredVerificationSeconds,
+            baselineTargetVerificationSeconds: greedyBatchedVerificationBaselineSeconds,
+            reductionSeconds: reductionSeconds,
+            requiredReductionSeconds: greedyBatchedVerificationRequiredReductionSeconds)
     }
 
     public static func validateJSONL(_ data: Data) throws -> [QwenMTPCorpusGateDecision] {
@@ -1158,7 +1321,11 @@ public enum QwenMTPCorpusGate {
             phase.generationSeconds <= timing.generationSeconds + tolerance,
             phase.promptSeconds + phase.generationSeconds <= timing.wallSeconds + tolerance
         else {
-            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase envelope")
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) phase envelope "
+                    + "prompt=\(phase.promptSeconds)/\(timing.promptSeconds) "
+                    + "generation=\(phase.generationSeconds)/\(timing.generationSeconds) "
+                    + "total=\(phase.promptSeconds + phase.generationSeconds)/\(timing.wallSeconds)")
         }
     }
 

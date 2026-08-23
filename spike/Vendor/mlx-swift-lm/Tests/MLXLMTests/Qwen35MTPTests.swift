@@ -268,6 +268,51 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35MTPPreparationCollectsChunkedPostNormPromptHidden() throws {
+        MLXRandom.seed(46)
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(
+                mtpLayers: 1, hiddenLayers: 2, fullAttentionInterval: 2).utf8))
+        let model = MLXLLM.Qwen35TextModel(cfg)
+        let tokens = MLXArray([Int32(1), 2, 3, 4, 5, 6, 7])
+        let referenceCache = model.newCache(parameters: nil as GenerateParameters?)
+        var referenceState = LMOutput.State()
+        referenceState[mtpEmitFlagKey] = true
+        var referenceChunks = [MLXArray]()
+        for range in [0 ..< 3, 3 ..< 6, 6 ..< 7] {
+            let chunk = tokens[range].reshaped([1, range.count])
+            let output = model(
+                LMInput.Text(tokens: chunk), cache: referenceCache, state: referenceState)
+            let hidden = try #require(output.state?[mtpLastHiddenStatesKey])
+            referenceChunks.append(hidden)
+            referenceState = output.state ?? referenceState
+            asyncEval(referenceCache, hidden)
+        }
+        let expected = concatenated(referenceChunks, axis: 1)
+        eval(referenceCache, expected)
+
+        let cache = model.newCache(parameters: nil as GenerateParameters?)
+
+        let optionalPreparation = try model.prepareForMTP(
+            LMInput(tokens: tokens), cache: cache, windowSize: 3)
+        let preparation = try #require(optionalPreparation)
+        guard case .logits(let output) = preparation.result else {
+            Issue.record("Qwen MTP preparation must consume the complete prompt")
+            return
+        }
+
+        eval(preparation.targetHidden, output.logits, expected)
+
+        #expect(preparation.targetHidden.shape == [1, 7, 16])
+        #expect(output.logits.shape == [1, 1, 16])
+        #expect(cache.map(\.offset) == referenceCache.map(\.offset))
+        #expect(
+            allClose(preparation.targetHidden, expected, rtol: 0, atol: 0)
+                .item(Bool.self))
+    }
+
+    @Test
     func testQwen35VLMEmitsPostFinalNormHiddenState() throws {
         let cfg = try JSONDecoder().decode(
             MLXVLM.Qwen35Configuration.self,

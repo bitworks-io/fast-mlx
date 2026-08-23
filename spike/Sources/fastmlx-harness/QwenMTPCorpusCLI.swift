@@ -93,8 +93,34 @@ func runQwenMTPCorpus(_ flags: Flags) async throws {
     }
 
     payload.profile = try runQwenMTPProfile(pair: pair)
+    let reuseVerdict: QwenMTPPromptHiddenReuseVerdict
+    let verificationVerdict: QwenMTPGreedyBatchedVerificationVerdict
+    do {
+        _ = try QwenMTPCorpusGate.validate(payload)
+        reuseVerdict = try QwenMTPCorpusGate.validatePromptHiddenReuse(payload)
+        verificationVerdict = try QwenMTPCorpusGate.validateGreedyBatchedVerification(payload)
+    } catch {
+        let rejectedURL = evidenceURL.appendingPathExtension("rejected")
+        try requireNewOrEmptyEvidence(rejectedURL)
+        try RequiredJSONLWriter.append(
+            resultRecord(
+                payload,
+                targetPath: targetPath,
+                subcommand: "qwen-mtp-corpus-rejected"),
+            to: rejectedURL)
+        throw error
+    }
     try RequiredJSONLWriter.append(resultRecord(payload, targetPath: targetPath), to: evidenceURL)
-    _ = try QwenMTPCorpusGate.validate(payload)
+    print(String(
+        format: "qwen-mtp-corpus prompt-hidden-reuse PASS measured=%.4fs reduction=%.4fs required=%.1fs",
+        reuseVerdict.measuredDrafterPromptPrimingSeconds,
+        reuseVerdict.reductionSeconds,
+        reuseVerdict.requiredReductionSeconds))
+    print(String(
+        format: "qwen-mtp-corpus greedy-batched-verification PASS measured=%.4fs reduction=%.4fs required=%.1fs",
+        verificationVerdict.measuredTargetVerificationSeconds,
+        verificationVerdict.reductionSeconds,
+        verificationVerdict.requiredReductionSeconds))
 }
 
 private var qwenMTPCorpusReleaseBuildObserved: Bool {
@@ -210,13 +236,13 @@ private func runScalar(
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
-    let wallStart = Date.timeIntervalSinceReferenceDate
+    let wallStart = ProcessInfo.processInfo.systemUptime
     var iterator = try TokenIterator(
         input: input,
         model: pair.target.model,
         cache: cache,
         parameters: parameters)
-    let generationStart = Date.timeIntervalSinceReferenceDate
+    let generationStart = ProcessInfo.processInfo.systemUptime
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
         modelConfiguration: pair.target.configuration,
@@ -240,7 +266,7 @@ private func runScalar(
     if stopOutcome == .stop, tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
         stopOutcome = .length
     }
-    let end = Date.timeIntervalSinceReferenceDate
+    let end = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
     return CorpusRun(
         promptTokenCount: promptTokenCount,
@@ -275,7 +301,7 @@ private func runMTPDrain(
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
-    let wallStart = Date.timeIntervalSinceReferenceDate
+    let wallStart = ProcessInfo.processInfo.systemUptime
     var iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: pair.target.model,
@@ -284,7 +310,7 @@ private func runMTPDrain(
         parameters: parameters,
         blockSize: pair.binding.runtimeBlockSize,
         collectPhaseTelemetry: true)
-    let generationStart = Date.timeIntervalSinceReferenceDate
+    let generationStart = ProcessInfo.processInfo.systemUptime
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
         modelConfiguration: pair.target.configuration,
@@ -305,7 +331,7 @@ private func runMTPDrain(
     if stopOutcome == .stop, tokens.count >= (parameters.maxTokens ?? spec.maxTokens) {
         stopOutcome = .length
     }
-    let end = Date.timeIntervalSinceReferenceDate
+    let end = ProcessInfo.processInfo.systemUptime
     let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
     let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
@@ -338,7 +364,7 @@ private func runMTPCancelAfterExtraGenerated(
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
-    let wallStart = Date.timeIntervalSinceReferenceDate
+    let wallStart = ProcessInfo.processInfo.systemUptime
     var iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: pair.target.model,
@@ -347,7 +373,7 @@ private func runMTPCancelAfterExtraGenerated(
         parameters: parameters,
         blockSize: pair.binding.runtimeBlockSize,
         collectPhaseTelemetry: true)
-    let generationStart = Date.timeIntervalSinceReferenceDate
+    let generationStart = ProcessInfo.processInfo.systemUptime
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
         modelConfiguration: pair.target.configuration,
@@ -368,7 +394,7 @@ private func runMTPCancelAfterExtraGenerated(
         discardedExtraGeneratedToken = true
     }
     iterator.finalizeGeneration()
-    let end = Date.timeIntervalSinceReferenceDate
+    let end = ProcessInfo.processInfo.systemUptime
     let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
     let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
@@ -401,7 +427,7 @@ private func runMTPCancelAfterAcceptedDraft(
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
-    let wallStart = Date.timeIntervalSinceReferenceDate
+    let wallStart = ProcessInfo.processInfo.systemUptime
     var iterator = try MTPSpeculativeTokenIterator(
         input: input,
         mainModel: pair.target.model,
@@ -410,7 +436,7 @@ private func runMTPCancelAfterAcceptedDraft(
         parameters: parameters,
         blockSize: pair.binding.runtimeBlockSize,
         collectPhaseTelemetry: true)
-    let generationStart = Date.timeIntervalSinceReferenceDate
+    let generationStart = ProcessInfo.processInfo.systemUptime
     var tokens: [Int] = []
     let safetyCap = max(parameters.maxTokens ?? spec.maxTokens, spec.maxTokens) + 8
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
@@ -433,7 +459,7 @@ private func runMTPCancelAfterAcceptedDraft(
         discardedExtraGeneratedToken = true
     }
     iterator.finalizeGeneration()
-    let end = Date.timeIntervalSinceReferenceDate
+    let end = ProcessInfo.processInfo.systemUptime
     let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
     let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
@@ -776,11 +802,12 @@ private func runtimeBinding(
 
 private func resultRecord(
     _ payload: QwenMTPCorpusEvidencePayload,
-    targetPath: String
+    targetPath: String,
+    subcommand: String = "qwen-mtp-corpus"
 ) -> ResultRecord<QwenMTPCorpusEvidencePayload> {
     let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
     return ResultRecord(
-        subcommand: "qwen-mtp-corpus",
+        subcommand: subcommand,
         provenance: Provenance(
             date: ISO8601DateFormatter().string(from: Date()),
             hardwareChip: ProvenanceCLI.chipBrand(),

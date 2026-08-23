@@ -622,7 +622,13 @@ public class Qwen35TextModelInner: Module {
     }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+private enum Qwen35MTPPromptPreparationError: Error {
+    case missingTargetHidden
+}
+
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
+    MTPPromptHiddenStatePreparingModel
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -684,6 +690,56 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
             cache: cache, fullAttentionIndex: model.faIdx)
         return LMOutput(logits: logits, state: outState)
+    }
+
+    /// Preserve the default LLM chunking/cache contract while collecting the
+    /// post-final-norm representation from each original target-prefill chunk.
+    /// This is Qwen-text-only: VLM/media preparation has independent position
+    /// state and deliberately keeps the replay fallback.
+    public func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> MTPPromptPreparation? {
+        let prefillStepSize = windowSize ?? 512
+        guard prefillStepSize > 0, input.text.tokens.size > 0 else { return nil }
+
+        var remaining = input.text
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+        var hiddenChunks = [MLXArray]()
+        var finalOutput: LMOutput?
+
+        try withPreparedCache(cache, lengths: remaining.sequenceLengths) {
+            while remaining.tokens.size > prefillStepSize {
+                let chunk = remaining[.newAxis, ..<prefillStepSize]
+                let output = self(
+                    chunk, cache: cache.isEmpty ? nil : cache, state: state)
+                guard let hidden = output.state?[mtpLastHiddenStatesKey] else {
+                    throw Qwen35MTPPromptPreparationError.missingTargetHidden
+                }
+                hiddenChunks.append(hidden)
+                state = output.state ?? state
+                asyncEval(cache, hidden)
+                remaining = remaining[prefillStepSize...]
+            }
+
+            let output = self(
+                remaining[text: .newAxis],
+                cache: cache.isEmpty ? nil : cache,
+                state: state)
+            guard let hidden = output.state?[mtpLastHiddenStatesKey] else {
+                throw Qwen35MTPPromptPreparationError.missingTargetHidden
+            }
+            hiddenChunks.append(hidden)
+            finalOutput = output
+            eval(cache, hidden)
+        }
+
+        guard let finalOutput, !hiddenChunks.isEmpty else { return nil }
+        return MTPPromptPreparation(
+            result: .logits(finalOutput),
+            targetHidden: concatenated(hiddenChunks, axis: 1))
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -770,7 +826,9 @@ private func qwen35SharedKVOffsets(
 
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider,
+    MTPPromptHiddenStatePreparingModel
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -795,6 +853,15 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> MTPPromptPreparation? {
+        try languageModel.prepareForMTP(
+            input, cache: cache, windowSize: windowSize)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
