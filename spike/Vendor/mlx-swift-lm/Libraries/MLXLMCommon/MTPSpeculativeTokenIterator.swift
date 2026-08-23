@@ -44,6 +44,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     var mainCache: [KVCache]
     var drafterState: MTPDrafterState?
     let quantizeKVCache: (inout [KVCache]) -> Void
+    let collectPhaseTelemetry: Bool
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
@@ -95,6 +96,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
         telemetry.roundCount > 0 ? telemetry : nil
     }
+    public var speculativeDecodingPhaseTelemetry: SpeculativeDecodingPhaseTelemetry {
+        telemetry.phases
+    }
+
+    @inline(__always)
+    private func phaseClock() -> TimeInterval {
+        collectPhaseTelemetry ? ProcessInfo.processInfo.systemUptime : 0
+    }
 
     public mutating func discardGeneratedToken() {
         telemetry.discardGeneratedToken()
@@ -123,7 +132,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         drafter: any MTPDrafterModel,
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        blockSize: Int
+        blockSize: Int,
+        collectPhaseTelemetry: Bool = false
     ) throws {
         precondition(
             blockSize >= 2,
@@ -132,6 +142,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.y = input.text
         self.mainModel = mainModel
         self.drafter = drafter
+        self.collectPhaseTelemetry = collectPhaseTelemetry
 
         let initialPassthroughReason: String?
         if !drafter.supportsSpeculation(for: input) {
@@ -188,6 +199,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Prefill the main model with the prompt and, for stateful drafters, prime
     /// iterator-owned private cache only after all fail-closed gates pass.
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        let targetPrefillStart = phaseClock()
         processor?.prompt(input.text.tokens)
 
         var prefillState = LMOutput.State()
@@ -280,6 +292,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             }
         }
 
+        if collectPhaseTelemetry {
+            synchronizeTargetPhaseBoundary(state: mainState)
+            telemetry.recordTargetPrefill(
+                seconds: ProcessInfo.processInfo.systemUptime - targetPrefillStart)
+        }
+
+        let shouldMeasureDrafterPriming =
+            collectPhaseTelemetry && !passthrough && drafter.requiresPromptPrefill
+        let drafterPrimingStart = phaseClock()
         if !passthrough, drafter.requiresPromptPrefill,
             let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
@@ -324,6 +345,45 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         } else if !passthrough, drafter.requiresPromptPrefill {
             switchToPassthrough(
                 reason: "target did not emit drafter state for Qwen MTP prompt prefill")
+        }
+        if shouldMeasureDrafterPriming {
+            synchronizeDrafterPhaseBoundary()
+            telemetry.recordDrafterPromptPriming(
+                seconds: ProcessInfo.processInfo.systemUptime - drafterPrimingStart)
+        }
+    }
+
+    private func synchronizeTargetPhaseBoundary(state: LMOutput.State?) {
+        guard collectPhaseTelemetry else { return }
+        var arrays = mainCache.flatMap { $0.state }
+        if let hidden = state?[mtpLastHiddenStatesKey] {
+            arrays.append(hidden)
+        }
+        if let sharedKV = state?[mtpSharedKVStatesKey] {
+            for value in sharedKV.values {
+                arrays.append(value.0)
+                arrays.append(value.1)
+            }
+        }
+        if let positionDeltas = state?[mtpPositionDeltasKey] {
+            arrays.append(positionDeltas)
+        }
+        if !arrays.isEmpty {
+            eval(arrays)
+        }
+    }
+
+    private func synchronizeDrafterPhaseBoundary() {
+        guard collectPhaseTelemetry, let drafterState else { return }
+        var arrays = drafterState.cache.flatMap { $0.state }
+        if let seedToken = drafterState.seedToken {
+            arrays.append(seedToken)
+        }
+        if let seedHidden = drafterState.seedHidden {
+            arrays.append(seedHidden)
+        }
+        if !arrays.isEmpty {
+            eval(arrays)
         }
     }
 
@@ -416,6 +476,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         let bonusToken = y.tokens
+        let draftPhaseStart = phaseClock()
         let draftTokens: MLXArray
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
@@ -446,9 +507,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
         let flatDraftTokens = draftTokens.flattened()
+        var draftPhaseSeconds = 0.0
+        if collectPhaseTelemetry {
+            eval(flatDraftTokens)
+            draftPhaseSeconds = ProcessInfo.processInfo.systemUptime - draftPhaseStart
+        }
 
         // Verify pass: main model evaluates [bonus, draft_1, ..., draft_numDraft]
         // in one forward call, emitting state for next round.
+        let verificationPhaseStart = phaseClock()
         var verifyState = state
         verifyState[mtpEmitFlagKey] = true
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
@@ -499,6 +566,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let emittedFinalToken = finalToken!
         committedPendingTokenCount = accepted
 
+        if collectPhaseTelemetry {
+            synchronizeTargetPhaseBoundary(state: mainResult.state)
+            telemetry.recordTargetVerification(
+                seconds: ProcessInfo.processInfo.systemUptime - verificationPhaseStart)
+        }
+
         proposedCount += numDraft
         acceptedCount += accepted
         var nextHiddenIndex = accepted
@@ -509,6 +582,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             draftModelCalls: 1
         )
 
+        let seedCommitStart = phaseClock()
         if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
@@ -523,10 +597,18 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 sampler: sampler)
             drafterState = currentDrafterState
         }
+        if collectPhaseTelemetry {
+            synchronizeDrafterPhaseBoundary()
+            draftPhaseSeconds += ProcessInfo.processInfo.systemUptime - seedCommitStart
+            telemetry.recordDraftBlock(seconds: draftPhaseSeconds)
+        }
 
         let rejected = numDraft - accepted
+        let hybridRewindStart = phaseClock()
+        var performedHybridRewindReplay = false
         if nativeHybridRewind {
             if rejected > 0 {
+                performedHybridRewindReplay = true
                 let rewound = rewindSpeculativePromptCache(mainCache, numTokens: numDraft)
                 precondition(
                     rewound == numDraft,
@@ -556,6 +638,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
         mainState = finalizedMainState
         lastRoundAccepted = nextHiddenIndex
+        if collectPhaseTelemetry, performedHybridRewindReplay {
+            synchronizeTargetPhaseBoundary(state: mainState)
+            telemetry.recordHybridRewindReplay(
+                seconds: ProcessInfo.processInfo.systemUptime - hybridRewindStart)
+        }
 
         // Dynamic cache quantization may convert `.regular` K/V to `.quantized`,
         // at which point the target's emit-hook returns sharedKV: nil and the
@@ -596,6 +683,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     private mutating func passthroughStep() -> Int? {
         if let maxTokens, tokenCount >= maxTokens { return nil }
 
+        let targetTailStart = phaseClock()
         let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
         mainState = result.state
         var logits = result.logits[0..., -1, 0...]
@@ -606,6 +694,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let tokenInt = token.item(Int.self)
         y = .init(tokens: token)
         quantizeKVCache(&mainCache)
+        if collectPhaseTelemetry {
+            synchronizeTargetPhaseBoundary(state: mainState)
+            telemetry.recordTargetTail(
+                seconds: ProcessInfo.processInfo.systemUptime - targetTailStart)
+        }
         lastReturnedTokenNeedsFinalCommit = true
         return tokenInt
     }
@@ -716,12 +809,23 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     public mutating func finalizeGeneration() {
-        defer { discardSpeculativePromptCacheCheckpoints(mainCache) }
+        let finalizationStart = phaseClock()
+        var nestedHybridRewindSeconds = 0.0
+        defer {
+            discardSpeculativePromptCacheCheckpoints(mainCache)
+            if collectPhaseTelemetry {
+                telemetry.recordFinalization(seconds: Swift.max(
+                    0,
+                    ProcessInfo.processInfo.systemUptime - finalizationStart
+                        - nestedHybridRewindSeconds))
+            }
+        }
         let emitted = Swift.min(
             emittedCommittedPendingTokenCount, committedPendingTokenCount)
         let lookahead = committedPendingTokenCount - emitted
         if lookahead > 0 {
             if mainCache.contains(where: { $0 is MambaCache }) {
+                let hybridRewindStart = phaseClock()
                 let rewound = rewindSpeculativePromptCache(
                     mainCache, numTokens: committedPendingTokenCount)
                 precondition(
@@ -736,6 +840,12 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
                         replayedState != nil,
                         "Hybrid speculative finalization cannot replay retained prefix exactly")
                     mainState = replayedState
+                }
+                if collectPhaseTelemetry {
+                    synchronizeTargetPhaseBoundary(state: mainState)
+                    nestedHybridRewindSeconds =
+                        ProcessInfo.processInfo.systemUptime - hybridRewindStart
+                    telemetry.recordHybridRewindReplay(seconds: nestedHybridRewindSeconds)
                 }
             } else {
                 let rewound = trimPromptCache(mainCache, numTokens: lookahead)
@@ -759,6 +869,7 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         mainState = result.state
         quantizeKVCache(&mainCache)
         eval(result.logits)
+        synchronizeTargetPhaseBoundary(state: mainState)
         lastReturnedTokenNeedsFinalCommit = false
     }
 }

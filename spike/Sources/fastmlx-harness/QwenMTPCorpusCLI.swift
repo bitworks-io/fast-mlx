@@ -197,6 +197,7 @@ private struct CorpusRun {
     let cacheFingerprint: QwenMTPCorpusCacheFingerprint
     let timing: QwenMTPCorpusTiming
     let mtpTelemetry: QwenMTPCorpusMTPTelemetry
+    let mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution?
     let passthroughReason: String?
 }
 
@@ -262,6 +263,7 @@ private func runScalar(
             draftModelCallCount: 0,
             targetVerifiedTokenCount: 0,
             emittedTokenCount: tokens.count),
+        mtpPhaseAttribution: nil,
         passthroughReason: nil)
 }
 
@@ -280,7 +282,8 @@ private func runMTPDrain(
         drafter: pair.drafter.model,
         mainCache: cache,
         parameters: parameters,
-        blockSize: pair.binding.runtimeBlockSize)
+        blockSize: pair.binding.runtimeBlockSize,
+        collectPhaseTelemetry: true)
     let generationStart = Date.timeIntervalSinceReferenceDate
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
@@ -303,7 +306,9 @@ private func runMTPDrain(
         stopOutcome = .length
     }
     let end = Date.timeIntervalSinceReferenceDate
+    let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
+    let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
     let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
     return CorpusRun(
         promptTokenCount: promptTokenCount,
@@ -318,6 +323,9 @@ private func runMTPDrain(
             wallSeconds: max(end - wallStart, 1e-9),
             e2eSeconds: max(end - wallStart, 1e-9)),
         mtpTelemetry: telemetry,
+        mtpPhaseAttribution: mtpPhaseAttribution(
+            from: iterator,
+            cacheFingerprintSeconds: fingerprintSeconds),
         passthroughReason: iterator.passthroughReason)
 }
 
@@ -337,7 +345,8 @@ private func runMTPCancelAfterExtraGenerated(
         drafter: pair.drafter.model,
         mainCache: cache,
         parameters: parameters,
-        blockSize: pair.binding.runtimeBlockSize)
+        blockSize: pair.binding.runtimeBlockSize,
+        collectPhaseTelemetry: true)
     let generationStart = Date.timeIntervalSinceReferenceDate
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
@@ -360,7 +369,9 @@ private func runMTPCancelAfterExtraGenerated(
     }
     iterator.finalizeGeneration()
     let end = Date.timeIntervalSinceReferenceDate
+    let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
+    let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
     let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
     return CorpusRun(
         promptTokenCount: promptTokenCount,
@@ -376,6 +387,9 @@ private func runMTPCancelAfterExtraGenerated(
             wallSeconds: max(end - wallStart, 1e-9),
             e2eSeconds: max(end - wallStart, 1e-9)),
         mtpTelemetry: telemetry,
+        mtpPhaseAttribution: mtpPhaseAttribution(
+            from: iterator,
+            cacheFingerprintSeconds: fingerprintSeconds),
         passthroughReason: iterator.passthroughReason)
 }
 
@@ -394,7 +408,8 @@ private func runMTPCancelAfterAcceptedDraft(
         drafter: pair.drafter.model,
         mainCache: cache,
         parameters: parameters,
-        blockSize: pair.binding.runtimeBlockSize)
+        blockSize: pair.binding.runtimeBlockSize,
+        collectPhaseTelemetry: true)
     let generationStart = Date.timeIntervalSinceReferenceDate
     var tokens: [Int] = []
     let safetyCap = max(parameters.maxTokens ?? spec.maxTokens, spec.maxTokens) + 8
@@ -419,7 +434,9 @@ private func runMTPCancelAfterAcceptedDraft(
     }
     iterator.finalizeGeneration()
     let end = Date.timeIntervalSinceReferenceDate
+    let fingerprintStart = ProcessInfo.processInfo.systemUptime
     let fingerprint = fingerprintCache(cache)
+    let fingerprintSeconds = ProcessInfo.processInfo.systemUptime - fingerprintStart
     let telemetry = mtpTelemetry(from: iterator, emittedTokenCount: tokens.count)
     return CorpusRun(
         promptTokenCount: promptTokenCount,
@@ -436,6 +453,9 @@ private func runMTPCancelAfterAcceptedDraft(
             wallSeconds: max(end - wallStart, 1e-9),
             e2eSeconds: max(end - wallStart, 1e-9)),
         mtpTelemetry: telemetry,
+        mtpPhaseAttribution: mtpPhaseAttribution(
+            from: iterator,
+            cacheFingerprintSeconds: fingerprintSeconds),
         passthroughReason: iterator.passthroughReason)
 }
 
@@ -444,6 +464,7 @@ private func caseResult(
     scalar: CorpusRun,
     mtp: CorpusRun
 ) -> QwenMTPCorpusCaseResult {
+    precondition(mtp.mtpPhaseAttribution != nil, "MTP corpus run must collect phase attribution")
     let exactness = MTPStreamExactness.compare(candidate: mtp.tokens, baseline: scalar.tokens)
     let cacheMismatch = firstCacheMismatch(scalar.cacheFingerprint, mtp.cacheFingerprint)
     return QwenMTPCorpusCaseResult(
@@ -466,6 +487,7 @@ private func caseResult(
         scalarTiming: scalar.timing,
         mtpTiming: mtp.timing,
         mtpTelemetry: mtp.mtpTelemetry,
+        mtpPhaseAttribution: mtp.mtpPhaseAttribution!,
         passthroughReason: mtp.passthroughReason)
 }
 
@@ -505,6 +527,7 @@ private func runQwenMTPProfile(pair: Qwen35ExactMTPLoadedPair) throws -> QwenMTP
                 decodeOnlyRatio: decodeRatio,
                 e2eRatio: scalarTPS > 0 ? mtpTPS / scalarTPS : 0,
                 mtpTelemetry: mtp.mtpTelemetry,
+                mtpPhaseAttribution: mtp.mtpPhaseAttribution!,
                 passthroughReason: mtp.passthroughReason))
         }
     }
@@ -593,6 +616,30 @@ private func mtpTelemetry(
         draftModelCallCount: 0,
         targetVerifiedTokenCount: 0,
         emittedTokenCount: emittedTokenCount)
+}
+
+private func mtpPhaseAttribution(
+    from iterator: MTPSpeculativeTokenIterator,
+    cacheFingerprintSeconds: Double
+) -> QwenMTPCorpusMTPPhaseAttribution {
+    let phase = iterator.speculativeDecodingPhaseTelemetry
+    return QwenMTPCorpusMTPPhaseAttribution(
+        targetPrefillSeconds: phase.targetPrefillSeconds,
+        drafterPromptPrimingSeconds: phase.drafterPromptPrimingSeconds,
+        draftBlockSeconds: phase.draftBlockSeconds,
+        targetVerificationSeconds: phase.targetVerificationSeconds,
+        targetTailSeconds: phase.targetTailSeconds,
+        hybridRewindReplaySeconds: phase.hybridRewindReplaySeconds,
+        finalizationSeconds: phase.finalizationSeconds,
+        cacheFingerprintSeconds: cacheFingerprintSeconds,
+        targetPrefillCount: phase.targetPrefillCount,
+        drafterPromptPrimingCount: phase.drafterPromptPrimingCount,
+        draftBlockCount: phase.draftBlockCount,
+        targetVerificationCount: phase.targetVerificationCount,
+        targetTailCount: phase.targetTailCount,
+        hybridRewindReplayCount: phase.hybridRewindReplayCount,
+        finalizationCount: phase.finalizationCount,
+        cacheFingerprintCount: 1)
 }
 
 private func buildQwenMTPCorpusStopTokenIds(

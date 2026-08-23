@@ -3,6 +3,68 @@
 import Foundation
 import MLX
 
+/// Wall-clock attribution for the logical phases of one MTP iterator.
+/// Call counts keep zero-duration measurements distinguishable from phases
+/// that did not execute.
+public struct SpeculativeDecodingPhaseTelemetry: Sendable, Equatable {
+    public private(set) var targetPrefillSeconds: Double = 0
+    public private(set) var drafterPromptPrimingSeconds: Double = 0
+    public private(set) var draftBlockSeconds: Double = 0
+    public private(set) var targetVerificationSeconds: Double = 0
+    public private(set) var targetTailSeconds: Double = 0
+    public private(set) var hybridRewindReplaySeconds: Double = 0
+    public private(set) var finalizationSeconds: Double = 0
+    public private(set) var targetPrefillCount: Int = 0
+    public private(set) var drafterPromptPrimingCount: Int = 0
+    public private(set) var draftBlockCount: Int = 0
+    public private(set) var targetVerificationCount: Int = 0
+    public private(set) var targetTailCount: Int = 0
+    public private(set) var hybridRewindReplayCount: Int = 0
+    public private(set) var finalizationCount: Int = 0
+
+    public init() {}
+
+    private static func checked(_ seconds: Double) -> Double {
+        precondition(seconds.isFinite && seconds >= 0, "phase time must be finite and nonnegative")
+        return seconds
+    }
+
+    package mutating func recordTargetPrefill(seconds: Double) {
+        targetPrefillSeconds += Self.checked(seconds)
+        targetPrefillCount += 1
+    }
+
+    package mutating func recordDrafterPromptPriming(seconds: Double) {
+        drafterPromptPrimingSeconds += Self.checked(seconds)
+        drafterPromptPrimingCount += 1
+    }
+
+    package mutating func recordDraftBlock(seconds: Double) {
+        draftBlockSeconds += Self.checked(seconds)
+        draftBlockCount += 1
+    }
+
+    package mutating func recordTargetVerification(seconds: Double) {
+        targetVerificationSeconds += Self.checked(seconds)
+        targetVerificationCount += 1
+    }
+
+    package mutating func recordTargetTail(seconds: Double) {
+        targetTailSeconds += Self.checked(seconds)
+        targetTailCount += 1
+    }
+
+    package mutating func recordHybridRewindReplay(seconds: Double) {
+        hybridRewindReplaySeconds += Self.checked(seconds)
+        hybridRewindReplayCount += 1
+    }
+
+    package mutating func recordFinalization(seconds: Double) {
+        finalizationSeconds += Self.checked(seconds)
+        finalizationCount += 1
+    }
+}
+
 private func defaultSpeculativeDecodingMemoryLimit() -> Int? {
     guard let bytes = GPU.maxRecommendedWorkingSetBytes(), bytes > 0 else {
         return nil
@@ -33,6 +95,9 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
     /// Number of tokens emitted from speculative rounds, including correction and bonus tokens.
     public private(set) var emittedTokenCount: Int
 
+    /// Logical phase timings for measurement and optimization attribution.
+    public private(set) var phases: SpeculativeDecodingPhaseTelemetry
+
     public init(
         roundCount: Int = 0,
         draftTokenCount: Int = 0,
@@ -40,7 +105,8 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         targetModelCallCount: Int = 0,
         draftModelCallCount: Int = 0,
         targetVerifiedTokenCount: Int = 0,
-        emittedTokenCount: Int = 0
+        emittedTokenCount: Int = 0,
+        phases: SpeculativeDecodingPhaseTelemetry = .init()
     ) {
         self.roundCount = roundCount
         self.draftTokenCount = draftTokenCount
@@ -49,6 +115,7 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         self.draftModelCallCount = draftModelCallCount
         self.targetVerifiedTokenCount = targetVerifiedTokenCount
         self.emittedTokenCount = emittedTokenCount
+        self.phases = phases
     }
 
     /// Number of draft tokens rejected by the target model.
@@ -94,6 +161,34 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
 
     package mutating func discardGeneratedToken() {
         emittedTokenCount = max(0, emittedTokenCount - 1)
+    }
+
+    package mutating func recordTargetPrefill(seconds: Double) {
+        phases.recordTargetPrefill(seconds: seconds)
+    }
+
+    package mutating func recordDrafterPromptPriming(seconds: Double) {
+        phases.recordDrafterPromptPriming(seconds: seconds)
+    }
+
+    package mutating func recordDraftBlock(seconds: Double) {
+        phases.recordDraftBlock(seconds: seconds)
+    }
+
+    package mutating func recordTargetVerification(seconds: Double) {
+        phases.recordTargetVerification(seconds: seconds)
+    }
+
+    package mutating func recordTargetTail(seconds: Double) {
+        phases.recordTargetTail(seconds: seconds)
+    }
+
+    package mutating func recordHybridRewindReplay(seconds: Double) {
+        phases.recordHybridRewindReplay(seconds: seconds)
+    }
+
+    package mutating func recordFinalization(seconds: Double) {
+        phases.recordFinalization(seconds: seconds)
     }
 }
 

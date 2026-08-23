@@ -218,6 +218,73 @@ public struct QwenMTPCorpusTiming: Codable, Equatable, Sendable {
     }
 }
 
+/// Measurement-only attribution for the MTP path. Cache fingerprinting is
+/// intentionally separated from the decode envelope because it is proof
+/// overhead, not user-visible generation latency.
+public struct QwenMTPCorpusMTPPhaseAttribution: Codable, Equatable, Sendable {
+    public let targetPrefillSeconds: Double
+    public let drafterPromptPrimingSeconds: Double
+    public let draftBlockSeconds: Double
+    public let targetVerificationSeconds: Double
+    public let targetTailSeconds: Double
+    public let hybridRewindReplaySeconds: Double
+    public let finalizationSeconds: Double
+    public let cacheFingerprintSeconds: Double
+    public let targetPrefillCount: Int
+    public let drafterPromptPrimingCount: Int
+    public let draftBlockCount: Int
+    public let targetVerificationCount: Int
+    public let targetTailCount: Int
+    public let hybridRewindReplayCount: Int
+    public let finalizationCount: Int
+    public let cacheFingerprintCount: Int
+
+    public init(
+        targetPrefillSeconds: Double,
+        drafterPromptPrimingSeconds: Double,
+        draftBlockSeconds: Double,
+        targetVerificationSeconds: Double,
+        targetTailSeconds: Double,
+        hybridRewindReplaySeconds: Double,
+        finalizationSeconds: Double,
+        cacheFingerprintSeconds: Double,
+        targetPrefillCount: Int,
+        drafterPromptPrimingCount: Int,
+        draftBlockCount: Int,
+        targetVerificationCount: Int,
+        targetTailCount: Int,
+        hybridRewindReplayCount: Int,
+        finalizationCount: Int,
+        cacheFingerprintCount: Int
+    ) {
+        self.targetPrefillSeconds = targetPrefillSeconds
+        self.drafterPromptPrimingSeconds = drafterPromptPrimingSeconds
+        self.draftBlockSeconds = draftBlockSeconds
+        self.targetVerificationSeconds = targetVerificationSeconds
+        self.targetTailSeconds = targetTailSeconds
+        self.hybridRewindReplaySeconds = hybridRewindReplaySeconds
+        self.finalizationSeconds = finalizationSeconds
+        self.cacheFingerprintSeconds = cacheFingerprintSeconds
+        self.targetPrefillCount = targetPrefillCount
+        self.drafterPromptPrimingCount = drafterPromptPrimingCount
+        self.draftBlockCount = draftBlockCount
+        self.targetVerificationCount = targetVerificationCount
+        self.targetTailCount = targetTailCount
+        self.hybridRewindReplayCount = hybridRewindReplayCount
+        self.finalizationCount = finalizationCount
+        self.cacheFingerprintCount = cacheFingerprintCount
+    }
+
+    public var promptSeconds: Double {
+        targetPrefillSeconds + drafterPromptPrimingSeconds
+    }
+
+    public var generationSeconds: Double {
+        draftBlockSeconds + targetVerificationSeconds + targetTailSeconds
+            + hybridRewindReplaySeconds + finalizationSeconds
+    }
+}
+
 public struct QwenMTPCorpusMTPTelemetry: Codable, Equatable, Sendable {
     public let proposedDraftTokens: Int
     public let acceptedDraftTokens: Int
@@ -309,6 +376,7 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
     public let scalarTiming: QwenMTPCorpusTiming
     public let mtpTiming: QwenMTPCorpusTiming
     public let mtpTelemetry: QwenMTPCorpusMTPTelemetry
+    public let mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution
     public let passthroughReason: String?
 
     public var draftsProposed: Int { mtpTelemetry.proposedDraftTokens }
@@ -334,6 +402,7 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
         scalarTiming: QwenMTPCorpusTiming,
         mtpTiming: QwenMTPCorpusTiming,
         mtpTelemetry: QwenMTPCorpusMTPTelemetry,
+        mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution,
         passthroughReason: String?
     ) {
         self.caseID = caseID
@@ -355,6 +424,7 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
         self.scalarTiming = scalarTiming
         self.mtpTiming = mtpTiming
         self.mtpTelemetry = mtpTelemetry
+        self.mtpPhaseAttribution = mtpPhaseAttribution
         self.passthroughReason = passthroughReason
     }
 
@@ -370,6 +440,7 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
         mtpCacheFingerprint: QwenMTPCorpusCacheFingerprint? = nil,
         firstCacheMismatch: String?? = nil,
         mtpTelemetry: QwenMTPCorpusMTPTelemetry? = nil,
+        mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution? = nil,
         passthroughReason: String?? = nil
     ) -> QwenMTPCorpusCaseResult {
         QwenMTPCorpusCaseResult(
@@ -392,6 +463,7 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
             scalarTiming: scalarTiming,
             mtpTiming: mtpTiming,
             mtpTelemetry: mtpTelemetry ?? self.mtpTelemetry,
+            mtpPhaseAttribution: mtpPhaseAttribution ?? self.mtpPhaseAttribution,
             passthroughReason: passthroughReason ?? self.passthroughReason)
     }
 
@@ -444,6 +516,12 @@ public struct QwenMTPCorpusCaseResult: Codable, Equatable, Sendable {
     public func withMTPTelemetry(_ telemetry: QwenMTPCorpusMTPTelemetry) -> QwenMTPCorpusCaseResult {
         copy(mtpTelemetry: telemetry)
     }
+
+    public func withMTPPhaseAttribution(
+        _ attribution: QwenMTPCorpusMTPPhaseAttribution
+    ) -> QwenMTPCorpusCaseResult {
+        copy(mtpPhaseAttribution: attribution)
+    }
 }
 
 public enum QwenMTPCorpusCorrectnessVerdict: String, Codable, Equatable, Sendable {
@@ -464,6 +542,7 @@ public struct QwenMTPCorpusProfileSample: Codable, Equatable, Sendable {
     public let decodeOnlyRatio: Double
     public let e2eRatio: Double
     public let mtpTelemetry: QwenMTPCorpusMTPTelemetry
+    public let mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution
     public let passthroughReason: String?
 
     public var draftsProposed: Int { mtpTelemetry.proposedDraftTokens }
@@ -482,6 +561,7 @@ public struct QwenMTPCorpusProfileSample: Codable, Equatable, Sendable {
         decodeOnlyRatio: Double,
         e2eRatio: Double,
         mtpTelemetry: QwenMTPCorpusMTPTelemetry,
+        mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution,
         passthroughReason: String?
     ) {
         self.caseID = caseID
@@ -496,6 +576,7 @@ public struct QwenMTPCorpusProfileSample: Codable, Equatable, Sendable {
         self.decodeOnlyRatio = decodeOnlyRatio
         self.e2eRatio = e2eRatio
         self.mtpTelemetry = mtpTelemetry
+        self.mtpPhaseAttribution = mtpPhaseAttribution
         self.passthroughReason = passthroughReason
     }
 
@@ -521,6 +602,7 @@ public struct QwenMTPCorpusProfileSample: Codable, Equatable, Sendable {
             decodeOnlyRatio: decodeOnlyRatio ?? self.decodeOnlyRatio,
             e2eRatio: e2eRatio ?? self.e2eRatio,
             mtpTelemetry: mtpTelemetry,
+            mtpPhaseAttribution: mtpPhaseAttribution,
             passthroughReason: passthroughReason)
     }
 
@@ -700,8 +782,12 @@ public enum QwenMTPCorpusGateError: Error, Equatable, CustomStringConvertible, S
     }
 }
 
+private struct QwenMTPCorpusSchemaProbe: Codable, Sendable {
+    let schemaVersion: Int
+}
+
 public enum QwenMTPCorpusGate {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let corpusID = "qwen3.5-9b-mtp-consumer-corpus-v1"
     public static let corpusContentHash = "5e3bc2fbb016d5e0"
 
@@ -767,9 +853,22 @@ public enum QwenMTPCorpusGate {
         let decoder = JSONDecoder()
         for (index, row) in rows.enumerated() {
             guard !row.isEmpty else { throw QwenMTPCorpusGateError.malformedJSONL(line: index + 1) }
+            let rowData = Data(row)
+            let probe: ResultRecord<QwenMTPCorpusSchemaProbe>
+            do {
+                probe = try decoder.decode(
+                    ResultRecord<QwenMTPCorpusSchemaProbe>.self, from: rowData)
+            } catch {
+                throw QwenMTPCorpusGateError.malformedJSONL(line: index + 1)
+            }
+            guard probe.payload.schemaVersion == schemaVersion else {
+                throw QwenMTPCorpusGateError.schemaVersionMismatch(
+                    probe.payload.schemaVersion)
+            }
             let record: ResultRecord<QwenMTPCorpusEvidencePayload>
             do {
-                record = try decoder.decode(ResultRecord<QwenMTPCorpusEvidencePayload>.self, from: Data(row))
+                record = try decoder.decode(
+                    ResultRecord<QwenMTPCorpusEvidencePayload>.self, from: rowData)
             } catch {
                 throw QwenMTPCorpusGateError.malformedJSONL(line: index + 1)
             }
@@ -850,6 +949,12 @@ public enum QwenMTPCorpusGate {
             throw QwenMTPCorpusGateError.invalidCaseMetadata("\(result.caseID) timing")
         }
         try validateTelemetry(result.mtpTelemetry, emittedTokenCount: result.mtpTokenCount, context: result.caseID)
+        try validatePhaseAttribution(
+            result.mtpPhaseAttribution,
+            telemetry: result.mtpTelemetry,
+            timing: result.mtpTiming,
+            expectsDrafterPriming: result.kind != .forcedFallback,
+            context: result.caseID)
 
         switch result.kind {
         case .lengthBoundary:
@@ -897,6 +1002,12 @@ public enum QwenMTPCorpusGate {
             }
             guard let reason = result.passthroughReason, !reason.isEmpty else {
                 throw QwenMTPCorpusGateError.correctnessMismatch("\(result.caseID) fallback reason")
+            }
+            guard result.mtpPhaseAttribution.targetTailCount
+                == max(0, result.mtpTokenCount - 1)
+            else {
+                throw QwenMTPCorpusGateError.correctnessMismatch(
+                    "\(result.caseID) fallback target-tail attribution")
             }
         }
     }
@@ -975,8 +1086,79 @@ public enum QwenMTPCorpusGate {
         else {
             throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) telemetry draft totals")
         }
-        guard telemetry.proposedDraftTokens == 0 || telemetry.targetModelCallCount > 0 else {
-            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) telemetry target calls")
+        guard telemetry.targetModelCallCount == telemetry.roundCount,
+            telemetry.draftModelCallCount == telemetry.roundCount,
+            telemetry.targetVerifiedTokenCount
+                == telemetry.proposedDraftTokens + telemetry.roundCount
+        else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) telemetry call coherence")
+        }
+    }
+
+    private static func validatePhaseAttribution(
+        _ phase: QwenMTPCorpusMTPPhaseAttribution,
+        telemetry: QwenMTPCorpusMTPTelemetry,
+        timing: QwenMTPCorpusTiming,
+        expectsDrafterPriming: Bool,
+        context: String
+    ) throws {
+        let seconds = [
+            phase.targetPrefillSeconds,
+            phase.drafterPromptPrimingSeconds,
+            phase.draftBlockSeconds,
+            phase.targetVerificationSeconds,
+            phase.targetTailSeconds,
+            phase.hybridRewindReplaySeconds,
+            phase.finalizationSeconds,
+            phase.cacheFingerprintSeconds,
+        ]
+        guard seconds.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase timing")
+        }
+
+        let counts = [
+            phase.targetPrefillCount,
+            phase.drafterPromptPrimingCount,
+            phase.draftBlockCount,
+            phase.targetVerificationCount,
+            phase.targetTailCount,
+            phase.hybridRewindReplayCount,
+            phase.finalizationCount,
+            phase.cacheFingerprintCount,
+        ]
+        guard counts.allSatisfy({ $0 >= 0 }) else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase count")
+        }
+        guard phase.targetPrefillCount == 1,
+            phase.drafterPromptPrimingCount == (expectsDrafterPriming ? 1 : 0),
+            phase.draftBlockCount == telemetry.draftModelCallCount,
+            phase.targetVerificationCount == telemetry.targetModelCallCount,
+            phase.targetTailCount <= telemetry.emittedTokenCount,
+            phase.hybridRewindReplayCount <= telemetry.targetModelCallCount + 1,
+            phase.finalizationCount == 1,
+            phase.cacheFingerprintCount == 1
+        else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase count coherence")
+        }
+
+        let zeroCountPhases = [
+            (phase.drafterPromptPrimingCount, phase.drafterPromptPrimingSeconds),
+            (phase.draftBlockCount, phase.draftBlockSeconds),
+            (phase.targetVerificationCount, phase.targetVerificationSeconds),
+            (phase.targetTailCount, phase.targetTailSeconds),
+            (phase.hybridRewindReplayCount, phase.hybridRewindReplaySeconds),
+        ]
+        guard zeroCountPhases.allSatisfy({ count, elapsed in count > 0 || elapsed == 0 }) else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase time without work")
+        }
+
+        let tolerance = 0.005
+        guard phase.promptSeconds <= timing.promptSeconds + tolerance,
+            phase.generationSeconds <= timing.generationSeconds + tolerance,
+            phase.promptSeconds + phase.generationSeconds <= timing.wallSeconds + tolerance
+        else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata("\(context) phase envelope")
         }
     }
 
@@ -1008,6 +1190,12 @@ public enum QwenMTPCorpusGate {
                 do {
                     try validateExactness(sample.exactness, context: "\(sample.caseID) profile[\(sample.pairIndex)]")
                     try validateTelemetry(sample.mtpTelemetry, emittedTokenCount: sample.exactness.mtpTokenCount, context: "\(sample.caseID) profile[\(sample.pairIndex)]")
+                    try validatePhaseAttribution(
+                        sample.mtpPhaseAttribution,
+                        telemetry: sample.mtpTelemetry,
+                        timing: sample.mtpTiming,
+                        expectsDrafterPriming: true,
+                        context: "\(sample.caseID) profile[\(sample.pairIndex)]")
                 } catch {
                     throw QwenMTPCorpusGateError.invalidProfileSample(index: sampleIndex, reason: String(describing: error))
                 }

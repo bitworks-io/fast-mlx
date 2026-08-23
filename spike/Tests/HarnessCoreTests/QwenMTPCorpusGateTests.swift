@@ -4,6 +4,7 @@ import XCTest
 
 final class QwenMTPCorpusGateTests: XCTestCase {
     func testFrozenCorpusIdentityAndCaseOrder() throws {
+        XCTAssertEqual(QwenMTPCorpusGate.schemaVersion, 2)
         XCTAssertEqual(QwenMTPCorpusGate.corpusID, "qwen3.5-9b-mtp-consumer-corpus-v1")
         XCTAssertEqual(QwenMTPCorpusGate.corpusContentHash, "5e3bc2fbb016d5e0")
 
@@ -189,6 +190,42 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                 targetVerifiedTokenCount: 0,
                 emittedTokenCount: 8))
         XCTAssertThrowsError(try QwenMTPCorpusGate.validate(fallbackWithFabricatedTargetCalls))
+
+        var forgedCalls = makePayload()
+        forgedCalls.caseResults[0] = forgedCalls.caseResults[0]
+            .withMTPTelemetry(.init(
+                proposedDraftTokens: 4,
+                acceptedDraftTokens: 3,
+                rejectedDraftTokens: 1,
+                roundCount: 2,
+                targetModelCallCount: 4,
+                draftModelCallCount: 2,
+                targetVerifiedTokenCount: 6,
+                emittedTokenCount: 8))
+            .withMTPPhaseAttribution(phaseAttribution(targetVerificationCount: 4))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(forgedCalls))
+    }
+
+    func testPhaseAttributionMustBeFiniteNonNegativeAndCountCoherent() {
+        var negative = makePayload()
+        negative.caseResults[0] = negative.caseResults[0].withMTPPhaseAttribution(
+            phaseAttribution(draftBlockSeconds: -0.001))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(negative))
+
+        var nonFinite = makePayload()
+        nonFinite.caseResults[0] = nonFinite.caseResults[0].withMTPPhaseAttribution(
+            phaseAttribution(targetVerificationSeconds: .nan))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(nonFinite))
+
+        var wrongDraftCount = makePayload()
+        wrongDraftCount.caseResults[0] = wrongDraftCount.caseResults[0].withMTPPhaseAttribution(
+            phaseAttribution(draftBlockCount: 1))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(wrongDraftCount))
+
+        var missingFingerprint = makePayload()
+        missingFingerprint.caseResults[0] = missingFingerprint.caseResults[0].withMTPPhaseAttribution(
+            phaseAttribution(cacheFingerprintSeconds: 0, cacheFingerprintCount: 0))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(missingFingerprint))
     }
 
     func testNormalFullCasesRequireDraftActivityAndNoPassthrough() {
@@ -212,6 +249,16 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         var drafted = makePayload()
         drafted.caseResults[10] = drafted.caseResults[10].withDrafts(proposed: 1, accepted: 0)
         XCTAssertThrowsError(try QwenMTPCorpusGate.validate(drafted))
+
+        var fabricatedSpeculationCost = makePayload()
+        fabricatedSpeculationCost.caseResults[10] = fabricatedSpeculationCost.caseResults[10]
+            .withMTPPhaseAttribution(fallbackPhaseAttribution(draftBlockSeconds: 0.01))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(fabricatedSpeculationCost))
+
+        var underreportedTailCalls = makePayload()
+        underreportedTailCalls.caseResults[10] = underreportedTailCalls.caseResults[10]
+            .withMTPPhaseAttribution(fallbackPhaseAttribution(targetTailCount: 1))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(underreportedTailCalls))
     }
 
     func testProfileEvidenceQualifiesOnlyAfterCorrectnessPasses() throws {
@@ -351,6 +398,22 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(localPath)) { error in
             XCTAssertFalse(String(describing: error).contains("/models/qwen"))
         }
+
+        var legacyRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        var legacyPayload = try XCTUnwrap(legacyRoot["payload"] as? [String: Any])
+        legacyPayload["schemaVersion"] = 1
+        var legacyCases = try XCTUnwrap(legacyPayload["caseResults"] as? [[String: Any]])
+        for index in legacyCases.indices {
+            legacyCases[index].removeValue(forKey: "mtpPhaseAttribution")
+        }
+        legacyPayload["caseResults"] = legacyCases
+        legacyRoot["payload"] = legacyPayload
+        var legacy = try JSONSerialization.data(withJSONObject: legacyRoot)
+        legacy.append(0x0a)
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(legacy)) { error in
+            XCTAssertEqual(error as? QwenMTPCorpusGateError, .schemaVersionMismatch(1))
+        }
     }
 
     private func makePayload() -> QwenMTPCorpusEvidencePayload {
@@ -404,7 +467,7 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                 acceptedDraftTokens: 3,
                 rejectedDraftTokens: 1,
                 roundCount: 2,
-                targetModelCallCount: 4,
+                targetModelCallCount: 2,
                 draftModelCallCount: 2,
                 targetVerifiedTokenCount: 6,
                 emittedTokenCount: tokenCount)
@@ -432,6 +495,9 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             scalarTiming: .init(promptSeconds: 0.01, generationSeconds: 0.02, wallSeconds: 0.03, e2eSeconds: 0.04),
             mtpTiming: .init(promptSeconds: 0.01, generationSeconds: 0.02, wallSeconds: 0.03, e2eSeconds: 0.04),
             mtpTelemetry: telemetry,
+            mtpPhaseAttribution: isFallback
+                ? fallbackPhaseAttribution()
+                : phaseAttribution(),
             passthroughReason: isFallback ? "Qwen MTP currently requires temperature == 0; generating without speculation" : nil)
     }
 
@@ -476,10 +542,13 @@ final class QwenMTPCorpusGateTests: XCTestCase {
                         acceptedDraftTokens: 8,
                         rejectedDraftTokens: 2,
                         roundCount: 5,
-                        targetModelCallCount: 10,
+                        targetModelCallCount: 5,
                         draftModelCallCount: 5,
                         targetVerifiedTokenCount: 15,
                         emittedTokenCount: 128),
+                    mtpPhaseAttribution: phaseAttribution(
+                        draftBlockCount: 5,
+                        targetVerificationCount: 5),
                     passthroughReason: nil))
             }
         }
@@ -507,6 +576,62 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             corpusId: QwenMTPCorpusGate.corpusID,
             corpusContentHash: QwenMTPCorpusGate.corpusContentHash,
             nonce: "nonce")
+    }
+
+    private func phaseAttribution(
+        targetPrefillSeconds: Double = 0.002,
+        drafterPromptPrimingSeconds: Double = 0.002,
+        draftBlockSeconds: Double = 0.004,
+        targetVerificationSeconds: Double = 0.006,
+        targetTailSeconds: Double = 0,
+        hybridRewindReplaySeconds: Double = 0.001,
+        finalizationSeconds: Double = 0.001,
+        cacheFingerprintSeconds: Double = 0.001,
+        draftBlockCount: Int = 2,
+        targetVerificationCount: Int = 2,
+        targetTailCount: Int = 0,
+        cacheFingerprintCount: Int = 1
+    ) -> QwenMTPCorpusMTPPhaseAttribution {
+        QwenMTPCorpusMTPPhaseAttribution(
+            targetPrefillSeconds: targetPrefillSeconds,
+            drafterPromptPrimingSeconds: drafterPromptPrimingSeconds,
+            draftBlockSeconds: draftBlockSeconds,
+            targetVerificationSeconds: targetVerificationSeconds,
+            targetTailSeconds: targetTailSeconds,
+            hybridRewindReplaySeconds: hybridRewindReplaySeconds,
+            finalizationSeconds: finalizationSeconds,
+            cacheFingerprintSeconds: cacheFingerprintSeconds,
+            targetPrefillCount: 1,
+            drafterPromptPrimingCount: 1,
+            draftBlockCount: draftBlockCount,
+            targetVerificationCount: targetVerificationCount,
+            targetTailCount: targetTailCount,
+            hybridRewindReplayCount: 1,
+            finalizationCount: 1,
+            cacheFingerprintCount: cacheFingerprintCount)
+    }
+
+    private func fallbackPhaseAttribution(
+        draftBlockSeconds: Double = 0,
+        targetTailCount: Int = 7
+    ) -> QwenMTPCorpusMTPPhaseAttribution {
+        QwenMTPCorpusMTPPhaseAttribution(
+            targetPrefillSeconds: 0.002,
+            drafterPromptPrimingSeconds: 0,
+            draftBlockSeconds: draftBlockSeconds,
+            targetVerificationSeconds: 0,
+            targetTailSeconds: 0.01,
+            hybridRewindReplaySeconds: 0,
+            finalizationSeconds: 0.001,
+            cacheFingerprintSeconds: 0.001,
+            targetPrefillCount: 1,
+            drafterPromptPrimingCount: 0,
+            draftBlockCount: 0,
+            targetVerificationCount: 0,
+            targetTailCount: targetTailCount,
+            hybridRewindReplayCount: 0,
+            finalizationCount: 1,
+            cacheFingerprintCount: 1)
     }
 }
 

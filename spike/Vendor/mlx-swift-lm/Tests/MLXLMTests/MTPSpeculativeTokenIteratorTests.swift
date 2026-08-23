@@ -345,7 +345,8 @@ func testMTPSpeculateRoundSmokeWithSynthetics() throws {
         drafter: drafter,
         mainCache: nil,
         parameters: GenerateParameters(maxTokens: 8),
-        blockSize: 4
+        blockSize: 4,
+        collectPhaseTelemetry: true
     )
 
     // First token drained from `next()` is the prepare-time bonus; the
@@ -377,6 +378,16 @@ func testMTPSpeculateRoundSmokeWithSynthetics() throws {
     #expect(telemetry.draftModelCallCount == 1)
     #expect(telemetry.targetVerifiedTokenCount == 4)
     #expect(telemetry.emittedTokenCount == iter.tokenCount)
+    let phases = iter.speculativeDecodingPhaseTelemetry
+    #expect(phases.targetPrefillCount == 1)
+    #expect(phases.drafterPromptPrimingCount == 0)
+    #expect(phases.draftBlockCount == 1)
+    #expect(phases.targetVerificationCount == 1)
+    #expect(phases.hybridRewindReplayCount == 0)
+    #expect(phases.finalizationCount == 0)
+    #expect(phases.targetPrefillSeconds >= 0)
+    #expect(phases.draftBlockSeconds >= 0)
+    #expect(phases.targetVerificationSeconds >= 0)
     // Verify the main model received emit=true on every call after prefill.
     #expect(main.lastIncomingEmitFlag == true)
 }
@@ -866,7 +877,8 @@ func testMTPIteratorUsesSingleStepWhenOnlyOneTokenRemains() throws {
 
     var iter = try MTPSpeculativeTokenIterator(
         input: input, mainModel: main, drafter: drafter, mainCache: [cache],
-        parameters: GenerateParameters(maxTokens: 2), blockSize: 4
+        parameters: GenerateParameters(maxTokens: 2), blockSize: 4,
+        collectPhaseTelemetry: true
     )
 
     let tokens = [iter.next(), iter.next(), iter.next()]
@@ -879,10 +891,15 @@ func testMTPIteratorUsesSingleStepWhenOnlyOneTokenRemains() throws {
     #expect(iter.proposedCount == 0)
     #expect(iter.acceptedCount == 0)
     #expect(cache.offset == 4)
+    #expect(iter.speculativeDecodingPhaseTelemetry.targetTailCount == 1)
+    #expect(iter.speculativeDecodingPhaseTelemetry.targetTailSeconds >= 0)
+    #expect(iter.speculativeDecodingPhaseTelemetry.draftBlockCount == 0)
+    #expect(iter.speculativeDecodingPhaseTelemetry.targetVerificationCount == 0)
 
     iter.finalizeGeneration()
 
     #expect(cache.offset == 5, "the retained single-step tail must be terminally committed")
+    #expect(iter.speculativeDecodingPhaseTelemetry.finalizationCount == 1)
 }
 
 // MARK: - LogitProcessor emit-only invariant
