@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
-import MLXLMCommon
+@testable import MLXLMCommon
 import Testing
 
 // MARK: - Contract check for generateLoopTask's iterator consumption
@@ -66,6 +66,42 @@ private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
     }
 }
 
+private final class FinalizationProbe {
+    var callCount = 0
+    var discardCount = 0
+}
+
+private struct MockFinalizingIterator: GenerationFinalizingTokenIterator {
+    let probe: FinalizationProbe
+    var emitted = false
+
+    let maxTokens: Int? = nil
+    var tokenCount = 0
+    let promptPrefillTime: TimeInterval = 0
+
+    mutating func next() -> Int? {
+        guard !emitted else { return nil }
+        emitted = true
+        tokenCount = 1
+        return 7
+    }
+
+    mutating func finalizeGeneration() {
+        probe.callCount += 1
+    }
+
+    mutating func discardGeneratedToken() {
+        probe.discardCount += 1
+    }
+}
+
+enum SimulatedLoopTermination {
+    case none
+    case taskCancellation
+    case tokenHandlerCancellation
+    case stopTokenHandlerCancellation
+}
+
 // MARK: - Minimal generateLoopTask reproduction
 //
 // The smallest faithful reproduction of the iterator-consuming pattern at
@@ -75,12 +111,30 @@ private struct MockMTPIterator: TokenIteratorProtocol, MTPStatsCollecting {
 // `iterator` binding stayed at zero because the for-in iterated a value-type
 // copy.
 private func consumeIteratorAndBuildInfo(
-    _ iterator: any TokenIteratorProtocol
+    _ iterator: any TokenIteratorProtocol,
+    termination: SimulatedLoopTermination = .none
 ) -> (tokens: [Int], info: GenerateCompletionInfo) {
     var iterator = iterator
     var tokens: [Int] = []
     while let token = iterator.next() {
+        if termination == .taskCancellation {
+            iterator.discardGeneratedToken()
+            break
+        }
+        if termination == .tokenHandlerCancellation
+            || termination == .stopTokenHandlerCancellation
+        {
+            // Faithfully models the two handler-driven `.cancelled` branches
+            // in generateLoopTask. The handler's stream yield was terminated,
+            // so the returned token was not retained by the consumer.
+            iterator.discardGeneratedToken()
+            break
+        }
         tokens.append(token)
+    }
+    if var finalizing = iterator as? any GenerationFinalizingTokenIterator {
+        finalizing.finalizeGeneration()
+        iterator = finalizing
     }
     let mtpStats = iterator as? MTPStatsCollecting
     let info = GenerateCompletionInfo(
@@ -98,6 +152,46 @@ private func consumeIteratorAndBuildInfo(
 
 @Suite
 struct MTPGenerateLoopTaskContractTests {
+
+    @Test
+    func finalizationHookRunsAfterTokenLoop() {
+        let probe = FinalizationProbe()
+
+        let (tokens, _) = consumeIteratorAndBuildInfo(
+            MockFinalizingIterator(probe: probe))
+
+        #expect(tokens == [7])
+        #expect(probe.callCount == 1)
+    }
+
+    @Test
+    func cancellationAfterNextDiscardsTokenBeforeFinalization() {
+        let probe = FinalizationProbe()
+
+        let (tokens, _) = consumeIteratorAndBuildInfo(
+            MockFinalizingIterator(probe: probe), termination: .taskCancellation)
+
+        #expect(tokens.isEmpty)
+        #expect(probe.discardCount == 1)
+        #expect(probe.callCount == 1)
+    }
+
+    @Test(arguments: [
+        SimulatedLoopTermination.tokenHandlerCancellation,
+        .stopTokenHandlerCancellation,
+    ])
+    func handlerCancellationAfterNextDiscardsTokenBeforeFinalization(
+        termination: SimulatedLoopTermination
+    ) {
+        let probe = FinalizationProbe()
+
+        let (tokens, _) = consumeIteratorAndBuildInfo(
+            MockFinalizingIterator(probe: probe), termination: termination)
+
+        #expect(tokens.isEmpty)
+        #expect(probe.discardCount == 1)
+        #expect(probe.callCount == 1)
+    }
 
     /// Load-bearing regression check: the iterator's counters on the outer
     /// binding must reflect the mutations performed by the consuming loop.

@@ -18,6 +18,14 @@ below; a future remote fork may replace this path dependency only at an immutabl
   `QuantizedKVCacheProtocol` route. Existing caches and model call sites retain their behavior.
 - fast-mlx's affine conformer keeps materialization as its default. The split packed route is an
   explicit per-cache opt-in and records the observed operation in post-run scalar telemetry.
+- Reconciled upstream MLX Swift LM PR #351 commit
+  `01472a78fca830689ff78246a82c6d31ab111a78` for Qwen3.5 MTP speculative
+  decoding. The port keeps fast-mlx's local cache-attention path and adapts the
+  PR's Qwen drafter state/one-token hybrid cache rewind semantics to this
+  vendor base without importing unrelated staged-cache upstream history. The
+  native Qwen drafter types remain package-scoped and intentionally absent from
+  model-factory and serving registration; a future loader must first consume
+  fast-mlx's exact artifact preflight binding.
 
 The product remains model-generic. A model whose attention call shape does not use a qualified
 router must fail closed for the packed route and continue to use its existing fp16 path.

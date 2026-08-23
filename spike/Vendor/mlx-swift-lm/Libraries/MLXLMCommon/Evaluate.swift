@@ -524,6 +524,12 @@ public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element 
     mutating func discardGeneratedToken()
 }
 
+/// Internal lifecycle capability for iterators that retain generation work
+/// which must be reconciled after the token loop stops.
+protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
+    mutating func finalizeGeneration()
+}
+
 extension TokenIteratorProtocol {
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? { nil }
     public mutating func discardGeneratedToken() {}
@@ -1664,7 +1670,7 @@ public func generateTokens(
 ///     quantization, etc.).
 ///   - context: model context for the main (verifier) model.
 ///   - mtpDrafter: the ``MTPDrafterModel``. The target is threaded through
-///     ``MTPDrafterModel/draftBlock(target:lastToken:lastHidden:sharedKV:queryOffset:blockSize:sampler:)``
+///     ``MTPDrafterModel/draftBlock(target:lastToken:lastHidden:sharedKV:positionDeltas:queryOffset:blockSize:sampler:)``
 ///     per round; drafter instances hold no target-derived state and are safe
 ///     to share across iterators.
 ///   - blockSize: total tokens per round (`blockSize - 1` drafted plus the
@@ -1844,6 +1850,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             tokenLoop: while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
+                    // `next()` may have returned a speculative token already
+                    // represented in cache. It was never retained or yielded,
+                    // so tell the iterator before terminal reconciliation.
+                    iterator.discardGeneratedToken()
                     stopReason = .cancelled
                     break
                 }
@@ -1865,6 +1875,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                             stopReason = .stop
                             break tokenLoop
                         case .cancelled:
+                            iterator.discardGeneratedToken()
                             stopReason = .cancelled
                             break tokenLoop
                         }
@@ -1883,6 +1894,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     stopReason = .stop
                     break tokenLoop
                 case .cancelled:
+                    iterator.discardGeneratedToken()
                     stopReason = .cancelled
                     break tokenLoop
                 }
@@ -1896,6 +1908,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 } else {
                     stopReason = .cancelled
                 }
+            }
+
+            // Speculative iterators verify several candidates at once. A stop
+            // token, consumer termination, or token limit can leave verified
+            // but unreturned candidates in their shared caches. Remove that
+            // lookahead before ChatSession reconciles its token ledger.
+            if var finalizing = iterator as? any GenerationFinalizingTokenIterator {
+                finalizing.finalizeGeneration()
+                iterator = finalizing
             }
 
             handler.onGenerationEnd(emit: continuation.yield)
