@@ -38,6 +38,11 @@ public enum FastMLXServeArgumentError:
     case autoQuantWithCandidates
     case autoQuantRequiresPickOnly
     case invalidAutoQuantBase
+    case mtpDrafterPathMustBeAbsolute
+    case mtpDrafterRequiresExactQwen35MTP
+    case exactQwen35MTPWithScripted
+    case exactQwen35MTPWithContinuousBatch
+    case exactQwen35MTPWithQuantSource
 
     public var description: String {
         switch self {
@@ -87,6 +92,18 @@ public enum FastMLXServeArgumentError:
                 + "not built yet; it enumerates candidate repo names offline)"
         case .invalidAutoQuantBase:
             "--auto-quant requires a non-empty base repository identifier"
+        case .mtpDrafterPathMustBeAbsolute:
+            "--mtp-drafter-path must be an absolute local path"
+        case .mtpDrafterRequiresExactQwen35MTP:
+            "--mtp-drafter-path requires --exact-qwen35-mtp"
+        case .exactQwen35MTPWithScripted:
+            "--exact-qwen35-mtp loads a model and cannot be combined with --scripted"
+        case .exactQwen35MTPWithContinuousBatch:
+            "--exact-qwen35-mtp is a scalar-fallback exact route and cannot be combined with "
+                + "--continuous-batch-no-spec"
+        case .exactQwen35MTPWithQuantSource:
+            "--exact-qwen35-mtp requires explicit local --model-path/--mtp-drafter-path snapshots "
+                + "and cannot be combined with quant selection flags"
         }
     }
 }
@@ -169,6 +186,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       back to scalar serving. Opt-in (default off);
                                       continuous-only, so it cannot be combined with
                                       --scripted.
+          --exact-qwen35-mtp          Explicitly compose the reviewed exact Qwen3.5 MTP
+                                      target/drafter pair. Default off; target remains
+                                      --model-path and scalar fallback loads first.
+          --mtp-drafter-path PATH     Absolute local drafter snapshot directory for
+                                      --exact-qwen35-mtp.
           --host HOST                 Bind host (default: 127.0.0.1).
           --port PORT                 Bind port (default: 8080; 0 is ephemeral).
           --max-completion-tokens N   Maximum accepted OpenAI completion budget
@@ -253,6 +275,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// combined with `--scripted` (which loads no model). See
     /// docs/task-inbox/2026-08-20-hybrid-continuous-serve-path-admission.md.
     public let allowHybridQwen35: Bool
+    /// `--exact-qwen35-mtp`: explicit opt-in to compose the reviewed exact Qwen3.5 MTP pair on top
+    /// of a separately loaded scalar fallback. Default `false`; the target stays the ordinary
+    /// `--model-path` scalar load, while `mtpDrafterDirectory` carries the separate local drafter
+    /// snapshot when enabled.
+    public let exactQwen35MTP: Bool
+    public let mtpDrafterDirectory: URL?
 
     private init(
         backend: FastMLXServeBackend?,
@@ -273,7 +301,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         planConcurrency: Int? = nil,
         preferMode: String? = nil,
         autoQuantBase: String? = nil,
-        allowHybridQwen35: Bool = false
+        allowHybridQwen35: Bool = false,
+        exactQwen35MTP: Bool = false,
+        mtpDrafterDirectory: URL? = nil
     ) {
         self.backend = backend
         self.host = host
@@ -293,6 +323,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.preferMode = preferMode
         self.autoQuantBase = autoQuantBase
         self.allowHybridQwen35 = allowHybridQwen35
+        self.exactQwen35MTP = exactQwen35MTP
+        self.mtpDrafterDirectory = mtpDrafterDirectory
     }
 
     public static func parse<S: Sequence>(
@@ -323,6 +355,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var preferMode: String?
         var autoQuantBase: String?
         var allowHybridQwen35 = false
+        var exactQwen35MTP = false
+        var mtpDrafterDirectory: URL?
         var evidencePath: URL?
 
         var index = 0
@@ -448,6 +482,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 autoQuantBase = try value(at: index, in: arguments, for: argument)
             case "--allow-hybrid-qwen35":
                 allowHybridQwen35 = true
+            case "--exact-qwen35-mtp":
+                exactQwen35MTP = true
+            case "--mtp-drafter-path":
+                index += 1
+                let path = try value(at: index, in: arguments, for: argument)
+                guard path.hasPrefix("/") else {
+                    throw FastMLXServeArgumentError.mtpDrafterPathMustBeAbsolute
+                }
+                mtpDrafterDirectory = URL(fileURLWithPath: path, isDirectory: true)
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -465,6 +508,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumCompletionTokens: maximumCompletionTokens)
         }
 
+        if mtpDrafterDirectory != nil, !exactQwen35MTP {
+            throw FastMLXServeArgumentError.mtpDrafterRequiresExactQwen35MTP
+        }
+
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
         // not built): mutually exclusive with the local --quant-candidates source, and usable only
         // under --quant-pick-only (enumerate the candidate repo names and exit). Fail closed on any
@@ -478,6 +525,21 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             }
             guard !base.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw FastMLXServeArgumentError.invalidAutoQuantBase
+            }
+        }
+
+        if exactQwen35MTP {
+            if scripted {
+                throw FastMLXServeArgumentError.exactQwen35MTPWithScripted
+            }
+            if continuousBatchNoSpec {
+                throw FastMLXServeArgumentError.exactQwen35MTPWithContinuousBatch
+            }
+            if !quantCandidateDirs.isEmpty || quantPickOnly || autoQuantBase != nil {
+                throw FastMLXServeArgumentError.exactQwen35MTPWithQuantSource
+            }
+            guard mtpDrafterDirectory != nil else {
+                throw FastMLXServeArgumentError.missingRequiredOption("--mtp-drafter-path")
             }
         }
 
@@ -636,7 +698,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             serveTier: serveTier,
             planConcurrency: planConcurrency,
             preferMode: preferMode,
-            allowHybridQwen35: allowHybridQwen35)
+            allowHybridQwen35: allowHybridQwen35,
+            exactQwen35MTP: exactQwen35MTP,
+            mtpDrafterDirectory: mtpDrafterDirectory)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -664,6 +728,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--prefer",
         "--auto-quant",
         "--allow-hybrid-qwen35",
+        "--exact-qwen35-mtp",
+        "--mtp-drafter-path",
     ]
 
     private static func value(

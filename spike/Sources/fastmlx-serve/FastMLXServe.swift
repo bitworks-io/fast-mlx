@@ -132,6 +132,7 @@ private struct PreparedServingBackend {
     let launchedModel: String
     let startupReport: PreparedServingStartupReport?
     let fitDecision: ServingFitDecision?
+    let exactMTPReport: ExactQwen35MTPServeStartupReport?
 
     func startupLine(
         localAddress: String,
@@ -151,8 +152,18 @@ private struct PreparedServingBackend {
             let nativeCacheKinds = Set(
                 report.nativeCacheKinds.map(\.rawValue)
             ).sorted().joined(separator: ",")
+            let route: String
+            let scalarFallbackRoute: String
+            if case .exactSuccess = exactMTPReport?.status {
+                route = ServingExecutionRoute.exactQwen35MTP.rawValue
+                scalarFallbackRoute = "scalar_fallback_route=\(report.route.rawValue)"
+            } else {
+                route = report.route.rawValue
+                scalarFallbackRoute = ""
+            }
+            let exactMTP = exactMTPReport?.machineReadableFields() ?? ""
             return """
-                fastmlx-serve mode=\(mode) route=\(report.route.rawValue) \
+                fastmlx-serve mode=\(mode) route=\(route) \
                 model=\(report.launchedModel) \
                 memory_limit_bytes=\(report.memoryLimitBytes) \
                 cache_limit_bytes=\(report.cacheLimitBytes) \
@@ -165,6 +176,8 @@ private struct PreparedServingBackend {
                 reset_parity_verified=\(report.resetParityVerified) \
                 max_completion_tokens_limit=\(maximumCompletionTokens) \
                 \(report.memoryFieldsFragment) \
+                \(scalarFallbackRoute) \
+                \(exactMTP) \
                 \(fit) \
                 listening=\(localAddress)
                 """
@@ -483,7 +496,8 @@ private func loadScalarServingBackend(
         mode: "scalar",
         launchedModel: arguments.model,
         startupReport: .scalar(loaded.startupReport),
-        fitDecision: fitDecision)
+        fitDecision: fitDecision,
+        exactMTPReport: nil)
 }
 
 private func prepareBackend(
@@ -497,17 +511,81 @@ private func prepareBackend(
             mode: "scripted",
             launchedModel: arguments.model,
             startupReport: nil,
-            fitDecision: nil)
+            fitDecision: nil,
+            exactMTPReport: nil)
     case .scalar(
         let modelDirectory,
         let memoryLimitBytes,
         let cacheLimitBytes
     ):
         let served = try resolveServedDirectory(arguments, fallback: modelDirectory)
+        let exactDrafterDirectory: URL?
+        if arguments.exactQwen35MTP {
+            guard let drafterDirectory = arguments.mtpDrafterDirectory else {
+                throw FastMLXServeArgumentError.missingRequiredOption("--mtp-drafter-path")
+            }
+            exactDrafterDirectory = drafterDirectory
+        } else {
+            exactDrafterDirectory = nil
+        }
+        let fitParsed: ParsedModelArch?
+        if let exactDrafterDirectory {
+            do {
+                let targetParsed = try served.parsed ?? ModelConfigDecoder.decodeModelDirectory(
+                    served.directory,
+                    id: arguments.model)
+                fitParsed = try ExactQwen35MTPCompositeFitProfile.make(
+                    target: targetParsed,
+                    drafterDirectory: exactDrafterDirectory)
+            } catch {
+                let lines = [
+                    "fastmlx-serve fit_check=refused "
+                        + "reason=exact_qwen35_mtp_composition_weights_unavailable",
+                    "  exact Qwen3.5 MTP requires a complete local target and drafter "
+                        + "whose resident safetensor bytes can be sized before load",
+                ]
+                emitFitCheck(lines)
+                throw FitCheckRefusal(lines: lines)
+            }
+        } else {
+            fitParsed = served.parsed
+        }
         let limits = try resolveServingLimits(
             modelDirectory: served.directory, arguments: arguments,
             providedMemory: memoryLimitBytes, providedCache: cacheLimitBytes, providedReservedKV: nil,
-            preParsed: served.parsed)
+            preParsed: fitParsed)
+        if let drafterDirectory = exactDrafterDirectory {
+            let loaded = try await loadExactQwen35MTPServeComposition(
+                configuration: ExactQwen35MTPServeCompositionConfiguration(
+                    launchedModel: arguments.model,
+                    targetDirectory: served.directory,
+                    drafterDirectory: drafterDirectory,
+                    memoryLimitBytes: limits.memoryLimitBytes,
+                    cacheLimitBytes: limits.cacheLimitBytes,
+                    scalarBackendConfiguration: ScalarServingBackendConfiguration(
+                        defaultMaximumCompletionTokens: 512,
+                        maximumQueuedRequests: 2,
+                        queueRetryAfterSeconds: 1,
+                        mailboxCapacity: .init(
+                            maxDeltas: 8,
+                            maxBytes: 32 * 1_024)),
+                    kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16))
+            let mode: String
+            switch loaded.exactStartupReport.status {
+            case .exactSuccess:
+                mode = "exact-qwen35-mtp"
+            case .scalarFallback:
+                mode = "scalar"
+            }
+            return PreparedServingBackend(
+                backend: loaded.backend,
+                evidenceSnapshot: nil,
+                mode: mode,
+                launchedModel: arguments.model,
+                startupReport: .scalar(loaded.scalarStartupReport),
+                fitDecision: limits.fitDecision,
+                exactMTPReport: loaded.exactStartupReport)
+        }
         return try await loadScalarServingBackend(
             arguments: arguments,
             modelDirectory: served.directory,
@@ -621,7 +699,8 @@ private func prepareBackend(
             mode: "continuous-batch-no-spec",
             launchedModel: arguments.model,
             startupReport: .continuous(loaded.startupReport),
-            fitDecision: limits.fitDecision)
+            fitDecision: limits.fitDecision,
+            exactMTPReport: nil)
     case nil:
         preconditionFailure("help is the only invocation without a backend")
     }

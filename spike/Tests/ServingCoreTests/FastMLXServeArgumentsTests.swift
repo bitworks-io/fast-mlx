@@ -659,6 +659,145 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         }
     }
 
+    // MARK: - --exact-qwen35-mtp: explicit local target/drafter opt-in. Default OFF preserves the
+    // existing scalar/continuous routes; the target remains --model-path and the drafter is a separate
+    // absolute local snapshot directory.
+
+    func testExactQwen35MTPParsesAsScalarRouteOptInWithSeparateDrafterPath() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/qwen35-target",
+            "--model", "qwen35-exact",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--exact-qwen35-mtp",
+            "--mtp-drafter-path", "/models/qwen35-drafter",
+        ])
+
+        XCTAssertEqual(
+            arguments.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/qwen35-target", isDirectory: true),
+                memoryLimitBytes: 68_719_476_736,
+                cacheLimitBytes: 8_589_934_592))
+        XCTAssertTrue(arguments.exactQwen35MTP)
+        XCTAssertEqual(
+            arguments.mtpDrafterDirectory,
+            URL(fileURLWithPath: "/models/qwen35-drafter", isDirectory: true))
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--exact-qwen35-mtp"))
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--mtp-drafter-path PATH"))
+    }
+
+    func testExactQwen35MTPDefaultsOffWhenAbsent() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ])
+
+        XCTAssertFalse(arguments.exactQwen35MTP)
+        XCTAssertNil(arguments.mtpDrafterDirectory)
+    }
+
+    func testExactQwen35MTPRequiresAbsoluteDrafterPath() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .missingRequiredOption("--mtp-drafter-path"))
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "relative/drafter",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .mtpDrafterPathMustBeAbsolute)
+        }
+    }
+
+    func testMTPDrafterPathCannotBePassedWithoutExactQwen35MTP() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .mtpDrafterRequiresExactQwen35MTP)
+        }
+    }
+
+    func testExactQwen35MTPRejectsScriptedContinuousAndQuantSources() {
+        let common = [
+            "--model-path", "/models/qwen35-target",
+            "--model", "qwen35-exact",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--exact-qwen35-mtp",
+            "--mtp-drafter-path", "/models/qwen35-drafter",
+        ]
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--exact-qwen35-mtp", "--mtp-drafter-path", "/models/qwen35-drafter"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithScripted)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(common + ["--continuous-batch-no-spec", "--max-reserved-kv-bytes", "17179869184"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithContinuousBatch)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/q4,/models/q8",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithQuantSource)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-pick-only",
+                "--quant-candidates", "/models/q4,/models/q8",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithQuantSource)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-pick-only",
+                "--auto-quant", "mlx-community/Qwen3-8B",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+            ])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithQuantSource)
+        }
+    }
+
     // MARK: - --plan-concurrency: opt-in planning slot count. The fit-check verdict is computed at
     // concurrency=1 by default (the shipped, byte-identical behavior); an operator who will actually
     // run N concurrent decode streams can request the stricter, concurrency-aware verdict with this
