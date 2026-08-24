@@ -215,6 +215,26 @@ public struct QwenMTPArtifactBinding: Equatable, Sendable {
     /// One committed input plus two drafted tokens for the exact block_size=3 row.
     public let runtimeBlockSize: Int
     public let maximumAcceptedDraftTokens: Int
+
+    package init(
+        targetModelID: String,
+        drafterModelID: String,
+        targetRevision: String,
+        drafterRevision: String,
+        sourceRevision: String,
+        architecture: QwenMTPArchitecture,
+        runtimeBlockSize: Int,
+        maximumAcceptedDraftTokens: Int
+    ) {
+        self.targetModelID = targetModelID
+        self.drafterModelID = drafterModelID
+        self.targetRevision = targetRevision
+        self.drafterRevision = drafterRevision
+        self.sourceRevision = sourceRevision
+        self.architecture = architecture
+        self.runtimeBlockSize = runtimeBlockSize
+        self.maximumAcceptedDraftTokens = maximumAcceptedDraftTokens
+    }
 }
 
 public enum QwenMTPArtifactPreflightError: Error, Equatable, Sendable {

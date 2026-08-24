@@ -47,6 +47,22 @@ func testMTPGenerateTokensOverloadIsCallableSurface() {
 }
 
 @Test
+func testMTPGenerateTaskOverloadIsCallableSurface() {
+    let _:
+        (
+            LMInput, [KVCache]?, GenerateParameters, ModelContext,
+            any MTPDrafterModel, Int, WiredMemoryTicket?
+        ) throws -> (AsyncStream<Generation>, Task<Void, Never>) = {
+            input, cache, params, ctx, drafter, block, ticket in
+            try generateTask(
+                input: input, cache: cache, parameters: params, context: ctx,
+                mtpDrafter: drafter, blockSize: block, wiredMemoryTicket: ticket,
+                parseToolCalls: false
+            )
+        }
+}
+
+@Test
 func testMTPGenerateUsesBlockSizeDefaultOfFour() {
     // The default value of `blockSize` is part of the public API surface.
     // Probe it via Mirror-equivalent: call the function with the default

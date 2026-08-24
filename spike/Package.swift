@@ -94,6 +94,7 @@ let package = Package(
                 "ServingCore",
                 "SpikeCore",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
@@ -111,6 +112,8 @@ let package = Package(
                 "SpikeServingAdapters",
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]

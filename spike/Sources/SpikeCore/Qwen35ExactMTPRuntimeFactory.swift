@@ -28,6 +28,27 @@ public enum Qwen35ExactMTPRuntimeFactory {
             progressHandler: progressHandler)
     }
 
+    /// Bridges the vendored binding carried by an admitted loaded pair into the independent
+    /// HarnessCore admission domain. Callers must derive serving admission from the pair itself;
+    /// accepting a separately supplied binding could authorize a different target/drafter pair.
+    package static func servingBinding(
+        for pair: borrowing Qwen35ExactMTPLoadedPair
+    ) throws -> QwenMTPArtifactBinding {
+        try validateKnownLockParity()
+        let vendored = pair.binding
+        let harness = QwenMTPArtifactBinding(
+            targetModelID: vendored.targetModelID,
+            drafterModelID: vendored.drafterModelID,
+            targetRevision: vendored.targetRevision,
+            drafterRevision: vendored.drafterRevision,
+            sourceRevision: vendored.sourceRevision,
+            architecture: harnessArchitecture(vendored.architecture),
+            runtimeBlockSize: vendored.runtimeBlockSize,
+            maximumAcceptedDraftTokens: vendored.maximumAcceptedDraftTokens)
+        try requireEquivalentBinding(vendored: vendored, harness: harness)
+        return harness
+    }
+
     package static func validateKnownLockParity() throws {
         guard harnessLock(Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1)
             == QwenMTPKnownArtifactLocks.qwen35_9BDepth1

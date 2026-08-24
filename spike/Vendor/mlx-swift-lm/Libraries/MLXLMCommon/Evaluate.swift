@@ -1711,6 +1711,47 @@ public func generate(
     return stream
 }
 
+/// Generates text and tool calls asynchronously using MTP speculative decoding,
+/// returning both the stream and the underlying task.
+///
+/// Prefer this overload when the caller must own cancellation/finalization
+/// boundaries. The returned task is the existing generation loop task; awaiting
+/// it observes when iterator finalization and stream termination have completed.
+public func generateTask(
+    input: LMInput,
+    cache: [KVCache]? = nil,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    blockSize: Int = 4,
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil,
+    parseToolCalls: Bool = true
+) throws -> (AsyncStream<Generation>, Task<Void, Never>) {
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        drafter: mtpDrafter,
+        mainCache: cache,
+        parameters: parameters,
+        blockSize: blockSize
+    )
+    return generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: context.tokenizer,
+            stopStrings: context.configuration.effectiveStopStrings,
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools,
+            parseToolCalls: parseToolCalls
+        )
+    )
+}
+
 /// Generates raw token IDs asynchronously using MTP speculative decoding.
 ///
 /// Parallels
@@ -2271,15 +2312,18 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
 
     var detokenizer: NaiveStreamingDetokenizer
     var stopStringFilter: StopStringFilter
-    let toolCallProcessor: ToolCallProcessor
+    let toolCallProcessor: ToolCallProcessor?
 
     init(
         tokenizer: Tokenizer, stopStrings: Set<String> = [], format: ToolCallFormat,
-        tools: [[String: any Sendable]]? = nil
+        tools: [[String: any Sendable]]? = nil,
+        parseToolCalls: Bool = true
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         stopStringFilter = StopStringFilter(stopStrings: stopStrings)
-        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        toolCallProcessor = parseToolCalls
+            ? ToolCallProcessor(format: format, tools: tools)
+            : nil
     }
 
     mutating func onToken(
@@ -2320,7 +2364,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
             }
         }
 
-        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
+        if let bufferedText = toolCallProcessor?.processEOS(returnBufferedText: true),
             !bufferedText.isEmpty
         {
             if case .terminated = emit(.chunk(bufferedText)) {
@@ -2328,7 +2372,7 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
             }
         }
 
-        for toolCall in toolCallProcessor.drainToolCalls() {
+        for toolCall in toolCallProcessor?.drainToolCalls() ?? [] {
             if case .terminated = emit(.toolCall(toolCall)) {
                 break
             }
@@ -2344,6 +2388,13 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler {
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) -> TokenLoopDisposition {
         guard !text.isEmpty else {
+            return .more
+        }
+
+        guard let toolCallProcessor else {
+            if case .terminated = emit(.chunk(text)) {
+                return .cancelled
+            }
             return .more
         }
 
