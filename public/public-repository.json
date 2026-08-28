@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 806,
-    "pathModeSha256": "0830d2e6f06285843d00d1b9f687e8a724c5b34a9c3f5b1531a88dc7ed4f02b9"
+    "pathCount": 808,
+    "pathModeSha256": "b738967973c97543470e48747a9827f04c1a1dfb8c68e6cfde151c1b62a97766"
   },
   "files": [
     {"source": ".gitignore", "destination": ".gitignore"},

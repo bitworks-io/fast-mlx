@@ -71,8 +71,8 @@
       "id": "capacity-proof-control-tools",
       "name": "Capacity and proof-control tools",
       "status": "implemented",
-      "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and fail-closed evidence controls make resource and identity assumptions inspectable.",
-      "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Planning and comparison tools do not mutate macOS, prove that a model fits every Mac, establish launchability, or prove runtime containment.",
+      "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and dry-run-only dedicated qualification plans make resource and identity assumptions inspectable.",
+      "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Qualification plans record staged safety gates but grant no privilege and perform no host mutation. Planning and comparison tools do not prove that a model fits every Mac, establish launchability, or prove runtime containment.",
       "evidenceSlugs": [
         "the-wall-that-wasnt",
         "lossless-wasnt-byte-identical"

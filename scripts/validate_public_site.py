@@ -110,8 +110,8 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         "id": "capacity-proof-control-tools",
         "name": "Capacity and proof-control tools",
         "status": "implemented",
-        "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and fail-closed evidence controls make resource and identity assumptions inspectable.",
-        "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Planning and comparison tools do not mutate macOS, prove that a model fits every Mac, establish launchability, or prove runtime containment.",
+        "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and dry-run-only dedicated qualification plans make resource and identity assumptions inspectable.",
+        "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Qualification plans record staged safety gates but grant no privilege and perform no host mutation. Planning and comparison tools do not prove that a model fits every Mac, establish launchability, or prove runtime containment.",
         "evidenceSlugs": ("the-wall-that-wasnt", "lossless-wasnt-byte-identical"),
     },
     {
@@ -196,13 +196,13 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_378
+REVIEWED_STATUS_PAGE_BYTES = 22_477
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "b55d407cf45a8c7a78836846ba8695f413561467a11776653e7dea29f692f383"
+    "68a4ac7ee1182988ced7e73e5efcc34174e6e09d52c04f31d074958a8895ee8d"
 )
-REVIEWED_CAPABILITIES_PAGE_BYTES = 17_648
+REVIEWED_CAPABILITIES_PAGE_BYTES = 17_747
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
-    "21603b69e58179def2e533d5a1cab7e19fe6c5a21ab0129888a5f5fafef58384"
+    "912d625e35eeabf72dc19aa559a69f528308d836e43a813a108434ef018c93fb"
 )
 REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "openai-http-sse-serving": (
@@ -230,8 +230,8 @@ REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
         "5af2a4a2b2941368c0b6521de0a18bd2d5bf3fdf33d3a246f616e4065bb523c7",
     ),
     "capacity-proof-control-tools": (
-        5_734,
-        "bcc13247ae4580714538ae3b7f5fd1bedb3cd92820c0a0d1696e08c838871e7f",
+        5_833,
+        "b189d8dddb5dcb524231051792724b50b769fdb5b7c6c2c7a839f705cdbcb96a",
     ),
     "openai-tool-calling": (
         5_778,

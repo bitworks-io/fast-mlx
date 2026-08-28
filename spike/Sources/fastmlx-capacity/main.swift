@@ -207,6 +207,91 @@ func takeFlag(_ flag: String, in args: inout [String]) -> Bool {
     return true
 }
 
+func failDedicatedServingPlan(_ message: String) -> Never {
+    FileHandle.standardError.write("error: \(message)\n".data(using: .utf8)!)
+    exit(2)
+}
+
+func takeRequiredValue(for flag: String, in args: inout [String]) -> String {
+    guard let value = takeValue(for: flag, in: &args) else {
+        failDedicatedServingPlan("\(flag) is required for --dedicated-serving-plan")
+    }
+    return value
+}
+
+func takeRequiredPositiveInt(for flag: String, in args: inout [String]) -> Int {
+    let rawValue = takeRequiredValue(for: flag, in: &args)
+    guard let parsed = Int(rawValue), parsed > 0 else {
+        failDedicatedServingPlan("\(flag) must be a positive integer")
+    }
+    return parsed
+}
+
+func dedicatedServingPlanFollowOnCandidates(after candidateCeilingMiB: Int) -> [Int] {
+    let ladder = [224 * 1024, 232 * 1024, 240 * 1024]
+    guard let index = ladder.firstIndex(of: candidateCeilingMiB) else { return [] }
+    return Array(ladder.suffix(from: index + 1))
+}
+
+func runDedicatedServingPlan(_ args: [String]) -> Never {
+    var planArgs = args
+    let hostUse = takeRequiredValue(for: "--host-use", in: &planArgs)
+    guard hostUse == HostUseClassification.Use.dedicatedServing.rawValue else {
+        failDedicatedServingPlan("--host-use must be dedicated-serving")
+    }
+
+    let candidateCeilingMiB = takeRequiredPositiveInt(for: "--candidate-ceiling-mib", in: &planArgs)
+    let osServiceReserveBytes = takeRequiredPositiveInt(for: "--os-service-reserve-bytes", in: &planArgs)
+    let memoryLimitBytes = takeRequiredPositiveInt(for: "--mlx-memory-limit-bytes", in: &planArgs)
+    let cacheLimitBytes = takeRequiredPositiveInt(for: "--mlx-cache-limit-bytes", in: &planArgs)
+    let kvBudgetBytes = takeRequiredPositiveInt(for: "--mlx-kv-budget-bytes", in: &planArgs)
+    let ioPrefetchBudgetBytes = takeRequiredPositiveInt(for: "--io-prefetch-budget-bytes", in: &planArgs)
+
+    guard planArgs.isEmpty else {
+        failDedicatedServingPlan("unknown --dedicated-serving-plan argument '\(planArgs[0])'")
+    }
+
+    let hostReport = SystemProfiler.probe()
+    guard let recommendedWorkingSet = hostReport.recommendedWorkingSetBytes else {
+        failDedicatedServingPlan("Metal recommended working set is unavailable")
+    }
+    guard let currentAllocated = hostReport.currentGPUAllocBytes else {
+        failDedicatedServingPlan("Metal current allocation is unavailable")
+    }
+
+    let selectedHostUse = HostUseClassification.operatorAssertedDedicatedServing()
+    let host = DedicatedServingQualificationHost(
+        hostUse: selectedHostUse.rawValue,
+        hostUseSource: selectedHostUse.source.rawValue,
+        hostUsePolicyVersion: selectedHostUse.policyVersion,
+        physicalRAMBytes: hostReport.totalRAMBytes,
+        originalWiredLimitBytes: hostReport.wiredLimitBytes,
+        originalWiredLimitProvenance: hostReport.wiredLimitIsDefault ? .synthesized : .measured,
+        metalRecommendedWorkingSetBytes: recommendedWorkingSet,
+        metalCurrentAllocatedBytes: currentAllocated,
+        osBuild: ProcessInfo.processInfo.operatingSystemVersionString,
+        osBuildSource: DedicatedServingQualificationHost.processInfoOSBuildSource)
+    let input = DedicatedServingQualificationInput(
+        host: host,
+        osServiceReserveBytes: osServiceReserveBytes,
+        candidateCeilingMiB: candidateCeilingMiB,
+        stagedFollowOnCandidateMiB: dedicatedServingPlanFollowOnCandidates(after: candidateCeilingMiB),
+        mlxBudgets: DedicatedServingQualificationBudgets(
+            memoryLimitBytes: memoryLimitBytes,
+            cacheLimitBytes: cacheLimitBytes,
+            kvBudgetBytes: kvBudgetBytes,
+            ioPrefetchBudgetBytes: ioPrefetchBudgetBytes))
+
+    do {
+        print(try DedicatedServingQualificationPlanner.plan(input).encodedJSON())
+        exit(0)
+    } catch let error as DedicatedServingQualificationError {
+        failDedicatedServingPlan(error.description)
+    } catch {
+        failDedicatedServingPlan(error.localizedDescription)
+    }
+}
+
 /// Resolve `--box` to the profile capacity is computed against. Defaults to the live host; the
 /// named presets let an operator plan for a target box they aren't currently running on (e.g.
 /// sizing a 512GB-Ultra deployment from a laptop) — capacity planning, not just current-box report.
@@ -224,6 +309,10 @@ func resolveBox(_ arg: String?, hostReport: HostReport) -> (SystemProfile, Strin
 }
 
 var args = Array(CommandLine.arguments.dropFirst())
+let dedicatedServingPlanFlag = takeFlag("--dedicated-serving-plan", in: &args)
+if dedicatedServingPlanFlag {
+    runDedicatedServingPlan(args)
+}
 let modelID = takeValue(for: "--model", in: &args)
 let contextWasSpecified = args.contains("--context")
 let contextValue = takeValue(for: "--context", in: &args)
