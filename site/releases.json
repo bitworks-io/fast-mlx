@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "dedicated-serving-qualification-planner",
+      "title": "Publish dedicated-serving qualification planning",
+      "publishedAt": "2026-08-28T14:53:17-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes a fail-closed, dry-run-only dedicated-serving qualification planner with explicit host evidence, staged ceiling candidates, and reconciled allocator budgets.",
+      "scope": "Planning source and tests only; no privilege, sysctl mutation, persistence, live host qualification, model load, runtime promotion, or deployment authority.",
+      "publicCommit": "5f070f128d68de97544c912bcde5223a76c97304",
+      "publicLinks": [
+        {
+          "label": "Inspect the capacity capability",
+          "path": "capabilities/capacity-proof-control-tools/"
+        },
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "seeded-sampled-mtp-diagnostic-provider",
       "title": "Publish seeded sampled-MTP diagnostics",
       "publishedAt": "2026-08-28T12:45:33-05:00",

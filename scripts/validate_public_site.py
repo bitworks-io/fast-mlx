@@ -170,9 +170,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_332
+REVIEWED_HOME_PAGE_BYTES = 10_346
 REVIEWED_HOME_PAGE_SHA256 = (
-    "2cacb870b69b5d2bfcb4695653ca62c0c672ecabb255d8705256fa220be71005"
+    "a070e4bcb3b5d388b930ffb2e1491f8b5df666e91e9f4db0814eef3630d95b18"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -196,9 +196,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_477
+REVIEWED_STATUS_PAGE_BYTES = 22_491
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "68a4ac7ee1182988ced7e73e5efcc34174e6e09d52c04f31d074958a8895ee8d"
+    "8e9d59cdc3272bf32bbdf454230ea31ea0b9c8a6db6f0437d020162d3f84b255"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 17_747
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -373,8 +373,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/seeded-sampled-mtp-diagnostic-provider/",
-    "https://github.com/bitworks-io/fast-mlx/commit/137d88d79d15fc65f169ba5dce79db75723ac92e",
+    "../releases/dedicated-serving-qualification-planner/",
+    "https://github.com/bitworks-io/fast-mlx/commit/5f070f128d68de97544c912bcde5223a76c97304",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -386,7 +386,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "23 published research notes",
-    "17 reviewed release records",
+    "18 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -529,11 +529,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 17_163
+REVIEWED_RELEASE_INDEX_BYTES = 18_316
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "0edb5efc63619323423f33f568791234f8c084562a06ce7f5974f9fa8bb9533b"
+    "362744aefad4fac44b1ed543e875db0faea90ae75019de13756073a582fba125"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "dedicated-serving-qualification-planner",
+        "Publish dedicated-serving qualification planning",
+    ),
     (
         "seeded-sampled-mtp-diagnostic-provider",
         "Publish seeded sampled-MTP diagnostics",
@@ -565,6 +569,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "dedicated-serving-qualification-planner": (
+        4_770,
+        "750df5a0bf2fe91613e22bafa16dce9978374be3c83a87f8da834e1d498eb6dc",
+    ),
     "seeded-sampled-mtp-diagnostic-provider": (
         4_699,
         "c5126d6be5ac5934a04e4493f3f6a52e912e45df1755342002ea604badbd95f3",
@@ -3254,7 +3262,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "seeded-sampled-mtp-diagnostic-provider",
+        "data-latest-release-id": "dedicated-serving-qualification-planner",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }
