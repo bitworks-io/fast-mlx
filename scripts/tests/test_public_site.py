@@ -296,23 +296,22 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "current-inference-and-capacity-foundations",
-                "title": "Publish current inference and capacity foundations",
-                "publishedAt": "2026-08-28T10:42:43-05:00",
+                "id": "seeded-sampled-mtp-diagnostic-provider",
+                "title": "Publish seeded sampled-MTP diagnostics",
+                "publishedAt": "2026-08-28T12:45:33-05:00",
                 "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes default-off sampled-MTP composition, adaptive serving "
-                    "controls, bounded Qwen3 MoE residency foundations, and auditable "
-                    "shared or dedicated capacity planning."
+                    "Publishes a caller-seeded, domain-separated sampled-MTP "
+                    "diagnostic provider with reproducible draw traces and "
+                    "transactional failure behavior."
                 ),
                 "scope": (
-                    "Source, tests, and fail-closed evidence only; no sampled-serving "
-                    "default, Qwen3.8-27B performance-parity claim, live MoE expert-"
-                    "streaming claim, model weights, production promotion, or host-"
-                    "mutation authority."
+                    "Default-off source and tests only; no sampled-serving default, "
+                    "model runtime or loader support, Qwen3.8-27B exactness or "
+                    "performance claim, production promotion, or host authority."
                 ),
-                "publicCommit": "17ce331930929b1deb100cd6afed60ca993e665d",
+                "publicCommit": "137d88d79d15fc65f169ba5dce79db75723ac92e",
                 "publicLinks": [
                     {
                         "label": "Inspect the capabilities",
@@ -333,6 +332,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "137d88d79d15fc65f169ba5dce79db75723ac92e",
                 "17ce331930929b1deb100cd6afed60ca993e665d",
                 "9e1424b62e3d36108992322664af5ed7c82a1298",
                 "c9ba0341a473dccf219f421efefedf3df3e30e2f",
