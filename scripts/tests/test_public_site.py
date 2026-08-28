@@ -296,32 +296,31 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "deterministic-sampled-generation-foundation",
-                "title": "Publish deterministic sampled-generation foundation",
-                "publishedAt": "2026-08-16T15:25:00-05:00",
+                "id": "current-inference-and-capacity-foundations",
+                "title": "Publish current inference and capacity foundations",
+                "publishedAt": "2026-08-28T10:42:43-05:00",
                 "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes the deterministic CPU sampling oracle, exact contract "
-                    "tests, capability page, and technical note."
+                    "Publishes default-off sampled-MTP composition, adaptive serving "
+                    "controls, bounded Qwen3 MoE residency foundations, and auditable "
+                    "shared or dedicated capacity planning."
                 ),
                 "scope": (
-                    "Internal deterministic CPU foundation only; no sampled HTTP/SSE "
-                    "serving, request/scheduler integration, MLX/model/tokenizer/"
-                    "automatic-entropy path, fusion, or performance claim."
+                    "Source, tests, and fail-closed evidence only; no sampled-serving "
+                    "default, Qwen3.8-27B performance-parity claim, live MoE expert-"
+                    "streaming claim, model weights, production promotion, or host-"
+                    "mutation authority."
                 ),
-                "publicCommit": "9e1424b62e3d36108992322664af5ed7c82a1298",
+                "publicCommit": "17ce331930929b1deb100cd6afed60ca993e665d",
                 "publicLinks": [
                     {
-                        "label": "Inspect the capability",
-                        "path": (
-                            "capabilities/"
-                            "deterministic-sampled-generation-foundation/"
-                        ),
+                        "label": "Inspect the capabilities",
+                        "path": "capabilities/",
                     },
                     {
-                        "label": "Read the technical note",
-                        "path": "research/sampling-before-serving/",
+                        "label": "See the improvement loop",
+                        "path": "process/",
                     },
                     {
                         "label": "Read the release JSON",
@@ -334,6 +333,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "17ce331930929b1deb100cd6afed60ca993e665d",
                 "9e1424b62e3d36108992322664af5ed7c82a1298",
                 "c9ba0341a473dccf219f421efefedf3df3e30e2f",
                 "1bb670b0d4be82e294f392c4cb35b0c9977a9f89",

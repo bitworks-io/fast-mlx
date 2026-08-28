@@ -240,7 +240,7 @@ class PublicCapabilityDetailTests(unittest.TestCase):
             index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
             detail_path.write_text(
                 original_detail.replace(
-                    "A chat-completions transport with streaming, bounded admission, cancellation, and evidence output.",
+                    "A chat-completions transport with streaming, bounded admission, cancellation, configurable completion ceilings, and evidence output.",
                     "Tampered but jointly reflected.",
                     1,
                 ),

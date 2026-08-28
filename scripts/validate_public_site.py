@@ -56,16 +56,16 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         "id": "openai-http-sse-serving",
         "name": "OpenAI-compatible HTTP/SSE serving",
         "status": "promoted-scoped",
-        "summary": "A chat-completions transport with streaming, bounded admission, cancellation, and evidence output.",
-        "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Scripted mode is transport-only, and no model weights are bundled.",
+        "summary": "A chat-completions transport with streaming, bounded admission, cancellation, configurable completion ceilings, and evidence output.",
+        "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Completion ceilings are request and operator controls, not a model-quality claim. Scripted mode is transport-only, and no model weights are bundled.",
         "evidenceSlugs": ("the-proof-did-not-end-when-the-timer-did",),
     },
     {
         "id": "exact-continuous-batching",
         "name": "Exact continuous batching",
         "status": "promoted-scoped",
-        "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route.",
-        "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. It is not an automatic router, a sampled-generation route, or a general model-family default.",
+        "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route, with a default-off adaptive solo-to-batch transition.",
+        "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. Adaptive late join is an explicit control with regression coverage; it is not a sampled-generation route, an unqualified automatic default, or a general model-family claim.",
         "evidenceSlugs": (
             "the-fastest-request-wasnt-the-fastest-service",
             "the-proof-did-not-end-when-the-timer-did",
@@ -110,8 +110,8 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         "id": "capacity-proof-control-tools",
         "name": "Capacity and proof-control tools",
         "status": "implemented",
-        "summary": "Command-line planning, provenance, and fail-closed evidence controls make resource and identity assumptions inspectable.",
-        "scope": "Planning and comparison tools do not prove that a model fits every Mac, that an artifact is launchable, or that a runtime is contained.",
+        "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and fail-closed evidence controls make resource and identity assumptions inspectable.",
+        "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Planning and comparison tools do not mutate macOS, prove that a model fits every Mac, establish launchability, or prove runtime containment.",
         "evidenceSlugs": ("the-wall-that-wasnt", "lossless-wasnt-byte-identical"),
     },
     {
@@ -170,9 +170,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_318
+REVIEWED_HOME_PAGE_BYTES = 10_407
 REVIEWED_HOME_PAGE_SHA256 = (
-    "068f775026a241f0f2ab3d0481d04595d9651b3cc15aa511d106fb675967754b"
+    "19db955c966b313e7452deb884a33ff8e08bed05816ec58d538f291b4b1c6994"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -196,22 +196,22 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 21_940
+REVIEWED_STATUS_PAGE_BYTES = 22_453
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "600c86c7dea27a3e656732a16eabc5898193ad063346d27ee17fe791659e7aa8"
+    "96a3819ed47a679ee163dd5573831e1219d0b6948416b2859f0af747682b469c"
 )
-REVIEWED_CAPABILITIES_PAGE_BYTES = 17_224
+REVIEWED_CAPABILITIES_PAGE_BYTES = 17_648
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
-    "3aba353ea977d78b0e9fdb0a88bc1d9138281c073bad3c0dbfe866f6c5e749f6"
+    "21603b69e58179def2e533d5a1cab7e19fe6c5a21ab0129888a5f5fafef58384"
 )
 REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "openai-http-sse-serving": (
-        5_218,
-        "ee0d20469fb5b850c534ee37e940e5d34562ad61536dff3373238f4b47f47b60",
+        5_334,
+        "33e959e88b3d3840f3dba8933e5cf9085db7ca0b6da0eea4a7680ba1515d27bd",
     ),
     "exact-continuous-batching": (
-        5_552,
-        "816aa47d8282e086085f30ca4f771a95d8404b1e3238a7f2822bf9af2e919e42",
+        5_685,
+        "936b54ca0831bda1d1d60b6ed47d593e5e087f3ddc6bf3361a81bb52feb37ca7",
     ),
     "deterministic-sampled-generation-foundation": (
         5_292,
@@ -230,8 +230,8 @@ REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
         "5af2a4a2b2941368c0b6521de0a18bd2d5bf3fdf33d3a246f616e4065bb523c7",
     ),
     "capacity-proof-control-tools": (
-        5_559,
-        "f5b86d209a73f0c20784ea05fe655f970245ac68f5de5a9d90521649bbe98dd9",
+        5_734,
+        "bcc13247ae4580714538ae3b7f5fd1bedb3cd92820c0a0d1696e08c838871e7f",
     ),
     "openai-tool-calling": (
         5_778,
@@ -373,8 +373,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/deterministic-sampled-generation-foundation/",
-    "https://github.com/bitworks-io/fast-mlx/commit/9e1424b62e3d36108992322664af5ed7c82a1298",
+    "../releases/current-inference-and-capacity-foundations/",
+    "https://github.com/bitworks-io/fast-mlx/commit/17ce331930929b1deb100cd6afed60ca993e665d",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -386,7 +386,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "23 published research notes",
-    "15 reviewed release records",
+    "16 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -529,11 +529,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 14_884
+REVIEWED_RELEASE_INDEX_BYTES = 16_059
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "64ecdaba9b4c4e9974d30e94f6485fcdc80cb8741e5c09b46b0bbfb8441177db"
+    "54307a64bb63a48b53805bc2ee2b3364f31619d7b4888a2ec1ad0afdd6ad0627"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "current-inference-and-capacity-foundations",
+        "Publish current inference and capacity foundations",
+    ),
     (
         "deterministic-sampled-generation-foundation",
         "Publish deterministic sampled-generation foundation",
@@ -557,6 +561,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "current-inference-and-capacity-foundations": (
+        4_802,
+        "3cdb994c04f6caa781a26705ab73a936e3edbeb45adad247f516257a05b17799",
+    ),
     "deterministic-sampled-generation-foundation": (
         4_782,
         "d475f2b4caa4843ead4bc12295051044523a2328d85dbe00fcf57f8efbc22d13",
@@ -3238,7 +3246,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "deterministic-sampled-generation-foundation",
+        "data-latest-release-id": "current-inference-and-capacity-foundations",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }

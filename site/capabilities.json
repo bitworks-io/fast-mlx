@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "policy": "fast-mlx-owned-results-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-17",
+  "updatedAt": "2026-08-28",
   "capabilities": [
     {
       "id": "openai-http-sse-serving",
       "name": "OpenAI-compatible HTTP/SSE serving",
       "status": "promoted-scoped",
-      "summary": "A chat-completions transport with streaming, bounded admission, cancellation, and evidence output.",
-      "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Scripted mode is transport-only, and no model weights are bundled.",
+      "summary": "A chat-completions transport with streaming, bounded admission, cancellation, configurable completion ceilings, and evidence output.",
+      "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Completion ceilings are request and operator controls, not a model-quality claim. Scripted mode is transport-only, and no model weights are bundled.",
       "evidenceSlugs": [
         "the-proof-did-not-end-when-the-timer-did"
       ]
@@ -18,8 +18,8 @@
       "id": "exact-continuous-batching",
       "name": "Exact continuous batching",
       "status": "promoted-scoped",
-      "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route.",
-      "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. It is not an automatic router, a sampled-generation route, or a general model-family default.",
+      "summary": "Simultaneous dense-model streams can join, advance, cancel, and release reservations through one explicit no-spec route, with a default-off adaptive solo-to-batch transition.",
+      "scope": "The measured policy is a dense-Qwen building block for the named paired workloads. Adaptive late join is an explicit control with regression coverage; it is not a sampled-generation route, an unqualified automatic default, or a general model-family claim.",
       "evidenceSlugs": [
         "the-fastest-request-wasnt-the-fastest-service",
         "the-proof-did-not-end-when-the-timer-did"
@@ -71,8 +71,8 @@
       "id": "capacity-proof-control-tools",
       "name": "Capacity and proof-control tools",
       "status": "implemented",
-      "summary": "Command-line planning, provenance, and fail-closed evidence controls make resource and identity assumptions inspectable.",
-      "scope": "Planning and comparison tools do not prove that a model fits every Mac, that an artifact is launchable, or that a runtime is contained.",
+      "summary": "Command-line planning, explicit shared or dedicated host profiles, auditable v2 capacity artifacts, and fail-closed evidence controls make resource and identity assumptions inspectable.",
+      "scope": "Shared or unspecified hosts use a conservative 75% ceiling; dedicated mode requires an explicit reserve. Planning and comparison tools do not mutate macOS, prove that a model fits every Mac, establish launchability, or prove runtime containment.",
       "evidenceSlugs": [
         "the-wall-that-wasnt",
         "lossless-wasnt-byte-identical"

@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-16",
+  "updatedAt": "2026-08-28",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,30 @@
     }
   },
   "releases": [
+    {
+      "id": "current-inference-and-capacity-foundations",
+      "title": "Publish current inference and capacity foundations",
+      "publishedAt": "2026-08-28T10:42:43-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes default-off sampled-MTP composition, adaptive serving controls, bounded Qwen3 MoE residency foundations, and auditable shared or dedicated capacity planning.",
+      "scope": "Source, tests, and fail-closed evidence only; no sampled-serving default, Qwen3.8-27B performance-parity claim, live MoE expert-streaming claim, model weights, production promotion, or host-mutation authority.",
+      "publicCommit": "17ce331930929b1deb100cd6afed60ca993e665d",
+      "publicLinks": [
+        {
+          "label": "Inspect the capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "deterministic-sampled-generation-foundation",
       "title": "Publish deterministic sampled-generation foundation",
