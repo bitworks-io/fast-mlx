@@ -626,8 +626,41 @@ private enum Qwen35MTPPromptPreparationError: Error {
     case missingTargetHidden
 }
 
+private func evaluateQwen35MTPPromptOutputs(
+    cache: [KVCache],
+    hidden: MLXArray,
+    order: MTPPromptPreparationEvaluationOrder
+) -> (cacheSeconds: Double, hiddenSeconds: Double) {
+    switch order {
+    case .cacheFirst:
+        let cacheStart = ProcessInfo.processInfo.systemUptime
+        eval(cache)
+        let cacheSeconds = ProcessInfo.processInfo.systemUptime - cacheStart
+        let hiddenStart = ProcessInfo.processInfo.systemUptime
+        eval(hidden)
+        return (
+            cacheSeconds,
+            ProcessInfo.processInfo.systemUptime - hiddenStart)
+    case .hiddenFirst:
+        let hiddenStart = ProcessInfo.processInfo.systemUptime
+        eval(hidden)
+        let hiddenSeconds = ProcessInfo.processInfo.systemUptime - hiddenStart
+        let cacheStart = ProcessInfo.processInfo.systemUptime
+        eval(cache)
+        return (
+            ProcessInfo.processInfo.systemUptime - cacheStart,
+            hiddenSeconds)
+    case .combined:
+        let combinedStart = ProcessInfo.processInfo.systemUptime
+        eval(cache, hidden)
+        return (
+            ProcessInfo.processInfo.systemUptime - combinedStart,
+            0)
+    }
+}
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
-    MTPPromptHiddenStatePreparingModel
+    MTPPromptHiddenStateEvaluationOrderPreparingModel
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -699,8 +732,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
     public func prepareForMTP(
         _ input: LMInput,
         cache: [KVCache],
-        windowSize: Int?
+        windowSize: Int?,
+        collectTelemetry: Bool,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder
     ) throws -> MTPPromptPreparation? {
+        guard collectTelemetry || evaluationOrder == .cacheFirst else {
+            throw MTPPromptPreparationEvaluationOrderError.telemetryRequired
+        }
         let prefillStepSize = windowSize ?? 512
         guard prefillStepSize > 0, input.text.tokens.size > 0 else { return nil }
 
@@ -708,38 +746,112 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
         var hiddenChunks = [MLXArray]()
+        var chunkTelemetry = [MTPPromptPreparationChunkTelemetry]()
+        var tokenOffset = 0
+        var targetForwardSchedulingSeconds = 0.0
+        var cacheEvaluationSeconds = 0.0
+        var hiddenEvaluationSeconds = 0.0
+        var preparedCacheHandoffSeconds = 0.0
         var finalOutput: LMOutput?
 
+        let preparedCacheStart = collectTelemetry
+            ? ProcessInfo.processInfo.systemUptime : 0
         try withPreparedCache(cache, lengths: remaining.sequenceLengths) {
             while remaining.tokens.size > prefillStepSize {
                 let chunk = remaining[.newAxis, ..<prefillStepSize]
+                let forwardStart = collectTelemetry
+                    ? ProcessInfo.processInfo.systemUptime : 0
                 let output = self(
                     chunk, cache: cache.isEmpty ? nil : cache, state: state)
+                let forwardSeconds = collectTelemetry
+                    ? ProcessInfo.processInfo.systemUptime - forwardStart : 0
                 guard let hidden = output.state?[mtpLastHiddenStatesKey] else {
                     throw Qwen35MTPPromptPreparationError.missingTargetHidden
                 }
                 hiddenChunks.append(hidden)
                 state = output.state ?? state
-                asyncEval(cache, hidden)
+                if collectTelemetry {
+                    targetForwardSchedulingSeconds += forwardSeconds
+                    let evaluation = evaluateQwen35MTPPromptOutputs(
+                        cache: cache,
+                        hidden: hidden,
+                        order: evaluationOrder)
+                    cacheEvaluationSeconds += evaluation.cacheSeconds
+                    hiddenEvaluationSeconds += evaluation.hiddenSeconds
+                    chunkTelemetry.append(.init(
+                        tokenOffset: tokenOffset,
+                        tokenCount: prefillStepSize,
+                        targetForwardSchedulingSeconds: forwardSeconds))
+                } else {
+                    asyncEval(cache, hidden)
+                }
+                tokenOffset += prefillStepSize
                 remaining = remaining[prefillStepSize...]
             }
 
+            let finalTokenCount = remaining.tokens.size
+            let forwardStart = collectTelemetry
+                ? ProcessInfo.processInfo.systemUptime : 0
             let output = self(
                 remaining[text: .newAxis],
                 cache: cache.isEmpty ? nil : cache,
                 state: state)
+            let forwardSeconds = collectTelemetry
+                ? ProcessInfo.processInfo.systemUptime - forwardStart : 0
             guard let hidden = output.state?[mtpLastHiddenStatesKey] else {
                 throw Qwen35MTPPromptPreparationError.missingTargetHidden
             }
             hiddenChunks.append(hidden)
             finalOutput = output
-            eval(cache, hidden)
+            if collectTelemetry {
+                targetForwardSchedulingSeconds += forwardSeconds
+                let evaluation = evaluateQwen35MTPPromptOutputs(
+                    cache: cache,
+                    hidden: hidden,
+                    order: evaluationOrder)
+                cacheEvaluationSeconds += evaluation.cacheSeconds
+                hiddenEvaluationSeconds += evaluation.hiddenSeconds
+                chunkTelemetry.append(.init(
+                    tokenOffset: tokenOffset,
+                    tokenCount: finalTokenCount,
+                    targetForwardSchedulingSeconds: forwardSeconds))
+            } else {
+                eval(cache, hidden)
+            }
+        }
+        if collectTelemetry {
+            preparedCacheHandoffSeconds =
+                ProcessInfo.processInfo.systemUptime - preparedCacheStart
+                - targetForwardSchedulingSeconds
+                - cacheEvaluationSeconds
+                - hiddenEvaluationSeconds
         }
 
         guard let finalOutput, !hiddenChunks.isEmpty else { return nil }
+        let targetHidden = concatenated(hiddenChunks, axis: 1)
+        let concatenatedHiddenEvaluationStart = collectTelemetry
+            ? ProcessInfo.processInfo.systemUptime : 0
+        if collectTelemetry {
+            eval(targetHidden)
+        }
+        let concatenatedHiddenEvaluationSeconds = collectTelemetry
+            ? ProcessInfo.processInfo.systemUptime - concatenatedHiddenEvaluationStart : 0
         return MTPPromptPreparation(
             result: .logits(finalOutput),
-            targetHidden: concatenated(hiddenChunks, axis: 1))
+            targetHidden: targetHidden,
+            telemetry: collectTelemetry
+                ? .init(
+                    promptTokenCount: input.text.tokens.size,
+                    hiddenShape: targetHidden.shape,
+                    hiddenByteCount: targetHidden.nbytes,
+                    evaluationOrder: evaluationOrder,
+                    chunks: chunkTelemetry,
+                    cacheEvaluationSeconds: cacheEvaluationSeconds,
+                    hiddenEvaluationSeconds: hiddenEvaluationSeconds,
+                    concatenatedHiddenEvaluationSeconds:
+                        concatenatedHiddenEvaluationSeconds,
+                    preparedCacheHandoffSeconds: preparedCacheHandoffSeconds)
+                : nil)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -827,7 +939,7 @@ private func qwen35SharedKVOffsets(
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider,
-    MTPPromptHiddenStatePreparingModel
+    MTPPromptHiddenStateEvaluationOrderPreparingModel
 {
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -858,10 +970,14 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider,
     public func prepareForMTP(
         _ input: LMInput,
         cache: [KVCache],
-        windowSize: Int?
+        windowSize: Int?,
+        collectTelemetry: Bool,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder
     ) throws -> MTPPromptPreparation? {
         try languageModel.prepareForMTP(
-            input, cache: cache, windowSize: windowSize)
+            input, cache: cache, windowSize: windowSize,
+            collectTelemetry: collectTelemetry,
+            evaluationOrder: evaluationOrder)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

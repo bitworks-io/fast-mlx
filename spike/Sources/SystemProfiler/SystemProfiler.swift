@@ -9,6 +9,12 @@ import HarnessCore
 /// inference-engine toolchain.
 public enum SystemProfiler {
 
+    /// Shared/default planning never exceeds floor(75% of physical RAM). Keep this thin bridge to
+    /// the pure policy so the live probe cannot drift through floating-point recomputation.
+    static func defaultSharedWiredLimitBytes(totalRAMBytes: Int) -> Int {
+        SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: totalRAMBytes)
+    }
+
     /// Probe the live host and return everything the capacity advisor + operator-facing CLI need.
     /// Every field is read from a real syscall/Metal API — see the individual helpers below for the
     /// exact source per spec §3's table. Tolerates absent MIBs/APIs by returning `nil` (or a
@@ -46,7 +52,7 @@ public enum SystemProfiler {
             wiredLimitBytes = wiredLimitMB * 1024 * 1024
             wiredLimitIsDefault = false
         } else {
-            wiredLimitBytes = Int(0.75 * Double(totalRAMBytes))
+            wiredLimitBytes = defaultSharedWiredLimitBytes(totalRAMBytes: totalRAMBytes)
             wiredLimitIsDefault = true
         }
 
@@ -71,7 +77,8 @@ public enum SystemProfiler {
             currentGPUAllocBytes: currentGPUAllocBytes,
             recommendedWorkingSetBytes: recommendedWorkingSetBytes,
             diskInternal: diskInternal,
-            diskFreeBytes: diskFreeBytes
+            diskFreeBytes: diskFreeBytes,
+            hostUse: .automaticShared
         )
     }
 
@@ -138,11 +145,13 @@ public struct HostReport: Sendable {
     public let recommendedWorkingSetBytes: Int?
     public let diskInternal: Bool?
     public let diskFreeBytes: Int?
+    public let hostUse: HostUseClassification
 
     public init(
         chip: String, totalRAMBytes: Int, wiredLimitBytes: Int, wiredLimitIsDefault: Bool,
         pCores: Int, eCores: Int, currentGPUAllocBytes: Int?, recommendedWorkingSetBytes: Int?,
-        diskInternal: Bool?, diskFreeBytes: Int?
+        diskInternal: Bool?, diskFreeBytes: Int?,
+        hostUse: HostUseClassification = .defaultShared
     ) {
         self.chip = chip
         self.totalRAMBytes = totalRAMBytes
@@ -154,11 +163,85 @@ public struct HostReport: Sendable {
         self.recommendedWorkingSetBytes = recommendedWorkingSetBytes
         self.diskInternal = diskInternal
         self.diskFreeBytes = diskFreeBytes
+        self.hostUse = hostUse
     }
 
-    /// The `HarnessCore.SystemProfile` the pure capacity model consumes — just the three fields it
-    /// needs (`chip`, `totalRAMBytes`, `wiredLimitBytes`), stripped of everything CLI-display-only.
+    /// The `HarnessCore.SystemProfile` the pure capacity model consumes, stripped of fields that
+    /// are CLI-display-only while preserving capacity provenance.
     public var systemProfile: SystemProfile {
-        SystemProfile(chip: chip, totalRAMBytes: totalRAMBytes, wiredLimitBytes: wiredLimitBytes)
+        SystemProfile(
+            chip: chip,
+            totalRAMBytes: totalRAMBytes,
+            wiredLimitBytes: wiredLimitBytes,
+            wiredLimitIsMeasured: !wiredLimitIsDefault,
+            recommendedWorkingSetBytes: recommendedWorkingSetBytes,
+            hostUse: hostUse)
+    }
+
+    /// Apply an explicit operator classification to the already-probed snapshot. This must copy
+    /// every observation instead of probing again: startup evidence and fit planning need one
+    /// coherent point-in-time view of the host.
+    public func applyingHostUse(_ selectedHostUse: HostUseClassification) -> HostReport {
+        HostReport(
+            chip: chip,
+            totalRAMBytes: totalRAMBytes,
+            wiredLimitBytes: wiredLimitBytes,
+            wiredLimitIsDefault: wiredLimitIsDefault,
+            pCores: pCores,
+            eCores: eCores,
+            currentGPUAllocBytes: currentGPUAllocBytes,
+            recommendedWorkingSetBytes: recommendedWorkingSetBytes,
+            diskInternal: diskInternal,
+            diskFreeBytes: diskFreeBytes,
+            hostUse: selectedHostUse)
+    }
+
+    /// Stable operator-facing fields for the serve startup record. Metal's recommended working set
+    /// is advisory and the current allocation is a point-in-time observation; the names preserve
+    /// those semantics instead of promoting either value to a hard or historical measurement.
+    public func machineReadableMemoryFields() -> String {
+        let profile = systemProfile
+        let effective = profile.effectiveMemoryCeiling
+        let wiredProvenance = wiredLimitIsDefault ? "synthesized" : "measured"
+        let recommended = recommendedWorkingSetBytes.map(String.init) ?? "unavailable"
+        let current = currentGPUAllocBytes.map(String.init) ?? "unavailable"
+        return [
+            "host_use=\(hostUse.rawValue)",
+            "host_use_source=\(hostUse.source.rawValue)",
+            "host_use_policy_version=\(hostUse.policyVersion)",
+            "host_physical_ram_bytes=\(totalRAMBytes)",
+            "host_wired_limit_bytes=\(wiredLimitBytes)",
+            "host_wired_limit_provenance=\(wiredProvenance)",
+            "host_metal_recommended_working_set_bytes=\(recommended)",
+            "host_metal_current_allocated_bytes=\(current)",
+            "host_effective_memory_ceiling_bytes=\(effective.bytes)",
+            "host_effective_memory_ceiling_source=\(effective.source.rawValue)",
+        ].joined(separator: " ")
+    }
+
+    /// Complete startup fragment: the one-probe host observations plus the final process limits.
+    /// A scalar backend has no separately reserved KV pool, while a transport-only backend has no
+    /// MLX allocator at all; spell both states explicitly instead of inventing a numeric budget.
+    public func machineReadableServingFields(
+        memoryLimitBytes: Int?,
+        cacheLimitBytes: Int?,
+        kvBudgetBytes: Int?,
+        osServiceReserveBytes: Int
+    ) -> String {
+        let memory = memoryLimitBytes.map(String.init) ?? "not-applicable"
+        let cache = cacheLimitBytes.map(String.init) ?? "not-applicable"
+        let kv: String
+        if let kvBudgetBytes {
+            kv = String(kvBudgetBytes)
+        } else if memoryLimitBytes != nil {
+            kv = "not-separately-reserved"
+        } else {
+            kv = "not-applicable"
+        }
+        return machineReadableMemoryFields()
+            + " host_os_service_reserve_bytes=\(osServiceReserveBytes)"
+            + " mlx_memory_limit_bytes=\(memory)"
+            + " mlx_cache_limit_bytes=\(cache)"
+            + " mlx_kv_budget_bytes=\(kv)"
     }
 }

@@ -99,8 +99,8 @@ final class ServeTierPolicyTests: XCTestCase {
 
     func testRuntimeWiredKVTiersAreFP16OnlyForNow() {
         // Single source of truth: the serving runtime stores KV in fp16 today (int8 runtime KV is
-        // metallib-gated). A future int8-KV runtime flips exactly this member and the advisory below
-        // stops firing — the enforced path must never claim a compressed ceiling the runtime can't honor.
+        // quality-gated). A future int8-KV runtime flip changes exactly this member and the advisory
+        // below stops firing — the enforced path must never claim a compressed ceiling it cannot honor.
         XCTAssertEqual(ServeTierPolicy.runtimeWiredKVTiers, [.fp16])
     }
 

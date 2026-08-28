@@ -1947,6 +1947,50 @@ struct Harness {
             runBenchQualificationEvidenceValidation(flags)
         case "validate-bench-capacity":
             runBenchCapacityEvidenceValidation(flags)
+        case "produce-qwen38-mtp-performance-scorecard":
+            do {
+                print(try await produceQwen38MTPPerformanceScorecard(
+                    arguments: Array(arguments.dropFirst(2))))
+            } catch {
+                let blocked = error as? Qwen38MTPPerformanceScorecardProducerCLIError
+                    == .producerUnavailable
+                print(
+                    "qwen38-mtp-performance-scorecard-producer "
+                        + (blocked ? "BLOCKED: " : "INVALID: ")
+                        + qwen38MTPPerformanceScorecardProducerExternalDiagnostic(error))
+                exit(blocked ? 3 : 2)
+            }
+        case "validate-qwen38-mtp-performance-scorecard":
+            do {
+                print(try validateQwen38MTPPerformanceScorecard(
+                    arguments: Array(arguments.dropFirst(2))))
+            } catch {
+                print(
+                    "qwen38-mtp-performance-scorecard INVALID: "
+                        + qwen38MTPPerformanceScorecardExternalDiagnostic(error))
+                exit(2)
+            }
+        case "validate-qwen38-mtp-live-exactness":
+            do {
+                print(try validateQwen38MTPLiveExactness(
+                    arguments: Array(arguments.dropFirst(2))))
+            } catch {
+                print(
+                    "qwen38-mtp-live-exactness INVALID: "
+                        + qwen38MTPLiveExactnessExternalDiagnostic(error))
+                exit(2)
+            }
+        case "validate-qwen38-heavy-host-trust-readiness":
+            do {
+                print(try validateQwen38HeavyHostTrustReadiness(
+                    arguments: Array(arguments.dropFirst(2))))
+            } catch {
+                let disposition = qwen38HeavyHostTrustReadinessDisposition(error)
+                print(
+                    "qwen38-heavy-host-trust-readiness \(disposition.label): "
+                        + qwen38HeavyHostTrustReadinessExternalDiagnostic(error))
+                exit(disposition.exitCode)
+            }
         case "service-bench": await runServiceBench(flags)
         case "service-cancel-bench": await runServiceCancellationBench(flags)
         case "service-state-poison-bench": await runServiceStatePoisonBench(flags)
@@ -1969,6 +2013,67 @@ struct Harness {
                 try await runQwenMTPCorpus(flags)
             } catch {
                 print("qwen-mtp-corpus FAILED: \(error)")
+                exit(1)
+            }
+        case "qwen-mtp-eval-order":
+            do {
+                try await runQwenMTPEvaluationOrderIsolation(flags)
+            } catch {
+                print("qwen-mtp-eval-order FAILED: \(error)")
+                exit(1)
+            }
+        case "qwen-mtp-hidden-first-runtime":
+            do {
+                try await runQwenMTPHiddenFirstRuntimeEquivalence(flags)
+            } catch {
+                print("qwen-mtp-hidden-first-runtime FAILED: \(error)")
+                exit(1)
+            }
+        case "qwen-mtp-eval-combined":
+            do {
+                try await runQwenMTPCombinedEvaluationIsolation(flags)
+            } catch {
+                print("qwen-mtp-eval-combined FAILED: \(error)")
+                exit(1)
+            }
+        case "qwen-mtp-sampled-trace":
+            do {
+                try await runQwenMTPSampledTrace(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "qwen-mtp-sampled-trace FAILED: "
+                        + qwenMTPSampledTraceExternalDiagnostic(error))
+                exit(1)
+            }
+        case "validate-qwen-mtp-sampled-trace":
+            do {
+                try validateQwenMTPSampledTrace(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "validate-qwen-mtp-sampled-trace FAILED: "
+                        + qwenMTPSampledTraceExternalDiagnostic(error))
+                exit(1)
+            }
+        case "qwen-mtp-sampled-block-trace":
+            do {
+                try await runQwenMTPSampledBlockTrace(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "qwen-mtp-sampled-block-trace FAILED: "
+                        + qwenMTPSampledBlockTraceExternalDiagnostic(error))
+                exit(1)
+            }
+        case "validate-qwen-mtp-sampled-block-trace":
+            do {
+                try validateQwenMTPSampledBlockTrace(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "validate-qwen-mtp-sampled-block-trace FAILED: "
+                        + qwenMTPSampledBlockTraceExternalDiagnostic(error))
                 exit(1)
             }
         case "exact-prefix-proof":
@@ -2047,6 +2152,19 @@ struct Harness {
           validate-bench-qualification --evidence <JSONL>
           validate-bench-capacity --evidence <JSONL>
                                                typed fail-closed validation for one runner row
+          produce-qwen38-mtp-performance-scorecard
+                 --authority <JSON> --output <JSONL>
+                                               produce the frozen Qwen3.8 27B scorecard when an
+                                               authenticated measurement adapter is compiled
+          validate-qwen38-mtp-performance-scorecard
+                 --evidence <JSONL> --authority <JSON>
+                                               validate one sealed Qwen3.8 27B scorecard
+          validate-qwen38-mtp-live-exactness --evidence <JSONL>
+                                               validate one canonical Qwen3.8 27B exactness row
+          validate-qwen38-heavy-host-trust-readiness
+                 --inventory <JSON> --observed <JSON>
+                                               fail-closed local trust/readiness preflight;
+                                               never contacts or enrolls the host
           service-bench --model <PATH>        aggregate service frontier (Release builds only)
                  --policy batch-no-spec|solo-pld  exact batch arm or serialized PLD policy
                  --scenario burst             simultaneous admission (initial measured scenario)
@@ -2101,6 +2219,20 @@ struct Harness {
                                                strict synthetic capture; never dial promotion
           qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
                  [--profile true|false]       exact Qwen3.5 9B scalar-vs-native-MTP corpus gate
+          qwen-mtp-eval-order --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+                                               long-retrieval cache-first vs hidden-first diagnostic
+          qwen-mtp-sampled-trace --target <DIR> --drafter <DIR> --evidence <NEW JSONL>
+                                               Release-only live p/q and hybrid-cache transaction gate
+          validate-qwen-mtp-sampled-trace --evidence <JSONL>
+                                               revalidate canonical sampled-trace evidence
+          qwen-mtp-sampled-block-trace --target <DIR> --drafter <DIR> --evidence <NEW JSONL>
+                                               Release-only two-proposal p/q + hybrid-cache gate
+          validate-qwen-mtp-sampled-block-trace --evidence <JSONL>
+                                               revalidate canonical sampled-block evidence
+          qwen-mtp-hidden-first-runtime --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+                                               opt-in hidden-first runtime-equivalence gate
+          qwen-mtp-eval-combined --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+                                               long-retrieval cache-first vs joint-eval diagnostic
           exact-prefix-proof                  fresh loaded exact request-start proof
                  --model <PATH> --model-id <ID> --source-revision <CHECKPOINT-SHA256>
                  --expected-harness-git-sha <SHA>

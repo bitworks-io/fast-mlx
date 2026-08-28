@@ -295,7 +295,8 @@ struct Qwen35MTPMetalTests {
         let cache = model.newCache(parameters: nil as GenerateParameters?)
 
         let optionalPreparation = try model.prepareForMTP(
-            LMInput(tokens: tokens), cache: cache, windowSize: 3)
+            LMInput(tokens: tokens), cache: cache, windowSize: 3,
+            collectTelemetry: true)
         let preparation = try #require(optionalPreparation)
         guard case .logits(let output) = preparation.result else {
             Issue.record("Qwen MTP preparation must consume the complete prompt")
@@ -307,9 +308,61 @@ struct Qwen35MTPMetalTests {
         #expect(preparation.targetHidden.shape == [1, 7, 16])
         #expect(output.logits.shape == [1, 1, 16])
         #expect(cache.map(\.offset) == referenceCache.map(\.offset))
+        let telemetry = try #require(preparation.telemetry)
+        #expect(telemetry.promptTokenCount == 7)
+        #expect(telemetry.hiddenShape == [1, 7, 16])
+        #expect(telemetry.hiddenByteCount == preparation.targetHidden.nbytes)
+        #expect(telemetry.chunks.map(\.tokenOffset) == [0, 3, 6])
+        #expect(telemetry.chunks.map(\.tokenCount) == [3, 3, 1])
+        #expect(telemetry.chunks.allSatisfy {
+            $0.targetForwardSchedulingSeconds >= 0
+        })
+        #expect(telemetry.cacheHiddenEvaluationSeconds >= 0)
+        #expect(telemetry.hiddenConcatenationSeconds >= 0)
+        #expect(telemetry.cacheEvaluationSeconds >= 0)
+        #expect(telemetry.hiddenEvaluationSeconds >= 0)
+        #expect(telemetry.concatenatedHiddenEvaluationSeconds >= 0)
+        #expect(telemetry.preparedCacheHandoffSeconds >= 0)
+        #expect(
+            telemetry.cacheHiddenEvaluationSeconds
+                == telemetry.cacheEvaluationSeconds + telemetry.hiddenEvaluationSeconds)
+        #expect(
+            telemetry.hiddenConcatenationSeconds
+                == telemetry.concatenatedHiddenEvaluationSeconds)
         #expect(
             allClose(preparation.targetHidden, expected, rtol: 0, atol: 0)
                 .item(Bool.self))
+
+        let optionalOrdinaryPreparation = try model.prepareForMTP(
+            LMInput(tokens: tokens),
+            cache: model.newCache(parameters: nil as GenerateParameters?),
+            windowSize: 3)
+        let ordinaryPreparation = try #require(optionalOrdinaryPreparation)
+        #expect(ordinaryPreparation.telemetry == nil)
+
+        let combinedPreparation = try #require(try model.prepareForMTP(
+            LMInput(tokens: tokens),
+            cache: model.newCache(parameters: nil as GenerateParameters?),
+            windowSize: 3,
+            collectTelemetry: true,
+            evaluationOrder: .combined))
+        eval(combinedPreparation.targetHidden)
+        #expect(combinedPreparation.telemetry?.evaluationOrder == .combined)
+        #expect(
+            allClose(combinedPreparation.targetHidden, expected, rtol: 0, atol: 0)
+                .item(Bool.self))
+
+        do {
+            _ = try model.prepareForMTP(
+                LMInput(tokens: tokens),
+                cache: model.newCache(parameters: nil as GenerateParameters?),
+                windowSize: 3,
+                collectTelemetry: false,
+                evaluationOrder: .hiddenFirst)
+            Issue.record("hidden-first preparation must require telemetry")
+        } catch let error as MTPPromptPreparationEvaluationOrderError {
+            #expect(error == .telemetryRequired)
+        }
     }
 
     @Test

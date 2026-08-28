@@ -11,6 +11,16 @@ public enum FastMLXServeBackend: Equatable, Sendable {
         memoryLimitBytes: Int,
         cacheLimitBytes: Int,
         maxReservedKVBytes: Int)
+    case continuousDynamicPLD(
+        modelDirectory: URL,
+        memoryLimitBytes: Int,
+        cacheLimitBytes: Int,
+        maxReservedKVBytes: Int)
+}
+
+public enum FastMLXServeHostUse: String, Equatable, Sendable {
+    case shared
+    case dedicatedServing = "dedicated-serving"
 }
 
 public enum FastMLXServeArgumentError:
@@ -43,6 +53,9 @@ public enum FastMLXServeArgumentError:
     case exactQwen35MTPWithScripted
     case exactQwen35MTPWithContinuousBatch
     case exactQwen35MTPWithQuantSource
+    case dynamicPLDWithHybridQwen35
+    case invalidHostUse
+    case osServiceReserveRequiresDedicatedServing
 
     public var description: String {
         switch self {
@@ -100,10 +113,17 @@ public enum FastMLXServeArgumentError:
             "--exact-qwen35-mtp loads a model and cannot be combined with --scripted"
         case .exactQwen35MTPWithContinuousBatch:
             "--exact-qwen35-mtp is a scalar-fallback exact route and cannot be combined with "
-                + "--continuous-batch-no-spec"
+                + "a continuous serving mode"
         case .exactQwen35MTPWithQuantSource:
             "--exact-qwen35-mtp requires explicit local --model-path/--mtp-drafter-path snapshots "
                 + "and cannot be combined with quant selection flags"
+        case .dynamicPLDWithHybridQwen35:
+            "--continuous-dynamic-pld is admitted only for the exact dense Qwen3 policy and "
+                + "cannot be combined with --allow-hybrid-qwen35"
+        case .invalidHostUse:
+            "--host-use must be shared or dedicated-serving"
+        case .osServiceReserveRequiresDedicatedServing:
+            "--os-service-reserve-bytes requires --host-use dedicated-serving"
         }
     }
 }
@@ -112,7 +132,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     public static let usage = """
         Usage:
           fastmlx-serve --scripted [--host HOST] [--port PORT] [--model MODEL]
-          fastmlx-serve [--continuous-batch-no-spec]
+          fastmlx-serve [--continuous-batch-no-spec | --continuous-dynamic-pld]
             --model-path PATH --model MODEL
             --memory-limit-bytes N --cache-limit-bytes N
             [--max-reserved-kv-bytes N]
@@ -120,6 +140,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
 
           --scripted                  Transport-only backend; no model is loaded.
           --continuous-batch-no-spec  Explicit dense continuous-batch route.
+          --continuous-dynamic-pld    Opt-in dense Qwen3 adaptive route: solo PLD,
+                                      then no-spec batching for compatible concurrency.
           --model-path PATH           Absolute local source-locked model directory.
           --model MODEL               Exact OpenAI request model identifier.
           --memory-limit-bytes N      Explicit positive MLX memory limit.
@@ -192,6 +214,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
           --mtp-drafter-path PATH     Absolute local drafter snapshot directory for
                                       --exact-qwen35-mtp.
           --host HOST                 Bind host (default: 127.0.0.1).
+          --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
+                                      Omit to keep default policy provenance distinct
+                                      from an explicit shared assertion.
+          --os-service-reserve-bytes N
+                                      Required nonzero OS/service reserve for an explicit
+                                      dedicated-serving host classification.
           --port PORT                 Bind port (default: 8080; 0 is ephemeral).
           --max-completion-tokens N   Maximum accepted OpenAI completion budget
                                       per request (default: 4096).
@@ -204,6 +232,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
 
     public let backend: FastMLXServeBackend?
     public let host: String
+    public let requestedHostUse: FastMLXServeHostUse?
+    public let osServiceReserveBytes: Int?
     public let port: Int
     public let model: String
     public let evidencePath: URL?
@@ -285,6 +315,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     private init(
         backend: FastMLXServeBackend?,
         host: String,
+        requestedHostUse: FastMLXServeHostUse? = nil,
+        osServiceReserveBytes: Int? = nil,
         port: Int,
         model: String,
         evidencePath: URL?,
@@ -307,6 +339,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     ) {
         self.backend = backend
         self.host = host
+        self.requestedHostUse = requestedHostUse
+        self.osServiceReserveBytes = osServiceReserveBytes
         self.port = port
         self.model = model
         self.evidencePath = evidencePath
@@ -334,10 +368,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var seen: Set<String> = []
         var scripted = false
         var continuousBatchNoSpec = false
+        var continuousDynamicPLD = false
         var showHelp = false
         var maximumCompletionTokens = OpenAIChatRequestLimits.productionDefault
             .maximumCompletionTokens
         var host = "127.0.0.1"
+        var requestedHostUse: FastMLXServeHostUse?
+        var osServiceReserveBytes: Int?
         var port = 8_080
         var model: String?
         var modelPath: String?
@@ -374,11 +411,25 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 scripted = true
             case "--continuous-batch-no-spec":
                 continuousBatchNoSpec = true
+            case "--continuous-dynamic-pld":
+                continuousDynamicPLD = true
             case "--help", "-h":
                 showHelp = true
             case "--host":
                 index += 1
                 host = try value(at: index, in: arguments, for: argument)
+            case "--host-use":
+                index += 1
+                let rawHostUse = try value(at: index, in: arguments, for: argument)
+                guard let hostUse = FastMLXServeHostUse(rawValue: rawHostUse) else {
+                    throw FastMLXServeArgumentError.invalidHostUse
+                }
+                requestedHostUse = hostUse
+            case "--os-service-reserve-bytes":
+                index += 1
+                osServiceReserveBytes = try positiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
             case "--port":
                 index += 1
                 let rawPort = try value(
@@ -501,6 +552,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             return FastMLXServeArguments(
                 backend: nil,
                 host: host,
+                requestedHostUse: requestedHostUse,
+                osServiceReserveBytes: osServiceReserveBytes,
                 port: port,
                 model: model ?? "fastmlx-scripted",
                 evidencePath: evidencePath,
@@ -508,9 +561,23 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumCompletionTokens: maximumCompletionTokens)
         }
 
+        if requestedHostUse == .dedicatedServing {
+            guard osServiceReserveBytes != nil else {
+                throw FastMLXServeArgumentError.missingRequiredOption(
+                    "--os-service-reserve-bytes")
+            }
+        } else if osServiceReserveBytes != nil {
+            throw FastMLXServeArgumentError.osServiceReserveRequiresDedicatedServing
+        }
+
         if mtpDrafterDirectory != nil, !exactQwen35MTP {
             throw FastMLXServeArgumentError.mtpDrafterRequiresExactQwen35MTP
         }
+
+        if continuousBatchNoSpec, continuousDynamicPLD {
+            throw FastMLXServeArgumentError.conflictingBackendModes
+        }
+        let continuousModeSelected = continuousBatchNoSpec || continuousDynamicPLD
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
         // not built): mutually exclusive with the local --quant-candidates source, and usable only
@@ -532,7 +599,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             if scripted {
                 throw FastMLXServeArgumentError.exactQwen35MTPWithScripted
             }
-            if continuousBatchNoSpec {
+            if continuousModeSelected {
                 throw FastMLXServeArgumentError.exactQwen35MTPWithContinuousBatch
             }
             if !quantCandidateDirs.isEmpty || quantPickOnly || autoQuantBase != nil {
@@ -554,6 +621,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 return FastMLXServeArguments(
                     backend: nil,
                     host: host,
+                    requestedHostUse: requestedHostUse,
+                    osServiceReserveBytes: osServiceReserveBytes,
                     port: port,
                     model: model ?? "fastmlx-quant-pick",
                     evidencePath: evidencePath,
@@ -575,6 +644,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             return FastMLXServeArguments(
                 backend: nil,
                 host: host,
+                requestedHostUse: requestedHostUse,
+                osServiceReserveBytes: osServiceReserveBytes,
                 port: port,
                 model: model ?? "fastmlx-quant-pick",
                 evidencePath: evidencePath,
@@ -594,7 +665,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         let hasLoadedModelOptions =
             modelPath != nil || memoryLimitBytes != nil || cacheLimitBytes != nil
                 || maxReservedKVBytes != nil || hasQuantCandidates
-        if scripted, continuousBatchNoSpec || hasLoadedModelOptions {
+        if scripted, continuousModeSelected || hasLoadedModelOptions {
             throw FastMLXServeArgumentError.conflictingBackendModes
         }
         // --kv-quant is a loaded-model concern (it previews a KV sizing); it is meaningless in the
@@ -607,12 +678,17 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         if scripted, allowHybridQwen35 {
             throw FastMLXServeArgumentError.allowHybridWithScripted
         }
+        if continuousDynamicPLD, allowHybridQwen35 {
+            throw FastMLXServeArgumentError.dynamicPLDWithHybridQwen35
+        }
         if scripted {
             let launchedModel = try validatedModel(
                 model ?? "fastmlx-scripted")
             return FastMLXServeArguments(
                 backend: .scripted,
                 host: host,
+                requestedHostUse: requestedHostUse,
+                osServiceReserveBytes: osServiceReserveBytes,
                 port: port,
                 model: launchedModel,
                 evidencePath: evidencePath,
@@ -620,10 +696,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumCompletionTokens: maximumCompletionTokens)
         }
 
-        guard continuousBatchNoSpec || hasLoadedModelOptions else {
+        guard continuousModeSelected || hasLoadedModelOptions else {
             throw FastMLXServeArgumentError.missingBackendMode
         }
-        if !continuousBatchNoSpec, maxReservedKVBytes != nil {
+        if !continuousModeSelected, maxReservedKVBytes != nil {
             throw FastMLXServeArgumentError.optionRequiresContinuousBatchMode(
                 "--max-reserved-kv-bytes")
         }
@@ -660,7 +736,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             throw FastMLXServeArgumentError.cacheLimitExceedsMemoryLimit
         }
         let resolvedMaxReservedKVBytes: Int?
-        if continuousBatchNoSpec {
+        if continuousModeSelected {
             guard let maxReservedKVBytes else {
                 throw FastMLXServeArgumentError.missingRequiredOption(
                     "--max-reserved-kv-bytes")
@@ -681,11 +757,19 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     memoryLimitBytes: memoryLimitBytes,
                     cacheLimitBytes: cacheLimitBytes,
                     maxReservedKVBytes: resolvedMaxReservedKVBytes!)
-                : .scalar(
-                    modelDirectory: modelDirectory,
-                    memoryLimitBytes: memoryLimitBytes,
-                    cacheLimitBytes: cacheLimitBytes),
+                : continuousDynamicPLD
+                    ? .continuousDynamicPLD(
+                        modelDirectory: modelDirectory,
+                        memoryLimitBytes: memoryLimitBytes,
+                        cacheLimitBytes: cacheLimitBytes,
+                        maxReservedKVBytes: resolvedMaxReservedKVBytes!)
+                    : .scalar(
+                        modelDirectory: modelDirectory,
+                        memoryLimitBytes: memoryLimitBytes,
+                        cacheLimitBytes: cacheLimitBytes),
             host: host,
+            requestedHostUse: requestedHostUse,
+            osServiceReserveBytes: osServiceReserveBytes,
             port: port,
             model: launchedModel,
             evidencePath: evidencePath,
@@ -706,9 +790,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     private static let supportedOptions: Set<String> = [
         "--scripted",
         "--continuous-batch-no-spec",
+        "--continuous-dynamic-pld",
         "--help",
         "-h",
         "--host",
+        "--host-use",
+        "--os-service-reserve-bytes",
         "--port",
         "--max-completion-tokens",
         "--model",

@@ -11,23 +11,38 @@ import Tokenizers
 
 enum QwenMTPCorpusCLIError: Error, CustomStringConvertible {
     case usage
+    case evaluationOrderUsage
+    case hiddenFirstRuntimeUsage
+    case combinedEvaluationUsage
     case evidenceMustBeNewOrEmpty(String)
     case unexpectedDownloadRequest(id: String, revision: String?)
     case releaseBuildRequired
+    case hiddenFirstRuntimeNotQualified
     case cannotCreateEvidence(String)
+    case missingEvaluationOrderTelemetry(String)
 
     var description: String {
         switch self {
         case .usage:
             return "usage: fastmlx-harness qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL> [--profile true|false]"
+        case .evaluationOrderUsage:
+            return "usage: fastmlx-harness qwen-mtp-eval-order --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>"
+        case .hiddenFirstRuntimeUsage:
+            return "usage: fastmlx-harness qwen-mtp-hidden-first-runtime --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>"
+        case .combinedEvaluationUsage:
+            return "usage: fastmlx-harness qwen-mtp-eval-combined --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>"
         case .evidenceMustBeNewOrEmpty(let path):
             return "--evidence must name a new or empty JSONL file: \(path)"
         case .unexpectedDownloadRequest(let id, let revision):
             return "unexpected exact Qwen MTP artifact request: \(id)@\(revision ?? "nil")"
         case .releaseBuildRequired:
-            return "--profile true requires a Release build"
+            return "Qwen MTP measurement requires a Release build"
+        case .hiddenFirstRuntimeNotQualified:
+            return "hidden-first runtime missed the frozen promotion thresholds"
         case .cannotCreateEvidence(let path):
             return "cannot create evidence parent directory for \(path)"
+        case .missingEvaluationOrderTelemetry(let order):
+            return "missing Qwen MTP prompt-evaluation telemetry for \(order)"
         }
     }
 }
@@ -121,6 +136,339 @@ func runQwenMTPCorpus(_ flags: Flags) async throws {
         verificationVerdict.measuredTargetVerificationSeconds,
         verificationVerdict.reductionSeconds,
         verificationVerdict.requiredReductionSeconds))
+    if let profileVerdict = try QwenMTPCorpusGate.validate(payload).profile {
+        print(String(
+            format: "qwen-mtp-corpus prompt-hidden-materialization diagnostic measured=%.4fs prompt_overhead=%.4fs share=%.4f threshold=%.1fs candidate=%@",
+            profileVerdict.hiddenMaterializationSecondsTotal,
+            profileVerdict.promptOverheadSecondsTotal,
+            profileVerdict.hiddenMaterializationShareOfPromptOverhead,
+            profileVerdict.hiddenMaterializationCandidateThresholdSeconds,
+            profileVerdict.hiddenMaterializationCandidateQualified ? "yes" : "no"))
+    }
+}
+
+func runQwenMTPEvaluationOrderIsolation(_ flags: Flags) async throws {
+    let targetPath = try flags.strictString("target", default: "")
+    let drafterPath = try flags.strictString("drafter", default: "")
+    let evidencePath = try flags.strictString("evidence", default: "")
+    guard !targetPath.isEmpty, !drafterPath.isEmpty, !evidencePath.isEmpty else {
+        throw QwenMTPCorpusCLIError.evaluationOrderUsage
+    }
+    guard qwenMTPCorpusReleaseBuildObserved else {
+        throw QwenMTPCorpusCLIError.releaseBuildRequired
+    }
+
+    let evidenceURL = URL(fileURLWithPath: evidencePath)
+    try requireNewOrEmptyEvidence(evidenceURL)
+    let downloader = QwenMTPLocalExactRevisionDownloader(
+        target: URL(fileURLWithPath: targetPath, isDirectory: true),
+        drafter: URL(fileURLWithPath: drafterPath, isDirectory: true))
+    let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        from: downloader,
+        using: #huggingFaceTokenizerLoader())
+    guard let spec = QwenMTPCorpusGate.cases.first(where: {
+        $0.id == "long-retrieval"
+    }) else {
+        throw QwenMTPCorpusCLIError.evaluationOrderUsage
+    }
+
+    let parameters = GenerateParameters(maxTokens: spec.maxTokens, temperature: 0)
+    var pairs = [QwenMTPEvaluationOrderPairEvidence]()
+    pairs.reserveCapacity(QwenMTPEvaluationOrderIsolationGate.pairOrders.count)
+    for (pairIndex, runOrder) in
+        QwenMTPEvaluationOrderIsolationGate.pairOrders.enumerated()
+    {
+        let scalar = try runScalar(spec, pair: pair, parameters: parameters)
+        let cacheFirst: CorpusRun
+        let hiddenFirst: CorpusRun
+        switch runOrder {
+        case .cacheFirstThenHiddenFirst:
+            cacheFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .cacheFirst)
+            hiddenFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .hiddenFirst)
+        case .hiddenFirstThenCacheFirst:
+            hiddenFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .hiddenFirst)
+            cacheFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .cacheFirst)
+        }
+        let pairEvidence = QwenMTPEvaluationOrderPairEvidence(
+            pairIndex: pairIndex,
+            warmup: pairIndex
+                < QwenMTPEvaluationOrderIsolationGate.droppedWarmupPairs,
+            runOrder: runOrder,
+            cacheFirst: try evaluationOrderRunEvidence(
+                .cacheFirst,
+                scalar: scalar,
+                mtp: cacheFirst),
+            hiddenFirst: try evaluationOrderRunEvidence(
+                .hiddenFirst,
+                scalar: scalar,
+                mtp: hiddenFirst))
+        try QwenMTPEvaluationOrderIsolationGate.validatePair(
+            pairEvidence,
+            at: pairIndex)
+        pairs.append(pairEvidence)
+    }
+
+    let payload = QwenMTPEvaluationOrderIsolationPayload(
+        schemaVersion: QwenMTPEvaluationOrderIsolationGate.schemaVersion,
+        corpusID: QwenMTPEvaluationOrderIsolationGate.corpusID,
+        corpusContentHash: QwenMTPEvaluationOrderIsolationGate.corpusContentHash,
+        binding: runtimeBinding(pair.binding),
+        host: .init(
+            chip: ProvenanceCLI.chipBrand(),
+            ramBytes: ProvenanceCLI.ramBytes(),
+            os: ProvenanceCLI.osVersion()),
+        releaseBuildRequired: true,
+        releaseBuildObserved: true,
+        pairs: pairs)
+    let verdict = try QwenMTPEvaluationOrderIsolationGate.validate(payload)
+    try RequiredJSONLWriter.append(
+        evaluationOrderResultRecord(payload, targetPath: targetPath),
+        to: evidenceURL)
+    print(String(
+        format: "qwen-mtp-eval-order %@ aggregate=%.4fs/%.1fs median=%.4fs/%.2fs",
+        verdict.qualified ? "PROMOTE" : "SHELVE",
+        verdict.aggregatePromptImprovementSeconds,
+        verdict.requiredAggregatePromptImprovementSeconds,
+        verdict.medianPromptImprovementSeconds,
+        verdict.requiredMedianPromptImprovementSeconds))
+}
+
+func runQwenMTPHiddenFirstRuntimeEquivalence(_ flags: Flags) async throws {
+    let targetPath = try flags.strictString("target", default: "")
+    let drafterPath = try flags.strictString("drafter", default: "")
+    let evidencePath = try flags.strictString("evidence", default: "")
+    guard !targetPath.isEmpty, !drafterPath.isEmpty, !evidencePath.isEmpty else {
+        throw QwenMTPCorpusCLIError.hiddenFirstRuntimeUsage
+    }
+    guard qwenMTPCorpusReleaseBuildObserved else {
+        throw QwenMTPCorpusCLIError.releaseBuildRequired
+    }
+
+    let evidenceURL = URL(fileURLWithPath: evidencePath)
+    try requireNewOrEmptyEvidence(evidenceURL)
+    let downloader = QwenMTPLocalExactRevisionDownloader(
+        target: URL(fileURLWithPath: targetPath, isDirectory: true),
+        drafter: URL(fileURLWithPath: drafterPath, isDirectory: true))
+    let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        from: downloader,
+        using: #huggingFaceTokenizerLoader())
+    guard let spec = QwenMTPCorpusGate.cases.first(where: {
+        $0.id == "long-retrieval"
+    }) else {
+        throw QwenMTPCorpusCLIError.hiddenFirstRuntimeUsage
+    }
+
+    let parameters = GenerateParameters(maxTokens: spec.maxTokens, temperature: 0)
+    var pairs = [QwenMTPHiddenFirstRuntimePairEvidence]()
+    pairs.reserveCapacity(QwenMTPHiddenFirstRuntimeEquivalenceGate.pairOrders.count)
+    for (pairIndex, runOrder) in
+        QwenMTPHiddenFirstRuntimeEquivalenceGate.pairOrders.enumerated()
+    {
+        let scalar = try runScalar(spec, pair: pair, parameters: parameters)
+        let defaultRuntime: CorpusRun
+        let hiddenFirstRuntime: CorpusRun
+        switch runOrder {
+        case .defaultThenHiddenFirst:
+            // Intentionally omit the evaluation-order argument: this run is
+            // the ordinary iterator default, not an explicitly relabeled
+            // cache-first diagnostic.
+            defaultRuntime = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters)
+            hiddenFirstRuntime = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .hiddenFirst)
+        case .hiddenFirstThenDefault:
+            hiddenFirstRuntime = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .hiddenFirst)
+            defaultRuntime = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters)
+        }
+        let pairEvidence = QwenMTPHiddenFirstRuntimePairEvidence(
+            pairIndex: pairIndex,
+            warmup: pairIndex
+                < QwenMTPHiddenFirstRuntimeEquivalenceGate.droppedWarmupPairs,
+            runOrder: runOrder,
+            defaultRuntime: try evaluationOrderRunEvidence(
+                .cacheFirst,
+                scalar: scalar,
+                mtp: defaultRuntime),
+            hiddenFirstRuntime: try evaluationOrderRunEvidence(
+                .hiddenFirst,
+                scalar: scalar,
+                mtp: hiddenFirstRuntime))
+        try QwenMTPHiddenFirstRuntimeEquivalenceGate.validatePair(
+            pairEvidence,
+            at: pairIndex)
+        pairs.append(pairEvidence)
+    }
+
+    let payload = QwenMTPHiddenFirstRuntimeEquivalencePayload(
+        schemaVersion: QwenMTPHiddenFirstRuntimeEquivalenceGate.schemaVersion,
+        corpusID: QwenMTPHiddenFirstRuntimeEquivalenceGate.corpusID,
+        corpusContentHash: QwenMTPHiddenFirstRuntimeEquivalenceGate.corpusContentHash,
+        binding: runtimeBinding(pair.binding),
+        host: .init(
+            chip: ProvenanceCLI.chipBrand(),
+            ramBytes: ProvenanceCLI.ramBytes(),
+            os: ProvenanceCLI.osVersion()),
+        releaseBuildRequired: true,
+        releaseBuildObserved: true,
+        pairs: pairs)
+    let verdict = try QwenMTPHiddenFirstRuntimeEquivalenceGate.validate(payload)
+    let subcommand = verdict.qualified
+        ? QwenMTPHiddenFirstRuntimeEquivalenceGate.subcommand
+        : QwenMTPHiddenFirstRuntimeEquivalenceGate.rejectedSubcommand
+    let record = hiddenFirstRuntimeResultRecord(
+        payload,
+        targetPath: targetPath,
+        subcommand: subcommand)
+    let recordData = Data((try record.jsonLine() + "\n").utf8)
+    if verdict.qualified {
+        _ = try QwenMTPHiddenFirstRuntimeEquivalenceGate.validateJSONL(recordData)
+    } else {
+        _ = try QwenMTPHiddenFirstRuntimeEquivalenceGate
+            .validateRejectedJSONL(recordData)
+    }
+    try RequiredJSONLWriter.append(
+        record,
+        to: evidenceURL)
+    print(String(
+        format: "qwen-mtp-hidden-first-runtime %@ aggregate=%.4fs/%.1fs median=%.4fs/%.2fs",
+        verdict.qualified ? "PROMOTE" : "SHELVE",
+        verdict.aggregatePromptImprovementSeconds,
+        verdict.requiredAggregatePromptImprovementSeconds,
+        verdict.medianPromptImprovementSeconds,
+        verdict.requiredMedianPromptImprovementSeconds))
+    guard verdict.qualified else {
+        throw QwenMTPCorpusCLIError.hiddenFirstRuntimeNotQualified
+    }
+}
+
+func runQwenMTPCombinedEvaluationIsolation(_ flags: Flags) async throws {
+    let targetPath = try flags.strictString("target", default: "")
+    let drafterPath = try flags.strictString("drafter", default: "")
+    let evidencePath = try flags.strictString("evidence", default: "")
+    guard !targetPath.isEmpty, !drafterPath.isEmpty, !evidencePath.isEmpty else {
+        throw QwenMTPCorpusCLIError.combinedEvaluationUsage
+    }
+    guard qwenMTPCorpusReleaseBuildObserved else {
+        throw QwenMTPCorpusCLIError.releaseBuildRequired
+    }
+
+    let evidenceURL = URL(fileURLWithPath: evidencePath)
+    try requireNewOrEmptyEvidence(evidenceURL)
+    let downloader = QwenMTPLocalExactRevisionDownloader(
+        target: URL(fileURLWithPath: targetPath, isDirectory: true),
+        drafter: URL(fileURLWithPath: drafterPath, isDirectory: true))
+    let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        from: downloader,
+        using: #huggingFaceTokenizerLoader())
+    guard let spec = QwenMTPCorpusGate.cases.first(where: {
+        $0.id == "long-retrieval"
+    }) else {
+        throw QwenMTPCorpusCLIError.combinedEvaluationUsage
+    }
+
+    let parameters = GenerateParameters(maxTokens: spec.maxTokens, temperature: 0)
+    var pairs = [QwenMTPCombinedEvaluationPairEvidence]()
+    pairs.reserveCapacity(QwenMTPCombinedEvaluationIsolationGate.pairOrders.count)
+    for (pairIndex, runOrder) in
+        QwenMTPCombinedEvaluationIsolationGate.pairOrders.enumerated()
+    {
+        let scalar = try runScalar(spec, pair: pair, parameters: parameters)
+        let cacheFirst: CorpusRun
+        let combined: CorpusRun
+        switch runOrder {
+        case .cacheFirstThenCombined:
+            cacheFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .cacheFirst)
+            combined = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .combined)
+        case .combinedThenCacheFirst:
+            combined = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .combined)
+            cacheFirst = try runMTPDrain(
+                spec,
+                pair: pair,
+                parameters: parameters,
+                promptPreparationEvaluationOrder: .cacheFirst)
+        }
+        let pairEvidence = QwenMTPCombinedEvaluationPairEvidence(
+            pairIndex: pairIndex,
+            warmup: pairIndex
+                < QwenMTPCombinedEvaluationIsolationGate.droppedWarmupPairs,
+            runOrder: runOrder,
+            cacheFirst: try evaluationOrderRunEvidence(
+                .cacheFirst,
+                scalar: scalar,
+                mtp: cacheFirst),
+            combined: try evaluationOrderRunEvidence(
+                .combined,
+                scalar: scalar,
+                mtp: combined))
+        try QwenMTPCombinedEvaluationIsolationGate.validatePair(
+            pairEvidence,
+            at: pairIndex)
+        pairs.append(pairEvidence)
+    }
+
+    let payload = QwenMTPCombinedEvaluationIsolationPayload(
+        schemaVersion: QwenMTPCombinedEvaluationIsolationGate.schemaVersion,
+        corpusID: QwenMTPCombinedEvaluationIsolationGate.corpusID,
+        corpusContentHash: QwenMTPCombinedEvaluationIsolationGate.corpusContentHash,
+        binding: runtimeBinding(pair.binding),
+        host: .init(
+            chip: ProvenanceCLI.chipBrand(),
+            ramBytes: ProvenanceCLI.ramBytes(),
+            os: ProvenanceCLI.osVersion()),
+        releaseBuildRequired: true,
+        releaseBuildObserved: true,
+        pairs: pairs)
+    let verdict = try QwenMTPCombinedEvaluationIsolationGate.validate(payload)
+    try RequiredJSONLWriter.append(
+        combinedEvaluationResultRecord(payload, targetPath: targetPath),
+        to: evidenceURL)
+    print(String(
+        format: "qwen-mtp-eval-combined %@ aggregate=%.4fs/%.1fs median=%.4fs/%.2fs",
+        verdict.qualified ? "PROMOTE" : "SHELVE",
+        verdict.aggregatePromptImprovementSeconds,
+        verdict.requiredAggregatePromptImprovementSeconds,
+        verdict.medianPromptImprovementSeconds,
+        verdict.requiredMedianPromptImprovementSeconds))
 }
 
 private var qwenMTPCorpusReleaseBuildObserved: Bool {
@@ -224,6 +572,7 @@ private struct CorpusRun {
     let timing: QwenMTPCorpusTiming
     let mtpTelemetry: QwenMTPCorpusMTPTelemetry
     let mtpPhaseAttribution: QwenMTPCorpusMTPPhaseAttribution?
+    let promptPreparationEvaluationOrder: MTPPromptPreparationEvaluationOrder?
     let passthroughReason: String?
 }
 
@@ -290,26 +639,42 @@ private func runScalar(
             targetVerifiedTokenCount: 0,
             emittedTokenCount: tokens.count),
         mtpPhaseAttribution: nil,
+        promptPreparationEvaluationOrder: nil,
         passthroughReason: nil)
 }
 
 private func runMTPDrain(
     _ spec: QwenMTPCorpusCaseSpec,
     pair: Qwen35ExactMTPLoadedPair,
-    parameters: GenerateParameters
+    parameters: GenerateParameters,
+    promptPreparationEvaluationOrder: MTPPromptPreparationEvaluationOrder? = nil
 ) throws -> CorpusRun {
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
     let wallStart = ProcessInfo.processInfo.systemUptime
-    var iterator = try MTPSpeculativeTokenIterator(
-        input: input,
-        mainModel: pair.target.model,
-        drafter: pair.drafter.model,
-        mainCache: cache,
-        parameters: parameters,
-        blockSize: pair.binding.runtimeBlockSize,
-        collectPhaseTelemetry: true)
+    let configuredIterator: MTPSpeculativeTokenIterator
+    if let promptPreparationEvaluationOrder {
+        configuredIterator = try MTPSpeculativeTokenIterator(
+            input: input,
+            mainModel: pair.target.model,
+            drafter: pair.drafter.model,
+            mainCache: cache,
+            parameters: parameters,
+            blockSize: pair.binding.runtimeBlockSize,
+            collectPhaseTelemetry: true,
+            promptPreparationEvaluationOrder: promptPreparationEvaluationOrder)
+    } else {
+        configuredIterator = try MTPSpeculativeTokenIterator(
+            input: input,
+            mainModel: pair.target.model,
+            drafter: pair.drafter.model,
+            mainCache: cache,
+            parameters: parameters,
+            blockSize: pair.binding.runtimeBlockSize,
+            collectPhaseTelemetry: true)
+    }
+    var iterator = configuredIterator
     let generationStart = ProcessInfo.processInfo.systemUptime
     var tokens: [Int] = []
     let stopTokenIds = buildQwenMTPCorpusStopTokenIds(
@@ -352,7 +717,38 @@ private func runMTPDrain(
         mtpPhaseAttribution: mtpPhaseAttribution(
             from: iterator,
             cacheFingerprintSeconds: fingerprintSeconds),
+        promptPreparationEvaluationOrder:
+            iterator.promptPreparationTelemetry?.evaluationOrder,
         passthroughReason: iterator.passthroughReason)
+}
+
+private func evaluationOrderRunEvidence(
+    _ expectedOrder: MTPPromptPreparationEvaluationOrder,
+    scalar: CorpusRun,
+    mtp: CorpusRun
+) throws -> QwenMTPEvaluationOrderRunEvidence {
+    guard mtp.promptPreparationEvaluationOrder == expectedOrder,
+        let phaseAttribution = mtp.mtpPhaseAttribution
+    else {
+        throw QwenMTPCorpusCLIError.missingEvaluationOrderTelemetry(
+            expectedOrder.rawValue)
+    }
+    let evidenceOrder: QwenMTPPromptEvaluationOrderEvidence
+    switch expectedOrder {
+    case .cacheFirst:
+        evidenceOrder = .cacheFirst
+    case .hiddenFirst:
+        evidenceOrder = .hiddenFirst
+    case .combined:
+        evidenceOrder = .combined
+    }
+    return QwenMTPEvaluationOrderRunEvidence(
+        evaluationOrder: evidenceOrder,
+        timing: mtp.timing,
+        exactness: exactnessEvidence(scalar: scalar, mtp: mtp),
+        telemetry: mtp.mtpTelemetry,
+        phaseAttribution: phaseAttribution,
+        passthroughReason: mtp.passthroughReason)
 }
 
 private func runMTPCancelAfterExtraGenerated(
@@ -416,6 +812,8 @@ private func runMTPCancelAfterExtraGenerated(
         mtpPhaseAttribution: mtpPhaseAttribution(
             from: iterator,
             cacheFingerprintSeconds: fingerprintSeconds),
+        promptPreparationEvaluationOrder:
+            iterator.promptPreparationTelemetry?.evaluationOrder,
         passthroughReason: iterator.passthroughReason)
 }
 
@@ -482,6 +880,8 @@ private func runMTPCancelAfterAcceptedDraft(
         mtpPhaseAttribution: mtpPhaseAttribution(
             from: iterator,
             cacheFingerprintSeconds: fingerprintSeconds),
+        promptPreparationEvaluationOrder:
+            iterator.promptPreparationTelemetry?.evaluationOrder,
         passthroughReason: iterator.passthroughReason)
 }
 
@@ -649,6 +1049,38 @@ private func mtpPhaseAttribution(
     cacheFingerprintSeconds: Double
 ) -> QwenMTPCorpusMTPPhaseAttribution {
     let phase = iterator.speculativeDecodingPhaseTelemetry
+    let targetPromptPreparation = iterator.promptPreparationTelemetry.map { telemetry in
+        let chunks = telemetry.chunks.map {
+            QwenMTPPromptPreparationChunkAttribution(
+                tokenOffset: $0.tokenOffset,
+                tokenCount: $0.tokenCount,
+                targetForwardSchedulingSeconds:
+                    $0.targetForwardSchedulingSeconds)
+        }
+        let attributedSeconds = chunks.reduce(
+            telemetry.cacheEvaluationSeconds
+                + telemetry.hiddenEvaluationSeconds
+                + telemetry.concatenatedHiddenEvaluationSeconds
+                + telemetry.preparedCacheHandoffSeconds
+                + iterator.promptPreparationPhaseBoundarySynchronizationSeconds
+        ) {
+            $0 + $1.targetForwardSchedulingSeconds
+        }
+        return QwenMTPPromptPreparationAttribution(
+            promptTokenCount: telemetry.promptTokenCount,
+            hiddenShape: telemetry.hiddenShape,
+            hiddenByteCount: telemetry.hiddenByteCount,
+            chunks: chunks,
+            cacheEvaluationSeconds: telemetry.cacheEvaluationSeconds,
+            hiddenEvaluationSeconds: telemetry.hiddenEvaluationSeconds,
+            concatenatedHiddenEvaluationSeconds:
+                telemetry.concatenatedHiddenEvaluationSeconds,
+            preparedCacheHandoffSeconds: telemetry.preparedCacheHandoffSeconds,
+            phaseBoundarySynchronizationSeconds:
+                iterator.promptPreparationPhaseBoundarySynchronizationSeconds,
+            targetPrefillResidualSeconds:
+                phase.targetPrefillSeconds - attributedSeconds)
+    }
     return QwenMTPCorpusMTPPhaseAttribution(
         targetPrefillSeconds: phase.targetPrefillSeconds,
         drafterPromptPrimingSeconds: phase.drafterPromptPrimingSeconds,
@@ -665,7 +1097,8 @@ private func mtpPhaseAttribution(
         targetTailCount: phase.targetTailCount,
         hybridRewindReplayCount: phase.hybridRewindReplayCount,
         finalizationCount: phase.finalizationCount,
-        cacheFingerprintCount: 1)
+        cacheFingerprintCount: 1,
+        targetPromptPreparation: targetPromptPreparation)
 }
 
 private func buildQwenMTPCorpusStopTokenIds(
@@ -823,6 +1256,88 @@ private func resultRecord(
             modelQuant: modelConfig.quant,
             corpusId: QwenMTPCorpusGate.corpusID,
             corpusContentHash: QwenMTPCorpusGate.corpusContentHash,
+            nonce: UUID().uuidString),
+        payload: payload)
+}
+
+private func evaluationOrderResultRecord(
+    _ payload: QwenMTPEvaluationOrderIsolationPayload,
+    targetPath: String
+) -> ResultRecord<QwenMTPEvaluationOrderIsolationPayload> {
+    let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
+    return ResultRecord(
+        subcommand: "qwen-mtp-eval-order",
+        provenance: Provenance(
+            date: ISO8601DateFormatter().string(from: Date()),
+            hardwareChip: ProvenanceCLI.chipBrand(),
+            hardwareRAMBytes: ProvenanceCLI.ramBytes(),
+            hardwareOS: ProvenanceCLI.osVersion(),
+            harnessGitSHA: ProvenanceCLI.harnessGitSHA(),
+            mlxSwiftVersion: ProvenanceCLI.mlxSwiftVersion,
+            referenceMLXVersion: nil,
+            referenceMLXLMVersion: ProvenanceCLI.mlxSwiftLMRevision,
+            modelPath: payload.binding.targetModelID,
+            modelConfigHash: modelConfig.hash,
+            modelCheckpointManifestHash:
+                try? ProvenanceCLI.checkpointManifestHash(at: targetPath),
+            modelQuant: modelConfig.quant,
+            corpusId: payload.corpusID,
+            corpusContentHash: payload.corpusContentHash,
+            nonce: UUID().uuidString),
+        payload: payload)
+}
+
+private func combinedEvaluationResultRecord(
+    _ payload: QwenMTPCombinedEvaluationIsolationPayload,
+    targetPath: String
+) -> ResultRecord<QwenMTPCombinedEvaluationIsolationPayload> {
+    let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
+    return ResultRecord(
+        subcommand: "qwen-mtp-eval-combined",
+        provenance: Provenance(
+            date: ISO8601DateFormatter().string(from: Date()),
+            hardwareChip: ProvenanceCLI.chipBrand(),
+            hardwareRAMBytes: ProvenanceCLI.ramBytes(),
+            hardwareOS: ProvenanceCLI.osVersion(),
+            harnessGitSHA: ProvenanceCLI.harnessGitSHA(),
+            mlxSwiftVersion: ProvenanceCLI.mlxSwiftVersion,
+            referenceMLXVersion: nil,
+            referenceMLXLMVersion: ProvenanceCLI.mlxSwiftLMRevision,
+            modelPath: payload.binding.targetModelID,
+            modelConfigHash: modelConfig.hash,
+            modelCheckpointManifestHash:
+                try? ProvenanceCLI.checkpointManifestHash(at: targetPath),
+            modelQuant: modelConfig.quant,
+            corpusId: payload.corpusID,
+            corpusContentHash: payload.corpusContentHash,
+            nonce: UUID().uuidString),
+        payload: payload)
+}
+
+private func hiddenFirstRuntimeResultRecord(
+    _ payload: QwenMTPHiddenFirstRuntimeEquivalencePayload,
+    targetPath: String,
+    subcommand: String
+) -> ResultRecord<QwenMTPHiddenFirstRuntimeEquivalencePayload> {
+    let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
+    return ResultRecord(
+        subcommand: subcommand,
+        provenance: Provenance(
+            date: ISO8601DateFormatter().string(from: Date()),
+            hardwareChip: ProvenanceCLI.chipBrand(),
+            hardwareRAMBytes: ProvenanceCLI.ramBytes(),
+            hardwareOS: ProvenanceCLI.osVersion(),
+            harnessGitSHA: ProvenanceCLI.harnessGitSHA(),
+            mlxSwiftVersion: ProvenanceCLI.mlxSwiftVersion,
+            referenceMLXVersion: nil,
+            referenceMLXLMVersion: ProvenanceCLI.mlxSwiftLMRevision,
+            modelPath: payload.binding.targetModelID,
+            modelConfigHash: modelConfig.hash,
+            modelCheckpointManifestHash:
+                try? ProvenanceCLI.checkpointManifestHash(at: targetPath),
+            modelQuant: modelConfig.quant,
+            corpusId: payload.corpusID,
+            corpusContentHash: payload.corpusContentHash,
             nonce: UUID().uuidString),
         payload: payload)
 }

@@ -103,4 +103,41 @@ final class KVQuantAdvisoryTests: XCTestCase {
         XCTAssertTrue(machine!.contains("fit_advisory_ceiling=\(int8Ceiling)"),
             "advisory ceiling must be the int8 what-if ceiling — got: \(machine!)")
     }
+
+    func testPreviewLines_usesDeclaredOSServiceReserve() {
+        let host = smallHost(ramGiB: 48, wiredGiB: 40)
+        let p = profile("Qwen3-32B")
+        let thresholds = CapacityThresholds(osReserveBytes: 16 * gib)
+        let expected = ServingFitPlanner.decide(
+            profile: p, weightsAreMeasured: false, host: host,
+            kvQuant: .int8, thresholds: thresholds).contextCeiling
+
+        let lines = KVQuantAdvisory.previewLines(
+            tier: .int8, profile: p, host: host, thresholds: thresholds)
+        let machine = lines.first { $0.contains("fit_advisory_ceiling=") }
+
+        XCTAssertNotNil(machine)
+        XCTAssertTrue(
+            machine!.contains("fit_advisory_ceiling=\(expected)"),
+            "advisory must use the same declared OS/service reserve as enforced fit — got: \(machine!)")
+    }
+
+    func testPreviewLines_usesDeclaredConcurrency() {
+        let host = smallHost(ramGiB: 48, wiredGiB: 40)
+        let p = profile("Qwen3-32B")
+        let expected = ServingFitPlanner.decide(
+            profile: p, weightsAreMeasured: false, host: host,
+            kvQuant: .int8, concurrency: 4).contextCeiling
+        let single = ServingFitPlanner.decide(
+            profile: p, weightsAreMeasured: false, host: host,
+            kvQuant: .int8, concurrency: 1).contextCeiling
+
+        let lines = KVQuantAdvisory.previewLines(
+            tier: .int8, profile: p, host: host, concurrency: 4)
+        let machine = lines.first { $0.contains("fit_advisory_ceiling=") }
+
+        XCTAssertLessThan(expected, single, "fixture must detect a dropped concurrency input")
+        XCTAssertNotNil(machine)
+        XCTAssertTrue(machine!.contains("fit_advisory_ceiling=\(expected)"))
+    }
 }

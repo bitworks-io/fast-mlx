@@ -62,6 +62,23 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
         }
     }
 
+    func testAuthenticatedQwen38BindingRemainsOutsideQwen35ServingAdmission() {
+        let qwen38 = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        let qwen38Binding = QwenMTPArtifactBinding(
+            targetModelID: qwen38.targetIdentity.modelID,
+            drafterModelID: qwen38.drafterIdentity.modelID,
+            targetRevision: qwen38.targetIdentity.revision,
+            drafterRevision: qwen38.drafterIdentity.revision,
+            sourceRevision: qwen38.sourceRevision,
+            architecture: qwen38.architecture,
+            runtimeBlockSize: 3,
+            maximumAcceptedDraftTokens: 2)
+
+        XCTAssertEqual(
+            decide(binding: qwen38Binding),
+            .scalarFallback(.bindingMismatch))
+    }
+
     func testSampledPolicyFallsBack() {
         XCTAssertEqual(
             decide(

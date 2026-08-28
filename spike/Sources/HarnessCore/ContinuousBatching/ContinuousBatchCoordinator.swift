@@ -32,6 +32,7 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
     public let tokens: [Int]
     public let finished: Bool
     public let soloPipelineState: BatchSoloPipelineState
+    public let observation: BatchDecodeObservation
 
     public var hasPendingSoloLookahead: Bool {
         soloPipelineState.requiresDrain
@@ -41,12 +42,14 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
         id: BatchRequestID,
         tokens: [Int],
         finished: Bool,
-        soloPipelineState: BatchSoloPipelineState
+        soloPipelineState: BatchSoloPipelineState,
+        observation: BatchDecodeObservation = .none
     ) {
         self.id = id
         self.tokens = tokens
         self.finished = finished
         self.soloPipelineState = soloPipelineState
+        self.observation = observation
     }
 
     /// Source-compatible bridge for existing non-speculative runtimes and fixtures.
@@ -54,7 +57,8 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
         id: BatchRequestID,
         tokens: [Int],
         finished: Bool,
-        hasPendingSoloLookahead: Bool
+        hasPendingSoloLookahead: Bool,
+        observation: BatchDecodeObservation = .none
     ) {
         self.init(
             id: id,
@@ -62,7 +66,8 @@ public struct ContinuousBatchRuntimeDecodeResult: Sendable, Equatable {
             finished: finished,
             soloPipelineState: hasPendingSoloLookahead
                 ? .pipelinedLookahead
-                : .canonical)
+                : .canonical,
+            observation: observation)
     }
 }
 
@@ -739,7 +744,8 @@ public actor ContinuousBatchCoordinator {
                 emittedTokenCount: visible.count,
                 finished: finished,
                 soloPipelineState: finished
-                    ? .canonical : result.soloPipelineState))
+                    ? .canonical : result.soloPipelineState,
+                observation: result.observation))
     }
 
     private func publish(

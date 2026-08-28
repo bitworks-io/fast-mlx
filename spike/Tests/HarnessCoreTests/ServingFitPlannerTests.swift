@@ -15,10 +15,16 @@ final class ServingFitPlannerTests: XCTestCase {
         return m
     }
 
+    private var qualifiedDedicatedHost: SystemProfile {
+        SystemProfile(
+            chip: "test dedicated", totalRAMBytes: 128 * gib, wiredLimitBytes: 115 * gib,
+            wiredLimitIsMeasured: true, hostUse: .operatorAssertedDedicatedServing())
+    }
+
     // MARK: - fitting model → green, limits from the sizer (NOT flat %)
 
     func testFittingDenseModel_green_proceeds_withSizerLimits() {
-        let host = SystemProfile.m5Max128 // 128 GiB, wired 115 GiB (measured)
+        let host = qualifiedDedicatedHost // 128 GiB, wired 115 GiB (measured)
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host)
         XCTAssertEqual(d.color, .green)
@@ -46,7 +52,7 @@ final class ServingFitPlannerTests: XCTestCase {
     /// the native max (== the backend's nil-maxContextTokens cap), NOT the 32K effective default —
     /// otherwise the wired maxContextTokens would newly hard-reject longer requests that used to work.
     func testDefaultServedContextIsMaxThatFits_notFlat32K() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let m = profile("Qwen3-32B") // nativeMax 40960, fits fully on 128 GiB
         let d = ServingFitPlanner.decide(profile: m, weightsAreMeasured: true, host: host)
         XCTAssertEqual(d.contextCeiling, m.nativeMaxContext, "the full native context fits on this box")
@@ -58,7 +64,9 @@ final class ServingFitPlannerTests: XCTestCase {
     // MARK: - too-big model on a small host → red → refuse; --force overrides
 
     private func smallHost(ramGiB: Int, wiredGiB: Int) -> SystemProfile {
-        SystemProfile(chip: "test", totalRAMBytes: ramGiB * gib, wiredLimitBytes: wiredGiB * gib, wiredLimitIsMeasured: true)
+        SystemProfile(
+            chip: "test", totalRAMBytes: ramGiB * gib, wiredLimitBytes: wiredGiB * gib,
+            wiredLimitIsMeasured: true, hostUse: .operatorAssertedDedicatedServing())
     }
 
     func testTooBigModel_smallHost_red_refusesByDefault() {
@@ -117,12 +125,70 @@ final class ServingFitPlannerTests: XCTestCase {
 
     /// A request that fits WITHOUT any cap is unaffected by the no-cap stance — it still proceeds.
     func testFittingRequest_noCapping_stillProceeds() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host, allowContextCapping: false)
         XCTAssertTrue(d.shouldProceed, "no cap was needed → no-cap policy changes nothing")
         XCTAssertFalse(d.contextWasCapped)
         XCTAssertEqual(d.servedContext, profile("Qwen3-32B").nativeMaxContext)
+    }
+
+    func testLowerPositiveMetalRecommendationDrivesLimitsAndCanBindRedWhenWiredWouldFit() {
+        let wiredHost = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * gib,
+            wiredLimitBytes: 96 * gib,
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: nil)
+        let metalHost = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * gib,
+            wiredLimitBytes: 96 * gib,
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: 24 * gib)
+        let m = profile("Qwen3-32B")
+
+        let wiredDecision = ServingFitPlanner.decide(
+            profile: m, weightsAreMeasured: true, host: wiredHost, requestedContext: m.nativeMaxContext)
+        let metalDecision = ServingFitPlanner.decide(
+            profile: m, weightsAreMeasured: true, host: metalHost, requestedContext: m.nativeMaxContext)
+
+        XCTAssertEqual(metalHost.effectiveMemoryCeiling.bytes, 24 * gib)
+        XCTAssertEqual(metalHost.effectiveMemoryCeiling.source, .recommendedWorkingSet)
+        XCTAssertNotEqual(metalHost.effectiveMemoryCeiling.source, .wiredLimit)
+        XCTAssertNotEqual(wiredDecision.color, .red, "precondition: the model fits under the wired/shared fallback envelope")
+        XCTAssertEqual(metalDecision.color, .red)
+        XCTAssertEqual(metalDecision.bindingConstraint, .recommendedWorkingSet)
+        XCTAssertEqual(metalDecision.memoryLimitBytes, 24 * gib)
+        XCTAssertEqual(metalDecision.effectiveMemoryCeilingSource, .recommendedWorkingSet)
+        XCTAssertFalse(metalDecision.effectiveMemoryCeilingIsMeasured)
+        XCTAssertTrue(metalDecision.wiredLimitIsMeasured)
+        XCTAssertTrue(metalDecision.machineReadableFields().contains("fit_estimate_measured=false"))
+        XCTAssertEqual(
+            metalDecision.cacheLimitBytes,
+            CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: 24 * gib),
+            "cache limit must derive from the same effective Metal ceiling as the memory limit")
+    }
+
+    func testLowerMeasuredWiredSharedCeilingDrivesPlannerMemoryAndCacheBudgets() {
+        let host = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * gib,
+            wiredLimitBytes: 48 * gib,
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: 80 * gib)
+
+        let decision = ServingFitPlanner.decide(
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host)
+
+        XCTAssertEqual(host.effectiveMemoryCeiling.source, .wiredLimit)
+        XCTAssertEqual(decision.memoryLimitBytes, 48 * gib)
+        XCTAssertEqual(
+            decision.cacheLimitBytes,
+            CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: 48 * gib))
+        XCTAssertTrue(decision.wiredLimitIsMeasured)
+        XCTAssertTrue(decision.effectiveMemoryCeilingIsMeasured)
+        XCTAssertTrue(decision.machineReadableFields().contains("fit_estimate_measured=true"))
     }
 
     // MARK: - --tier dial ↔ serve decision composition (ServeTierPolicy → decide(allowContextCapping:))
@@ -181,7 +247,7 @@ final class ServingFitPlannerTests: XCTestCase {
     // MARK: - requested context beyond the model's native max → red modelNativeMax
 
     func testRequestBeyondNativeMax_redModelNativeMax() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         // Phi-4 native max is 16384; ask for 32768.
         let d = ServingFitPlanner.decide(
             profile: profile("Phi-4-14B"), weightsAreMeasured: true, host: host, requestedContext: 32768)
@@ -193,7 +259,7 @@ final class ServingFitPlannerTests: XCTestCase {
     // MARK: - estimated weights provenance flows through
 
     func testEstimatedWeightsProvenanceSurfaced() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(profile: profile("Qwen3-32B"), weightsAreMeasured: false, host: host)
         XCTAssertFalse(d.weightsAreMeasured)
         // summary reflects the estimated weights label
@@ -203,7 +269,7 @@ final class ServingFitPlannerTests: XCTestCase {
     // MARK: - machine-readable startup-line fields
 
     func testMachineReadableFields_greenMeasured_omitsForced() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host)
         let fields = d.machineReadableFields()
@@ -212,7 +278,7 @@ final class ServingFitPlannerTests: XCTestCase {
         XCTAssertTrue(fields.contains("fit_served_context="))
         XCTAssertTrue(fields.contains("fit_context_ceiling="))
         XCTAssertFalse(fields.contains("fit_forced"))
-        // folded provenance: both weights and wired-limit measured on m5Max128 → estimate is measured
+        // folded provenance: both weights and wired-limit measured → estimate is measured
         XCTAssertTrue(fields.contains("fit_estimate_measured=true"))
         // no --quant → none; default context on a box that holds native max → not capped
         XCTAssertTrue(fields.contains("fit_quant_bits=none"))
@@ -222,7 +288,7 @@ final class ServingFitPlannerTests: XCTestCase {
     }
 
     func testMachineReadableFields_estimateNotMeasured_whenWeightsEstimated() {
-        let host = SystemProfile.m5Max128 // wired-limit measured, but weights passed as estimated
+        let host = qualifiedDedicatedHost // wired-limit measured, but weights passed as estimated
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: false, host: host)
         let fields = d.machineReadableFields()
@@ -255,14 +321,14 @@ final class ServingFitPlannerTests: XCTestCase {
     // MARK: - quant-bits label in the summary header
 
     func testSummaryHeader_withQuantBits_showsBitLabel() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host, quantBits: 4)
         XCTAssertTrue(d.summaryLines()[0].contains("[4-bit]"))
     }
 
     func testSummaryHeader_withoutQuantBits_unchanged() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(
             profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host)
         XCTAssertFalse(d.summaryLines()[0].contains("-bit]"))
@@ -274,7 +340,7 @@ final class ServingFitPlannerTests: XCTestCase {
     /// param-count *estimate* — measured still wins. Machine-readable `weights_measured=false` stays
     /// correct for declared (declared is not measured on disk).
     func testWeightsProvenance_threeStateLabel() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let m = profile("Qwen3-32B")
 
         let measured = ServingFitPlanner.decide(profile: m, weightsAreMeasured: true, host: host)
@@ -302,7 +368,7 @@ final class ServingFitPlannerTests: XCTestCase {
     /// byte-for-byte identical to the shipped call, and emits NO planning-concurrency label. This is
     /// the non-regression lock that keeps the frozen announce contract intact for existing callers.
     func testPlanConcurrency_default1_isByteIdenticalAndUnlabeled() {
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let m = profile("Qwen3-32B")
         let base = ServingFitPlanner.decide(profile: m, weightsAreMeasured: true, host: host)
         let explicit1 = ServingFitPlanner.decide(profile: m, weightsAreMeasured: true, host: host, concurrency: 1)
@@ -336,7 +402,7 @@ final class ServingFitPlannerTests: XCTestCase {
     /// line and the machine line appends `fit_plan_concurrency=N` (before any `fit_forced`), so a
     /// stricter verdict is never silently attributed to the single-slot default.
     func testPlanConcurrency_higherN_labelsBasis() {
-        let host = SystemProfile.m5Max128 // a 32B model on 128 GiB still proceeds at 4 streams
+        let host = qualifiedDedicatedHost // a 32B model on 128 GiB still proceeds at 4 streams
         let d = ServingFitPlanner.decide(profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: host, concurrency: 4)
         XCTAssertTrue(d.shouldProceed, "precondition: this model proceeds at concurrency 4 on a 128 GiB box")
         XCTAssertEqual(d.planningConcurrency, 4)
@@ -421,7 +487,7 @@ final class ServingFitPlannerTests: XCTestCase {
         XCTAssertTrue(parsed.weightsAreMeasured, "on-disk shards were summed — a measured fact")
         XCTAssertFalse(parsed.weightsAreDeclared)
 
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let d = ServingFitPlanner.decide(
             profile: parsed.profile, weightsAreMeasured: parsed.weightsAreMeasured, host: host,
             weightsAreDeclared: parsed.weightsAreDeclared)

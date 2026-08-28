@@ -83,9 +83,8 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     case emptyStartupPrompt
     case startupDidNotGenerateToken
     case startupParityMismatch
-    /// The requested KV tier passed `selectKVCacheQuant` (it is runtime-wired) but the runtime does not
-    /// yet build its quantized caches — a future state guarded so a `runtimeWiredKVTiers` flip cannot
-    /// silently reach fp16 construction. Today unreachable (int8+ fail closed at selection).
+    /// A selected tier has no construction strategy for this scalar route. The production policy keeps
+    /// int8 unreachable until quality approval; this remains the defensive boundary for future pairings.
     case kvQuantTierConstructionUnavailable(KVQuantTier)
     /// A qwen3_5 hybrid checkpoint (the default scalar-fallback route for the family) whose linear key
     /// head dim (Dk) is not a multiple of 32, which the gated-delta Metal kernel requires
@@ -95,6 +94,32 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// (`ContinuousServingModelLoadError.hybridKernelKeyHeadDimUnaligned`) for the scalar route that
     /// serves qwen3_5 by default (continuous admission is opt-in). Carries the offending Dk.
     case hybridKernelKeyHeadDimUnaligned(Int)
+}
+
+enum ScalarServingDecoderStrategy: Equatable {
+    /// Preserve the existing compiled fp16 fast path byte-for-byte.
+    case compiledFP16
+    /// Use the model's native forward path with caches constructed from the selected storage tier.
+    /// The int8 branch is inert until the production policy's quality gate admits it.
+    case nativeCaches(KVCacheQuantDecision)
+}
+
+func scalarServingDecoderStrategy(
+    route: ScalarServingDecoderRoute,
+    kvCacheDecision: KVCacheQuantDecision
+) throws -> ScalarServingDecoderStrategy {
+    switch (route, kvCacheDecision) {
+    case (.compiled, .fp16):
+        return .compiledFP16
+    case (.compiled, .int8):
+        return .nativeCaches(kvCacheDecision)
+    case (.nativeHeterogeneous, .fp16):
+        return .nativeCaches(.fp16)
+    case (.nativeHeterogeneous, .int8):
+        // Selection rejects this earlier because recurrent state cannot be represented by the
+        // dense-only quantized cache. Retain a defensive construction boundary if call order drifts.
+        throw ScalarServingModelLoadError.kvQuantTierConstructionUnavailable(.int8)
+    }
 }
 
 public struct ScalarServingModelLoadConfiguration: Sendable {
@@ -111,9 +136,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     public let backendConfiguration: ScalarServingBackendConfiguration
     public let startupMessages: [OpenAIChatMessage]
     /// Requested KV-cache storage tier for this serve. Default `.fp16` (the runtime's always-valid
-    /// native storage). Non-fp16 tiers are resolved fail-closed at load via `selectKVCacheQuant`: a tier
-    /// the runtime cannot store yet (int8 until its quality gate flips `runtimeWiredKVTiers`) refuses to
-    /// start rather than silently serve fp16 while the fit-check sized for the smaller tier.
+    /// native storage). Non-fp16 tiers remain fail-closed until their runtime + quality gate passes.
     public let kvQuantTier: KVQuantTier
 
     public init(
@@ -296,21 +319,13 @@ public func loadScalarServingModel(
     let nativeCacheKinds = classifyScalarServingNativeCaches(
         context.model.newCache(parameters: nil))
     let decoderRoute = try classifyScalarServingDecoderRoute(nativeCacheKinds)
-    // Fail-closed KV-cache tier selection, BEFORE any live cache is built. A non-fp16 tier the runtime
-    // cannot store yet (int8/turbo/tq* until a dated quality gate flips `runtimeWiredKVTiers`) throws
-    // here — the process refuses to start rather than silently downgrade to fp16, which would leave the
-    // fit-check's smaller-tier GREEN served at the larger fp16 footprint. fp16 (default/omitted) resolves
-    // to `.fp16`, byte-identical to today. int8 QuantizedKVCache CONSTRUCTION + its long-session quality
-    // gate is the M5-128 operator step (docs/task-inbox/2026-08-19-runtime-kv-quant-quality.md); the
-    // selection wiring is done and inert until then.
+    // Fail-closed KV-cache tier selection before a live request cache is built. Production policy keeps
+    // int8 unwired after its dated quality NO-GO, so a request throws instead of silently downgrading.
+    // The construction strategy below remains compiled and testable for a future quality-approved flip.
     let kvCacheDecision = try selectKVCacheQuant(
         requested: configuration.kvQuantTier, nativeKinds: nativeCacheKinds)
-    guard case .fp16 = kvCacheDecision else {
-        // Unreachable today (selection yields only `.fp16`). Defensive: if a future `runtimeWiredKVTiers`
-        // flip admits int8 through selection before the quantized-cache construction below is wired, fail
-        // closed here instead of silently building fp16 caches for an int8-sized serve.
-        throw ScalarServingModelLoadError.kvQuantTierConstructionUnavailable(configuration.kvQuantTier)
-    }
+    let decoderStrategy = try scalarServingDecoderStrategy(
+        route: decoderRoute, kvCacheDecision: kvCacheDecision)
     let codec = MLXScalarTextCodec(tokenizer: tokenizer)
     let stopTokenIDs = try resolveScalarServingStopTokenIDs(
         configuration: modelConfiguration,
@@ -329,22 +344,22 @@ public func loadScalarServingModel(
     }
 
     let inference: InferenceActor
-    switch decoderRoute {
-    case .compiled:
+    switch decoderStrategy {
+    case .compiledFP16:
         inference = InferenceActor(decoder: CompiledMLXDecoder(model: context.model))
-    case .nativeHeterogeneous:
-        // Route the KV cache through the construction seam so the selected tier drives what is built
-        // rather than being computed and discarded. `kvCacheDecision` is `.fp16` here by construction
-        // (the fail-closed guard above throws otherwise, and int8 is rejected at selection for this
-        // route's recurrent caches), so `buildRouteKVCaches` returns the native caches unchanged —
-        // byte-identical to `context.model.newCache(parameters: nil)`. int8 construction activates only
-        // when the M5 quality gate relaxes that guard.
+    case .nativeCaches(let decision):
+        // The same factory owns initial construction and every later request reset. For fp16 it returns
+        // the model's native instances unchanged. If the quality gate later admits dense int8, this
+        // already-built seam prevents reset from reverting quantized caches to native fp16.
+        let model = context.model
         inference = InferenceActor(
             decoder: MLXDecoder(
-                model: context.model,
-                cache: buildRouteKVCaches(
-                    decision: kvCacheDecision,
-                    nativeCaches: context.model.newCache(parameters: nil))))
+                model: model,
+                cacheFactory: {
+                    buildRouteKVCaches(
+                        decision: decision,
+                        nativeCaches: model.newCache(parameters: nil))
+                }))
     }
     let parity = try await verifyScalarServingResetParity(
         inference: inference,

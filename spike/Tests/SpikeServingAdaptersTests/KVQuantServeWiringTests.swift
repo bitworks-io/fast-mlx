@@ -53,13 +53,13 @@ final class KVQuantServeWiringTests: XCTestCase {
         XCTAssertEqual(decision, .fp16)
     }
 
-    /// int8 is fail-closed at the load-path selection today (runtimeWiredKVTiers == [.fp16]) — the process
-    /// throws before any cache is built, so `--kv-quant int8` refuses to start rather than silently
-    /// serving fp16. Pins the safety behavior the wiring exists to deliver.
+    /// int8 remains fail-closed at production selection after the dated quality NO-GO. The process
+    /// throws before any cache is built, while injected construction tests keep the future seam ready.
     func testInt8FailsClosedAtSelectionForDenseRoute() {
         XCTAssertThrowsError(
             try selectKVCacheQuant(
-                requested: makeConfig(kvQuantTier: .int8).kvQuantTier, nativeKinds: [.denseAttention])
+                requested: makeConfig(kvQuantTier: .int8).kvQuantTier,
+                nativeKinds: [.denseAttention])
         ) { error in
             XCTAssertEqual(error as? KVQuantSelectionError, .tierNotRuntimeWired(.int8))
         }
@@ -74,6 +74,32 @@ final class KVQuantServeWiringTests: XCTestCase {
         XCTAssertNotEqual(
             ScalarServingModelLoadError.kvQuantTierConstructionUnavailable(.int8),
             ScalarServingModelLoadError.kvQuantTierConstructionUnavailable(.fp16))
+    }
+
+    func testDenseFP16KeepsCompiledDecoderStrategy() throws {
+        XCTAssertEqual(
+            try scalarServingDecoderStrategy(route: .compiled, kvCacheDecision: .fp16),
+            .compiledFP16)
+    }
+
+    func testDenseInt8SelectsNativeDecoderWithQuantizedCaches() throws {
+        XCTAssertEqual(
+            try scalarServingDecoderStrategy(
+                route: .compiled,
+                kvCacheDecision: .int8(groupSize: 32, bits: 8)),
+            .nativeCaches(.int8(groupSize: 32, bits: 8)))
+    }
+
+    func testHeterogeneousInt8StrategyFailsClosedDefensively() {
+        XCTAssertThrowsError(
+            try scalarServingDecoderStrategy(
+                route: .nativeHeterogeneous,
+                kvCacheDecision: .int8(groupSize: 32, bits: 8))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .kvQuantTierConstructionUnavailable(.int8))
+        }
     }
 
     // MARK: - Continuous-batch route (the DEFAULT serve.sh path)
@@ -121,5 +147,16 @@ final class KVQuantServeWiringTests: XCTestCase {
         XCTAssertNotEqual(
             ContinuousServingModelLoadError.kvQuantTierConstructionUnavailable(.int8),
             ContinuousServingModelLoadError.kvQuantTierConstructionUnavailable(.fp16))
+    }
+
+    func testContinuousInt8RemainsConstructionUnavailable() {
+        XCTAssertThrowsError(
+            try validateContinuousServingKVCacheDecision(
+                .int8(groupSize: 32, bits: 8), requestedTier: .int8)
+        ) { error in
+            XCTAssertEqual(
+                error as? ContinuousServingModelLoadError,
+                .kvQuantTierConstructionUnavailable(.int8))
+        }
     }
 }

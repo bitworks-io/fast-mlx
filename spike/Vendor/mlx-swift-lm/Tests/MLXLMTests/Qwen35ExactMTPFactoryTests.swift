@@ -34,6 +34,22 @@ func testQwen35ExactMTPKnownArtifactRuntimeMetadata() {
 }
 
 @Test
+func testQwen38ExactMTPKnownArtifactRuntimeMetadata() {
+    let lock = Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+
+    #expect(lock.target.modelID == "mlx-community/Qwen3.8-27B-mxfp8")
+    #expect(lock.drafter.modelID == "mlx-community/Qwen3.8-27B-MTP-mxfp8")
+    #expect(lock.target.revision == "d48d163bcdf24acaf656474854ab88ea17d65bd1")
+    #expect(lock.drafter.revision == "a50634460045613f166b09b13519466e801c6568")
+    #expect(lock.targetQuantization == .init(bits: 8, groupSize: 32, mode: "mxfp8"))
+    #expect(lock.drafterQuantization == .init(bits: 8, groupSize: 32, mode: "mxfp8"))
+    #expect(lock.drafterTensors.count == 23)
+    #expect(lock.runtimeBlockSize == 3)
+    #expect(lock.maximumAcceptedDraftTokens == 2)
+    #expect(lock.architecture.mtpDepth == 1)
+}
+
+@Test
 func testQwen35ExactMTPPublicLoaderResolvesFixedPairWithUseLatestFalse() async throws {
     let root = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -60,6 +76,39 @@ func testQwen35ExactMTPPublicLoaderResolvesFixedPairWithUseLatestFalse() async t
     #expect(calls.map(\.revision) == [
         "938d8919941c6e7efd3c7150eff7fe9d12afa631",
         "994730d199bff7799aa3ddef33a96723967a3e33",
+    ])
+    #expect(calls.allSatisfy { !$0.useLatest })
+    #expect(calls.allSatisfy { $0.patterns == ["*.safetensors", "*.json", "*.jinja"] })
+}
+
+@Test
+func testQwen38ExactMTPSelectedLoaderResolvesFixedPairWithUseLatestFalse() async throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let target = root.appending(component: "target")
+    let drafter = root.appending(component: "drafter")
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
+    let downloader = RecordingDownloader(directories: [
+        "mlx-community/Qwen3.8-27B-mxfp8": target,
+        "mlx-community/Qwen3.8-27B-MTP-mxfp8": drafter,
+    ])
+
+    _ = try? await Qwen35ExactMTPFactory.loadDepth1Pair(
+        selection: .qwen38_27BMXFP8Depth1,
+        from: downloader,
+        using: UnusedTokenizerLoader()
+    ) { _ in }
+
+    let calls = await downloader.calls()
+    #expect(calls.count == 2)
+    #expect(calls.map(\.id) == [
+        "mlx-community/Qwen3.8-27B-mxfp8",
+        "mlx-community/Qwen3.8-27B-MTP-mxfp8",
+    ])
+    #expect(calls.map(\.revision) == [
+        "d48d163bcdf24acaf656474854ab88ea17d65bd1",
+        "a50634460045613f166b09b13519466e801c6568",
     ])
     #expect(calls.allSatisfy { !$0.useLatest })
     #expect(calls.allSatisfy { $0.patterns == ["*.safetensors", "*.json", "*.jinja"] })

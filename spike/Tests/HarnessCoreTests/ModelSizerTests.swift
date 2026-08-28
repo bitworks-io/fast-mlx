@@ -48,9 +48,60 @@ final class ModelSizerTests: XCTestCase {
 
     // MARK: - estimateIsMeasured (the honest measured-vs-modeled flag)
 
-    func testEstimateIsMeasured_TrueForM5Max128WithFp16() {
-        let rows = ModelSizer.report(box: .m5Max128, context: 32768, kvQuant: .fp16)
-        XCTAssertTrue(rows.allSatisfy(\.estimateIsMeasured), "m5Max128 + fp16 must report measured")
+    func testEstimateIsMeasured_TrueForMeasuredDedicatedCeilingWithFp16() {
+        let measuredDedicated = SystemProfile(
+            chip: "measured-dedicated",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true,
+            hostUse: .operatorAssertedDedicatedServing())
+        let rows = ModelSizer.report(box: measuredDedicated, context: 32768, kvQuant: .fp16)
+        XCTAssertTrue(rows.allSatisfy(\.estimateIsMeasured), "a measured dedicated ceiling + fp16 must report measured")
+    }
+
+    func testEstimateIsMeasured_FalseForSharedPolicyAndMetalCeilings() {
+        let sharedPolicy = SystemProfile(
+            chip: "shared-policy",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true)
+        let metalBound = SystemProfile(
+            chip: "metal-bound",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 90 * Int(gib),
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: 80 * Int(gib))
+
+        XCTAssertTrue(ModelSizer.report(box: sharedPolicy, context: 32768).allSatisfy { !$0.estimateIsMeasured })
+        XCTAssertTrue(ModelSizer.report(box: metalBound, context: 32768).allSatisfy { !$0.estimateIsMeasured })
+    }
+
+    func testProvenanceNotesDistinguishSharedAndMetalCeilingsFromExperimentalKV() {
+        let sharedPolicy = SystemProfile(
+            chip: "shared-policy",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true)
+        let metalBound = SystemProfile(
+            chip: "metal-bound",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 90 * Int(gib),
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: 80 * Int(gib))
+
+        let sharedNotes = ModelSizer.provenanceNotes(box: sharedPolicy, kvQuant: .fp16)
+        let metalNotes = ModelSizer.provenanceNotes(box: metalBound, kvQuant: .fp16)
+        let experimentalNotes = ModelSizer.provenanceNotes(box: sharedPolicy, kvQuant: .tq2_5)
+
+        XCTAssertEqual(sharedNotes, [
+            "NOTE: the effective memory ceiling is synthesized by shared policy (not measured) — headroom numbers are approximate."
+        ])
+        XCTAssertEqual(metalNotes, [
+            "NOTE: the effective memory ceiling is Metal's advisory recommended working set (not a measured hard limit) — headroom numbers are approximate."
+        ])
+        XCTAssertTrue(experimentalNotes.contains { $0.contains("EXPERIMENTAL/UNMEASURED placeholder KV tier") })
+        XCTAssertFalse(sharedNotes.contains { $0.contains("EXPERIMENTAL/UNMEASURED placeholder KV tier") })
+        XCTAssertFalse(metalNotes.contains { $0.contains("EXPERIMENTAL/UNMEASURED placeholder KV tier") })
     }
 
     func testEstimateIsMeasured_FalseForDetectedHost() {
@@ -60,9 +111,15 @@ final class ModelSizerTests: XCTestCase {
     }
 
     func testEstimateIsMeasured_FalseForPlaceholderKVTier() {
-        // m5Max128's wiredLimit IS measured, but tq2_5 is an unmeasured placeholder KV tier —
+        // The dedicated host's wired limit IS measured, but tq2_5 is an unmeasured placeholder KV tier —
         // estimateIsMeasured must still go false (either condition can sink the honesty flag).
-        let rows = ModelSizer.report(box: .m5Max128, context: 32768, kvQuant: .tq2_5)
+        let host = SystemProfile(
+            chip: "measured-dedicated",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true,
+            hostUse: .operatorAssertedDedicatedServing())
+        let rows = ModelSizer.report(box: host, context: 32768, kvQuant: .tq2_5)
         XCTAssertTrue(rows.allSatisfy { !$0.estimateIsMeasured }, "tq2_5 is an unmeasured placeholder tier")
     }
 
@@ -74,31 +131,75 @@ final class ModelSizerTests: XCTestCase {
         XCTAssertFalse(host.wiredLimitIsMeasured, "a detected host's wired limit is always an estimate")
         XCTAssertGreaterThan(host.wiredLimitBytes, 0, "estimated wired limit must be positive")
         XCTAssertLessThanOrEqual(host.wiredLimitBytes, host.totalRAMBytes, "estimate must not exceed total RAM")
+        XCTAssertEqual(host.hostUse.rawValue, "shared")
+        XCTAssertEqual(host.hostUse.source.rawValue, "automatic")
+        XCTAssertEqual(host.hostUse.policyVersion, HostUseClassification.currentPolicyVersion)
     }
 
-    /// `estimatedWiredLimitBytes` reconciles the two data points this repo already has: ~0.90 at
-    /// the 128GB scale (m5Max128's measured 115/128 ≈ 0.898), ~0.75 at 256GB+ (m3Ultra256/512's
-    /// own documented planning assumption). ±3% tolerance, matching CapacityModelTests' style.
-    func testEstimatedWiredLimitBytes_MatchesDocumentedEndpoints() {
-        let at128 = SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: 128 * Int(gib))
-        XCTAssertEqual(Double(at128) / gib, 0.90 * 128, accuracy: 0.03 * 0.90 * 128)
+    func testHostUseDefaultsToSharedDefaultPolicy() {
+        let host = SystemProfile(
+            chip: "test", totalRAMBytes: 24 * Int(gib), wiredLimitBytes: 18 * Int(gib),
+            wiredLimitIsMeasured: false)
 
-        let at256 = SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: 256 * Int(gib))
-        XCTAssertEqual(Double(at256) / gib, 0.75 * 256, accuracy: 0.03 * 0.75 * 256)
-
-        let at512 = SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: 512 * Int(gib))
-        XCTAssertEqual(Double(at512) / gib, 0.75 * 512, accuracy: 0.03 * 0.75 * 512)
+        XCTAssertEqual(host.hostUse.rawValue, "shared")
+        XCTAssertEqual(host.hostUse.source.rawValue, "default")
+        XCTAssertEqual(host.hostUse.policyVersion, HostUseClassification.currentPolicyVersion)
     }
 
-    /// Monotonic: a bigger box never gets a higher fraction-of-RAM wired-limit estimate.
-    func testEstimatedWiredLimitBytes_FractionIsMonotonicNonIncreasing() {
+    func testDedicatedServingRequiresOperatorAssertionFactory() {
+        let hostUse = HostUseClassification.operatorAssertedDedicatedServing()
+
+        XCTAssertEqual(hostUse.rawValue, "dedicated-serving")
+        XCTAssertEqual(hostUse.source.rawValue, "operator-assertion")
+        XCTAssertEqual(hostUse.policyVersion, HostUseClassification.currentPolicyVersion)
+    }
+
+    func testHostUseDecodingRejectsInconsistentDedicatedServingSource() {
+        let data = """
+        {"use":"dedicated-serving","source":"automatic","policyVersion":"host-use/v1"}
+        """.data(using: .utf8)!
+
+        XCTAssertThrowsError(try JSONDecoder().decode(HostUseClassification.self, from: data))
+    }
+
+    func testHostUseDecodingRejectsUnknownPolicyVersion() {
+        let data = """
+        {"use":"shared","source":"default","policyVersion":"host-use/v999"}
+        """.data(using: .utf8)!
+
+        XCTAssertThrowsError(try JSONDecoder().decode(HostUseClassification.self, from: data))
+    }
+
+    func testEstimatedWiredLimitBytes_IsExactlySeventyFivePercentForSharedAutoHosts() {
+        for ramGiB in [24, 128, 256] {
+            let totalRAMBytes = ramGiB * Int(gib)
+            XCTAssertEqual(
+                SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: totalRAMBytes),
+                (totalRAMBytes * 3) / 4,
+                "\(ramGiB) GiB auto/default shared hosts must use floor(75% RAM)")
+        }
+    }
+
+    func testEstimatedWiredLimitBytes_FractionNeverExceedsSeventyFivePercent() {
         let ramSizesGiB = [64, 128, 160, 192, 224, 256, 384, 512]
-        let fractions = ramSizesGiB.map { ramGiB -> Double in
+        for ramGiB in ramSizesGiB {
             let bytes = SystemProfile.estimatedWiredLimitBytes(totalRAMBytes: ramGiB * Int(gib))
-            return Double(bytes) / (Double(ramGiB) * gib)
+            XCTAssertLessThanOrEqual(Double(bytes) / (Double(ramGiB) * gib), 0.75)
         }
-        for i in 1..<fractions.count {
-            XCTAssertLessThanOrEqual(fractions[i], fractions[i - 1] + 1e-9, "fraction must not increase with RAM")
-        }
+    }
+
+    func testSharedEffectiveCeilingUsesExactSeventyFivePercentWhenWiredIsHigherAndMetalAbsent() {
+        let host = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: nil)
+
+        XCTAssertEqual(host.effectiveMemoryCeiling.bytes, 96 * Int(gib))
+        XCTAssertEqual(host.effectiveMemoryCeiling.source, .sharedPolicy)
+        XCTAssertTrue(
+            host.wiredLimitIsMeasured,
+            "effective shared-policy provenance must not rewrite the measured wired input fact")
     }
 }

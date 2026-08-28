@@ -4,7 +4,7 @@ import XCTest
 
 final class QwenMTPCorpusGateTests: XCTestCase {
     func testFrozenCorpusIdentityAndCaseOrder() throws {
-        XCTAssertEqual(QwenMTPCorpusGate.schemaVersion, 2)
+        XCTAssertEqual(QwenMTPCorpusGate.schemaVersion, 4)
         XCTAssertEqual(QwenMTPCorpusGate.corpusID, "qwen3.5-9b-mtp-consumer-corpus-v1")
         XCTAssertEqual(QwenMTPCorpusGate.corpusContentHash, "5e3bc2fbb016d5e0")
 
@@ -228,6 +228,76 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         XCTAssertThrowsError(try QwenMTPCorpusGate.validate(missingFingerprint))
     }
 
+    func testPromptPreparationAttributionMustBePresentAndInternallyCoherent() {
+        var missing = makePayload()
+        missing.caseResults[0] = missing.caseResults[0].withMTPPhaseAttribution(
+            phaseAttribution(includeTargetPromptPreparation: false))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(missing))
+
+        var wrongPromptLength = makePayload()
+        wrongPromptLength.caseResults[0] = wrongPromptLength.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    promptTokenCount: 15)))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(wrongPromptLength))
+
+        var outOfOrderChunks = makePayload()
+        outOfOrderChunks.caseResults[0] = outOfOrderChunks.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(chunks: [
+                    .init(
+                        tokenOffset: 0, tokenCount: 8,
+                        targetForwardSchedulingSeconds: 0.0002),
+                    .init(
+                        tokenOffset: 9, tokenCount: 7,
+                        targetForwardSchedulingSeconds: 0.0002),
+                ])))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(outOfOrderChunks))
+
+        var wrongHiddenShape = makePayload()
+        wrongHiddenShape.caseResults[0] = wrongHiddenShape.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    hiddenShape: [1, 15, 4])))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(wrongHiddenShape))
+
+        var impossibleHiddenBytes = makePayload()
+        impossibleHiddenBytes.caseResults[0] = impossibleHiddenBytes.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    hiddenByteCount: 255)))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(impossibleHiddenBytes))
+
+        var forgedEnvelope = makePayload()
+        forgedEnvelope.caseResults[0] = forgedEnvelope.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    concatenatedHiddenEvaluationSeconds: 0.002,
+                    targetPrefillResidualSeconds: 0.001)))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(forgedEnvelope))
+
+        var negativeSubphase = makePayload()
+        negativeSubphase.caseResults[0] = negativeSubphase.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    cacheEvaluationSeconds: -0.0001)))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(negativeSubphase))
+
+        var fabricatedSync = makePayload()
+        fabricatedSync.caseResults[0] = fabricatedSync.caseResults[0]
+            .withMTPPhaseAttribution(phaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution(
+                    phaseBoundarySynchronizationSeconds: 0.002,
+                    targetPrefillResidualSeconds: 0)))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(fabricatedSync))
+
+        var fallbackFabrication = makePayload()
+        fallbackFabrication.caseResults[10] = fallbackFabrication.caseResults[10]
+            .withMTPPhaseAttribution(fallbackPhaseAttribution(
+                targetPromptPreparation: promptPreparationAttribution()))
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validate(fallbackFabrication))
+    }
+
     func testNormalFullCasesRequireDraftActivityAndNoPassthrough() {
         var noDrafts = makePayload()
         noDrafts.caseResults[0] = noDrafts.caseResults[0].withDrafts(proposed: 0, accepted: 0)
@@ -270,6 +340,17 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         XCTAssertEqual(verdict.correctness, .pass)
         XCTAssertEqual(verdict.profile?.qualified, true)
         XCTAssertGreaterThanOrEqual(verdict.profile?.aggregatePairedMedian ?? 0, 1.08)
+        XCTAssertEqual(
+            verdict.profile?.hiddenMaterializationSecondsTotal ?? 0,
+            Double(QwenMTPCorpusGate.profilePlan.caseIDs.count
+                * QwenMTPCorpusGate.profilePlan.measuredPairs) * 0.0004,
+            accuracy: 1e-12)
+        XCTAssertEqual(verdict.profile?.promptOverheadSecondsTotal ?? -1, 0, accuracy: 1e-12)
+        XCTAssertEqual(
+            verdict.profile?.hiddenMaterializationShareOfPromptOverhead ?? -1,
+            0,
+            accuracy: 1e-12)
+        XCTAssertEqual(verdict.profile?.hiddenMaterializationCandidateQualified, false)
 
         var incorrect = payload
         incorrect.caseResults[1] = incorrect.caseResults[1].withDecodedDigests(
@@ -540,10 +621,30 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             XCTAssertFalse(String(describing: error).contains("/models/qwen"))
         }
 
+        var oldKeysRoot = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: valid) as? [String: Any])
+        var oldKeysPayload = try XCTUnwrap(oldKeysRoot["payload"] as? [String: Any])
+        var oldKeysCases = try XCTUnwrap(oldKeysPayload["caseResults"] as? [[String: Any]])
+        var oldKeysPhase = try XCTUnwrap(
+            oldKeysCases[0]["mtpPhaseAttribution"] as? [String: Any])
+        var oldKeysPreparation = try XCTUnwrap(
+            oldKeysPhase["targetPromptPreparation"] as? [String: Any])
+        oldKeysPreparation["cacheHiddenEvaluationSeconds"] =
+            oldKeysPreparation.removeValue(forKey: "cacheEvaluationSeconds")
+        oldKeysPreparation["hiddenConcatenationSeconds"] =
+            oldKeysPreparation.removeValue(forKey: "concatenatedHiddenEvaluationSeconds")
+        oldKeysPhase["targetPromptPreparation"] = oldKeysPreparation
+        oldKeysCases[0]["mtpPhaseAttribution"] = oldKeysPhase
+        oldKeysPayload["caseResults"] = oldKeysCases
+        oldKeysRoot["payload"] = oldKeysPayload
+        var oldKeys = try JSONSerialization.data(withJSONObject: oldKeysRoot)
+        oldKeys.append(0x0a)
+        XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(oldKeys))
+
         var legacyRoot = try XCTUnwrap(
             JSONSerialization.jsonObject(with: valid) as? [String: Any])
         var legacyPayload = try XCTUnwrap(legacyRoot["payload"] as? [String: Any])
-        legacyPayload["schemaVersion"] = 1
+        legacyPayload["schemaVersion"] = 3
         var legacyCases = try XCTUnwrap(legacyPayload["caseResults"] as? [[String: Any]])
         for index in legacyCases.indices {
             legacyCases[index].removeValue(forKey: "mtpPhaseAttribution")
@@ -553,7 +654,7 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         var legacy = try JSONSerialization.data(withJSONObject: legacyRoot)
         legacy.append(0x0a)
         XCTAssertThrowsError(try QwenMTPCorpusGate.validateJSONL(legacy)) { error in
-            XCTAssertEqual(error as? QwenMTPCorpusGateError, .schemaVersionMismatch(1))
+            XCTAssertEqual(error as? QwenMTPCorpusGateError, .schemaVersionMismatch(3))
         }
     }
 
@@ -745,7 +846,9 @@ final class QwenMTPCorpusGateTests: XCTestCase {
         draftBlockCount: Int = 2,
         targetVerificationCount: Int = 2,
         targetTailCount: Int = 0,
-        cacheFingerprintCount: Int = 1
+        cacheFingerprintCount: Int = 1,
+        includeTargetPromptPreparation: Bool = true,
+        targetPromptPreparation: QwenMTPPromptPreparationAttribution? = nil
     ) -> QwenMTPCorpusMTPPhaseAttribution {
         QwenMTPCorpusMTPPhaseAttribution(
             targetPrefillSeconds: targetPrefillSeconds,
@@ -763,12 +866,16 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             targetTailCount: targetTailCount,
             hybridRewindReplayCount: 1,
             finalizationCount: 1,
-            cacheFingerprintCount: cacheFingerprintCount)
+            cacheFingerprintCount: cacheFingerprintCount,
+            targetPromptPreparation: includeTargetPromptPreparation
+                ? (targetPromptPreparation ?? promptPreparationAttribution())
+                : nil)
     }
 
     private func fallbackPhaseAttribution(
         draftBlockSeconds: Double = 0,
-        targetTailCount: Int = 7
+        targetTailCount: Int = 7,
+        targetPromptPreparation: QwenMTPPromptPreparationAttribution? = nil
     ) -> QwenMTPCorpusMTPPhaseAttribution {
         QwenMTPCorpusMTPPhaseAttribution(
             targetPrefillSeconds: 0.002,
@@ -786,7 +893,40 @@ final class QwenMTPCorpusGateTests: XCTestCase {
             targetTailCount: targetTailCount,
             hybridRewindReplayCount: 0,
             finalizationCount: 1,
-            cacheFingerprintCount: 1)
+            cacheFingerprintCount: 1,
+            targetPromptPreparation: targetPromptPreparation)
+    }
+
+    private func promptPreparationAttribution(
+        promptTokenCount: Int = 16,
+        hiddenShape: [Int] = [1, 16, 4],
+        hiddenByteCount: Int = 256,
+        chunks: [QwenMTPPromptPreparationChunkAttribution] = [
+            .init(
+                tokenOffset: 0, tokenCount: 8,
+                targetForwardSchedulingSeconds: 0.0002),
+            .init(
+                tokenOffset: 8, tokenCount: 8,
+                targetForwardSchedulingSeconds: 0.0002),
+        ],
+        cacheEvaluationSeconds: Double = 0.0003,
+        hiddenEvaluationSeconds: Double = 0.0002,
+        concatenatedHiddenEvaluationSeconds: Double = 0.0002,
+        preparedCacheHandoffSeconds: Double = 0.0004,
+        phaseBoundarySynchronizationSeconds: Double = 0.0001,
+        targetPrefillResidualSeconds: Double = 0.0004
+    ) -> QwenMTPPromptPreparationAttribution {
+        QwenMTPPromptPreparationAttribution(
+            promptTokenCount: promptTokenCount,
+            hiddenShape: hiddenShape,
+            hiddenByteCount: hiddenByteCount,
+            chunks: chunks,
+            cacheEvaluationSeconds: cacheEvaluationSeconds,
+            hiddenEvaluationSeconds: hiddenEvaluationSeconds,
+            concatenatedHiddenEvaluationSeconds: concatenatedHiddenEvaluationSeconds,
+            preparedCacheHandoffSeconds: preparedCacheHandoffSeconds,
+            phaseBoundarySynchronizationSeconds: phaseBoundarySynchronizationSeconds,
+            targetPrefillResidualSeconds: targetPrefillResidualSeconds)
     }
 }
 

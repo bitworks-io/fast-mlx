@@ -10,6 +10,10 @@ import MLXLMCommon
 /// with nothing else in flight (that is the 7.3x stall this spike exists to avoid).
 public struct MLXDecoder: Decoder {
     private let model: any LanguageModel
+    /// Rebuilds the same cache family selected at load for every request reset. The default
+    /// initializer uses `model.newCache`; explicit runtime KV tiers inject their own factory so a
+    /// reset can never silently change the storage format back to the model's native fp16 cache.
+    private let cacheFactory: () -> [KVCache]
     private var cache: [KVCache]
     private var pendingLogits: MLXArray?
     /// Token selection for the current generation. Default argmax (greedy) is byte-identical to
@@ -21,7 +25,19 @@ public struct MLXDecoder: Decoder {
 
     public init(model: any LanguageModel, cache: [KVCache]) {
         self.model = model
+        self.cacheFactory = { model.newCache(parameters: nil) }
         self.cache = cache
+    }
+
+    /// Construct a decoder whose initial cache and every later reset come from one storage-bound
+    /// factory. This is the load-bearing initializer for explicit quantized-KV serving.
+    public init(
+        model: any LanguageModel,
+        cacheFactory: @escaping () -> [KVCache]
+    ) {
+        self.model = model
+        self.cacheFactory = cacheFactory
+        self.cache = cacheFactory()
     }
 
     public mutating func prefill(_ promptTokens: [Int]) -> Int {
@@ -59,12 +75,11 @@ public struct MLXDecoder: Decoder {
         return next.item(Int.self)
     }
 
-    /// Rebuild the KV cache from `model` (already owned by this decoder, so this never
-    /// needs to cross the actor boundary with a fresh non-Sendable reference) and drop
-    /// any pending lookahead. Used between bench runs so each run starts with an empty
-    /// cache instead of seeing the previous run's tokens as false history.
+    /// Rebuild the selected KV cache family and drop any pending lookahead. The factory is already
+    /// owned by this decoder, so this never crosses the actor boundary with a fresh non-Sendable
+    /// model reference. Used between runs so each request starts empty without changing KV storage.
     public mutating func reset() {
-        cache = model.newCache(parameters: nil)
+        cache = cacheFactory()
         pendingLogits = nil
         sampler = ArgMaxSampler()
         processor = nil

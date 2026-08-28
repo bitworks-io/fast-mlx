@@ -112,13 +112,126 @@ public protocol SpeculativeCacheRewindModel {
 /// `[batch, promptLength, hiddenSize]`. It is deliberately carried outside
 /// `LMOutput.State` so the full-prompt tensor does not remain resident through
 /// the later autoregressive decode state.
+public struct MTPPromptPreparationChunkTelemetry: Sendable, Equatable {
+    public let tokenOffset: Int
+    public let tokenCount: Int
+    public let targetForwardSchedulingSeconds: Double
+
+    public init(
+        tokenOffset: Int,
+        tokenCount: Int,
+        targetForwardSchedulingSeconds: Double
+    ) {
+        self.tokenOffset = tokenOffset
+        self.tokenCount = tokenCount
+        self.targetForwardSchedulingSeconds = targetForwardSchedulingSeconds
+    }
+}
+
+/// Explicit ordering for opt-in prompt-preparation evaluation diagnostics.
+/// The ordinary path remains cache-first; alternate orders are measurement
+/// modes and do not imply a serving optimization.
+public enum MTPPromptPreparationEvaluationOrder: String, Sendable, Equatable {
+    case cacheFirst = "cache-first"
+    case hiddenFirst = "hidden-first"
+    case combined = "combined"
+}
+
+public enum MTPPromptPreparationEvaluationOrderError: Error, Sendable, Equatable {
+    case telemetryRequired
+    case unsupportedTarget
+}
+
+/// Opt-in timing and geometry for target prompt-hidden capture.
+///
+/// The values are populated only when the iterator collects phase telemetry.
+/// Ordinary generation therefore does not add clocks or synchronization.
+public struct MTPPromptPreparationTelemetry: Sendable, Equatable {
+    public let promptTokenCount: Int
+    public let hiddenShape: [Int]
+    public let hiddenByteCount: Int
+    public let evaluationOrder: MTPPromptPreparationEvaluationOrder
+    public let chunks: [MTPPromptPreparationChunkTelemetry]
+    /// Wall time for synchronizing the cache output. When `evaluationOrder`
+    /// is cache-first this bucket owns shared lazy-graph work; when hidden-first
+    /// it is the incremental second synchronization; when combined it owns the
+    /// single joint cache/hidden synchronization.
+    public let cacheEvaluationSeconds: Double
+
+    /// Wall time for synchronizing the hidden output. When `evaluationOrder`
+    /// is hidden-first this bucket owns shared lazy-graph work; when cache-first
+    /// it is the incremental second synchronization. The two buckets are an
+    /// ordered wall-time decomposition, not intrinsic kernel costs. This is
+    /// zero in combined mode because there is no separate hidden wait.
+    public let hiddenEvaluationSeconds: Double
+    public let concatenatedHiddenEvaluationSeconds: Double
+    public let preparedCacheHandoffSeconds: Double
+
+    public init(
+        promptTokenCount: Int,
+        hiddenShape: [Int],
+        hiddenByteCount: Int,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder = .cacheFirst,
+        chunks: [MTPPromptPreparationChunkTelemetry],
+        cacheEvaluationSeconds: Double,
+        hiddenEvaluationSeconds: Double,
+        concatenatedHiddenEvaluationSeconds: Double,
+        preparedCacheHandoffSeconds: Double
+    ) {
+        self.promptTokenCount = promptTokenCount
+        self.hiddenShape = hiddenShape
+        self.hiddenByteCount = hiddenByteCount
+        self.evaluationOrder = evaluationOrder
+        self.chunks = chunks
+        self.cacheEvaluationSeconds = cacheEvaluationSeconds
+        self.hiddenEvaluationSeconds = hiddenEvaluationSeconds
+        self.concatenatedHiddenEvaluationSeconds = concatenatedHiddenEvaluationSeconds
+        self.preparedCacheHandoffSeconds = preparedCacheHandoffSeconds
+    }
+
+    public init(
+        promptTokenCount: Int,
+        hiddenShape: [Int],
+        hiddenByteCount: Int,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder = .cacheFirst,
+        chunks: [MTPPromptPreparationChunkTelemetry],
+        cacheHiddenEvaluationSeconds: Double,
+        hiddenConcatenationSeconds: Double
+    ) {
+        self.init(
+            promptTokenCount: promptTokenCount,
+            hiddenShape: hiddenShape,
+            hiddenByteCount: hiddenByteCount,
+            evaluationOrder: evaluationOrder,
+            chunks: chunks,
+            cacheEvaluationSeconds: cacheHiddenEvaluationSeconds,
+            hiddenEvaluationSeconds: 0,
+            concatenatedHiddenEvaluationSeconds: hiddenConcatenationSeconds,
+            preparedCacheHandoffSeconds: 0)
+    }
+
+    public var cacheHiddenEvaluationSeconds: Double {
+        cacheEvaluationSeconds + hiddenEvaluationSeconds
+    }
+
+    public var hiddenConcatenationSeconds: Double {
+        concatenatedHiddenEvaluationSeconds
+    }
+}
+
 public struct MTPPromptPreparation {
     public let result: PrepareResult
     public let targetHidden: MLXArray
+    public let telemetry: MTPPromptPreparationTelemetry?
 
-    public init(result: PrepareResult, targetHidden: MLXArray) {
+    public init(
+        result: PrepareResult,
+        targetHidden: MLXArray,
+        telemetry: MTPPromptPreparationTelemetry? = nil
+    ) {
         self.result = result
         self.targetHidden = targetHidden
+        self.telemetry = telemetry
     }
 }
 
@@ -135,6 +248,62 @@ public protocol MTPPromptHiddenStatePreparingModel: LanguageModel {
         cache: [KVCache],
         windowSize: Int?
     ) throws -> MTPPromptPreparation?
+}
+
+/// Optional refinement for targets that can attribute their prompt-hidden
+/// capture without changing the existing preparation protocol requirement.
+public protocol MTPPromptHiddenStateTelemetryPreparingModel:
+    MTPPromptHiddenStatePreparingModel
+{
+    func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?,
+        collectTelemetry: Bool
+    ) throws -> MTPPromptPreparation?
+}
+
+/// Optional diagnostic refinement for targets that can evaluate prompt cache
+/// and hidden outputs in an explicitly selected order. Alternate ordering is
+/// opt-in and telemetry-only; the inherited method remains cache-first.
+public protocol MTPPromptHiddenStateEvaluationOrderPreparingModel:
+    MTPPromptHiddenStateTelemetryPreparingModel
+{
+    func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?,
+        collectTelemetry: Bool,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder
+    ) throws -> MTPPromptPreparation?
+}
+
+extension MTPPromptHiddenStateEvaluationOrderPreparingModel {
+    public func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?,
+        collectTelemetry: Bool
+    ) throws -> MTPPromptPreparation? {
+        try prepareForMTP(
+            input,
+            cache: cache,
+            windowSize: windowSize,
+            collectTelemetry: collectTelemetry,
+            evaluationOrder: .cacheFirst)
+    }
+}
+
+extension MTPPromptHiddenStateTelemetryPreparingModel {
+    public func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> MTPPromptPreparation? {
+        try prepareForMTP(
+            input, cache: cache, windowSize: windowSize,
+            collectTelemetry: false)
+    }
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.

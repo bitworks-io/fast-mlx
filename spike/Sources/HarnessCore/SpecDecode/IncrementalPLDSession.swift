@@ -69,6 +69,10 @@ public struct IncrementalPLDSession: Sendable {
     public private(set) var verificationRounds = 0
     public private(set) var fallbackRounds = 0
 
+    public var isGateEnabled: Bool {
+        gate.isEnabled
+    }
+
     public init(
         promptTokens: [Int],
         drafter: any SpecDrafter = PromptLookupDrafter(ngram: 3),

@@ -57,6 +57,8 @@ private final class MockStatefulGreedyDrafter: Module, StatefulMTPDrafterModel {
 
     private(set) var prepareCallCount = 0
     private(set) var draftCallCount = 0
+    private(set) var commitCallCount = 0
+    var sampleDuringCommit = false
     private(set) var preparedPromptShape: [Int]?
     private(set) var preparedHiddenShape: [Int]?
 
@@ -110,12 +112,68 @@ private final class MockStatefulGreedyDrafter: Module, StatefulMTPDrafterModel {
             sharedKV: sharedKV, positionDeltas: positionDeltas,
             queryOffset: queryOffset, blockSize: blockSize, sampler: sampler)
     }
+
+    func commitDrafterState(
+        target _: any LanguageModel,
+        targetHidden _: MLXArray,
+        draftTokens _: MLXArray,
+        acceptedCount _: Int,
+        finalToken _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state _: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        commitCallCount += 1
+        if sampleDuringCommit {
+            _ = sampler.sample(logits: MLXArray([Float(0), 1]))
+        }
+    }
+}
+
+private enum ForcedSampledBlockDecisionError: Error {
+    case rejected
+}
+
+private final class ForcedSampledBlockDecisionProvider: SampledMTPBlockRuntimeDeciding {
+    let proposalSampler: any LogitSampler
+    var supported = true
+    var shouldThrow = false
+    var decision = SampledMTPBlockRuntimeDecision(
+        outputTokens: [11], acceptedDraftCount: 0)
+    private(set) var proposedTokens = [[Int]]()
+    private(set) var targetRowCounts = [Int]()
+
+    init(proposalSampler: any LogitSampler = ArgMaxSampler()) {
+        self.proposalSampler = proposalSampler
+    }
+
+    func supports(parameters _: GenerateParameters) -> Bool { supported }
+
+    func decide(
+        proposedTokens: [Int],
+        targetLogits: [MLXArray],
+        bonusTargetLogits _: MLXArray
+    ) throws -> SampledMTPBlockRuntimeDecision {
+        self.proposedTokens.append(proposedTokens)
+        targetRowCounts.append(targetLogits.count)
+        if shouldThrow { throw ForcedSampledBlockDecisionError.rejected }
+        return decision
+    }
+}
+
+private final class CountingSampler: LogitSampler {
+    private(set) var sampleCount = 0
+
+    func sample(logits: MLXArray) -> MLXArray {
+        sampleCount += 1
+        return argMax(logits, axis: -1)
+    }
 }
 
 /// Minimal `LanguageModel` mock that emits MTP state on every call when
 /// `mtpEmitFlagKey` is true. Returns shaped logits and a trimmable KV cache.
 private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider,
-    SpeculativeCacheRewindModel, MTPPromptHiddenStatePreparingModel
+    SpeculativeCacheRewindModel, MTPPromptHiddenStateEvaluationOrderPreparingModel
 {
     var kvHeads: [Int] { [1] }
     var maximumNativeTargetCacheRewind = 0
@@ -135,6 +193,7 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     private(set) var lastIncomingEmitFlag: Bool? = nil
     private(set) var incomingPrepareContinuationValues: [Int?] = []
     private(set) var receivedTokenShapes: [[Int]] = []
+    private(set) var receivedPromptEvaluationOrders: [MTPPromptPreparationEvaluationOrder] = []
     /// Sequence-axis span of each emitted sharedKV snapshot, in emit order.
     /// Tests assert this against the mock cache offset to pin the mock's
     /// span fidelity (see the emit block below).
@@ -163,15 +222,47 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     func prepareForMTP(
         _ input: LMInput,
         cache: [KVCache],
-        windowSize _: Int?
+        windowSize _: Int?,
+        collectTelemetry: Bool
+    ) throws -> MTPPromptPreparation? {
+        try prepareForMTP(
+            input,
+            cache: cache,
+            windowSize: nil,
+            collectTelemetry: collectTelemetry,
+            evaluationOrder: .cacheFirst)
+    }
+
+    func prepareForMTP(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize _: Int?,
+        collectTelemetry: Bool,
+        evaluationOrder: MTPPromptPreparationEvaluationOrder
     ) throws -> MTPPromptPreparation? {
         guard capturesPromptHiddenDuringPrepare else { return nil }
+        receivedPromptEvaluationOrders.append(evaluationOrder)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
         let normalized = LMInput.Text(tokens: normalizedMTPTokenBatch(input.text.tokens))
         let output = callAsFunction(normalized, cache: cache, state: state)
         guard let hidden = output.state?[mtpLastHiddenStatesKey] else { return nil }
-        return MTPPromptPreparation(result: .logits(output), targetHidden: hidden)
+        return MTPPromptPreparation(
+            result: .logits(output),
+            targetHidden: hidden,
+            telemetry: collectTelemetry
+                ? .init(
+                    promptTokenCount: normalized.tokens.size,
+                    hiddenShape: hidden.shape,
+                    hiddenByteCount: hidden.nbytes,
+                    evaluationOrder: evaluationOrder,
+                    chunks: [.init(
+                        tokenOffset: 0,
+                        tokenCount: normalized.tokens.size,
+                        targetForwardSchedulingSeconds: 0)],
+                    cacheHiddenEvaluationSeconds: 0,
+                    hiddenConcatenationSeconds: 0)
+                : nil)
     }
 
     /// Returns deterministic one-hot logits at each position so a `softmax/
@@ -297,10 +388,54 @@ func testMTPPromptPrimingReusesNormalizedFullPromptHidden() throws {
     #expect(drafter.prepareCallCount == 1)
     #expect(drafter.preparedPromptShape == [1, 3])
     #expect(drafter.preparedHiddenShape == [1, 3, 4])
+    let promptTelemetry = try #require(iterator.promptPreparationTelemetry)
+    #expect(promptTelemetry.promptTokenCount == 3)
+    #expect(promptTelemetry.hiddenShape == [1, 3, 4])
+    #expect(promptTelemetry.evaluationOrder == .cacheFirst)
+    #expect(promptTelemetry.chunks.map(\.tokenOffset) == [0])
+    #expect(promptTelemetry.chunks.map(\.tokenCount) == [3])
     let phases = iterator.speculativeDecodingPhaseTelemetry
     #expect(
         phases.targetPrefillSeconds + phases.drafterPromptPrimingSeconds
             <= iterator.promptPrefillTime)
+}
+
+@Test
+func testMTPPromptPrimingForwardsHiddenFirstEvaluationOrder() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 0, 0, 0])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+        blockSize: 2,
+        collectPhaseTelemetry: true,
+        promptPreparationEvaluationOrder: .hiddenFirst)
+
+    #expect(main.receivedPromptEvaluationOrders == [.hiddenFirst])
+    #expect(iterator.promptPreparationTelemetry?.evaluationOrder == .hiddenFirst)
+}
+
+@Test
+func testMTPPromptPrimingForwardsCombinedEvaluationOrder() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 0, 0, 0])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 1, temperature: 0),
+        blockSize: 2,
+        collectPhaseTelemetry: true,
+        promptPreparationEvaluationOrder: .combined)
+
+    #expect(main.receivedPromptEvaluationOrders == [.combined])
+    #expect(iterator.promptPreparationTelemetry?.evaluationOrder == .combined)
 }
 
 /// Minimal `KVCache` that satisfies the protocol's trimmable interface; the
@@ -709,6 +844,140 @@ func testGreedyOnlyDrafterFallsBackBeforeDrafterPrefill() throws {
     #expect(drafter.prepareCallCount == 0)
     #expect(drafter.draftCallCount == 0)
     #expect(main.lastIncomingEmitFlag == false)
+}
+
+@Test
+func testGreedyOnlyDrafterUsesExplicitSampledBlockDecisionProvider() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+    let provider = ForcedSampledBlockDecisionProvider()
+    let cache = CountingKVCache()
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5, "prepare-time target bonus")
+    #expect(iterator.next() == 11, "provider-selected residual correction")
+    #expect(provider.proposedTokens == [[0]])
+    #expect(provider.targetRowCounts == [1])
+    #expect(iterator.proposedCount == 1)
+    #expect(iterator.acceptedCount == 0)
+    #expect(drafter.draftCallCount == 1)
+    #expect(iterator.passthroughReason == nil)
+    #expect(cache.offset == 4, "only the selected input is committed")
+}
+
+@Test
+func testSampledBlockDecisionFailureRollsBackAndFallsBackToTarget() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8, 9])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+    let provider = ForcedSampledBlockDecisionProvider()
+    provider.shouldThrow = true
+    let cache = CountingKVCache()
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1, seed: 7),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5, "prepare-time target bonus")
+    #expect(iterator.next() == 7, "ordinary target sampler correction")
+    #expect(iterator.acceptedCount == 0)
+    #expect(iterator.passthroughReason == "sampled MTP block decision failed")
+    #expect(cache.offset == 4, "failed speculative draft must be rolled back")
+}
+
+@Test
+func testSampledBlockDecisionFailureSkipsDrafterCommitAndProposalRNG() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8, 9])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+    drafter.sampleDuringCommit = true
+    let proposalSampler = CountingSampler()
+    let provider = ForcedSampledBlockDecisionProvider(proposalSampler: proposalSampler)
+    provider.shouldThrow = true
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1, seed: 7),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5)
+    #expect(iterator.next() == 7)
+    #expect(drafter.commitCallCount == 0)
+    #expect(proposalSampler.sampleCount == 0)
+}
+
+@Test
+func testOutOfVocabularySampledDecisionFallsBackToTarget() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8, 9])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+    let provider = ForcedSampledBlockDecisionProvider()
+    provider.decision = SampledMTPBlockRuntimeDecision(
+        outputTokens: [20], acceptedDraftCount: 0)
+    let cache = CountingKVCache()
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1, seed: 7),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5)
+    #expect(iterator.next() == 7)
+    #expect(iterator.passthroughReason == "sampled MTP block decision failed")
+    #expect(cache.offset == 4)
+}
+
+@Test(arguments: [
+    (accepted: 1, output: [7, 11], expectedOffset: 5),
+    (accepted: 2, output: [7, 7, 11], expectedOffset: 6),
+])
+func testSampledProviderPreservesPartialAndFullAcceptedPrefix(
+    fixture: (accepted: Int, output: [Int], expectedOffset: Int)
+) throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 7, 9, 10])
+    let drafter = MockDrafter(draftedTokenValue: 7)
+    let provider = ForcedSampledBlockDecisionProvider()
+    provider.decision = SampledMTPBlockRuntimeDecision(
+        outputTokens: fixture.output,
+        acceptedDraftCount: fixture.accepted)
+    let cache = CountingKVCache()
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 5, temperature: 1, seed: 7),
+        blockSize: 3,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5)
+    for token in fixture.output {
+        #expect(iterator.next() == token)
+    }
+    #expect(iterator.acceptedCount == fixture.accepted)
+    #expect(cache.offset == fixture.expectedOffset)
 }
 
 @Test

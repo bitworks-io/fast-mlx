@@ -581,6 +581,156 @@ final class ContinuousBatchSchedulerTests: XCTestCase {
         )
     }
 
+    func testLowYieldObservationLatchesSoloSpeculationSuppressionForRequest() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 1, prefill: 1, chunk: 1))
+        try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+        _ = try applyNext(&scheduler)
+
+        let speculative = scheduler.makeTick()
+        XCTAssertEqual(speculative.decode, .solo(id(1), speculationAllowed: true))
+        try scheduler.apply(
+            speculative,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 1,
+                    finished: false,
+                    soloPipelineState: .speculative,
+                    observation: .pldLowYieldDisabled),
+            ])
+
+        XCTAssertEqual(
+            scheduler.makeTick().decode,
+            .drainSoloPipeline(id(1)))
+        _ = try applyNext(&scheduler)
+        XCTAssertEqual(
+            scheduler.makeTick().decode,
+            .solo(id(1), speculationAllowed: false))
+    }
+
+    func testHighYieldObservationDoesNotLatchSoloSpeculationSuppression() throws {
+        var scheduler = ContinuousBatchScheduler(
+            configuration: configuration(active: 1, prefill: 1, chunk: 1))
+        try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+        _ = try applyNext(&scheduler)
+
+        let speculative = scheduler.makeTick()
+        XCTAssertEqual(speculative.decode, .solo(id(1), speculationAllowed: true))
+        try scheduler.apply(
+            speculative,
+            decodeOutcomes: [
+                BatchDecodeOutcome(
+                    id: id(1),
+                    emittedTokenCount: 1,
+                    finished: false,
+                    soloPipelineState: .pipelinedLookahead,
+                    observation: .none),
+            ])
+
+        XCTAssertEqual(
+            scheduler.makeTick().decode,
+            .solo(id(1), speculationAllowed: true))
+    }
+
+    func testInvalidLowYieldObservationsFailAtomically() throws {
+        do {
+            var scheduler = ContinuousBatchScheduler(
+                configuration: configuration(active: 2, prefill: 1, chunk: 1))
+            try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+            _ = try applyNext(&scheduler)
+            try scheduler.submit(request(2, promptTokens: 2, speculation: true))
+            let plan = scheduler.makeTick()
+            XCTAssertEqual(plan.decode, .solo(id(1), speculationAllowed: false))
+            let before = scheduler.snapshots
+
+            XCTAssertThrowsError(
+                try scheduler.apply(
+                    plan,
+                    decodeOutcomes: [
+                        BatchDecodeOutcome(
+                            id: id(1),
+                            emittedTokenCount: 1,
+                            finished: false,
+                            soloPipelineState: .pipelinedLookahead,
+                            observation: .pldLowYieldDisabled),
+                    ])
+            ) { error in
+                XCTAssertEqual(
+                    error as? ContinuousBatchSchedulerError,
+                    .invalidDecodeObservation(id(1)))
+            }
+            XCTAssertEqual(scheduler.snapshots, before)
+            XCTAssertEqual(scheduler.makeTick(), plan)
+        }
+
+        do {
+            var scheduler = ContinuousBatchScheduler(
+                configuration: configuration(active: 2, prefill: 2, chunk: 1))
+            try scheduler.submit(request(1, promptTokens: 1, speculation: true))
+            try scheduler.submit(request(2, promptTokens: 1, speculation: true))
+            _ = try applyNext(&scheduler)
+            let plan = scheduler.makeTick()
+            XCTAssertEqual(
+                plan.decode,
+                .batch([id(1), id(2)], speculationAllowed: false))
+            let before = scheduler.snapshots
+
+            XCTAssertThrowsError(
+                try scheduler.apply(
+                    plan,
+                    decodeOutcomes: [
+                        BatchDecodeOutcome(
+                            id: id(1),
+                            emittedTokenCount: 1,
+                            finished: false,
+                            soloPipelineState: .canonical,
+                            observation: .pldLowYieldDisabled),
+                        BatchDecodeOutcome(
+                            id: id(2),
+                            emittedTokenCount: 1,
+                            finished: false,
+                            soloPipelineState: .canonical),
+                    ])
+            ) { error in
+                XCTAssertEqual(
+                    error as? ContinuousBatchSchedulerError,
+                    .invalidDecodeObservation(id(1)))
+            }
+            XCTAssertEqual(scheduler.snapshots, before)
+            XCTAssertEqual(scheduler.makeTick(), plan)
+        }
+
+        do {
+            var scheduler = ContinuousBatchScheduler(
+                configuration: configuration(active: 1, prefill: 1, chunk: 1))
+            try scheduler.submit(request(1, promptTokens: 1, speculation: false))
+            _ = try applyNext(&scheduler)
+            let plan = scheduler.makeTick()
+            XCTAssertEqual(plan.decode, .solo(id(1), speculationAllowed: false))
+            let before = scheduler.snapshots
+
+            XCTAssertThrowsError(
+                try scheduler.apply(
+                    plan,
+                    decodeOutcomes: [
+                        BatchDecodeOutcome(
+                            id: id(1),
+                            emittedTokenCount: 1,
+                            finished: false,
+                            soloPipelineState: .pipelinedLookahead,
+                            observation: .pldLowYieldDisabled),
+                    ])
+            ) { error in
+                XCTAssertEqual(
+                    error as? ContinuousBatchSchedulerError,
+                    .invalidDecodeObservation(id(1)))
+            }
+            XCTAssertEqual(scheduler.snapshots, before)
+            XCTAssertEqual(scheduler.makeTick(), plan)
+        }
+    }
+
     func testCancellationRemovesQueuedPrefillingReadyAndDecodingSlots() throws {
         do {
             var scheduler = ContinuousBatchScheduler(

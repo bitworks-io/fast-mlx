@@ -2037,44 +2037,38 @@ final class ModelConfigDecoderTests: XCTestCase {
         }
     }
 
-    // MARK: - unservable-checkpoint classification (which decode failures must fail the serve closed)
+    // MARK: - fail-closed decode-error classification (which decode failures must refuse serving)
 
-    /// The serve path skips the fit-check on a decode error and proceeds with provided limits — the
-    /// right call for an *unmodeled arch* (weights are fine, the KV formula just isn't audited yet).
-    /// But `.weightsUnknown` means there are NO loadable weights on disk (interrupted/metadata-only
-    /// download): the MLXLMCommon loader needs `*.safetensors`, so proceeding drives to a guaranteed
-    /// load failure. This predicate lets the serve path fail closed on that case only, so the
-    /// differentiator's fail-closed promise covers an incomplete checkpoint rather than crashing at load.
+    /// Every decoder error means the serve path has no trustworthy fit decision. The operator may
+    /// override a RED decision with `--force`, but `--force` must not override absence of a decision:
+    /// serving must refuse before load with an attributable reason instead of falling back to flat
+    /// provided limits.
     func testIndicatesUnservableCheckpoint_forUnservableCases() {
-        // A directory the MLXLMCommon loader itself cannot load — no *.safetensors, no config.json,
-        // or a config.json that is not valid JSON — is unservable regardless of arch. The fit-check
-        // must fail closed on these rather than skip-and-proceed to a guaranteed load-time crash.
         XCTAssertTrue(ModelConfigDecodeError.weightsUnknown("/x").indicatesUnservableCheckpoint,
             "no weights on disk → the load is doomed → the fit-check must fail closed, not skip")
         XCTAssertTrue(ModelConfigDecodeError.missingConfigFile("/x").indicatesUnservableCheckpoint,
             "no config.json → the MLX loader needs one → unservable → fail closed")
         XCTAssertTrue(ModelConfigDecodeError.malformedJSON.indicatesUnservableCheckpoint,
             "config.json is not valid JSON → the loader cannot parse it → unservable → fail closed")
-        // A geometry field the DECODER rejects may still load: MLX reads its own config fields
-        // independently, so a checkpoint rejected for a term this decoder happens to require MIGHT
-        // still load. Keep these on skip-and-proceed until a live smoke proves otherwise. Likewise an
-        // unmodeled arch has its weights on disk and can load — the skip path exists for it.
-        XCTAssertFalse(ModelConfigDecodeError.unsupportedModelType("afmoe").indicatesUnservableCheckpoint)
-        XCTAssertFalse(ModelConfigDecodeError.missingField("head_dim").indicatesUnservableCheckpoint)
-        XCTAssertFalse(ModelConfigDecodeError.invalidField("num_key_value_heads").indicatesUnservableCheckpoint)
+        XCTAssertTrue(ModelConfigDecodeError.unsupportedModelType("afmoe").indicatesUnservableCheckpoint,
+            "unmodeled arch → no trustworthy fit decision → fail closed")
+        XCTAssertTrue(ModelConfigDecodeError.missingField("head_dim").indicatesUnservableCheckpoint,
+            "missing fit field → no trustworthy fit decision → fail closed")
+        XCTAssertTrue(ModelConfigDecodeError.invalidField("num_key_value_heads").indicatesUnservableCheckpoint,
+            "invalid fit field → no trustworthy fit decision → fail closed")
     }
 
     /// The refusal `reason=` token is case-appropriate and kept in lockstep with
-    /// `indicatesUnservableCheckpoint`: exactly the fail-closed cases return a distinct token, and the
-    /// skip cases return `nil`. Distinct tokens keep the serve-path refusal honest — an interrupted
-    /// download is not the same failure mode as a missing or unparseable config.
+    /// `indicatesUnservableCheckpoint`: every decoder error returns a distinct token. Distinct tokens
+    /// keep the serve-path refusal honest — an interrupted download is not the same failure mode as an
+    /// unsupported model type or a malformed fit field.
     func testUnservableRefusalReason_distinctTokensForFailClosedCasesOnly() {
         XCTAssertEqual(ModelConfigDecodeError.weightsUnknown("/x").unservableRefusalReason, "incomplete_checkpoint")
         XCTAssertEqual(ModelConfigDecodeError.missingConfigFile("/x").unservableRefusalReason, "missing_config")
         XCTAssertEqual(ModelConfigDecodeError.malformedJSON.unservableRefusalReason, "malformed_config")
-        XCTAssertNil(ModelConfigDecodeError.missingField("head_dim").unservableRefusalReason)
-        XCTAssertNil(ModelConfigDecodeError.invalidField("num_key_value_heads").unservableRefusalReason)
-        XCTAssertNil(ModelConfigDecodeError.unsupportedModelType("afmoe").unservableRefusalReason)
+        XCTAssertEqual(ModelConfigDecodeError.unsupportedModelType("afmoe").unservableRefusalReason, "unsupported_model_type")
+        XCTAssertEqual(ModelConfigDecodeError.missingField("head_dim").unservableRefusalReason, "missing_fit_field")
+        XCTAssertEqual(ModelConfigDecodeError.invalidField("num_key_value_heads").unservableRefusalReason, "invalid_fit_field")
         // Lockstep invariant: a token exists iff the case fails closed.
         let cases: [ModelConfigDecodeError] = [
             .weightsUnknown("/x"), .missingConfigFile("/x"), .malformedJSON,

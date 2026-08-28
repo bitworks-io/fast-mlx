@@ -131,6 +131,10 @@ private struct TinyNextTokenDrafter: SpecDrafter {
     }
 }
 
+private struct TinyEmptyDrafter: SpecDrafter {
+    func propose(context _: [Int], maxDraft _: Int) -> [Int] { [] }
+}
+
 private struct TinyNextTokenColdAfterTokenDrafter: SpecDrafter {
     let coldLastToken: Int
 
@@ -846,6 +850,106 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
             first[0].tokens + speculative[0].tokens + fallback[0].tokens,
             [11, 22, 44, 88, 176])
         XCTAssertEqual(fallback[0].soloPipelineState, .pipelinedLookahead)
+    }
+
+    func testIncrementalSoloPLDReportsLowYieldDisableWhenGateTrips() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyNextTokenDrafter(),
+                maxDraft: 1,
+                gate: PLDGate(
+                    window: 8,
+                    minimumSamples: 4,
+                    minAcceptPerStep: 0.5,
+                    cooldown: 8),
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        XCTAssertEqual(first[0].observation, .none)
+
+        let firstMiss = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let secondMiss = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let thirdMiss = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        let disablingMiss = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+
+        XCTAssertEqual(firstMiss[0].observation, .none)
+        XCTAssertEqual(secondMiss[0].observation, .none)
+        XCTAssertEqual(thirdMiss[0].observation, .none)
+        XCTAssertEqual(disablingMiss[0].observation, .pldLowYieldDisabled)
+        XCTAssertEqual(disablingMiss[0].soloPipelineState, .speculative)
+    }
+
+    func testIncrementalSoloPLDReportsLowYieldDisableAfterEmptyLookupRounds() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyEmptyDrafter(),
+                maxDraft: 1,
+                gate: PLDGate(
+                    window: 8,
+                    minimumSamples: 4,
+                    minAcceptPerStep: 0.5,
+                    cooldown: 8),
+                lookback: 32,
+                compiledVerify: true))
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(1),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: [10],
+                    maxOutputTokens: 16,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: true)),
+        ])
+        try prefill(
+            runtime,
+            id: 1,
+            tokens: [10],
+            chunks: [1],
+            maxOutputTokens: 16)
+
+        let first = try runtime.decode(
+            .solo(BatchRequestID(1), speculationAllowed: true))
+        XCTAssertEqual(first[0].observation, .none)
+
+        for sample in 1 ... 4 {
+            let result = try runtime.decode(
+                .solo(BatchRequestID(1), speculationAllowed: true))
+            XCTAssertEqual(
+                result[0].observation,
+                sample == 4 ? .pldLowYieldDisabled : .none)
+            XCTAssertEqual(
+                result[0].soloPipelineState,
+                .pipelinedLookahead)
+        }
     }
 
     func testIncrementalSoloPLDRemovalIsSafeFromEveryCacheInvariant() throws {

@@ -129,6 +129,7 @@ let package = Package(
                 "ServingSnapshotBridge",
                 "SpikeCore",
                 "SpikeServingAdapters",
+                "SystemProfiler",
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -248,6 +249,11 @@ let package = Package(
         .target(
             name: "SystemProfiler",
             dependencies: ["HarnessCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "SystemProfilerTests",
+            dependencies: ["SystemProfiler", "HarnessCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(

@@ -15,6 +15,141 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertFalse(arguments.showHelp)
     }
 
+    func testHostUseParsesExplicitOperatorIntentAndDefaultsNil() throws {
+        let absent = try FastMLXServeArguments.parse(["--scripted"])
+        XCTAssertNil(absent.requestedHostUse)
+
+        let shared = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--host-use", "shared",
+        ])
+        XCTAssertEqual(shared.requestedHostUse, .shared)
+
+        let dedicated = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--host-use", "dedicated-serving",
+            "--os-service-reserve-bytes", "4294967296",
+        ])
+        XCTAssertEqual(dedicated.requestedHostUse, .dedicatedServing)
+        XCTAssertEqual(dedicated.osServiceReserveBytes, 4_294_967_296)
+
+        XCTAssertEqual(FastMLXServeHostUse.shared.rawValue, "shared")
+        XCTAssertEqual(FastMLXServeHostUse.dedicatedServing.rawValue, "dedicated-serving")
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--host-use VALUE"))
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("shared|dedicated-serving"))
+    }
+
+    func testHostUseRejectsMissingDuplicateAndUnknownValues() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--host-use",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .missingValue("--host-use"))
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--host-use", "shared",
+                "--host-use", "dedicated-serving",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .duplicateOption("--host-use"))
+        }
+
+        for rawValue in ["dedicated", "DEDICATED-SERVING", " shared", "shared "] {
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse([
+                    "--scripted",
+                    "--host-use", rawValue,
+                ]),
+                "expected host-use rejection for \(rawValue.debugDescription)"
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    .invalidHostUse)
+            }
+        }
+    }
+
+    func testDedicatedHostUseRequiresAndPreservesDeclaredOSServiceReserve() throws {
+        let loaded = [
+            "--model-path", "/models/source-locked",
+            "--model", "source-locked-model",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ]
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(
+                loaded + ["--host-use", "dedicated-serving"])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .missingRequiredOption("--os-service-reserve-bytes"))
+        }
+
+        let dedicated = try FastMLXServeArguments.parse(
+            loaded + [
+                "--host-use", "dedicated-serving",
+                "--os-service-reserve-bytes", "8589934592",
+            ])
+        XCTAssertEqual(dedicated.requestedHostUse, .dedicatedServing)
+        XCTAssertEqual(dedicated.osServiceReserveBytes, 8_589_934_592)
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--os-service-reserve-bytes N"))
+    }
+
+    func testOSServiceReserveRejectsSharedMissingDuplicateAndInvalidValues() {
+        let loaded = [
+            "--model-path", "/models/source-locked",
+            "--model", "source-locked-model",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ]
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(
+                loaded + ["--os-service-reserve-bytes", "8589934592"])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .osServiceReserveRequiresDedicatedServing)
+        }
+
+        for invalid in ["0", "-1", "not-a-number"] {
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse(
+                    loaded + [
+                        "--host-use", "dedicated-serving",
+                        "--os-service-reserve-bytes", invalid,
+                    ])
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    .invalidPositiveInteger("--os-service-reserve-bytes"))
+            }
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(
+                loaded + [
+                    "--host-use", "dedicated-serving",
+                    "--os-service-reserve-bytes", "1024",
+                    "--os-service-reserve-bytes", "2048",
+                ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .duplicateOption("--os-service-reserve-bytes"))
+        }
+    }
+
     func testMaxCompletionTokensAcceptsStrictPositiveIntegerAndAppearsInUsage() throws {
         let arguments = try FastMLXServeArguments.parse([
             "--scripted",
@@ -149,15 +284,70 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertNil(arguments.backend)
     }
 
-    func testNonPromotedDynamicPLDModeIsNotExposedByCLI() {
-        XCTAssertFalse(
+    func testDynamicPLDModeParsesAsExplicitContinuousRoute() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--continuous-dynamic-pld",
+            "--model-path", "/models/qwen3-source-locked",
+            "--model", "qwen3-source-locked",
+            "--memory-limit-bytes", "103079215104",
+            "--cache-limit-bytes", "8589934592",
+            "--max-reserved-kv-bytes", "17179869184",
+        ])
+
+        XCTAssertEqual(
+            arguments.backend,
+            .continuousDynamicPLD(
+                modelDirectory: URL(
+                    fileURLWithPath: "/models/qwen3-source-locked",
+                    isDirectory: true),
+                memoryLimitBytes: 103_079_215_104,
+                cacheLimitBytes: 8_589_934_592,
+                maxReservedKVBytes: 17_179_869_184))
+        XCTAssertTrue(
             FastMLXServeArguments.usage.contains("--continuous-dynamic-pld"))
+    }
+
+    func testDynamicPLDModeRejectsConflictingOrUnprovenCombinations() {
+        let loaded = [
+            "--model-path", "/models/qwen3-source-locked",
+            "--model", "qwen3-source-locked",
+            "--memory-limit-bytes", "103079215104",
+            "--cache-limit-bytes", "8589934592",
+            "--max-reserved-kv-bytes", "17179869184",
+        ]
+
         XCTAssertThrowsError(
-            try FastMLXServeArguments.parse(["--continuous-dynamic-pld"])
+            try FastMLXServeArguments.parse([
+                "--scripted", "--continuous-dynamic-pld",
+            ])
         ) { error in
             XCTAssertEqual(
                 error as? FastMLXServeArgumentError,
-                .unknownArgument("--continuous-dynamic-pld"))
+                .conflictingBackendModes)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(
+                loaded + [
+                    "--continuous-batch-no-spec",
+                    "--continuous-dynamic-pld",
+                ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .conflictingBackendModes)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(
+                loaded + [
+                    "--continuous-dynamic-pld",
+                    "--allow-hybrid-qwen35",
+                ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .dynamicPLDWithHybridQwen35)
         }
     }
 
@@ -758,6 +948,12 @@ final class FastMLXServeArgumentsTests: XCTestCase {
 
         XCTAssertThrowsError(
             try FastMLXServeArguments.parse(common + ["--continuous-batch-no-spec", "--max-reserved-kv-bytes", "17179869184"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithContinuousBatch)
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(common + ["--continuous-dynamic-pld", "--max-reserved-kv-bytes", "17179869184"])
         ) { error in
             XCTAssertEqual(error as? FastMLXServeArgumentError, .exactQwen35MTPWithContinuousBatch)
         }

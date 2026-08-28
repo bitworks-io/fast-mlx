@@ -113,6 +113,7 @@ public enum ContinuousBatchSchedulerError: Error, Sendable, Equatable {
     case staleTick(expected: Int, actual: Int)
     case tickPlanMismatch(sequence: Int)
     case invalidDecodeOutcomeIDs(expected: [BatchRequestID], actual: [BatchRequestID])
+    case invalidDecodeObservation(BatchRequestID)
     case invalidEmittedTokenCount(BatchRequestID, Int)
     case invalidPendingLookahead(BatchRequestID)
     case outputBudgetExceeded(BatchRequestID, attempted: Int, remaining: Int)
@@ -130,6 +131,11 @@ public enum BatchSoloPipelineState: Sendable, Equatable {
     case speculative
 
     public var requiresDrain: Bool { self != .canonical }
+}
+
+public enum BatchDecodeObservation: Sendable, Equatable {
+    case none
+    case pldLowYieldDisabled
 }
 
 public enum BatchSlotPhase: Sendable, Equatable {
@@ -189,6 +195,7 @@ public struct BatchDecodeOutcome: Sendable, Equatable {
     public let emittedTokenCount: Int
     public let finished: Bool
     public let soloPipelineState: BatchSoloPipelineState
+    public let observation: BatchDecodeObservation
 
     public var hasPendingSoloLookahead: Bool {
         soloPipelineState.requiresDrain
@@ -198,12 +205,14 @@ public struct BatchDecodeOutcome: Sendable, Equatable {
         id: BatchRequestID,
         emittedTokenCount: Int,
         finished: Bool,
-        soloPipelineState: BatchSoloPipelineState
+        soloPipelineState: BatchSoloPipelineState,
+        observation: BatchDecodeObservation = .none
     ) {
         self.id = id
         self.emittedTokenCount = emittedTokenCount
         self.finished = finished
         self.soloPipelineState = soloPipelineState
+        self.observation = observation
     }
 
     /// Source-compatible bridge for existing non-speculative runtimes and fixtures.
@@ -211,7 +220,8 @@ public struct BatchDecodeOutcome: Sendable, Equatable {
         id: BatchRequestID,
         emittedTokenCount: Int,
         finished: Bool,
-        hasPendingSoloLookahead: Bool
+        hasPendingSoloLookahead: Bool,
+        observation: BatchDecodeObservation = .none
     ) {
         self.init(
             id: id,
@@ -219,7 +229,8 @@ public struct BatchDecodeOutcome: Sendable, Equatable {
             finished: finished,
             soloPipelineState: hasPendingSoloLookahead
                 ? .pipelinedLookahead
-                : .canonical)
+                : .canonical,
+            observation: observation)
     }
 }
 
@@ -274,6 +285,7 @@ public struct ContinuousBatchScheduler: Sendable {
         let request: BatchRequest
         var phase: BatchSlotPhase
         let arrivalOrdinal: UInt64
+        var suppressesSoloSpeculation: Bool
     }
 
     public let configuration: ContinuousBatchConfiguration
@@ -345,7 +357,8 @@ public struct ContinuousBatchScheduler: Sendable {
         slots[request.id] = Slot(
             request: request,
             phase: .queued,
-            arrivalOrdinal: nextArrivalOrdinal
+            arrivalOrdinal: nextArrivalOrdinal,
+            suppressesSoloSpeculation: false
         )
         nextArrivalOrdinal += 1
         queue.append(request.id)
@@ -451,6 +464,7 @@ public struct ContinuousBatchScheduler: Sendable {
                 ticksSinceMembershipChange: 0
             ))
             let speculationAllowed = only.request.requestsSpeculation
+                && !only.suppressesSoloSpeculation
                 && adaptiveMode == .soloSpeculative
             let pendingSoloDrain: Bool = {
                 guard case .decoding(_, let state) = only.phase else {
@@ -458,8 +472,17 @@ public struct ContinuousBatchScheduler: Sendable {
                 }
                 return state.requiresDrain
             }()
+            let pendingSpeculativeDrain: Bool = {
+                guard case .decoding(_, .speculative) = only.phase else {
+                    return false
+                }
+                return true
+            }()
             let companionIsImminent = prefillingCompanions > 0
-            if companionIsImminent, !speculationAllowed, pendingSoloDrain {
+            if !speculationAllowed,
+                pendingSpeculativeDrain
+                    || (companionIsImminent && pendingSoloDrain)
+            {
                 decode = .drainSoloPipeline(only.request.id)
             } else {
                 decode = .solo(
@@ -553,7 +576,14 @@ public struct ContinuousBatchScheduler: Sendable {
                 next.lastDecodedCohort = next.slots[firstID]?.request.decodeCohort
             }
             for id in decode.requestIDs {
-                next.advanceDecode(outcomeByID[id]!)
+                let outcome = outcomeByID[id]!
+                if outcome.observation == .pldLowYieldDisabled,
+                    var slot = next.slots[id]
+                {
+                    slot.suppressesSoloSpeculation = true
+                    next.slots[id] = slot
+                }
+                next.advanceDecode(outcome)
             }
         }
 
@@ -630,6 +660,18 @@ public struct ContinuousBatchScheduler: Sendable {
                     attempted: outcome.emittedTokenCount,
                     remaining: remaining
                 )
+            }
+
+            switch outcome.observation {
+            case .none:
+                break
+            case .pldLowYieldDisabled:
+                guard case .solo(let soloID, true) = action,
+                    soloID == id,
+                    slot.request.requestsSpeculation
+                else {
+                    throw ContinuousBatchSchedulerError.invalidDecodeObservation(id)
+                }
             }
 
             switch action {

@@ -3,6 +3,10 @@
 import Foundation
 import MLX
 
+private enum SampledMTPBlockRuntimeDecisionValidationError: Error {
+    case invalidDecision
+}
+
 /// Generator of tokens using MTP (Multi-Token Prediction) speculative
 /// decoding.
 ///
@@ -45,9 +49,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     var drafterState: MTPDrafterState?
     let quantizeKVCache: (inout [KVCache]) -> Void
     let collectPhaseTelemetry: Bool
+    let promptPreparationEvaluationOrder: MTPPromptPreparationEvaluationOrder
 
     var processor: LogitProcessor?
     let sampler: LogitSampler
+    let drafterSampler: LogitSampler
+    let sampledBlockDecisionProvider: (any SampledMTPBlockRuntimeDeciding)?
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
     public let maxTokens: Int?
@@ -99,6 +106,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     public var speculativeDecodingPhaseTelemetry: SpeculativeDecodingPhaseTelemetry {
         telemetry.phases
     }
+    public private(set) var promptPreparationTelemetry: MTPPromptPreparationTelemetry?
+    public private(set) var promptPreparationPhaseBoundarySynchronizationSeconds = 0.0
 
     @inline(__always)
     private func phaseClock() -> TimeInterval {
@@ -134,7 +143,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
-        collectPhaseTelemetry: Bool = false
+        collectPhaseTelemetry: Bool = false,
+        promptPreparationEvaluationOrder: MTPPromptPreparationEvaluationOrder = .cacheFirst,
+        sampledBlockDecisionProvider: (any SampledMTPBlockRuntimeDeciding)? = nil
     ) throws {
         precondition(
             blockSize >= 2,
@@ -144,11 +155,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.mainModel = mainModel
         self.drafter = drafter
         self.collectPhaseTelemetry = collectPhaseTelemetry
+        self.promptPreparationEvaluationOrder = promptPreparationEvaluationOrder
+        guard collectPhaseTelemetry || promptPreparationEvaluationOrder == .cacheFirst else {
+            throw MTPPromptPreparationEvaluationOrderError.telemetryRequired
+        }
 
+        let providerIsEligible = parameters.temperature != 0
+            && parameters.processor() == nil
+            && (sampledBlockDecisionProvider?.supports(parameters: parameters) ?? false)
         let initialPassthroughReason: String?
         if !drafter.supportsSpeculation(for: input) {
             initialPassthroughReason = "drafter does not support this prompt input"
-        } else if drafter.requiresGreedySampling, parameters.temperature != 0 {
+        } else if drafter.requiresGreedySampling, parameters.temperature != 0,
+            !providerIsEligible
+        {
             initialPassthroughReason =
                 "Qwen MTP currently requires temperature == 0; generating without speculation"
         } else {
@@ -174,6 +194,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         self.sampler = parameters.sampler()
+        self.sampledBlockDecisionProvider = providerIsEligible
+            ? sampledBlockDecisionProvider : nil
+        self.drafterSampler = providerIsEligible
+            ? sampledBlockDecisionProvider!.proposalSampler : self.sampler
         self.processor = parameters.processor()
 
         self.maxTokens = parameters.maxTokens
@@ -213,13 +237,41 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // forward call after prefill (one position, the bonus token).
 
         let prepareResult: PrepareResult
-        if !passthrough, drafter.requiresPromptPrefill,
-            let reuseTarget = mainModel as? any MTPPromptHiddenStatePreparingModel,
-            let preparation = try reuseTarget.prepareForMTP(
+        let targetPromptPreparation: MTPPromptPreparation?
+        if !passthrough, drafter.requiresPromptPrefill, collectPhaseTelemetry,
+            let telemetryTarget = mainModel
+                as? any MTPPromptHiddenStateEvaluationOrderPreparingModel
+        {
+            targetPromptPreparation = try telemetryTarget.prepareForMTP(
+                input, cache: mainCache, windowSize: windowSize,
+                collectTelemetry: true,
+                evaluationOrder: promptPreparationEvaluationOrder)
+        } else if !passthrough, drafter.requiresPromptPrefill, collectPhaseTelemetry,
+            promptPreparationEvaluationOrder != .cacheFirst
+        {
+            throw MTPPromptPreparationEvaluationOrderError.unsupportedTarget
+        } else if !passthrough, drafter.requiresPromptPrefill, collectPhaseTelemetry,
+            let telemetryTarget = mainModel
+                as? any MTPPromptHiddenStateTelemetryPreparingModel
+        {
+            targetPromptPreparation = try telemetryTarget.prepareForMTP(
+                input, cache: mainCache, windowSize: windowSize,
+                collectTelemetry: true)
+        } else if !passthrough, drafter.requiresPromptPrefill,
+            let reuseTarget = mainModel
+            as? any MTPPromptHiddenStatePreparingModel
+        {
+            targetPromptPreparation = try reuseTarget.prepareForMTP(
                 input, cache: mainCache, windowSize: windowSize)
+        } else {
+            targetPromptPreparation = nil
+        }
+        if !passthrough, drafter.requiresPromptPrefill,
+            let preparation = targetPromptPreparation
         {
             prepareResult = preparation.result
             capturedPromptHidden = preparation.targetHidden
+            promptPreparationTelemetry = preparation.telemetry
         } else {
             prepareResult = try mainModel.prepare(
                 input, cache: mainCache, windowSize: windowSize)
@@ -308,7 +360,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         if collectPhaseTelemetry {
-            synchronizeTargetPhaseBoundary(
+            promptPreparationPhaseBoundarySynchronizationSeconds += synchronizeTargetPhaseBoundary(
                 state: mainState, capturedPromptHidden: capturedPromptHidden)
             telemetry.recordTargetPrefill(
                 seconds: ProcessInfo.processInfo.systemUptime - targetPrefillStart)
@@ -359,7 +411,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     firstBonus: y.tokens,
                     positionDeltas: mainState?[mtpPositionDeltasKey],
                     state: &currentDrafterState,
-                    sampler: sampler)
+                    sampler: drafterSampler)
                 drafterState = currentDrafterState
             } else {
                 switchToPassthrough(
@@ -376,11 +428,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
-    private func synchronizeTargetPhaseBoundary(
+    @discardableResult
+    private mutating func synchronizeTargetPhaseBoundary(
         state: LMOutput.State?,
         capturedPromptHidden: MLXArray? = nil
-    ) {
-        guard collectPhaseTelemetry else { return }
+    ) -> TimeInterval {
+        guard collectPhaseTelemetry else { return 0 }
         var arrays = mainCache.flatMap { $0.state }
         if let capturedPromptHidden {
             arrays.append(capturedPromptHidden)
@@ -398,8 +451,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             arrays.append(positionDeltas)
         }
         if !arrays.isEmpty {
+            let start = ProcessInfo.processInfo.systemUptime
             eval(arrays)
+            return ProcessInfo.processInfo.systemUptime - start
         }
+        return 0
     }
 
     private func synchronizeDrafterPhaseBoundary() {
@@ -519,7 +575,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 queryOffset: cacheOffset,
                 blockSize: numDraft + 1,
                 state: &currentDrafterState,
-                sampler: sampler
+                sampler: drafterSampler
             )
             drafterState = currentDrafterState
         } else {
@@ -531,7 +587,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 positionDeltas: state[mtpPositionDeltasKey],
                 queryOffset: cacheOffset,
                 blockSize: numDraft + 1,
-                sampler: sampler
+                sampler: drafterSampler
             )
         }
         // draftTokens shape [B, numDraft] -> flatten to [numDraft].
@@ -564,7 +620,48 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let draftTokensList: [Int]
         var accepted = 0
         let emittedFinalToken: MLXArray
-        if processor == nil, sampler is ArgMaxSampler {
+        var sampledDecisionFailed = false
+        if let sampledBlockDecisionProvider {
+            eval(flatDraftTokens)
+            draftTokensList = flatDraftTokens.asArray(Int.self)
+            let targetLogits = (0 ..< numDraft).map { index in
+                mainLogits[0..., verifyStart + index, 0...]
+            }
+            do {
+                let decision = try sampledBlockDecisionProvider.decide(
+                    proposedTokens: draftTokensList,
+                    targetLogits: targetLogits,
+                    bonusTargetLogits: mainLogits[0..., verifyStart + numDraft, 0...])
+                guard (0 ... numDraft).contains(decision.acceptedDraftCount),
+                    decision.outputTokens.count == decision.acceptedDraftCount + 1,
+                    Array(decision.outputTokens.prefix(decision.acceptedDraftCount))
+                        == Array(draftTokensList.prefix(decision.acceptedDraftCount)),
+                    decision.outputTokens.allSatisfy({
+                        $0 >= 0 && $0 < mainLogits.dim(-1)
+                            && Int32(exactly: $0) != nil
+                    })
+                else {
+                    throw SampledMTPBlockRuntimeDecisionValidationError.invalidDecision
+                }
+                accepted = decision.acceptedDraftCount
+                pendingTokens.append(contentsOf: decision.outputTokens)
+                emittedFinalToken = MLXArray([
+                    Int32(decision.outputTokens[decision.acceptedDraftCount])
+                ])
+            } catch {
+                // The verify pass has already appended [bonus, drafts]. Treat a
+                // provider failure as zero acceptance, select the next token
+                // from the ordinary target sampler, and let the shared cache
+                // transaction below remove every draft before going sticky
+                // passthrough. Draft RNG never touched this target sampler.
+                let targetToken = sampler.sample(logits: targetLogits[0])
+                eval(targetToken)
+                verifierTokenReadbackCount += 1
+                pendingTokens.append(targetToken.item(Int.self))
+                emittedFinalToken = targetToken
+                sampledDecisionFailed = true
+            }
+        } else if processor == nil, sampler is ArgMaxSampler {
             // Match the ordinary speculative iterator's processor-free path:
             // select the complete greedy verification block in one operation
             // and materialize its target token IDs once. The target forward,
@@ -640,7 +737,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         )
 
         let seedCommitStart = phaseClock()
-        if let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
+        if !sampledDecisionFailed,
+            let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
             var currentDrafterState = drafterState
         {
             statefulDrafter.commitDrafterState(
@@ -651,8 +749,11 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken: emittedFinalToken,
                 positionDeltas: mainResult.state?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: drafterSampler)
             drafterState = currentDrafterState
+        }
+        if sampledDecisionFailed {
+            drafterState = nil
         }
         if collectPhaseTelemetry {
             synchronizeDrafterPhaseBoundary()
@@ -707,6 +808,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         quantizeKVCache(&mainCache)
 
         y = .init(tokens: emittedFinalToken)
+        if sampledDecisionFailed {
+            switchToPassthrough(reason: "sampled MTP block decision failed")
+        }
     }
 
     /// Switch to single-token generation for the remainder of the stream.

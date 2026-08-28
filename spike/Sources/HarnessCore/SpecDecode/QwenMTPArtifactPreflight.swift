@@ -137,6 +137,11 @@ public enum QwenMTPKnownArtifactLocks {
     // gitleaks:allow -- canonical public token-to-id vocabulary SHA-256, not a credential.
     private static let qwen35TokenizerVocabularySHA256 =
         "38eaf282b2679a1ede9fb3ee9418fc72f656f3fabfb9c33e16d34239ca88ddc1"
+    // gitleaks:allow -- canonical public token-to-id vocabulary SHA-256, not a credential.
+    private static let qwen38TokenizerVocabularySHA256 =
+        "38eaf282b2679a1ede9fb3ee9418fc72f656f3fabfb9c33e16d34239ca88ddc1"
+    private static let qwen38SourceRevision =
+        "01472a78fca830689ff78246a82c6d31ab111a78"
 
     /// Qwen3.5 9B affine-4bit target plus its standalone affine-5bit native MTP artifact.
     ///
@@ -170,6 +175,37 @@ public enum QwenMTPKnownArtifactLocks {
         drafterQuantization: .init(bits: 5, groupSize: 64, mode: "affine"),
         drafterTensors: qwen35_9BMTP5BitTensors)
 
+    /// Qwen3.8 27B MXFP8 production-family target plus its standalone MXFP8 native MTP artifact.
+    ///
+    /// This row authenticates metadata only. It does not register, load, or admit the 27B pair for
+    /// runtime or serving; those remain separate vendor, factory, live-exactness, and hardware gates.
+    public static let qwen38_27BMXFP8Depth1 = QwenMTPArtifactLock(
+        sourceRevision: qwen38SourceRevision,
+        targetIdentity: .init(
+            modelID: "mlx-community/Qwen3.8-27B-mxfp8",
+            revision: "d48d163bcdf24acaf656474854ab88ea17d65bd1",
+            configSHA256: "ce016401438761ac53dcc6df48eb897036ed5c0eadd735002a35fd253701cfbf",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "7a5e32297470983aa8dafe03a094f59a79787fee09c25760e82abaa09fe2e7b3"),
+        drafterIdentity: .init(
+            modelID: "mlx-community/Qwen3.8-27B-MTP-mxfp8",
+            revision: "a50634460045613f166b09b13519466e801c6568",
+            configSHA256: "be0048271c09a95620762f32cac1e487d4a798368ac25f42c7c35d9a9f1b4827",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "32ee1b818a5c6ce7191863910131b172ac3fa82f99ce8c23521ddac27cc1fcb7"),
+        architecture: .init(
+            hiddenSize: 5120,
+            intermediateSize: 17408,
+            vocabularySize: 248_320,
+            targetLayerCount: 64,
+            fullAttentionInterval: 4,
+            attentionHeadCount: 24,
+            keyValueHeadCount: 4,
+            headDimension: 256),
+        targetQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
+        drafterQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
+        drafterTensors: qwen38_27BMXFP8MTPTensors)
+
     private static let qwen35_9BMTP5BitTensors: [QwenMTPTensorDescriptor] = [
         .init(name: "fc.biases", shape: [4096, 128], dtype: "BF16"),
         .init(name: "fc.scales", shape: [4096, 128], dtype: "BF16"),
@@ -202,6 +238,32 @@ public enum QwenMTPKnownArtifactLocks {
         .init(name: "norm.weight", shape: [4096], dtype: "BF16"),
         .init(name: "pre_fc_norm_embedding.weight", shape: [4096], dtype: "BF16"),
         .init(name: "pre_fc_norm_hidden.weight", shape: [4096], dtype: "BF16"),
+    ]
+
+    private static let qwen38_27BMXFP8MTPTensors: [QwenMTPTensorDescriptor] = [
+        .init(name: "fc.scales", shape: [5120, 320], dtype: "U8"),
+        .init(name: "fc.weight", shape: [5120, 2560], dtype: "U32"),
+        .init(name: "layers.0.input_layernorm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "layers.0.mlp.down_proj.scales", shape: [5120, 544], dtype: "U8"),
+        .init(name: "layers.0.mlp.down_proj.weight", shape: [5120, 4352], dtype: "U32"),
+        .init(name: "layers.0.mlp.gate_proj.scales", shape: [17408, 160], dtype: "U8"),
+        .init(name: "layers.0.mlp.gate_proj.weight", shape: [17408, 1280], dtype: "U32"),
+        .init(name: "layers.0.mlp.up_proj.scales", shape: [17408, 160], dtype: "U8"),
+        .init(name: "layers.0.mlp.up_proj.weight", shape: [17408, 1280], dtype: "U32"),
+        .init(name: "layers.0.post_attention_layernorm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.k_norm.weight", shape: [256], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.k_proj.scales", shape: [1024, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.k_proj.weight", shape: [1024, 1280], dtype: "U32"),
+        .init(name: "layers.0.self_attn.o_proj.scales", shape: [5120, 192], dtype: "U8"),
+        .init(name: "layers.0.self_attn.o_proj.weight", shape: [5120, 1536], dtype: "U32"),
+        .init(name: "layers.0.self_attn.q_norm.weight", shape: [256], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.q_proj.scales", shape: [12288, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.q_proj.weight", shape: [12288, 1280], dtype: "U32"),
+        .init(name: "layers.0.self_attn.v_proj.scales", shape: [1024, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.v_proj.weight", shape: [1024, 1280], dtype: "U32"),
+        .init(name: "norm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "pre_fc_norm_embedding.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "pre_fc_norm_hidden.weight", shape: [5120], dtype: "BF16"),
     ]
 }
 
@@ -258,7 +320,7 @@ public enum QwenMTPArtifactPreflightError: Error, Equatable, Sendable {
 }
 
 public enum QwenMTPArtifactPreflight {
-    /// Validate one exact Qwen3.5 target plus standalone native MTP artifact before any model use.
+    /// Validate one exact target plus standalone native MTP artifact before any model use.
     ///
     /// This gate deliberately admits depth one only. It authenticates the source/config/tokenizer/
     /// tensor boundary and returns immutable binding data; it does not load weights or expose MTP to

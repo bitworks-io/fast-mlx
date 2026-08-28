@@ -23,9 +23,9 @@ public struct ModelFit: Equatable, Sendable {
     public let requestedContext: Int
     public let classification: CapacityColor
     /// `false` whenever this row's numbers rest on an estimate rather than a measurement: the
-    /// box's `wiredLimitBytes` was synthesized (not read from hardware), OR `kvQuant` is one of
-    /// the ⚠️ EXPERIMENTAL/UNMEASURED placeholder tiers (`tq2_5`/`tq3_5`). The honest
-    /// measured-vs-modeled flag — never present an estimate as a guarantee.
+    /// the box's effective memory ceiling is synthesized/advisory, OR `kvQuant` is one of the
+    /// ⚠️ EXPERIMENTAL/UNMEASURED placeholder tiers (`tq2_5`/`tq3_5`). The honest measured-vs-
+    /// modeled flag — never present an estimate as a guarantee.
     public let estimateIsMeasured: Bool
 
     public init(
@@ -43,6 +43,36 @@ public struct ModelFit: Equatable, Sendable {
 
 public enum ModelSizer {
 
+    /// Human-facing provenance notes for the sizer report. Derive them from the effective binding
+    /// source and the requested KV tier directly; `estimateIsMeasured == false` is intentionally
+    /// insufficient because a synthesized/advisory host ceiling is not an experimental KV format.
+    public static func provenanceNotes(box: SystemProfile, kvQuant: KVQuantTier) -> [String] {
+        var notes: [String] = []
+
+        switch box.effectiveMemoryCeiling.source {
+        case .sharedPolicy:
+            notes.append(
+                "NOTE: the effective memory ceiling is synthesized by shared policy (not measured) — headroom numbers are approximate.")
+        case .recommendedWorkingSet:
+            notes.append(
+                "NOTE: the effective memory ceiling is Metal's advisory recommended working set (not a measured hard limit) — headroom numbers are approximate.")
+        case .wiredLimit where !box.wiredLimitIsMeasured:
+            notes.append(
+                "NOTE: this box's wired-memory limit is ESTIMATED (not read from hardware) — headroom numbers are approximate.")
+        case .physicalRAM:
+            notes.append(
+                "NOTE: physical-RAM measurement provenance is unavailable — headroom numbers are approximate.")
+        case .wiredLimit:
+            break
+        }
+
+        if kvQuant == .tq2_5 || kvQuant == .tq3_5 {
+            notes.append(
+                "NOTE: \(kvQuant.rawValue) is an ⚠️ EXPERIMENTAL/UNMEASURED placeholder KV tier — treat fit/ceiling numbers as more speculative than usual.")
+        }
+        return notes
+    }
+
     /// Report every cataloged model at the given weight-bit assumptions (default 4-bit and 8-bit)
     /// against a box, at a single context (or each model's own effective default when `context` is
     /// `nil` — mirrors `fastmlx-capacity`'s per-model default resolution).
@@ -54,7 +84,7 @@ public enum ModelSizer {
         rows.reserveCapacity(ModelArchProfile.catalog.count * weightBitOptions.count)
 
         let placeholderKVQuant = kvQuant == .tq2_5 || kvQuant == .tq3_5
-        let estimateIsMeasured = box.wiredLimitIsMeasured && !placeholderKVQuant
+        let estimateIsMeasured = box.effectiveMemoryCeilingIsMeasured && !placeholderKVQuant
 
         for model in ModelArchProfile.catalog {
             let resolvedContext = context ?? CapacityModel.effectiveDefaultContext(model)

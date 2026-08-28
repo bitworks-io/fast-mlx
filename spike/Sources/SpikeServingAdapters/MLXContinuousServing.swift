@@ -117,9 +117,8 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
     public let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
     public let startupMessages: [OpenAIChatMessage]
     /// Requested KV-cache storage tier. Default `.fp16` — the continuous runtime builds fp16 caches
-    /// unconditionally (`kvCacheKind: .fp16`). A non-fp16 tier is resolved fail-closed at load via
-    /// `selectKVCacheQuant`: a tier the runtime cannot store yet refuses to start rather than silently
-    /// serve fp16 while the fit-check sized for the smaller tier (matches the scalar route).
+    /// unconditionally (`kvCacheKind: .fp16`). Non-fp16 remains fail-closed at selection; the explicit
+    /// validation below also prevents a future scalar-only capability flip from leaking into this route.
     public let kvQuantTier: KVQuantTier
     /// Opt-in admission of the qwen3_5 hybrid architecture onto this continuous route (operator flag
     /// `--allow-hybrid-qwen35`). Default `false` — the proof rejects the hybrid family with
@@ -395,17 +394,13 @@ public func loadContinuousServingModel(
     try validateContinuousServingCacheLayout(
         nativeCacheKinds,
         hybridAdmitted: proof.verifiedHybridGeometry != nil)
-    // Fail-closed KV-cache tier selection, BEFORE the runtime builds any cache (it hardcodes
-    // `kvCacheKind: .fp16` below). A non-fp16 tier the runtime cannot store yet throws here — the
-    // continuous route refuses to start rather than silently serve fp16 under a smaller-tier-sized
-    // verdict, matching the scalar route. fp16 (default/omitted) resolves to `.fp16`, byte-identical.
+    // Fail-closed KV-cache tier selection before the runtime builds any cache (it hardcodes
+    // `kvCacheKind: .fp16` below). Non-fp16 currently throws at selection; the route-specific validation
+    // also rejects an injected/future int8 decision rather than silently serving fp16.
     let kvCacheDecision = try selectKVCacheQuant(
         requested: configuration.kvQuantTier, nativeKinds: nativeCacheKinds)
-    guard case .fp16 = kvCacheDecision else {
-        // Unreachable today (selection yields only `.fp16`). Defensive: a future `runtimeWiredKVTiers`
-        // flip must not reach the fp16-hardcoded runtime below for a quantized request.
-        throw ContinuousServingModelLoadError.kvQuantTierConstructionUnavailable(configuration.kvQuantTier)
-    }
+    try validateContinuousServingKVCacheDecision(
+        kvCacheDecision, requestedTier: configuration.kvQuantTier)
     let codec = MLXScalarTextCodec(tokenizer: context.tokenizer)
     let stopTokenIDs = try resolveScalarServingStopTokenIDs(
         configuration: context.configuration,
@@ -488,6 +483,17 @@ public func loadContinuousServingModel(
     return LoadedContinuousServingModel(
         backend: backend,
         startupReport: report)
+}
+
+func validateContinuousServingKVCacheDecision(
+    _ decision: KVCacheQuantDecision,
+    requestedTier: KVQuantTier
+) throws {
+    guard case .fp16 = decision else {
+        // Continuous serving retains its existing fp16 cache family until a separate
+        // construction/parity/quality gate wires compressed KV.
+        throw ContinuousServingModelLoadError.kvQuantTierConstructionUnavailable(requestedTier)
+    }
 }
 
 /// Exercise the exact continuous runtime before publishing a ready startup report.

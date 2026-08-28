@@ -27,7 +27,8 @@ public func resolvedWeightQuantizationPath(
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFilter: (String) -> Bool = { _ in true }
 ) throws {
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
@@ -37,7 +38,7 @@ public func loadWeights(
     for case let url as URL in enumerator {
         if url.pathExtension == "safetensors" {
             let (w, m) = try loadArraysAndMetadata(url: url)
-            for (key, value) in w {
+            for (key, value) in w where weightFilter(key) {
                 weights[key] = value
             }
             if metadata.isEmpty {

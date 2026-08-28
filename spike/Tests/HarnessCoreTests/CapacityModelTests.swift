@@ -325,4 +325,61 @@ final class CapacityModelTests: XCTestCase {
         let cacheLimit = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: wiredLimit)
         XCTAssertEqual(cacheLimit, 24 * Int(gib))
     }
+
+    func testRecommendedCacheLimitBytes_BelowOrdinaryFloorStaysBeneathEffectiveCeiling() {
+        let effectiveCeiling = 3 * Int(gib)
+        let cacheLimit = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: effectiveCeiling)
+
+        XCTAssertEqual(cacheLimit, effectiveCeiling / 2)
+        XCTAssertLessThan(cacheLimit, effectiveCeiling)
+    }
+
+    // MARK: - shared-host effective memory ceiling
+
+    func testSharedEffectiveCeilingLowerMeasuredWiredWinsAndHardwareHoldsDeductsReserveOnce() {
+        let host = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 64 * Int(gib),
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: nil)
+
+        XCTAssertEqual(host.effectiveMemoryCeiling.bytes, 64 * Int(gib))
+        XCTAssertEqual(host.effectiveMemoryCeiling.source, .wiredLimit)
+        XCTAssertEqual(
+            host.hardwareHoldsBytes(weightsBytes: 10 * Int(gib), osReserveBytes: 4 * Int(gib)),
+            50 * Int(gib),
+            "hardwareHolds must subtract weights and reserve once from the effective ceiling")
+    }
+
+    func testNilZeroOrNegativeMetalRecommendationCannotRaiseSharedFallbackCeiling() {
+        let fallback = 48 * Int(gib)
+        for recommendedWorkingSetBytes in [nil, 0, -1] as [Int?] {
+            let host = SystemProfile(
+                chip: "test",
+                totalRAMBytes: 64 * Int(gib),
+                wiredLimitBytes: 50 * Int(gib),
+                wiredLimitIsMeasured: true,
+                recommendedWorkingSetBytes: recommendedWorkingSetBytes)
+
+            XCTAssertEqual(host.effectiveMemoryCeiling.bytes, fallback)
+            XCTAssertEqual(host.effectiveMemoryCeiling.source, .sharedPolicy)
+        }
+    }
+
+    func testDedicatedServingIgnoresSharedPolicyAndMetalRecommendationForThisIncrement() {
+        let host = SystemProfile(
+            chip: "test",
+            totalRAMBytes: 128 * Int(gib),
+            wiredLimitBytes: 115 * Int(gib),
+            wiredLimitIsMeasured: true,
+            recommendedWorkingSetBytes: 64 * Int(gib),
+            hostUse: .operatorAssertedDedicatedServing())
+
+        XCTAssertEqual(host.effectiveMemoryCeiling.bytes, 115 * Int(gib))
+        XCTAssertEqual(host.effectiveMemoryCeiling.source, .wiredLimit)
+        XCTAssertEqual(
+            host.hardwareHoldsBytes(weightsBytes: 10 * Int(gib), osReserveBytes: 4 * Int(gib)),
+            101 * Int(gib))
+    }
 }

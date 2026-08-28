@@ -137,11 +137,8 @@ func runSizerTable(box: SystemProfile, context: Int?, kvQuant: KVQuantTier, conc
 
     print("== Model sizer (MODELED ESTIMATE, not a measured guarantee) ==")
     print("kvQuant: \(kvQuant.rawValue), concurrency: \(concurrency)")
-    if !box.wiredLimitIsMeasured {
-        print("NOTE: this box's wired-memory limit is ESTIMATED (not read from hardware) — headroom numbers are approximate.")
-    }
-    if !rows.isEmpty && !rows[0].estimateIsMeasured && box.wiredLimitIsMeasured {
-        print("NOTE: \(kvQuant.rawValue) is an ⚠️ EXPERIMENTAL/UNMEASURED placeholder KV tier — treat fit/ceiling numbers as more speculative than usual.")
+    for note in ModelSizer.provenanceNotes(box: box, kvQuant: kvQuant) {
+        print(note)
     }
     print("")
 
@@ -228,17 +225,49 @@ func resolveBox(_ arg: String?, hostReport: HostReport) -> (SystemProfile, Strin
 
 var args = Array(CommandLine.arguments.dropFirst())
 let modelID = takeValue(for: "--model", in: &args)
-let contextArg = takeValue(for: "--context", in: &args).flatMap { Int($0) }
-let concurrencyArg = takeValue(for: "--concurrency", in: &args).flatMap { Int($0) } ?? 1
+let contextWasSpecified = args.contains("--context")
+let contextValue = takeValue(for: "--context", in: &args)
+let contextArg: Int?
+if contextWasSpecified && contextValue == nil {
+    FileHandle.standardError.write(
+        "error: --context must be a nonnegative integer\n".data(using: .utf8)!)
+    exit(1)
+} else if let contextValue {
+    guard let parsed = Int(contextValue), parsed >= 0 else {
+        FileHandle.standardError.write(
+            "error: --context must be a nonnegative integer\n".data(using: .utf8)!)
+        exit(1)
+    }
+    contextArg = parsed
+} else {
+    contextArg = nil
+}
+let concurrencyWasSpecified = args.contains("--concurrency")
+let concurrencyValue = takeValue(for: "--concurrency", in: &args)
+let concurrencyArg: Int
+if concurrencyWasSpecified && concurrencyValue == nil {
+    FileHandle.standardError.write(
+        "error: --concurrency must be a positive integer\n".data(using: .utf8)!)
+    exit(1)
+} else if let concurrencyValue {
+    guard let parsed = Int(concurrencyValue), parsed > 0 else {
+        FileHandle.standardError.write(
+            "error: --concurrency must be a positive integer\n".data(using: .utf8)!)
+        exit(1)
+    }
+    concurrencyArg = parsed
+} else {
+    concurrencyArg = 1
+}
 let kvQuantArg = takeValue(for: "--kv-quant", in: &args).flatMap { KVQuantTier(rawValue: $0) } ?? .fp16
 let boxArg = takeValue(for: "--box", in: &args)
-// `--auto`: target the live host via HarnessCore's pure-Swift `SystemProfile.detectHost()`
-// (sysctl RAM/chip + an estimated wired limit) instead of a `--box` preset. `--sizer`: run the
-// model-sizer report instead of the default catalog table / `--model` detail view.
+// `--auto`: target the full live HostReport profile instead of a named `--box` preset. This keeps
+// measured/synthesized wired provenance and the Metal recommended working set in the capacity math.
+// `--sizer`: run the model-sizer report instead of the default catalog table / `--model` detail view.
 let autoFlag = takeFlag("--auto", in: &args)
 let sizerFlag = takeFlag("--sizer", in: &args)
 let jsonFlag = takeFlag("--json", in: &args)
-// `--sizer-matrix`: emit `ModelSizer.report(...)` as a schema-tagged `sizer-matrix/v1` artifact
+// `--sizer-matrix`: emit `ModelSizer.report(...)` as a schema-tagged `sizer-matrix/v2` artifact
 // (`SizerMatrixArtifact.encodedJSON()`) instead of the table/`--sizer --json` array. This is the
 // data source a later increment's public "which model fits which Mac" sizer page consumes — always
 // JSON, regardless of `--json` (that flag only gates the existing `--sizer` array output).
@@ -281,21 +310,23 @@ if !sizerMatrixFlag {
 
 // The live host is always profiled + printed above (spec: "understand the system the tool is
 // running on"); `--box` retargets the capacity math to a preset for planning a different box.
-// `--auto` retargets it to a fresh `detectHost()` read instead (same host, but sourced from
-// HarnessCore's own minimal sysctl probe rather than the `SystemProfiler.probe()` above, and with
-// an explicitly ESTIMATED wired limit — see `wiredLimitIsMeasured`).
+// `--auto` explicitly selects that same full live profile instead of a preset. Reusing the report is
+// important: the Metal recommendation and honest wired provenance must not be dropped on an auto path.
 let targetProfile: SystemProfile
 let targetLabel: String
 if autoFlag {
-    targetProfile = SystemProfile.detectHost()
+    targetProfile = hostReport.systemProfile
     targetLabel = "auto"
 } else {
     (targetProfile, targetLabel) = resolveBox(boxArg, hostReport: hostReport)
 }
 if !sizerMatrixFlag {
     if targetLabel == "auto" {
+        let wiredProvenance = targetProfile.wiredLimitIsMeasured ? "MEASURED" : "ESTIMATED, not measured"
+        let ceiling = targetProfile.effectiveMemoryCeiling
         print("Capacity computed for: auto-detected host — \(gibString(targetProfile.totalRAMBytes)) RAM, "
-            + "\(gibString(targetProfile.wiredLimitBytes)) wired (ESTIMATED, not measured)\n")
+            + "\(gibString(targetProfile.wiredLimitBytes)) wired (\(wiredProvenance)), "
+            + "\(gibString(ceiling.bytes)) effective (\(ceiling.source.rawValue))\n")
     } else if targetLabel != "host" {
         print("Capacity computed for: \(targetLabel) — \(gibString(targetProfile.totalRAMBytes)) RAM, "
             + "\(gibString(targetProfile.wiredLimitBytes)) wired — NOT the live host\n")
@@ -303,9 +334,17 @@ if !sizerMatrixFlag {
 }
 
 if sizerMatrixFlag {
+    let observation: SizerMatrixArtifact.BuildObservation
+    if targetLabel == "auto" {
+        observation = .live(label: .auto, currentMetalAllocatedBytes: hostReport.currentGPUAllocBytes)
+    } else if targetLabel == "host" {
+        observation = .live(label: .host, currentMetalAllocatedBytes: hostReport.currentGPUAllocBytes)
+    } else {
+        observation = .modeledPreset(label: targetLabel)
+    }
     let artifact = SizerMatrixArtifact.build(
-        box: targetProfile, boxLabel: targetLabel, context: contextArg, kvQuant: kvQuantArg,
-        concurrency: concurrencyArg)
+        box: targetProfile, context: contextArg, kvQuant: kvQuantArg, concurrency: concurrencyArg,
+        observation: observation)
     print(artifact.encodedJSON())
 } else if sizerFlag {
     runSizerTable(box: targetProfile, context: contextArg, kvQuant: kvQuantArg, concurrency: concurrencyArg, json: jsonFlag)

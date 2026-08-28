@@ -3,6 +3,99 @@ import Foundation
 import Darwin
 #endif
 
+/// Durable host-use provenance for capacity policy. The default/automatic policy is conservative:
+/// absent or ambiguous host tenancy is treated as shared. Dedicated serving is only created by an
+/// explicit operator assertion (the factory, or a decoded configuration whose source says exactly
+/// that), so callers cannot infer it from RAM, chip, or wired-limit shape.
+///
+/// This is provenance, not authorization: decoding an evidence artifact never grants permission to
+/// mutate the host. The later operator-facing admission boundary must require its own explicit input.
+public struct HostUseClassification: Sendable, Equatable, Codable {
+    public enum Use: String, Sendable, Codable {
+        case shared
+        case dedicatedServing = "dedicated-serving"
+    }
+
+    public enum Source: String, Sendable, Codable {
+        case `default` = "default"
+        case automatic = "automatic"
+        case operatorAssertion = "operator-assertion"
+    }
+
+    public static let currentPolicyVersion = "host-use/v1"
+
+    public let use: Use
+    public let source: Source
+    public let policyVersion: String
+
+    public var rawValue: String { use.rawValue }
+
+    private enum CodingKeys: String, CodingKey {
+        case use
+        case source
+        case policyVersion
+    }
+
+    private init(use: Use, source: Source, policyVersion: String = Self.currentPolicyVersion) {
+        self.use = use
+        self.source = source
+        self.policyVersion = policyVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let use = try container.decode(Use.self, forKey: .use)
+        let source = try container.decode(Source.self, forKey: .source)
+        let policyVersion = try container.decode(String.self, forKey: .policyVersion)
+        guard policyVersion == Self.currentPolicyVersion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .policyVersion,
+                in: container,
+                debugDescription: "unsupported host-use policy version")
+        }
+        guard use == .shared || source == .operatorAssertion else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .source,
+                in: container,
+                debugDescription: "dedicated-serving host use requires operator-assertion source")
+        }
+        self.init(use: use, source: source, policyVersion: policyVersion)
+    }
+
+    public static let defaultShared = HostUseClassification(use: .shared, source: .default)
+    public static let automaticShared = HostUseClassification(use: .shared, source: .automatic)
+
+    public static func operatorAssertedShared() -> HostUseClassification {
+        HostUseClassification(
+            use: .shared,
+            source: .operatorAssertion,
+            policyVersion: Self.currentPolicyVersion)
+    }
+
+    public static func operatorAssertedDedicatedServing() -> HostUseClassification {
+        HostUseClassification(
+            use: .dedicatedServing,
+            source: .operatorAssertion,
+            policyVersion: Self.currentPolicyVersion)
+    }
+}
+
+/// The conservative process-planning envelope selected from the host observations that apply to
+/// the current host-use policy. The source is retained separately from the wired-limit measurement
+/// flag: a Metal recommendation can bind a shared host without changing where the wired input came
+/// from.
+public struct EffectiveMemoryCeiling: Sendable, Equatable {
+    public enum Source: String, Sendable, Equatable {
+        case physicalRAM = "physical-ram"
+        case sharedPolicy = "shared-policy"
+        case wiredLimit = "wired-limit"
+        case recommendedWorkingSet = "metal-recommended-working-set"
+    }
+
+    public let bytes: Int
+    public let source: Source
+}
+
 /// A pure, injectable description of a host's memory topology. **No introspection here** —
 /// reading `sysctlbyname`/Metal/IOKit live is deferred engine work (spec §3); this type is the
 /// data shape the capacity model consumes, constructed by the caller (tests, or eventually the
@@ -15,9 +108,10 @@ public struct SystemProfile: Sendable {
     public let chip: String
     /// Total physical RAM, in bytes (`ProcessInfo.physicalMemory` / `hw.memsize` on the real box).
     public let totalRAMBytes: Int
-    /// The effective GPU wired-memory ceiling, in bytes (`iogpu.wired_limit_mb` × 1024² on the
+    /// The resolved GPU wired-memory observation, in bytes (`iogpu.wired_limit_mb` × 1024² on the
     /// real box; `0` from the sysctl means "system default", which callers must resolve to a
-    /// concrete byte count before constructing this profile — this type only holds resolved values).
+    /// concrete byte count before constructing this profile). Shared capacity math consumes
+    /// `effectiveMemoryCeiling`, which may be lower than this observation.
     public let wiredLimitBytes: Int
     /// `true` when `wiredLimitBytes` came from an actual `iogpu.wired_limit_mb` reading (or a
     /// hand-measured preset); `false` when it was synthesized/estimated from a fraction of RAM
@@ -26,12 +120,79 @@ public struct SystemProfile: Sendable {
     /// estimate as a measured fact. Defaults to `true` to preserve existing call sites that
     /// construct a `SystemProfile` from a genuinely measured/assumed-authoritative value.
     public let wiredLimitIsMeasured: Bool
+    /// Metal's approximate good-performance working-set threshold. This is an advisory observation,
+    /// not a hard allocation guarantee. A positive value conservatively bounds shared-host planning;
+    /// dedicated-serving qualification remains a separate operator-controlled gate.
+    public let recommendedWorkingSetBytes: Int?
+    public let hostUse: HostUseClassification
 
-    public init(chip: String, totalRAMBytes: Int, wiredLimitBytes: Int, wiredLimitIsMeasured: Bool = true) {
+    public init(
+        chip: String,
+        totalRAMBytes: Int,
+        wiredLimitBytes: Int,
+        wiredLimitIsMeasured: Bool = true,
+        recommendedWorkingSetBytes: Int? = nil,
+        hostUse: HostUseClassification = .defaultShared
+    ) {
         self.chip = chip
         self.totalRAMBytes = totalRAMBytes
         self.wiredLimitBytes = wiredLimitBytes
         self.wiredLimitIsMeasured = wiredLimitIsMeasured
+        self.recommendedWorkingSetBytes = recommendedWorkingSetBytes
+        self.hostUse = hostUse
+    }
+
+    /// The envelope all capacity, admission, and allocator/cache budgeting must consume.
+    ///
+    /// Shared hosts are capped at exact integer `floor(75% * physical RAM)`, then further bounded
+    /// by a lower positive wired-limit observation and a lower positive Metal recommended working
+    /// set. Missing/non-positive Metal observations are unavailable rather than zero-byte limits.
+    /// Dedicated-serving retains the pre-existing `min(wired limit, physical RAM)` behavior here;
+    /// its separate qualification path owns any future Metal/OS/service-reserve policy.
+    public var effectiveMemoryCeiling: EffectiveMemoryCeiling {
+        guard totalRAMBytes > 0 else {
+            return EffectiveMemoryCeiling(bytes: 0, source: .physicalRAM)
+        }
+
+        switch hostUse.use {
+        case .shared:
+            var result = EffectiveMemoryCeiling(
+                bytes: Self.estimatedWiredLimitBytes(totalRAMBytes: totalRAMBytes),
+                source: .sharedPolicy)
+            if wiredLimitBytes > 0, wiredLimitBytes < result.bytes {
+                result = EffectiveMemoryCeiling(bytes: wiredLimitBytes, source: .wiredLimit)
+            }
+            if let recommendedWorkingSetBytes,
+                recommendedWorkingSetBytes > 0,
+                recommendedWorkingSetBytes < result.bytes
+            {
+                result = EffectiveMemoryCeiling(
+                    bytes: recommendedWorkingSetBytes,
+                    source: .recommendedWorkingSet)
+            }
+            return result
+
+        case .dedicatedServing:
+            if wiredLimitBytes <= 0 {
+                return EffectiveMemoryCeiling(bytes: 0, source: .wiredLimit)
+            }
+            if wiredLimitBytes < totalRAMBytes {
+                return EffectiveMemoryCeiling(bytes: wiredLimitBytes, source: .wiredLimit)
+            }
+            return EffectiveMemoryCeiling(bytes: totalRAMBytes, source: .physicalRAM)
+        }
+    }
+
+    /// Whether the observation that actually selected `effectiveMemoryCeiling` is measured rather
+    /// than synthesized or advisory. Physical-RAM provenance is not represented by this type yet,
+    /// and Metal documents its recommendation as an approximation, so both remain conservative.
+    public var effectiveMemoryCeilingIsMeasured: Bool {
+        switch effectiveMemoryCeiling.source {
+        case .wiredLimit:
+            return wiredLimitIsMeasured
+        case .physicalRAM, .sharedPolicy, .recommendedWorkingSet:
+            return false
+        }
     }
 
     /// The bytes actually available to hold model weights + KV + transient overhead once the
@@ -39,13 +200,13 @@ public struct SystemProfile: Sendable {
     /// OS/other-processes reserve. This is the `hardwareHolds` function from spec §4/§5 — the
     /// single headroom computation both the context ceiling and the capacity advisor share.
     public func hardwareHoldsBytes(weightsBytes: Int, osReserveBytes: Int) -> Int {
-        min(wiredLimitBytes, totalRAMBytes) - weightsBytes - osReserveBytes
+        effectiveMemoryCeiling.bytes - weightsBytes - osReserveBytes
     }
 
     private static let gib = 1024 * 1024 * 1024
 
-    /// Qualified 128 GiB bench-host profile with `iogpu.wired_limit_mb=117760` (115 GiB exactly),
-    /// retained as an explicit measured value rather than a default-percentage guess.
+    /// Qualified 128 GiB hardware profile with a measured 115 GiB wired observation. Host use still
+    /// defaults to shared: the hardware preset is evidence, not an operator dedication assertion.
     public static let m5Max128 = SystemProfile(
         chip: "Apple M5 Max",
         totalRAMBytes: 128 * gib,
@@ -74,35 +235,11 @@ public struct SystemProfile: Sendable {
         wiredLimitIsMeasured: false
     )
 
-    /// Estimated `wiredLimitBytes` for a host whose `iogpu.wired_limit_mb` cannot be read directly
-    /// (no such sysctl exists — spec §3). NOT a measurement: a documented, monotonically
-    /// non-increasing fraction of total RAM, chosen to agree with the two data points this repo
-    /// actually has —
-    ///   - `.m5Max128`'s hand-measured 115/128 GiB ≈ 0.898 (rounds to "~0.90" in the small-box case)
-    ///   - `.m3Ultra256`/`.m3Ultra512`'s own documented planning assumption of 0.75 (spec §3's
-    ///     "system default ~66–75% RAM", upper end)
-    /// A single global fraction can't fit both: small boxes can dedicate a larger share of RAM to
-    /// the GPU wired limit (less OS/other-process pressure in absolute terms), while big boxes
-    /// reserve a larger absolute (though smaller relative) slice for the OS and other processes.
-    /// This clamped linear interpolation is conservative in both directions (never guesses higher
-    /// than either endpoint) and monotonic (larger RAM never yields a higher fraction):
-    ///   RAM <= 128 GiB  -> 0.90
-    ///   RAM >= 256 GiB  -> 0.75
-    ///   in between      -> linear ramp from 0.90 down to 0.75
+    /// Estimated `wiredLimitBytes` for a shared/default auto host whose `iogpu.wired_limit_mb`
+    /// cannot be read directly. NOT a measurement: spec §3 describes the system default as
+    /// "~66-75% RAM"; capacity planning uses the upper bound exactly and floors fractional bytes.
     public static func estimatedWiredLimitBytes(totalRAMBytes: Int) -> Int {
-        let ramGiB = Double(totalRAMBytes) / Double(gib)
-        let highFraction = 0.90, lowFraction = 0.75
-        let highRAMGiB = 128.0, lowRAMGiB = 256.0
-        let fraction: Double
-        if ramGiB <= highRAMGiB {
-            fraction = highFraction
-        } else if ramGiB >= lowRAMGiB {
-            fraction = lowFraction
-        } else {
-            let t = (ramGiB - highRAMGiB) / (lowRAMGiB - highRAMGiB)
-            fraction = highFraction - t * (highFraction - lowFraction)
-        }
-        return Int(fraction * Double(totalRAMBytes))
+        (totalRAMBytes / 4) * 3 + ((totalRAMBytes % 4) * 3) / 4
     }
 
     /// Probe the live host's RAM + chip string via `sysctlbyname`/`ProcessInfo` and synthesize the
@@ -122,7 +259,7 @@ public struct SystemProfile: Sendable {
 
         return SystemProfile(
             chip: chip, totalRAMBytes: totalRAMBytes, wiredLimitBytes: wiredLimitBytes,
-            wiredLimitIsMeasured: false)
+            wiredLimitIsMeasured: false, hostUse: .automaticShared)
     }
 
     /// Minimal C-string sysctl read (mirrors `SystemProfiler.sysctlString`, duplicated narrowly

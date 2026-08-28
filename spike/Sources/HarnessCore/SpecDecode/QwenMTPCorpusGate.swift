@@ -221,6 +221,102 @@ public struct QwenMTPCorpusTiming: Codable, Equatable, Sendable {
 /// Measurement-only attribution for the MTP path. Cache fingerprinting is
 /// intentionally separated from the decode envelope because it is proof
 /// overhead, not user-visible generation latency.
+public struct QwenMTPPromptPreparationChunkAttribution: Codable, Equatable, Sendable {
+    public let tokenOffset: Int
+    public let tokenCount: Int
+    public let targetForwardSchedulingSeconds: Double
+
+    public init(
+        tokenOffset: Int,
+        tokenCount: Int,
+        targetForwardSchedulingSeconds: Double
+    ) {
+        self.tokenOffset = tokenOffset
+        self.tokenCount = tokenCount
+        self.targetForwardSchedulingSeconds = targetForwardSchedulingSeconds
+    }
+}
+
+public struct QwenMTPPromptPreparationAttribution: Codable, Equatable, Sendable {
+    public let promptTokenCount: Int
+    public let hiddenShape: [Int]
+    public let hiddenByteCount: Int
+    public let chunks: [QwenMTPPromptPreparationChunkAttribution]
+    public let cacheEvaluationSeconds: Double
+    public let hiddenEvaluationSeconds: Double
+    public let concatenatedHiddenEvaluationSeconds: Double
+    public let preparedCacheHandoffSeconds: Double
+    public let phaseBoundarySynchronizationSeconds: Double
+    public let targetPrefillResidualSeconds: Double
+
+    public init(
+        promptTokenCount: Int,
+        hiddenShape: [Int],
+        hiddenByteCount: Int,
+        chunks: [QwenMTPPromptPreparationChunkAttribution],
+        cacheEvaluationSeconds: Double,
+        hiddenEvaluationSeconds: Double,
+        concatenatedHiddenEvaluationSeconds: Double,
+        preparedCacheHandoffSeconds: Double,
+        phaseBoundarySynchronizationSeconds: Double,
+        targetPrefillResidualSeconds: Double
+    ) {
+        self.promptTokenCount = promptTokenCount
+        self.hiddenShape = hiddenShape
+        self.hiddenByteCount = hiddenByteCount
+        self.chunks = chunks
+        self.cacheEvaluationSeconds = cacheEvaluationSeconds
+        self.hiddenEvaluationSeconds = hiddenEvaluationSeconds
+        self.concatenatedHiddenEvaluationSeconds = concatenatedHiddenEvaluationSeconds
+        self.preparedCacheHandoffSeconds = preparedCacheHandoffSeconds
+        self.phaseBoundarySynchronizationSeconds = phaseBoundarySynchronizationSeconds
+        self.targetPrefillResidualSeconds = targetPrefillResidualSeconds
+    }
+
+    public init(
+        promptTokenCount: Int,
+        hiddenShape: [Int],
+        hiddenByteCount: Int,
+        chunks: [QwenMTPPromptPreparationChunkAttribution],
+        cacheHiddenEvaluationSeconds: Double,
+        hiddenConcatenationSeconds: Double,
+        targetPrefillResidualSeconds: Double
+    ) {
+        self.init(
+            promptTokenCount: promptTokenCount,
+            hiddenShape: hiddenShape,
+            hiddenByteCount: hiddenByteCount,
+            chunks: chunks,
+            cacheEvaluationSeconds: cacheHiddenEvaluationSeconds,
+            hiddenEvaluationSeconds: 0,
+            concatenatedHiddenEvaluationSeconds: hiddenConcatenationSeconds,
+            preparedCacheHandoffSeconds: 0,
+            phaseBoundarySynchronizationSeconds: 0,
+            targetPrefillResidualSeconds: targetPrefillResidualSeconds)
+    }
+
+    public var targetForwardSchedulingSeconds: Double {
+        chunks.reduce(0) { $0 + $1.targetForwardSchedulingSeconds }
+    }
+
+    public var cacheHiddenEvaluationSeconds: Double {
+        cacheEvaluationSeconds + hiddenEvaluationSeconds
+    }
+
+    public var hiddenConcatenationSeconds: Double {
+        concatenatedHiddenEvaluationSeconds
+    }
+
+    public var attributedSeconds: Double {
+        targetForwardSchedulingSeconds
+            + cacheEvaluationSeconds
+            + hiddenEvaluationSeconds
+            + concatenatedHiddenEvaluationSeconds
+            + preparedCacheHandoffSeconds
+            + phaseBoundarySynchronizationSeconds
+    }
+}
+
 public struct QwenMTPCorpusMTPPhaseAttribution: Codable, Equatable, Sendable {
     public let targetPrefillSeconds: Double
     public let drafterPromptPrimingSeconds: Double
@@ -238,6 +334,7 @@ public struct QwenMTPCorpusMTPPhaseAttribution: Codable, Equatable, Sendable {
     public let hybridRewindReplayCount: Int
     public let finalizationCount: Int
     public let cacheFingerprintCount: Int
+    public let targetPromptPreparation: QwenMTPPromptPreparationAttribution?
 
     public init(
         targetPrefillSeconds: Double,
@@ -255,7 +352,8 @@ public struct QwenMTPCorpusMTPPhaseAttribution: Codable, Equatable, Sendable {
         targetTailCount: Int,
         hybridRewindReplayCount: Int,
         finalizationCount: Int,
-        cacheFingerprintCount: Int
+        cacheFingerprintCount: Int,
+        targetPromptPreparation: QwenMTPPromptPreparationAttribution?
     ) {
         self.targetPrefillSeconds = targetPrefillSeconds
         self.drafterPromptPrimingSeconds = drafterPromptPrimingSeconds
@@ -273,6 +371,7 @@ public struct QwenMTPCorpusMTPPhaseAttribution: Codable, Equatable, Sendable {
         self.hybridRewindReplayCount = hybridRewindReplayCount
         self.finalizationCount = finalizationCount
         self.cacheFingerprintCount = cacheFingerprintCount
+        self.targetPromptPreparation = targetPromptPreparation
     }
 
     public var promptSeconds: Double {
@@ -689,6 +788,11 @@ public struct QwenMTPCorpusProfileVerdict: Codable, Equatable, Sendable {
     public let aggregateThreshold: Double
     public let chronologicalHalfThreshold: Double
     public let perPromptFloor: Double
+    public let hiddenMaterializationSecondsTotal: Double
+    public let promptOverheadSecondsTotal: Double
+    public let hiddenMaterializationShareOfPromptOverhead: Double
+    public let hiddenMaterializationCandidateQualified: Bool
+    public let hiddenMaterializationCandidateThresholdSeconds: Double
 
     public init(
         qualified: Bool,
@@ -699,7 +803,12 @@ public struct QwenMTPCorpusProfileVerdict: Codable, Equatable, Sendable {
         perPromptMedianBelowFloorCount: Int,
         aggregateThreshold: Double,
         chronologicalHalfThreshold: Double,
-        perPromptFloor: Double
+        perPromptFloor: Double,
+        hiddenMaterializationSecondsTotal: Double,
+        promptOverheadSecondsTotal: Double,
+        hiddenMaterializationShareOfPromptOverhead: Double,
+        hiddenMaterializationCandidateQualified: Bool,
+        hiddenMaterializationCandidateThresholdSeconds: Double
     ) {
         self.qualified = qualified
         self.aggregatePairedMedian = aggregatePairedMedian
@@ -710,6 +819,14 @@ public struct QwenMTPCorpusProfileVerdict: Codable, Equatable, Sendable {
         self.aggregateThreshold = aggregateThreshold
         self.chronologicalHalfThreshold = chronologicalHalfThreshold
         self.perPromptFloor = perPromptFloor
+        self.hiddenMaterializationSecondsTotal = hiddenMaterializationSecondsTotal
+        self.promptOverheadSecondsTotal = promptOverheadSecondsTotal
+        self.hiddenMaterializationShareOfPromptOverhead =
+            hiddenMaterializationShareOfPromptOverhead
+        self.hiddenMaterializationCandidateQualified =
+            hiddenMaterializationCandidateQualified
+        self.hiddenMaterializationCandidateThresholdSeconds =
+            hiddenMaterializationCandidateThresholdSeconds
     }
 }
 
@@ -829,6 +946,9 @@ public enum QwenMTPCorpusGateError: Error, Equatable, CustomStringConvertible, S
                 + "secondHalf=\(verdict.chronologicalSecondHalfMedian) "
                 + "belowFloor=\(verdict.perPromptMedianBelowFloorCount) "
                 + "perPrompt=[\(promptSummary)] "
+                + "hiddenMaterialization=\(verdict.hiddenMaterializationSecondsTotal) "
+                + "promptOverhead=\(verdict.promptOverheadSecondsTotal) "
+                + "hiddenShare=\(verdict.hiddenMaterializationShareOfPromptOverhead) "
                 + "thresholds=\(verdict.aggregateThreshold)/"
                 + "\(verdict.chronologicalHalfThreshold)/"
                 + "\(verdict.perPromptFloor)"
@@ -856,13 +976,14 @@ private struct QwenMTPCorpusSchemaProbe: Codable, Sendable {
 }
 
 public enum QwenMTPCorpusGate {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 4
     public static let corpusID = "qwen3.5-9b-mtp-consumer-corpus-v1"
     public static let corpusContentHash = "5e3bc2fbb016d5e0"
     public static let promptHiddenReusePrimingBaselineSeconds = 88.6121
     public static let promptHiddenReuseRequiredReductionSeconds = 80.0
     public static let greedyBatchedVerificationBaselineSeconds = 204.43435170891462
     public static let greedyBatchedVerificationRequiredReductionSeconds = 5.0
+    public static let hiddenMaterializationCandidateThresholdSeconds = 5.0
 
     public static let requiredBinding = QwenMTPCorpusRuntimeBinding(
         targetModelID: "mlx-community/Qwen3.5-9B-MLX-4bit",
@@ -909,7 +1030,13 @@ public enum QwenMTPCorpusGate {
     public static func validate(_ payload: QwenMTPCorpusEvidencePayload) throws -> QwenMTPCorpusGateDecision {
         try validateCorrectness(payload)
         if let profile = payload.profile {
-            let verdict = try validateProfile(profile, correctness: payload.correctness)
+            let verdict = try validateProfile(
+                profile,
+                correctness: payload.correctness,
+                promptTokenCounts: Dictionary(
+                    uniqueKeysWithValues: payload.caseResults.map {
+                        ($0.caseID, $0.promptTokenCount)
+                    }))
             guard verdict.qualified else {
                 throw QwenMTPCorpusGateError.unqualifiedPerformance(verdict)
             }
@@ -919,7 +1046,7 @@ public enum QwenMTPCorpusGate {
     }
 
     /// Apply the optimization-specific promotion gate without changing the
-    /// frozen v2 corpus identity or its general MTP qualification thresholds.
+    /// frozen corpus identity or its general MTP qualification thresholds.
     public static func evaluatePromptHiddenReuse(
         _ payload: QwenMTPCorpusEvidencePayload
     ) throws -> QwenMTPPromptHiddenReuseVerdict {
@@ -1117,6 +1244,7 @@ public enum QwenMTPCorpusGate {
             telemetry: result.mtpTelemetry,
             timing: result.mtpTiming,
             expectsDrafterPriming: result.kind != .forcedFallback,
+            expectedPromptTokenCount: result.promptTokenCount,
             context: result.caseID)
 
         switch result.kind {
@@ -1264,6 +1392,7 @@ public enum QwenMTPCorpusGate {
         telemetry: QwenMTPCorpusMTPTelemetry,
         timing: QwenMTPCorpusTiming,
         expectsDrafterPriming: Bool,
+        expectedPromptTokenCount: Int,
         context: String
     ) throws {
         let seconds = [
@@ -1327,11 +1456,105 @@ public enum QwenMTPCorpusGate {
                     + "generation=\(phase.generationSeconds)/\(timing.generationSeconds) "
                     + "total=\(phase.promptSeconds + phase.generationSeconds)/\(timing.wallSeconds)")
         }
+
+        if expectsDrafterPriming {
+            guard let preparation = phase.targetPromptPreparation else {
+                throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                    "\(context) target prompt preparation missing")
+            }
+            try validatePromptPreparation(
+                preparation,
+                targetPrefillSeconds: phase.targetPrefillSeconds,
+                expectedPromptTokenCount: expectedPromptTokenCount,
+                context: context)
+        } else if phase.targetPromptPreparation != nil {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) target prompt preparation without MTP")
+        }
+    }
+
+    private static func validatePromptPreparation(
+        _ preparation: QwenMTPPromptPreparationAttribution,
+        targetPrefillSeconds: Double,
+        expectedPromptTokenCount: Int,
+        context: String
+    ) throws {
+        guard preparation.promptTokenCount == expectedPromptTokenCount,
+            preparation.promptTokenCount > 0,
+            preparation.hiddenShape.count == 3,
+            preparation.hiddenShape[0] == 1,
+            preparation.hiddenShape[1] == preparation.promptTokenCount,
+            preparation.hiddenShape[2] > 0,
+            preparation.hiddenByteCount > 0,
+            !preparation.chunks.isEmpty,
+            preparation.cacheEvaluationSeconds.isFinite,
+            preparation.cacheEvaluationSeconds >= 0,
+            preparation.hiddenEvaluationSeconds.isFinite,
+            preparation.hiddenEvaluationSeconds >= 0,
+            preparation.concatenatedHiddenEvaluationSeconds.isFinite,
+            preparation.concatenatedHiddenEvaluationSeconds >= 0,
+            preparation.preparedCacheHandoffSeconds.isFinite,
+            preparation.preparedCacheHandoffSeconds >= 0,
+            preparation.phaseBoundarySynchronizationSeconds.isFinite,
+            preparation.phaseBoundarySynchronizationSeconds >= 0,
+            preparation.targetPrefillResidualSeconds.isFinite,
+            preparation.targetPrefillResidualSeconds >= 0
+        else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) target prompt preparation geometry")
+        }
+
+        var elementCount = 1
+        for dimension in preparation.hiddenShape {
+            let (next, overflow) = elementCount.multipliedReportingOverflow(by: dimension)
+            guard !overflow, next > 0 else {
+                throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                    "\(context) target prompt hidden size")
+            }
+            elementCount = next
+        }
+        guard preparation.hiddenByteCount.isMultiple(of: elementCount),
+            [1, 2, 4, 8].contains(preparation.hiddenByteCount / elementCount)
+        else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) target prompt hidden bytes")
+        }
+
+        var expectedOffset = 0
+        for chunk in preparation.chunks {
+            guard chunk.tokenOffset == expectedOffset,
+                chunk.tokenCount > 0,
+                chunk.targetForwardSchedulingSeconds.isFinite,
+                chunk.targetForwardSchedulingSeconds >= 0
+            else {
+                throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                    "\(context) target prompt chunk")
+            }
+            let (nextOffset, overflow) = expectedOffset.addingReportingOverflow(
+                chunk.tokenCount)
+            guard !overflow else {
+                throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                    "\(context) target prompt chunk overflow")
+            }
+            expectedOffset = nextOffset
+        }
+        guard expectedOffset == preparation.promptTokenCount else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) target prompt chunk coverage")
+        }
+
+        let reconstructed = preparation.attributedSeconds
+            + preparation.targetPrefillResidualSeconds
+        guard approximatelyEqual(reconstructed, targetPrefillSeconds) else {
+            throw QwenMTPCorpusGateError.invalidCaseMetadata(
+                "\(context) target prompt phase envelope")
+        }
     }
 
     private static func validateProfile(
         _ profile: QwenMTPCorpusProfileEvidence,
-        correctness: QwenMTPCorpusCorrectnessVerdict
+        correctness: QwenMTPCorpusCorrectnessVerdict,
+        promptTokenCounts: [String: Int]
     ) throws -> QwenMTPCorpusProfileVerdict {
         guard correctness == .pass else { throw QwenMTPCorpusGateError.profilePresentAfterCorrectnessFailure }
         guard profile.releaseBuildRequired, profile.releaseBuildObserved else {
@@ -1346,6 +1569,8 @@ public enum QwenMTPCorpusGate {
         var measuredByCase: [String: [Double]] = [:]
         var measuredByPairIndex: [Int: [Double]] = [:]
         var measuredRatios: [Double] = []
+        var hiddenMaterializationSecondsTotal = 0.0
+        var promptOverheadSecondsTotal = 0.0
 
         for caseID in profilePlan.caseIDs {
             for pairIndex in 0..<profilePlan.totalPairsPerCase {
@@ -1362,6 +1587,7 @@ public enum QwenMTPCorpusGate {
                         telemetry: sample.mtpTelemetry,
                         timing: sample.mtpTiming,
                         expectsDrafterPriming: true,
+                        expectedPromptTokenCount: promptTokenCounts[caseID] ?? 0,
                         context: "\(sample.caseID) profile[\(sample.pairIndex)]")
                 } catch {
                     throw QwenMTPCorpusGateError.invalidProfileSample(index: sampleIndex, reason: String(describing: error))
@@ -1407,6 +1633,15 @@ public enum QwenMTPCorpusGate {
                     measuredRatios.append(recomputedE2ERatio)
                     measuredByCase[caseID, default: []].append(recomputedE2ERatio)
                     measuredByPairIndex[pairIndex - profilePlan.droppedWarmupPairs, default: []].append(recomputedE2ERatio)
+                    if let preparation = sample.mtpPhaseAttribution.targetPromptPreparation {
+                        hiddenMaterializationSecondsTotal +=
+                            preparation.hiddenEvaluationSeconds
+                            + preparation.concatenatedHiddenEvaluationSeconds
+                    }
+                    promptOverheadSecondsTotal += max(
+                        0,
+                        sample.mtpTiming.promptSeconds
+                            - sample.scalarTiming.promptSeconds)
                 }
                 sampleIndex += 1
             }
@@ -1423,6 +1658,9 @@ public enum QwenMTPCorpusGate {
             && firstHalfMedian >= 1.05
             && secondHalfMedian >= 1.05
             && weakPromptCount <= 1
+        let hiddenMaterializationShare = promptOverheadSecondsTotal > 0
+            ? hiddenMaterializationSecondsTotal / promptOverheadSecondsTotal
+            : 0
 
         return QwenMTPCorpusProfileVerdict(
             qualified: qualified,
@@ -1433,7 +1671,16 @@ public enum QwenMTPCorpusGate {
             perPromptMedianBelowFloorCount: weakPromptCount,
             aggregateThreshold: 1.08,
             chronologicalHalfThreshold: 1.05,
-            perPromptFloor: 0.97)
+            perPromptFloor: 0.97,
+            hiddenMaterializationSecondsTotal: hiddenMaterializationSecondsTotal,
+            promptOverheadSecondsTotal: promptOverheadSecondsTotal,
+            hiddenMaterializationShareOfPromptOverhead:
+                hiddenMaterializationShare,
+            hiddenMaterializationCandidateQualified:
+                hiddenMaterializationSecondsTotal
+                    >= hiddenMaterializationCandidateThresholdSeconds,
+            hiddenMaterializationCandidateThresholdSeconds:
+                hiddenMaterializationCandidateThresholdSeconds)
     }
 
     private static func isLowerHexSHA256(_ value: String) -> Bool {

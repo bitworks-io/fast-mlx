@@ -8,7 +8,12 @@ public enum Qwen35ExactMTPRuntimeAdmissionError: Error, Equatable, Sendable {
     case bindingDrift(field: String)
 }
 
-/// Application composition boundary for the one reviewed Qwen3.5 depth-one MTP pair.
+public enum Qwen35ExactMTPRuntimeSelection: Equatable, Sendable {
+    case qwen35_9BDepth1
+    case qwen38_27BMXFP8Depth1
+}
+
+/// Application composition boundary for explicitly selected, reviewed Qwen3 depth-one MTP pairs.
 ///
 /// The vendored factory owns exact revision resolution and reconstructs artifact evidence from the
 /// resolved directories. This wrapper makes the project's independent `HarnessCore` preflight a
@@ -19,11 +24,25 @@ public enum Qwen35ExactMTPRuntimeFactory {
         using tokenizerLoader: any TokenizerLoader,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> sending Qwen35ExactMTPLoadedPair {
+        try await loadDepth1Pair(
+            selection: .qwen35_9BDepth1,
+            from: downloader,
+            using: tokenizerLoader,
+            progressHandler: progressHandler)
+    }
+
+    public static func loadDepth1Pair(
+        selection: Qwen35ExactMTPRuntimeSelection,
+        from downloader: any Downloader,
+        using tokenizerLoader: any TokenizerLoader,
+        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
+    ) async throws -> sending Qwen35ExactMTPLoadedPair {
         try await Qwen35ExactMTPFactory.loadDepth1Pair(
+            selection: vendoredSelection(selection),
             from: downloader,
             using: tokenizerLoader,
             authorizePreflight: { evidence in
-                try authorize(evidence)
+                try authorize(evidence, selection: selection)
             },
             progressHandler: progressHandler)
     }
@@ -50,25 +69,71 @@ public enum Qwen35ExactMTPRuntimeFactory {
     }
 
     package static func validateKnownLockParity() throws {
-        guard harnessLock(Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1)
-            == QwenMTPKnownArtifactLocks.qwen35_9BDepth1
-        else {
+        try validateKnownLockParity(selection: .qwen35_9BDepth1)
+    }
+
+    package static func validateKnownLockParity(
+        selection: Qwen35ExactMTPRuntimeSelection
+    ) throws {
+        guard harnessLock(vendoredLock(selection)) == harnessLock(selection) else {
             throw Qwen35ExactMTPRuntimeAdmissionError.vendoredLockDrift
         }
     }
 
-    package static func authorize(_ evidence: Qwen35ExactMTPPreflightEvidence) throws {
-        let vendoredLock = Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
-        guard evidence.lock == vendoredLock else {
+    package static func validateSelectedVendoredLock(
+        _ lock: Qwen35ExactMTPArtifactLock,
+        selection: Qwen35ExactMTPRuntimeSelection
+    ) throws {
+        guard lock == vendoredLock(selection) else {
             throw Qwen35ExactMTPRuntimeAdmissionError.vendoredLockDrift
         }
-        try validateKnownLockParity()
+    }
+
+    package static func authorize(
+        _ evidence: Qwen35ExactMTPPreflightEvidence,
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1
+    ) throws {
+        try validateSelectedVendoredLock(evidence.lock, selection: selection)
+        try validateKnownLockParity(selection: selection)
 
         let binding = try QwenMTPArtifactPreflight.validate(
-            lock: QwenMTPKnownArtifactLocks.qwen35_9BDepth1,
+            lock: harnessLock(selection),
             target: harnessCandidate(evidence.target),
             drafter: harnessCandidate(evidence.drafter))
         try requireEquivalentBinding(vendored: evidence.binding, harness: binding)
+    }
+
+    private static func vendoredSelection(
+        _ selection: Qwen35ExactMTPRuntimeSelection
+    ) -> Qwen35ExactMTPArtifactSelection {
+        switch selection {
+        case .qwen35_9BDepth1:
+            .qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            .qwen38_27BMXFP8Depth1
+        }
+    }
+
+    private static func vendoredLock(
+        _ selection: Qwen35ExactMTPRuntimeSelection
+    ) -> Qwen35ExactMTPArtifactLock {
+        switch selection {
+        case .qwen35_9BDepth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        }
+    }
+
+    private static func harnessLock(
+        _ selection: Qwen35ExactMTPRuntimeSelection
+    ) -> QwenMTPArtifactLock {
+        switch selection {
+        case .qwen35_9BDepth1:
+            QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        }
     }
 
     private static func harnessLock(

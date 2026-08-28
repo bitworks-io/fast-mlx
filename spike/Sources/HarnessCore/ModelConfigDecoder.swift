@@ -66,39 +66,36 @@ public enum ModelConfigDecodeError: Error, Equatable, CustomStringConvertible {
         }
     }
 
-    /// True when the error means the checkpoint itself cannot be served, so the serve-path fit-check
-    /// must FAIL CLOSED rather than skip-and-proceed. Three cases qualify — each names a directory the
-    /// MLXLMCommon loader itself could never load, so skipping the fit-check only defers a guaranteed
-    /// load-time crash to a worse place:
+    /// True when the serve path cannot produce a trustworthy fit decision from the checkpoint's
+    /// config, so it must FAIL CLOSED rather than skip-and-proceed with operator-provided limits:
     ///   - `.weightsUnknown` — no `*.safetensors` on disk and no readable index; the loader requires
     ///     shards (interrupted / metadata-only download).
     ///   - `.missingConfigFile` — no `config.json`; the loader needs one to build the model.
     ///   - `.malformedJSON` — `config.json` is present but not valid JSON; the loader cannot parse it.
-    /// `.unsupportedModelType` is deliberately excluded — the arch is merely not fit-checkable yet; its
-    /// weights are present and the load can still succeed (the skip path exists exactly to not regress
-    /// those). `.missingField`/`.invalidField` also stay on skip: MLX reads its own config fields
-    /// independently of this decoder, so a checkpoint rejected here for a geometry term it happens to
-    /// require MIGHT still load — kept on skip until a live smoke against a real offending checkpoint
-    /// proves otherwise. Taxonomy + rationale:
-    /// docs/task-inbox/2026-08-19-fit-check-skip-vs-failclosed-taxonomy.md.
+    ///   - `.unsupportedModelType` — the arch may be loadable, but the fit-check has no audited KV
+    ///     formula, so serving would proceed without the promised fit decision.
+    ///   - `.missingField` / `.invalidField` — the decoder cannot derive the fit geometry honestly.
+    /// `--force` may override a RED fit verdict, but it must not override absence of a fit decision.
     public var indicatesUnservableCheckpoint: Bool {
         switch self {
-        case .weightsUnknown, .missingConfigFile, .malformedJSON: return true
-        case .missingField, .invalidField, .unsupportedModelType: return false
+        case .weightsUnknown, .missingConfigFile, .malformedJSON,
+             .missingField, .invalidField, .unsupportedModelType:
+            return true
         }
     }
 
-    /// A stable, case-appropriate machine-readable `reason=` token for the serve-path refusal, or
-    /// `nil` for the cases that stay on skip-and-proceed (kept in lockstep with
-    /// `indicatesUnservableCheckpoint`: exactly the `true` cases return a token). Distinct tokens keep
-    /// the refusal honest — an interrupted download is not the same failure as a missing or unparseable
-    /// config — while the human-readable `description` line carries the detail.
+    /// A stable, case-appropriate machine-readable `reason=` token for the serve-path refusal.
+    /// Distinct tokens keep the refusal honest — an interrupted download is not the same failure as a
+    /// missing geometry field or unsupported architecture — while the human-readable `description`
+    /// line carries the detail.
     public var unservableRefusalReason: String? {
         switch self {
         case .weightsUnknown: return "incomplete_checkpoint"
         case .missingConfigFile: return "missing_config"
         case .malformedJSON: return "malformed_config"
-        case .missingField, .invalidField, .unsupportedModelType: return nil
+        case .unsupportedModelType: return "unsupported_model_type"
+        case .missingField: return "missing_fit_field"
+        case .invalidField: return "invalid_fit_field"
         }
     }
 }

@@ -24,6 +24,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     private let omittedPromptHead: Int?
     private let speculativeSoloWidth: Int
     private let soloPipelineStateAfterSolo: BatchSoloPipelineState
+    private let speculativeSoloObservation: BatchDecodeObservation
     private let outputlessSpeculativeDrain: Bool
     private let resources: ContinuousBatchRuntimeResourceSnapshot?
     private let cohortByPromptHead: [Int: BatchDecodeCohort]
@@ -36,6 +37,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         omittedPromptHead: Int? = nil,
         speculativeSoloWidth: Int = 1,
         soloPipelineStateAfterSolo: BatchSoloPipelineState = .pipelinedLookahead,
+        speculativeSoloObservation: BatchDecodeObservation = .none,
         outputlessSpeculativeDrain: Bool = false,
         resources: ContinuousBatchRuntimeResourceSnapshot? = nil,
         cohortByPromptHead: [Int: BatchDecodeCohort] = [:]
@@ -45,6 +47,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
         self.omittedPromptHead = omittedPromptHead
         self.speculativeSoloWidth = speculativeSoloWidth
         self.soloPipelineStateAfterSolo = soloPipelineStateAfterSolo
+        self.speculativeSoloObservation = speculativeSoloObservation
         self.outputlessSpeculativeDrain = outputlessSpeculativeDrain
         self.resources = resources
         self.cohortByPromptHead = cohortByPromptHead
@@ -86,6 +89,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     func decode(_ action: BatchDecodeAction) throws -> [ContinuousBatchRuntimeDecodeResult] {
         let ids: [BatchRequestID]
         let soloPipelineStateAfter: BatchSoloPipelineState
+        let observation: BatchDecodeObservation
         let resultWidth: Int
         switch action {
         case .solo(let id, let speculationAllowed):
@@ -93,6 +97,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
             soloPipelineStateAfter = speculationAllowed
                 ? soloPipelineStateAfterSolo
                 : .pipelinedLookahead
+            observation = speculationAllowed ? speculativeSoloObservation : .none
             resultWidth = speculationAllowed ? speculativeSoloWidth : 1
         case .drainSoloPipeline(let id):
             guard let state = slots[id]?.soloPipelineState, state.requiresDrain else {
@@ -100,6 +105,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
             }
             ids = [id]
             soloPipelineStateAfter = .canonical
+            observation = .none
             resultWidth = state == .speculative && outputlessSpeculativeDrain ? 0 : 1
         case .batch(let batchIDs, _):
             for id in batchIDs where slots[id]?.soloPipelineState.requiresDrain == true {
@@ -107,6 +113,7 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
             }
             ids = batchIDs
             soloPipelineStateAfter = .canonical
+            observation = .none
             resultWidth = 1
         }
 
@@ -135,7 +142,8 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
                     id: id,
                     tokens: tokens,
                     finished: finished,
-                    soloPipelineState: soloPipelineStateAfter))
+                    soloPipelineState: soloPipelineStateAfter,
+                    observation: observation))
         }
         if reverseBatchResults, case .batch = action {
             results.reverse()
@@ -627,6 +635,51 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
                     .batch(
                         [short.id, long.id],
                         speculationAllowed: false))))
+    }
+
+    func testRuntimeLowYieldObservationDrainsThenLatchesCoordinatorToNoSpecSolo()
+        async throws
+    {
+        let runtime = ScriptedBatchRuntime(
+            scriptsByPromptHead: [10: [101, 102, 2]],
+            soloPipelineStateAfterSolo: .speculative,
+            speculativeSoloObservation: .pldLowYieldDisabled,
+            outputlessSpeculativeDrain: true)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 1, prefill: 1, chunk: 8),
+            runtime: runtime,
+            automaticDrive: false,
+            traceLimit: 16)
+        let handle = try await coordinator.submit(
+            submission([10], maxTokens: 3, speculation: true))
+
+        _ = try await coordinator.runOneTick() // prefill
+        _ = try await coordinator.runOneTick() // speculative solo reports low yield
+        _ = try await coordinator.runOneTick() // commit staged speculative bonus
+        _ = try await coordinator.runOneTick() // request-local latch selects no-spec solo
+
+        let operations = await coordinator.executionTrace().compactMap { event in
+            if case .operation(let operation) = event { return operation }
+            return nil
+        }
+        XCTAssertEqual(
+            Array(operations.prefix(4)),
+            [
+                .prefill(BatchPrefillSlice(id: handle.id, startToken: 0, count: 1)),
+                .decode(.solo(handle.id, speculationAllowed: true)),
+                .decode(.drainSoloPipeline(handle.id)),
+                .decode(.solo(handle.id, speculationAllowed: false)),
+            ])
+        let latchedSnapshot = await coordinator.snapshot(for: handle.id)
+        XCTAssertEqual(
+            latchedSnapshot?.phase,
+            .decoding(
+                emittedTokens: 2,
+                soloPipelineState: .pipelinedLookahead))
+
+        try await drain(coordinator)
+        let tokens = try await collect(handle.tokens)
+        XCTAssertEqual(tokens, [101, 102])
     }
 
     func testMultiTokenSpeculativeSoloResultConsumesEOSAndHonorsBudget() async throws {

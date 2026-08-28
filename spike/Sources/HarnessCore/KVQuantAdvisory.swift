@@ -56,14 +56,15 @@ public enum KVQuantAdvisory {
         host: SystemProfile,
         requestedContext: Int? = nil,
         concurrency: Int = 1,
-        quantBits: Int? = nil
+        quantBits: Int? = nil,
+        thresholds: CapacityThresholds = .default
     ) -> [String] {
         guard tier != .fp16 else { return [] }
 
         let whatIf = ServingFitPlanner.decide(
             profile: profile, weightsAreMeasured: false, host: host,
             requestedContext: requestedContext, kvQuant: tier, concurrency: concurrency,
-            quantBits: quantBits)
+            thresholds: thresholds, quantBits: quantBits)
 
         func gib(_ bytes: Int) -> String { String(format: "%.2f GiB", Double(bytes) / 1_073_741_824.0) }
         let peakBytes = Int(whatIf.prediction.totalBytes.rounded(.up))

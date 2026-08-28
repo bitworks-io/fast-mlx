@@ -15,8 +15,16 @@ import XCTest
 final class QuantAutoPickerTests: XCTestCase {
     private let gib = 1024 * 1024 * 1024
 
+    /// Picker-policy fixtures vary the wired envelope independently of the shared-host safety cap.
+    /// Make that operator assertion explicit so these tests retain their quant/context geometry;
+    /// default-shared behavior is covered by the capacity and serving-fit suites.
     private func host(ramGiB: Int, wiredGiB: Int) -> SystemProfile {
-        SystemProfile(chip: "test", totalRAMBytes: ramGiB * gib, wiredLimitBytes: wiredGiB * gib, wiredLimitIsMeasured: true)
+        SystemProfile(
+            chip: "test",
+            totalRAMBytes: ramGiB * gib,
+            wiredLimitBytes: wiredGiB * gib,
+            wiredLimitIsMeasured: true,
+            hostUse: .operatorAssertedDedicatedServing())
     }
 
     /// A synthetic quant variant: uniform-GQA geometry fixed, only the declared bits + weight bytes

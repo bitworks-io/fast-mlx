@@ -130,6 +130,9 @@ public enum Qwen35ExactMTPKnownArtifactLocks {
     // gitleaks:allow -- canonical public token-to-id vocabulary SHA-256, not a credential.
     private static let qwen35TokenizerVocabularySHA256 =
         "38eaf282b2679a1ede9fb3ee9418fc72f656f3fabfb9c33e16d34239ca88ddc1"
+    // gitleaks:allow -- canonical public token-to-id vocabulary SHA-256, not a credential.
+    private static let qwen38TokenizerVocabularySHA256 =
+        "38eaf282b2679a1ede9fb3ee9418fc72f656f3fabfb9c33e16d34239ca88ddc1"
 
     public static let qwen35_9BDepth1 = Qwen35ExactMTPArtifactLock(
         sourceRevision: "01472a78fca830689ff78246a82c6d31ab111a78",
@@ -158,6 +161,38 @@ public enum Qwen35ExactMTPKnownArtifactLocks {
         targetQuantization: .init(bits: 4, groupSize: 64, mode: "affine"),
         drafterQuantization: .init(bits: 5, groupSize: 64, mode: "affine"),
         drafterTensors: qwen35_9BMTP5BitTensors)
+
+    /// Authenticated Qwen3.8 27B MXFP8 target and native MTP pair.
+    ///
+    /// This row is selectable only through the exact factory SPI. It does not register the MTP model
+    /// type or grant serving authority; live token/cache equivalence remains a separate gate.
+    public static let qwen38_27BMXFP8Depth1 = Qwen35ExactMTPArtifactLock(
+        sourceRevision: "01472a78fca830689ff78246a82c6d31ab111a78",
+        target: .init(
+            modelID: "mlx-community/Qwen3.8-27B-mxfp8",
+            revision: "d48d163bcdf24acaf656474854ab88ea17d65bd1",
+            configSHA256: "ce016401438761ac53dcc6df48eb897036ed5c0eadd735002a35fd253701cfbf",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "7a5e32297470983aa8dafe03a094f59a79787fee09c25760e82abaa09fe2e7b3"),
+        drafter: .init(
+            modelID: "mlx-community/Qwen3.8-27B-MTP-mxfp8",
+            revision: "a50634460045613f166b09b13519466e801c6568",
+            configSHA256: "be0048271c09a95620762f32cac1e487d4a798368ac25f42c7c35d9a9f1b4827",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "32ee1b818a5c6ce7191863910131b172ac3fa82f99ce8c23521ddac27cc1fcb7"),
+        architecture: .init(
+            hiddenSize: 5120,
+            intermediateSize: 17408,
+            vocabularySize: 248_320,
+            targetLayerCount: 64,
+            fullAttentionInterval: 4,
+            attentionHeadCount: 24,
+            keyValueHeadCount: 4,
+            headDimension: 256,
+            mtpDepth: 1),
+        targetQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
+        drafterQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
+        drafterTensors: qwen38_27BMXFP8MTPTensors)
 
     private static let qwen35_9BMTP5BitTensors: [Qwen35ExactMTPTensorDescriptor] = [
         .init(name: "fc.biases", shape: [4096, 128], dtype: "BF16"),
@@ -191,6 +226,32 @@ public enum Qwen35ExactMTPKnownArtifactLocks {
         .init(name: "norm.weight", shape: [4096], dtype: "BF16"),
         .init(name: "pre_fc_norm_embedding.weight", shape: [4096], dtype: "BF16"),
         .init(name: "pre_fc_norm_hidden.weight", shape: [4096], dtype: "BF16"),
+    ]
+
+    private static let qwen38_27BMXFP8MTPTensors: [Qwen35ExactMTPTensorDescriptor] = [
+        .init(name: "fc.scales", shape: [5120, 320], dtype: "U8"),
+        .init(name: "fc.weight", shape: [5120, 2560], dtype: "U32"),
+        .init(name: "layers.0.input_layernorm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "layers.0.mlp.down_proj.scales", shape: [5120, 544], dtype: "U8"),
+        .init(name: "layers.0.mlp.down_proj.weight", shape: [5120, 4352], dtype: "U32"),
+        .init(name: "layers.0.mlp.gate_proj.scales", shape: [17408, 160], dtype: "U8"),
+        .init(name: "layers.0.mlp.gate_proj.weight", shape: [17408, 1280], dtype: "U32"),
+        .init(name: "layers.0.mlp.up_proj.scales", shape: [17408, 160], dtype: "U8"),
+        .init(name: "layers.0.mlp.up_proj.weight", shape: [17408, 1280], dtype: "U32"),
+        .init(name: "layers.0.post_attention_layernorm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.k_norm.weight", shape: [256], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.k_proj.scales", shape: [1024, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.k_proj.weight", shape: [1024, 1280], dtype: "U32"),
+        .init(name: "layers.0.self_attn.o_proj.scales", shape: [5120, 192], dtype: "U8"),
+        .init(name: "layers.0.self_attn.o_proj.weight", shape: [5120, 1536], dtype: "U32"),
+        .init(name: "layers.0.self_attn.q_norm.weight", shape: [256], dtype: "BF16"),
+        .init(name: "layers.0.self_attn.q_proj.scales", shape: [12288, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.q_proj.weight", shape: [12288, 1280], dtype: "U32"),
+        .init(name: "layers.0.self_attn.v_proj.scales", shape: [1024, 160], dtype: "U8"),
+        .init(name: "layers.0.self_attn.v_proj.weight", shape: [1024, 1280], dtype: "U32"),
+        .init(name: "norm.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "pre_fc_norm_embedding.weight", shape: [5120], dtype: "BF16"),
+        .init(name: "pre_fc_norm_hidden.weight", shape: [5120], dtype: "BF16"),
     ]
 }
 
@@ -260,6 +321,12 @@ public struct Qwen35ExactMTPLoadedPair {
 }
 
 @_spi(FastMLXExactMTP)
+public enum Qwen35ExactMTPArtifactSelection: Equatable, Sendable {
+    case qwen35_9BDepth1
+    case qwen38_27BMXFP8Depth1
+}
+
+@_spi(FastMLXExactMTP)
 public enum Qwen35ExactMTPFactory {
     public static func loadDepth1Pair(
         from downloader: any Downloader,
@@ -267,7 +334,22 @@ public enum Qwen35ExactMTPFactory {
         authorizePreflight: @Sendable (Qwen35ExactMTPPreflightEvidence) async throws -> Void,
         progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
     ) async throws -> sending Qwen35ExactMTPLoadedPair {
-        let lock = Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
+        try await loadDepth1Pair(
+            selection: .qwen35_9BDepth1,
+            from: downloader,
+            using: tokenizerLoader,
+            authorizePreflight: authorizePreflight,
+            progressHandler: progressHandler)
+    }
+
+    public static func loadDepth1Pair(
+        selection: Qwen35ExactMTPArtifactSelection,
+        from downloader: any Downloader,
+        using tokenizerLoader: any TokenizerLoader,
+        authorizePreflight: @Sendable (Qwen35ExactMTPPreflightEvidence) async throws -> Void,
+        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
+    ) async throws -> sending Qwen35ExactMTPLoadedPair {
+        let lock = selectedLock(selection)
         let targetConfiguration = ModelConfiguration(
             id: lock.target.modelID,
             revision: lock.target.revision)
@@ -290,6 +372,17 @@ public enum Qwen35ExactMTPFactory {
             drafter: drafterResolved,
             tokenizerLoader: tokenizerLoader,
             authorizePreflight: authorizePreflight)
+    }
+
+    private static func selectedLock(
+        _ selection: Qwen35ExactMTPArtifactSelection
+    ) -> Qwen35ExactMTPArtifactLock {
+        switch selection {
+        case .qwen35_9BDepth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        }
     }
 
     package static func loadResolvedDepth1Pair(

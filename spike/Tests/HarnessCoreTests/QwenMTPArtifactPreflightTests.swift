@@ -3,6 +3,83 @@ import XCTest
 @testable import HarnessCore
 
 final class QwenMTPArtifactPreflightTests: XCTestCase {
+    func testKnownQwen38_27BMXFP8LockMatchesReviewedArtifacts() throws {
+        let lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        let targetConfig = try fixtureData(named: "qwen38-27b-target-config")
+        let drafterConfig = try fixtureData(named: "qwen38-27b-mtp-config")
+        let targetTensors = try tensorFixture(named: "qwen38-27b-target-tensors")
+
+        XCTAssertEqual(lock.sourceRevision, "01472a78fca830689ff78246a82c6d31ab111a78")
+        XCTAssertEqual(sha256Hex(targetConfig), lock.targetIdentity.configSHA256)
+        XCTAssertEqual(sha256Hex(drafterConfig), lock.drafterIdentity.configSHA256)
+        XCTAssertEqual(lock.targetIdentity.tokenizerSHA256,
+            lock.drafterIdentity.tokenizerSHA256)
+        XCTAssertEqual(lock.drafterTensors.count, 23)
+        XCTAssertEqual(
+            QwenMTPArtifactPreflight.tensorManifestSHA256(lock.drafterTensors),
+            lock.drafterIdentity.tensorManifestSHA256)
+        XCTAssertEqual(targetTensors.count, 1_682)
+        XCTAssertEqual(
+            QwenMTPArtifactPreflight.tensorManifestSHA256(targetTensors),
+            lock.targetIdentity.tensorManifestSHA256)
+
+        let result = try QwenMTPArtifactPreflight.validate(
+            lock: lock,
+            target: .init(
+                identity: lock.targetIdentity,
+                configJSON: targetConfig,
+                tensors: targetTensors),
+            drafter: .init(
+                identity: lock.drafterIdentity,
+                configJSON: drafterConfig,
+                tensors: lock.drafterTensors))
+
+        XCTAssertEqual(result.targetModelID, "mlx-community/Qwen3.8-27B-mxfp8")
+        XCTAssertEqual(result.drafterModelID, "mlx-community/Qwen3.8-27B-MTP-mxfp8")
+        XCTAssertEqual(result.targetRevision, "d48d163bcdf24acaf656474854ab88ea17d65bd1")
+        XCTAssertEqual(result.drafterRevision, "a50634460045613f166b09b13519466e801c6568")
+        XCTAssertEqual(result.sourceRevision, lock.sourceRevision)
+        XCTAssertEqual(result.runtimeBlockSize, 3)
+        XCTAssertEqual(result.maximumAcceptedDraftTokens, 2)
+    }
+
+    func testKnownQwen38_27BMXFP8TargetAndDrafterManifestDriftFailsClosed() throws {
+        let lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        let targetConfig = try fixtureData(named: "qwen38-27b-target-config")
+        let drafterConfig = try fixtureData(named: "qwen38-27b-mtp-config")
+        let targetTensors = try tensorFixture(named: "qwen38-27b-target-tensors")
+        let target = QwenMTPArtifactCandidate(
+            identity: lock.targetIdentity,
+            configJSON: targetConfig,
+            tensors: targetTensors)
+        let drafter = QwenMTPArtifactCandidate(
+            identity: lock.drafterIdentity,
+            configJSON: drafterConfig,
+            tensors: lock.drafterTensors)
+
+        let badTargetIdentity = lock.targetIdentity.withTensorManifestSHA256(
+            String(repeating: "7", count: 64))
+        XCTAssertThrowsError(try QwenMTPArtifactPreflight.validate(
+            lock: lock.withTargetIdentity(badTargetIdentity),
+            target: target.withIdentity(badTargetIdentity),
+            drafter: drafter
+        )) { error in
+            XCTAssertEqual(error as? QwenMTPArtifactPreflightError,
+                .tensorManifestDigestMismatch(role: .target))
+        }
+
+        let badDrafterIdentity = lock.drafterIdentity.withTensorManifestSHA256(
+            String(repeating: "8", count: 64))
+        XCTAssertThrowsError(try QwenMTPArtifactPreflight.validate(
+            lock: lock.withDrafterIdentity(badDrafterIdentity),
+            target: target,
+            drafter: drafter.withIdentity(badDrafterIdentity)
+        )) { error in
+            XCTAssertEqual(error as? QwenMTPArtifactPreflightError,
+                .tensorManifestDigestMismatch(role: .drafter))
+        }
+    }
+
     func testKnownQwen35_9BLockMatchesReviewedArtifacts() throws {
         let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
         let targetConfig = try fixtureData(named: "qwen35-9b-target-config")

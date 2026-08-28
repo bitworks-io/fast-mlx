@@ -234,7 +234,19 @@ enum ProvenanceCLI {
             throw EvidenceIdentityError.missingCheckpointWeights(modelPath)
         }
         for weight in weights {
-            let size = try weight.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1
+            let resolvedWeight = weight.resolvingSymlinksInPath()
+            let values: URLResourceValues
+            do {
+                values = try resolvedWeight.resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey])
+            } catch {
+                throw EvidenceIdentityError.invalidCheckpointWeight(weight.path)
+            }
+            guard values.isRegularFile == true, let size = values.fileSize,
+                size >= 0
+            else {
+                throw EvidenceIdentityError.invalidCheckpointWeight(weight.path)
+            }
             bytes.append(contentsOf: "\(weight.lastPathComponent):\(size)\n".utf8)
         }
         return fnv1a64(bytes)

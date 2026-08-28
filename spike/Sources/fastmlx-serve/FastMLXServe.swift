@@ -7,11 +7,39 @@ import ServingNIO
 import ServingSnapshotBridge
 import SpikeCore
 import SpikeServingAdapters
+import SystemProfiler
 
 /// Concurrent decode slots the continuous-batch route admits. Shared between the runtime
 /// `ContinuousBatchConfiguration` and the fit-check's concurrency advisory so the modeled
 /// concurrent-KV line always reflects the slot count the backend actually runs.
 private let continuousMaxActiveSlots = 4
+
+/// Take exactly one live host snapshot for this process, then apply any explicit operator
+/// classification without probing again. Omitted input stays automatic/shared; neither selection
+/// mutates the host or authorizes a privileged memory-ceiling change.
+private func detectedServingHostReport(_ arguments: FastMLXServeArguments) -> HostReport {
+    let detected = SystemProfiler.probe()
+    guard let requested = arguments.requestedHostUse else { return detected }
+    switch requested {
+    case .shared:
+        return detected.applyingHostUse(.operatorAssertedShared())
+    case .dedicatedServing:
+        return detected.applyingHostUse(.operatorAssertedDedicatedServing())
+    }
+}
+
+/// Resolve the declared reserve once and thread it through every fit/quant decision. Shared and
+/// absent classifications keep the established conservative 4 GiB default; dedicated-serving can
+/// only reach this function after the parser required an explicit nonzero operator declaration.
+private func servingCapacityThresholds(
+    _ arguments: FastMLXServeArguments
+) -> CapacityThresholds {
+    let defaults = CapacityThresholds.default
+    return CapacityThresholds(
+        greenMax: defaults.greenMax,
+        yellowMax: defaults.yellowMax,
+        osReserveBytes: arguments.osServiceReserveBytes ?? defaults.osReserveBytes)
+}
 
 @main
 struct FastMLXServe {
@@ -51,15 +79,17 @@ struct FastMLXServe {
             _ = try QuantPickPreference.validated(rawPrefer)
         }
 
+        let hostReport = detectedServingHostReport(arguments)
+
         if arguments.quantPickOnly {
-            try runQuantPickOnly(arguments)
+            try runQuantPickOnly(arguments, host: hostReport.systemProfile)
             return
         }
 
         let apiKey = ProcessInfo.processInfo.environment["FASTMLX_API_KEY"].flatMap {
             $0.isEmpty ? nil : $0
         }
-        let prepared = try await prepareBackend(arguments)
+        let prepared = try await prepareBackend(arguments, hostReport: hostReport)
         let evidenceSink: ServingEvidenceJSONLSink?
         do {
             evidenceSink = try arguments.evidencePath.map {
@@ -133,16 +163,24 @@ private struct PreparedServingBackend {
     let startupReport: PreparedServingStartupReport?
     let fitDecision: ServingFitDecision?
     let exactMTPReport: ExactQwen35MTPServeStartupReport?
+    let hostReport: HostReport
+    let osServiceReserveBytes: Int
 
     func startupLine(
         localAddress: String,
         maximumCompletionTokens: Int
     ) -> String {
         guard let startupReport else {
+            let memory = hostReport.machineReadableServingFields(
+                memoryLimitBytes: nil,
+                cacheLimitBytes: nil,
+                kvBudgetBytes: nil,
+                osServiceReserveBytes: osServiceReserveBytes)
             return """
                 fastmlx-serve mode=\(mode) transport_only=true \
                 model=\(launchedModel) \
                 max_completion_tokens_limit=\(maximumCompletionTokens) \
+                \(memory) \
                 listening=\(localAddress)
                 """
         }
@@ -162,6 +200,11 @@ private struct PreparedServingBackend {
                 scalarFallbackRoute = ""
             }
             let exactMTP = exactMTPReport?.machineReadableFields() ?? ""
+            let memory = hostReport.machineReadableServingFields(
+                memoryLimitBytes: report.memoryLimitBytes,
+                cacheLimitBytes: report.cacheLimitBytes,
+                kvBudgetBytes: nil,
+                osServiceReserveBytes: osServiceReserveBytes)
             return """
                 fastmlx-serve mode=\(mode) route=\(route) \
                 model=\(report.launchedModel) \
@@ -176,6 +219,7 @@ private struct PreparedServingBackend {
                 reset_parity_verified=\(report.resetParityVerified) \
                 max_completion_tokens_limit=\(maximumCompletionTokens) \
                 \(report.memoryFieldsFragment) \
+                \(memory) \
                 \(scalarFallbackRoute) \
                 \(exactMTP) \
                 \(fit) \
@@ -186,6 +230,11 @@ private struct PreparedServingBackend {
                 report.nativeCacheKinds.map(\.rawValue)
             ).sorted().joined(separator: ",")
             let soloPLD = report.soloPLDPolicy
+            let memory = hostReport.machineReadableServingFields(
+                memoryLimitBytes: report.memoryLimitBytes,
+                cacheLimitBytes: report.cacheLimitBytes,
+                kvBudgetBytes: report.maxReservedKVBytes,
+                osServiceReserveBytes: osServiceReserveBytes)
             return """
                 fastmlx-serve mode=\(mode) route=\(report.route.rawValue) \
                 model=\(report.launchedModel) \
@@ -217,6 +266,7 @@ private struct PreparedServingBackend {
                 solo_pld_compiled_verify=\(soloPLD?.compiledVerify ?? false) \
                 model_proof_verified=\(report.modelProofVerified) \
                 max_completion_tokens_limit=\(maximumCompletionTokens) \
+                \(memory) \
                 \(fit) \
                 listening=\(localAddress)
                 """
@@ -225,17 +275,16 @@ private struct PreparedServingBackend {
 }
 
 /// MLX limits resolved for a backend after the pre-load fit-check: either the sizer's own
-/// derivation (when the on-disk config was fit-checkable and the model fits) or the operator-
-/// provided values unchanged (when the arch isn't fit-checkable yet — no serving regression).
+/// derivation after the on-disk config was fit-checkable and the model fits.
 private struct ResolvedServingLimits {
     let memoryLimitBytes: Int
     let cacheLimitBytes: Int
     /// `nil` for the scalar route (which has no reserved-KV knob); the continuous route falls back
     /// to its provided value when this is `nil`.
     let maxReservedKVBytes: Int?
-    /// Served context cap the sizer computed; `nil` when the fit-check was skipped.
+    /// Served context cap the sizer computed.
     let maxContextTokens: Int?
-    /// The computed fit-check decision; `nil` when the fit-check was skipped (decoder failure).
+    /// The computed fit-check decision.
     let fitDecision: ServingFitDecision?
 }
 
@@ -248,12 +297,27 @@ private func emitFitCheck(_ lines: [String]) {
     FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
 }
 
+/// Refuse a loaded serve whenever checkpoint decoding cannot produce a fit decision. Keep this
+/// rendering shared by the ordinary and exact-MTP loaded routes so the stable reason taxonomy does
+/// not depend on which backend composition the operator selected.
+private func refuseUnprovenFit(_ error: ModelConfigDecodeError) throws -> Never {
+    let lines = [
+        "fastmlx-serve fit_check=refused reason=\(error.unservableRefusalReason ?? "unservable_checkpoint")",
+        "  \(error)",
+    ]
+    emitFitCheck(lines)
+    throw FitCheckRefusal(lines: lines)
+}
+
 /// `--quant-pick-only`: resolve which candidate quant would load for this host and print the
 /// machine-readable winner line to STDOUT, then return without loading a model. Per-candidate
 /// diagnostics go to STDERR (via `emitFitCheck`) so STDOUT carries only the pipeable winner line
 /// (`WINNER=$(fastmlx-serve --quant-pick-only …)`). A red-only set has no winner → throw
 /// `FitCheckRefusal`, which `main()` maps to exit 2 — the same code the serve path refuses with.
-private func runQuantPickOnly(_ arguments: FastMLXServeArguments) throws {
+private func runQuantPickOnly(
+    _ arguments: FastMLXServeArguments,
+    host: SystemProfile
+) throws {
     // --auto-quant: OFFLINE-enumerate the base repo's HF quant variants and print the candidate list.
     // This is the network-free half (probe/download is not built): it emits the ordered repo names a
     // downstream step would probe, on a frozen-key STDOUT line mirroring the winner line's style.
@@ -275,9 +339,10 @@ private func runQuantPickOnly(_ arguments: FastMLXServeArguments) throws {
     if let note = policy?.conflictAnnotation { emitFitCheck(["serve-tier note: \(note)"]) }
     let resolution = QuantCandidateResolver.resolve(
         candidateDirectories: arguments.quantCandidateDirectories,
-        host: SystemProfile.detectHost(),
+        host: host,
         requestedContext: arguments.requestedContext,
         concurrency: arguments.planConcurrency ?? 1,
+        thresholds: servingCapacityThresholds(arguments),
         allowedKVTiers: policy?.allowedKVTiers,
         allowContextCapping: policy?.allowContextCapping ?? true,
         preference: try quantPickPreference(arguments))
@@ -329,10 +394,11 @@ private func emitQuantReliabilityOverlay(arguments: FastMLXServeArguments, pick:
 /// Fit-check a real on-disk checkpoint against the detected host before loading (fit-checked-serve,
 /// differentiator #2): derive the MLX memory/cache/reserved-KV limits and served-context cap from
 /// the sizer instead of the flat RAM-percentage values serve.sh passes, and fail closed on a red
-/// verdict unless `--force`. Falls back to the provided limits (with a `fit_check=skipped` note)
-/// when the arch is not fit-checkable yet, so serving an unmodeled family is never regressed.
+/// verdict unless `--force`. Any decoder error refuses before load; `--force` must not override
+/// absence of a fit decision.
 private func resolveServingLimits(
     modelDirectory: URL, arguments: FastMLXServeArguments,
+    host: SystemProfile,
     providedMemory: Int, providedCache: Int, providedReservedKV: Int?,
     preParsed: ParsedModelArch? = nil, advisorySlotCount: Int? = nil
 ) throws -> ResolvedServingLimits {
@@ -344,27 +410,12 @@ private func resolveServingLimits(
     } else {
         do {
             parsed = try ModelConfigDecoder.decodeModelDirectory(modelDirectory, id: arguments.model)
-        } catch let error as ModelConfigDecodeError where error.indicatesUnservableCheckpoint {
-            // The checkpoint has no loadable weights on disk (interrupted / metadata-only download):
-            // skipping the fit-check here would drive on to a guaranteed load failure. Fail closed with
-            // a clear refusal instead, keeping the differentiator's fail-closed promise honest for an
-            // incomplete checkpoint rather than crashing deep in the loader. (An *unmodeled arch* whose
-            // weights ARE present still takes the skip path below — see indicatesUnservableCheckpoint.)
-            let lines = [
-                "fastmlx-serve fit_check=refused reason=\(error.unservableRefusalReason ?? "unservable_checkpoint")",
-                "  \(error)",
-            ]
-            emitFitCheck(lines)
-            throw FitCheckRefusal(lines: lines)
-        } catch {
-            emitFitCheck(["fastmlx-serve fit_check=skipped reason=\"\(error)\" — using provided limits"])
-            return ResolvedServingLimits(
-                memoryLimitBytes: providedMemory, cacheLimitBytes: providedCache,
-                maxReservedKVBytes: providedReservedKV, maxContextTokens: nil, fitDecision: nil)
+        } catch let error as ModelConfigDecodeError {
+            // No decoded config means no fit decision. Refuse here instead of loading with provided
+            // limits; `--force` applies only to an explicit RED verdict from ServingFitPlanner.
+            try refuseUnprovenFit(error)
         }
     }
-
-    let host = SystemProfile.detectHost()
 
     // Resolve the `--tier` serve dial (differentiator #4) into its policy so the dial governs the REAL
     // serve decision, not only the `--quant-pick-only` dry-run: transparent/balanced refuse a
@@ -382,7 +433,7 @@ private func resolveServingLimits(
     let decision = ServingFitPlanner.decide(
         profile: parsed.profile, weightsAreMeasured: parsed.weightsAreMeasured, host: host,
         requestedContext: arguments.requestedContext, concurrency: arguments.planConcurrency ?? 1,
-        force: arguments.forceServe,
+        force: arguments.forceServe, thresholds: servingCapacityThresholds(arguments),
         quantBits: parsed.quantBits, weightsAreDeclared: parsed.weightsAreDeclared,
         advisorySlotCount: advisorySlotCount,
         allowContextCapping: servePolicy?.allowContextCapping ?? true)
@@ -395,7 +446,10 @@ private func resolveServingLimits(
     if let rawTier = arguments.kvQuantTier, let tier = try? KVQuantAdvisory.validateTier(rawTier) {
         let advisory = KVQuantAdvisory.previewLines(
             tier: tier, profile: parsed.profile, host: host,
-            requestedContext: arguments.requestedContext, quantBits: parsed.quantBits)
+            requestedContext: arguments.requestedContext,
+            concurrency: arguments.planConcurrency ?? 1,
+            quantBits: parsed.quantBits,
+            thresholds: servingCapacityThresholds(arguments))
         if !advisory.isEmpty { emitFitCheck(advisory) }
     }
 
@@ -431,7 +485,7 @@ private func resolveServingLimits(
 /// docs/task-inbox/2026-08-18-quant-auto-pick-policy.md). Without candidates, return the single
 /// provided directory unchanged.
 private func resolveServedDirectory(
-    _ arguments: FastMLXServeArguments, fallback: URL
+    _ arguments: FastMLXServeArguments, fallback: URL, host: SystemProfile
 ) throws -> (directory: URL, parsed: ParsedModelArch?) {
     guard !arguments.quantCandidateDirectories.isEmpty else { return (fallback, nil) }
     // Apply the `--tier` serve dial (differentiator #4, item #5) to the ENFORCED candidates path so the
@@ -447,9 +501,10 @@ private func resolveServedDirectory(
     if let advisory = ServeTierPolicy.enforcedPathKVAdvisory(for: servePolicy) { emitFitCheck([advisory]) }
     let resolution = QuantCandidateResolver.resolve(
         candidateDirectories: arguments.quantCandidateDirectories,
-        host: SystemProfile.detectHost(),
+        host: host,
         requestedContext: arguments.requestedContext,
         concurrency: arguments.planConcurrency ?? 1,
+        thresholds: servingCapacityThresholds(arguments),
         allowContextCapping: servePolicy?.allowContextCapping ?? true,
         preference: try quantPickPreference(arguments))
     emitFitCheck(resolution.summaryLines())
@@ -468,6 +523,8 @@ private func resolveServedDirectory(
 /// identical `mode=scalar` startup line; callers pass the already-resolved fit-check limits.
 private func loadScalarServingBackend(
     arguments: FastMLXServeArguments,
+    hostReport: HostReport,
+    osServiceReserveBytes: Int,
     modelDirectory: URL,
     memoryLimitBytes: Int,
     cacheLimitBytes: Int,
@@ -497,12 +554,16 @@ private func loadScalarServingBackend(
         launchedModel: arguments.model,
         startupReport: .scalar(loaded.startupReport),
         fitDecision: fitDecision,
-        exactMTPReport: nil)
+        exactMTPReport: nil,
+        hostReport: hostReport,
+        osServiceReserveBytes: osServiceReserveBytes)
 }
 
 private func prepareBackend(
-    _ arguments: FastMLXServeArguments
+    _ arguments: FastMLXServeArguments,
+    hostReport: HostReport
 ) async throws -> PreparedServingBackend {
+    let osServiceReserveBytes = servingCapacityThresholds(arguments).osReserveBytes
     switch arguments.backend {
     case .scripted:
         return PreparedServingBackend(
@@ -512,13 +573,16 @@ private func prepareBackend(
             launchedModel: arguments.model,
             startupReport: nil,
             fitDecision: nil,
-            exactMTPReport: nil)
+            exactMTPReport: nil,
+            hostReport: hostReport,
+            osServiceReserveBytes: osServiceReserveBytes)
     case .scalar(
         let modelDirectory,
         let memoryLimitBytes,
         let cacheLimitBytes
     ):
-        let served = try resolveServedDirectory(arguments, fallback: modelDirectory)
+        let host = hostReport.systemProfile
+        let served = try resolveServedDirectory(arguments, fallback: modelDirectory, host: host)
         let exactDrafterDirectory: URL?
         if arguments.exactQwen35MTP {
             guard let drafterDirectory = arguments.mtpDrafterDirectory else {
@@ -537,6 +601,8 @@ private func prepareBackend(
                 fitParsed = try ExactQwen35MTPCompositeFitProfile.make(
                     target: targetParsed,
                     drafterDirectory: exactDrafterDirectory)
+            } catch let error as ModelConfigDecodeError {
+                try refuseUnprovenFit(error)
             } catch {
                 let lines = [
                     "fastmlx-serve fit_check=refused "
@@ -551,7 +617,7 @@ private func prepareBackend(
             fitParsed = served.parsed
         }
         let limits = try resolveServingLimits(
-            modelDirectory: served.directory, arguments: arguments,
+            modelDirectory: served.directory, arguments: arguments, host: host,
             providedMemory: memoryLimitBytes, providedCache: cacheLimitBytes, providedReservedKV: nil,
             preParsed: fitParsed)
         if let drafterDirectory = exactDrafterDirectory {
@@ -584,10 +650,14 @@ private func prepareBackend(
                 launchedModel: arguments.model,
                 startupReport: .scalar(loaded.scalarStartupReport),
                 fitDecision: limits.fitDecision,
-                exactMTPReport: loaded.exactStartupReport)
+                exactMTPReport: loaded.exactStartupReport,
+                hostReport: hostReport,
+                osServiceReserveBytes: osServiceReserveBytes)
         }
         return try await loadScalarServingBackend(
             arguments: arguments,
+            hostReport: hostReport,
+            osServiceReserveBytes: osServiceReserveBytes,
             modelDirectory: served.directory,
             memoryLimitBytes: limits.memoryLimitBytes,
             cacheLimitBytes: limits.cacheLimitBytes,
@@ -597,10 +667,37 @@ private func prepareBackend(
         let memoryLimitBytes,
         let cacheLimitBytes,
         let maxReservedKVBytes
+    ), .continuousDynamicPLD(
+        let modelDirectory,
+        let memoryLimitBytes,
+        let cacheLimitBytes,
+        let maxReservedKVBytes
     ):
-        let served = try resolveServedDirectory(arguments, fallback: modelDirectory)
+        let usesDynamicPLD: Bool
+        switch arguments.backend {
+        case .some(.continuousDynamicPLD):
+            usesDynamicPLD = true
+        default:
+            usesDynamicPLD = false
+        }
+        let admission: ContinuousServingAdmissionMode
+        let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
+        if usesDynamicPLD {
+            admission = .dynamic(
+                configuration: ServingAdmissionConfiguration(
+                    soloPLDQualified: true,
+                    maximumBatchRequests: continuousMaxActiveSlots,
+                    maximumQueuedRequests: 8),
+                coalescing: .automatic(.milliseconds(5)))
+            soloPLDPolicy = .qwen3WidthOne
+        } else {
+            admission = .immediateBatchNoSpec
+            soloPLDPolicy = nil
+        }
+        let host = hostReport.systemProfile
+        let served = try resolveServedDirectory(arguments, fallback: modelDirectory, host: host)
         let limits = try resolveServingLimits(
-            modelDirectory: served.directory, arguments: arguments,
+            modelDirectory: served.directory, arguments: arguments, host: host,
             providedMemory: memoryLimitBytes, providedCache: cacheLimitBytes,
             providedReservedKV: maxReservedKVBytes, preParsed: served.parsed,
             advisorySlotCount: continuousMaxActiveSlots)
@@ -627,10 +724,12 @@ private func prepareBackend(
                     mailboxCapacity: .init(
                         maxDeltas: 8,
                         maxBytes: 32 * 1_024),
+                    admission: admission,
                     // The continuous route serves dense models; keep the legacy tool-thinking-off
                     // workaround here (QwenLM/Qwen3 #1817). The agentic qwen3_5 family serves on the
                     // scalar route, which respects the template default instead.
                     disableThinkingWhenToolsActive: true),
+                soloPLDPolicy: soloPLDPolicy,
                 // Thread the requested KV tier so `selectKVCacheQuant` resolves it fail-closed at load
                 // on the continuous route too (the default serve.sh path). nil (omitted flag) → `.fp16`.
                 kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
@@ -652,6 +751,8 @@ private func prepareBackend(
                 Data((scalarHybridFallbackAnnounceLine(modelType: family) + "\n").utf8))
             return try await loadScalarServingBackend(
                 arguments: arguments,
+                hostReport: hostReport,
+                osServiceReserveBytes: osServiceReserveBytes,
                 modelDirectory: served.directory,
                 memoryLimitBytes: limits.memoryLimitBytes,
                 cacheLimitBytes: limits.cacheLimitBytes,
@@ -696,11 +797,15 @@ private func prepareBackend(
                     fitModeledTransientBytes: drift?.modeledTransientBytes,
                     fitModeledHeadroomBytes: drift?.modeledHeadroomBytes)
             },
-            mode: "continuous-batch-no-spec",
+            mode: usesDynamicPLD
+                ? "continuous-dynamic-pld"
+                : "continuous-batch-no-spec",
             launchedModel: arguments.model,
             startupReport: .continuous(loaded.startupReport),
             fitDecision: limits.fitDecision,
-            exactMTPReport: nil)
+            exactMTPReport: nil,
+            hostReport: hostReport,
+            osServiceReserveBytes: osServiceReserveBytes)
     case nil:
         preconditionFailure("help is the only invocation without a backend")
     }

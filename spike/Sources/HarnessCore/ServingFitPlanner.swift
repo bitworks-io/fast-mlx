@@ -32,7 +32,8 @@ public struct ServingFitDecision: Sendable {
     public let planningConcurrency: Int
 
     // MARK: MLX limits — derived from the sizer, NOT flat RAM percentages.
-    /// `min(wiredLimit, RAM)` — the physical GPU-wired envelope, not a flat `RAM×80%`.
+    /// The host policy's effective memory ceiling. Shared hosts use the lowest of exact 75% RAM,
+    /// a lower wired observation, and a lower Metal recommended working set.
     public let memoryLimitBytes: Int
     /// `CapacityModel.recommendedCacheLimitBytes(wiredLimit)` — the explicit anti-hoard cache cap,
     /// not a flat `RAM×10%`.
@@ -61,6 +62,11 @@ public struct ServingFitDecision: Sendable {
     /// reports `weights_measured=false` for both (declared is, correctly, not measured).
     public let weightsAreDeclared: Bool
     public let wiredLimitIsMeasured: Bool
+    /// Provenance for the envelope that actually governed this decision. This stays distinct from
+    /// the wired-input flag so a synthesized shared cap or advisory Metal bound cannot be folded
+    /// into `fit_estimate_measured=true` merely because the unused wired observation was measured.
+    public let effectiveMemoryCeilingSource: EffectiveMemoryCeiling.Source
+    public let effectiveMemoryCeilingIsMeasured: Bool
     /// The full term-by-term peak prediction the verdict was computed from (weights/KV/transient/
     /// allocator), for surfacing measured-vs-modeled totals.
     public let prediction: CapacityPrediction
@@ -117,13 +123,10 @@ public struct ServingFitDecision: Sendable {
     /// Machine-readable fit-check fields for the STDOUT startup line (spliced immediately before
     /// `listening=<addr>`, which must remain the last token — gate scripts anchor on it).
     public func machineReadableFields() -> String {
-        // `fit_estimate_measured` folds the two provenance flags a gate script otherwise has to AND
-        // itself: the verdict rests on fully-measured inputs only when BOTH the weights byte count
-        // and the wired-limit envelope are measured on this host (the KV/transient/allocator terms
-        // are always modeled, so folding those in would make it uselessly always-false). This is a
-        // convenience gate, not a new measurement — `weights_measured`/`wired_limit_measured` remain
-        // for callers that need the terms separately.
-        let estimateMeasured = weightsAreMeasured && wiredLimitIsMeasured
+        // The folded value follows the envelope that actually governed this decision. A shared
+        // policy cap is synthesized, and Metal documents its recommendation as an approximation;
+        // neither is promoted to a fully measured fit even if the separate wired input was read.
+        let estimateMeasured = weightsAreMeasured && effectiveMemoryCeilingIsMeasured
         var fields = "fit_check=\(color.rawValue) fit_binding=\(bindingConstraint.rawValue) "
             + "weights_measured=\(weightsAreMeasured) wired_limit_measured=\(wiredLimitIsMeasured) "
             + "fit_estimate_measured=\(estimateMeasured) fit_quant_bits=\(quantBits.map(String.init) ?? "none") "
@@ -228,8 +231,9 @@ public enum ServingFitPlanner {
         let proceedingUnderForce = isRed && force
 
         // Limits from the sizer, not flat RAM percentages.
-        let memoryLimitBytes = min(host.wiredLimitBytes, host.totalRAMBytes)
-        let cacheLimitBytes = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: host.wiredLimitBytes)
+        let effectiveMemoryCeiling = host.effectiveMemoryCeiling
+        let memoryLimitBytes = effectiveMemoryCeiling.bytes
+        let cacheLimitBytes = CapacityModel.recommendedCacheLimitBytes(wiredLimitBytes: memoryLimitBytes)
         let kvServe = CapacityModel.kvBytesForContext(
             profile, context: max(1, servedContext), kvQuant: kvQuant, concurrency: concurrency)
         let maxReservedKVBytes = Int(kvServe.rounded(.up))
@@ -252,6 +256,8 @@ public enum ServingFitPlanner {
             shouldProceed: shouldProceed, proceedingUnderForce: proceedingUnderForce,
             weightsAreMeasured: weightsAreMeasured, weightsAreDeclared: weightsAreDeclared,
             wiredLimitIsMeasured: host.wiredLimitIsMeasured,
+            effectiveMemoryCeilingSource: effectiveMemoryCeiling.source,
+            effectiveMemoryCeilingIsMeasured: host.effectiveMemoryCeilingIsMeasured,
             prediction: prediction)
     }
 }

@@ -59,6 +59,31 @@ research → design → test-first implementation → verification → review
         → Pages deployment → live verification → feedback into research
 ```
 
+Publication is part of the definition of done for every accepted measurable increment. Before
+starting unrelated implementation, the increment must have one explicit public disposition:
+
+- `PUBLIC_READY`: public-safe source, tests, documentation, and site metadata publish in the same
+  cycle;
+- `PUBLIC_SUMMARY_ONLY`: private evidence or implementation details remain private, but a sanitized
+  public release, capability, benchmark, or research summary publishes in the same cycle;
+- `INTERNAL_ONLY`: no public source or narrative change is warranted, with a reviewed reason;
+- `PRIVATE_NO_GO`: failed, shelved, competitor, host, credential, or machine-local evidence remains
+  private; or
+- `PUBLICATION_BLOCKED`: a required public update failed a projection, validation, marker, secret,
+  diff, workflow, Pages, or deployed-byte gate.
+
+`PUBLICATION_BLOCKED` is stop-the-line work. The next action is to repair the public boundary and
+finish the pending publication; unrelated feature work does not continue while an accepted
+`PUBLIC_READY` or `PUBLIC_SUMMARY_ONLY` increment lacks its public commit, successful workflow, Pages
+deployment, and validated receipt. A gate failure may be recorded as diagnostic evidence, but that
+record does not discharge the publication obligation. Only `INTERNAL_ONLY` and `PRIVATE_NO_GO`
+increments may complete without a public write.
+
+The publication test suite exports and validates the current projection, so a new projected path,
+mode change, stale identity seal, or prohibited marker must be resolved in the same internal commit
+that introduces it. Negative tests construct prohibited marker strings from non-matching fragments
+or stay outside the projection; they never weaken the validator.
+
 The exporter refuses files outside its manifest. The site builder refuses unlisted articles and
 known private markers. Capability cards require an explicit state and scope. Numeric highlights also
 require the exact model, hardware, workload, date, decision, caveat, and one published evidence slug;

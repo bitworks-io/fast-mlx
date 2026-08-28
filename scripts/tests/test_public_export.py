@@ -13,6 +13,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 
 import export_public_repository  # noqa: E402
+import validate_public_repository  # noqa: E402
 
 
 def public_index_seal(entries: dict[str, str]) -> dict[str, object]:
@@ -145,6 +146,23 @@ class PublicExportTests(unittest.TestCase):
             set(public_manifest.get("publicIndex", {})),
             {"pathCount", "pathModeSha256"},
         )
+
+    def test_current_development_projection_passes_public_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public"
+            output.mkdir()
+            export_public_repository.export(
+                REPOSITORY_ROOT,
+                output,
+                allow_development_manifest=(
+                    REPOSITORY_ROOT
+                    / "public/public-repository-public.json"
+                ).is_file(),
+            )
+
+            failures = validate_public_repository.validate(output)
+
+        self.assertEqual(failures, [])
 
     def test_sampled_generation_foundation_is_exported_byte_for_byte(self) -> None:
         development_manifest = json.loads(

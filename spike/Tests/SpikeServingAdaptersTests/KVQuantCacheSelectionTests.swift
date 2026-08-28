@@ -33,13 +33,26 @@ final class KVQuantCacheSelectionTests: XCTestCase {
         }
     }
 
-    // MARK: int8 activates once runtimeWired includes it, and only for all-dense routes.
+    func testInt8ThrowsTierNotQualityApprovedWhenCapabilityAloneIsWired() {
+        XCTAssertThrowsError(
+            try selectKVCacheQuant(
+                requested: .int8,
+                nativeKinds: [.denseAttention],
+                runtimeWired: [.fp16, .int8],
+                qualityApproved: [.fp16])
+        ) { error in
+            XCTAssertEqual(error as? KVQuantSelectionError, .tierNotQualityApproved(.int8))
+        }
+    }
+
+    // MARK: int8 activates only when capability and quality approval agree, and only for dense routes.
 
     func testInt8ReturnsQuantizedDecisionWithBits8WhenWiredAndAllDense() throws {
         let decision = try selectKVCacheQuant(
             requested: .int8,
             nativeKinds: [.denseAttention, .denseAttention],
-            runtimeWired: [.fp16, .int8]
+            runtimeWired: [.fp16, .int8],
+            qualityApproved: [.fp16, .int8]
         )
         guard case .int8(let groupSize, let bits) = decision else {
             XCTFail("expected .int8 decision, got \(decision)")
@@ -56,7 +69,11 @@ final class KVQuantCacheSelectionTests: XCTestCase {
         for kind in nonDenseKinds {
             let kinds: [ScalarServingNativeCacheKind] = [.denseAttention, kind]
             XCTAssertThrowsError(
-                try selectKVCacheQuant(requested: .int8, nativeKinds: kinds, runtimeWired: [.fp16, .int8])
+                try selectKVCacheQuant(
+                    requested: .int8,
+                    nativeKinds: kinds,
+                    runtimeWired: [.fp16, .int8],
+                    qualityApproved: [.fp16, .int8])
             ) { error in
                 XCTAssertEqual(
                     error as? KVQuantSelectionError,
@@ -69,7 +86,11 @@ final class KVQuantCacheSelectionTests: XCTestCase {
 
     func testInt8ThrowsEmptyCacheRouteWhenWiredButKindsEmpty() {
         XCTAssertThrowsError(
-            try selectKVCacheQuant(requested: .int8, nativeKinds: [], runtimeWired: [.fp16, .int8])
+            try selectKVCacheQuant(
+                requested: .int8,
+                nativeKinds: [],
+                runtimeWired: [.fp16, .int8],
+                qualityApproved: [.fp16, .int8])
         ) { error in
             XCTAssertEqual(error as? KVQuantSelectionError, .emptyCacheRoute(.int8))
         }
@@ -123,13 +144,13 @@ final class KVQuantCacheSelectionTests: XCTestCase {
     }
 
     /// End-to-end: an all-dense route with int8 wired composes selection → construction into int8
-    /// QuantizedKVCache. Proves the two halves of the seam agree (the M5 activation flips
-    /// runtimeWired; this is what it then builds).
+    /// QuantizedKVCache. Proves the two halves agree when both activation gates are injected.
     func testSelectionComposesIntoInt8ConstructionForWiredAllDenseRoute() throws {
         let decision = try selectKVCacheQuant(
             requested: .int8,
             nativeKinds: [.denseAttention, .denseAttention],
-            runtimeWired: [.fp16, .int8])
+            runtimeWired: [.fp16, .int8],
+            qualityApproved: [.fp16, .int8])
         let built = buildRouteKVCaches(
             decision: decision,
             nativeCaches: [KVCacheSimple(), KVCacheSimple()])

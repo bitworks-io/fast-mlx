@@ -40,6 +40,9 @@ public enum BindingConstraint: String, Sendable {
     /// The GPU wired-memory ceiling (`iogpu.wired_limit_mb`) is the smaller of the two and is
     /// exceeded — raisable, but requires root (spec §3).
     case wiredLimit
+    /// Metal's approximate recommended maximum working set is the lowest shared-host envelope.
+    /// This is a conservative good-performance policy bound, not a hard allocation guarantee.
+    case recommendedWorkingSet
     /// The requested context exceeds the model's own native maximum — no amount of hardware helps.
     case modelNativeMax
     /// The model's native max sits below the 32K tunable default (Phi-4 = 16K) — the effective
@@ -279,7 +282,7 @@ public enum CapacityModel {
         // Weights alone don't fit inside {wired limit, RAM} minus reserve: definitely red,
         // regardless of KV/transient/allocator terms.
         guard headroom > 0 else {
-            let binding: BindingConstraint = profile.wiredLimitBytes < profile.totalRAMBytes ? .wiredLimit : .physicalRAM
+            let binding = memoryBindingConstraint(for: profile)
             return CapacityVerdict(
                 color: .red, bindingConstraint: binding, ratio: .infinity,
                 suggestedMitigation: mitigation(for: binding))
@@ -301,7 +304,7 @@ public enum CapacityModel {
             // holds this until absorbed-MLA ships) — name it specifically rather than generic RAM.
             binding = .mlaAsImplemented
         } else {
-            binding = profile.wiredLimitBytes < profile.totalRAMBytes ? .wiredLimit : .physicalRAM
+            binding = memoryBindingConstraint(for: profile)
         }
 
         return CapacityVerdict(color: color, bindingConstraint: binding, ratio: ratio, suggestedMitigation: mitigation(for: binding))
@@ -321,8 +324,19 @@ public enum CapacityModel {
             return "model's native max is below the 32K tunable default — effective default is the native max"
         case .kvNotDerivable:
             return "KV cost not derivable (unconfirmed attention-layer count or out-of-scope arch) — confirm the model config before trusting any fit estimate"
-        case .wiredLimit, .physicalRAM:
+        case .wiredLimit, .physicalRAM, .recommendedWorkingSet:
             return "drop KV to a lossy quant tier, then reduce concurrency, then pick a lighter-footprint model"
+        }
+    }
+
+    private static func memoryBindingConstraint(for profile: SystemProfile) -> BindingConstraint {
+        switch profile.effectiveMemoryCeiling.source {
+        case .physicalRAM:
+            return .physicalRAM
+        case .recommendedWorkingSet:
+            return .recommendedWorkingSet
+        case .sharedPolicy, .wiredLimit:
+            return .wiredLimit
         }
     }
 
@@ -348,14 +362,18 @@ public enum CapacityModel {
     /// tuned by soak measurement**, not a derived constant — the key property is that it is
     /// explicit and far below the 1.5x default, not that 1/8th is the "correct" fraction.
     ///
-    /// `min(max(wiredLimitBytes / 8, 4 GiB), 24 GiB)`: ~12.5% of the wired limit, floored at 4 GiB
+    /// `min(max(wiredLimitBytes / 8, 4 GiB), 24 GiB)`: ~12.5% of the supplied effective ceiling,
+    /// floored at 4 GiB
     /// (usable on small boxes where 1/8th alone would starve the cache) and capped at 24 GiB
     /// (anti-hoard on big boxes, where 1/8th alone would still let the cache claim tens of GiB).
     public static func recommendedCacheLimitBytes(wiredLimitBytes: Int) -> Int {
         let gib = 1024 * 1024 * 1024
         let floor = 4 * gib
         let cap = 24 * gib
-        return min(max(wiredLimitBytes / 8, floor), cap)
+        guard wiredLimitBytes > 1 else { return 0 }
+        // A tiny or conservatively Metal-bounded host may sit below the ordinary 4 GiB floor.
+        // Keep the cache strictly below that envelope even on a forced red decision.
+        return min(max(wiredLimitBytes / 8, floor), cap, wiredLimitBytes / 2)
     }
 
     /// `min(model.nativeMax, largest context that still fits under headroom)` — the tunable's true

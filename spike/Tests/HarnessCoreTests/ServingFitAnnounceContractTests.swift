@@ -23,8 +23,16 @@ final class ServingFitAnnounceContractTests: XCTestCase {
         return m
     }
 
+    private var qualifiedDedicatedHost: SystemProfile {
+        SystemProfile(
+            chip: "test dedicated", totalRAMBytes: 128 * gib, wiredLimitBytes: 115 * gib,
+            wiredLimitIsMeasured: true, hostUse: .operatorAssertedDedicatedServing())
+    }
+
     private func smallHost(ramGiB: Int, wiredGiB: Int) -> SystemProfile {
-        SystemProfile(chip: "test", totalRAMBytes: ramGiB * gib, wiredLimitBytes: wiredGiB * gib, wiredLimitIsMeasured: true)
+        SystemProfile(
+            chip: "test", totalRAMBytes: ramGiB * gib, wiredLimitBytes: wiredGiB * gib,
+            wiredLimitIsMeasured: true, hostUse: .operatorAssertedDedicatedServing())
     }
 
     /// Ordered keys of a `key=value ...` line — used only to assert the line's SHAPE (which keys,
@@ -40,7 +48,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// splices that AFTER, and it must remain the last token). Adding/removing/reordering a field
     /// breaks this test on purpose — that is a wire-format change reviewers must see.
     func testMachineLine_greenUnforced_frozenKeyContract() {
-        let d = ServingFitPlanner.decide(profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128)
+        let d = ServingFitPlanner.decide(
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: qualifiedDedicatedHost)
         let fields = d.machineReadableFields()
         XCTAssertEqual(keys(fields), [
             "fit_check", "fit_binding", "weights_measured", "wired_limit_measured",
@@ -75,7 +84,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// (locked by the frozen-contract test above, which runs at concurrency 1).
     func testMachineLine_planConcurrency_appendsAfterBaseContract() {
         let d = ServingFitPlanner.decide(
-            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128, concurrency: 4)
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true,
+            host: qualifiedDedicatedHost, concurrency: 4)
         XCTAssertTrue(d.shouldProceed, "precondition: 32B on 128 GiB proceeds at 4 streams")
         XCTAssertEqual(keys(d.machineReadableFields()), [
             "fit_check", "fit_binding", "weights_measured", "wired_limit_measured",
@@ -115,8 +125,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     func testCeilingZero_alwaysRedAndFailsClosed() {
         let cases: [(model: String, host: SystemProfile, why: String)] = [
             ("GLM-4.5-Air", smallHost(ramGiB: 8, wiredGiB: 6), "weights alone exceed the box (headroom ≤ 0)"),
-            ("DeepSeek-V4-Flash", .m5Max128, "novel-compressed arch: KV not derivable even on a huge box"),
-            ("Nemotron-3-Ultra", .m5Max128, "hybrid mamba2/MoE, nAttnLayers==0: KV not derivable"),
+            ("DeepSeek-V4-Flash", qualifiedDedicatedHost, "novel-compressed arch: KV not derivable even on a huge box"),
+            ("Nemotron-3-Ultra", qualifiedDedicatedHost, "hybrid mamba2/MoE, nAttnLayers==0: KV not derivable"),
             ("Phi-4-14B", smallHost(ramGiB: 14, wiredGiB: 13), "memory-bound ratio: weights fit but context=1 peak > yellowMax"),
         ]
         for c in cases {
@@ -150,7 +160,7 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// `red@1 ⇒ red@nativeMax` — fails here.
     func testPredictedPeak_isMonotonicInContext_transientFixed_kvGrows() {
         let m = profile("Phi-4-14B")
-        let host = SystemProfile.m5Max128
+        let host = qualifiedDedicatedHost
         let lo = CapacityModel.predictPeakBytes(model: m, context: 1, concurrency: 1, kvQuant: .fp16, profile: host)
         let hi = CapacityModel.predictPeakBytes(model: m, context: 8192, concurrency: 1, kvQuant: .fp16, profile: host)
         XCTAssertEqual(lo.transientPrefillPeakBytes, hi.transientPrefillPeakBytes,
@@ -162,7 +172,9 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// The KV-not-derivable ceiling-0 case is refused with the honest binding constraint (spec
     /// §2.1/§8) — the fit-check says "I can't derive this" rather than fabricating a fit.
     func testCeilingZero_kvNotDerivable_bindingIsHonest() {
-        let d = ServingFitPlanner.decide(profile: profile("DeepSeek-V4-Flash"), weightsAreMeasured: true, host: .m5Max128)
+        let d = ServingFitPlanner.decide(
+            profile: profile("DeepSeek-V4-Flash"), weightsAreMeasured: true,
+            host: qualifiedDedicatedHost)
         XCTAssertEqual(d.bindingConstraint, .kvNotDerivable)
         XCTAssertFalse(d.shouldProceed)
     }
@@ -171,7 +183,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// is flagged as forced (the announce never launders a forced serve into a clean one).
     func testCeilingZero_forceProceedsButStaysRedAndFlagged() {
         let d = ServingFitPlanner.decide(
-            profile: profile("DeepSeek-V4-Flash"), weightsAreMeasured: true, host: .m5Max128, force: true)
+            profile: profile("DeepSeek-V4-Flash"), weightsAreMeasured: true,
+            host: qualifiedDedicatedHost, force: true)
         XCTAssertEqual(d.contextCeiling, 0)
         XCTAssertEqual(d.color, .red)
         XCTAssertTrue(d.shouldProceed, "--force proceeds past a ceiling-0 red")
@@ -188,7 +201,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// only; it labels itself modeled+advisory so it is never read as a measured cap.
     func testConcurrencyAdvisory_present_rendersModeledSlotLine() {
         let d = ServingFitPlanner.decide(
-            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128, advisorySlotCount: 4)
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true,
+            host: qualifiedDedicatedHost, advisorySlotCount: 4)
         let advisory = d.summaryLines().first { $0.contains("x4 slots") }
         XCTAssertNotNil(advisory, "an advisory slot-count line must render when advisorySlotCount is set")
         XCTAssertTrue(advisory!.contains("kv@\(d.servedContext)"), "advisory names the served context it modeled")
@@ -203,7 +217,8 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// Absent an advisory slot-count (the default), NO slot line renders — the shipped summary is
     /// byte-for-byte unchanged for existing callers.
     func testConcurrencyAdvisory_absent_noSlotLine() {
-        let d = ServingFitPlanner.decide(profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128)
+        let d = ServingFitPlanner.decide(
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: qualifiedDedicatedHost)
         XCTAssertNil(d.kvAtSlotsBytes)
         XCTAssertFalse(d.summaryLines().contains { $0.contains("slots") },
             "no slot advisory line without an explicit advisorySlotCount")
@@ -214,9 +229,11 @@ final class ServingFitAnnounceContractTests: XCTestCase {
     /// entire frozen machine-readable line, are identical with and without it. If a future edit lets
     /// the advisory feed the verdict math, this fails.
     func testConcurrencyAdvisory_doesNotAlterVerdictOrLimits() {
-        let base = ServingFitPlanner.decide(profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128)
+        let base = ServingFitPlanner.decide(
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: qualifiedDedicatedHost)
         let adv = ServingFitPlanner.decide(
-            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: .m5Max128, advisorySlotCount: 4)
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true,
+            host: qualifiedDedicatedHost, advisorySlotCount: 4)
         XCTAssertEqual(adv.color, base.color)
         XCTAssertEqual(adv.shouldProceed, base.shouldProceed)
         XCTAssertEqual(adv.servedContext, base.servedContext)

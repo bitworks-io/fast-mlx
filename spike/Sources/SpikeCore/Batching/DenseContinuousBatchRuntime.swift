@@ -1030,6 +1030,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
 
         switch plan {
         case .plainFromPipeline:
+            let gateWasEnabled = session.isGateEnabled
             let result = try decodeScalar(
                 id,
                 soloPipelineState: .pipelinedLookahead,
@@ -1038,7 +1039,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 id: id,
                 plan: plan,
                 emittedToken: result.tokens[0])
-            return result
+            return resultWithObservation(
+                result,
+                observation: pldLowYieldObservation(
+                    gateWasEnabled: gateWasEnabled,
+                    session: slots[id]?.pldSession))
 
         case .fallbackFromSpeculative:
             return try decodeSpeculativeFallback(id: id, plan: plan)
@@ -1069,6 +1074,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard forwardedLast == plannedLast else {
             throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
         }
+        let gateWasEnabled = session.isGateEnabled
         // Speculative truncate/rollback is a dense-KV-only operation; hybrid rejects speculation
         // at construction (recurrent state cannot rewind), so this narrow is defense in depth.
         let denseCaches = caches.compactMap { $0 as? any ContinuousScalarKVCache }
@@ -1115,7 +1121,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             id: id,
             tokens: [emitted],
             finished: false,
-            soloPipelineState: .pipelinedLookahead)
+            soloPipelineState: .pipelinedLookahead,
+            observation: pldLowYieldObservation(
+                gateWasEnabled: gateWasEnabled,
+                session: session))
     }
 
     private func decodeSpeculativeVerification(
@@ -1173,6 +1182,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard !verifyInput.isEmpty else {
             throw DenseContinuousBatchRuntimeError.speculationStateMismatch(id)
         }
+        let gateWasEnabled = session.isGateEnabled
 
         let previousCachedTokens = slot.cachedTokens
         try ensureScalarCapacity(
@@ -1251,7 +1261,32 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             id: id,
             tokens: commit.emittedTokens,
             finished: false,
-            soloPipelineState: .speculative)
+            soloPipelineState: .speculative,
+            observation: pldLowYieldObservation(
+                gateWasEnabled: gateWasEnabled,
+                session: session))
+    }
+
+    private func pldLowYieldObservation(
+        gateWasEnabled: Bool,
+        session: IncrementalPLDSession?
+    ) -> BatchDecodeObservation {
+        guard gateWasEnabled, let session, !session.isGateEnabled else {
+            return .none
+        }
+        return .pldLowYieldDisabled
+    }
+
+    private func resultWithObservation(
+        _ result: ContinuousBatchRuntimeDecodeResult,
+        observation: BatchDecodeObservation
+    ) -> ContinuousBatchRuntimeDecodeResult {
+        ContinuousBatchRuntimeDecodeResult(
+            id: result.id,
+            tokens: result.tokens,
+            finished: result.finished,
+            soloPipelineState: result.soloPipelineState,
+            observation: observation)
     }
 
     private func drainSpeculativeSolo(
