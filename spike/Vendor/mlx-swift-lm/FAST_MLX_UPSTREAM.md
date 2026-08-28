@@ -26,6 +26,13 @@ below; a future remote fork may replace this path dependency only at an immutabl
   native Qwen drafter types remain package-scoped and intentionally absent from
   model-factory and serving registration; a future loader must first consume
   fast-mlx's exact artifact preflight binding.
+- Ported the bounded Qwen3.5 GatedDeltaNet four-input-projection fusion candidate
+  from upstream MLX Swift LM PR #572 / commit
+  `37688d2cf7d3906e08c74479c9d9949ce6b81136`. In this fork the candidate is
+  default-off (`MLX_QWEN_FOUR_GDN=1|true|yes|on`), limited to stock compatible
+  `QuantizedLinear` projections, and preserves the existing checkpoint-visible
+  Qwen text/VLM projection names by replacing them with storage-sharing views
+  only after explicit model preparation.
 
 The product remains model-generic. A model whose attention call shape does not use a qualified
 router must fail closed for the packed route and continue to use its existing fp16 path.

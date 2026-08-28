@@ -185,6 +185,11 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
 
+    // Inference-only physical projection. The four registered modules remain
+    // as views so checkpoint, adapter, and parameter paths do not change.
+    private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
+    var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
 
@@ -233,6 +238,110 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let inputProjectionPrefixes = [
+            "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
+        ]
+        let replacesInputProjection = parameters.flattened().contains { key, _ in
+            inputProjectionPrefixes.contains(where: key.hasPrefix)
+        }
+        defer {
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        let replacesInputProjection =
+            key == "in_proj_qkv" || key == "in_proj_z"
+            || key == "in_proj_b" || key == "in_proj_a"
+        defer {
+            if replacesInputProjection {
+                fusedInputProjection.invalidate()
+            }
+        }
+        try super.updateModule(key: key, value)
+    }
+
+    var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+    var inputProjectionLinears: [Linear] {
+        [inProjQKV, inProjZ, inProjB, inProjA]
+    }
+
+    @discardableResult
+    func prepareFusedInputProjection() throws -> Bool {
+        try prepareFusedInputProjectionResult().hasPreparedProjection
+    }
+
+    @discardableResult
+    func prepareFusedInputProjectionResult() throws -> FusedQuantizedLinearPrepareResult {
+        try fusedInputProjection.prepareResult(
+            enabled: fusedInputProjectionEnabled,
+            linears: inputProjectionLinears,
+            expectedOutputDimensions: [
+                keyDim * 2 + valueDim,
+                valueDim,
+                numVHeads,
+                numVHeads,
+            ]
+        ) { sourceViews in
+            try update(
+                modules: ModuleChildren(values: [
+                    "in_proj_qkv": .value(sourceViews[0]),
+                    "in_proj_z": .value(sourceViews[1]),
+                    "in_proj_b": .value(sourceViews[2]),
+                    "in_proj_a": .value(sourceViews[3]),
+                ]),
+                verify: [])
+        }
+    }
+
+    func restoreInputProjections(_ linears: [Linear]) throws {
+        precondition(linears.count == 4)
+        try update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(linears[0]),
+                "in_proj_z": .value(linears[1]),
+                "in_proj_b": .value(linears[2]),
+                "in_proj_a": .value(linears[3]),
+            ]),
+            verify: [])
+    }
+
+    func projectInputs(_ inputs: MLXArray, batch: Int, sequence: Int) -> (
+        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+    ) {
+        guard fusedInputProjectionEnabled, let fusedInProj = fusedInputProjection.fused else {
+            return (
+                inProjQKV(inputs),
+                inProjZ(inputs).reshaped(batch, sequence, numVHeads, headVDim),
+                inProjB(inputs),
+                inProjA(inputs)
+            )
+        }
+
+        let projected = fusedInProj(inputs)
+        let qkvEnd = keyDim * 2 + valueDim
+        let zEnd = qkvEnd + valueDim
+        let bEnd = zEnd + numVHeads
+        let aEnd = bEnd + numVHeads
+        return (
+            projected[0..., 0..., ..<qkvEnd],
+            projected[0..., 0..., qkvEnd ..< zEnd].reshaped(
+                batch, sequence, numVHeads, headVDim),
+            projected[0..., 0..., zEnd ..< bEnd],
+            projected[0..., 0..., bEnd ..< aEnd]
+        )
+    }
+
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
@@ -242,10 +351,7 @@ final class Qwen35GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        var (qkv, z, b, a) = projectInputs(inputs, batch: B, sequence: S)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -659,6 +765,38 @@ private func evaluateQwen35MTPPromptOutputs(
     }
 }
 
+func prepareQwen35GatedDeltaNetLayers(
+    _ layers: [Qwen35GatedDeltaNet],
+    prepareLayer: (Qwen35GatedDeltaNet) throws -> FusedQuantizedLinearPrepareResult = {
+        try $0.prepareFusedInputProjectionResult()
+    }
+) throws {
+    var preparedLayers: [(layer: Qwen35GatedDeltaNet, linears: [Linear])] = []
+    do {
+        for layer in layers {
+            let originalLinears = layer.inputProjectionLinears
+            if try prepareLayer(layer) == .prepared {
+                preparedLayers.append((layer, originalLinears))
+            }
+        }
+    } catch {
+        var rollbackError: (any Error)?
+        for prepared in preparedLayers.reversed() {
+            do {
+                try prepared.layer.restoreInputProjections(prepared.linears)
+            } catch let error {
+                rollbackError = error
+            }
+        }
+        if let rollbackError {
+            throw FusedQuantizedLinearPreparationError(
+                installationError: error,
+                rollbackError: rollbackError)
+        }
+        throw error
+    }
+}
+
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
     MTPPromptHiddenStateEvaluationOrderPreparingModel
 {
@@ -679,6 +817,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    var linearAttentionLayers: [Qwen35GatedDeltaNet] {
+        model.layers.compactMap(\.linearAttn)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -863,6 +1005,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
         }
     }
 
+    public func prepare() throws {
+        try prepareQwen35GatedDeltaNetLayers(linearAttentionLayers)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
         let hasUnsanitizedConv1d = weights.contains { key, value in
@@ -965,6 +1111,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider,
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func prepareForMTP(

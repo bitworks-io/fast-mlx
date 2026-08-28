@@ -84,5 +84,9 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
 
+    if let languageModel = model as? LanguageModel {
+        try languageModel.prepare()
+    }
+
     eval(model)
 }

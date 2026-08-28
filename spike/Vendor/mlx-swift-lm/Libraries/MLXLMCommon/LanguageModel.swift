@@ -255,6 +255,13 @@ public enum PrepareResult {
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: BaseLanguageModel {
 
+    /// Build derived inference state after checkpoint or topology updates.
+    ///
+    /// Implementations may materialize arrays or replace storage-sharing module
+    /// views. Callers should invoke this while they have exclusive access to
+    /// the model; inference calls must remain read-only.
+    func prepare() throws
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// This can return:
@@ -275,6 +282,9 @@ public protocol LanguageModel: BaseLanguageModel {
 }
 
 extension LanguageModel {
+    /// Most language models have no derived inference state to prepare.
+    public func prepare() throws {}
+
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
     {
