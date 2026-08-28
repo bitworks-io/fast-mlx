@@ -296,26 +296,26 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "dedicated-serving-qualification-planner",
-                "title": "Publish dedicated-serving qualification planning",
-                "publishedAt": "2026-08-28T14:53:17-05:00",
+                "id": "qwen-gdn-four-projection-fusion",
+                "title": "Publish opt-in Qwen GDN projection fusion",
+                "publishedAt": "2026-08-28T17:12:49-05:00",
                 "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes a fail-closed, dry-run-only dedicated-serving "
-                    "qualification planner with explicit host evidence, staged "
-                    "ceiling candidates, and reconciled allocator budgets."
+                    "Publishes a default-off four-input-projection fusion candidate "
+                    "for compatible quantized Qwen Gated DeltaNet layers, with "
+                    "storage-sharing checkpoint views and atomic lifecycle controls."
                 ),
                 "scope": (
-                    "Planning source and tests only; no privilege, sysctl mutation, "
-                    "persistence, live host qualification, model load, runtime "
-                    "promotion, or deployment authority."
+                    "Reviewed source and synthetic parity tests only; no live "
+                    "Qwen3.8-27B performance result, serving default, model promotion, "
+                    "deployment, or production authority."
                 ),
-                "publicCommit": "5f070f128d68de97544c912bcde5223a76c97304",
+                "publicCommit": "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
                 "publicLinks": [
                     {
-                        "label": "Inspect the capacity capability",
-                        "path": "capabilities/capacity-proof-control-tools/",
+                        "label": "Inspect the capabilities",
+                        "path": "capabilities/",
                     },
                     {
                         "label": "See the improvement loop",
@@ -332,6 +332,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
                 "5f070f128d68de97544c912bcde5223a76c97304",
                 "137d88d79d15fc65f169ba5dce79db75723ac92e",
                 "17ce331930929b1deb100cd6afed60ca993e665d",

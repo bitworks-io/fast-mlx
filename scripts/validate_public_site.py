@@ -170,9 +170,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_346
+REVIEWED_HOME_PAGE_BYTES = 10_343
 REVIEWED_HOME_PAGE_SHA256 = (
-    "a070e4bcb3b5d388b930ffb2e1491f8b5df666e91e9f4db0814eef3630d95b18"
+    "303e29a1ae9c1c9d49c0666a1cf9d0e5ee07a4b9fb32fa9cea9c828aef4b96cc"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -196,9 +196,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_491
+REVIEWED_STATUS_PAGE_BYTES = 22_488
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "8e9d59cdc3272bf32bbdf454230ea31ea0b9c8a6db6f0437d020162d3f84b255"
+    "be1808471e1af7c0b86fa001803888d7d57a99b60547b8bf176ea0e1c4df2bc4"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 17_747
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -373,8 +373,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/dedicated-serving-qualification-planner/",
-    "https://github.com/bitworks-io/fast-mlx/commit/5f070f128d68de97544c912bcde5223a76c97304",
+    "../releases/qwen-gdn-four-projection-fusion/",
+    "https://github.com/bitworks-io/fast-mlx/commit/1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -386,7 +386,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "23 published research notes",
-    "18 reviewed release records",
+    "19 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -529,11 +529,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 18_316
+REVIEWED_RELEASE_INDEX_BYTES = 19_438
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "362744aefad4fac44b1ed543e875db0faea90ae75019de13756073a582fba125"
+    "0c6df8c0ee5c6e11038eaaacd4aa58ed5dde2b71f9175aea1322fc079c20296b"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "qwen-gdn-four-projection-fusion",
+        "Publish opt-in Qwen GDN projection fusion",
+    ),
     (
         "dedicated-serving-qualification-planner",
         "Publish dedicated-serving qualification planning",
@@ -569,6 +573,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "qwen-gdn-four-projection-fusion": (
+        4_709,
+        "6408d9fd66c73ba44b8f059607c0bdd12b8ae31156eeddc17a6b9065311e709b",
+    ),
     "dedicated-serving-qualification-planner": (
         4_770,
         "750df5a0bf2fe91613e22bafa16dce9978374be3c83a87f8da834e1d498eb6dc",
@@ -3262,7 +3270,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "dedicated-serving-qualification-planner",
+        "data-latest-release-id": "qwen-gdn-four-projection-fusion",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }

@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "qwen-gdn-four-projection-fusion",
+      "title": "Publish opt-in Qwen GDN projection fusion",
+      "publishedAt": "2026-08-28T17:12:49-05:00",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes a default-off four-input-projection fusion candidate for compatible quantized Qwen Gated DeltaNet layers, with storage-sharing checkpoint views and atomic lifecycle controls.",
+      "scope": "Reviewed source and synthetic parity tests only; no live Qwen3.8-27B performance result, serving default, model promotion, deployment, or production authority.",
+      "publicCommit": "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
+      "publicLinks": [
+        {
+          "label": "Inspect the capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "dedicated-serving-qualification-planner",
       "title": "Publish dedicated-serving qualification planning",
       "publishedAt": "2026-08-28T14:53:17-05:00",
