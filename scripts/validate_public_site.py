@@ -173,9 +173,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_425
+REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "d9f8a0d6a4642540f285c260604d3557bea4e6304d907863b9c5eefeaeff28f9"
+    "c8ca552011fe158028d2fa9edcaf198c5238b6d4d4393eb39900db7d6c0d6958"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -199,9 +199,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_855
+REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "a703085488876684ed3a14d14f61ddd3b2dc2c899ab07aed59720f7487e0ad86"
+    "c3e076032be8f35e9168f95d5cdc9e9719b14c41dbe69cafe91b1ef0c7b198c4"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -377,8 +377,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/qwen-gdn-launch-evidence-producer/",
-    "https://github.com/bitworks-io/fast-mlx/commit/b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
+    "../releases/model-aware-context-completion-budgets/",
+    "https://github.com/bitworks-io/fast-mlx/commit/940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -390,7 +390,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "24 published research notes",
-    "21 reviewed release records",
+    "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -535,11 +535,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 21_792
+REVIEWED_RELEASE_INDEX_BYTES = 23_025
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "b56d88215f904156cb07a57e12286d83c701c6fc12cb122161dfb5f8db73cea8"
+    "e1d5ccae648b66108562fb3c85b2628c82d926a9e8f8238f12ab64ee3b9eb23f"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "model-aware-context-completion-budgets",
+        "Publish model-aware context and completion budgets",
+    ),
     (
         "qwen-gdn-launch-evidence-producer",
         "Publish Qwen GDN launch evidence producer",
@@ -587,6 +591,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "model-aware-context-completion-budgets": (
+        4_852,
+        "6e307e05e3e2eb1b806c8dd7e86fa2ecdfd27eda541e6a8bad304652b6df972a",
+    ),
     "qwen-gdn-launch-evidence-producer": (
         4_793,
         "ae64354558c712c3e30a8cb6b2a0bd2b2bb554303a41ce10e6fda18654b14e4f",
@@ -3298,7 +3306,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "qwen-gdn-launch-evidence-producer",
+        "data-latest-release-id": "model-aware-context-completion-budgets",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }

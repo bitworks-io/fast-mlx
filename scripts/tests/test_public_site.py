@@ -296,31 +296,30 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "qwen-gdn-launch-evidence-producer",
-                "title": "Publish Qwen GDN launch evidence producer",
-                "publishedAt": "2026-08-29T20:35:34Z",
-                "category": "foundation",
+                "id": "model-aware-context-completion-budgets",
+                "title": "Publish model-aware context and completion budgets",
+                "publishedAt": "2026-08-29T21:36:35Z",
+                "category": "product",
                 "state": "released",
                 "summary": (
-                    "Publishes a fail-closed Qwen3.8 live-exactness evidence producer "
-                    "that binds the committed harness, kernel-observed executable, process "
-                    "identity, GDN-on environment, and explicit dedicated-serving memory "
-                    "policy before model allocation."
+                    "Publishes model- and host-fit-aware context and completion budgets "
+                    "with authenticated discovery and exact prompt, transport, and "
+                    "response enforcement across supported serving routes."
                 ),
                 "scope": (
-                    "Reviewed source and deterministic contract tests only; no live model "
-                    "exactness or performance result, host qualification, serving default, "
-                    "model promotion, deployment, or production authority."
+                    "Reviewed source and regression tests for supported fast-mlx routes; "
+                    "no universal model-family support, long-context quality, throughput, "
+                    "GLM runtime, deployment, or production promotion claim."
                 ),
-                "publicCommit": "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
+                "publicCommit": "940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
                 "publicLinks": [
                     {
-                        "label": "Inspect the capabilities",
-                        "path": "capabilities/",
+                        "label": "Inspect the serving capability",
+                        "path": "capabilities/openai-http-sse-serving/",
                     },
                     {
-                        "label": "See the improvement loop",
-                        "path": "process/",
+                        "label": "Read the implementation note",
+                        "path": "research/the-4k-limit-was-not-the-model-limit/",
                     },
                     {
                         "label": "Read the release JSON",
@@ -333,6 +332,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
                 "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
                 "6a44732e6834788c12b569a8dc5fe1d3b1376455",
                 "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",

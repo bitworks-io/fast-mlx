@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "model-aware-context-completion-budgets",
+      "title": "Publish model-aware context and completion budgets",
+      "publishedAt": "2026-08-29T21:36:35Z",
+      "category": "product",
+      "state": "released",
+      "summary": "Publishes model- and host-fit-aware context and completion budgets with authenticated discovery and exact prompt, transport, and response enforcement across supported serving routes.",
+      "scope": "Reviewed source and regression tests for supported fast-mlx routes; no universal model-family support, long-context quality, throughput, GLM runtime, deployment, or production promotion claim.",
+      "publicCommit": "940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
+      "publicLinks": [
+        {
+          "label": "Inspect the serving capability",
+          "path": "capabilities/openai-http-sse-serving/"
+        },
+        {
+          "label": "Read the implementation note",
+          "path": "research/the-4k-limit-was-not-the-model-limit/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "qwen-gdn-launch-evidence-producer",
       "title": "Publish Qwen GDN launch evidence producer",
       "publishedAt": "2026-08-29T20:35:34Z",
