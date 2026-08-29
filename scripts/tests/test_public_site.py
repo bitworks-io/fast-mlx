@@ -296,22 +296,22 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "qwen-gdn-four-projection-fusion",
-                "title": "Publish opt-in Qwen GDN projection fusion",
-                "publishedAt": "2026-08-28T17:12:49-05:00",
+                "id": "qwen-gdn-scorecard-mode-identity",
+                "title": "Bind Qwen scorecards to isolated GDN modes",
+                "publishedAt": "2026-08-29T15:40:20Z",
                 "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes a default-off four-input-projection fusion candidate "
-                    "for compatible quantized Qwen Gated DeltaNet layers, with "
-                    "storage-sharing checkpoint views and atomic lifecycle controls."
+                    "Publishes a fail-closed Qwen performance scorecard contract that "
+                    "binds fusion mode, observed environment, launch identity, and "
+                    "process-isolation evidence before a fusion-enabled row can promote."
                 ),
                 "scope": (
-                    "Reviewed source and synthetic parity tests only; no live "
-                    "Qwen3.8-27B performance result, serving default, model promotion, "
-                    "deployment, or production authority."
+                    "Reviewed source and synthetic contract tests only; no live "
+                    "Qwen3.8-27B exactness or performance result, host or model "
+                    "promotion, serving default, deployment, or production authority."
                 ),
-                "publicCommit": "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
+                "publicCommit": "6a44732e6834788c12b569a8dc5fe1d3b1376455",
                 "publicLinks": [
                     {
                         "label": "Inspect the capabilities",
@@ -332,6 +332,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "6a44732e6834788c12b569a8dc5fe1d3b1376455",
                 "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
                 "5f070f128d68de97544c912bcde5223a76c97304",
                 "137d88d79d15fc65f169ba5dce79db75723ac92e",

@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-28",
+  "updatedAt": "2026-08-29",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,30 @@
     }
   },
   "releases": [
+    {
+      "id": "qwen-gdn-scorecard-mode-identity",
+      "title": "Bind Qwen scorecards to isolated GDN modes",
+      "publishedAt": "2026-08-29T15:40:20Z",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes a fail-closed Qwen performance scorecard contract that binds fusion mode, observed environment, launch identity, and process-isolation evidence before a fusion-enabled row can promote.",
+      "scope": "Reviewed source and synthetic contract tests only; no live Qwen3.8-27B exactness or performance result, host or model promotion, serving default, deployment, or production authority.",
+      "publicCommit": "6a44732e6834788c12b569a8dc5fe1d3b1376455",
+      "publicLinks": [
+        {
+          "label": "Inspect the capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "qwen-gdn-four-projection-fusion",
       "title": "Publish opt-in Qwen GDN projection fusion",
