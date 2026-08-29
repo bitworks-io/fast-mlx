@@ -296,22 +296,23 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "qwen-gdn-scorecard-mode-identity",
-                "title": "Bind Qwen scorecards to isolated GDN modes",
-                "publishedAt": "2026-08-29T15:40:20Z",
+                "id": "qwen-gdn-launch-evidence-producer",
+                "title": "Publish Qwen GDN launch evidence producer",
+                "publishedAt": "2026-08-29T20:35:34Z",
                 "category": "foundation",
                 "state": "released",
                 "summary": (
-                    "Publishes a fail-closed Qwen performance scorecard contract that "
-                    "binds fusion mode, observed environment, launch identity, and "
-                    "process-isolation evidence before a fusion-enabled row can promote."
+                    "Publishes a fail-closed Qwen3.8 live-exactness evidence producer "
+                    "that binds the committed harness, kernel-observed executable, process "
+                    "identity, GDN-on environment, and explicit dedicated-serving memory "
+                    "policy before model allocation."
                 ),
                 "scope": (
-                    "Reviewed source and synthetic contract tests only; no live "
-                    "Qwen3.8-27B exactness or performance result, host or model "
-                    "promotion, serving default, deployment, or production authority."
+                    "Reviewed source and deterministic contract tests only; no live model "
+                    "exactness or performance result, host qualification, serving default, "
+                    "model promotion, deployment, or production authority."
                 ),
-                "publicCommit": "6a44732e6834788c12b569a8dc5fe1d3b1376455",
+                "publicCommit": "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
                 "publicLinks": [
                     {
                         "label": "Inspect the capabilities",
@@ -332,6 +333,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
                 "6a44732e6834788c12b569a8dc5fe1d3b1376455",
                 "1cb589cc71241cf84c4763f4f37b5ad5b8520bdc",
                 "5f070f128d68de97544c912bcde5223a76c97304",

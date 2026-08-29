@@ -16,6 +16,30 @@
   },
   "releases": [
     {
+      "id": "qwen-gdn-launch-evidence-producer",
+      "title": "Publish Qwen GDN launch evidence producer",
+      "publishedAt": "2026-08-29T20:35:34Z",
+      "category": "foundation",
+      "state": "released",
+      "summary": "Publishes a fail-closed Qwen3.8 live-exactness evidence producer that binds the committed harness, kernel-observed executable, process identity, GDN-on environment, and explicit dedicated-serving memory policy before model allocation.",
+      "scope": "Reviewed source and deterministic contract tests only; no live model exactness or performance result, host qualification, serving default, model promotion, deployment, or production authority.",
+      "publicCommit": "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
+      "publicLinks": [
+        {
+          "label": "Inspect the capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "See the improvement loop",
+          "path": "process/"
+        },
+        {
+          "label": "Read the release JSON",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "qwen-gdn-scorecard-mode-identity",
       "title": "Bind Qwen scorecards to isolated GDN modes",
       "publishedAt": "2026-08-29T15:40:20Z",
