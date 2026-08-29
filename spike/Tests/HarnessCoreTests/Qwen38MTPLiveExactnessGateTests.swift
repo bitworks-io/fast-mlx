@@ -13,6 +13,8 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         XCTAssertEqual(proof.artifactID, Gate.requiredArtifactID)
         XCTAssertEqual(proof.sourceID, Gate.requiredSourceIdentity.sourceID)
         XCTAssertTrue(proof.accepted)
+        XCTAssertNil(proof.gdnMode)
+        XCTAssertNil(proof.launchBinding)
         XCTAssertEqual(proof.evidenceID.count, 64)
         XCTAssertTrue(proof.evidenceID.allSatisfy { $0.isHexDigit && !$0.isUppercase })
         XCTAssertNil(Qwen38MTPPerformanceScorecardGate.requiredAcceptedLiveExactnessProof)
@@ -214,6 +216,20 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         }
     }
 
+    func testCanonicalLiveProofIsUnboundAndCannotAuthorizeFusionOnPerformance() throws {
+        let proof = try Gate.validateJSONL(try recordData())
+
+        XCTAssertNil(proof.gdnMode)
+        XCTAssertNil(proof.launchBinding)
+        XCTAssertThrowsError(
+            try Qwen38MTPPerformanceScorecardGate.validateAuthority(
+                scorecardAuthority(liveProof: proof))) { error in
+            XCTAssertEqual(
+                error as? Qwen38MTPPerformanceScorecardGateError,
+                .invalidLiveExactnessProof)
+        }
+    }
+
     private func validate(
         _ evidence: Qwen38MTPLiveExactnessEvidence
     ) throws -> Qwen38MTPPerformanceScorecardLiveExactnessProof {
@@ -331,5 +347,75 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
 
     private func hex40(_ character: Character) -> String {
         String(repeating: String(character), count: 40)
+    }
+
+    private func scorecardAuthority(
+        liveProof: Qwen38MTPPerformanceScorecardLiveExactnessProof
+    ) -> Qwen38MTPPerformanceScorecardAuthorityBundle {
+        let sourceID = Gate.requiredSourceIdentity.sourceID
+        return Qwen38MTPPerformanceScorecardAuthorityBundle(
+            acceptedLiveExactnessProof: liveProof,
+            trustedEngineIdentities: .init(
+                candidate: .init(
+                    label: "candidate",
+                    artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
+                    executionDigest: Qwen38MTPPerformanceScorecardGate.promptSHA256(
+                        "generic candidate execution identity"),
+                    sourceDigest: sourceID,
+                    gdnMode: .gdnOn,
+                    launchBinding: scorecardLaunchBinding(
+                        mode: .gdnOn,
+                        sourceDigest: sourceID,
+                        processIsolationEvidenceID: hex("4"))),
+                reference: .init(
+                    label: "reference",
+                    artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
+                    executionDigest: Qwen38MTPPerformanceScorecardGate.promptSHA256(
+                        "generic reference execution identity"),
+                    sourceDigest: sourceID,
+                    gdnMode: .gdnOff,
+                    launchBinding: scorecardLaunchBinding(
+                        mode: .gdnOff,
+                        sourceDigest: sourceID,
+                        processIsolationEvidenceID: hex("5")))),
+            trustedRunIdentity: .init(
+                measurementClass: Qwen38MTPPerformanceScorecardGate.measurementClass,
+                hardwareChip: "generic-heavy-chip",
+                hardwareRAMBytes: Qwen38MTPPerformanceScorecardGate.requiredRAMBytes,
+                hardwareOSBuild: "generic-os-build-2026-08-24",
+                hostIdentityDigest: Qwen38MTPPerformanceScorecardGate.promptSHA256(
+                    "generic dedicated heavy host identity"),
+                harnessGitSHA: String(repeating: "1", count: 40),
+                candidateMLXSwiftVersion: "generic-mlx-swift-framework-1",
+                referenceMLXVersion: nil,
+                referenceMLXLMVersion: nil,
+                modelLabel: Qwen38MTPPerformanceScorecardGate.modelArtifactLabel,
+                modelConfigHash:
+                    Qwen38MTPPerformanceScorecardGate.requiredArtifact.targetConfigSHA256,
+                modelCheckpointManifestHash:
+                    Qwen38MTPPerformanceScorecardGate.requiredArtifact.targetTensorManifestSHA256,
+                modelQuant: ModelQuantInfo(bits: 8, groupSize: 32),
+                corpusID: Qwen38MTPPerformanceScorecardGate.requiredWorkload.id,
+                corpusContentHash:
+                    Qwen38MTPPerformanceScorecardGate.requiredWorkload.contentSHA256))
+    }
+
+    private func scorecardLaunchBinding(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        sourceDigest: String,
+        processIsolationEvidenceID: String
+    ) -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv =
+            mode == .gdnOn ? .enabled : .disabled
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: mode,
+            sourceDigest: sourceDigest,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: Qwen38MTPPerformanceScorecardGate.launchDigest(
+                mode: mode,
+                sourceDigest: sourceDigest,
+                observedEnv: observedEnv,
+                processIsolationEvidenceID: processIsolationEvidenceID))
     }
 }

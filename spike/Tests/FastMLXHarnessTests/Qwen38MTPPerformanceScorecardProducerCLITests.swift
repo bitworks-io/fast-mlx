@@ -175,21 +175,27 @@ final class Qwen38MTPPerformanceScorecardProducerCLITests: XCTestCase {
         Qwen38MTPPerformanceScorecardAuthorityBundle(
             acceptedLiveExactnessProof: .init(
                 artifact: Gate.requiredArtifact,
-                artifactID: hex("a"),
-                sourceID: hex("b"),
+                artifactID: Qwen38MTPLiveExactnessGate.requiredArtifactID,
+                sourceID: Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
                 evidenceID: hex("c"),
-                accepted: true),
+                accepted: true,
+                gdnMode: .gdnOn,
+                launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
             trustedEngineIdentities: .init(
                 candidate: .init(
                     label: "candidate",
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic candidate execution"),
-                    sourceDigest: Gate.promptSHA256("generic candidate source")),
+                    sourceDigest: sharedSourceDigest,
+                    gdnMode: .gdnOn,
+                    launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
                 reference: .init(
                     label: "reference",
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic reference execution"),
-                    sourceDigest: Gate.promptSHA256("generic reference source"))),
+                    sourceDigest: sharedSourceDigest,
+                    gdnMode: .gdnOff,
+                    launchBinding: launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("5")))),
             trustedRunIdentity: .init(
                 measurementClass: Gate.measurementClass,
                 hardwareChip: "generic-heavy-chip",
@@ -311,6 +317,28 @@ final class Qwen38MTPPerformanceScorecardProducerCLITests: XCTestCase {
 
     private static func hex(_ character: Character) -> String {
         String(repeating: String(character), count: 64)
+    }
+
+    private static var sharedSourceDigest: String {
+        Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID
+    }
+
+    private static func launchBinding(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        processIsolationEvidenceID: String
+    ) -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv =
+            mode == .gdnOn ? .enabled : .disabled
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: mode,
+            sourceDigest: sharedSourceDigest,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: Gate.launchDigest(
+                mode: mode,
+                sourceDigest: sharedSourceDigest,
+                observedEnv: observedEnv,
+                processIsolationEvidenceID: processIsolationEvidenceID))
     }
 }
 

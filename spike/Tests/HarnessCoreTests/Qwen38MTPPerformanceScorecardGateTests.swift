@@ -99,8 +99,16 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         XCTAssertEqual(evidence.reference, trustedEngineIdentities.reference)
         XCTAssertEqual(evidence.reference.artifact, evidence.candidate.artifact)
         XCTAssertNotEqual(evidence.candidate.executionDigest, evidence.reference.executionDigest)
-        XCTAssertNotEqual(evidence.candidate.sourceDigest, evidence.reference.sourceDigest)
+        XCTAssertEqual(evidence.candidate.sourceDigest, evidence.reference.sourceDigest)
+        XCTAssertEqual(evidence.candidate.gdnMode, .gdnOn)
+        XCTAssertEqual(evidence.reference.gdnMode, .gdnOff)
+        XCTAssertEqual(evidence.candidate.launchBinding?.mode, .gdnOn)
+        XCTAssertEqual(evidence.reference.launchBinding?.mode, .gdnOff)
+        XCTAssertEqual(evidence.candidate.launchBinding?.observedEnv, .enabled)
+        XCTAssertEqual(evidence.reference.launchBinding?.observedEnv, .disabled)
         XCTAssertEqual(evidence.liveExactnessProof, trustedProof)
+        XCTAssertEqual(evidence.liveExactnessProof?.gdnMode, .gdnOn)
+        XCTAssertEqual(evidence.liveExactnessProof?.launchBinding, evidence.candidate.launchBinding)
         XCTAssertEqual(evidence.measurementClass, "dedicated-heavy-256gib")
         XCTAssertEqual(evidence.hardware.chip, trustedRunIdentity.hardwareChip)
         XCTAssertEqual(evidence.hardware.ramBytes, 274_877_906_944)
@@ -175,6 +183,102 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
                 trustedEngineIdentities: trustedEngineIdentities,
                 trustedRunIdentity: driftedRunIdentity)) { error in
             XCTAssertEqual(error as? GateError, .invalidRunIdentity)
+        }
+    }
+
+    func testGDNModeIdentityAcceptsSameArtifactAndSourceOnlyForAuthenticatedOppositeModes() {
+        XCTAssertNoThrow(try validateTrusted(makeEvidence()))
+
+        let labelOnlyAuthority = authority(
+            candidate: model(mode: nil, binding: nil, label: "candidate-gdn-on"),
+            reference: model(mode: nil, binding: nil, label: "reference-gdn-off"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: labelOnlyAuthority), authority: labelOnlyAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var sameModeAuthority = trustedAuthority
+        sameModeAuthority.trustedEngineIdentities.reference.gdnMode = .gdnOn
+        sameModeAuthority.trustedEngineIdentities.reference.launchBinding =
+            launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("8"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: sameModeAuthority), authority: sameModeAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var unboundAuthority = trustedAuthority
+        unboundAuthority.trustedEngineIdentities.candidate.launchBinding = nil
+        unboundAuthority.trustedEngineIdentities.reference.launchBinding = nil
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: unboundAuthority), authority: unboundAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var sameProcessAuthority = trustedAuthority
+        sameProcessAuthority.trustedEngineIdentities.reference.launchBinding =
+            launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("4"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: sameProcessAuthority), authority: sameProcessAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var envMismatchAuthority = trustedAuthority
+        envMismatchAuthority.trustedEngineIdentities.reference.launchBinding =
+            launchBinding(
+                mode: .gdnOff,
+                observedEnv: .enabled,
+                processIsolationEvidenceID: hex("5"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: envMismatchAuthority), authority: envMismatchAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var forgedDigestAuthority = trustedAuthority
+        forgedDigestAuthority.trustedEngineIdentities.candidate.launchBinding =
+            launchBinding(
+                mode: .gdnOn,
+                processIsolationEvidenceID: hex("4"),
+                launchDigest: hex("9"))
+        forgedDigestAuthority.acceptedLiveExactnessProof.launchBinding =
+            forgedDigestAuthority.trustedEngineIdentities.candidate.launchBinding
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: forgedDigestAuthority), authority: forgedDigestAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var fakeSourceAuthority = trustedAuthority
+        fakeSourceAuthority.trustedEngineIdentities.reference.sourceDigest =
+            Gate.promptSHA256("different unauthenticated source")
+        fakeSourceAuthority.trustedEngineIdentities.reference.launchBinding =
+            launchBinding(
+                mode: .gdnOff,
+                sourceDigest: fakeSourceAuthority.trustedEngineIdentities.reference.sourceDigest,
+                processIsolationEvidenceID: hex("9"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: fakeSourceAuthority), authority: fakeSourceAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+    }
+
+    func testFusionOnPerformanceCannotConsumeUnboundOrOffExactnessProof() {
+        var unbound = trustedAuthority
+        unbound.acceptedLiveExactnessProof.gdnMode = nil
+        unbound.acceptedLiveExactnessProof.launchBinding = nil
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: unbound), authority: unbound)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLiveExactnessProof)
+        }
+
+        var off = trustedAuthority
+        off.acceptedLiveExactnessProof.gdnMode = .gdnOff
+        off.acceptedLiveExactnessProof.launchBinding =
+            launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("a"))
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: off), authority: off)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLiveExactnessProof)
+        }
+
+        var arbitraryArtifact = trustedAuthority
+        arbitraryArtifact.acceptedLiveExactnessProof.artifactID = hex("b")
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: arbitraryArtifact), authority: arbitraryArtifact)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLiveExactnessProof)
+        }
+
+        var arbitrarySource = trustedAuthority
+        arbitrarySource.acceptedLiveExactnessProof.sourceID = hex("d")
+        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: arbitrarySource), authority: arbitrarySource)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLiveExactnessProof)
         }
     }
 
@@ -553,24 +657,20 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
     private var trustedProof: Qwen38MTPPerformanceScorecardLiveExactnessProof {
         Qwen38MTPPerformanceScorecardLiveExactnessProof(
             artifact: Gate.requiredArtifact,
-            artifactID: hex("a"),
-            sourceID: hex("b"),
+            artifactID: Qwen38MTPLiveExactnessGate.requiredArtifactID,
+            sourceID: Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
             evidenceID: hex("c"),
-            accepted: true)
+            accepted: true,
+            gdnMode: .gdnOn,
+            launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4")))
+    }
+
+    private var trustedAuthority: Qwen38MTPPerformanceScorecardAuthorityBundle {
+        authority(candidate: model(mode: .gdnOn), reference: model(mode: .gdnOff))
     }
 
     private var trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities {
-        Qwen38MTPPerformanceScorecardTrustedEngineIdentities(
-            candidate: Qwen38MTPPerformanceScorecardModel(
-                label: "candidate",
-                artifact: Gate.requiredArtifact,
-                executionDigest: Gate.promptSHA256("generic candidate execution identity"),
-                sourceDigest: Gate.promptSHA256("generic candidate source identity")),
-            reference: Qwen38MTPPerformanceScorecardModel(
-                label: "reference",
-                artifact: Gate.requiredArtifact,
-                executionDigest: Gate.promptSHA256("generic reference execution identity"),
-                sourceDigest: Gate.promptSHA256("generic reference source identity")))
+        trustedAuthority.trustedEngineIdentities
     }
 
     private var trustedRunIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity {
@@ -612,34 +712,36 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
             trustedRunIdentity: trustedRunIdentity)
     }
 
-    private func makeEvidence() -> Qwen38MTPPerformanceScorecardEvidence {
+    private func makeEvidence(
+        authority: Qwen38MTPPerformanceScorecardAuthorityBundle? = nil
+    ) -> Qwen38MTPPerformanceScorecardEvidence {
+        let suppliedAuthority = authority
+        let authority = authority ?? trustedAuthority
         var evidence = Qwen38MTPPerformanceScorecardEvidence(
             schemaVersion: Gate.schemaVersion,
             artifact: Gate.requiredArtifact,
-            candidate: trustedEngineIdentities.candidate,
-            reference: trustedEngineIdentities.reference,
-            liveExactnessProof: trustedProof,
+            candidate: authority.trustedEngineIdentities.candidate,
+            reference: authority.trustedEngineIdentities.reference,
+            liveExactnessProof: authority.acceptedLiveExactnessProof,
             measurementClass: Gate.measurementClass,
             hardware: .init(
                 className: Gate.measurementClass,
-                chip: trustedRunIdentity.hardwareChip,
+                chip: authority.trustedRunIdentity.hardwareChip,
                 ramBytes: Gate.requiredRAMBytes,
-                osBuild: trustedRunIdentity.hardwareOSBuild,
-                hostIdentityDigest: trustedRunIdentity.hostIdentityDigest),
+                osBuild: authority.trustedRunIdentity.hardwareOSBuild,
+                hostIdentityDigest: authority.trustedRunIdentity.hostIdentityDigest),
             releaseBuildRequired: true,
             releaseBuildObserved: true,
             workload: Gate.requiredWorkload,
             settings: Gate.requiredSettings,
             runPlan: Gate.runPlan,
-            pairs: makePairs(),
+            pairs: makePairs(authority: authority),
             metrics: .empty,
             verdict: .unqualified)
-        evidence.metrics = try! computeTrustedMetrics(evidence)
-        evidence.verdict = try! Gate.evaluateCandidate(
-            evidence,
-            trustedLiveExactnessProof: trustedProof,
-            trustedEngineIdentities: trustedEngineIdentities,
-            trustedRunIdentity: trustedRunIdentity)
+        if suppliedAuthority == nil {
+            evidence.metrics = try! Gate.computeMetrics(evidence, authority: authority)
+            evidence.verdict = try! Gate.evaluateCandidate(evidence, authority: authority)
+        }
         return evidence
     }
 
@@ -656,7 +758,9 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         return updated
     }
 
-    private func makePairs() -> [Qwen38MTPPerformanceScorecardPair] {
+    private func makePairs(
+        authority: Qwen38MTPPerformanceScorecardAuthorityBundle
+    ) -> [Qwen38MTPPerformanceScorecardPair] {
         Gate.runPlan.schedules.enumerated().map { offset, schedule in
             Qwen38MTPPerformanceScorecardPair(
                 concurrency: schedule.concurrency,
@@ -665,16 +769,74 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
                 order: schedule.order,
                 scheduledCaseIDs: schedule.caseIDs,
                 candidate: makeEngine(
-                    identity: trustedEngineIdentities.candidate,
+                    identity: authority.trustedEngineIdentities.candidate,
                     schedule: schedule,
                     offset: offset,
                     candidate: true),
                 reference: makeEngine(
-                    identity: trustedEngineIdentities.reference,
+                    identity: authority.trustedEngineIdentities.reference,
                     schedule: schedule,
                     offset: offset,
                     candidate: false))
         }
+    }
+
+    private func authority(
+        candidate: Qwen38MTPPerformanceScorecardModel,
+        reference: Qwen38MTPPerformanceScorecardModel
+    ) -> Qwen38MTPPerformanceScorecardAuthorityBundle {
+        Qwen38MTPPerformanceScorecardAuthorityBundle(
+            acceptedLiveExactnessProof: trustedProof,
+            trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities(
+                candidate: candidate,
+                reference: reference),
+            trustedRunIdentity: trustedRunIdentity)
+    }
+
+    private func model(
+        mode: Qwen38MTPPerformanceScorecardGDNMode?,
+        binding: Qwen38MTPPerformanceScorecardLaunchBinding? = nil,
+        label: String = "engine"
+    ) -> Qwen38MTPPerformanceScorecardModel {
+        let isOn = mode == .gdnOn || label.contains("candidate")
+        return Qwen38MTPPerformanceScorecardModel(
+            label: label,
+            artifact: Gate.requiredArtifact,
+            executionDigest: Gate.promptSHA256(
+                isOn ? "generic candidate execution identity" : "generic reference execution identity"),
+            sourceDigest: sharedSourceDigest,
+            gdnMode: mode,
+            launchBinding: binding ?? mode.map {
+                launchBinding(
+                    mode: $0,
+                    processIsolationEvidenceID: isOn ? hex("4") : hex("5"))
+            })
+    }
+
+    private func launchBinding(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        sourceDigest: String? = nil,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv? = nil,
+        processIsolationEvidenceID: String,
+        launchDigest: String? = nil
+    ) -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let sourceDigest = sourceDigest ?? sharedSourceDigest
+        let observedEnv = observedEnv ?? (mode == .gdnOn ? .enabled : .disabled)
+        let processIsolationEvidenceID = processIsolationEvidenceID
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: mode,
+            sourceDigest: sourceDigest,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: launchDigest ?? Gate.launchDigest(
+                mode: mode,
+                sourceDigest: sourceDigest,
+                observedEnv: observedEnv,
+                processIsolationEvidenceID: processIsolationEvidenceID))
+    }
+
+    private var sharedSourceDigest: String {
+        Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID
     }
 
     private func makeEngine(

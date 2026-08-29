@@ -62,6 +62,53 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
         XCTAssertEqual(calls, [])
     }
 
+    func testUnsafeSameProcessStaticEnvironmentToggleFailsBeforeMeasurement() async {
+        let log = CallLog()
+        var authority = Self.trustedAuthority
+        authority.trustedEngineIdentities.candidate.launchBinding =
+            Self.launchBinding(mode: .gdnOn, processIsolationEvidenceID: Self.hex("4"))
+        authority.trustedEngineIdentities.reference.launchBinding =
+            Self.launchBinding(mode: .gdnOff, processIsolationEvidenceID: Self.hex("4"))
+        let producer = Self.makeProducer(log: log)
+
+        do {
+            _ = try await producer.makeRecord(
+                authority: authority,
+                provenance: Self.makeProvenance(),
+                releaseBuildObserved: true)
+            XCTFail("Expected unsafe same-process static environment toggle to fail before measurement")
+        } catch {
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        let calls = await log.snapshot()
+        XCTAssertEqual(calls, [])
+    }
+
+    func testForgedLaunchDigestFailsBeforeMeasurement() async {
+        let log = CallLog()
+        var authority = Self.trustedAuthority
+        authority.trustedEngineIdentities.candidate.launchBinding = Self.launchBinding(
+            mode: .gdnOn,
+            processIsolationEvidenceID: Self.hex("4"),
+            launchDigest: Self.hex("8"))
+        authority.acceptedLiveExactnessProof.launchBinding = authority.trustedEngineIdentities.candidate.launchBinding
+        let producer = Self.makeProducer(log: log)
+
+        do {
+            _ = try await producer.makeRecord(
+                authority: authority,
+                provenance: Self.makeProvenance(),
+                releaseBuildObserved: true)
+            XCTFail("Expected forged launch digest to fail before measurement")
+        } catch {
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        let calls = await log.snapshot()
+        XCTAssertEqual(calls, [])
+    }
+
     func testProducerMeasuresFrozenSchedulesInFrozenOrder() async throws {
         let log = CallLog()
         let producer = Self.makeProducer(log: log)
@@ -185,21 +232,27 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
         Qwen38MTPPerformanceScorecardAuthorityBundle(
             acceptedLiveExactnessProof: Qwen38MTPPerformanceScorecardLiveExactnessProof(
                 artifact: Gate.requiredArtifact,
-                artifactID: hex("a"),
-                sourceID: hex("b"),
+                artifactID: Qwen38MTPLiveExactnessGate.requiredArtifactID,
+                sourceID: Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
                 evidenceID: hex("c"),
-                accepted: true),
+                accepted: true,
+                gdnMode: .gdnOn,
+                launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
             trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities(
                 candidate: Qwen38MTPPerformanceScorecardModel(
                     label: "candidate",
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic candidate execution identity"),
-                    sourceDigest: Gate.promptSHA256("generic candidate source identity")),
+                    sourceDigest: sharedSourceDigest,
+                    gdnMode: .gdnOn,
+                    launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
                 reference: Qwen38MTPPerformanceScorecardModel(
                     label: "reference",
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic reference execution identity"),
-                    sourceDigest: Gate.promptSHA256("generic reference source identity"))),
+                    sourceDigest: sharedSourceDigest,
+                    gdnMode: .gdnOff,
+                    launchBinding: launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("5")))),
             trustedRunIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity(
                 measurementClass: Gate.measurementClass,
                 hardwareChip: "generic-heavy-chip",
@@ -318,6 +371,29 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
 
     private static func hex(_ character: Character) -> String {
         String(repeating: String(character), count: 64)
+    }
+
+    private static var sharedSourceDigest: String {
+        Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID
+    }
+
+    private static func launchBinding(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv? = nil,
+        processIsolationEvidenceID: String,
+        launchDigest: String? = nil
+    ) -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let observedEnv = observedEnv ?? (mode == .gdnOn ? .enabled : .disabled)
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: mode,
+            sourceDigest: sharedSourceDigest,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: launchDigest ?? Gate.launchDigest(
+                mode: mode,
+                sourceDigest: sharedSourceDigest,
+                observedEnv: observedEnv,
+                processIsolationEvidenceID: processIsolationEvidenceID))
     }
 }
 

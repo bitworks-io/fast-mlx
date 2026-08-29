@@ -59,22 +59,60 @@ public struct Qwen38MTPPerformanceScorecardArtifact: Codable, Equatable, Sendabl
     }
 }
 
+public enum Qwen38MTPPerformanceScorecardGDNMode: String, Codable, Equatable, Sendable {
+    case gdnOff = "gdn-off"
+    case gdnOn = "gdn-on"
+}
+
+public enum Qwen38MTPPerformanceScorecardGDNObservedEnv: String, Codable, Equatable, Sendable {
+    case disabled
+    case enabled
+}
+
+public struct Qwen38MTPPerformanceScorecardLaunchBinding: Codable, Equatable, Sendable {
+    public var mode: Qwen38MTPPerformanceScorecardGDNMode
+    public var sourceDigest: String
+    public var observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv
+    public var processIsolationEvidenceID: String
+    public var launchDigest: String
+
+    public init(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        sourceDigest: String,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv,
+        processIsolationEvidenceID: String,
+        launchDigest: String
+    ) {
+        self.mode = mode
+        self.sourceDigest = sourceDigest
+        self.observedEnv = observedEnv
+        self.processIsolationEvidenceID = processIsolationEvidenceID
+        self.launchDigest = launchDigest
+    }
+}
+
 public struct Qwen38MTPPerformanceScorecardModel: Codable, Equatable, Sendable {
     public let label: String
     public var artifact: Qwen38MTPPerformanceScorecardArtifact
     public var executionDigest: String
     public var sourceDigest: String
+    public var gdnMode: Qwen38MTPPerformanceScorecardGDNMode?
+    public var launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding?
 
     public init(
         label: String,
         artifact: Qwen38MTPPerformanceScorecardArtifact,
         executionDigest: String,
-        sourceDigest: String
+        sourceDigest: String,
+        gdnMode: Qwen38MTPPerformanceScorecardGDNMode? = nil,
+        launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding? = nil
     ) {
         self.label = label
         self.artifact = artifact
         self.executionDigest = executionDigest
         self.sourceDigest = sourceDigest
+        self.gdnMode = gdnMode
+        self.launchBinding = launchBinding
     }
 }
 
@@ -149,19 +187,25 @@ public struct Qwen38MTPPerformanceScorecardLiveExactnessProof: Codable, Equatabl
     public var sourceID: String
     public var evidenceID: String
     public var accepted: Bool
+    public var gdnMode: Qwen38MTPPerformanceScorecardGDNMode?
+    public var launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding?
 
     public init(
         artifact: Qwen38MTPPerformanceScorecardArtifact,
         artifactID: String,
         sourceID: String,
         evidenceID: String,
-        accepted: Bool
+        accepted: Bool,
+        gdnMode: Qwen38MTPPerformanceScorecardGDNMode? = nil,
+        launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding? = nil
     ) {
         self.artifact = artifact
         self.artifactID = artifactID
         self.sourceID = sourceID
         self.evidenceID = evidenceID
         self.accepted = accepted
+        self.gdnMode = gdnMode
+        self.launchBinding = launchBinding
     }
 }
 
@@ -863,6 +907,13 @@ private struct Qwen38MTPPerformanceScorecardSchemaProbe: Codable, Sendable {
     let schemaVersion: Int
 }
 
+private struct Qwen38MTPPerformanceScorecardLaunchDigestBasis: Codable, Equatable, Sendable {
+    let mode: Qwen38MTPPerformanceScorecardGDNMode
+    let sourceDigest: String
+    let observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv
+    let processIsolationEvidenceID: String
+}
+
 public enum Qwen38MTPPerformanceScorecardGate {
     public static let schemaVersion = 2
     public static let subcommand = "qwen38-mtp-performance-scorecard"
@@ -943,6 +994,22 @@ public enum Qwen38MTPPerformanceScorecardGate {
 
     public static func promptSHA256(_ prompt: String) -> String {
         sha256Hex(Data(prompt.utf8))
+    }
+
+    public static func launchDigest(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        sourceDigest: String,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv,
+        processIsolationEvidenceID: String
+    ) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try! encoder.encode(Qwen38MTPPerformanceScorecardLaunchDigestBasis(
+            mode: mode,
+            sourceDigest: sourceDigest,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID))
+        return sha256Hex(data)
     }
 
     public static func canonicalWorkloadContentSHA256(
@@ -1392,7 +1459,7 @@ public enum Qwen38MTPPerformanceScorecardGate {
             evidence.reference == trustedEngineIdentities.reference,
             evidence.candidate.artifact == evidence.reference.artifact,
             evidence.candidate.executionDigest != evidence.reference.executionDigest,
-            evidence.candidate.sourceDigest != evidence.reference.sourceDigest
+            evidence.candidate.sourceDigest == evidence.reference.sourceDigest
         else {
             throw Qwen38MTPPerformanceScorecardGateError.invalidModelIdentity
         }
@@ -1435,24 +1502,39 @@ public enum Qwen38MTPPerformanceScorecardGate {
         trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities,
         trustedRunIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity
     ) throws {
-        guard trustedEngineIdentities.candidate.artifact == requiredArtifact,
-            trustedEngineIdentities.reference.artifact == requiredArtifact,
-            isLowerHex(trustedEngineIdentities.candidate.executionDigest, count: 64),
-            isLowerHex(trustedEngineIdentities.candidate.sourceDigest, count: 64),
-            isLowerHex(trustedEngineIdentities.reference.executionDigest, count: 64),
-            isLowerHex(trustedEngineIdentities.reference.sourceDigest, count: 64),
-            trustedEngineIdentities.candidate.executionDigest
-                != trustedEngineIdentities.reference.executionDigest,
-            trustedEngineIdentities.candidate.sourceDigest
-                != trustedEngineIdentities.reference.sourceDigest
+        let candidate = trustedEngineIdentities.candidate
+        let reference = trustedEngineIdentities.reference
+        guard candidate.artifact == requiredArtifact,
+            reference.artifact == requiredArtifact,
+            isLowerHex(candidate.executionDigest, count: 64),
+            isLowerHex(candidate.sourceDigest, count: 64),
+            isLowerHex(reference.executionDigest, count: 64),
+            isLowerHex(reference.sourceDigest, count: 64),
+            candidate.executionDigest != reference.executionDigest,
+            candidate.sourceDigest == reference.sourceDigest,
+            candidate.sourceDigest == Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
+            candidate.gdnMode == .gdnOn,
+            reference.gdnMode == .gdnOff,
+            let candidateLaunch = candidate.launchBinding,
+            let referenceLaunch = reference.launchBinding,
+            isValidLaunchBinding(candidateLaunch, expectedMode: .gdnOn, sourceDigest: candidate.sourceDigest),
+            isValidLaunchBinding(referenceLaunch, expectedMode: .gdnOff, sourceDigest: reference.sourceDigest),
+            candidateLaunch.launchDigest != referenceLaunch.launchDigest,
+            hasSafeModeSeparation(candidateLaunch, referenceLaunch)
         else {
             throw Qwen38MTPPerformanceScorecardGateError.invalidModelIdentity
         }
         guard trustedLiveExactnessProof.artifact == requiredArtifact,
+            trustedLiveExactnessProof.artifactID == Qwen38MTPLiveExactnessGate.requiredArtifactID,
+            trustedLiveExactnessProof.sourceID == Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
             trustedLiveExactnessProof.accepted,
             isLowerHex(trustedLiveExactnessProof.artifactID, count: 64),
             isLowerHex(trustedLiveExactnessProof.sourceID, count: 64),
-            isLowerHex(trustedLiveExactnessProof.evidenceID, count: 64)
+            isLowerHex(trustedLiveExactnessProof.evidenceID, count: 64),
+            trustedLiveExactnessProof.gdnMode == .gdnOn,
+            let exactnessLaunch = trustedLiveExactnessProof.launchBinding,
+            isValidLaunchBinding(exactnessLaunch, expectedMode: .gdnOn, sourceDigest: candidate.sourceDigest),
+            exactnessLaunch == candidateLaunch
         else {
             throw Qwen38MTPPerformanceScorecardGateError.invalidLiveExactnessProof
         }
@@ -1473,6 +1555,41 @@ public enum Qwen38MTPPerformanceScorecardGate {
         else {
             throw Qwen38MTPPerformanceScorecardGateError.invalidRunIdentity
         }
+    }
+
+    private static func isValidLaunchBinding(
+        _ binding: Qwen38MTPPerformanceScorecardLaunchBinding,
+        expectedMode: Qwen38MTPPerformanceScorecardGDNMode,
+        sourceDigest: String
+    ) -> Bool {
+        guard binding.mode == expectedMode,
+            binding.sourceDigest == sourceDigest,
+            binding.observedEnv == observedEnv(for: expectedMode),
+            isLowerHex(binding.sourceDigest, count: 64),
+            isLowerHex(binding.processIsolationEvidenceID, count: 64),
+            isLowerHex(binding.launchDigest, count: 64),
+            binding.launchDigest == launchDigest(
+                mode: binding.mode,
+                sourceDigest: binding.sourceDigest,
+                observedEnv: binding.observedEnv,
+                processIsolationEvidenceID: binding.processIsolationEvidenceID)
+        else {
+            return false
+        }
+        return true
+    }
+
+    private static func observedEnv(
+        for mode: Qwen38MTPPerformanceScorecardGDNMode
+    ) -> Qwen38MTPPerformanceScorecardGDNObservedEnv {
+        mode == .gdnOn ? .enabled : .disabled
+    }
+
+    private static func hasSafeModeSeparation(
+        _ candidate: Qwen38MTPPerformanceScorecardLaunchBinding,
+        _ reference: Qwen38MTPPerformanceScorecardLaunchBinding
+    ) -> Bool {
+        candidate.processIsolationEvidenceID != reference.processIsolationEvidenceID
     }
 
     private static func validateSettings(
