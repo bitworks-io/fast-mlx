@@ -134,11 +134,128 @@ public struct Qwen38MTPLiveExactnessSourceIdentity: Codable, Equatable, Sendable
     }
 }
 
+public struct Qwen38MTPLiveExactnessProcessIsolationEvidence: Codable, Equatable, Sendable {
+    public var processID: Int
+    public var parentProcessID: Int
+    public var processStartUptimeNanoseconds: UInt64
+    public var bootTimeUnixSeconds: Int64
+    public var executableIdentitySource: Qwen38MTPLiveExactnessExecutableIdentitySource
+    public var executableSHA256: String
+    public var harnessGitSHA: String
+    public var sourceID: String
+    public var gdnMode: Qwen38MTPPerformanceScorecardGDNMode
+    public var observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv
+
+    public init(
+        processID: Int,
+        parentProcessID: Int,
+        processStartUptimeNanoseconds: UInt64,
+        bootTimeUnixSeconds: Int64,
+        executableIdentitySource: Qwen38MTPLiveExactnessExecutableIdentitySource,
+        executableSHA256: String,
+        harnessGitSHA: String,
+        sourceID: String,
+        gdnMode: Qwen38MTPPerformanceScorecardGDNMode,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv
+    ) {
+        self.processID = processID
+        self.parentProcessID = parentProcessID
+        self.processStartUptimeNanoseconds = processStartUptimeNanoseconds
+        self.bootTimeUnixSeconds = bootTimeUnixSeconds
+        self.executableIdentitySource = executableIdentitySource
+        self.executableSHA256 = executableSHA256
+        self.harnessGitSHA = harnessGitSHA
+        self.sourceID = sourceID
+        self.gdnMode = gdnMode
+        self.observedEnv = observedEnv
+    }
+}
+
+public enum Qwen38MTPLiveExactnessExecutableIdentitySource: String, Codable, Equatable, Sendable {
+    case procPIDPath = "proc_pidpath"
+    case argumentVector = "argument-vector"
+}
+
+public struct Qwen38MTPLiveExactnessMLXMemoryBudget: Codable, Equatable, Sendable {
+    public var memoryLimitBytes: Int
+    public var cacheLimitBytes: Int
+
+    public init(memoryLimitBytes: Int, cacheLimitBytes: Int) {
+        self.memoryLimitBytes = memoryLimitBytes
+        self.cacheLimitBytes = cacheLimitBytes
+    }
+}
+
+public enum Qwen38MTPLiveExactnessObservationProvenance: String, Codable, Equatable, Sendable {
+    case measured
+    case synthesized
+}
+
+public struct Qwen38MTPLiveExactnessHostMemoryObservation: Codable, Equatable, Sendable {
+    public var hostUse: String
+    public var hostUseSource: String
+    public var hostUsePolicyVersion: String
+    public var physicalRAMBytes: UInt64
+    public var wiredLimitMB: Int
+    public var wiredLimitProvenance: Qwen38MTPLiveExactnessObservationProvenance
+    public var metalRecommendedMaxWorkingSetSizeBytes: UInt64
+    public var metalCurrentAllocatedSizeBytes: UInt64
+    public var memoryLimitBytes: UInt64
+    public var cacheLimitBytes: UInt64
+    public var reservedKVBytes: UInt64
+    public var reservedIOBytes: UInt64
+    public var reservedPrefetchBytes: UInt64
+    public var osServiceReserveBytes: UInt64
+
+    public init(
+        hostUse: String,
+        hostUseSource: String,
+        hostUsePolicyVersion: String,
+        physicalRAMBytes: UInt64,
+        wiredLimitMB: Int,
+        wiredLimitProvenance: Qwen38MTPLiveExactnessObservationProvenance,
+        metalRecommendedMaxWorkingSetSizeBytes: UInt64,
+        metalCurrentAllocatedSizeBytes: UInt64,
+        memoryLimitBytes: UInt64,
+        cacheLimitBytes: UInt64,
+        reservedKVBytes: UInt64,
+        reservedIOBytes: UInt64,
+        reservedPrefetchBytes: UInt64,
+        osServiceReserveBytes: UInt64
+    ) {
+        self.hostUse = hostUse
+        self.hostUseSource = hostUseSource
+        self.hostUsePolicyVersion = hostUsePolicyVersion
+        self.physicalRAMBytes = physicalRAMBytes
+        self.wiredLimitMB = wiredLimitMB
+        self.wiredLimitProvenance = wiredLimitProvenance
+        self.metalRecommendedMaxWorkingSetSizeBytes = metalRecommendedMaxWorkingSetSizeBytes
+        self.metalCurrentAllocatedSizeBytes = metalCurrentAllocatedSizeBytes
+        self.memoryLimitBytes = memoryLimitBytes
+        self.cacheLimitBytes = cacheLimitBytes
+        self.reservedKVBytes = reservedKVBytes
+        self.reservedIOBytes = reservedIOBytes
+        self.reservedPrefetchBytes = reservedPrefetchBytes
+        self.osServiceReserveBytes = osServiceReserveBytes
+    }
+
+    public var mlxMemoryBudget: Qwen38MTPLiveExactnessMLXMemoryBudget {
+        Qwen38MTPLiveExactnessMLXMemoryBudget(
+            memoryLimitBytes: Int(memoryLimitBytes),
+            cacheLimitBytes: Int(cacheLimitBytes))
+    }
+}
+
 public struct Qwen38MTPLiveExactnessEvidence: Codable, Equatable, Sendable {
     public var schemaVersion: Int
     public var artifact: Qwen38MTPPerformanceScorecardArtifact
     public var artifactID: String
     public var source: Qwen38MTPLiveExactnessSourceIdentity
+    public var gdnMode: Qwen38MTPPerformanceScorecardGDNMode
+    public var launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding
+    public var processIsolation: Qwen38MTPLiveExactnessProcessIsolationEvidence
+    public var mlxMemoryBudget: Qwen38MTPLiveExactnessMLXMemoryBudget
+    public var hostMemoryObservation: Qwen38MTPLiveExactnessHostMemoryObservation
     public var cases: [Qwen38MTPLiveExactnessCaseEvidence]
 
     public init(
@@ -146,14 +263,25 @@ public struct Qwen38MTPLiveExactnessEvidence: Codable, Equatable, Sendable {
         artifact: Qwen38MTPPerformanceScorecardArtifact,
         artifactID: String,
         source: Qwen38MTPLiveExactnessSourceIdentity,
+        gdnMode: Qwen38MTPPerformanceScorecardGDNMode,
+        launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding,
+        processIsolation: Qwen38MTPLiveExactnessProcessIsolationEvidence,
+        mlxMemoryBudget: Qwen38MTPLiveExactnessMLXMemoryBudget,
+        hostMemoryObservation: Qwen38MTPLiveExactnessHostMemoryObservation,
         cases: [Qwen38MTPLiveExactnessCaseEvidence]
     ) {
         self.schemaVersion = schemaVersion
         self.artifact = artifact
         self.artifactID = artifactID
         self.source = source
+        self.gdnMode = gdnMode
+        self.launchBinding = launchBinding
+        self.processIsolation = processIsolation
+        self.mlxMemoryBudget = mlxMemoryBudget
+        self.hostMemoryObservation = hostMemoryObservation
         self.cases = cases
     }
+
 }
 
 public enum Qwen38MTPLiveExactnessGateError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -168,6 +296,9 @@ public enum Qwen38MTPLiveExactnessGateError: Error, Equatable, CustomStringConve
     case wrongSubcommand(String)
     case invalidProvenance(String)
     case nonCanonicalJSONL
+    case invalidLaunchBinding(String)
+    case invalidMemoryBudget(String)
+    case invalidHostMemoryObservation(String)
 
     public var description: String {
         switch self {
@@ -182,6 +313,10 @@ public enum Qwen38MTPLiveExactnessGateError: Error, Equatable, CustomStringConve
         case .wrongSubcommand(let subcommand): return "wrong subcommand: \(subcommand)"
         case .invalidProvenance(let field): return "invalid provenance: \(field)"
         case .nonCanonicalJSONL: return "non-canonical JSONL"
+        case .invalidLaunchBinding(let field): return "invalid launch binding: \(field)"
+        case .invalidMemoryBudget(let field): return "invalid memory budget: \(field)"
+        case .invalidHostMemoryObservation(let field):
+            return "invalid host memory observation: \(field)"
         }
     }
 }
@@ -202,8 +337,9 @@ private struct Qwen38MTPLiveExactnessSourceBasis: Codable, Equatable, Sendable {
 }
 
 public enum Qwen38MTPLiveExactnessGate {
-    public static let schemaVersion = 1
+    public static let schemaVersion = 2
     public static let subcommand = "qwen38-mtp-live-exactness"
+    public static let requiredHostUsePolicyVersion = "host-use/v1"
     public static let modelPathSentinel = "qwen38-27b-mxfp8-depth1-live-exactness"
     public static let requiredCases: [Qwen38MTPLiveExactnessCaseSpec] = [
         makeCaseSpec(
@@ -267,17 +403,20 @@ public enum Qwen38MTPLiveExactnessGate {
             throw Qwen38MTPLiveExactnessGateError.nonCanonicalJSONL
         }
         try validateProvenance(record.provenance)
-        try validateEvidence(record.payload)
+        try validateEvidence(record.payload, provenance: record.provenance)
         return Qwen38MTPPerformanceScorecardLiveExactnessProof(
             artifact: requiredArtifact,
             artifactID: requiredArtifactID,
             sourceID: requiredSourceIdentity.sourceID,
             evidenceID: sha256Hex(rowData),
-            accepted: true)
+            accepted: true,
+            gdnMode: .gdnOn,
+            launchBinding: record.payload.launchBinding)
     }
 
     private static func validateEvidence(
-        _ evidence: Qwen38MTPLiveExactnessEvidence
+        _ evidence: Qwen38MTPLiveExactnessEvidence,
+        provenance: Provenance
     ) throws {
         guard evidence.schemaVersion == schemaVersion else {
             throw Qwen38MTPLiveExactnessGateError.schemaVersionMismatch(evidence.schemaVersion)
@@ -295,6 +434,15 @@ public enum Qwen38MTPLiveExactnessGate {
         else {
             throw Qwen38MTPLiveExactnessGateError.invalidSourceIdentity
         }
+        guard evidence.processIsolation.harnessGitSHA == provenance.harnessGitSHA else {
+            throw Qwen38MTPLiveExactnessGateError.invalidProvenance(
+                "processIsolation.harnessGitSHA")
+        }
+        try validateLaunchBinding(evidence)
+        try validateMemoryBudget(evidence.mlxMemoryBudget)
+        try validateHostMemoryObservation(
+            evidence.hostMemoryObservation,
+            memoryBudget: evidence.mlxMemoryBudget)
         guard evidence.cases.map(\.id) == requiredCaseIDs else {
             throw Qwen38MTPLiveExactnessGateError.invalidCaseOrder
         }
@@ -305,6 +453,12 @@ public enum Qwen38MTPLiveExactnessGate {
 
     public static func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func processIsolationEvidenceID(
+        for evidence: Qwen38MTPLiveExactnessProcessIsolationEvidence
+    ) -> String {
+        sha256Hex(canonicalData(evidence))
     }
 
     private static let requiredSourceBasis = Qwen38MTPLiveExactnessSourceBasis(
@@ -387,6 +541,137 @@ public enum Qwen38MTPLiveExactnessGate {
         }
     }
 
+    private static func validateLaunchBinding(
+        _ evidence: Qwen38MTPLiveExactnessEvidence
+    ) throws {
+        guard evidence.gdnMode == .gdnOn else {
+            throw Qwen38MTPLiveExactnessGateError.invalidLaunchBinding("gdnMode")
+        }
+        guard validProcessIsolation(evidence.processIsolation) else {
+            throw Qwen38MTPLiveExactnessGateError.invalidLaunchBinding("processIsolation")
+        }
+        let processIsolationEvidenceID = processIsolationEvidenceID(
+            for: evidence.processIsolation)
+        guard evidence.launchBinding.mode == .gdnOn,
+            evidence.launchBinding.sourceDigest == requiredSourceIdentity.sourceID,
+            evidence.launchBinding.observedEnv == .enabled,
+            evidence.launchBinding.processIsolationEvidenceID == processIsolationEvidenceID,
+            isLowerHex(evidence.launchBinding.processIsolationEvidenceID, count: 64)
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidLaunchBinding(
+                "processIsolationEvidenceID")
+        }
+        let expectedLaunchDigest = Qwen38MTPPerformanceScorecardGate.launchDigest(
+            mode: .gdnOn,
+            sourceDigest: requiredSourceIdentity.sourceID,
+            observedEnv: .enabled,
+            processIsolationEvidenceID: processIsolationEvidenceID)
+        guard evidence.launchBinding.launchDigest == expectedLaunchDigest,
+            isLowerHex(evidence.launchBinding.launchDigest, count: 64)
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidLaunchBinding("launchDigest")
+        }
+    }
+
+    private static func validateMemoryBudget(
+        _ budget: Qwen38MTPLiveExactnessMLXMemoryBudget
+    ) throws {
+        guard budget.memoryLimitBytes > 0 else {
+            throw Qwen38MTPLiveExactnessGateError.invalidMemoryBudget("memoryLimitBytes")
+        }
+        guard budget.cacheLimitBytes > 0,
+            budget.cacheLimitBytes <= budget.memoryLimitBytes
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidMemoryBudget("cacheLimitBytes")
+        }
+    }
+
+    private static func validateHostMemoryObservation(
+        _ observation: Qwen38MTPLiveExactnessHostMemoryObservation,
+        memoryBudget: Qwen38MTPLiveExactnessMLXMemoryBudget
+    ) throws {
+        guard observation.hostUse == "dedicated-serving",
+            observation.hostUseSource == "operator-assertion",
+            observation.hostUsePolicyVersion == requiredHostUsePolicyVersion
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("hostUse")
+        }
+        guard observation.physicalRAMBytes == Qwen38MTPPerformanceScorecardGate.requiredRAMBytes else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("physicalRAMBytes")
+        }
+        guard observation.wiredLimitMB >= 0,
+            observation.wiredLimitProvenance == .measured
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("wiredLimit")
+        }
+        let wiredLimitBytes = observation.wiredLimitMB == 0
+            ? Optional(UInt64.max)
+            : mebibytesToBytes(observation.wiredLimitMB)
+        guard let wiredLimitBytes else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("wiredLimit")
+        }
+        guard observation.metalRecommendedMaxWorkingSetSizeBytes > 0,
+            observation.metalCurrentAllocatedSizeBytes
+                < observation.metalRecommendedMaxWorkingSetSizeBytes
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("metal")
+        }
+        guard UInt64(memoryBudget.memoryLimitBytes) == observation.memoryLimitBytes,
+            UInt64(memoryBudget.cacheLimitBytes) == observation.cacheLimitBytes
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("memoryBudget")
+        }
+        guard observation.memoryLimitBytes > 0,
+            observation.cacheLimitBytes > 0,
+            observation.cacheLimitBytes <= observation.memoryLimitBytes,
+            observation.reservedKVBytes > 0,
+            observation.reservedIOBytes > 0,
+            observation.reservedPrefetchBytes > 0,
+            observation.osServiceReserveBytes > 0
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("budget")
+        }
+        guard let memoryResident = checkedSum([
+            observation.cacheLimitBytes,
+            observation.reservedKVBytes,
+        ]),
+            memoryResident <= observation.memoryLimitBytes
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("budget")
+        }
+        let effectiveCeiling = min(
+            observation.physicalRAMBytes,
+            min(wiredLimitBytes, observation.metalRecommendedMaxWorkingSetSizeBytes))
+        guard let totalPlanned = checkedSum([
+            observation.metalCurrentAllocatedSizeBytes,
+            observation.memoryLimitBytes,
+            observation.reservedIOBytes,
+            observation.reservedPrefetchBytes,
+            observation.osServiceReserveBytes,
+        ]),
+            totalPlanned <= effectiveCeiling
+        else {
+            throw Qwen38MTPLiveExactnessGateError.invalidHostMemoryObservation("budget")
+        }
+    }
+
+    private static func validProcessIsolation(
+        _ evidence: Qwen38MTPLiveExactnessProcessIsolationEvidence
+    ) -> Bool {
+        evidence.processID > 0
+            && evidence.parentProcessID > 0
+            && evidence.processStartUptimeNanoseconds > 0
+            && evidence.bootTimeUnixSeconds > 0
+            && evidence.executableIdentitySource == .procPIDPath
+            && isLowerHex(evidence.executableSHA256, count: 64)
+            && evidence.executableSHA256 != String(repeating: "0", count: 64)
+            && isLowerHex(evidence.harnessGitSHA, count: 40)
+            && evidence.harnessGitSHA != String(repeating: "0", count: 40)
+            && evidence.sourceID == requiredSourceIdentity.sourceID
+            && evidence.gdnMode == .gdnOn
+            && evidence.observedEnv == .enabled
+    }
+
     private static func validCacheFingerprints(
         _ fingerprints: [Qwen38MTPLiveExactnessCacheFingerprint]
     ) -> Bool {
@@ -455,6 +740,23 @@ public enum Qwen38MTPLiveExactnessGate {
             count = next
         }
         return shape.allSatisfy({ $0 > 0 }) ? count : nil
+    }
+
+    private static func checkedSum(_ values: [UInt64]) -> UInt64? {
+        var total: UInt64 = 0
+        for value in values {
+            let result = total.addingReportingOverflow(value)
+            if result.overflow { return nil }
+            total = result.partialValue
+        }
+        return total
+    }
+
+    private static func mebibytesToBytes(_ value: Int) -> UInt64? {
+        guard value > 0 else { return nil }
+        return UInt64(value).multipliedReportingOverflow(by: 1024 * 1024).overflow
+            ? nil
+            : UInt64(value) * 1024 * 1024
     }
 
     private static func validateProvenance(_ provenance: Provenance) throws {

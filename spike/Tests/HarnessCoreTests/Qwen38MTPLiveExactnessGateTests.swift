@@ -6,15 +6,15 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
     private typealias Gate = Qwen38MTPLiveExactnessGate
     private typealias GateError = Qwen38MTPLiveExactnessGateError
 
-    func testCanonicalTwoCaseRecordReturnsDerivedProofWithoutPromotingScorecardAuthority() throws {
+    func testCanonicalTwoCaseRecordReturnsGDNOnLaunchBoundProof() throws {
         let proof = try Gate.validateJSONL(try recordData())
 
         XCTAssertEqual(proof.artifact, Qwen38MTPPerformanceScorecardGate.requiredArtifact)
         XCTAssertEqual(proof.artifactID, Gate.requiredArtifactID)
         XCTAssertEqual(proof.sourceID, Gate.requiredSourceIdentity.sourceID)
         XCTAssertTrue(proof.accepted)
-        XCTAssertNil(proof.gdnMode)
-        XCTAssertNil(proof.launchBinding)
+        XCTAssertEqual(proof.gdnMode, .gdnOn)
+        XCTAssertEqual(proof.launchBinding, evidence().launchBinding)
         XCTAssertEqual(proof.evidenceID.count, 64)
         XCTAssertTrue(proof.evidenceID.allSatisfy { $0.isHexDigit && !$0.isUppercase })
         XCTAssertNil(Qwen38MTPPerformanceScorecardGate.requiredAcceptedLiveExactnessProof)
@@ -62,7 +62,9 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         }
     }
 
-    func testRejectsArtifactSourceCaseTokenDecodeDraftPassthroughAndCacheDrift() throws {
+    func testRejectsArtifactSourceLaunchProcessBudgetCaseTokenDecodeDraftPassthroughAndCacheDrift()
+        throws
+    {
         var wrongArtifact = evidence()
         wrongArtifact.artifactID = hex("A")
         XCTAssertThrowsError(try validate(wrongArtifact)) { error in
@@ -73,6 +75,125 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         wrongSelection.source.selection = "qwen35_9BDepth1"
         XCTAssertThrowsError(try validate(wrongSelection)) { error in
             XCTAssertEqual(error as? GateError, .invalidSourceIdentity)
+        }
+
+        var missingFusion = evidence()
+        missingFusion.gdnMode = .gdnOff
+        missingFusion.launchBinding = launchBinding(mode: .gdnOff)
+        missingFusion.processIsolation.gdnMode = .gdnOff
+        missingFusion.processIsolation.observedEnv = .disabled
+        XCTAssertThrowsError(try validate(missingFusion)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("gdnMode"))
+        }
+
+        var forgedLaunchDigest = evidence()
+        forgedLaunchDigest.launchBinding.launchDigest = hex("f")
+        XCTAssertThrowsError(try validate(forgedLaunchDigest)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("launchDigest"))
+        }
+
+        var callerSuppliedProcessHash = evidence()
+        callerSuppliedProcessHash.launchBinding.processIsolationEvidenceID = hex("b")
+        callerSuppliedProcessHash.launchBinding.launchDigest = Qwen38MTPPerformanceScorecardGate
+            .launchDigest(
+                mode: .gdnOn,
+                sourceDigest: Gate.requiredSourceIdentity.sourceID,
+                observedEnv: .enabled,
+                processIsolationEvidenceID: hex("b"))
+        XCTAssertThrowsError(try validate(callerSuppliedProcessHash)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("processIsolationEvidenceID"))
+        }
+
+        var malformedProcess = evidence()
+        malformedProcess.processIsolation.processID = 0
+        XCTAssertThrowsError(try validate(malformedProcess)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("processIsolation"))
+        }
+
+        var wrongExecutableSource = evidence()
+        wrongExecutableSource.processIsolation.executableIdentitySource = .argumentVector
+        wrongExecutableSource.launchBinding = launchBinding(
+            mode: .gdnOn,
+            process: wrongExecutableSource.processIsolation)
+        XCTAssertThrowsError(try validate(wrongExecutableSource)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("processIsolation"))
+        }
+
+        var zeroExecutableHash = evidence()
+        zeroExecutableHash.processIsolation.executableSHA256 = hex("0")
+        zeroExecutableHash.launchBinding = launchBinding(
+            mode: .gdnOn,
+            process: zeroExecutableHash.processIsolation)
+        XCTAssertThrowsError(try validate(zeroExecutableHash)) { error in
+            XCTAssertEqual(error as? GateError, .invalidLaunchBinding("processIsolation"))
+        }
+
+        var missingMemoryLimit = evidence()
+        missingMemoryLimit.mlxMemoryBudget.memoryLimitBytes = 0
+        XCTAssertThrowsError(try validate(missingMemoryLimit)) { error in
+            XCTAssertEqual(error as? GateError, .invalidMemoryBudget("memoryLimitBytes"))
+        }
+
+        var cacheOverMemory = evidence()
+        cacheOverMemory.mlxMemoryBudget.cacheLimitBytes =
+            cacheOverMemory.mlxMemoryBudget.memoryLimitBytes + 1
+        XCTAssertThrowsError(try validate(cacheOverMemory)) { error in
+            XCTAssertEqual(error as? GateError, .invalidMemoryBudget("cacheLimitBytes"))
+        }
+
+        var sharedHost = evidence()
+        sharedHost.hostMemoryObservation.hostUse = "shared"
+        XCTAssertThrowsError(try validate(sharedHost)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("hostUse"))
+        }
+
+        var unknownHost = evidence()
+        unknownHost.hostMemoryObservation.hostUse = "auto"
+        XCTAssertThrowsError(try validate(unknownHost)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("hostUse"))
+        }
+
+        var synthesizedWired = evidence()
+        synthesizedWired.hostMemoryObservation.wiredLimitProvenance = .synthesized
+        XCTAssertThrowsError(try validate(synthesizedWired)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("wiredLimit"))
+        }
+
+        var measuredZeroWired = evidence()
+        measuredZeroWired.hostMemoryObservation.wiredLimitMB = 0
+        XCTAssertNoThrow(try validate(measuredZeroWired))
+
+        var measuredZeroWiredOverBudget = measuredZeroWired
+        measuredZeroWiredOverBudget.hostMemoryObservation.memoryLimitBytes =
+            measuredZeroWiredOverBudget.hostMemoryObservation.metalRecommendedMaxWorkingSetSizeBytes
+        measuredZeroWiredOverBudget.mlxMemoryBudget.memoryLimitBytes =
+            Int(measuredZeroWiredOverBudget.hostMemoryObservation.memoryLimitBytes)
+        XCTAssertThrowsError(try validate(measuredZeroWiredOverBudget)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("budget"))
+        }
+
+        var invalidMetal = evidence()
+        invalidMetal.hostMemoryObservation.metalRecommendedMaxWorkingSetSizeBytes = 0
+        XCTAssertThrowsError(try validate(invalidMetal)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("metal"))
+        }
+
+        var reserveOverflow = evidence()
+        reserveOverflow.hostMemoryObservation.osServiceReserveBytes =
+            reserveOverflow.hostMemoryObservation.physicalRAMBytes
+        XCTAssertThrowsError(try validate(reserveOverflow)) { error in
+            XCTAssertEqual(error as? GateError, .invalidHostMemoryObservation("budget"))
+        }
+
+        let mismatchedProvenance = provenance(harnessGitSHA: String(repeating: "c", count: 40))
+        let mismatchedRecord = evidenceRecord(
+            provenance: mismatchedProvenance,
+            payload: evidence())
+        XCTAssertThrowsError(try Gate.validateJSONL(
+            Data((try mismatchedRecord.jsonLine() + "\n").utf8))) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .invalidProvenance("processIsolation.harnessGitSHA"))
         }
 
         var reordered = evidence()
@@ -216,18 +337,23 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         }
     }
 
-    func testCanonicalLiveProofIsUnboundAndCannotAuthorizeFusionOnPerformance() throws {
+    func testLegacySchemaOneUnboundProofCannotAuthorizeFusionOnPerformance() throws {
+        var legacy = evidence()
+        legacy.schemaVersion = 1
+        XCTAssertThrowsError(try validate(legacy)) { error in
+            XCTAssertEqual(error as? GateError, .schemaVersionMismatch(1))
+        }
+    }
+
+    func testCanonicalLiveProofCanAuthorizeFusionOnPerformanceWhenUsedAsTrustedAuthority()
+        throws
+    {
         let proof = try Gate.validateJSONL(try recordData())
 
-        XCTAssertNil(proof.gdnMode)
-        XCTAssertNil(proof.launchBinding)
-        XCTAssertThrowsError(
-            try Qwen38MTPPerformanceScorecardGate.validateAuthority(
-                scorecardAuthority(liveProof: proof))) { error in
-            XCTAssertEqual(
-                error as? Qwen38MTPPerformanceScorecardGateError,
-                .invalidLiveExactnessProof)
-        }
+        XCTAssertEqual(proof.gdnMode, .gdnOn)
+        XCTAssertEqual(proof.launchBinding, evidence().launchBinding)
+        XCTAssertNoThrow(try Qwen38MTPPerformanceScorecardGate.validateAuthority(
+            scorecardAuthority(liveProof: proof)))
     }
 
     private func validate(
@@ -237,7 +363,13 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
     }
 
     private func recordData(provenance: Provenance? = nil) throws -> Data {
-        Data((try evidenceRecord(provenance: provenance).jsonLine() + "\n").utf8)
+        let recordProvenance = provenance ?? self.provenance()
+        var payload = evidence()
+        payload.processIsolation.harnessGitSHA = recordProvenance.harnessGitSHA
+        payload.launchBinding = launchBinding(mode: .gdnOn, process: payload.processIsolation)
+        return Data((try evidenceRecord(
+            provenance: recordProvenance,
+            payload: payload).jsonLine() + "\n").utf8)
     }
 
     private func evidenceRecord(
@@ -257,6 +389,13 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
             artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
             artifactID: Gate.requiredArtifactID,
             source: Gate.requiredSourceIdentity,
+            gdnMode: .gdnOn,
+            launchBinding: launchBinding(mode: .gdnOn),
+            processIsolation: processIsolation(),
+            mlxMemoryBudget: .init(
+                memoryLimitBytes: 220 * 1024 * 1024 * 1024,
+                cacheLimitBytes: 48 * 1024 * 1024 * 1024),
+            hostMemoryObservation: hostMemoryObservation(),
             cases: [
                 caseEvidence(id: "numbers", text: " 13, 17", tokenBase: 100),
                 caseEvidence(id: "sentence", text: " the automated one.", tokenBase: 200),
@@ -349,6 +488,59 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
         String(repeating: String(character), count: 40)
     }
 
+    private func processIsolation() -> Qwen38MTPLiveExactnessProcessIsolationEvidence {
+        Qwen38MTPLiveExactnessProcessIsolationEvidence(
+            processID: 44_001,
+            parentProcessID: 44_000,
+            processStartUptimeNanoseconds: 123_456_789,
+            bootTimeUnixSeconds: 1_777_000_000,
+            executableIdentitySource: .procPIDPath,
+            executableSHA256: hex("6"),
+            harnessGitSHA: String(repeating: "e", count: 40),
+            sourceID: Gate.requiredSourceIdentity.sourceID,
+            gdnMode: .gdnOn,
+            observedEnv: .enabled)
+    }
+
+    private func launchBinding(
+        mode: Qwen38MTPPerformanceScorecardGDNMode,
+        process: Qwen38MTPLiveExactnessProcessIsolationEvidence? = nil
+    ) -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv =
+            mode == .gdnOn ? .enabled : .disabled
+        let processIsolationEvidenceID = Gate.processIsolationEvidenceID(
+            for: process ?? processIsolation())
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: mode,
+            sourceDigest: Gate.requiredSourceIdentity.sourceID,
+            observedEnv: observedEnv,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: Qwen38MTPPerformanceScorecardGate.launchDigest(
+                mode: mode,
+                sourceDigest: Gate.requiredSourceIdentity.sourceID,
+                observedEnv: observedEnv,
+                processIsolationEvidenceID: processIsolationEvidenceID))
+    }
+
+    private func hostMemoryObservation() -> Qwen38MTPLiveExactnessHostMemoryObservation {
+        let gib = UInt64(1024 * 1024 * 1024)
+        return Qwen38MTPLiveExactnessHostMemoryObservation(
+            hostUse: "dedicated-serving",
+            hostUseSource: "operator-assertion",
+            hostUsePolicyVersion: Gate.requiredHostUsePolicyVersion,
+            physicalRAMBytes: 256 * gib,
+            wiredLimitMB: 245_760,
+            wiredLimitProvenance: .measured,
+            metalRecommendedMaxWorkingSetSizeBytes: 245_760 * 1024 * 1024,
+            metalCurrentAllocatedSizeBytes: 2 * gib,
+            memoryLimitBytes: 220 * gib,
+            cacheLimitBytes: 48 * gib,
+            reservedKVBytes: 40 * gib,
+            reservedIOBytes: 2 * gib,
+            reservedPrefetchBytes: 4 * gib,
+            osServiceReserveBytes: 8 * gib)
+    }
+
     private func scorecardAuthority(
         liveProof: Qwen38MTPPerformanceScorecardLiveExactnessProof
     ) -> Qwen38MTPPerformanceScorecardAuthorityBundle {
@@ -363,10 +555,7 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
                         "generic candidate execution identity"),
                     sourceDigest: sourceID,
                     gdnMode: .gdnOn,
-                    launchBinding: scorecardLaunchBinding(
-                        mode: .gdnOn,
-                        sourceDigest: sourceID,
-                        processIsolationEvidenceID: hex("4"))),
+                    launchBinding: liveProof.launchBinding!),
                 reference: .init(
                     label: "reference",
                     artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,

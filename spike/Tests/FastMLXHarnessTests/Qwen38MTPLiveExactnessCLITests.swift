@@ -101,6 +101,13 @@ final class Qwen38MTPLiveExactnessCLITests: XCTestCase {
             artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
             artifactID: Gate.requiredArtifactID,
             source: Gate.requiredSourceIdentity,
+            gdnMode: .gdnOn,
+            launchBinding: launchBinding(),
+            processIsolation: processIsolation(),
+            mlxMemoryBudget: .init(
+                memoryLimitBytes: 220 * 1024 * 1024 * 1024,
+                cacheLimitBytes: 48 * 1024 * 1024 * 1024),
+            hostMemoryObservation: hostMemoryObservation(),
             cases: [
                 caseEvidence(id: "numbers", text: " 13, 17", tokenBase: 100),
                 caseEvidence(id: "sentence", text: " the automated one.", tokenBase: 200),
@@ -172,5 +179,53 @@ final class Qwen38MTPLiveExactnessCLITests: XCTestCase {
 
     private func hex(_ character: Character) -> String {
         String(repeating: String(character), count: 64)
+    }
+
+    private func processIsolation() -> Qwen38MTPLiveExactnessProcessIsolationEvidence {
+        Qwen38MTPLiveExactnessProcessIsolationEvidence(
+            processID: 44_001,
+            parentProcessID: 44_000,
+            processStartUptimeNanoseconds: 123_456_789,
+            bootTimeUnixSeconds: 1_777_000_000,
+            executableIdentitySource: .procPIDPath,
+            executableSHA256: hex("6"),
+            harnessGitSHA: String(repeating: "e", count: 40),
+            sourceID: Gate.requiredSourceIdentity.sourceID,
+            gdnMode: .gdnOn,
+            observedEnv: .enabled)
+    }
+
+    private func launchBinding() -> Qwen38MTPPerformanceScorecardLaunchBinding {
+        let processIsolationEvidenceID = Gate.processIsolationEvidenceID(
+            for: processIsolation())
+        return Qwen38MTPPerformanceScorecardLaunchBinding(
+            mode: .gdnOn,
+            sourceDigest: Gate.requiredSourceIdentity.sourceID,
+            observedEnv: .enabled,
+            processIsolationEvidenceID: processIsolationEvidenceID,
+            launchDigest: Qwen38MTPPerformanceScorecardGate.launchDigest(
+                mode: .gdnOn,
+                sourceDigest: Gate.requiredSourceIdentity.sourceID,
+                observedEnv: .enabled,
+                processIsolationEvidenceID: processIsolationEvidenceID))
+    }
+
+    private func hostMemoryObservation() -> Qwen38MTPLiveExactnessHostMemoryObservation {
+        let gib = UInt64(1024 * 1024 * 1024)
+        return Qwen38MTPLiveExactnessHostMemoryObservation(
+            hostUse: "dedicated-serving",
+            hostUseSource: "operator-assertion",
+            hostUsePolicyVersion: Gate.requiredHostUsePolicyVersion,
+            physicalRAMBytes: 256 * gib,
+            wiredLimitMB: 0,
+            wiredLimitProvenance: .measured,
+            metalRecommendedMaxWorkingSetSizeBytes: 240 * gib,
+            metalCurrentAllocatedSizeBytes: 2 * gib,
+            memoryLimitBytes: 220 * gib,
+            cacheLimitBytes: 48 * gib,
+            reservedKVBytes: 40 * gib,
+            reservedIOBytes: 2 * gib,
+            reservedPrefetchBytes: 4 * gib,
+            osServiceReserveBytes: 8 * gib)
     }
 }
