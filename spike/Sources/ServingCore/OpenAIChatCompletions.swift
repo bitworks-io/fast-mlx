@@ -54,6 +54,7 @@ public struct OpenAIErrorEnvelope: Codable, Sendable, Equatable {
 
 public enum OpenAIServingError: Error, Sendable, Equatable {
     case invalidRequest(String, param: String?)
+    case invalidRequestWithCode(String, param: String?, code: String)
     case rateLimited(String, code: String?)
     case server(String, code: String?)
 
@@ -61,6 +62,8 @@ public enum OpenAIServingError: Error, Sendable, Equatable {
         switch self {
         case .invalidRequest(let message, let param):
             OpenAIErrorPayload(type: .invalidRequest, message: message, param: param, code: nil)
+        case .invalidRequestWithCode(let message, let param, let code):
+            OpenAIErrorPayload(type: .invalidRequest, message: message, param: param, code: code)
         case .rateLimited(let message, let code):
             OpenAIErrorPayload(type: .rateLimit, message: message, param: nil, code: code)
         case .server(let message, let code):
@@ -105,16 +108,23 @@ public struct OpenAIChatMessage: Sendable, Equatable {
 public struct OpenAIChatRequestLimits: Sendable, Equatable {
     public static let productionDefault = OpenAIChatRequestLimits(
         maximumBodyBytes: 1_048_576,
-        maximumCompletionTokens: 4_096)
+        maximumCompletionTokens: 4_096,
+        enforceMaximumCompletionTokensDuringDecoding: true)
 
     public let maximumBodyBytes: Int
     public let maximumCompletionTokens: Int
+    public let enforceMaximumCompletionTokensDuringDecoding: Bool
 
-    public init(maximumBodyBytes: Int, maximumCompletionTokens: Int) {
+    public init(
+        maximumBodyBytes: Int,
+        maximumCompletionTokens: Int,
+        enforceMaximumCompletionTokensDuringDecoding: Bool = true
+    ) {
         precondition(maximumBodyBytes > 0, "maximumBodyBytes must be positive")
         precondition(maximumCompletionTokens > 0, "maximumCompletionTokens must be positive")
         self.maximumBodyBytes = maximumBodyBytes
         self.maximumCompletionTokens = maximumCompletionTokens
+        self.enforceMaximumCompletionTokensDuringDecoding = enforceMaximumCompletionTokensDuringDecoding
     }
 }
 
@@ -249,7 +259,9 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         }
 
         let completionBudget = primaryBudget ?? deprecatedBudget
-        if let completionBudget, completionBudget > limits.maximumCompletionTokens {
+        if limits.enforceMaximumCompletionTokensDuringDecoding,
+           let completionBudget,
+           completionBudget > limits.maximumCompletionTokens {
             throw OpenAIServingError.invalidRequest(
                 "max_completion_tokens exceeds the configured limit",
                 param: "max_completion_tokens")
@@ -1059,32 +1071,57 @@ private func optionalDouble(_ raw: Any?, param: String) throws -> Double? {
 
 private func optionalInt(_ raw: Any?, param: String) throws -> Int? {
     guard let raw else { return nil }
-    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
-        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
-    }
-    let double = number.doubleValue
-    guard double.rounded() == double else {
-        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
-    }
-    return number.intValue
+    return try exactInteger(raw, param: param, lowerBound: Decimal(Int.min), upperBound: Decimal(Int.max), convert: Int.init)
 }
 
 private func optionalInt64(_ raw: Any?, param: String) throws -> Int64? {
     guard let raw else { return nil }
-    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
-        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
-    }
-    let double = number.doubleValue
-    guard double.rounded() == double else {
-        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
-    }
-    return number.int64Value
+    return try exactInteger(
+        raw,
+        param: param,
+        lowerBound: Decimal(Int64.min),
+        upperBound: Decimal(Int64.max),
+        convert: Int64.init)
 }
 
 private func optionalPositiveInt(_ raw: Any?, param: String) throws -> Int? {
     guard let value = try optionalInt(raw, param: param) else { return nil }
     guard value > 0 else {
         throw OpenAIServingError.invalidRequest("\(param) must be greater than zero", param: param)
+    }
+    return value
+}
+
+private func exactInteger<T>(
+    _ raw: Any,
+    param: String,
+    lowerBound: Decimal,
+    upperBound: Decimal,
+    convert: (String) -> T?
+) throws -> T {
+    guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
+    }
+
+    let decimal = number.decimalValue
+    let exact = NSDecimalNumber(decimal: decimal)
+    guard exact != NSDecimalNumber.notANumber,
+          exact.doubleValue.isFinite else {
+        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
+    }
+
+    var roundedDecimal = Decimal()
+    var workingDecimal = decimal
+    NSDecimalRound(&roundedDecimal, &workingDecimal, 0, .plain)
+    guard roundedDecimal == decimal,
+          decimal >= lowerBound,
+          decimal <= upperBound else {
+        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
+    }
+
+    let integerString = NSDecimalNumber(decimal: decimal).stringValue
+    guard let value = convert(integerString) else {
+        throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
     }
     return value
 }

@@ -149,7 +149,7 @@ rejects route drift, non-UTF-8 or oversized content, DTD/entity declarations, sy
 non-regular files.
 
 Canonical and Open Graph metadata are a discovery and presentation surface for that same exact
-44-page set. The validator independently pins every page's route, title, description, object
+45-page set. The validator independently pins every page's route, title, description, object
 type, and research-note section instead of accepting generated HTML or `research/index.json` as
 authority. Canonical and `og:url` values must be identical absolute same-origin URLs; only reviewed
 notes may carry article properties. The shared preview PNG is size-, signature-, dimension-, and

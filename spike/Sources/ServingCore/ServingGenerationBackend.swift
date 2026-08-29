@@ -2,10 +2,23 @@ import Foundation
 
 public protocol ServingGenerationBackend: Sendable {
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle
+    func start(
+        _ request: OpenAIChatCompletionRequest,
+        resolvedCompletionBudget: ServingCompletionBudgetResolution
+    ) async throws -> ServingGenerationHandle
     func shutdown() async
 }
 
 extension ServingGenerationBackend {
+    public func start(
+        _ request: OpenAIChatCompletionRequest,
+        resolvedCompletionBudget: ServingCompletionBudgetResolution
+    ) async throws -> ServingGenerationHandle {
+        throw OpenAIServingError.server(
+            "The selected fallback route cannot preserve the resolved completion budget",
+            code: "resolved_budget_fallback_unsupported")
+    }
+
     public func shutdown() async {}
 }
 
@@ -57,6 +70,9 @@ public struct ServingGenerationHandle: Sendable {
     public let route: ServingExecutionRoute
     public let mailbox: BoundedDeltaMailbox
     public let lease: ServingRequestLease
+    /// Exact post-template admission result. Nil is retained only for source-compatible fixture and
+    /// third-party backends that have not opted into model-aware production admission.
+    public let completionBudgetResolution: ServingCompletionBudgetResolution?
     /// Whether this stream separates reasoning from the visible answer: the streaming SSE handler routes
     /// its `.text` deltas through `StreamingReasoningSplitter` (reasoning until `</think>`, then content)
     /// when true, and passes them through as raw `delta.content` (byte-identical to before) when false.
@@ -71,6 +87,7 @@ public struct ServingGenerationHandle: Sendable {
         route: ServingExecutionRoute,
         mailbox: BoundedDeltaMailbox,
         lease: ServingRequestLease,
+        completionBudgetResolution: ServingCompletionBudgetResolution? = nil,
         separatesReasoning: Bool = false
     ) {
         self.responseID = responseID
@@ -79,6 +96,7 @@ public struct ServingGenerationHandle: Sendable {
         self.route = route
         self.mailbox = mailbox
         self.lease = lease
+        self.completionBudgetResolution = completionBudgetResolution
         self.separatesReasoning = separatesReasoning
     }
 }

@@ -53,6 +53,39 @@ final class ServingBoundedDeltaMailboxTests: XCTestCase {
         XCTAssertEqual(second, .text("x"))
     }
 
+    func testToolCallArgumentsCountAgainstMailboxByteCapacity() async throws {
+        let call = OpenAIToolCall(
+            id: "call_0",
+            function: .init(name: "lookup", arguments: String(repeating: "x", count: 128)))
+        let delta = ServingResponseDelta.toolCalls([call])
+        XCTAssertGreaterThan(delta.utf8ByteCount, 128)
+
+        let mailbox = BoundedDeltaMailbox(
+            capacity: .init(maxDeltas: 1, maxBytes: 64))
+        do {
+            try await mailbox.send(delta)
+            XCTFail("Expected the serialized tool-call payload to exceed mailbox capacity")
+        } catch let error as ServingMailboxError {
+            XCTAssertEqual(error, .backend("delta exceeds mailbox byte capacity"))
+        }
+        let snapshot = await mailbox.snapshot()
+        XCTAssertEqual(snapshot.bufferedDeltas, 0)
+    }
+
+    func testJSONStringEscapesCountAgainstMailboxByteCapacity() async throws {
+        let delta = ServingResponseDelta.text(String(repeating: "\"", count: 20))
+        XCTAssertEqual(delta.utf8ByteCount, 40)
+
+        let mailbox = BoundedDeltaMailbox(
+            capacity: .init(maxDeltas: 1, maxBytes: 32))
+        do {
+            try await mailbox.send(delta)
+            XCTFail("Expected escaped JSON text to exceed mailbox capacity")
+        } catch let error as ServingMailboxError {
+            XCTAssertEqual(error, .backend("delta exceeds mailbox byte capacity"))
+        }
+    }
+
     func testCancelResumesBlockedProducerAndClearsCapacity() async throws {
         let mailbox = BoundedDeltaMailbox(
             capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 1, maxBytes: 4))

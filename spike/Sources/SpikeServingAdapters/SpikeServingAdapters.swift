@@ -64,6 +64,9 @@ public struct ScalarServingBackendConfiguration: Sendable {
     /// with the per-request resolved thinking flag into `handle.separatesReasoning`. Defaults false
     /// (dense/compiled + any family not yet live-attested → today's passthrough, zero regression).
     public var thinksByDefault: Bool
+    /// Immutable model/host-fit capability. Nil preserves the legacy library behavior for existing
+    /// embedders; `fastmlx-serve` always supplies it for production routes.
+    public let modelCapabilities: ServingModelCapabilities?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -72,7 +75,8 @@ public struct ScalarServingBackendConfiguration: Sendable {
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
         toolCallFormat: ToolCallFormat = .json,
         disableThinkingWhenToolsActive: Bool = false,
-        thinksByDefault: Bool = false
+        thinksByDefault: Bool = false,
+        modelCapabilities: ServingModelCapabilities? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -90,6 +94,7 @@ public struct ScalarServingBackendConfiguration: Sendable {
         self.toolCallFormat = toolCallFormat
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
         self.thinksByDefault = thinksByDefault
+        self.modelCapabilities = modelCapabilities
     }
 }
 
@@ -116,6 +121,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let request: OpenAIChatCompletionRequest
         let promptTokens: [Int]
         let maximumCompletionTokens: Int
+        let completionBudgetResolution: ServingCompletionBudgetResolution?
         let sampling: DecoderSampling
         let penalties: DecoderPenalties
         let activeTools: [OpenAIToolSpec]
@@ -158,10 +164,28 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         self.stopTokenIDs = stopTokenIDs
         self.modelStopStrings = modelStopStrings
         self.configuration = configuration
+        precondition(
+            configuration.modelCapabilities == nil
+                || configuration.modelCapabilities?.model == launchedModel,
+            "modelCapabilities must describe the launched model")
     }
 
     public func start(
         _ request: OpenAIChatCompletionRequest
+    ) async throws -> ServingGenerationHandle {
+        try await start(request, preservedResolution: nil)
+    }
+
+    public func start(
+        _ request: OpenAIChatCompletionRequest,
+        resolvedCompletionBudget: ServingCompletionBudgetResolution
+    ) async throws -> ServingGenerationHandle {
+        try await start(request, preservedResolution: resolvedCompletionBudget)
+    }
+
+    private func start(
+        _ request: OpenAIChatCompletionRequest,
+        preservedResolution: ServingCompletionBudgetResolution?
     ) async throws -> ServingGenerationHandle {
         guard acceptingRequests else {
             throw ScalarServingBackendError.shuttingDown
@@ -175,22 +199,53 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             throw ScalarServingBackendError.invalidStopTokenIDs
         }
 
-        if active != nil, queue.count >= configuration.maximumQueuedRequests {
-            throw ServingBackendAdmissionError.queueFull(
-                retryAfterSeconds: configuration.queueRetryAfterSeconds)
-        }
         let activeTools = request.activeTools
         // Resolve thinking ONCE and use the SAME value for both the prompt render and the streaming
         // reasoning gate — rendering and gating must not desync (a closed <think></think> in the prompt
         // with a splitter still engaged would mislabel the answer).
         let resolvedEnableThinking = request.resolvedEnableThinking(
             disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive)
-        let promptTokens = try codec.render(
-            messages: request.messages,
-            tools: activeTools,
-            enableThinking: resolvedEnableThinking,
-            reasoningEffort: request.reasoningEffort)
-        guard !promptTokens.isEmpty else {
+        var promptTokens: [Int]?
+        var completionBudgetResolution: ServingCompletionBudgetResolution?
+        if let capabilities = configuration.modelCapabilities {
+            let rendered = try codec.render(
+                messages: request.messages,
+                tools: activeTools,
+                enableThinking: resolvedEnableThinking,
+                reasoningEffort: request.reasoningEffort)
+            guard !rendered.isEmpty else {
+                throw ScalarServingBackendError.emptyRenderedPrompt
+            }
+            let resolved = try capabilities.resolveCompletionBudget(
+                requestedCompletionTokens: request.maxCompletionTokens,
+                renderedPromptTokens: rendered.count,
+                stream: request.stream)
+            if let preservedResolution, preservedResolution != resolved {
+                throw OpenAIServingError.server(
+                    "The fallback route rendered a different prompt or completion budget",
+                    code: "resolved_budget_fallback_mismatch")
+            }
+            promptTokens = rendered
+            completionBudgetResolution = resolved
+        } else if preservedResolution != nil {
+            throw OpenAIServingError.server(
+                "The fallback route has no model-aware capability for budget validation",
+                code: "resolved_budget_fallback_unsupported")
+        }
+
+        if active != nil, queue.count >= configuration.maximumQueuedRequests {
+            throw ServingBackendAdmissionError.queueFull(
+                retryAfterSeconds: configuration.queueRetryAfterSeconds)
+        }
+        if promptTokens == nil {
+            promptTokens = try codec.render(
+                messages: request.messages,
+                tools: activeTools,
+                enableThinking: resolvedEnableThinking,
+                reasoningEffort: request.reasoningEffort)
+        }
+        let renderedPromptTokens = promptTokens ?? []
+        guard !renderedPromptTokens.isEmpty else {
             throw ScalarServingBackendError.emptyRenderedPrompt
         }
         // Resolve + validate sampling at admission so an out-of-range temperature/top_p rejects
@@ -209,10 +264,12 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let pending = PendingRequest(
             id: id,
             request: request,
-            promptTokens: promptTokens,
+            promptTokens: renderedPromptTokens,
             maximumCompletionTokens:
-                request.maxCompletionTokens
+                completionBudgetResolution?.appliedCompletionTokens
+                ?? request.maxCompletionTokens
                 ?? configuration.defaultMaximumCompletionTokens,
+            completionBudgetResolution: completionBudgetResolution,
             sampling: sampling,
             penalties: penalties,
             activeTools: activeTools,
@@ -232,6 +289,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             route: .scalarGreedy,
             mailbox: mailbox,
             lease: lease,
+            completionBudgetResolution: completionBudgetResolution,
             separatesReasoning: servingSeparatesReasoning(
                 thinksByDefault: configuration.thinksByDefault,
                 resolvedEnableThinking: resolvedEnableThinking))

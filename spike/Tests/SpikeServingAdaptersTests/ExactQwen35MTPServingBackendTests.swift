@@ -238,13 +238,102 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
                 .scalarFallbackMustUseSeparateRawTarget)
         }
     }
+
+    func testModelAwareBudgetUsesExactPromptAndReachesRunnerAndHandle() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 6,
+            requestedDefaultCompletionTokens: 4,
+            maximumNonStreamingCompletionTokens: 5,
+            completionLimitPolicy: .clamp)
+        let runner = ScriptedMTPRunner(
+            script: .completed(
+                text: ["a", "b", "c", "d"],
+                promptTokens: 2,
+                completionTokens: 4,
+                stopReason: .length))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(
+            runner: runner,
+            scalarFallback: scalar,
+            modelCapabilities: capabilities)
+
+        let handle = try await backend.start(request(maxTokens: 8))
+        let resolution = try XCTUnwrap(handle.completionBudgetResolution)
+        XCTAssertEqual(resolution.renderedPromptTokens, 2)
+        XCTAssertEqual(resolution.maximumAllowedCompletionTokens, 4)
+        XCTAssertEqual(resolution.appliedCompletionTokens, 4)
+        XCTAssertTrue(resolution.wasClamped)
+        XCTAssertEqual(runner.snapshot().lastMaximumCompletionTokens, 4)
+        _ = try await collect(handle.mailbox)
+    }
+
+    func testModelAwareRejectionMutatesNoStartupReservationOrRunnerState() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 4,
+            requestedDefaultCompletionTokens: 2,
+            maximumNonStreamingCompletionTokens: 3,
+            completionLimitPolicy: .reject)
+        let runner = ScriptedMTPRunner(
+            script: .completed(
+                text: ["unused"],
+                promptTokens: 2,
+                completionTokens: 1,
+                stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(
+            runner: runner,
+            scalarFallback: scalar,
+            modelCapabilities: capabilities)
+
+        do {
+            _ = try await backend.start(request(maxTokens: 4))
+            XCTFail("Expected model-aware budget rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "completion_limit_exceeded")
+        }
+
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+        let snapshot = await backend.snapshot()
+        XCTAssertEqual(snapshot.pendingMTPStartups, 0)
+        XCTAssertEqual(snapshot.activeMTPReservations, 0)
+    }
+
+    func testRunnerFailurePreservesResolvedBudgetAcrossScalarFallback() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 6,
+            requestedDefaultCompletionTokens: 4,
+            maximumNonStreamingCompletionTokens: 5,
+            completionLimitPolicy: .clamp)
+        let runner = ScriptedMTPRunner(script: .failToStart)
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(
+            runner: runner,
+            scalarFallback: scalar,
+            modelCapabilities: capabilities)
+
+        let handle = try await backend.start(request(maxTokens: 8))
+        _ = try await collect(handle.mailbox)
+
+        let preserved = try XCTUnwrap(scalar.snapshot().lastCompletionBudgetResolution)
+        XCTAssertEqual(preserved.appliedCompletionTokens, 4)
+        XCTAssertEqual(preserved.renderedPromptTokens, 2)
+        XCTAssertEqual(handle.completionBudgetResolution, preserved)
+    }
 }
 
 private func makeBackend(
     enabled: Bool = true,
     runner: ScriptedMTPRunner,
     scalarFallback: ScriptedScalarFallback,
-    scalarFallbackIsolation: ExactQwen35MTPScalarFallbackIsolation = .strictlySeparateRawTarget
+    scalarFallbackIsolation: ExactQwen35MTPScalarFallbackIsolation = .strictlySeparateRawTarget,
+    modelCapabilities: ServingModelCapabilities? = nil
 ) throws -> ExactQwen35MTPServingBackend {
     try ExactQwen35MTPServingBackend(
         launchedModel: "fixture-model",
@@ -255,7 +344,8 @@ private func makeBackend(
         codec: FixtureScalarTextCodec(promptTokens: [10, 11]),
         configuration: .init(
             defaultMaximumCompletionTokens: 8,
-            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024)))
+            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024),
+            modelCapabilities: modelCapabilities))
 }
 
 private let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
@@ -386,18 +476,37 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
     struct Snapshot: Sendable {
         let startCount: Int
         let shutdownCount: Int
+        let lastCompletionBudgetResolution: ServingCompletionBudgetResolution?
     }
 
     private struct State: Sendable {
         var startCount = 0
         var shutdownCount = 0
+        var lastCompletionBudgetResolution: ServingCompletionBudgetResolution?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
+        try await start(request, completionBudgetResolution: nil)
+    }
+
+    func start(
+        _ request: OpenAIChatCompletionRequest,
+        resolvedCompletionBudget: ServingCompletionBudgetResolution
+    ) async throws -> ServingGenerationHandle {
+        try await start(
+            request,
+            completionBudgetResolution: resolvedCompletionBudget)
+    }
+
+    private func start(
+        _ request: OpenAIChatCompletionRequest,
+        completionBudgetResolution: ServingCompletionBudgetResolution?
+    ) async throws -> ServingGenerationHandle {
         let sequence = state.withLock { state in
             state.startCount += 1
+            state.lastCompletionBudgetResolution = completionBudgetResolution
             return state.startCount
         }
         let mailbox = BoundedDeltaMailbox(capacity: .init(maxDeltas: 4, maxBytes: 1_024))
@@ -419,7 +528,8 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
             model: request.model,
             route: .scalarGreedy,
             mailbox: mailbox,
-            lease: lease)
+            lease: lease,
+            completionBudgetResolution: completionBudgetResolution)
     }
 
     func shutdown() async {
@@ -428,7 +538,10 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
 
     func snapshot() -> Snapshot {
         state.withLock {
-            Snapshot(startCount: $0.startCount, shutdownCount: $0.shutdownCount)
+            Snapshot(
+                startCount: $0.startCount,
+                shutdownCount: $0.shutdownCount,
+                lastCompletionBudgetResolution: $0.lastCompletionBudgetResolution)
         }
     }
 }

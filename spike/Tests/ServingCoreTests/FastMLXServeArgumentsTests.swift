@@ -157,8 +157,144 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         ])
 
         XCTAssertEqual(arguments.maximumCompletionTokens, 8_192)
+        XCTAssertTrue(arguments.maximumCompletionTokensWasExplicit)
         XCTAssertTrue(
             FastMLXServeArguments.usage.contains("--max-completion-tokens N"))
+    }
+
+    func testCompletionBudgetDefaultsAndExplicitMaxIntentArePreserved() throws {
+        let absent = try FastMLXServeArguments.parse(["--scripted"])
+        XCTAssertEqual(absent.defaultCompletionTokens, 4_096)
+        XCTAssertFalse(absent.defaultCompletionTokensWasExplicit)
+        XCTAssertEqual(absent.maximumCompletionTokens, 4_096)
+        XCTAssertFalse(absent.maximumCompletionTokensWasExplicit)
+        XCTAssertEqual(absent.maximumNonStreamingCompletionTokens, 16_384)
+        XCTAssertNil(absent.maximumRequestBodyBytes)
+        XCTAssertEqual(absent.maximumNonStreamingResponseBytes, 16 * 1_048_576)
+        XCTAssertEqual(absent.completionLimitPolicy, .reject)
+
+        let explicitMax = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--max-completion-tokens", "4096",
+        ])
+        XCTAssertEqual(explicitMax.maximumCompletionTokens, 4_096)
+        XCTAssertTrue(
+            explicitMax.maximumCompletionTokensWasExplicit,
+            "explicit 4096 must remain distinguishable from the default so served model caps can be derived from the model when the operator omits the flag")
+    }
+
+    func testDefaultCompletionTokensParsesStrictPositiveInteger() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--default-completion-tokens", "8192",
+        ])
+
+        XCTAssertEqual(arguments.defaultCompletionTokens, 8_192)
+        XCTAssertTrue(arguments.defaultCompletionTokensWasExplicit)
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--default-completion-tokens N"))
+    }
+
+    func testMaximumNonStreamingCompletionTokensParsesStrictPositiveInteger() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--max-non-streaming-completion-tokens", "32768",
+        ])
+
+        XCTAssertEqual(arguments.maximumNonStreamingCompletionTokens, 32_768)
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains(
+                "--max-non-streaming-completion-tokens N"))
+    }
+
+    func testTransportByteLimitsParseStrictPositiveIntegersAndAppearInUsage() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--max-request-body-bytes", "67108864",
+            "--max-non-streaming-response-bytes", "33554432",
+        ])
+
+        XCTAssertEqual(arguments.maximumRequestBodyBytes, 64 * 1_048_576)
+        XCTAssertEqual(arguments.maximumNonStreamingResponseBytes, 32 * 1_048_576)
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--max-request-body-bytes N"))
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains(
+                "--max-non-streaming-response-bytes N"))
+    }
+
+    func testCompletionLimitPolicyParsesRejectAndClamp() throws {
+        let reject = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--completion-limit-policy", "reject",
+        ])
+        XCTAssertEqual(reject.completionLimitPolicy, .reject)
+
+        let clamp = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--completion-limit-policy", "clamp",
+        ])
+        XCTAssertEqual(clamp.completionLimitPolicy, .clamp)
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--completion-limit-policy MODE"))
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("reject|clamp"))
+    }
+
+    func testCompletionBudgetFlagsRejectInvalidValues() {
+        for option in [
+            "--default-completion-tokens",
+            "--max-non-streaming-completion-tokens",
+            "--max-request-body-bytes",
+            "--max-non-streaming-response-bytes",
+        ] {
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse([
+                    "--scripted",
+                    option, "0",
+                ]),
+                "expected zero rejection for \(option)"
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    .invalidPositiveInteger(option))
+            }
+
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse([
+                    "--scripted",
+                    option, "-1",
+                ]),
+                "expected negative rejection for \(option)"
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    .invalidPositiveInteger(option))
+            }
+        }
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--completion-limit-policy", "truncate",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .invalidCompletionLimitPolicy)
+        }
+    }
+
+    func testExplicitDefaultCompletionBudgetCannotExceedExplicitMaximum() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--default-completion-tokens", "8192",
+                "--max-completion-tokens", "4096",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .defaultCompletionTokensExceedsMaximumCompletionTokens)
+        }
     }
 
     func testMaxCompletionTokensRejectsMissingDuplicateAndNonStrictValues() {

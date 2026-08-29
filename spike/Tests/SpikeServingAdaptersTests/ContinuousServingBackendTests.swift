@@ -927,6 +927,164 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    func testModelCapabilitiesClampRequestBeforeCoordinatorSubmission()
+        async throws
+    {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture",
+            nativeMaxContextTokens: 10,
+            effectiveMaxContextTokens: 10,
+            requestedDefaultCompletionTokens: 4,
+            maximumCompletionTokens: 6,
+            maximumNonStreamingCompletionTokens: 6,
+            completionLimitPolicy: .clamp)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 2, 99]],
+                recorder: ContinuousRuntimeRecorder()),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["long": [10, 11, 12, 13, 14, 15, 16, 17]],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99],
+            modelCapabilities: capabilities)
+
+        let handle = try await backend.start(
+            request(text: "long", maxTokens: 6))
+
+        XCTAssertEqual(handle.completionBudgetResolution?.requestedCompletionTokens, 6)
+        XCTAssertEqual(handle.completionBudgetResolution?.appliedCompletionTokens, 2)
+        XCTAssertEqual(handle.completionBudgetResolution?.maximumAllowedCompletionTokens, 2)
+        XCTAssertEqual(handle.completionBudgetResolution?.renderedPromptTokens, 8)
+        XCTAssertEqual(handle.completionBudgetResolution?.wasClamped, true)
+        XCTAssertEqual(handle.completionBudgetResolution?.limitingFactor, .contextWindow)
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(snapshots.map(\.request.maxOutputTokens), [2])
+        XCTAssertEqual(snapshots.map(\.request.promptTokenCount), [8])
+
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    func testModelCapabilitiesRejectBeforeDynamicAdmissionOrRuntimeValidation()
+        async throws
+    {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture",
+            nativeMaxContextTokens: 10,
+            effectiveMaxContextTokens: 10,
+            requestedDefaultCompletionTokens: 4,
+            maximumCompletionTokens: 6,
+            maximumNonStreamingCompletionTokens: 6,
+            completionLimitPolicy: .reject)
+        let runtime = CountingValidationContinuousRuntime()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: runtime,
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["too-long": [10, 11, 12, 13, 14, 15, 16, 17]],
+            pieces: [:],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            maximumQueuedRequests: 1,
+            modelCapabilities: capabilities)
+
+        do {
+            _ = try await backend.start(
+                request(text: "too-long", maxTokens: 6))
+            XCTFail("Expected prompt-aware completion budget rejection")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                await backend.shutdown()
+                return
+            }
+            XCTAssertEqual(param, "max_completion_tokens")
+            XCTAssertEqual(code, "completion_limit_exceeded")
+        }
+        let pendingAdmissionCount =
+            await backend.diagnosticPendingAdmissionRequestCount()
+        XCTAssertEqual(pendingAdmissionCount, 0)
+        XCTAssertEqual(runtime.validationCount, 0)
+        XCTAssertEqual(runtime.admissionBatchCount, 0)
+        let snapshots = await coordinator.snapshots()
+        XCTAssertTrue(snapshots.isEmpty)
+
+        await backend.shutdown()
+    }
+
+    func testModelCapabilitiesKeepIndependentResolutionsForCoalescedRequests()
+        async throws
+    {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture",
+            nativeMaxContextTokens: 10,
+            effectiveMaxContextTokens: 10,
+            requestedDefaultCompletionTokens: 4,
+            maximumCompletionTokens: 6,
+            maximumNonStreamingCompletionTokens: 6,
+            completionLimitPolicy: .clamp)
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [
+                    10: [1, 99],
+                    20: [2, 99],
+                ],
+                recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "short": [10, 11],
+                "long": [20, 21, 22, 23, 24, 25, 26, 27],
+            ],
+            pieces: [1: "s", 2: "l"],
+            stopTokenIDs: [99],
+            modelCapabilities: capabilities)
+
+        let shortStart = Task {
+            try await backend.start(request(text: "short", maxTokens: 5))
+        }
+        let longStart = Task {
+            try await backend.start(request(text: "long", maxTokens: 5))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 2
+        }
+
+        await backend.diagnosticExpireAdmissionCoalescingWindow()
+        let short = try await shortStart.value
+        let long = try await longStart.value
+
+        XCTAssertEqual(short.completionBudgetResolution?.renderedPromptTokens, 2)
+        XCTAssertEqual(short.completionBudgetResolution?.appliedCompletionTokens, 5)
+        XCTAssertEqual(short.completionBudgetResolution?.wasClamped, false)
+        XCTAssertEqual(long.completionBudgetResolution?.renderedPromptTokens, 8)
+        XCTAssertEqual(long.completionBudgetResolution?.appliedCompletionTokens, 2)
+        XCTAssertEqual(long.completionBudgetResolution?.wasClamped, true)
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(
+            snapshots.sorted { $0.request.promptTokenCount < $1.request.promptTokenCount }
+                .map(\.request.maxOutputTokens),
+            [5, 2])
+
+        _ = await short.lease.cancel(.clientDisconnected)
+        _ = await long.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
     func testDefaultConfigurationStillStartsImmediateBatchNoSpec()
         async throws
     {
@@ -1856,6 +2014,53 @@ private final class AdmissionValidationFailureContinuousRuntime:
     func remove(_ id: BatchRequestID) {}
 }
 
+private final class CountingValidationContinuousRuntime:
+    ContinuousBatchRuntime, @unchecked Sendable
+{
+    private struct State: Sendable {
+        var validationCount = 0
+        var admissionBatchCount = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    var validationCount: Int {
+        state.withLock(\.validationCount)
+    }
+
+    var admissionBatchCount: Int {
+        state.withLock(\.admissionBatchCount)
+    }
+
+    func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        state.withLock { $0.validationCount += 1 }
+        return .unrestricted
+    }
+
+    func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
+        state.withLock { $0.admissionBatchCount += 1 }
+    }
+
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
+        ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 64,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 4_096)
+    }
+
+    func prefill(_ work: ContinuousBatchRuntimePrefill) throws {}
+
+    func decode(
+        _ action: BatchDecodeAction
+    ) throws -> [ContinuousBatchRuntimeDecodeResult] {
+        []
+    }
+
+    func remove(_ id: BatchRequestID) {}
+}
+
 private enum FixtureContinuousRuntimeError: Error {
     case invalidPrefill
     case decodeBeforeReady
@@ -1925,7 +2130,8 @@ private func makeBackend(
     stopTokenIDs: Set<Int>,
     mailboxCapacity: BoundedDeltaMailbox.Capacity = .init(
         maxDeltas: 2,
-        maxBytes: 4_096)
+        maxBytes: 4_096),
+    modelCapabilities: ServingModelCapabilities? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -1939,7 +2145,8 @@ private func makeBackend(
         configuration: ContinuousServingBackendConfiguration(
             defaultMaximumCompletionTokens: 8,
             queueRetryAfterSeconds: 2,
-            mailboxCapacity: mailboxCapacity))
+            mailboxCapacity: mailboxCapacity,
+            modelCapabilities: modelCapabilities))
 }
 
 private func makeDynamicBackend(
@@ -1953,7 +2160,8 @@ private func makeDynamicBackend(
     mailboxCapacity: BoundedDeltaMailbox.Capacity = .init(
         maxDeltas: 2,
         maxBytes: 4_096),
-    renderGate: BlockingRuntimeResourceSnapshotGate? = nil
+    renderGate: BlockingRuntimeResourceSnapshotGate? = nil,
+    modelCapabilities: ServingModelCapabilities? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -1973,7 +2181,8 @@ private func makeDynamicBackend(
                     soloPLDQualified: true,
                     maximumBatchRequests: maximumBatchRequests,
                     maximumQueuedRequests: maximumQueuedRequests),
-                coalescing: coalescing)))
+                coalescing: coalescing),
+            modelCapabilities: modelCapabilities))
 }
 
 private func request(

@@ -269,7 +269,8 @@ public func loadExactQwen35MTPServeComposition(
                 mailboxCapacity: configuration.scalarBackendConfiguration.mailboxCapacity,
                 disableThinkingWhenToolsActive: configuration
                     .scalarBackendConfiguration.disableThinkingWhenToolsActive,
-                thinksByDefault: configuration.scalarBackendConfiguration.thinksByDefault))
+                thinksByDefault: configuration.scalarBackendConfiguration.thinksByDefault,
+                modelCapabilities: configuration.scalarBackendConfiguration.modelCapabilities))
         return LoadedExactQwen35MTPServeComposition(
             backend: backend,
             scalarStartupReport: scalar.startupReport,

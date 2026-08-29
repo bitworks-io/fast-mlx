@@ -56,6 +56,8 @@ public enum FastMLXServeArgumentError:
     case dynamicPLDWithHybridQwen35
     case invalidHostUse
     case osServiceReserveRequiresDedicatedServing
+    case invalidCompletionLimitPolicy
+    case defaultCompletionTokensExceedsMaximumCompletionTokens
 
     public var description: String {
         switch self {
@@ -124,6 +126,10 @@ public enum FastMLXServeArgumentError:
             "--host-use must be shared or dedicated-serving"
         case .osServiceReserveRequiresDedicatedServing:
             "--os-service-reserve-bytes requires --host-use dedicated-serving"
+        case .invalidCompletionLimitPolicy:
+            "--completion-limit-policy must be reject or clamp"
+        case .defaultCompletionTokensExceedsMaximumCompletionTokens:
+            "--default-completion-tokens cannot exceed an explicit --max-completion-tokens"
         }
     }
 }
@@ -221,8 +227,23 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       Required nonzero OS/service reserve for an explicit
                                       dedicated-serving host classification.
           --port PORT                 Bind port (default: 8080; 0 is ephemeral).
-          --max-completion-tokens N   Maximum accepted OpenAI completion budget
-                                      per request (default: 4096).
+          --default-completion-tokens N
+                                      Budget used when a request omits max tokens
+                                      (default: 4096; safely reduced for small contexts).
+          --max-completion-tokens N   Optional operator ceiling. When omitted, the
+                                      model/host-fit context determines the maximum.
+          --max-non-streaming-completion-tokens N
+                                      In-memory non-streaming safety cap (default: 16384).
+                                      Larger admitted budgets require stream=true.
+          --max-request-body-bytes N  HTTP request-body safety cap. Loaded-model default is
+                                      derived from admitted context (64 bytes/token, bounded
+                                      from 1 MiB through 64 MiB); explicit values override it.
+          --max-non-streaming-response-bytes N
+                                      Exact serialized JSON response cap (default: 16 MiB).
+                                      Streaming is not subject to this aggregate-response cap.
+          --completion-limit-policy MODE
+                                      Explicit over-limit behavior: reject|clamp
+                                      (default: reject).
           --evidence-path PATH        Fresh append-only canonical evidence output.
           --help                      Show this help.
 
@@ -238,9 +259,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     public let model: String
     public let evidencePath: URL?
     public let showHelp: Bool
-    /// Maximum OpenAI completion budget admitted per request. This remains a flat transport limit;
-    /// the model/context fit-check is intentionally a separate serving concern.
+    /// Compatibility value for the maximum flag. `maximumCompletionTokensWasExplicit` determines
+    /// whether it narrows the model/fit-derived maximum or is merely the historical parser default.
     public let maximumCompletionTokens: Int
+    public let maximumCompletionTokensWasExplicit: Bool
+    public let defaultCompletionTokens: Int
+    public let defaultCompletionTokensWasExplicit: Bool
+    public let maximumNonStreamingCompletionTokens: Int
+    public let maximumRequestBodyBytes: Int?
+    public let maximumNonStreamingResponseBytes: Int
+    public let completionLimitPolicy: ServingCompletionLimitPolicy
     /// Operator-requested served context (`--context N`); `nil` uses the sizer's effective default.
     /// Consumed by the pre-load fit-check, not by backend selection.
     public let requestedContext: Int?
@@ -323,6 +351,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         showHelp: Bool,
         maximumCompletionTokens: Int = OpenAIChatRequestLimits.productionDefault
             .maximumCompletionTokens,
+        maximumCompletionTokensWasExplicit: Bool = false,
+        defaultCompletionTokens: Int = 4_096,
+        defaultCompletionTokensWasExplicit: Bool = false,
+        maximumNonStreamingCompletionTokens: Int = 16_384,
+        maximumRequestBodyBytes: Int? = nil,
+        maximumNonStreamingResponseBytes: Int = 16 * 1_048_576,
+        completionLimitPolicy: ServingCompletionLimitPolicy = .reject,
         requestedContext: Int? = nil,
         forceServe: Bool = false,
         quantCandidateDirectories: [URL] = [],
@@ -346,6 +381,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.evidencePath = evidencePath
         self.showHelp = showHelp
         self.maximumCompletionTokens = maximumCompletionTokens
+        self.maximumCompletionTokensWasExplicit = maximumCompletionTokensWasExplicit
+        self.defaultCompletionTokens = defaultCompletionTokens
+        self.defaultCompletionTokensWasExplicit = defaultCompletionTokensWasExplicit
+        self.maximumNonStreamingCompletionTokens = maximumNonStreamingCompletionTokens
+        self.maximumRequestBodyBytes = maximumRequestBodyBytes
+        self.maximumNonStreamingResponseBytes = maximumNonStreamingResponseBytes
+        self.completionLimitPolicy = completionLimitPolicy
         self.requestedContext = requestedContext
         self.forceServe = forceServe
         self.quantCandidateDirectories = quantCandidateDirectories
@@ -372,6 +414,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var showHelp = false
         var maximumCompletionTokens = OpenAIChatRequestLimits.productionDefault
             .maximumCompletionTokens
+        var maximumCompletionTokensWasExplicit = false
+        var defaultCompletionTokens = 4_096
+        var defaultCompletionTokensWasExplicit = false
+        var maximumNonStreamingCompletionTokens = 16_384
+        var maximumRequestBodyBytes: Int?
+        var maximumNonStreamingResponseBytes = 16 * 1_048_576
+        var completionLimitPolicy = ServingCompletionLimitPolicy.reject
         var host = "127.0.0.1"
         var requestedHostUse: FastMLXServeHostUse?
         var osServiceReserveBytes: Int?
@@ -445,6 +494,35 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumCompletionTokens = try strictPositiveInteger(
                     try value(at: index, in: arguments, for: argument),
                     option: argument)
+                maximumCompletionTokensWasExplicit = true
+            case "--default-completion-tokens":
+                index += 1
+                defaultCompletionTokens = try strictPositiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
+                defaultCompletionTokensWasExplicit = true
+            case "--max-non-streaming-completion-tokens":
+                index += 1
+                maximumNonStreamingCompletionTokens = try strictPositiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
+            case "--max-request-body-bytes":
+                index += 1
+                maximumRequestBodyBytes = try strictPositiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
+            case "--max-non-streaming-response-bytes":
+                index += 1
+                maximumNonStreamingResponseBytes = try strictPositiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
+            case "--completion-limit-policy":
+                index += 1
+                let rawPolicy = try value(at: index, in: arguments, for: argument)
+                guard let policy = ServingCompletionLimitPolicy(rawValue: rawPolicy) else {
+                    throw FastMLXServeArgumentError.invalidCompletionLimitPolicy
+                }
+                completionLimitPolicy = policy
             case "--model":
                 index += 1
                 model = try value(at: index, in: arguments, for: argument)
@@ -548,6 +626,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             index += 1
         }
 
+        if defaultCompletionTokensWasExplicit,
+            maximumCompletionTokensWasExplicit,
+            defaultCompletionTokens > maximumCompletionTokens
+        {
+            throw FastMLXServeArgumentError
+                .defaultCompletionTokensExceedsMaximumCompletionTokens
+        }
+
         if showHelp {
             return FastMLXServeArguments(
                 backend: nil,
@@ -558,7 +644,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 model: model ?? "fastmlx-scripted",
                 evidencePath: evidencePath,
                 showHelp: true,
-                maximumCompletionTokens: maximumCompletionTokens)
+                maximumCompletionTokens: maximumCompletionTokens,
+                maximumCompletionTokensWasExplicit: maximumCompletionTokensWasExplicit,
+                defaultCompletionTokens: defaultCompletionTokens,
+                defaultCompletionTokensWasExplicit: defaultCompletionTokensWasExplicit,
+                maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
+                maximumRequestBodyBytes: maximumRequestBodyBytes,
+                maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
+                completionLimitPolicy: completionLimitPolicy)
         }
 
         if requestedHostUse == .dedicatedServing {
@@ -628,6 +721,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     evidencePath: evidencePath,
                     showHelp: false,
                     maximumCompletionTokens: maximumCompletionTokens,
+                    maximumCompletionTokensWasExplicit: maximumCompletionTokensWasExplicit,
+                    defaultCompletionTokens: defaultCompletionTokens,
+                    defaultCompletionTokensWasExplicit: defaultCompletionTokensWasExplicit,
+                    maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
+                    maximumRequestBodyBytes: maximumRequestBodyBytes,
+                    maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
+                    completionLimitPolicy: completionLimitPolicy,
                     requestedContext: requestedContext,
                     forceServe: forceServe,
                     quantCandidateDirectories: [],
@@ -651,6 +751,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 evidencePath: evidencePath,
                 showHelp: false,
                 maximumCompletionTokens: maximumCompletionTokens,
+                maximumCompletionTokensWasExplicit: maximumCompletionTokensWasExplicit,
+                defaultCompletionTokens: defaultCompletionTokens,
+                defaultCompletionTokensWasExplicit: defaultCompletionTokensWasExplicit,
+                maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
+                maximumRequestBodyBytes: maximumRequestBodyBytes,
+                maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
+                completionLimitPolicy: completionLimitPolicy,
                 requestedContext: requestedContext,
                 forceServe: forceServe,
                 quantCandidateDirectories: quantCandidateDirs,
@@ -693,7 +800,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 model: launchedModel,
                 evidencePath: evidencePath,
                 showHelp: false,
-                maximumCompletionTokens: maximumCompletionTokens)
+                maximumCompletionTokens: maximumCompletionTokens,
+                maximumCompletionTokensWasExplicit: maximumCompletionTokensWasExplicit,
+                defaultCompletionTokens: defaultCompletionTokens,
+                defaultCompletionTokensWasExplicit: defaultCompletionTokensWasExplicit,
+                maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
+                maximumRequestBodyBytes: maximumRequestBodyBytes,
+                maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
+                completionLimitPolicy: completionLimitPolicy)
         }
 
         guard continuousModeSelected || hasLoadedModelOptions else {
@@ -775,6 +889,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             evidencePath: evidencePath,
             showHelp: false,
             maximumCompletionTokens: maximumCompletionTokens,
+            maximumCompletionTokensWasExplicit: maximumCompletionTokensWasExplicit,
+            defaultCompletionTokens: defaultCompletionTokens,
+            defaultCompletionTokensWasExplicit: defaultCompletionTokensWasExplicit,
+            maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
+            maximumRequestBodyBytes: maximumRequestBodyBytes,
+            maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
+            completionLimitPolicy: completionLimitPolicy,
             requestedContext: requestedContext,
             forceServe: forceServe,
             quantCandidateDirectories: quantCandidateDirs,
@@ -797,7 +918,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--host-use",
         "--os-service-reserve-bytes",
         "--port",
+        "--default-completion-tokens",
         "--max-completion-tokens",
+        "--max-non-streaming-completion-tokens",
+        "--max-request-body-bytes",
+        "--max-non-streaming-response-bytes",
+        "--completion-limit-policy",
         "--model",
         "--model-path",
         "--evidence-path",

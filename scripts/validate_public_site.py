@@ -56,9 +56,12 @@ REVIEWED_CAPABILITIES: Tuple[Dict[str, object], ...] = (
         "id": "openai-http-sse-serving",
         "name": "OpenAI-compatible HTTP/SSE serving",
         "status": "promoted-scoped",
-        "summary": "A chat-completions transport with streaming, bounded admission, cancellation, configurable completion ceilings, and evidence output.",
-        "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Completion ceilings are request and operator controls, not a model-quality claim. Scripted mode is transport-only, and no model weights are bundled.",
-        "evidenceSlugs": ("the-proof-did-not-end-when-the-timer-did",),
+        "summary": "A chat-completions transport with streaming, bounded admission, cancellation, model- and host-fit-aware context/completion limits, authenticated capability discovery, and evidence output.",
+        "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Model-aware limits are implemented and regression-tested across scalar, continuous, exact-MTP, and fallback routes; they are capacity controls, not a model-quality, speed, or universal native-context claim. Scripted mode is transport-only, and no model weights are bundled.",
+        "evidenceSlugs": (
+            "the-proof-did-not-end-when-the-timer-did",
+            "the-4k-limit-was-not-the-model-limit",
+        ),
     },
     {
         "id": "exact-continuous-batching",
@@ -172,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_425
 REVIEWED_HOME_PAGE_SHA256 = (
-    "6f05929efda022c2874f49584c249f03d4c2f221f7813d0dbab834320ad60029"
+    "d9f8a0d6a4642540f285c260604d3557bea4e6304d907863b9c5eefeaeff28f9"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -196,18 +199,18 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_570
+REVIEWED_STATUS_PAGE_BYTES = 22_855
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "f33dc96f7ca35b15c37808d22447586ca616286b31a956408db0a6a6d9f67d80"
+    "a703085488876684ed3a14d14f61ddd3b2dc2c899ab07aed59720f7487e0ad86"
 )
-REVIEWED_CAPABILITIES_PAGE_BYTES = 17_747
+REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
-    "912d625e35eeabf72dc19aa559a69f528308d836e43a813a108434ef018c93fb"
+    "61cc7bc395910f139222934a951ade9d5593b6778b9d5cfb14d6944f8587570b"
 )
 REVIEWED_CAPABILITY_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
     "openai-http-sse-serving": (
-        5_334,
-        "33e959e88b3d3840f3dba8933e5cf9085db7ca0b6da0eea4a7680ba1515d27bd",
+        5_849,
+        "753d212c07fb57a0c6e20be7fa8738d225106392f5dfa19dd707ee694aeb8be6",
     ),
     "exact-continuous-batching": (
         5_685,
@@ -346,6 +349,7 @@ REVIEWED_STATUS_LINKS = (
     "../research/",
     "../releases/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
+    "../research/the-4k-limit-was-not-the-model-limit/",
     "../capabilities/openai-http-sse-serving/",
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
@@ -385,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "23 published research notes",
+    "24 published research notes",
     "21 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -480,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/the-4k-limit-was-not-the-model-limit/",
     "research/how-the-autonomous-loop-builds-fast-mlx/",
     "research/the-state-was-right-the-ledger-was-frozen/",
     "research/the-bytes-were-derivable-we-refused-anyway/",
@@ -505,6 +510,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/the-4k-limit-was-not-the-model-limit/": ("2026-08-29", "2026-08-29"),
     "research/how-the-autonomous-loop-builds-fast-mlx/": ("2026-08-22", "2026-08-22"),
     "research/the-state-was-right-the-ledger-was-frozen/": ("2026-08-20", "2026-08-22"),
     "research/the-bytes-were-derivable-we-refused-anyway/": ("2026-08-19", "2026-08-22"),
@@ -787,6 +793,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/the-4k-limit-was-not-the-model-limit/": (
+        "The 4K limit was not the model limit — fast-mlx",
+        "A completion limit can look like a model fact when it is really only a server default.",
+        "article",
+        "OpenAI-compatible serving; Long-horizon inference; Fail-closed capacity",
     ),
     "research/how-the-autonomous-loop-builds-fast-mlx/": (
         "How the autonomous loop builds fast-mlx — fast-mlx",

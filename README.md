@@ -89,6 +89,17 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 The assistant replies with an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`); send the
 tool result back as a `{"role":"tool","tool_call_id":…,"content":…}` message to continue.
 
+Completion length is model- and host-fit-aware. The default request budget is 4,096 tokens, but it
+is not a global maximum: when `--max-completion-tokens` is omitted, the loaded model's authenticated
+context and the pre-load host-fit decision determine the ceiling. Use
+`--default-completion-tokens`, `--max-completion-tokens`,
+`--max-non-streaming-completion-tokens`, and `--completion-limit-policy reject|clamp` to narrow or
+shape the policy. Long completions above the non-streaming ceiling remain available with
+`"stream":true`. The request-body ceiling scales with the admitted context (1–64 MiB by default),
+and `--max-request-body-bytes` plus `--max-non-streaming-response-bytes` provide explicit transport
+overrides. Authenticated clients can inspect every effective token and byte limit at
+`GET /v1/models` instead of guessing from a model name.
+
 ### Transport-only (no model)
 
 ```sh
@@ -117,7 +128,7 @@ capability/evidence review gates.
 
 [`/research/index.json`](https://bitworks-io.github.io/fast-mlx/research/index.json) and
 [`/research/feed.atom`](https://bitworks-io.github.io/fast-mlx/research/feed.atom) are generated
-from the nine explicitly reviewed notes in `site/publications.json`. Each research-feed entry
+from the 24 explicitly reviewed notes in `site/publications.json`. Each research-feed entry
 contains only pinned titles, dates, themes, summaries, and canonical article links—never article
 bodies, external intake, scripts, trackers, or a build-time network request.
 
@@ -137,8 +148,8 @@ human-facing pages, and [`/robots.txt`](https://bitworks-io.github.io/fast-mlx/r
 crawlers to that canonical map. They are deterministic discovery hints—not an indexing guarantee,
 an external-content intake path, or a second publication authority.
 
-Each of the 44 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
-reviewed Open Graph description. The nine research notes alone use article metadata; the ten
+Each of the 45 reviewed HTML pages also publishes one self-referential absolute canonical URL and a
+reviewed Open Graph description. The 24 research notes alone use article metadata; the ten
 product/index pages, seven capability-detail pages, three benchmark-detail pages, and fifteen
 release-detail pages remain website objects, while `404.html` and machine-readable endpoints publish
 neither. Detail pages are immutable views of already-reviewed capability records, benchmark

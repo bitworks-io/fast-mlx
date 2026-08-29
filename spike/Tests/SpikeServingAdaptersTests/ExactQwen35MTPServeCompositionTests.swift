@@ -84,6 +84,41 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
         XCTAssertEqual(scalar.snapshot().startCount, 0)
     }
 
+    func testCompositionForwardsOneModelCapabilityIntoExactRunner() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 12,
+            effectiveMaxContextTokens: 6,
+            requestedDefaultCompletionTokens: 4,
+            maximumNonStreamingCompletionTokens: 4,
+            completionLimitPolicy: .clamp)
+        let runner = RecordingMTPRunner()
+
+        let loaded = try await loadExactQwen35MTPServeComposition(
+            configuration: compositionConfiguration(modelCapabilities: capabilities),
+            scalarLoader: { configuration in
+                ExactQwen35MTPLoadedScalarFallback(
+                    backend: ScriptedCompositionScalarBackend(),
+                    startupReport: scalarReport(
+                        memory: configuration.memoryLimitBytes,
+                        cache: configuration.cacheLimitBytes))
+            },
+            runtimeLoader: { _ in
+                ExactQwen35MTPServingRuntimeComponents(
+                    runner: runner,
+                    codec: FixtureCompositionCodec(promptTokens: [91, 92]),
+                    descriptor: exactDescriptor())
+            })
+
+        let handle = try await loaded.backend.start(
+            compositionRequest(maxCompletionTokens: 8))
+        _ = try await collectComposition(handle.mailbox)
+
+        XCTAssertEqual(handle.completionBudgetResolution?.appliedCompletionTokens, 4)
+        XCTAssertTrue(handle.completionBudgetResolution?.wasClamped == true)
+        XCTAssertEqual(runner.snapshot().maximumCompletionTokens, 4)
+    }
+
     func testExactRuntimeFailureReturnsScalarFallbackWithPathFreeStatus() async throws {
         let events = LockedEvents()
         let scalar = ScriptedCompositionScalarBackend()
@@ -203,7 +238,9 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
     }
 }
 
-private func compositionConfiguration() -> ExactQwen35MTPServeCompositionConfiguration {
+private func compositionConfiguration(
+    modelCapabilities: ServingModelCapabilities? = nil
+) -> ExactQwen35MTPServeCompositionConfiguration {
     ExactQwen35MTPServeCompositionConfiguration(
         launchedModel: "fixture-model",
         targetDirectory: URL(fileURLWithPath: "/models/qwen35-target", isDirectory: true),
@@ -214,7 +251,8 @@ private func compositionConfiguration() -> ExactQwen35MTPServeCompositionConfigu
             defaultMaximumCompletionTokens: 8,
             maximumQueuedRequests: 1,
             queueRetryAfterSeconds: 1,
-            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024)))
+            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024),
+            modelCapabilities: modelCapabilities))
 }
 
 private func compositeTargetParsed(
@@ -266,11 +304,13 @@ private func exactDescriptor() -> ExactQwen35MTPServingDescriptor {
         maximumAcceptedDraftTokens: 2)
 }
 
-private func compositionRequest() -> OpenAIChatCompletionRequest {
+private func compositionRequest(
+    maxCompletionTokens: Int = 2
+) -> OpenAIChatCompletionRequest {
     OpenAIChatCompletionRequest(
         model: "fixture-model",
         messages: [OpenAIChatMessage(role: .user, text: "hello")],
-        maxCompletionTokens: 2,
+        maxCompletionTokens: maxCompletionTokens,
         temperature: 0,
         choiceCount: 1,
         stream: true,
@@ -357,6 +397,7 @@ private final class ScriptedCompositionScalarBackend: ServingGenerationBackend, 
 private final class RecordingMTPRunner: ExactQwen35MTPServingRunner, Sendable {
     struct Snapshot: Sendable {
         let lastPromptTokens: [Int]
+        let maximumCompletionTokens: Int
     }
 
     let binding: QwenMTPArtifactBinding? = {
@@ -372,12 +413,20 @@ private final class RecordingMTPRunner: ExactQwen35MTPServingRunner, Sendable {
             maximumAcceptedDraftTokens: descriptor.maximumAcceptedDraftTokens)
     }()
 
-    private let state = OSAllocatedUnfairLock(initialState: [Int]())
+    private struct State: Sendable {
+        var promptTokens: [Int] = []
+        var maximumCompletionTokens = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
 
     func start(
         _ request: ExactQwen35MTPServingRunnerRequest
     ) async throws -> ExactQwen35MTPServingRunnerHandle {
-        state.withLock { $0 = request.promptTokens }
+        state.withLock {
+            $0.promptTokens = request.promptTokens
+            $0.maximumCompletionTokens = request.maximumCompletionTokens
+        }
         let (stream, continuation) = AsyncStream<Generation>.makeStream()
         let task = Task {
             continuation.yield(.chunk("exact"))
@@ -395,7 +444,11 @@ private final class RecordingMTPRunner: ExactQwen35MTPServingRunner, Sendable {
     }
 
     func snapshot() -> Snapshot {
-        state.withLock { Snapshot(lastPromptTokens: $0) }
+        state.withLock {
+            Snapshot(
+                lastPromptTokens: $0.promptTokens,
+                maximumCompletionTokens: $0.maximumCompletionTokens)
+        }
     }
 }
 

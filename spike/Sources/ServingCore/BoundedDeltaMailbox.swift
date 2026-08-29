@@ -39,13 +39,59 @@ public enum ServingResponseDelta: Equatable, Sendable {
     public var utf8ByteCount: Int {
         switch self {
         case .text(let text):
-            return text.utf8.count
-        case .toolCalls:
-            return 0
+            return jsonStringPayloadUpperBound(text)
+        case .toolCalls(let calls):
+            // Count a conservative upper bound of the exact OpenAI JSON representation. This keeps
+            // generated function arguments inside the same mailbox/resource boundary as text and
+            // avoids allocating a second potentially large encoded Data value just to measure it.
+            var count = 2  // array brackets
+            for (index, call) in calls.enumerated() {
+                count = saturatingAdd(count, index == 0 ? 0 : 1)
+                count = saturatingAdd(count, 96)  // object keys, punctuation, and quotes
+                count = saturatingAdd(count, jsonStringPayloadUpperBound(call.id))
+                count = saturatingAdd(count, jsonStringPayloadUpperBound(call.type))
+                count = saturatingAdd(count, jsonStringPayloadUpperBound(call.function.name))
+                count = saturatingAdd(
+                    count,
+                    jsonStringPayloadUpperBound(call.function.arguments))
+            }
+            return count
         case .completion:
             return 0
         }
     }
+}
+
+private func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+    return overflow ? Int.max : sum
+}
+
+/// Number of UTF-8 bytes a string's contents can occupy inside JSON quotes. The count includes
+/// required escapes but excludes the two surrounding quote bytes. Forward slashes are counted as
+/// escaped because Foundation may emit `\/`; this intentionally remains a safe upper bound.
+private func jsonStringPayloadUpperBound(_ string: String) -> Int {
+    var count = 0
+    for scalar in string.unicodeScalars {
+        let value = scalar.value
+        let bytes: Int
+        switch value {
+        case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x2F, 0x5C:
+            bytes = 2
+        case 0x00...0x1F, 0x2028, 0x2029:
+            bytes = 6
+        case 0x00...0x7F:
+            bytes = 1
+        case 0x80...0x7FF:
+            bytes = 2
+        case 0x800...0xFFFF:
+            bytes = 3
+        default:
+            bytes = 4
+        }
+        count = saturatingAdd(count, bytes)
+    }
+    return count
 }
 
 public enum ServingCancellationReason: String, Codable, Equatable, Sendable {
@@ -225,13 +271,20 @@ public actor BoundedDeltaMailbox {
     }
 
     private func canBuffer(_ delta: ServingResponseDelta) -> Bool {
-        buffered.count < capacity.maxDeltas
-            && bufferedBytes + delta.utf8ByteCount <= capacity.maxBytes
+        guard buffered.count < capacity.maxDeltas else {
+            return false
+        }
+        let (newCount, overflow) = bufferedBytes.addingReportingOverflow(
+            delta.utf8ByteCount)
+        return !overflow && newCount <= capacity.maxBytes
     }
 
     private func append(_ delta: ServingResponseDelta) {
         buffered.append(delta)
-        bufferedBytes += delta.utf8ByteCount
+        let (newCount, overflow) = bufferedBytes.addingReportingOverflow(
+            delta.utf8ByteCount)
+        precondition(!overflow && newCount <= capacity.maxBytes)
+        bufferedBytes = newCount
     }
 
     private func removeFirstBuffered() -> ServingResponseDelta {

@@ -2,16 +2,17 @@
   "schemaVersion": 1,
   "policy": "fast-mlx-owned-results-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-28",
+  "updatedAt": "2026-08-29",
   "capabilities": [
     {
       "id": "openai-http-sse-serving",
       "name": "OpenAI-compatible HTTP/SSE serving",
       "status": "promoted-scoped",
-      "summary": "A chat-completions transport with streaming, bounded admission, cancellation, configurable completion ceilings, and evidence output.",
-      "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Completion ceilings are request and operator controls, not a model-quality claim. Scripted mode is transport-only, and no model weights are bundled.",
+      "summary": "A chat-completions transport with streaming, bounded admission, cancellation, model- and host-fit-aware context/completion limits, authenticated capability discovery, and evidence output.",
+      "scope": "The explicit temperature-zero continuous-batch-no-spec route is qualified only for the published source-locked Qwen3-32B-4bit workload. Model-aware limits are implemented and regression-tested across scalar, continuous, exact-MTP, and fallback routes; they are capacity controls, not a model-quality, speed, or universal native-context claim. Scripted mode is transport-only, and no model weights are bundled.",
       "evidenceSlugs": [
-        "the-proof-did-not-end-when-the-timer-did"
+        "the-proof-did-not-end-when-the-timer-did",
+        "the-4k-limit-was-not-the-model-limit"
       ]
     },
     {

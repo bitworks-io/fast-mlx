@@ -51,6 +51,13 @@ struct FastMLXServe {
             // clean non-zero exit instead of a Swift top-level fatalError trap (exit 133, doubled
             // message). Covers both the single-model red verdict and the quant-candidates all-red set.
             exit(2)
+        } catch let error as ServingModelCapabilitiesError {
+            FileHandle.standardError.write(
+                Data(
+                    "fastmlx-serve configuration=refused reason=model_capabilities "
+                        .appending(error.description + "\n")
+                        .utf8))
+            exit(2)
         }
     }
 
@@ -111,15 +118,25 @@ struct FastMLXServe {
                 })
         }
         let requestLimits = OpenAIChatRequestLimits(
-            maximumBodyBytes: OpenAIChatRequestLimits.productionDefault.maximumBodyBytes,
-            maximumCompletionTokens: arguments.maximumCompletionTokens)
+            maximumBodyBytes: prepared.modelCapabilities.maximumRequestBodyBytes,
+            maximumCompletionTokens: prepared.modelCapabilities.maximumCompletionTokens,
+            // Loaded routes resolve against the exact post-template token count inside the
+            // backend. Scripted transport has no tokenizer, so it retains its bounded decoder
+            // fixture instead of pretending to know a model context window.
+            enforceMaximumCompletionTokensDuringDecoding:
+                !prepared.usesPostRenderBudgetResolver)
         let configuration = ServingHTTPConfiguration(
             launchedModel: arguments.model,
             requestLimits: requestLimits,
             requiredBearerToken: apiKey,
-            maximumNonStreamingResponseBytes: 1_048_576,
+            maximumNonStreamingResponseBytes:
+                prepared.modelCapabilities.maximumNonStreamingResponseBytes,
             backpressureStallTimeout: .seconds(5),
-            evidence: evidenceConfiguration)
+            evidence: evidenceConfiguration,
+            // Scripted mode is transport-only and has no tokenizer/model-derived context.
+            modelCapabilities: prepared.usesPostRenderBudgetResolver
+                ? prepared.modelCapabilities
+                : nil)
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(
@@ -132,9 +149,7 @@ struct FastMLXServe {
             throw error
         }
 
-        print(prepared.startupLine(
-            localAddress: server.localAddress.description,
-            maximumCompletionTokens: requestLimits.maximumCompletionTokens))
+        print(prepared.startupLine(localAddress: server.localAddress.description))
         print("fastmlx-serve ready=true; press Control-C to stop.")
 
         await waitForShutdownSignal()
@@ -163,13 +178,27 @@ private struct PreparedServingBackend {
     let startupReport: PreparedServingStartupReport?
     let fitDecision: ServingFitDecision?
     let exactMTPReport: ExactQwen35MTPServeStartupReport?
+    let modelCapabilities: ServingModelCapabilities
+    /// True only when the executable backend renders the exact prompt and resolves the immutable
+    /// model capability before admission. Do not infer this behavior from reporting fields.
+    let usesPostRenderBudgetResolver: Bool
     let hostReport: HostReport
     let osServiceReserveBytes: Int
 
-    func startupLine(
-        localAddress: String,
-        maximumCompletionTokens: Int
-    ) -> String {
+    private var modelCapabilityFields: String {
+        "native_max_context_tokens=\(modelCapabilities.nativeMaxContextTokens) "
+            + "effective_max_context_tokens=\(modelCapabilities.effectiveMaxContextTokens) "
+            + "default_completion_tokens=\(modelCapabilities.defaultCompletionTokens) "
+            + "max_completion_tokens_limit=\(modelCapabilities.maximumCompletionTokens) "
+            + "max_non_streaming_completion_tokens="
+            + "\(modelCapabilities.maximumNonStreamingCompletionTokens) "
+            + "max_request_body_bytes=\(modelCapabilities.maximumRequestBodyBytes) "
+            + "max_non_streaming_response_bytes="
+            + "\(modelCapabilities.maximumNonStreamingResponseBytes) "
+            + "completion_limit_policy=\(modelCapabilities.completionLimitPolicy.rawValue)"
+    }
+
+    func startupLine(localAddress: String) -> String {
         guard let startupReport else {
             let memory = hostReport.machineReadableServingFields(
                 memoryLimitBytes: nil,
@@ -179,7 +208,9 @@ private struct PreparedServingBackend {
             return """
                 fastmlx-serve mode=\(mode) transport_only=true \
                 model=\(launchedModel) \
-                max_completion_tokens_limit=\(maximumCompletionTokens) \
+                max_completion_tokens_limit=\(modelCapabilities.maximumCompletionTokens) \
+                max_request_body_bytes=\(modelCapabilities.maximumRequestBodyBytes) \
+                max_non_streaming_response_bytes=\(modelCapabilities.maximumNonStreamingResponseBytes) \
                 \(memory) \
                 listening=\(localAddress)
                 """
@@ -217,7 +248,7 @@ private struct PreparedServingBackend {
                 startup_prompt_token_count=\(report.startupPromptTokenCount) \
                 startup_generated_token_count=\(report.startupGeneratedTokenCount) \
                 reset_parity_verified=\(report.resetParityVerified) \
-                max_completion_tokens_limit=\(maximumCompletionTokens) \
+                \(modelCapabilityFields) \
                 \(report.memoryFieldsFragment) \
                 \(memory) \
                 \(scalarFallbackRoute) \
@@ -265,7 +296,7 @@ private struct PreparedServingBackend {
                 solo_pld_lookback=\(soloPLD?.lookback ?? 0) \
                 solo_pld_compiled_verify=\(soloPLD?.compiledVerify ?? false) \
                 model_proof_verified=\(report.modelProofVerified) \
-                max_completion_tokens_limit=\(maximumCompletionTokens) \
+                \(modelCapabilityFields) \
                 \(memory) \
                 \(fit) \
                 listening=\(localAddress)
@@ -282,15 +313,59 @@ private struct ResolvedServingLimits {
     /// `nil` for the scalar route (which has no reserved-KV knob); the continuous route falls back
     /// to its provided value when this is `nil`.
     let maxReservedKVBytes: Int?
-    /// Served context cap the sizer computed.
-    let maxContextTokens: Int?
+    /// Served context cap the sizer computed. Loaded routes always enforce this value, including
+    /// when the operator omitted `--context`, so runtime and discovery cannot diverge.
+    let maxContextTokens: Int
     /// The computed fit-check decision.
     let fitDecision: ServingFitDecision?
+    /// The one immutable request capability derived from the same fit decision.
+    let modelCapabilities: ServingModelCapabilities
 }
 
 private struct FitCheckRefusal: Error, CustomStringConvertible {
     let lines: [String]
     var description: String { lines.joined(separator: "\n") }
+}
+
+/// Construct the public request capability from authenticated model geometry, the admitted host-fit
+/// context, and operator narrowing controls. Keeping this as the sole production constructor makes
+/// discovery, HTTP admission, every backend, and startup reporting share the same immutable facts.
+private func servingModelCapabilities(
+    arguments: FastMLXServeArguments,
+    nativeMaxContextTokens: Int,
+    effectiveMaxContextTokens: Int
+) throws -> ServingModelCapabilities {
+    try ServingModelCapabilities(
+        model: arguments.model,
+        nativeMaxContextTokens: nativeMaxContextTokens,
+        effectiveMaxContextTokens: effectiveMaxContextTokens,
+        requestedDefaultCompletionTokens: arguments.defaultCompletionTokens,
+        defaultCompletionTokensWasExplicit: arguments.defaultCompletionTokensWasExplicit,
+        maximumCompletionTokens: arguments.maximumCompletionTokensWasExplicit
+            ? arguments.maximumCompletionTokens
+            : nil,
+        maximumNonStreamingCompletionTokens: arguments.maximumNonStreamingCompletionTokens,
+        maximumRequestBodyBytes: arguments.maximumRequestBodyBytes,
+        maximumNonStreamingResponseBytes: arguments.maximumNonStreamingResponseBytes,
+        completionLimitPolicy: arguments.completionLimitPolicy)
+}
+
+/// Scripted transport intentionally has no model/tokenizer. Give it an explicit synthetic fixture
+/// boundary rather than claiming a model-derived context; loaded routes never use this path.
+private func scriptedServingModelCapabilities(
+    arguments: FastMLXServeArguments
+) throws -> ServingModelCapabilities {
+    let fixtureMaximum = arguments.maximumCompletionTokensWasExplicit
+        ? arguments.maximumCompletionTokens
+        : max(4_096, arguments.defaultCompletionTokens)
+    let (fixtureContext, overflow) = fixtureMaximum.addingReportingOverflow(1)
+    guard !overflow else {
+        throw ServingModelCapabilitiesError.invalidMaximumCompletionTokens
+    }
+    return try servingModelCapabilities(
+        arguments: arguments,
+        nativeMaxContextTokens: fixtureContext,
+        effectiveMaxContextTokens: fixtureContext)
 }
 
 private func emitFitCheck(_ lines: [String]) {
@@ -468,13 +543,18 @@ private func resolveServingLimits(
     // admits — and --force does not relax runtime caps. Pass the provided reserved-KV through.
     let memory = decision.memoryLimitBytes
     let cache = min(decision.cacheLimitBytes, memory)
-    // Only enforce a served-context cap when the operator explicitly asked for one. On the default
-    // path leave it nil: the backend then uses the model's native max (proof.maximumContextTokens),
-    // identical to prior behavior — no previously-serving request is newly rejected.
-    let contextCap: Int? = decision.explicitContextRequested ? decision.servedContext : nil
+    // Enforce the admitted served context on every path. Omitting --context lets the fit planner
+    // choose the largest safe value; it does not authorize runtime/discovery to claim native context
+    // when the current host fit is smaller.
+    let contextCap = decision.servedContext
+    let modelCapabilities = try servingModelCapabilities(
+        arguments: arguments,
+        nativeMaxContextTokens: parsed.profile.nativeMaxContext,
+        effectiveMaxContextTokens: contextCap)
     return ResolvedServingLimits(
         memoryLimitBytes: memory, cacheLimitBytes: cache,
-        maxReservedKVBytes: providedReservedKV, maxContextTokens: contextCap, fitDecision: decision)
+        maxReservedKVBytes: providedReservedKV, maxContextTokens: contextCap,
+        fitDecision: decision, modelCapabilities: modelCapabilities)
 }
 
 /// Resolve which directory the serve path actually loads. With `--quant-candidates` set, run the
@@ -528,7 +608,8 @@ private func loadScalarServingBackend(
     modelDirectory: URL,
     memoryLimitBytes: Int,
     cacheLimitBytes: Int,
-    fitDecision: ServingFitDecision?
+    fitDecision: ServingFitDecision?,
+    modelCapabilities: ServingModelCapabilities
 ) async throws -> PreparedServingBackend {
     let loaded = try await loadScalarServingModel(
         configuration: ScalarServingModelLoadConfiguration(
@@ -537,12 +618,12 @@ private func loadScalarServingBackend(
             memoryLimitBytes: memoryLimitBytes,
             cacheLimitBytes: cacheLimitBytes,
             backendConfiguration: ScalarServingBackendConfiguration(
-                defaultMaximumCompletionTokens: 512,
+                defaultMaximumCompletionTokens: modelCapabilities.defaultCompletionTokens,
                 maximumQueuedRequests: 2,
                 queueRetryAfterSeconds: 1,
-                mailboxCapacity: .init(
-                    maxDeltas: 8,
-                    maxBytes: 32 * 1_024)),
+                mailboxCapacity: modelCapabilities.responseMailboxCapacity(
+                    maxDeltas: 8),
+                modelCapabilities: modelCapabilities),
             // Thread the requested KV tier into the load path so `selectKVCacheQuant` resolves it
             // fail-closed at cache-construction time. Validated once at startup (run()) and re-validated
             // here as the single source that reaches the runtime; nil (omitted flag) → `.fp16`.
@@ -555,6 +636,8 @@ private func loadScalarServingBackend(
         startupReport: .scalar(loaded.startupReport),
         fitDecision: fitDecision,
         exactMTPReport: nil,
+        modelCapabilities: modelCapabilities,
+        usesPostRenderBudgetResolver: true,
         hostReport: hostReport,
         osServiceReserveBytes: osServiceReserveBytes)
 }
@@ -566,6 +649,7 @@ private func prepareBackend(
     let osServiceReserveBytes = servingCapacityThresholds(arguments).osReserveBytes
     switch arguments.backend {
     case .scripted:
+        let modelCapabilities = try scriptedServingModelCapabilities(arguments: arguments)
         return PreparedServingBackend(
             backend: ScriptedTransportBackend(),
             evidenceSnapshot: nil,
@@ -574,6 +658,8 @@ private func prepareBackend(
             startupReport: nil,
             fitDecision: nil,
             exactMTPReport: nil,
+            modelCapabilities: modelCapabilities,
+            usesPostRenderBudgetResolver: false,
             hostReport: hostReport,
             osServiceReserveBytes: osServiceReserveBytes)
     case .scalar(
@@ -629,12 +715,12 @@ private func prepareBackend(
                     memoryLimitBytes: limits.memoryLimitBytes,
                     cacheLimitBytes: limits.cacheLimitBytes,
                     scalarBackendConfiguration: ScalarServingBackendConfiguration(
-                        defaultMaximumCompletionTokens: 512,
+                        defaultMaximumCompletionTokens: limits.modelCapabilities.defaultCompletionTokens,
                         maximumQueuedRequests: 2,
                         queueRetryAfterSeconds: 1,
-                        mailboxCapacity: .init(
-                            maxDeltas: 8,
-                            maxBytes: 32 * 1_024)),
+                        mailboxCapacity: limits.modelCapabilities.responseMailboxCapacity(
+                            maxDeltas: 8),
+                        modelCapabilities: limits.modelCapabilities),
                     kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16))
             let mode: String
             switch loaded.exactStartupReport.status {
@@ -651,6 +737,8 @@ private func prepareBackend(
                 startupReport: .scalar(loaded.scalarStartupReport),
                 fitDecision: limits.fitDecision,
                 exactMTPReport: loaded.exactStartupReport,
+                modelCapabilities: limits.modelCapabilities,
+                usesPostRenderBudgetResolver: true,
                 hostReport: hostReport,
                 osServiceReserveBytes: osServiceReserveBytes)
         }
@@ -661,7 +749,8 @@ private func prepareBackend(
             modelDirectory: served.directory,
             memoryLimitBytes: limits.memoryLimitBytes,
             cacheLimitBytes: limits.cacheLimitBytes,
-            fitDecision: limits.fitDecision)
+            fitDecision: limits.fitDecision,
+            modelCapabilities: limits.modelCapabilities)
     case .continuousBatchNoSpec(
         let modelDirectory,
         let memoryLimitBytes,
@@ -712,6 +801,7 @@ private func prepareBackend(
                 maxReservedKVBytes: limits.maxReservedKVBytes ?? maxReservedKVBytes,
                 maxContextTokens: limits.maxContextTokens,
                 maxReservedContextTokens: limits.maxContextTokens,
+                initialDecodeReserve: limits.modelCapabilities.defaultCompletionTokens,
                 coordinatorConfiguration: try ContinuousBatchConfiguration(
                     maxActiveSlots: continuousMaxActiveSlots,
                     maxPrefillSlots: 2,
@@ -719,16 +809,16 @@ private func prepareBackend(
                     maxQueuedRequests: 8),
                 publicationCapacity: 1,
                 backendConfiguration: ContinuousServingBackendConfiguration(
-                    defaultMaximumCompletionTokens: 512,
+                    defaultMaximumCompletionTokens: limits.modelCapabilities.defaultCompletionTokens,
                     queueRetryAfterSeconds: 1,
-                    mailboxCapacity: .init(
-                        maxDeltas: 8,
-                        maxBytes: 32 * 1_024),
+                    mailboxCapacity: limits.modelCapabilities.responseMailboxCapacity(
+                        maxDeltas: 8),
                     admission: admission,
                     // The continuous route serves dense models; keep the legacy tool-thinking-off
                     // workaround here (QwenLM/Qwen3 #1817). The agentic qwen3_5 family serves on the
                     // scalar route, which respects the template default instead.
-                    disableThinkingWhenToolsActive: true),
+                    disableThinkingWhenToolsActive: true,
+                    modelCapabilities: limits.modelCapabilities),
                 soloPLDPolicy: soloPLDPolicy,
                 // Thread the requested KV tier so `selectKVCacheQuant` resolves it fail-closed at load
                 // on the continuous route too (the default serve.sh path). nil (omitted flag) → `.fp16`.
@@ -756,7 +846,8 @@ private func prepareBackend(
                 modelDirectory: served.directory,
                 memoryLimitBytes: limits.memoryLimitBytes,
                 cacheLimitBytes: limits.cacheLimitBytes,
-                fitDecision: limits.fitDecision)
+                fitDecision: limits.fitDecision,
+                modelCapabilities: limits.modelCapabilities)
         }
         // The opt-in hybrid family was actually admitted onto the continuous route (the proof carried
         // qwen3_5 through rather than throwing). Announce it explicitly so the operator can tell a
@@ -804,6 +895,8 @@ private func prepareBackend(
             startupReport: .continuous(loaded.startupReport),
             fitDecision: limits.fitDecision,
             exactMTPReport: nil,
+            modelCapabilities: limits.modelCapabilities,
+            usesPostRenderBudgetResolver: true,
             hostReport: hostReport,
             osServiceReserveBytes: osServiceReserveBytes)
     case nil:

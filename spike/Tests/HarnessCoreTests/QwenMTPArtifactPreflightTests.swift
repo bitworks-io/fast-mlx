@@ -43,6 +43,19 @@ final class QwenMTPArtifactPreflightTests: XCTestCase {
         XCTAssertEqual(result.maximumAcceptedDraftTokens, 2)
     }
 
+    func testKnownQwen38TargetAdvertisesNestedNativeContextThroughCapacityModel() throws {
+        let targetConfig = try fixtureData(named: "qwen38-27b-target-config")
+
+        let parsed = try ModelConfigDecoder.decode(
+            configJSON: targetConfig,
+            safetensorsBytes: 1,
+            id: "mlx-community/Qwen3.8-27B-mxfp8")
+
+        XCTAssertEqual(parsed.profile.modelType, .hybridLinear)
+        XCTAssertEqual(parsed.profile.nativeMaxContext, 262_144)
+        XCTAssertEqual(CapacityModel.effectiveDefaultContext(parsed.profile), 32_768)
+    }
+
     func testKnownQwen38_27BMXFP8TargetAndDrafterManifestDriftFailsClosed() throws {
         let lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
         let targetConfig = try fixtureData(named: "qwen38-27b-target-config")

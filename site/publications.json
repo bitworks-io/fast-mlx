@@ -139,6 +139,12 @@
       "slug": "how-the-autonomous-loop-builds-fast-mlx",
       "status": "published",
       "reviewedAt": "2026-08-22"
+    },
+    {
+      "source": "docs/content/2026-08-29-the-4k-limit-was-not-the-model-limit.md",
+      "slug": "the-4k-limit-was-not-the-model-limit",
+      "status": "published",
+      "reviewedAt": "2026-08-29"
     }
   ]
 }

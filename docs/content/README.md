@@ -17,6 +17,7 @@ described in the article. It is not a current universal performance guarantee.
 - [The fastest request wasn't the fastest service](2026-07-14-the-fastest-request-wasnt-the-fastest-service.md)
 - [The proof did not end when the timer did](2026-07-28-the-proof-did-not-end-when-the-timer-did.md)
 - [The repository that could reproduce itself — but could not publish itself](2026-08-14-the-repository-that-could-reproduce-itself.md)
+- [The 4K limit was not the model limit](2026-08-29-the-4k-limit-was-not-the-model-limit.md)
 
 `site/publications.json` is the fail-closed publication manifest. A note must be explicitly added
 there and pass the site/public-repository validators before it can appear on GitHub Pages. The same

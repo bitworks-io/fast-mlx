@@ -135,6 +135,19 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         pendingHead = nil
         pendingBody = nil
 
+        if head.method == .GET, head.uri == "/v1/models" {
+            guard body.readableBytes == 0 else {
+                writeError(
+                    .invalidRequest("GET /v1/models does not accept a request body", param: nil),
+                    status: .badRequest,
+                    keepAlive: head.isKeepAlive,
+                    context: context)
+                return
+            }
+            writeModelList(keepAlive: head.isKeepAlive, context: context)
+            return
+        }
+
         let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
         let request: OpenAIChatCompletionRequest
         do {
@@ -207,15 +220,46 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private func validateHead(
         _ head: HTTPRequestHead
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
-        guard head.method == .POST else {
-            return (
-                .methodNotAllowed,
-                .invalidRequest("Only POST is supported for this route", param: nil))
-        }
-        guard head.uri == "/v1/chat/completions" else {
+        let isChat = head.uri == "/v1/chat/completions"
+        let isModels = head.uri == "/v1/models"
+        guard isChat || isModels else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
+        }
+        guard (isChat && head.method == .POST) || (isModels && head.method == .GET) else {
+            return (
+                .methodNotAllowed,
+                .invalidRequest("Method is not supported for this route", param: nil))
+        }
+
+        if let requiredBearerToken = configuration.requiredBearerToken {
+            let authorization = head.headers["authorization"]
+            guard authorization.count == 1,
+                let suppliedToken = bearerToken(from: authorization[0]),
+                constantTimeEqual(suppliedToken, requiredBearerToken)
+            else {
+                return (
+                    .unauthorized,
+                    .invalidRequest("Missing or invalid API key", param: nil))
+            }
+        }
+
+        if isModels {
+            let lengthHeaders = head.headers["content-length"]
+            guard lengthHeaders.count <= 1 else {
+                return (
+                    .badRequest,
+                    .invalidRequest("Content-Length must be unique", param: nil))
+            }
+            if let rawLength = lengthHeaders.first,
+                (Int(rawLength) ?? -1) != 0
+            {
+                return (
+                    .badRequest,
+                    .invalidRequest("GET /v1/models does not accept a request body", param: nil))
+            }
+            return nil
         }
 
         let contentTypes = head.headers["content-type"]
@@ -250,18 +294,42 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             }
         }
 
-        if let requiredBearerToken = configuration.requiredBearerToken {
-            let authorization = head.headers["authorization"]
-            guard authorization.count == 1,
-                let suppliedToken = bearerToken(from: authorization[0]),
-                constantTimeEqual(suppliedToken, requiredBearerToken)
-            else {
-                return (
-                    .unauthorized,
-                    .invalidRequest("Missing or invalid API key", param: nil))
-            }
-        }
         return nil
+    }
+
+    private func writeModelList(
+        keepAlive: Bool,
+        context: ChannelHandlerContext
+    ) {
+        do {
+            let data = try JSONEncoder.openAI.encode(
+                OpenAIModelListResponse(
+                    model: configuration.launchedModel,
+                    capabilities: configuration.modelCapabilities))
+            var headers = HTTPHeaders()
+            headers.add(name: "content-type", value: "application/json")
+            headers.add(name: "content-length", value: "\(data.count)")
+            if !keepAlive {
+                headers.add(name: "connection", value: "close")
+            }
+            let head = HTTPResponseHead(
+                version: .http1_1,
+                status: .ok,
+                headers: headers)
+            var body = context.channel.allocator.buffer(capacity: data.count)
+            body.writeBytes(data)
+            context.write(wrapOutboundOut(.head(head)), promise: nil)
+            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
+            if !keepAlive {
+                let channel = context.channel
+                completion.whenComplete { _ in
+                    channel.close(promise: nil)
+                }
+            }
+        } catch {
+            context.close(promise: nil)
+        }
     }
 
     private func writeError(
@@ -421,6 +489,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     writabilityGate,
                     timeout: configuration.backpressureStallTimeout)
                 try await writeSSEHead(
+                    handle: started,
                     keepAlive: keepAlive,
                     channel: channel,
                     timeout: configuration.backpressureStallTimeout)
@@ -469,6 +538,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     reasoningContent: split.reasoning)
                 try await writeJSONResponse(
                     response,
+                    handle: started,
+                    maximumBytes: configuration.maximumNonStreamingResponseBytes,
                     keepAlive: keepAlive,
                     channel: channel,
                     writabilityGate: writabilityGate,
@@ -480,6 +551,19 @@ private extension OpenAIChatCompletionsHTTPHandler {
             control.markTerminal()
             if !keepAlive {
                 await close(channel)
+            }
+        } catch let servingError as OpenAIServingError {
+            if servingError.openAIError.type == .serverError {
+                admission = .backendFailure
+            }
+            if let writeCancellation = await writeServingFailure(
+                servingError,
+                responseStarted: responseStarted,
+                keepAlive: keepAlive,
+                channel: channel,
+                timeout: configuration.backpressureStallTimeout)
+            {
+                await control.cancellation.cancel(writeCancellation)
             }
         } catch let admissionError as ServingBackendAdmissionError {
             admission = servingEvidenceAdmission(for: admissionError.reason)
@@ -521,7 +605,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await control.cancellation.cancel(.backpressureTimeout)
                 await close(channel)
             case .responseLimitExceeded:
-                let writeCancellation = await writeFailureIfPossible(
+                let writeCancellation = await writeServingFailure(
+                    .invalidRequestWithCode(
+                        "The non-streaming response exceeded its configured byte limit; retry with stream=true",
+                        param: "stream",
+                        code: "response_too_large"),
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
@@ -778,15 +866,23 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 guard completion == nil else {
                     throw RunError.missingCompletion
                 }
-                byteCount += delta.utf8.count
-                guard byteCount <= maximumBytes else {
+                let (newCount, overflow) = byteCount.addingReportingOverflow(
+                    event.utf8ByteCount)
+                guard !overflow, newCount <= maximumBytes else {
                     throw RunError.responseLimitExceeded
                 }
+                byteCount = newCount
                 text += delta
             case .toolCalls(let calls):
                 guard completion == nil else {
                     throw RunError.missingCompletion
                 }
+                let (newCount, overflow) = byteCount.addingReportingOverflow(
+                    event.utf8ByteCount)
+                guard !overflow, newCount <= maximumBytes else {
+                    throw RunError.responseLimitExceeded
+                }
+                byteCount = newCount
                 toolCalls.append(contentsOf: calls)
             case .completion(let value):
                 guard completion == nil else {
@@ -802,6 +898,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
     }
 
     static func writeSSEHead(
+        handle: ServingGenerationHandle,
         keepAlive: Bool,
         channel: any Channel,
         timeout: Duration
@@ -810,6 +907,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         headers.add(name: "content-type", value: "text/event-stream")
         headers.add(name: "cache-control", value: "no-cache")
         headers.add(name: "x-accel-buffering", value: "no")
+        addCompletionBudgetHeaders(from: handle, to: &headers)
         if !keepAlive {
             headers.add(name: "connection", value: "close")
         }
@@ -861,6 +959,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func writeJSONResponse(
         _ response: OpenAIChatCompletionResponse,
+        handle: ServingGenerationHandle,
+        maximumBytes: Int,
         keepAlive: Bool,
         channel: any Channel,
         writabilityGate: ServingChannelWritabilityGate,
@@ -868,9 +968,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
         let data = try JSONEncoder.openAI.encode(response)
+        guard data.count <= maximumBytes else {
+            throw RunError.responseLimitExceeded
+        }
         var headers = HTTPHeaders()
         headers.add(name: "content-type", value: "application/json")
         headers.add(name: "content-length", value: "\(data.count)")
+        addCompletionBudgetHeaders(from: handle, to: &headers)
         if !keepAlive {
             headers.add(name: "connection", value: "close")
         }
@@ -1015,6 +1119,94 @@ private extension OpenAIChatCompletionsHTTPHandler {
             await close(channel)
             return nil
         }
+    }
+
+    static func writeServingFailure(
+        _ error: OpenAIServingError,
+        responseStarted: Bool,
+        keepAlive: Bool,
+        channel: any Channel,
+        timeout: Duration
+    ) async -> ServingCancellationReason? {
+        let status: HTTPResponseStatus
+        switch error.openAIError.type {
+        case .invalidRequest:
+            status = error.openAIError.code == "response_too_large"
+                ? .payloadTooLarge
+                : .badRequest
+        case .rateLimit:
+            status = .tooManyRequests
+        case .serverError:
+            status = .internalServerError
+        }
+        do {
+            let data = try JSONEncoder.openAI.encode(
+                OpenAIErrorEnvelope(error: error.openAIError))
+            if responseStarted {
+                let event = "data: \(String(decoding: data, as: UTF8.self))\n\n"
+                try await writeBody(event, channel: channel, timeout: timeout)
+                try await writePart(.end(nil), channel: channel, timeout: timeout)
+                await close(channel)
+            } else {
+                var headers = HTTPHeaders()
+                headers.add(name: "content-type", value: "application/json")
+                headers.add(name: "content-length", value: "\(data.count)")
+                if !keepAlive {
+                    headers.add(name: "connection", value: "close")
+                }
+                let head = HTTPResponseHead(
+                    version: .http1_1,
+                    status: status,
+                    headers: headers)
+                try await writePart(.head(head), channel: channel, timeout: timeout)
+                var body = channel.allocator.buffer(capacity: data.count)
+                body.writeBytes(data)
+                try await writePart(
+                    .body(.byteBuffer(body)),
+                    channel: channel,
+                    timeout: timeout)
+                try await writePart(.end(nil), channel: channel, timeout: timeout)
+                if !keepAlive {
+                    await close(channel)
+                }
+            }
+            return nil
+        } catch RunError.backpressureTimeout {
+            await close(channel)
+            return .backpressureTimeout
+        } catch RunError.writeFailure {
+            await close(channel)
+            return .clientDisconnected
+        } catch {
+            await close(channel)
+            return nil
+        }
+    }
+
+    static func addCompletionBudgetHeaders(
+        from handle: ServingGenerationHandle,
+        to headers: inout HTTPHeaders
+    ) {
+        guard let resolution = handle.completionBudgetResolution else {
+            return
+        }
+        if let requested = resolution.requestedCompletionTokens {
+            headers.add(
+                name: "x-fastmlx-requested-completion-tokens",
+                value: "\(requested)")
+        }
+        headers.add(
+            name: "x-fastmlx-applied-completion-tokens",
+            value: "\(resolution.appliedCompletionTokens)")
+        headers.add(
+            name: "x-fastmlx-max-completion-tokens",
+            value: "\(resolution.maximumAllowedCompletionTokens)")
+        headers.add(
+            name: "x-fastmlx-completion-tokens-clamped",
+            value: resolution.wasClamped ? "true" : "false")
+        headers.add(
+            name: "x-fastmlx-completion-limit-policy",
+            value: resolution.completionLimitPolicy.rawValue)
     }
 
     static func writeAdmissionFailure(

@@ -695,6 +695,38 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    func testStreamingToolCallAboveLegacyMailboxLimitUsesConfiguredByteBudget() async throws {
+        let arguments = #"{"payload":""# + String(repeating: "x", count: 40 * 1_024) + #""}"#
+        let toolCall = OpenAIToolCall(
+            id: "call-large",
+            type: "function",
+            function: .init(name: "store_payload", arguments: arguments))
+        let backend = ScriptedBackend(
+            scripts: [
+                .completedWithToolCalls(
+                    text: [],
+                    toolCalls: [toolCall],
+                    finishReason: .toolCalls,
+                    promptTokens: 8,
+                    completionTokens: 256)
+            ],
+            mailboxMaximumBytes: 1_048_576)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains(#""id":"call-large""#), response.body)
+        XCTAssertTrue(response.body.contains(#""name":"store_payload""#), response.body)
+        XCTAssertTrue(response.body.contains(#""finish_reason":"tool_calls""#), response.body)
+        XCTAssertEqual(
+            response.body.components(separatedBy: "data: [DONE]\n\n").count - 1,
+            1)
+
+        _ = try await channel.finish()
+    }
+
     func testAuthenticationAndBodyBoundsRejectBeforeBackendAdmission() async throws {
         let backend = ScriptedBackend(scripts: [])
         let authLimits = OpenAIChatRequestLimits(
@@ -796,6 +828,271 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(defaultResponse.head.status, .badRequest)
         XCTAssertEqual(defaultBackend.snapshot().startCount, 0)
         _ = try await defaultChannel.finish()
+    }
+
+    func testStructuralOnlyHTTPDecoderAcceptsLargeCompletionBudgetForModelAwareAdmission()
+        async throws
+    {
+        let limits = OpenAIChatRequestLimits(
+            maximumBodyBytes: 1_024,
+            maximumCompletionTokens: 4_096,
+            enforceMaximumCompletionTokensDuringDecoding: false)
+        let request = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(
+                """
+                {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":32768,"temperature":0,"stream":true}
+                """.utf8),
+            limits: limits)
+
+        XCTAssertEqual(request.maxCompletionTokens, 32_768)
+    }
+
+    func testModelsEndpointRequiresAuthAndReturnsAllowlistedCapabilityMetadata()
+        async throws
+    {
+        let capabilities = try modelCapabilities(
+            effectiveContext: 131_072,
+            defaultCompletion: 8_192,
+            maximumCompletion: 65_536,
+            maximumNonStreaming: 16_384,
+            requestBodyMaximum: 8 * 1_048_576,
+            nonStreamingResponseMaximum: 16 * 1_048_576,
+            policy: .clamp)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: OpenAIChatRequestLimits(
+                maximumBodyBytes: capabilities.maximumRequestBodyBytes,
+                maximumCompletionTokens: capabilities.maximumCompletionTokens),
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes:
+                capabilities.maximumNonStreamingResponseBytes,
+            backpressureStallTimeout: .seconds(1),
+            modelCapabilities: capabilities)
+
+        let unauthorizedBackend = ScriptedBackend(scripts: [])
+        let unauthorizedChannel = try await makeChannel(
+            backend: unauthorizedBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            unauthorizedChannel,
+            method: .GET,
+            uri: "/v1/models")
+        let unauthorized = try await collectResponse(from: unauthorizedChannel)
+        XCTAssertEqual(unauthorized.head.status, .unauthorized)
+        XCTAssertEqual(unauthorizedBackend.snapshot().startCount, 0)
+        _ = try await unauthorizedChannel.finish()
+
+        let authorizedBackend = ScriptedBackend(scripts: [])
+        let authorizedChannel = try await makeChannel(
+            backend: authorizedBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            authorizedChannel,
+            method: .GET,
+            uri: "/v1/models",
+            authorization: "Bearer secret")
+        let response = try await collectResponse(from: authorizedChannel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        XCTAssertEqual(root["object"] as? String, "list")
+        let model = try XCTUnwrap((root["data"] as? [[String: Any]])?.first)
+        XCTAssertEqual(model["id"] as? String, "qwen3-32b")
+        XCTAssertEqual(model["object"] as? String, "model")
+        XCTAssertNotNil(model["created"])
+        XCTAssertEqual(model["owned_by"] as? String, "fast-mlx")
+        XCTAssertEqual(model["max_model_len"] as? Int, 131_072)
+        let extensionKeys = try XCTUnwrap(
+            (model["fast_mlx_capabilities"] as? [String: Any])?.keys.sorted())
+        XCTAssertEqual(
+            extensionKeys,
+            [
+                "completion_limit_policy",
+                "default_completion_tokens",
+                "effective_max_context_tokens",
+                "maximum_completion_tokens",
+                "maximum_non_streaming_completion_tokens",
+                "maximum_non_streaming_response_bytes",
+                "maximum_request_body_bytes",
+                "native_max_context_tokens",
+                "reasoning_tokens_count_toward_completion",
+            ])
+        let extensionObject = try XCTUnwrap(
+            model["fast_mlx_capabilities"] as? [String: Any])
+        XCTAssertEqual(extensionObject["native_max_context_tokens"] as? Int, 262_144)
+        XCTAssertEqual(extensionObject["effective_max_context_tokens"] as? Int, 131_072)
+        XCTAssertEqual(extensionObject["default_completion_tokens"] as? Int, 8_192)
+        XCTAssertEqual(extensionObject["maximum_completion_tokens"] as? Int, 65_536)
+        XCTAssertEqual(
+            extensionObject["maximum_non_streaming_completion_tokens"] as? Int,
+            16_384)
+        XCTAssertEqual(
+            extensionObject["maximum_request_body_bytes"] as? Int,
+            8 * 1_048_576)
+        XCTAssertEqual(
+            extensionObject["maximum_non_streaming_response_bytes"] as? Int,
+            16 * 1_048_576)
+        XCTAssertEqual(extensionObject["completion_limit_policy"] as? String, "clamp")
+        XCTAssertEqual(
+            extensionObject["reasoning_tokens_count_toward_completion"] as? Bool,
+            true)
+        XCTAssertEqual(authorizedBackend.snapshot().startCount, 0)
+        _ = try await authorizedChannel.finish()
+    }
+
+    func testBackendInvalidRequestWithCodeReturnsHTTP400InsteadOfInternalError()
+        async throws
+    {
+        let backend = ScriptedBackend(scripts: [
+            .servingError(
+                .invalidRequestWithCode(
+                    "Requested completion exceeds this model's remaining context",
+                    param: "max_completion_tokens",
+                    code: "completion_limit_exceeded"))
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        XCTAssertTrue(response.body.contains(#""type":"invalid_request_error""#), response.body)
+        XCTAssertTrue(response.body.contains(#""param":"max_completion_tokens""#), response.body)
+        XCTAssertTrue(response.body.contains(#""code":"completion_limit_exceeded""#), response.body)
+        XCTAssertFalse(response.body.contains(#""code":"internal_error""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
+    func testNonStreamingToolCallBytesAreBoundedAndCancelGeneration() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completedWithToolCalls(
+                text: [],
+                toolCalls: [
+                    OpenAIToolCall(
+                        id: "call_0",
+                        function: .init(
+                            name: "lookup",
+                            arguments: String(repeating: "x", count: 256)))
+                ],
+                finishReason: .toolCalls,
+                promptTokens: 4,
+                completionTokens: 4)
+        ])
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 128,
+            backpressureStallTimeout: .seconds(1))
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .payloadTooLarge)
+        XCTAssertTrue(response.body.contains(#""code":"response_too_large""#), response.body)
+        XCTAssertFalse(response.body.contains(String(repeating: "x", count: 128)))
+        await waitUntil { backend.snapshot().cancelCount == 1 }
+        XCTAssertEqual(backend.snapshot().cancelCount, 1)
+        _ = try await channel.finish()
+    }
+
+    func testSuccessfulResponsesIncludeModelAwareCompletionBudgetHeaders()
+        async throws
+    {
+        let nonStreamingResolution = budgetResolution(
+            requested: 65_536,
+            applied: 16_384,
+            maximumAllowed: 16_384,
+            prompt: 114_688,
+            wasClamped: true,
+            limitingFactor: .contextWindow)
+        let streamResolution = budgetResolution(
+            requested: 65_536,
+            applied: 65_536,
+            maximumAllowed: 65_536,
+            prompt: 65_536,
+            wasClamped: false,
+            limitingFactor: .operatorMaximumAndContextWindow)
+        let backend = ScriptedBackend(scripts: [
+            .completed(
+                text: ["json"],
+                promptTokens: 114_688,
+                completionTokens: 16_384,
+                budgetResolution: nonStreamingResolution),
+            .completed(
+                text: ["sse"],
+                promptTokens: 65_536,
+                completionTokens: 65_536,
+                budgetResolution: streamResolution),
+        ])
+        let modelAwareTransportConfiguration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: OpenAIChatRequestLimits(
+                maximumBodyBytes: 1_048_576,
+                maximumCompletionTokens: 4_096,
+                enforceMaximumCompletionTokensDuringDecoding: false),
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+
+        let nonStreamingChannel = try await makeChannel(
+            backend: backend,
+            configuration: modelAwareTransportConfiguration)
+        try await writeRequest(
+            nonStreamingChannel,
+            body: """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":65536,"temperature":0,"stream":false}
+            """)
+        let nonStreaming = try await collectResponse(from: nonStreamingChannel)
+        XCTAssertEqual(nonStreaming.head.status, .ok)
+        XCTAssertEqual(
+            nonStreaming.head.headers.first(name: "x-fastmlx-requested-completion-tokens"),
+            "65536")
+        XCTAssertEqual(
+            nonStreaming.head.headers.first(name: "x-fastmlx-applied-completion-tokens"),
+            "16384")
+        XCTAssertEqual(
+            nonStreaming.head.headers.first(name: "x-fastmlx-max-completion-tokens"),
+            "16384")
+        XCTAssertEqual(
+            nonStreaming.head.headers.first(name: "x-fastmlx-completion-tokens-clamped"),
+            "true")
+        XCTAssertEqual(
+            nonStreaming.head.headers.first(name: "x-fastmlx-completion-limit-policy"),
+            "clamp")
+        _ = try await nonStreamingChannel.finish()
+
+        let streamingChannel = try await makeChannel(
+            backend: backend,
+            configuration: modelAwareTransportConfiguration)
+        try await writeRequest(
+            streamingChannel,
+            body: """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":65536,"temperature":0,"stream":true}
+            """)
+        let streaming = try await collectResponse(from: streamingChannel)
+        XCTAssertEqual(streaming.head.status, .ok)
+        XCTAssertEqual(
+            streaming.head.headers.first(name: "x-fastmlx-requested-completion-tokens"),
+            "65536")
+        XCTAssertEqual(
+            streaming.head.headers.first(name: "x-fastmlx-applied-completion-tokens"),
+            "65536")
+        XCTAssertEqual(
+            streaming.head.headers.first(name: "x-fastmlx-max-completion-tokens"),
+            "65536")
+        XCTAssertEqual(
+            streaming.head.headers.first(name: "x-fastmlx-completion-tokens-clamped"),
+            "false")
+        XCTAssertEqual(
+            streaming.head.headers.first(name: "x-fastmlx-completion-limit-policy"),
+            "reject")
+
+        _ = try await streamingChannel.finish()
     }
 
     func testQueueExhaustionReturnsTyped429WithBoundedRetrySignal() async throws {
@@ -1084,6 +1381,45 @@ private func requestBody(stream: Bool) -> String {
     """
 }
 
+private func modelCapabilities(
+    effectiveContext: Int,
+    defaultCompletion: Int,
+    maximumCompletion: Int,
+    maximumNonStreaming: Int,
+    requestBodyMaximum: Int? = nil,
+    nonStreamingResponseMaximum: Int = 16 * 1_048_576,
+    policy: ServingCompletionLimitPolicy
+) throws -> ServingModelCapabilities {
+    try ServingModelCapabilities(
+        model: "qwen3-32b",
+        nativeMaxContextTokens: 262_144,
+        effectiveMaxContextTokens: effectiveContext,
+        requestedDefaultCompletionTokens: defaultCompletion,
+        defaultCompletionTokensWasExplicit: true,
+        maximumCompletionTokens: maximumCompletion,
+        maximumNonStreamingCompletionTokens: maximumNonStreaming,
+        maximumRequestBodyBytes: requestBodyMaximum,
+        maximumNonStreamingResponseBytes: nonStreamingResponseMaximum,
+        completionLimitPolicy: policy)
+}
+
+private func budgetResolution(
+    requested: Int?,
+    applied: Int,
+    maximumAllowed: Int,
+    prompt: Int,
+    wasClamped: Bool,
+    limitingFactor: ServingCompletionLimitingFactor
+) -> ServingCompletionBudgetResolution {
+    ServingCompletionBudgetResolution(
+        requestedCompletionTokens: requested,
+        appliedCompletionTokens: applied,
+        maximumAllowedCompletionTokens: maximumAllowed,
+        renderedPromptTokens: prompt,
+        wasClamped: wasClamped,
+        limitingFactor: limitingFactor)
+}
+
 private func validHead(contentLength: Int) -> HTTPRequestHead {
     HTTPRequestHead(
         version: .http1_1,
@@ -1094,6 +1430,24 @@ private func validHead(contentLength: Int) -> HTTPRequestHead {
             "content-type": "application/json",
             "content-length": "\(contentLength)",
         ])
+}
+
+private func validHead(
+    method: HTTPMethod,
+    uri: String,
+    authorization: String? = nil
+) -> HTTPRequestHead {
+    var head = HTTPRequestHead(
+        version: .http1_1,
+        method: method,
+        uri: uri,
+        headers: [
+            "host": "localhost"
+        ])
+    if let authorization {
+        head.headers.add(name: "authorization", value: authorization)
+    }
+    return head
 }
 
 private func writeRequest(
@@ -1108,6 +1462,18 @@ private func writeRequest(
     _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
     _ = try await channel.writeInbound(
         HTTPServerRequestPart.body(ByteBuffer(string: body)))
+    _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
+private func writeHeadOnlyRequest(
+    _ channel: NIOAsyncTestingChannel,
+    method: HTTPMethod,
+    uri: String,
+    authorization: String? = nil
+) async throws {
+    _ = try await channel.writeInbound(
+        HTTPServerRequestPart.head(
+            validHead(method: method, uri: uri, authorization: authorization)))
     _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
 }
 
@@ -1220,13 +1586,15 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             text: [String],
             finishReason: OpenAIChatFinishReason = .stop,
             promptTokens: Int,
-            completionTokens: Int)
+            completionTokens: Int,
+            budgetResolution: ServingCompletionBudgetResolution? = nil)
         case completedWithToolCalls(
             text: [String],
             toolCalls: [OpenAIToolCall],
             finishReason: OpenAIChatFinishReason,
             promptTokens: Int,
             completionTokens: Int)
+        case servingError(OpenAIServingError)
         case cancelled(ServingCancellationReason)
         case admissionRejected(ServingBackendAdmissionError)
         case held
@@ -1244,9 +1612,16 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
     private let state: OSAllocatedUnfairLock<State>
     private let separatesReasoning: Bool
 
-    init(scripts: [Script], separatesReasoning: Bool = false) {
+    private let mailboxMaximumBytes: Int
+
+    init(
+        scripts: [Script],
+        separatesReasoning: Bool = false,
+        mailboxMaximumBytes: Int = 1_024
+    ) {
         state = OSAllocatedUnfairLock(initialState: State(scripts: scripts))
         self.separatesReasoning = separatesReasoning
+        self.mailboxMaximumBytes = mailboxMaximumBytes
     }
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
@@ -1256,7 +1631,9 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             return (script, state.startCount)
         }
         let mailbox = BoundedDeltaMailbox(
-            capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 1, maxBytes: 64))
+            capacity: BoundedDeltaMailbox.Capacity(
+                maxDeltas: 1,
+                maxBytes: mailboxMaximumBytes))
         let lease: ServingRequestLease
         if case .heldWithDelayedCancel(let cancellationGate) = script {
             lease = ServingRequestLease(
@@ -1283,11 +1660,14 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             route: .continuousBatchNoSpec,
             mailbox: mailbox,
             lease: lease,
+            completionBudgetResolution: budgetResolution(for: script),
             separatesReasoning: separatesReasoning)
 
         if case .admissionRejected(let error) = script {
             throw error
-        } else if case .completed(let text, let finishReason, let promptTokens, let completionTokens) = script {
+        } else if case .servingError(let error) = script {
+            throw error
+        } else if case .completed(let text, let finishReason, let promptTokens, let completionTokens, _) = script {
             Task {
                 do {
                     for delta in text {
@@ -1332,6 +1712,15 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             }
         }
         return handle
+    }
+
+    private func budgetResolution(
+        for script: Script
+    ) -> ServingCompletionBudgetResolution? {
+        guard case .completed(_, _, _, _, let budgetResolution) = script else {
+            return nil
+        }
+        return budgetResolution
     }
 
     func snapshot() -> Snapshot {

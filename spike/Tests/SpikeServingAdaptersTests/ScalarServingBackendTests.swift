@@ -384,6 +384,76 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(renderCounter.value, 2)
         await backend.shutdown()
     }
+
+    func testModelAwareBudgetUsesExactRenderedPromptAndIsCarriedByHandle() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 6,
+            requestedDefaultCompletionTokens: 4,
+            maximumNonStreamingCompletionTokens: 4,
+            completionLimitPolicy: .clamp)
+        let backend = makeBackend(
+            script: [1, 2, 3, 4, 99],
+            pieces: [1: "a", 2: "b", 3: "c", 4: "d"],
+            promptTokens: [10, 11],
+            modelCapabilities: capabilities)
+
+        let handle = try await backend.start(request(maxTokens: 8))
+        let resolution = try XCTUnwrap(handle.completionBudgetResolution)
+
+        XCTAssertEqual(resolution.requestedCompletionTokens, 8)
+        XCTAssertEqual(resolution.renderedPromptTokens, 2)
+        XCTAssertEqual(resolution.maximumAllowedCompletionTokens, 4)
+        XCTAssertEqual(resolution.appliedCompletionTokens, 4)
+        XCTAssertTrue(resolution.wasClamped)
+        let events = try await collect(handle.mailbox)
+        XCTAssertEqual(
+            events.last,
+            .completion(
+                ServingGenerationCompletion(
+                    finishReason: .length,
+                    usage: OpenAIChatUsage(promptTokens: 2, completionTokens: 4))))
+    }
+
+    func testModelAwareInvalidBudgetPrecedesQueueFullAndDoesNotEnqueue() async throws {
+        let renderCounter = RenderCounter()
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 4,
+            requestedDefaultCompletionTokens: 2,
+            maximumNonStreamingCompletionTokens: 3,
+            completionLimitPolicy: .reject)
+        let backend = makeBackend(
+            script: [1, 2, 3, 99],
+            pieces: [1: "a", 2: "b", 3: "c"],
+            promptTokens: [10],
+            mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
+            maximumQueuedRequests: 1,
+            renderCounter: renderCounter,
+            modelCapabilities: capabilities)
+
+        let active = try await backend.start(request(maxTokens: 3))
+        await waitUntil {
+            let mailbox = await active.mailbox.snapshot()
+            return mailbox.bufferedDeltas == 1 && mailbox.waitingProducers == 1
+        }
+        _ = try await backend.start(request(maxTokens: 3))
+
+        do {
+            _ = try await backend.start(request(maxTokens: 4))
+            XCTFail("Expected model-aware budget rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "completion_limit_exceeded")
+        }
+
+        XCTAssertEqual(renderCounter.value, 3)
+        let snapshot = await backend.snapshot()
+        XCTAssertEqual(snapshot.activeRequests, 1)
+        XCTAssertEqual(snapshot.queuedRequests, 1)
+        await backend.shutdown()
+    }
 }
 
 private func makeBackend(
@@ -397,7 +467,8 @@ private func makeBackend(
     renderCounter: RenderCounter? = nil,
     toolCallFormat: ToolCallFormat = .json,
     thinksByDefault: Bool = false,
-    disableThinkingWhenToolsActive: Bool = false
+    disableThinkingWhenToolsActive: Bool = false,
+    modelCapabilities: ServingModelCapabilities? = nil
 ) -> ScalarServingBackend {
     ScalarServingBackend(
         launchedModel: "fixture-model",
@@ -416,7 +487,8 @@ private func makeBackend(
             mailboxCapacity: mailboxCapacity,
             toolCallFormat: toolCallFormat,
             disableThinkingWhenToolsActive: disableThinkingWhenToolsActive,
-            thinksByDefault: thinksByDefault))
+            thinksByDefault: thinksByDefault,
+            modelCapabilities: modelCapabilities))
 }
 
 private let weatherTool = OpenAIToolSpec(

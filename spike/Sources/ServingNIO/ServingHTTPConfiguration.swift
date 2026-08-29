@@ -83,6 +83,7 @@ public struct ServingHTTPConfiguration: Sendable {
     public let maximumNonStreamingResponseBytes: Int
     public let backpressureStallTimeout: Duration
     public let evidence: ServingHTTPEvidenceConfiguration?
+    public let modelCapabilities: ServingModelCapabilities?
 
     public init(
         launchedModel: String,
@@ -90,7 +91,8 @@ public struct ServingHTTPConfiguration: Sendable {
         requiredBearerToken: String?,
         maximumNonStreamingResponseBytes: Int,
         backpressureStallTimeout: Duration,
-        evidence: ServingHTTPEvidenceConfiguration? = nil
+        evidence: ServingHTTPEvidenceConfiguration? = nil,
+        modelCapabilities: ServingModelCapabilities? = nil
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -111,5 +113,18 @@ public struct ServingHTTPConfiguration: Sendable {
         self.maximumNonStreamingResponseBytes = maximumNonStreamingResponseBytes
         self.backpressureStallTimeout = backpressureStallTimeout
         self.evidence = evidence
+        self.modelCapabilities = modelCapabilities
+        precondition(
+            modelCapabilities == nil || modelCapabilities?.model == launchedModel,
+            "modelCapabilities must describe the launched model")
+        precondition(
+            modelCapabilities == nil
+                || modelCapabilities?.maximumRequestBodyBytes == requestLimits.maximumBodyBytes,
+            "requestLimits must match advertised model capability")
+        precondition(
+            modelCapabilities == nil
+                || modelCapabilities?.maximumNonStreamingResponseBytes
+                    == maximumNonStreamingResponseBytes,
+            "response limits must match advertised model capability")
     }
 }

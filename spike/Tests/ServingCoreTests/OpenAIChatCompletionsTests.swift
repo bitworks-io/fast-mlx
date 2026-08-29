@@ -138,6 +138,33 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             param: "max_completion_tokens")
     }
 
+    func testRequestLimitsCanDeferCompletionBudgetToModelAwareResolution() throws {
+        let limits = OpenAIChatRequestLimits(
+            maximumBodyBytes: 1_048_576,
+            maximumCompletionTokens: 4_096,
+            enforceMaximumCompletionTokensDuringDecoding: false)
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":8192}
+        """
+
+        let request = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(body.utf8),
+            limits: limits)
+
+        XCTAssertEqual(request.maxCompletionTokens, 8_192)
+    }
+
+    func testProductionDefaultStillRejectsCompletionBudgetAboveLegacyStaticLimit() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":4097}
+        """
+
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "max_completion_tokens")
+    }
+
     func testLaunchedModelIdentityFailsClosedBeforeAdmission() throws {
         let body = """
         {"model":"other-model","messages":[{"role":"user","content":"Hi"}]}
@@ -173,7 +200,13 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stop":["a","b","c","d","e"]}"#, "stop"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stop":""}"#, "stop"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":0}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":-1}"#, "max_completion_tokens"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":true}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":"8192"}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":1.5}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":9223372036854775808}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":18446744073709551617}"#, "max_completion_tokens"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"max_completion_tokens":1e100}"#, "max_completion_tokens"),
         ]
 
         for (body, param) in cases {

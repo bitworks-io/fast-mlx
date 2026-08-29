@@ -103,12 +103,14 @@ public struct ExactQwen35MTPServingBackendConfiguration: Sendable {
     public let mailboxCapacity: BoundedDeltaMailbox.Capacity
     public let disableThinkingWhenToolsActive: Bool
     public let thinksByDefault: Bool
+    public let modelCapabilities: ServingModelCapabilities?
 
     public init(
         defaultMaximumCompletionTokens: Int,
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
         disableThinkingWhenToolsActive: Bool = false,
-        thinksByDefault: Bool = false
+        thinksByDefault: Bool = false,
+        modelCapabilities: ServingModelCapabilities? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -117,6 +119,7 @@ public struct ExactQwen35MTPServingBackendConfiguration: Sendable {
         self.mailboxCapacity = mailboxCapacity
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
         self.thinksByDefault = thinksByDefault
+        self.modelCapabilities = modelCapabilities
     }
 }
 
@@ -247,6 +250,10 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
         self.codec = codec
         self.configuration = configuration
         self.serialOwner = serialOwner
+        precondition(
+            configuration.modelCapabilities == nil
+                || configuration.modelCapabilities?.model == launchedModel,
+            "modelCapabilities must describe the launched model")
     }
 
     public func start(
@@ -261,30 +268,6 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
 
         let sampling = try Self.resolveSampling(request)
         let penalties = Self.decoderPenalties(request)
-        let startupID = UUID()
-        let startupLatch = ExactQwen35MTPStartupLatch()
-        pendingStartups[startupID] = startupLatch
-
-        do {
-            let handle = try await startTracked(
-                request,
-                sampling: sampling,
-                penalties: penalties)
-            pendingStartups.removeValue(forKey: startupID)
-            await startupLatch.finish()
-            return handle
-        } catch {
-            pendingStartups.removeValue(forKey: startupID)
-            await startupLatch.finish()
-            throw error
-        }
-    }
-
-    private func startTracked(
-        _ request: OpenAIChatCompletionRequest,
-        sampling: ServingSamplingPolicy,
-        penalties: DecoderPenalties
-    ) async throws -> ServingGenerationHandle {
         let activeReservationCount = await serialOwner.activeReservationCount()
         guard acceptingRequests else {
             throw ExactQwen35MTPServingBackendError.shuttingDown
@@ -300,14 +283,6 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
         guard case .eligible(let descriptor) = decision else {
             return try await scalarFallback.start(request)
         }
-        let reservation = await serialOwner.acquire()
-        guard acceptingRequests else {
-            await reservation?.release()
-            throw ExactQwen35MTPServingBackendError.shuttingDown
-        }
-        guard let reservation else {
-            return try await scalarFallback.start(request)
-        }
 
         let promptTokens: [Int]
         do {
@@ -318,18 +293,60 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
                     disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive),
                 reasoningEffort: request.reasoningEffort)
         } catch {
-            await reservation.release()
             guard acceptingRequests else {
                 throw ExactQwen35MTPServingBackendError.shuttingDown
             }
             return try await scalarFallback.start(request)
         }
         guard !promptTokens.isEmpty else {
-            await reservation.release()
             guard acceptingRequests else {
                 throw ExactQwen35MTPServingBackendError.shuttingDown
             }
             return try await scalarFallback.start(request)
+        }
+
+        // The exact rendered prompt is the final budget authority. This happens before any pending
+        // startup bookkeeping, serial reservation, runner work, RNG, or cache mutation.
+        let completionBudgetResolution = try configuration.modelCapabilities?
+            .resolveCompletionBudget(
+                requestedCompletionTokens: request.maxCompletionTokens,
+                renderedPromptTokens: promptTokens.count,
+                stream: request.stream)
+
+        let startupID = UUID()
+        let startupLatch = ExactQwen35MTPStartupLatch()
+        pendingStartups[startupID] = startupLatch
+        do {
+            let handle = try await startTracked(
+                request,
+                descriptor: descriptor,
+                promptTokens: promptTokens,
+                completionBudgetResolution: completionBudgetResolution)
+            pendingStartups.removeValue(forKey: startupID)
+            await startupLatch.finish()
+            return handle
+        } catch {
+            pendingStartups.removeValue(forKey: startupID)
+            await startupLatch.finish()
+            throw error
+        }
+    }
+
+    private func startTracked(
+        _ request: OpenAIChatCompletionRequest,
+        descriptor: ExactQwen35MTPServingDescriptor,
+        promptTokens: [Int],
+        completionBudgetResolution: ServingCompletionBudgetResolution?
+    ) async throws -> ServingGenerationHandle {
+        let reservation = await serialOwner.acquire()
+        guard acceptingRequests else {
+            await reservation?.release()
+            throw ExactQwen35MTPServingBackendError.shuttingDown
+        }
+        guard let reservation else {
+            return try await startFallback(
+                request,
+                completionBudgetResolution: completionBudgetResolution)
         }
 
         let runnerHandle: ExactQwen35MTPServingRunnerHandle
@@ -337,7 +354,9 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             runnerHandle = try await runner.start(
                 ExactQwen35MTPServingRunnerRequest(
                     promptTokens: promptTokens,
-                    maximumCompletionTokens: request.maxCompletionTokens
+                    maximumCompletionTokens:
+                        completionBudgetResolution?.appliedCompletionTokens
+                        ?? request.maxCompletionTokens
                         ?? configuration.defaultMaximumCompletionTokens,
                     stopStrings: Set(request.stop),
                     descriptor: descriptor))
@@ -346,7 +365,9 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             guard acceptingRequests else {
                 throw ExactQwen35MTPServingBackendError.shuttingDown
             }
-            return try await scalarFallback.start(request)
+            return try await startFallback(
+                request,
+                completionBudgetResolution: completionBudgetResolution)
         }
 
         guard acceptingRequests else {
@@ -359,7 +380,20 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             request: request,
             runnerHandle: runnerHandle,
             reservation: reservation,
-            requestStopStrings: Set(request.stop))
+            requestStopStrings: Set(request.stop),
+            completionBudgetResolution: completionBudgetResolution)
+    }
+
+    private func startFallback(
+        _ request: OpenAIChatCompletionRequest,
+        completionBudgetResolution: ServingCompletionBudgetResolution?
+    ) async throws -> ServingGenerationHandle {
+        if let completionBudgetResolution {
+            return try await scalarFallback.start(
+                request,
+                resolvedCompletionBudget: completionBudgetResolution)
+        }
+        return try await scalarFallback.start(request)
     }
 
     public func shutdown() async {
@@ -393,7 +427,8 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
         request: OpenAIChatCompletionRequest,
         runnerHandle: ExactQwen35MTPServingRunnerHandle,
         reservation: ExactQwen35MTPReservation,
-        requestStopStrings: Set<String>
+        requestStopStrings: Set<String>,
+        completionBudgetResolution: ServingCompletionBudgetResolution?
     ) -> ServingGenerationHandle {
         let id = ServingRequestID("exact-mtp-\(UUID().uuidString)")
         let mailbox = BoundedDeltaMailbox(capacity: configuration.mailboxCapacity)
@@ -429,6 +464,7 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             route: .exactQwen35MTP,
             mailbox: mailbox,
             lease: lease,
+            completionBudgetResolution: completionBudgetResolution,
             separatesReasoning: servingSeparatesReasoning(
                 thinksByDefault: configuration.thinksByDefault,
                 resolvedEnableThinking: request.resolvedEnableThinking(

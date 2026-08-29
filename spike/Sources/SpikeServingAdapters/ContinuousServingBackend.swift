@@ -31,6 +31,9 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// (QwenLM/Qwen3 #1817). The agentic qwen3_5 family is served on the scalar route, which leaves
     /// this off and respects the template default.
     public var disableThinkingWhenToolsActive: Bool
+    /// Immutable model/host-fit capability. Production serving always supplies this; nil retains
+    /// the legacy embedding contract for existing library callers and fixtures.
+    public let modelCapabilities: ServingModelCapabilities?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -38,7 +41,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
         admission: ContinuousServingAdmissionMode = .immediateBatchNoSpec,
         toolCallFormat: ToolCallFormat = .json,
-        disableThinkingWhenToolsActive: Bool = false
+        disableThinkingWhenToolsActive: Bool = false,
+        modelCapabilities: ServingModelCapabilities? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -55,6 +59,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.admission = admission
         self.toolCallFormat = toolCallFormat
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
+        self.modelCapabilities = modelCapabilities
     }
 }
 
@@ -76,6 +81,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let maximumCompletionTokens: Int
         let stopStrings: Set<String>
         let activeTools: [OpenAIToolSpec]
+        let completionBudgetResolution: ServingCompletionBudgetResolution?
     }
 
     private struct PendingAdmission {
@@ -133,6 +139,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         self.stopTokenIDs = stopTokenIDs
         self.modelStopStrings = modelStopStrings
         self.configuration = configuration
+        precondition(
+            configuration.modelCapabilities == nil
+                || configuration.modelCapabilities?.model == launchedModel,
+            "modelCapabilities must describe the launched model")
         if case .dynamic(let admissionConfiguration, _) = configuration.admission {
             self.admissionReducer = ServingAdmissionReducer(
                 configuration: admissionConfiguration)
@@ -193,8 +203,14 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard !promptTokens.isEmpty else {
             throw ContinuousServingBackendError.emptyRenderedPrompt
         }
+        let completionBudgetResolution = try configuration.modelCapabilities?
+            .resolveCompletionBudget(
+                requestedCompletionTokens: request.maxCompletionTokens,
+                renderedPromptTokens: promptTokens.count,
+                stream: request.stream)
         let maximumCompletionTokens =
-            request.maxCompletionTokens
+            completionBudgetResolution?.appliedCompletionTokens
+            ?? request.maxCompletionTokens
             ?? configuration.defaultMaximumCompletionTokens
 
         let prepared = PreparedRequest(
@@ -202,7 +218,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             promptTokens: promptTokens,
             maximumCompletionTokens: maximumCompletionTokens,
             stopStrings: modelStopStrings.union(request.stop),
-            activeTools: activeTools)
+            activeTools: activeTools,
+            completionBudgetResolution: completionBudgetResolution)
         switch configuration.admission {
         case .immediateBatchNoSpec:
             let handles = try await submitToCoordinator(
@@ -660,7 +677,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             model: launchedModel,
             route: route,
             mailbox: mailbox,
-            lease: lease)
+            lease: lease,
+            completionBudgetResolution: prepared.completionBudgetResolution)
     }
 
     private func execute(
