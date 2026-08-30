@@ -1949,16 +1949,39 @@ struct Harness {
             runBenchCapacityEvidenceValidation(flags)
         case "produce-qwen38-mtp-performance-scorecard":
             do {
-                print(try await produceQwen38MTPPerformanceScorecard(
-                    arguments: Array(arguments.dropFirst(2))))
+                let producerArguments = Array(arguments.dropFirst(2))
+                if producerArguments.contains("--target")
+                    || producerArguments.contains("--drafter")
+                    || producerArguments.contains("--authority-output")
+                {
+                    print(try await runQwen38MTPScorecardLiveAdapter(
+                        arguments: producerArguments))
+                } else {
+                    print(try await produceQwen38MTPPerformanceScorecard(
+                        arguments: producerArguments))
+                }
             } catch {
                 let blocked = error as? Qwen38MTPPerformanceScorecardProducerCLIError
                     == .producerUnavailable
+                let diagnostic =
+                    error is Qwen38MTPScorecardLiveAdapterError || error is CancellationError
+                    ? qwen38MTPScorecardLiveAdapterExternalDiagnostic(error)
+                    : qwen38MTPPerformanceScorecardProducerExternalDiagnostic(error)
                 print(
                     "qwen38-mtp-performance-scorecard-producer "
                         + (blocked ? "BLOCKED: " : "INVALID: ")
-                        + qwen38MTPPerformanceScorecardProducerExternalDiagnostic(error))
+                        + diagnostic)
                 exit(blocked ? 3 : 2)
+            }
+        case "qwen38-mtp-scorecard-worker":
+            do {
+                try await runQwen38MTPScorecardWorker(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "qwen38-mtp-scorecard-worker INVALID: "
+                        + qwen38MTPScorecardLiveAdapterExternalDiagnostic(error))
+                exit(2)
             }
         case "validate-qwen38-mtp-performance-scorecard":
             do {
