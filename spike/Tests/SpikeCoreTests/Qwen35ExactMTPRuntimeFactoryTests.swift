@@ -56,6 +56,105 @@ final class Qwen35ExactMTPRuntimeFactoryTests: XCTestCase {
         }
     }
 
+    func testQwen38HarnessRevisionFindsDeployStampFromCompiledSourceOutsideTestCWD() throws {
+        let fixture = try makeQwen38DeploySourceFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let unrelatedWorkingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: unrelatedWorkingDirectory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unrelatedWorkingDirectory) }
+
+        XCTAssertEqual(
+            try qwen38HarnessGitSHA(
+                currentDirectory: unrelatedWorkingDirectory,
+                compiledSourceFile: fixture.compiledSourceFile),
+            fixture.sha)
+    }
+
+    func testQwen38HarnessRevisionRejectsUnmarkedDeployStampAndArbitraryCWDStamp() throws {
+        let fixture = try makeQwen38DeploySourceFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let arbitraryWorkingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: arbitraryWorkingDirectory,
+            withIntermediateDirectories: true)
+        try "\(String(repeating: "d", count: 40))\n".write(
+            to: arbitraryWorkingDirectory.appendingPathComponent(".harness-sha"),
+            atomically: true,
+            encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: arbitraryWorkingDirectory) }
+
+        for missingMarker in fixture.requiredMarkers {
+            try FileManager.default.removeItem(at: missingMarker)
+            XCTAssertThrowsError(try qwen38HarnessGitSHA(
+                currentDirectory: arbitraryWorkingDirectory,
+                compiledSourceFile: fixture.compiledSourceFile))
+            try Data().write(to: missingMarker)
+        }
+        try FileManager.default.removeItem(
+            at: fixture.root.appendingPathComponent(".harness-sha"))
+        XCTAssertThrowsError(try qwen38HarnessGitSHA(
+            currentDirectory: arbitraryWorkingDirectory,
+            compiledSourceFile: fixture.compiledSourceFile))
+
+        let externalStamp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try "\(fixture.sha)\n".write(
+            to: externalStamp,
+            atomically: true,
+            encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.root.appendingPathComponent(".harness-sha"),
+            withDestinationURL: externalStamp)
+        defer { try? FileManager.default.removeItem(at: externalStamp) }
+        XCTAssertThrowsError(try qwen38HarnessGitSHA(
+            currentDirectory: arbitraryWorkingDirectory,
+            compiledSourceFile: fixture.compiledSourceFile))
+    }
+
+    func testQwen38HarnessRevisionPrefersCompiledSourceLiveGitOverDeployStamp() throws {
+        let fixture = try makeQwen38DeploySourceFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try FileManager.default.createDirectory(
+            at: fixture.root.appendingPathComponent(".git"),
+            withIntermediateDirectories: true)
+        try Data().write(to: fixture.root.appendingPathComponent("AGENTS.md"))
+        let repositoryPackageMarker = fixture.root.appendingPathComponent("spike/Package.swift")
+        try FileManager.default.createDirectory(
+            at: repositoryPackageMarker.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data().write(to: repositoryPackageMarker)
+        let unrelatedWorkingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: unrelatedWorkingDirectory,
+            withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: unrelatedWorkingDirectory) }
+        let liveSHA = String(repeating: "e", count: 40)
+
+        XCTAssertEqual(
+            try qwen38HarnessGitSHA(
+                currentDirectory: unrelatedWorkingDirectory,
+                compiledSourceFile: fixture.compiledSourceFile,
+                liveGitSHA: { _ in liveSHA }),
+            liveSHA)
+        XCTAssertThrowsError(try qwen38HarnessGitSHA(
+            currentDirectory: unrelatedWorkingDirectory,
+            compiledSourceFile: fixture.compiledSourceFile,
+            liveGitSHA: { _ in nil })) { error in
+            XCTAssertEqual(error as? Qwen38LiveExactnessProducerError, .harnessGitSHAUnavailable)
+        }
+        XCTAssertThrowsError(try qwen38HarnessGitSHA(
+            currentDirectory: unrelatedWorkingDirectory,
+            compiledSourceFile: fixture.compiledSourceFile,
+            liveGitSHA: { _ in "\(liveSHA)-dirty" })) { error in
+            XCTAssertEqual(error as? Qwen38LiveExactnessProducerError, .invalidHarnessGitSHA)
+        }
+    }
+
     func testQwen38ValidatedEvidenceWriterPublishesCompleteRecordAndPreservesExistingFile() throws {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -1060,13 +1159,103 @@ private func qwen38HarnessGitSHA() throws -> String {
     let currentDirectory = URL(
         fileURLWithPath: FileManager.default.currentDirectoryPath,
         isDirectory: true)
-    let repositoryRoot = qwen38LiveExactnessRepositoryRoot(startingAt: currentDirectory)
+    return try qwen38HarnessGitSHA(
+        currentDirectory: currentDirectory,
+        compiledSourceFile: URL(fileURLWithPath: #filePath))
+}
+
+private func qwen38HarnessGitSHA(
+    currentDirectory: URL,
+    compiledSourceFile: URL,
+    liveGitSHA: (URL) -> String? = qwen38LiveGitSHA
+) throws -> String {
+    let compiledSourceRepositoryRoot = qwen38LiveExactnessRepositoryRoot(
+        startingAt: compiledSourceFile.deletingLastPathComponent())
+    let repositoryRoot = compiledSourceRepositoryRoot
+        ?? qwen38LiveExactnessRepositoryRoot(startingAt: currentDirectory)
+    let deploySourceRoot = qwen38LiveExactnessDeploySourceRoot(
+        compiledSourceFile: compiledSourceFile)
     return try resolveQwen38LiveExactnessHarnessGitSHA(
-        liveGitOutput: repositoryRoot.flatMap(qwen38LiveGitSHA),
+        liveGitOutput: repositoryRoot.flatMap(liveGitSHA),
         liveRepositoryPresent: repositoryRoot != nil,
-        shaFile: try? String(
-            contentsOf: currentDirectory.appendingPathComponent(".harness-sha"),
-            encoding: .utf8))
+        shaFile: deploySourceRoot.flatMap(qwen38LiveExactnessDeployStamp))
+}
+
+private struct Qwen38DeploySourceFixture {
+    var root: URL
+    var compiledSourceFile: URL
+    var requiredMarkers: [URL]
+    var sha: String
+}
+
+private func makeQwen38DeploySourceFixture() throws -> Qwen38DeploySourceFixture {
+    let manager = FileManager.default
+    let root = manager.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let sourceFile = root.appendingPathComponent(
+        "Tests/SpikeCoreTests/Qwen35ExactMTPRuntimeFactoryTests.swift")
+    let requiredMarkers = [
+        root.appendingPathComponent("Package.swift"),
+        root.appendingPathComponent("Package.resolved"),
+        root.appendingPathComponent("Sources/SpikeCore/Qwen35ExactMTPRuntimeFactory.swift"),
+        sourceFile,
+        root.appendingPathComponent("Vendor/mlx-swift-lm/Package.swift"),
+    ]
+    for marker in requiredMarkers {
+        try manager.createDirectory(
+            at: marker.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try Data().write(to: marker)
+    }
+    let sha = String(repeating: "c", count: 40)
+    try "\(sha)\n".write(
+        to: root.appendingPathComponent(".harness-sha"),
+        atomically: true,
+        encoding: .utf8)
+    return Qwen38DeploySourceFixture(
+        root: root,
+        compiledSourceFile: sourceFile,
+        requiredMarkers: requiredMarkers,
+        sha: sha)
+}
+
+private func qwen38LiveExactnessDeploySourceRoot(
+    compiledSourceFile: URL
+) -> URL? {
+    let sourceFile = compiledSourceFile.standardizedFileURL
+    let testTargetDirectory = sourceFile.deletingLastPathComponent()
+    let testsDirectory = testTargetDirectory.deletingLastPathComponent()
+    let packageRoot = testsDirectory.deletingLastPathComponent()
+    guard sourceFile.lastPathComponent == "Qwen35ExactMTPRuntimeFactoryTests.swift",
+        testTargetDirectory.lastPathComponent == "SpikeCoreTests",
+        testsDirectory.lastPathComponent == "Tests"
+    else { return nil }
+
+    let requiredMarkers = [
+        packageRoot.appendingPathComponent("Package.swift"),
+        packageRoot.appendingPathComponent("Package.resolved"),
+        packageRoot.appendingPathComponent(
+            "Sources/SpikeCore/Qwen35ExactMTPRuntimeFactory.swift"),
+        sourceFile,
+        packageRoot.appendingPathComponent("Vendor/mlx-swift-lm/Package.swift"),
+    ]
+    let manager = FileManager.default
+    guard requiredMarkers.allSatisfy({ marker in
+        guard let attributes = try? manager.attributesOfItem(atPath: marker.path),
+            let type = attributes[.type] as? FileAttributeType
+        else { return false }
+        return type == .typeRegular
+    }) else { return nil }
+    return packageRoot
+}
+
+private func qwen38LiveExactnessDeployStamp(packageRoot: URL) -> String? {
+    let stamp = packageRoot.appendingPathComponent(".harness-sha")
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: stamp.path),
+        let type = attributes[.type] as? FileAttributeType,
+        type == .typeRegular
+    else { return nil }
+    return try? String(contentsOf: stamp, encoding: .utf8)
 }
 
 private func resolveQwen38LiveExactnessHarnessGitSHA(
