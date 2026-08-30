@@ -4,6 +4,17 @@ import HarnessCore
 import MLX
 import MLXLMCommon
 
+public enum SampledMTPBlockRuntimeEntropyDomain: String, Sendable, Equatable, Hashable {
+    case proposal
+    case acceptance
+    case residual
+    case bonus
+}
+
+public typealias SampledMTPBlockRuntimeEntropy = @Sendable (
+    SampledMTPBlockRuntimeEntropyDomain
+) -> Double
+
 public struct SampledMTPBlockRuntimeDrawPlan: Sendable, Equatable {
     public let proposalUniforms: [Double]
     public let acceptanceUniforms: [Double]
@@ -38,6 +49,17 @@ public enum SeededSampledMTPBlockRuntimeProviderError: Error, Sendable, Equatabl
     case invalidLogits
 }
 
+public enum NondeterministicSampledMTPBlockRuntimeProviderError: Error, Sendable, Equatable {
+    case proposalCaptureFailed
+    case proposalCountMismatch(expected: Int, actual: Int)
+    case proposalTokenMismatch(index: Int, expected: Int, actual: Int)
+    case invalidProposalToken(token: Int, vocabularyCount: Int)
+    case targetRowCountMismatch(expected: Int, actual: Int)
+    case vocabularyWidthMismatch(expected: Int, actual: Int)
+    case invalidEntropy(domain: SampledMTPBlockRuntimeEntropyDomain, value: Double)
+    case invalidLogits
+}
+
 public struct SeededSampledMTPBlockRuntimeDrawTrace: Sendable, Equatable {
     public let blockIndex: Int
     public let proposalUniforms: [Double]
@@ -67,6 +89,137 @@ public struct SeededSampledMTPBlockRuntimeDrawTrace: Sendable, Equatable {
         self.terminalDraw = terminalDraw
         self.outputTokens = outputTokens
         self.acceptedDraftCount = acceptedDraftCount
+    }
+}
+
+/// Default-off production-shaped sampled MTP provider. It mirrors the seeded
+/// diagnostic provider's validation and commit-on-success behavior, but draws
+/// proposal, acceptance, residual, and bonus uniforms from caller-supplied
+/// runtime entropy. Serving/admission stays unchanged unless a caller
+/// explicitly constructs and passes this provider to the iterator.
+public final class NondeterministicSampledMTPBlockRuntimeProvider:
+    SampledMTPBlockRuntimeDeciding
+{
+    private let entropy: SampledMTPBlockRuntimeEntropy
+    private let recorder: NondeterministicSampledMTPProposalSampler
+    private var blockIndex = 0
+
+    public private(set) var drawTraces: [SeededSampledMTPBlockRuntimeDrawTrace] = []
+    public var proposalSampler: any LogitSampler { recorder }
+
+    public init(
+        entropy: @escaping SampledMTPBlockRuntimeEntropy = { _ in
+            Double.random(in: 0 ..< 1)
+        }
+    ) {
+        self.entropy = entropy
+        self.recorder = NondeterministicSampledMTPProposalSampler(entropy: entropy)
+    }
+
+    public func supports(parameters: GenerateParameters) -> Bool {
+        parameters.temperature == 1
+            && parameters.topP == 1
+            && parameters.topK == 0
+            && parameters.minP == 0
+            && parameters.repetitionPenalty == nil
+            && parameters.presencePenalty == nil
+            && parameters.frequencyPenalty == nil
+    }
+
+    public func decide(
+        proposedTokens: [Int],
+        targetLogits: [MLXArray],
+        bonusTargetLogits: MLXArray
+    ) throws -> SampledMTPBlockRuntimeDecision {
+        guard !recorder.failed else {
+            throw NondeterministicSampledMTPBlockRuntimeProviderError.proposalCaptureFailed
+        }
+        let pendingCaptureCount = recorder.pendingCaptureCount
+        guard proposedTokens.count == pendingCaptureCount else {
+            throw NondeterministicSampledMTPBlockRuntimeProviderError.proposalCountMismatch(
+                expected: pendingCaptureCount,
+                actual: proposedTokens.count)
+        }
+        guard targetLogits.count == proposedTokens.count else {
+            throw NondeterministicSampledMTPBlockRuntimeProviderError.targetRowCountMismatch(
+                expected: proposedTokens.count,
+                actual: targetLogits.count)
+        }
+
+        let proposals = try recorder.peek(count: proposedTokens.count)
+        let vocabularyCount = try validateRuntimeVocabularyWidth(proposals: proposals)
+        let bonusTargetDistribution = try runtimeNormalizedProbabilities(bonusTargetLogits)
+        try validateRuntimeWidth(bonusTargetDistribution.count, expected: vocabularyCount)
+
+        var steps = [SampledMTPBlockStep]()
+        steps.reserveCapacity(proposedTokens.count)
+        for (index, proposedToken) in proposedTokens.enumerated() {
+            try validateRuntimeProposalToken(proposedToken, vocabularyCount: vocabularyCount)
+            let proposal = proposals[index]
+            try validateRuntimeProposalToken(proposal.token, vocabularyCount: vocabularyCount)
+            guard proposal.token == proposedToken else {
+                throw NondeterministicSampledMTPBlockRuntimeProviderError.proposalTokenMismatch(
+                    index: index,
+                    expected: proposal.token,
+                    actual: proposedToken)
+            }
+
+            let targetDistribution = try runtimeNormalizedProbabilities(targetLogits[index])
+            try validateRuntimeWidth(targetDistribution.count, expected: vocabularyCount)
+            steps.append(SampledMTPBlockStep(
+                targetDistribution: targetDistribution,
+                draftDistribution: proposal.probabilities,
+                proposedToken: proposedToken))
+        }
+
+        var acceptanceDraws = [Double]()
+        acceptanceDraws.reserveCapacity(steps.count)
+        var terminalDraw: SampledMTPBlockTerminalDraw?
+        for step in steps {
+            let acceptanceUniform = try drawUniform(domain: .acceptance)
+            acceptanceDraws.append(acceptanceUniform)
+            let acceptanceProbability = try SampledMTPResidualCorrection.acceptanceProbability(
+                target: step.targetDistribution,
+                draft: step.draftDistribution,
+                proposedToken: step.proposedToken)
+            if acceptanceUniform >= acceptanceProbability {
+                terminalDraw = .residual(try drawUniform(domain: .residual))
+                break
+            }
+        }
+        if terminalDraw == nil {
+            terminalDraw = .bonus(try drawUniform(domain: .bonus))
+        }
+
+        let decision = try SampledMTPBlockAcceptance.decide(
+            steps: steps,
+            acceptanceUniforms: acceptanceDraws,
+            terminalDraws: terminalDraw.map { [$0] } ?? [],
+            bonusTargetDistribution: bonusTargetDistribution)
+        recorder.commit(count: proposedTokens.count)
+        drawTraces.append(SeededSampledMTPBlockRuntimeDrawTrace(
+            blockIndex: blockIndex,
+            proposalUniforms: proposals.map(\.uniform),
+            acceptanceUniforms: acceptanceDraws,
+            terminalDraw: terminalDraw!,
+            outputTokens: decision.tokens,
+            acceptedDraftCount: decision.acceptedDraftCount))
+        blockIndex += 1
+        return SampledMTPBlockRuntimeDecision(
+            outputTokens: decision.tokens,
+            acceptedDraftCount: decision.acceptedDraftCount)
+    }
+
+    private func drawUniform(
+        domain: SampledMTPBlockRuntimeEntropyDomain
+    ) throws -> Double {
+        let uniform = entropy(domain)
+        guard uniform.isFinite, (0 ..< 1).contains(uniform) else {
+            throw NondeterministicSampledMTPBlockRuntimeProviderError.invalidEntropy(
+                domain: domain,
+                value: uniform)
+        }
+        return uniform
     }
 }
 
@@ -364,6 +517,55 @@ private final class SeededSampledMTPProposalSampler: LogitSampler {
     }
 }
 
+private final class NondeterministicSampledMTPProposalSampler: LogitSampler {
+    private let entropy: SampledMTPBlockRuntimeEntropy
+    private var consumedCaptureCount = 0
+    private var captures = [CapturedProposal]()
+    private(set) var failed = false
+
+    var pendingCaptureCount: Int {
+        captures.count - consumedCaptureCount
+    }
+
+    init(entropy: @escaping SampledMTPBlockRuntimeEntropy) {
+        self.entropy = entropy
+    }
+
+    func sample(logits: MLXArray) -> MLXArray {
+        do {
+            let probabilities = try runtimeNormalizedProbabilities(logits)
+            let uniform = entropy(.proposal)
+            guard uniform.isFinite, (0 ..< 1).contains(uniform),
+                let token = categoricalSample(probabilities, uniform: uniform)
+            else {
+                failed = true
+                return MLXArray([Int32(0)])
+            }
+            captures.append(CapturedProposal(
+                token: token,
+                uniform: uniform,
+                probabilities: probabilities))
+            return MLXArray([Int32(token)])
+        } catch {
+            failed = true
+            return MLXArray([Int32(0)])
+        }
+    }
+
+    func peek(count: Int) throws -> [CapturedProposal] {
+        guard !failed, count >= 0,
+            consumedCaptureCount + count <= captures.count
+        else {
+            throw NondeterministicSampledMTPBlockRuntimeProviderError.proposalCaptureFailed
+        }
+        return Array(captures[consumedCaptureCount ..< consumedCaptureCount + count])
+    }
+
+    func commit(count: Int) {
+        consumedCaptureCount += count
+    }
+}
+
 private enum SeededSampledMTPUniformDomain: UInt8 {
     case proposal = 1
     case acceptance = 2
@@ -467,6 +669,39 @@ private func validateWidth(_ actual: Int, expected: Int) throws {
 private func validateProposalToken(_ token: Int, vocabularyCount: Int) throws {
     guard token >= 0, token < vocabularyCount else {
         throw SeededSampledMTPBlockRuntimeProviderError.invalidProposalToken(
+            token: token,
+            vocabularyCount: vocabularyCount)
+    }
+}
+
+private func runtimeNormalizedProbabilities(_ logits: MLXArray) throws -> [Double] {
+    do {
+        return try validatingNormalizedProbabilities(logits)
+    } catch {
+        throw NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits
+    }
+}
+
+private func validateRuntimeVocabularyWidth(proposals: [CapturedProposal]) throws -> Int {
+    guard let first = proposals.first else { return 0 }
+    let vocabularyCount = first.probabilities.count
+    for proposal in proposals {
+        try validateRuntimeWidth(proposal.probabilities.count, expected: vocabularyCount)
+    }
+    return vocabularyCount
+}
+
+private func validateRuntimeWidth(_ actual: Int, expected: Int) throws {
+    guard actual == expected else {
+        throw NondeterministicSampledMTPBlockRuntimeProviderError.vocabularyWidthMismatch(
+            expected: expected,
+            actual: actual)
+    }
+}
+
+private func validateRuntimeProposalToken(_ token: Int, vocabularyCount: Int) throws {
+    guard token >= 0, token < vocabularyCount else {
+        throw NondeterministicSampledMTPBlockRuntimeProviderError.invalidProposalToken(
             token: token,
             vocabularyCount: vocabularyCount)
     }

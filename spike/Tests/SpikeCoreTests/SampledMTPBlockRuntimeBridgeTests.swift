@@ -337,3 +337,162 @@ final class SeededSampledMTPBlockRuntimeProviderTests: XCTestCase {
             decisions: [firstDecision, secondDecision])
     }
 }
+
+final class SampledMTPBlockRuntimeBridgeTestsNondeterministicProvider: XCTestCase {
+    func testUsesLabeledEntropyDomainsAndFiniteTraceUniforms() throws {
+        let entropy = RecordingRuntimeEntropy(draws: [
+            .proposal: [0.1, 0.8],
+            .acceptance: [0, 0],
+            .bonus: [0.5],
+        ])
+        let provider = NondeterministicSampledMTPBlockRuntimeProvider(entropy: entropy.next)
+        let proposalDistributions = [[0.2, 0.3, 0.5], [0.4, 0.35, 0.25]]
+        let proposals = sampleProposals(provider, distributions: proposalDistributions)
+
+        let decision = try provider.decide(
+            proposedTokens: proposals,
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.1, 0.2, 0.7]))
+
+        XCTAssertEqual(entropy.domains, [.proposal, .proposal, .acceptance, .acceptance, .bonus])
+        XCTAssertEqual(decision.acceptedDraftCount, 2)
+        XCTAssertEqual(Array(decision.outputTokens.prefix(2)), proposals)
+        XCTAssertEqual(provider.drawTraces.count, 1)
+        XCTAssertEqual(provider.drawTraces[0].terminalDraw, .bonus(0.5))
+        let allUniforms = provider.drawTraces[0].proposalUniforms
+            + provider.drawTraces[0].acceptanceUniforms
+            + [provider.drawTraces[0].terminalUniform]
+        XCTAssertTrue(allUniforms.allSatisfy { $0.isFinite && (0 ..< 1).contains($0) })
+    }
+
+    func testDefaultEntropyDoesNotReplaySeededSequenceForFreshProviders() throws {
+        let first = NondeterministicSampledMTPBlockRuntimeProvider()
+        let second = NondeterministicSampledMTPBlockRuntimeProvider()
+        let proposalDistributions = Array(
+            repeating: [0.2, 0.3, 0.5],
+            count: 6)
+
+        let firstProposals = sampleProposals(first, distributions: proposalDistributions)
+        _ = try first.decide(
+            proposedTokens: firstProposals,
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.1, 0.2, 0.7]))
+
+        let secondProposals = sampleProposals(second, distributions: proposalDistributions)
+        _ = try second.decide(
+            proposedTokens: secondProposals,
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.1, 0.2, 0.7]))
+
+        XCTAssertNotEqual(
+            first.drawTraces.flatMap(\.proposalUniforms),
+            second.drawTraces.flatMap(\.proposalUniforms))
+    }
+
+    func testFirstRejectionUsesResidualEntropyDomain() throws {
+        let entropy = RecordingRuntimeEntropy(draws: [
+            .proposal: [0.1],
+            .acceptance: [0.9],
+            .residual: [0.4],
+        ])
+        let provider = NondeterministicSampledMTPBlockRuntimeProvider(entropy: entropy.next)
+        let proposals = sampleProposals(provider, distributions: [[0.95, 0.05]])
+
+        let decision = try provider.decide(
+            proposedTokens: proposals,
+            targetLogits: [logits([0.05, 0.95])],
+            bonusTargetLogits: logits([0.6, 0.4]))
+
+        XCTAssertEqual(entropy.domains, [.proposal, .acceptance, .residual])
+        XCTAssertEqual(decision.acceptedDraftCount, 0)
+        XCTAssertEqual(provider.drawTraces[0].terminalDraw, .residual(0.4))
+    }
+
+    func testValidationFailureDoesNotConsumeCaptureOrAdvanceTrace() throws {
+        let entropy = RecordingRuntimeEntropy(draws: [
+            .proposal: [0.25, 0.25],
+            .acceptance: [0, 0],
+            .bonus: [0.5],
+        ])
+        let provider = NondeterministicSampledMTPBlockRuntimeProvider(entropy: entropy.next)
+        let proposalDistributions = [[0.6, 0.4], [0.7, 0.3]]
+        let proposals = sampleProposals(provider, distributions: proposalDistributions)
+
+        XCTAssertThrowsError(try provider.decide(
+            proposedTokens: [2, proposals[1]],
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.6, 0.4])))
+        XCTAssertTrue(provider.drawTraces.isEmpty)
+
+        let decision = try provider.decide(
+            proposedTokens: proposals,
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.6, 0.4]))
+
+        let freshEntropy = RecordingRuntimeEntropy(draws: [
+            .proposal: [0.25, 0.25],
+            .acceptance: [0, 0],
+            .bonus: [0.5],
+        ])
+        let fresh = NondeterministicSampledMTPBlockRuntimeProvider(entropy: freshEntropy.next)
+        let freshProposals = sampleProposals(fresh, distributions: proposalDistributions)
+        let freshDecision = try fresh.decide(
+            proposedTokens: freshProposals,
+            targetLogits: proposalDistributions.map(logits),
+            bonusTargetLogits: logits([0.6, 0.4]))
+
+        XCTAssertEqual(proposals, freshProposals)
+        XCTAssertEqual(decision, freshDecision)
+        XCTAssertEqual(provider.drawTraces, fresh.drawTraces)
+    }
+
+    func testUnsupportedSamplingParametersFailClosed() {
+        let provider = NondeterministicSampledMTPBlockRuntimeProvider()
+
+        XCTAssertTrue(provider.supports(parameters: GenerateParameters(temperature: 1, seed: 7)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 0)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 0.7)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topP: 0.95)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topK: 4)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, minP: 0.05)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+            temperature: 1,
+            repetitionPenalty: 1.1)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+            temperature: 1,
+            presencePenalty: 0.1)))
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+            temperature: 1,
+            frequencyPenalty: 0.1)))
+    }
+
+    private func sampleProposals(
+        _ provider: any SampledMTPBlockRuntimeDeciding,
+        distributions: [[Double]]
+    ) -> [Int] {
+        distributions.map { distribution in
+            provider.proposalSampler.sample(logits: logits(distribution)).item(Int.self)
+        }
+    }
+
+    private func logits(_ distribution: [Double]) -> MLXArray {
+        MLXArray(distribution.map { Float(log($0)) })
+    }
+}
+
+private final class RecordingRuntimeEntropy: @unchecked Sendable {
+    private var draws: [SampledMTPBlockRuntimeEntropyDomain: [Double]]
+    private(set) var domains = [SampledMTPBlockRuntimeEntropyDomain]()
+
+    init(draws: [SampledMTPBlockRuntimeEntropyDomain: [Double]]) {
+        self.draws = draws
+    }
+
+    func next(_ domain: SampledMTPBlockRuntimeEntropyDomain) -> Double {
+        domains.append(domain)
+        guard var values = draws[domain], !values.isEmpty else { return .nan }
+        let value = values.removeFirst()
+        draws[domain] = values
+        return value
+    }
+}
