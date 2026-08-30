@@ -709,6 +709,7 @@ private func prepareBackend(
         if let drafterDirectory = exactDrafterDirectory {
             let loaded = try await loadExactQwen35MTPServeComposition(
                 configuration: ExactQwen35MTPServeCompositionConfiguration(
+                    selection: exactMTPRuntimeSelection(arguments.exactMTPSelection),
                     launchedModel: arguments.model,
                     targetDirectory: served.directory,
                     drafterDirectory: drafterDirectory,
@@ -901,6 +902,17 @@ private func prepareBackend(
             osServiceReserveBytes: osServiceReserveBytes)
     case nil:
         preconditionFailure("help is the only invocation without a backend")
+    }
+}
+
+private func exactMTPRuntimeSelection(
+    _ selection: FastMLXExactMTPSelection
+) -> Qwen35ExactMTPRuntimeSelection {
+    switch selection {
+    case .qwen35_9BDepth1:
+        .qwen35_9BDepth1
+    case .qwen38_27BMXFP8Depth1:
+        .qwen38_27BMXFP8Depth1
     }
 }
 

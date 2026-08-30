@@ -8,9 +8,9 @@ public enum Qwen35ExactMTPRuntimeAdmissionError: Error, Equatable, Sendable {
     case bindingDrift(field: String)
 }
 
-public enum Qwen35ExactMTPRuntimeSelection: Equatable, Sendable {
-    case qwen35_9BDepth1
-    case qwen38_27BMXFP8Depth1
+public enum Qwen35ExactMTPRuntimeSelection: String, Equatable, Sendable {
+    case qwen35_9BDepth1 = "qwen35-9b-depth1"
+    case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
 }
 
 /// Application composition boundary for explicitly selected, reviewed Qwen3 depth-one MTP pairs.

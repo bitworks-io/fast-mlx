@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+@_spi(FastMLXExactPrefix) import MLXLMCommon
 import Testing
 
 @testable import MLXLMCommon
@@ -210,6 +211,35 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(cache.offset == 7)
     #expect(cache.leftPaddingValues == [1, 3])
     #expect(cache.lengthsValues == [2, 4])
+}
+
+@Test func testMambaCacheAuditReportsSpeculativeCheckpointLifecycle() throws {
+    let cache = MambaCache(leftPadding: [4])
+    cache[0] = MLXArray.ones([1, 3, 4], dtype: .float16)
+    cache[1] = MLXArray.ones([1, 2, 3, 2], dtype: .float32)
+    cache.offset = 7
+    cache.prepare(lengths: [5])
+
+    #expect(cache.hasSpeculativeCheckpointForAudit == false)
+
+    cache.saveSpeculativeCheckpoint(
+        convState: MLXArray.zeros([1, 3, 4], dtype: .float16),
+        recurrentState: MLXArray.zeros([1, 2, 3, 2], dtype: .float32),
+        advancedBy: 2)
+
+    #expect(cache.hasSpeculativeCheckpointForAudit == true)
+
+    cache.discardSpeculativeCheckpoint()
+    #expect(cache.hasSpeculativeCheckpointForAudit == false)
+
+    cache.saveSpeculativeCheckpoint(
+        convState: MLXArray.zeros([1, 3, 4], dtype: .float16),
+        recurrentState: MLXArray.zeros([1, 2, 3, 2], dtype: .float32),
+        advancedBy: 2)
+    #expect(cache.hasSpeculativeCheckpointForAudit == true)
+
+    #expect(cache.restoreSpeculativeCheckpoint() == true)
+    #expect(cache.hasSpeculativeCheckpointForAudit == false)
 }
 
 @Test func testArraysCacheMaskUsesLengthsWhenLeftPaddingIsAbsent() throws {

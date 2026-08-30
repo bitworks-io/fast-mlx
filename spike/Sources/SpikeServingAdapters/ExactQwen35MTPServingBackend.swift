@@ -99,6 +99,7 @@ public actor ExactQwen35MTPMLXServingRunner: ExactQwen35MTPServingRunner {
 }
 
 public struct ExactQwen35MTPServingBackendConfiguration: Sendable {
+    public let selection: Qwen35ExactMTPRuntimeSelection
     public let defaultMaximumCompletionTokens: Int
     public let mailboxCapacity: BoundedDeltaMailbox.Capacity
     public let disableThinkingWhenToolsActive: Bool
@@ -106,6 +107,7 @@ public struct ExactQwen35MTPServingBackendConfiguration: Sendable {
     public let modelCapabilities: ServingModelCapabilities?
 
     public init(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
         defaultMaximumCompletionTokens: Int,
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
         disableThinkingWhenToolsActive: Bool = false,
@@ -115,6 +117,7 @@ public struct ExactQwen35MTPServingBackendConfiguration: Sendable {
         precondition(
             defaultMaximumCompletionTokens > 0,
             "defaultMaximumCompletionTokens must be positive")
+        self.selection = selection
         self.defaultMaximumCompletionTokens = defaultMaximumCompletionTokens
         self.mailboxCapacity = mailboxCapacity
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
@@ -273,6 +276,7 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             throw ExactQwen35MTPServingBackendError.shuttingDown
         }
         let decision = ExactQwen35MTPServingAdmissionPolicy.decide(
+            selection: configuration.selection,
             enabled: enabled,
             binding: runner.binding,
             sampling: sampling,

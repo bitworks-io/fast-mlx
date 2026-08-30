@@ -1450,6 +1450,11 @@ public class MambaCache: ArraysCache {
         speculativeCheckpoint != nil
     }
 
+    @_spi(FastMLXExactPrefix)
+    public var hasSpeculativeCheckpointForAudit: Bool {
+        speculativeCheckpoint != nil
+    }
+
     @discardableResult
     package func restoreSpeculativeCheckpoint() -> Bool {
         guard let checkpoint = speculativeCheckpoint else { return false }

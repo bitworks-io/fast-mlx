@@ -6,6 +6,7 @@ import SpikeCore
 /// passed the serving prerequisite gate. This descriptor is classification output only: it does not
 /// contain model objects, load weights, construct an iterator, or authorize a live MTP executor.
 public struct ExactQwen35MTPServingDescriptor: Equatable, Sendable {
+    public let artifactSelection: Qwen35ExactMTPRuntimeSelection
     public let targetModelID: String
     public let drafterModelID: String
     public let targetRevision: String
@@ -16,6 +17,7 @@ public struct ExactQwen35MTPServingDescriptor: Equatable, Sendable {
     public let maximumAcceptedDraftTokens: Int
 
     public init(
+        artifactSelection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
         targetModelID: String,
         drafterModelID: String,
         targetRevision: String,
@@ -25,6 +27,7 @@ public struct ExactQwen35MTPServingDescriptor: Equatable, Sendable {
         runtimeBlockSize: Int,
         maximumAcceptedDraftTokens: Int
     ) {
+        self.artifactSelection = artifactSelection
         self.targetModelID = targetModelID
         self.drafterModelID = drafterModelID
         self.targetRevision = targetRevision
@@ -62,6 +65,7 @@ public enum ExactQwen35MTPServingAdmissionDecision: Equatable, Sendable {
 /// finalization, or API parity; those remain separate live-executor gates.
 public enum ExactQwen35MTPServingAdmissionPolicy {
     public static func decide(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
         enabled: Bool,
         binding: QwenMTPArtifactBinding?,
         sampling: ServingSamplingPolicy,
@@ -78,7 +82,7 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
         guard let binding else {
             return .scalarFallback(.noValidatedBinding)
         }
-        guard matchesReviewedBinding(binding) else {
+        guard matchesReviewedBinding(binding, selection: selection) else {
             return .scalarFallback(.bindingMismatch)
         }
         guard case .greedy = sampling else {
@@ -96,6 +100,7 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
 
         return .eligible(
             ExactQwen35MTPServingDescriptor(
+                artifactSelection: selection,
                 targetModelID: binding.targetModelID,
                 drafterModelID: binding.drafterModelID,
                 targetRevision: binding.targetRevision,
@@ -106,8 +111,11 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
                 maximumAcceptedDraftTokens: binding.maximumAcceptedDraftTokens))
     }
 
-    private static func matchesReviewedBinding(_ binding: QwenMTPArtifactBinding) -> Bool {
-        let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+    private static func matchesReviewedBinding(
+        _ binding: QwenMTPArtifactBinding,
+        selection: Qwen35ExactMTPRuntimeSelection
+    ) -> Bool {
+        let lock = reviewedLock(selection)
         return binding.targetModelID == lock.targetIdentity.modelID
             && binding.drafterModelID == lock.drafterIdentity.modelID
             && binding.targetRevision == lock.targetIdentity.revision
@@ -116,5 +124,16 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
             && binding.architecture == lock.architecture
             && binding.runtimeBlockSize == 3
             && binding.maximumAcceptedDraftTokens == 2
+    }
+
+    private static func reviewedLock(
+        _ selection: Qwen35ExactMTPRuntimeSelection
+    ) -> QwenMTPArtifactLock {
+        switch selection {
+        case .qwen35_9BDepth1:
+            QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        }
     }
 }

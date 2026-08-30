@@ -303,6 +303,8 @@ public struct ContinuousBatchScheduler: Sendable {
 
     public var isEmpty: Bool { slots.isEmpty }
 
+    public var currentStateRevision: Int { stateRevision }
+
     public var queuedRequestIDs: [BatchRequestID] { queue }
 
     public var activeRequestIDs: [BatchRequestID] {

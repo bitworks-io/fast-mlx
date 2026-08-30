@@ -98,14 +98,17 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         XCTAssertEqual(evidence.candidate, trustedEngineIdentities.candidate)
         XCTAssertEqual(evidence.reference, trustedEngineIdentities.reference)
         XCTAssertEqual(evidence.reference.artifact, evidence.candidate.artifact)
+        XCTAssertEqual(evidence.comparisonAxis, .executionMode)
+        XCTAssertEqual(evidence.candidate.executionMode, .exactMTP)
+        XCTAssertEqual(evidence.reference.executionMode, .scalar)
         XCTAssertNotEqual(evidence.candidate.executionDigest, evidence.reference.executionDigest)
         XCTAssertEqual(evidence.candidate.sourceDigest, evidence.reference.sourceDigest)
         XCTAssertEqual(evidence.candidate.gdnMode, .gdnOn)
-        XCTAssertEqual(evidence.reference.gdnMode, .gdnOff)
+        XCTAssertEqual(evidence.reference.gdnMode, .gdnOn)
         XCTAssertEqual(evidence.candidate.launchBinding?.mode, .gdnOn)
-        XCTAssertEqual(evidence.reference.launchBinding?.mode, .gdnOff)
+        XCTAssertEqual(evidence.reference.launchBinding?.mode, .gdnOn)
         XCTAssertEqual(evidence.candidate.launchBinding?.observedEnv, .enabled)
-        XCTAssertEqual(evidence.reference.launchBinding?.observedEnv, .disabled)
+        XCTAssertEqual(evidence.reference.launchBinding?.observedEnv, .enabled)
         XCTAssertEqual(evidence.liveExactnessProof, trustedProof)
         XCTAssertEqual(evidence.liveExactnessProof?.gdnMode, .gdnOn)
         XCTAssertEqual(evidence.liveExactnessProof?.launchBinding, evidence.candidate.launchBinding)
@@ -118,7 +121,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         XCTAssertEqual(
             evidence.workload.chatTemplateSHA256,
             "b426d0bb02412efa9e44777312cc7df1bf95ea332dc0d2e46376c801f273599d")
-        XCTAssertEqual(evidence.workload.contextTokenLimit, 40_960)
+        XCTAssertEqual(evidence.workload.contextTokenLimit, 32_768)
         XCTAssertEqual(evidence.workload.cases.count, 6)
         XCTAssertEqual(
             evidence.workload.cases.map(\.promptSHA256),
@@ -130,6 +133,15 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         XCTAssertEqual(evidence.runPlan.droppedWarmupPairs, 2)
         XCTAssertEqual(evidence.runPlan.measuredPairs, 40)
         XCTAssertEqual(evidence.runPlan.schedules.count, 126)
+        XCTAssertEqual(
+            Set(evidence.runPlan.schedules.flatMap(\.benchmarkCells).map(\.contextTokens)),
+            [.tokens4096, .tokens16384, .tokens32768])
+        XCTAssertEqual(
+            Set(evidence.runPlan.schedules.flatMap(\.benchmarkCells).map(\.prefixKind)),
+            [.cold, .exactWarmPrefix])
+        XCTAssertTrue(evidence.runPlan.schedules.allSatisfy {
+            $0.lane.kind == .syntheticInProcess && $0.lane.width == $0.concurrency
+        })
         assertMeasuredHalvesAreBalanced(evidence.runPlan)
         XCTAssertEqual(evidence.metrics, try computeTrustedMetrics(evidence))
         XCTAssertEqual(verdict, evidence.verdict)
@@ -141,6 +153,39 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         XCTAssertFalse(json.contains("http"))
         XCTAssertFalse(json.contains("/" + "Users/"))
         XCTAssertFalse(json.contains("192" + ".168."))
+    }
+
+    func testBenchmarkIntegritySchemaFailsClosedAgainstLegacyUntypedEvidence() throws {
+        XCTAssertEqual(Gate.schemaVersion, 3)
+
+        var legacy = makeEvidence()
+        legacy = recomputed(legacy)
+        let legacyJSON = try JSONEncoder().encode(legacy)
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: legacyJSON) as? [String: Any])
+        legacyObject["schemaVersion"] = 2
+        legacyObject.removeValue(forKey: "comparisonAxis")
+        let data = try JSONSerialization.data(withJSONObject: legacyObject)
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(Qwen38MTPPerformanceScorecardEvidence.self, from: data)
+        ) { error in
+            XCTAssertTrue(error is DecodingError)
+        }
+
+        let record = ResultRecord(
+            subcommand: Gate.subcommand,
+            provenance: makeProvenance(),
+            payload: legacy)
+        let legacyLine = try record.jsonLine().replacingOccurrences(
+            of: "\"schemaVersion\":3",
+            with: "\"schemaVersion\":2")
+        XCTAssertThrowsError(
+            try Gate.validateJSONL(
+                Data((legacyLine + "\n").utf8),
+                authority: trustedAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .schemaVersionMismatch(2))
+        }
     }
 
     func testTrustedValidationRejectsAnyProofOrEngineIdentityOtherThanInjectedExactObjects() {
@@ -186,21 +231,41 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         }
     }
 
-    func testGDNModeIdentityAcceptsSameArtifactAndSourceOnlyForAuthenticatedOppositeModes() {
+    func testComparisonIdentityVariesOnlyExecutionModeAndDoesNotConflateGDNWithMTP() {
         XCTAssertNoThrow(try validateTrusted(makeEvidence()))
 
         let labelOnlyAuthority = authority(
-            candidate: model(mode: nil, binding: nil, label: "candidate-gdn-on"),
-            reference: model(mode: nil, binding: nil, label: "reference-gdn-off"))
+            candidate: model(
+                executionMode: .exactMTP,
+                gdnMode: nil,
+                binding: nil,
+                label: "candidate-gdn-on"),
+            reference: model(
+                executionMode: .scalar,
+                gdnMode: nil,
+                binding: nil,
+                label: "reference-gdn-off"))
         XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: labelOnlyAuthority), authority: labelOnlyAuthority)) { error in
             XCTAssertEqual(error as? GateError, .invalidModelIdentity)
         }
 
-        var sameModeAuthority = trustedAuthority
-        sameModeAuthority.trustedEngineIdentities.reference.gdnMode = .gdnOn
-        sameModeAuthority.trustedEngineIdentities.reference.launchBinding =
-            launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("8"))
-        XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: sameModeAuthority), authority: sameModeAuthority)) { error in
+        var sameExecutionModeAuthority = trustedAuthority
+        sameExecutionModeAuthority.trustedEngineIdentities.reference.executionMode = .exactMTP
+        XCTAssertThrowsError(
+            try Gate.validate(
+                makeEvidence(authority: sameExecutionModeAuthority),
+                authority: sameExecutionModeAuthority)) { error in
+            XCTAssertEqual(error as? GateError, .invalidModelIdentity)
+        }
+
+        var gdnAxisDriftAuthority = trustedAuthority
+        gdnAxisDriftAuthority.trustedEngineIdentities.reference.gdnMode = .gdnOff
+        gdnAxisDriftAuthority.trustedEngineIdentities.reference.launchBinding =
+            launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("8"))
+        XCTAssertThrowsError(
+            try Gate.validate(
+                makeEvidence(authority: gdnAxisDriftAuthority),
+                authority: gdnAxisDriftAuthority)) { error in
             XCTAssertEqual(error as? GateError, .invalidModelIdentity)
         }
 
@@ -213,7 +278,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
 
         var sameProcessAuthority = trustedAuthority
         sameProcessAuthority.trustedEngineIdentities.reference.launchBinding =
-            launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("4"))
+            launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))
         XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: sameProcessAuthority), authority: sameProcessAuthority)) { error in
             XCTAssertEqual(error as? GateError, .invalidModelIdentity)
         }
@@ -221,8 +286,8 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         var envMismatchAuthority = trustedAuthority
         envMismatchAuthority.trustedEngineIdentities.reference.launchBinding =
             launchBinding(
-                mode: .gdnOff,
-                observedEnv: .enabled,
+                mode: .gdnOn,
+                observedEnv: .disabled,
                 processIsolationEvidenceID: hex("5"))
         XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: envMismatchAuthority), authority: envMismatchAuthority)) { error in
             XCTAssertEqual(error as? GateError, .invalidModelIdentity)
@@ -245,7 +310,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
             Gate.promptSHA256("different unauthenticated source")
         fakeSourceAuthority.trustedEngineIdentities.reference.launchBinding =
             launchBinding(
-                mode: .gdnOff,
+                mode: .gdnOn,
                 sourceDigest: fakeSourceAuthority.trustedEngineIdentities.reference.sourceDigest,
                 processIsolationEvidenceID: hex("9"))
         XCTAssertThrowsError(try Gate.validate(makeEvidence(authority: fakeSourceAuthority), authority: fakeSourceAuthority)) { error in
@@ -339,6 +404,58 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         contextDrift.workload.contextTokenLimit = 16_384
         XCTAssertThrowsError(try validateTrusted(contextDrift)) { error in
             XCTAssertEqual(error as? GateError, .invalidWorkload)
+        }
+    }
+
+    func testBenchmarkCellsAreCompactTypedAndMustMatchScheduledFixture() {
+        let soloPair = firstMeasuredPairIndex(concurrency: 1)
+        let c2Pair = firstMeasuredPairIndex(concurrency: 2)
+
+        var candidateCellDrift = makeEvidence()
+        candidateCellDrift.pairs[soloPair].candidate.requests[0].benchmarkCell =
+            Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                contextTokens: .tokens16384,
+                prefixKind: .cold,
+                fixtureRef: candidateCellDrift.pairs[soloPair].candidate.requests[0].caseID)
+        XCTAssertThrowsError(try validateTrusted(candidateCellDrift)) { error in
+            XCTAssertEqual(error as? GateError, .invalidPair(index: soloPair, reason: "benchmark cell"))
+        }
+
+        var fixtureDrift = makeEvidence()
+        fixtureDrift.pairs[soloPair].candidate.requests[0].benchmarkCell =
+            Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                contextTokens: fixtureDrift.pairs[soloPair].scheduledBenchmarkCells[0].contextTokens,
+                prefixKind: fixtureDrift.pairs[soloPair].scheduledBenchmarkCells[0].prefixKind,
+                fixtureRef: "case-legacy")
+        XCTAssertThrowsError(try validateTrusted(fixtureDrift)) { error in
+            XCTAssertEqual(error as? GateError, .invalidPair(index: soloPair, reason: "benchmark cell"))
+        }
+
+        var candidateReferenceMismatch = makeEvidence()
+        candidateReferenceMismatch.pairs[c2Pair].reference.requests[1].benchmarkCell =
+            Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                contextTokens: .tokens32768,
+                prefixKind: .exactWarmPrefix,
+                fixtureRef: candidateReferenceMismatch.pairs[c2Pair].reference.requests[1].caseID)
+        XCTAssertThrowsError(try validateTrusted(candidateReferenceMismatch)) { error in
+            XCTAssertEqual(error as? GateError, .invalidPair(index: c2Pair, reason: "benchmark cell"))
+        }
+    }
+
+    func testLaneIdentityDistinguishesSyntheticConcurrencyFromProductionSchedulerLanes() {
+        XCTAssertTrue(Gate.runPlan.schedules.allSatisfy {
+            $0.lane.kind == .syntheticInProcess
+        })
+
+        let soloPair = firstMeasuredPairIndex(concurrency: 1)
+        var laneDrift = makeEvidence()
+        laneDrift.pairs[soloPair].lane = Qwen38MTPPerformanceScorecardLaneIdentity(
+            kind: .productionScheduler,
+            width: laneDrift.pairs[soloPair].concurrency,
+            laneRef: "prod-lane-a")
+
+        XCTAssertThrowsError(try validateTrusted(laneDrift)) { error in
+            XCTAssertEqual(error as? GateError, .invalidPair(index: soloPair, reason: "lane identity"))
         }
     }
 
@@ -666,7 +783,9 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
     }
 
     private var trustedAuthority: Qwen38MTPPerformanceScorecardAuthorityBundle {
-        authority(candidate: model(mode: .gdnOn), reference: model(mode: .gdnOff))
+        authority(
+            candidate: model(executionMode: .exactMTP, gdnMode: .gdnOn),
+            reference: model(executionMode: .scalar, gdnMode: .gdnOn))
     }
 
     private var trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities {
@@ -723,6 +842,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
             candidate: authority.trustedEngineIdentities.candidate,
             reference: authority.trustedEngineIdentities.reference,
             liveExactnessProof: authority.acceptedLiveExactnessProof,
+            comparisonAxis: .executionMode,
             measurementClass: Gate.measurementClass,
             hardware: .init(
                 className: Gate.measurementClass,
@@ -768,6 +888,8 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
                 warmup: schedule.pairIndex < Gate.runPlan.droppedWarmupPairs,
                 order: schedule.order,
                 scheduledCaseIDs: schedule.caseIDs,
+                scheduledBenchmarkCells: schedule.benchmarkCells,
+                lane: schedule.lane,
                 candidate: makeEngine(
                     identity: authority.trustedEngineIdentities.candidate,
                     schedule: schedule,
@@ -794,22 +916,26 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
     }
 
     private func model(
-        mode: Qwen38MTPPerformanceScorecardGDNMode?,
+        executionMode: Qwen38MTPPerformanceScorecardExecutionMode,
+        gdnMode: Qwen38MTPPerformanceScorecardGDNMode?,
         binding: Qwen38MTPPerformanceScorecardLaunchBinding? = nil,
         label: String = "engine"
     ) -> Qwen38MTPPerformanceScorecardModel {
-        let isOn = mode == .gdnOn || label.contains("candidate")
+        let isExactMTP = executionMode == .exactMTP
         return Qwen38MTPPerformanceScorecardModel(
             label: label,
+            executionMode: executionMode,
             artifact: Gate.requiredArtifact,
             executionDigest: Gate.promptSHA256(
-                isOn ? "generic candidate execution identity" : "generic reference execution identity"),
+                isExactMTP
+                    ? "generic exact mtp execution identity"
+                    : "generic scalar execution identity"),
             sourceDigest: sharedSourceDigest,
-            gdnMode: mode,
-            launchBinding: binding ?? mode.map {
+            gdnMode: gdnMode,
+            launchBinding: binding ?? gdnMode.map {
                 launchBinding(
                     mode: $0,
-                    processIsolationEvidenceID: isOn ? hex("4") : hex("5"))
+                    processIsolationEvidenceID: isExactMTP ? hex("4") : hex("5"))
             })
     }
 
@@ -850,6 +976,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
         let requests = schedule.caseIDs.enumerated().map { requestIndex, caseID in
             makeRequest(
                 caseID: caseID,
+                benchmarkCell: schedule.benchmarkCells[requestIndex],
                 requestIndex: requestIndex,
                 seed: offset + requestIndex,
                 e2eSeconds: e2e,
@@ -871,6 +998,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
 
     private func makeRequest(
         caseID: String,
+        benchmarkCell: Qwen38MTPPerformanceScorecardBenchmarkCellIdentity,
         requestIndex: Int,
         seed: Int,
         e2eSeconds: Double,
@@ -878,6 +1006,7 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
     ) -> Qwen38MTPPerformanceScorecardRequestMeasurement {
         Qwen38MTPPerformanceScorecardRequestMeasurement(
             caseID: caseID,
+            benchmarkCell: benchmarkCell,
             requestIndex: requestIndex,
             promptSeconds: 0.25,
             prefillSeconds: 0.80,

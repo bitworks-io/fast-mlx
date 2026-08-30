@@ -69,6 +69,70 @@ public enum Qwen38MTPPerformanceScorecardGDNObservedEnv: String, Codable, Equata
     case enabled
 }
 
+public enum Qwen38MTPPerformanceScorecardExecutionMode: String, Codable, Equatable, Sendable {
+    case scalar
+    case exactMTP
+}
+
+public enum Qwen38MTPPerformanceScorecardComparisonAxis: String, Codable, Equatable, Sendable {
+    case executionMode
+}
+
+public enum Qwen38MTPPerformanceScorecardBenchmarkContextTokens: Int, Codable, Equatable, Sendable {
+    case tokens4096 = 4096
+    case tokens16384 = 16_384
+    case tokens32768 = 32_768
+}
+
+public enum Qwen38MTPPerformanceScorecardPrefixKind: String, Codable, Equatable, Sendable {
+    case cold
+    case exactWarmPrefix
+}
+
+public struct Qwen38MTPPerformanceScorecardBenchmarkCellIdentity: Codable, Equatable, Sendable {
+    public var contextTokens: Qwen38MTPPerformanceScorecardBenchmarkContextTokens
+    public var prefixKind: Qwen38MTPPerformanceScorecardPrefixKind
+    public var fixtureRef: String
+
+    public init(
+        contextTokens: Qwen38MTPPerformanceScorecardBenchmarkContextTokens,
+        prefixKind: Qwen38MTPPerformanceScorecardPrefixKind,
+        fixtureRef: String
+    ) {
+        self.contextTokens = contextTokens
+        self.prefixKind = prefixKind
+        self.fixtureRef = fixtureRef
+    }
+}
+
+public enum Qwen38MTPPerformanceScorecardLaneKind: String, Codable, Equatable, Sendable {
+    case syntheticInProcess
+    case productionScheduler
+}
+
+public struct Qwen38MTPPerformanceScorecardLaneIdentity: Codable, Equatable, Sendable {
+    public var kind: Qwen38MTPPerformanceScorecardLaneKind
+    public var width: Int
+    public var laneRef: String
+
+    public init(
+        kind: Qwen38MTPPerformanceScorecardLaneKind,
+        width: Int,
+        laneRef: String
+    ) {
+        self.kind = kind
+        self.width = width
+        self.laneRef = laneRef
+    }
+
+    public static func syntheticInProcess(width: Int) -> Qwen38MTPPerformanceScorecardLaneIdentity {
+        Qwen38MTPPerformanceScorecardLaneIdentity(
+            kind: .syntheticInProcess,
+            width: width,
+            laneRef: "synthetic-in-process-\(width)")
+    }
+}
+
 public struct Qwen38MTPPerformanceScorecardLaunchBinding: Codable, Equatable, Sendable {
     public var mode: Qwen38MTPPerformanceScorecardGDNMode
     public var sourceDigest: String
@@ -93,6 +157,7 @@ public struct Qwen38MTPPerformanceScorecardLaunchBinding: Codable, Equatable, Se
 
 public struct Qwen38MTPPerformanceScorecardModel: Codable, Equatable, Sendable {
     public let label: String
+    public var executionMode: Qwen38MTPPerformanceScorecardExecutionMode
     public var artifact: Qwen38MTPPerformanceScorecardArtifact
     public var executionDigest: String
     public var sourceDigest: String
@@ -101,6 +166,7 @@ public struct Qwen38MTPPerformanceScorecardModel: Codable, Equatable, Sendable {
 
     public init(
         label: String,
+        executionMode: Qwen38MTPPerformanceScorecardExecutionMode = .exactMTP,
         artifact: Qwen38MTPPerformanceScorecardArtifact,
         executionDigest: String,
         sourceDigest: String,
@@ -108,6 +174,7 @@ public struct Qwen38MTPPerformanceScorecardModel: Codable, Equatable, Sendable {
         launchBinding: Qwen38MTPPerformanceScorecardLaunchBinding? = nil
     ) {
         self.label = label
+        self.executionMode = executionMode
         self.artifact = artifact
         self.executionDigest = executionDigest
         self.sourceDigest = sourceDigest
@@ -335,17 +402,28 @@ public struct Qwen38MTPPerformanceScorecardPairSchedule: Codable, Equatable, Sen
     public let pairIndex: Int
     public let order: Qwen38MTPPerformanceScorecardRunOrder
     public let caseIDs: [String]
+    public let benchmarkCells: [Qwen38MTPPerformanceScorecardBenchmarkCellIdentity]
+    public let lane: Qwen38MTPPerformanceScorecardLaneIdentity
 
     public init(
         concurrency: Int,
         pairIndex: Int,
         order: Qwen38MTPPerformanceScorecardRunOrder,
-        caseIDs: [String]
+        caseIDs: [String],
+        benchmarkCells: [Qwen38MTPPerformanceScorecardBenchmarkCellIdentity]? = nil,
+        lane: Qwen38MTPPerformanceScorecardLaneIdentity? = nil
     ) {
         self.concurrency = concurrency
         self.pairIndex = pairIndex
         self.order = order
         self.caseIDs = caseIDs
+        self.benchmarkCells = benchmarkCells ?? caseIDs.map {
+            Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                contextTokens: .tokens4096,
+                prefixKind: .cold,
+                fixtureRef: $0)
+        }
+        self.lane = lane ?? .syntheticInProcess(width: concurrency)
     }
 }
 
@@ -469,6 +547,7 @@ public struct Qwen38MTPPerformanceScorecardRunBudget: Codable, Equatable, Sendab
 
 public struct Qwen38MTPPerformanceScorecardRequestMeasurement: Codable, Equatable, Sendable {
     public var caseID: String
+    public var benchmarkCell: Qwen38MTPPerformanceScorecardBenchmarkCellIdentity
     public let requestIndex: Int
     public let promptSeconds: Double
     public let prefillSeconds: Double
@@ -483,6 +562,7 @@ public struct Qwen38MTPPerformanceScorecardRequestMeasurement: Codable, Equatabl
 
     public init(
         caseID: String,
+        benchmarkCell: Qwen38MTPPerformanceScorecardBenchmarkCellIdentity? = nil,
         requestIndex: Int,
         promptSeconds: Double,
         prefillSeconds: Double,
@@ -496,6 +576,10 @@ public struct Qwen38MTPPerformanceScorecardRequestMeasurement: Codable, Equatabl
         cacheProvenanceID: String
     ) {
         self.caseID = caseID
+        self.benchmarkCell = benchmarkCell ?? Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+            contextTokens: .tokens4096,
+            prefixKind: .cold,
+            fixtureRef: caseID)
         self.requestIndex = requestIndex
         self.promptSeconds = promptSeconds
         self.prefillSeconds = prefillSeconds
@@ -560,6 +644,8 @@ public struct Qwen38MTPPerformanceScorecardPair: Codable, Equatable, Sendable {
     public let warmup: Bool
     public let order: Qwen38MTPPerformanceScorecardRunOrder
     public let scheduledCaseIDs: [String]
+    public let scheduledBenchmarkCells: [Qwen38MTPPerformanceScorecardBenchmarkCellIdentity]
+    public var lane: Qwen38MTPPerformanceScorecardLaneIdentity
     public var candidate: Qwen38MTPPerformanceScorecardEngineMeasurement
     public var reference: Qwen38MTPPerformanceScorecardEngineMeasurement
 
@@ -569,6 +655,8 @@ public struct Qwen38MTPPerformanceScorecardPair: Codable, Equatable, Sendable {
         warmup: Bool,
         order: Qwen38MTPPerformanceScorecardRunOrder,
         scheduledCaseIDs: [String],
+        scheduledBenchmarkCells: [Qwen38MTPPerformanceScorecardBenchmarkCellIdentity]? = nil,
+        lane: Qwen38MTPPerformanceScorecardLaneIdentity? = nil,
         candidate: Qwen38MTPPerformanceScorecardEngineMeasurement,
         reference: Qwen38MTPPerformanceScorecardEngineMeasurement
     ) {
@@ -577,6 +665,13 @@ public struct Qwen38MTPPerformanceScorecardPair: Codable, Equatable, Sendable {
         self.warmup = warmup
         self.order = order
         self.scheduledCaseIDs = scheduledCaseIDs
+        self.scheduledBenchmarkCells = scheduledBenchmarkCells ?? scheduledCaseIDs.map {
+            Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                contextTokens: .tokens4096,
+                prefixKind: .cold,
+                fixtureRef: $0)
+        }
+        self.lane = lane ?? .syntheticInProcess(width: concurrency)
         self.candidate = candidate
         self.reference = reference
     }
@@ -800,6 +895,7 @@ public struct Qwen38MTPPerformanceScorecardEvidence: Codable, Equatable, Sendabl
     public var candidate: Qwen38MTPPerformanceScorecardModel
     public var reference: Qwen38MTPPerformanceScorecardModel
     public var liveExactnessProof: Qwen38MTPPerformanceScorecardLiveExactnessProof?
+    public var comparisonAxis: Qwen38MTPPerformanceScorecardComparisonAxis
     public let measurementClass: String
     public let hardware: Qwen38MTPPerformanceScorecardHardware
     public let releaseBuildRequired: Bool
@@ -817,6 +913,7 @@ public struct Qwen38MTPPerformanceScorecardEvidence: Codable, Equatable, Sendabl
         candidate: Qwen38MTPPerformanceScorecardModel,
         reference: Qwen38MTPPerformanceScorecardModel,
         liveExactnessProof: Qwen38MTPPerformanceScorecardLiveExactnessProof?,
+        comparisonAxis: Qwen38MTPPerformanceScorecardComparisonAxis = .executionMode,
         measurementClass: String,
         hardware: Qwen38MTPPerformanceScorecardHardware,
         releaseBuildRequired: Bool,
@@ -833,6 +930,7 @@ public struct Qwen38MTPPerformanceScorecardEvidence: Codable, Equatable, Sendabl
         self.candidate = candidate
         self.reference = reference
         self.liveExactnessProof = liveExactnessProof
+        self.comparisonAxis = comparisonAxis
         self.measurementClass = measurementClass
         self.hardware = hardware
         self.releaseBuildRequired = releaseBuildRequired
@@ -915,7 +1013,7 @@ private struct Qwen38MTPPerformanceScorecardLaunchDigestBasis: Codable, Equatabl
 }
 
 public enum Qwen38MTPPerformanceScorecardGate {
-    public static let schemaVersion = 2
+    public static let schemaVersion = 3
     public static let subcommand = "qwen38-mtp-performance-scorecard"
     public static let rejectedSubcommand = "qwen38-mtp-performance-scorecard-rejected"
     public static let measurementClass = "dedicated-heavy-256gib"
@@ -979,7 +1077,7 @@ public enum Qwen38MTPPerformanceScorecardGate {
         contentSHA256: canonicalWorkloadContentSHA256(requiredWorkloadCases),
         tokenizerSHA256: requiredArtifact.tokenizerSHA256,
         chatTemplateSHA256: "b426d0bb02412efa9e44777312cc7df1bf95ea332dc0d2e46376c801f273599d",
-        contextTokenLimit: 40_960,
+        contextTokenLimit: 32_768,
         thinkingEnabled: false,
         cases: requiredWorkloadCases)
     public static let runPlan = Qwen38MTPPerformanceScorecardRunPlan(
@@ -1451,6 +1549,9 @@ public enum Qwen38MTPPerformanceScorecardGate {
         guard evidence.artifact == requiredArtifact else {
             throw Qwen38MTPPerformanceScorecardGateError.invalidArtifactBinding
         }
+        guard evidence.comparisonAxis == .executionMode else {
+            throw Qwen38MTPPerformanceScorecardGateError.invalidModelIdentity
+        }
         try validateAuthority(
             trustedLiveExactnessProof: trustedLiveExactnessProof,
             trustedEngineIdentities: trustedEngineIdentities,
@@ -1504,7 +1605,10 @@ public enum Qwen38MTPPerformanceScorecardGate {
     ) throws {
         let candidate = trustedEngineIdentities.candidate
         let reference = trustedEngineIdentities.reference
-        guard candidate.artifact == requiredArtifact,
+        guard candidate.label == reference.label,
+            candidate.executionMode == .exactMTP,
+            reference.executionMode == .scalar,
+            candidate.artifact == requiredArtifact,
             reference.artifact == requiredArtifact,
             isLowerHex(candidate.executionDigest, count: 64),
             isLowerHex(candidate.sourceDigest, count: 64),
@@ -1514,11 +1618,11 @@ public enum Qwen38MTPPerformanceScorecardGate {
             candidate.sourceDigest == reference.sourceDigest,
             candidate.sourceDigest == Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
             candidate.gdnMode == .gdnOn,
-            reference.gdnMode == .gdnOff,
+            reference.gdnMode == .gdnOn,
             let candidateLaunch = candidate.launchBinding,
             let referenceLaunch = reference.launchBinding,
             isValidLaunchBinding(candidateLaunch, expectedMode: .gdnOn, sourceDigest: candidate.sourceDigest),
-            isValidLaunchBinding(referenceLaunch, expectedMode: .gdnOff, sourceDigest: reference.sourceDigest),
+            isValidLaunchBinding(referenceLaunch, expectedMode: .gdnOn, sourceDigest: reference.sourceDigest),
             candidateLaunch.launchDigest != referenceLaunch.launchDigest,
             hasSafeModeSeparation(candidateLaunch, referenceLaunch)
         else {
@@ -1634,6 +1738,20 @@ public enum Qwen38MTPPerformanceScorecardGate {
                     index: index,
                     reason: "order/cardinality")
             }
+            guard schedule.benchmarkCells.count == schedule.concurrency,
+                pair.scheduledBenchmarkCells == schedule.benchmarkCells
+            else {
+                throw Qwen38MTPPerformanceScorecardGateError.invalidPair(
+                    index: index,
+                    reason: "benchmark cell")
+            }
+            guard isValidSyntheticLane(schedule.lane, concurrency: schedule.concurrency),
+                pair.lane == schedule.lane
+            else {
+                throw Qwen38MTPPerformanceScorecardGateError.invalidPair(
+                    index: index,
+                    reason: "lane identity")
+            }
             try validateEngine(
                 pair.candidate,
                 expectedIdentity: trustedEngineIdentities.candidate,
@@ -1653,6 +1771,11 @@ public enum Qwen38MTPPerformanceScorecardGate {
                     throw Qwen38MTPPerformanceScorecardGateError.invalidPair(
                         index: index,
                         reason: "request schedule")
+                }
+                guard candidate.benchmarkCell == reference.benchmarkCell else {
+                    throw Qwen38MTPPerformanceScorecardGateError.invalidPair(
+                        index: index,
+                        reason: "benchmark cell")
                 }
                 guard candidate.outputDigest == reference.outputDigest,
                     candidate.cacheDigest == reference.cacheDigest,
@@ -1736,6 +1859,13 @@ public enum Qwen38MTPPerformanceScorecardGate {
                     index: index,
                     reason: "request schedule")
             }
+            guard request.benchmarkCell == schedule.benchmarkCells[requestIndex],
+                request.benchmarkCell.fixtureRef == request.caseID
+            else {
+                throw Qwen38MTPPerformanceScorecardGateError.invalidPair(
+                    index: index,
+                    reason: "benchmark cell")
+            }
             try validateRequest(
                 request,
                 index: index,
@@ -1786,6 +1916,15 @@ public enum Qwen38MTPPerformanceScorecardGate {
                 index: index,
                 reason: "output/cache provenance")
         }
+    }
+
+    private static func isValidSyntheticLane(
+        _ lane: Qwen38MTPPerformanceScorecardLaneIdentity,
+        concurrency: Int
+    ) -> Bool {
+        lane.kind == .syntheticInProcess
+            && lane.width == concurrency
+            && lane.laneRef == "synthetic-in-process-\(concurrency)"
     }
 
     private static func metrics(
@@ -1967,15 +2106,32 @@ public enum Qwen38MTPPerformanceScorecardGate {
     private static func makeSchedules() -> [Qwen38MTPPerformanceScorecardPairSchedule] {
         let ids = requiredWorkloadCases.map(\.id)
         let orders = makeOrders()
+        let contexts: [Qwen38MTPPerformanceScorecardBenchmarkContextTokens] = [
+            .tokens4096,
+            .tokens16384,
+            .tokens32768,
+        ]
+        let prefixKinds: [Qwen38MTPPerformanceScorecardPrefixKind] = [
+            .cold,
+            .exactWarmPrefix,
+        ]
         return [1, 2, 4].flatMap { concurrency in
             (0..<orders.count).map { pairIndex in
-                Qwen38MTPPerformanceScorecardPairSchedule(
+                let caseIDs = (0..<concurrency).map {
+                    ids[(pairIndex + $0 + concurrency) % ids.count]
+                }
+                return Qwen38MTPPerformanceScorecardPairSchedule(
                     concurrency: concurrency,
                     pairIndex: pairIndex,
                     order: orders[pairIndex],
-                    caseIDs: (0..<concurrency).map {
-                        ids[(pairIndex + $0 + concurrency) % ids.count]
-                    })
+                    caseIDs: caseIDs,
+                    benchmarkCells: caseIDs.enumerated().map { requestIndex, caseID in
+                        Qwen38MTPPerformanceScorecardBenchmarkCellIdentity(
+                            contextTokens: contexts[(pairIndex + requestIndex) % contexts.count],
+                            prefixKind: prefixKinds[(pairIndex + requestIndex) % prefixKinds.count],
+                            fixtureRef: caseID)
+                    },
+                    lane: .syntheticInProcess(width: concurrency))
             }
         }
     }

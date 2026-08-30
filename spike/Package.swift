@@ -197,7 +197,9 @@ let package = Package(
             name: "fastmlx-harness",
             dependencies: [
                 "HarnessCore",
+                "ServingCore",
                 "SpikeCore",
+                "SpikeServingAdapters",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
@@ -236,6 +238,7 @@ let package = Package(
             dependencies: [
                 "fastmlx-harness",
                 "HarnessCore",
+                "ServingCore",
                 "SpikeCore",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),

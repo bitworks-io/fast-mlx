@@ -16,6 +16,18 @@ import export_public_repository  # noqa: E402
 import validate_public_repository  # noqa: E402
 
 
+PUBLIC_VENDOR_SOURCE_OVERRIDES = {
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift",
+        "sha256": "9f5c926ffe8625b6b17dd7a48056f2d638f29b1a9036b188a6cf1c5e16230d44",
+    },
+    "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift",
+        "sha256": "9d66385dbf031beaf34dffb3d379e7a6e7cd4e5df30b7ad045793a5a2d5e4ac4",
+    },
+}
+
+
 def public_index_seal(entries: dict[str, str]) -> dict[str, object]:
     digest = hashlib.sha256()
     for path in sorted(entries):
@@ -204,6 +216,108 @@ class PublicExportTests(unittest.TestCase):
                     (output / relative).read_bytes(),
                     (REPOSITORY_ROOT / relative).read_bytes(),
                 )
+
+    def test_public_projection_uses_sanitized_vendor_overrides(self) -> None:
+        development_manifest = json.loads(
+            (REPOSITORY_ROOT / "public/public-repository.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        public_manifest_path = REPOSITORY_ROOT / "public/public-repository-public.json"
+        has_development_manifest = public_manifest_path.is_file()
+        public_manifest = (
+            json.loads(public_manifest_path.read_text(encoding="utf-8"))
+            if has_development_manifest
+            else development_manifest
+        )
+        self.assertEqual(
+            public_manifest.get("publicIndex"),
+            {
+                "pathCount": 827,
+                "pathModeSha256": "75fb7027d1edb296b5114e913bb4d20504d4bd3b4237723638e1c4dea6554a7d",
+            },
+        )
+
+        if has_development_manifest:
+            vendor_root = "spike/Vendor/mlx-swift-lm"
+            vendor_tree = next(
+                entry
+                for entry in development_manifest["trees"]
+                if entry.get("source") == vendor_root
+                and entry.get("destination") == vendor_root
+            )
+            excluded = set(vendor_tree.get("exclude", []))
+            expected_excludes = {
+                destination.removeprefix(vendor_root + "/")
+                for destination in PUBLIC_VENDOR_SOURCE_OVERRIDES
+            }
+            self.assertLessEqual(expected_excludes, excluded)
+
+            file_mappings = {
+                (entry.get("source"), entry.get("destination"))
+                for entry in development_manifest["files"]
+            }
+            expected_mappings = {
+                (metadata["source"], destination)
+                for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items()
+            }
+            self.assertLessEqual(expected_mappings, file_mappings)
+
+            for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
+                source_path = REPOSITORY_ROOT / metadata["source"]
+                source_bytes = source_path.read_bytes()
+                destination_bytes = (REPOSITORY_ROOT / destination).read_bytes()
+                self.assertEqual(
+                    hashlib.sha256(source_bytes).hexdigest(),
+                    metadata["sha256"],
+                )
+                self.assertNotEqual(source_bytes, destination_bytes)
+        else:
+            for metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.values():
+                self.assertFalse((REPOSITORY_ROOT / metadata["source"]).exists())
+
+        self.assertEqual(
+            set(public_manifest.get("publicIndex", {})),
+            {"pathCount", "pathModeSha256"},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public"
+            reexport = Path(directory) / "reexport"
+            output.mkdir()
+            export_public_repository.export(
+                REPOSITORY_ROOT,
+                output,
+                allow_development_manifest=has_development_manifest,
+            )
+
+            self.assertFalse((output / "public/sanitized-projection").exists())
+            for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
+                output_bytes = (output / destination).read_bytes()
+                self.assertEqual(
+                    hashlib.sha256(output_bytes).hexdigest(),
+                    metadata["sha256"],
+                )
+                if has_development_manifest:
+                    source_bytes = (REPOSITORY_ROOT / metadata["source"]).read_bytes()
+                    self.assertEqual(output_bytes, source_bytes)
+                else:
+                    checkout_bytes = (REPOSITORY_ROOT / destination).read_bytes()
+                    self.assertEqual(output_bytes, checkout_bytes)
+
+            subprocess.run(["git", "init", "-q"], cwd=output, check=True)
+            subprocess.run(["git", "add", "."], cwd=output, check=True)
+            reexport_count = export_public_repository.export(output, reexport)
+            self.assertEqual(reexport_count, 827)
+            for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
+                output_bytes = (output / destination).read_bytes()
+                reexport_bytes = (reexport / destination).read_bytes()
+                self.assertEqual(reexport_bytes, output_bytes)
+                self.assertEqual(
+                    hashlib.sha256(reexport_bytes).hexdigest(),
+                    metadata["sha256"],
+                )
+            self.assertFalse((reexport / "public/sanitized-projection").exists())
 
     def test_export_copies_only_indexed_allowlist_and_published_articles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

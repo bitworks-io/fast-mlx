@@ -23,6 +23,11 @@ public enum FastMLXServeHostUse: String, Equatable, Sendable {
     case dedicatedServing = "dedicated-serving"
 }
 
+public enum FastMLXExactMTPSelection: String, Equatable, Sendable {
+    case qwen35_9BDepth1 = "qwen35-9b-depth1"
+    case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
+}
+
 public enum FastMLXServeArgumentError:
     Error, Equatable, CustomStringConvertible, Sendable
 {
@@ -50,6 +55,8 @@ public enum FastMLXServeArgumentError:
     case invalidAutoQuantBase
     case mtpDrafterPathMustBeAbsolute
     case mtpDrafterRequiresExactQwen35MTP
+    case invalidExactMTPSelection
+    case exactMTPSelectionRequiresExactQwen35MTP
     case exactQwen35MTPWithScripted
     case exactQwen35MTPWithContinuousBatch
     case exactQwen35MTPWithQuantSource
@@ -111,6 +118,10 @@ public enum FastMLXServeArgumentError:
             "--mtp-drafter-path must be an absolute local path"
         case .mtpDrafterRequiresExactQwen35MTP:
             "--mtp-drafter-path requires --exact-qwen35-mtp"
+        case .invalidExactMTPSelection:
+            "--exact-mtp-selection must be qwen35-9b-depth1 or qwen38-27b-mxfp8-depth1"
+        case .exactMTPSelectionRequiresExactQwen35MTP:
+            "--exact-mtp-selection requires --exact-qwen35-mtp"
         case .exactQwen35MTPWithScripted:
             "--exact-qwen35-mtp loads a model and cannot be combined with --scripted"
         case .exactQwen35MTPWithContinuousBatch:
@@ -217,6 +228,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
           --exact-qwen35-mtp          Explicitly compose the reviewed exact Qwen3.5 MTP
                                       target/drafter pair. Default off; target remains
                                       --model-path and scalar fallback loads first.
+          --exact-mtp-selection SELECTION
+                                      Reviewed exact-MTP artifact lock
+                                      (qwen35-9b-depth1|qwen38-27b-mxfp8-depth1).
+                                      Defaults to qwen35-9b-depth1 for compatibility.
           --mtp-drafter-path PATH     Absolute local drafter snapshot directory for
                                       --exact-qwen35-mtp.
           --host HOST                 Bind host (default: 127.0.0.1).
@@ -338,6 +353,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// `--model-path` scalar load, while `mtpDrafterDirectory` carries the separate local drafter
     /// snapshot when enabled.
     public let exactQwen35MTP: Bool
+    /// `--exact-mtp-selection`: reviewed exact-MTP artifact lock to load when exact MTP is enabled.
+    /// Defaults to the original 9B lock so existing invocations stay compatible.
+    public let exactMTPSelection: FastMLXExactMTPSelection
     public let mtpDrafterDirectory: URL?
 
     private init(
@@ -370,6 +388,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         autoQuantBase: String? = nil,
         allowHybridQwen35: Bool = false,
         exactQwen35MTP: Bool = false,
+        exactMTPSelection: FastMLXExactMTPSelection = .qwen35_9BDepth1,
         mtpDrafterDirectory: URL? = nil
     ) {
         self.backend = backend
@@ -400,6 +419,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.autoQuantBase = autoQuantBase
         self.allowHybridQwen35 = allowHybridQwen35
         self.exactQwen35MTP = exactQwen35MTP
+        self.exactMTPSelection = exactMTPSelection
         self.mtpDrafterDirectory = mtpDrafterDirectory
     }
 
@@ -442,6 +462,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var autoQuantBase: String?
         var allowHybridQwen35 = false
         var exactQwen35MTP = false
+        var exactMTPSelection = FastMLXExactMTPSelection.qwen35_9BDepth1
+        var exactMTPSelectionWasExplicit = false
         var mtpDrafterDirectory: URL?
         var evidencePath: URL?
 
@@ -613,6 +635,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 allowHybridQwen35 = true
             case "--exact-qwen35-mtp":
                 exactQwen35MTP = true
+            case "--exact-mtp-selection":
+                index += 1
+                let rawSelection = try value(at: index, in: arguments, for: argument)
+                guard let parsedSelection = FastMLXExactMTPSelection(rawValue: rawSelection) else {
+                    throw FastMLXServeArgumentError.invalidExactMTPSelection
+                }
+                exactMTPSelection = parsedSelection
+                exactMTPSelectionWasExplicit = true
             case "--mtp-drafter-path":
                 index += 1
                 let path = try value(at: index, in: arguments, for: argument)
@@ -665,6 +695,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
 
         if mtpDrafterDirectory != nil, !exactQwen35MTP {
             throw FastMLXServeArgumentError.mtpDrafterRequiresExactQwen35MTP
+        }
+        if exactMTPSelectionWasExplicit, !exactQwen35MTP {
+            throw FastMLXServeArgumentError.exactMTPSelectionRequiresExactQwen35MTP
         }
 
         if continuousBatchNoSpec, continuousDynamicPLD {
@@ -905,6 +938,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             preferMode: preferMode,
             allowHybridQwen35: allowHybridQwen35,
             exactQwen35MTP: exactQwen35MTP,
+            exactMTPSelection: exactMTPSelection,
             mtpDrafterDirectory: mtpDrafterDirectory)
     }
 
@@ -942,6 +976,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--auto-quant",
         "--allow-hybrid-qwen35",
         "--exact-qwen35-mtp",
+        "--exact-mtp-selection",
         "--mtp-drafter-path",
     ]
 

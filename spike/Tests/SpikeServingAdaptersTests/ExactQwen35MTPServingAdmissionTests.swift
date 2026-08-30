@@ -79,6 +79,39 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
             .scalarFallback(.bindingMismatch))
     }
 
+    func testExplicitQwen38SelectionAdmitsAuthenticatedQwen38Binding() {
+        let qwen38 = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        let qwen38Binding = QwenMTPArtifactBinding(
+            targetModelID: qwen38.targetIdentity.modelID,
+            drafterModelID: qwen38.drafterIdentity.modelID,
+            targetRevision: qwen38.targetIdentity.revision,
+            drafterRevision: qwen38.drafterIdentity.revision,
+            sourceRevision: qwen38.sourceRevision,
+            architecture: qwen38.architecture,
+            runtimeBlockSize: 3,
+            maximumAcceptedDraftTokens: 2)
+
+        XCTAssertEqual(
+            decide(selection: .qwen38_27BMXFP8Depth1, binding: qwen38Binding),
+            .eligible(
+                ExactQwen35MTPServingDescriptor(
+                    artifactSelection: .qwen38_27BMXFP8Depth1,
+                    targetModelID: qwen38.targetIdentity.modelID,
+                    drafterModelID: qwen38.drafterIdentity.modelID,
+                    targetRevision: qwen38.targetIdentity.revision,
+                    drafterRevision: qwen38.drafterIdentity.revision,
+                    sourceRevision: qwen38.sourceRevision,
+                    architecture: qwen38.architecture,
+                    runtimeBlockSize: 3,
+                    maximumAcceptedDraftTokens: 2)))
+    }
+
+    func testExplicitQwen38SelectionRejectsLegacyQwen35Binding() {
+        XCTAssertEqual(
+            decide(selection: .qwen38_27BMXFP8Depth1, binding: binding()),
+            .scalarFallback(.bindingMismatch))
+    }
+
     func testSampledPolicyFallsBack() {
         XCTAssertEqual(
             decide(
@@ -135,6 +168,7 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
 private let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
 
 private func decide(
+    selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
     enabled: Bool = true,
     binding: QwenMTPArtifactBinding? = binding(),
     sampling: ServingSamplingPolicy = .greedy,
@@ -143,6 +177,7 @@ private func decide(
     speculativeRequestCount: Int = 0
 ) -> ExactQwen35MTPServingAdmissionDecision {
     ExactQwen35MTPServingAdmissionPolicy.decide(
+        selection: selection,
         enabled: enabled,
         binding: binding,
         sampling: sampling,

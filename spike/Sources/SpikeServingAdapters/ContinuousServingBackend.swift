@@ -252,6 +252,45 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxReservedKVBytes: resources?.maxReservedKVBytes ?? 0)
     }
 
+    public func takeScorecardContinuousRouteObservation()
+        async -> ContinuousServingBackendScorecardObservation
+    {
+        await scorecardContinuousRouteObservation(consumingTraces: true)
+    }
+
+    public func scorecardContinuousRouteObservation()
+        async -> ContinuousServingBackendScorecardObservation
+    {
+        await scorecardContinuousRouteObservation(consumingTraces: false)
+    }
+
+    private func scorecardContinuousRouteObservation(
+        consumingTraces: Bool
+    ) async -> ContinuousServingBackendScorecardObservation {
+        let slots = await coordinator.snapshots()
+        let resources = await coordinator.runtimeResourceSnapshot()
+        let executionTrace: [ContinuousBatchCoordinatorEvent]
+        let planObservations: [ContinuousBatchPlanObservation]
+        let timingTrace: [ContinuousBatchTimingEvent]
+        if consumingTraces {
+            executionTrace = await coordinator.takeExecutionTrace()
+            planObservations = await coordinator.takePlanObservations()
+            timingTrace = await coordinator.takeTimingTrace()
+        } else {
+            executionTrace = await coordinator.executionTrace()
+            planObservations = await coordinator.planObservations()
+            timingTrace = await coordinator.timingObservations()
+        }
+        return ContinuousServingBackendScorecardObservation(
+            activeRequests: requests.count,
+            coordinatorRequestIDs: requests.values.map(\.coordinatorID).sorted(),
+            coordinatorSlots: slots,
+            runtimeResources: resources,
+            executionTrace: executionTrace,
+            planObservations: planObservations,
+            timingTrace: timingTrace)
+    }
+
     /// Package diagnostics deliberately expose only opaque coordinator IDs and bounded,
     /// prompt-free scheduler telemetry. They are used by authenticated serving evidence to
     /// prove cancellation and membership transitions without logging request content.

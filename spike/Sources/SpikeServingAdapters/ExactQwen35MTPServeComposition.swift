@@ -8,6 +8,7 @@ import SpikeCore
 import Tokenizers
 
 public struct ExactQwen35MTPServeCompositionConfiguration: Sendable {
+    public let selection: Qwen35ExactMTPRuntimeSelection
     public let launchedModel: String
     public let targetDirectory: URL
     public let drafterDirectory: URL
@@ -18,6 +19,7 @@ public struct ExactQwen35MTPServeCompositionConfiguration: Sendable {
     public let kvQuantTier: KVQuantTier
 
     public init(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
         launchedModel: String,
         targetDirectory: URL,
         drafterDirectory: URL,
@@ -28,6 +30,7 @@ public struct ExactQwen35MTPServeCompositionConfiguration: Sendable {
             .defaultStartupMessages,
         kvQuantTier: KVQuantTier = .fp16
     ) {
+        self.selection = selection
         self.launchedModel = launchedModel
         self.targetDirectory = targetDirectory
         self.drafterDirectory = drafterDirectory
@@ -51,16 +54,23 @@ public struct ExactQwen35MTPServeCompositionConfiguration: Sendable {
 
     var runtimeConfiguration: ExactQwen35MTPRuntimeLoadConfiguration {
         ExactQwen35MTPRuntimeLoadConfiguration(
+            selection: selection,
             targetDirectory: targetDirectory,
             drafterDirectory: drafterDirectory)
     }
 }
 
 public struct ExactQwen35MTPRuntimeLoadConfiguration: Sendable {
+    public let selection: Qwen35ExactMTPRuntimeSelection
     public let targetDirectory: URL
     public let drafterDirectory: URL
 
-    public init(targetDirectory: URL, drafterDirectory: URL) {
+    public init(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
+        targetDirectory: URL,
+        drafterDirectory: URL
+    ) {
+        self.selection = selection
         self.targetDirectory = targetDirectory
         self.drafterDirectory = drafterDirectory
     }
@@ -165,13 +175,16 @@ public enum ExactQwen35MTPServeStartupStatus: Equatable, Sendable {
 
 public struct ExactQwen35MTPServeStartupReport: Equatable, Sendable {
     public let status: ExactQwen35MTPServeStartupStatus
+    public let requestedSelection: Qwen35ExactMTPRuntimeSelection
     public let descriptor: ExactQwen35MTPServingDescriptor?
 
     public init(
         status: ExactQwen35MTPServeStartupStatus,
+        requestedSelection: Qwen35ExactMTPRuntimeSelection,
         descriptor: ExactQwen35MTPServingDescriptor?
     ) {
         self.status = status
+        self.requestedSelection = requestedSelection
         self.descriptor = descriptor
     }
 
@@ -179,10 +192,14 @@ public struct ExactQwen35MTPServeStartupReport: Equatable, Sendable {
         switch status {
         case .exactSuccess:
             guard let descriptor else {
-                return "exact_qwen35_mtp_status=exact_success"
+                return [
+                    "exact_qwen35_mtp_status=exact_success",
+                    "exact_qwen35_mtp_selection=\(requestedSelection.rawValue)",
+                ].joined(separator: " ")
             }
             return [
                 "exact_qwen35_mtp_status=exact_success",
+                "exact_qwen35_mtp_selection=\(descriptor.artifactSelection.rawValue)",
                 "exact_qwen35_mtp_target_id=\(descriptor.targetModelID)",
                 "exact_qwen35_mtp_drafter_id=\(descriptor.drafterModelID)",
                 "exact_qwen35_mtp_target_revision=\(descriptor.targetRevision)",
@@ -192,7 +209,11 @@ public struct ExactQwen35MTPServeStartupReport: Equatable, Sendable {
                 "exact_qwen35_mtp_max_draft_tokens=\(descriptor.maximumAcceptedDraftTokens)",
             ].joined(separator: " ")
         case .scalarFallback(let reason):
-            return "exact_qwen35_mtp_status=scalar_fallback exact_qwen35_mtp_reason=\(reason.rawValue)"
+            return [
+                "exact_qwen35_mtp_status=scalar_fallback",
+                "exact_qwen35_mtp_selection=\(requestedSelection.rawValue)",
+                "exact_qwen35_mtp_reason=\(reason.rawValue)",
+            ].joined(separator: " ")
         }
     }
 }
@@ -254,6 +275,7 @@ public func loadExactQwen35MTPServeComposition(
     do {
         let runtime = try await runtimeLoader(configuration.runtimeConfiguration)
         let descriptor = try validatedExactDescriptor(
+            selection: configuration.selection,
             runtimeDescriptor: runtime.descriptor,
             runnerBinding: runtime.runner.binding)
         let backend = try ExactQwen35MTPServingBackend(
@@ -263,8 +285,9 @@ public func loadExactQwen35MTPServeComposition(
             scalarFallback: scalar.backend,
             scalarFallbackIsolation: .strictlySeparateRawTarget,
             codec: runtime.codec,
-            configuration: ExactQwen35MTPServingBackendConfiguration(
-                defaultMaximumCompletionTokens: configuration
+                configuration: ExactQwen35MTPServingBackendConfiguration(
+                    selection: configuration.selection,
+                    defaultMaximumCompletionTokens: configuration
                     .scalarBackendConfiguration.defaultMaximumCompletionTokens,
                 mailboxCapacity: configuration.scalarBackendConfiguration.mailboxCapacity,
                 disableThinkingWhenToolsActive: configuration
@@ -276,6 +299,7 @@ public func loadExactQwen35MTPServeComposition(
             scalarStartupReport: scalar.startupReport,
             exactStartupReport: ExactQwen35MTPServeStartupReport(
                 status: .exactSuccess,
+                requestedSelection: configuration.selection,
                 descriptor: descriptor))
     } catch is CancellationError {
         await scalar.backend.shutdown()
@@ -286,6 +310,7 @@ public func loadExactQwen35MTPServeComposition(
             scalarStartupReport: scalar.startupReport,
             exactStartupReport: ExactQwen35MTPServeStartupReport(
                 status: .scalarFallback(reason: .exactRuntimeUnavailable),
+                requestedSelection: configuration.selection,
                 descriptor: nil))
     }
 }
@@ -294,13 +319,16 @@ public func loadExactQwen35MTPRuntimeComponents(
     configuration: ExactQwen35MTPRuntimeLoadConfiguration
 ) async throws -> ExactQwen35MTPServingRuntimeComponents {
     let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        selection: configuration.selection,
         from: ExactQwen35MTPLocalSnapshotDownloader(
+            selection: configuration.selection,
             targetDirectory: configuration.targetDirectory,
             drafterDirectory: configuration.drafterDirectory),
         using: #huggingFaceTokenizerLoader())
     let codec = MLXScalarTextCodec(tokenizer: pair.target.tokenizer)
     let runner = try ExactQwen35MTPMLXServingRunner(pair: pair)
     let descriptor = try validatedExactDescriptor(
+        selection: configuration.selection,
         runtimeDescriptor: nil,
         runnerBinding: runner.binding)
     return ExactQwen35MTPServingRuntimeComponents(
@@ -315,10 +343,16 @@ public enum ExactQwen35MTPLocalSnapshotDownloaderError: Error, Equatable, Sendab
 }
 
 public struct ExactQwen35MTPLocalSnapshotDownloader: Downloader {
+    public let selection: Qwen35ExactMTPRuntimeSelection
     public let targetDirectory: URL
     public let drafterDirectory: URL
 
-    public init(targetDirectory: URL, drafterDirectory: URL) {
+    public init(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
+        targetDirectory: URL,
+        drafterDirectory: URL
+    ) {
+        self.selection = selection
         self.targetDirectory = targetDirectory
         self.drafterDirectory = drafterDirectory
     }
@@ -333,7 +367,7 @@ public struct ExactQwen35MTPLocalSnapshotDownloader: Downloader {
         guard !useLatest, patterns == ["*.safetensors", "*.json", "*.jinja"] else {
             throw ExactQwen35MTPLocalSnapshotDownloaderError.unexpectedRequest
         }
-        let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+        let lock = selectedHarnessLock(selection)
         let directory: URL
         switch (id, revision) {
         case (lock.targetIdentity.modelID, lock.targetIdentity.revision):
@@ -358,6 +392,7 @@ public struct ExactQwen35MTPLocalSnapshotDownloader: Downloader {
 }
 
 private func validatedExactDescriptor(
+    selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
     runtimeDescriptor: ExactQwen35MTPServingDescriptor?,
     runnerBinding: QwenMTPArtifactBinding?
 ) throws -> ExactQwen35MTPServingDescriptor {
@@ -365,6 +400,7 @@ private func validatedExactDescriptor(
         throw ExactQwen35MTPServeCompositionError.invalidRuntimeBinding
     }
     let decision = ExactQwen35MTPServingAdmissionPolicy.decide(
+        selection: selection,
         enabled: true,
         binding: binding,
         sampling: .greedy,
@@ -377,4 +413,15 @@ private func validatedExactDescriptor(
         throw ExactQwen35MTPServeCompositionError.invalidRuntimeBinding
     }
     return descriptor
+}
+
+private func selectedHarnessLock(
+    _ selection: Qwen35ExactMTPRuntimeSelection
+) -> QwenMTPArtifactLock {
+    switch selection {
+    case .qwen35_9BDepth1:
+        QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+    case .qwen38_27BMXFP8Depth1:
+        QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+    }
 }

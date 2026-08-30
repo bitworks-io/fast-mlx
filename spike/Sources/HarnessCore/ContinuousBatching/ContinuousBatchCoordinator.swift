@@ -259,6 +259,60 @@ public enum ContinuousBatchTimingEvent: Sendable, Equatable {
     case finished(BatchRequestID, timestamp: Double)
 }
 
+/// Bounded, prompt-free tick evidence for scorecard and serving-route audits.
+public enum ContinuousBatchPlanDecodeObservation: Sendable, Equatable {
+    case drainSoloPipeline(requestID: BatchRequestID)
+    case solo(requestID: BatchRequestID, speculationAllowed: Bool)
+    case batch(requestIDs: [BatchRequestID], speculationAllowed: Bool)
+
+    public var requestIDs: [BatchRequestID] {
+        switch self {
+        case .drainSoloPipeline(let id), .solo(let id, _):
+            return [id]
+        case .batch(let ids, _):
+            return ids
+        }
+    }
+
+    public var speculationAllowed: Bool {
+        switch self {
+        case .drainSoloPipeline:
+            return false
+        case .solo(_, let speculationAllowed), .batch(_, let speculationAllowed):
+            return speculationAllowed
+        }
+    }
+}
+
+/// Monotonic plan/state observation captured after a tick successfully commits.
+public struct ContinuousBatchPlanObservation: Sendable, Equatable {
+    public let planSequence: Int
+    public let stateRevisionAfterApply: Int
+    public let admissions: [BatchRequestID]
+    public let decode: ContinuousBatchPlanDecodeObservation?
+    public let prefillIDs: [BatchRequestID]
+    public let activeSlotCount: Int
+    public let queuedSlotCount: Int
+
+    public init(
+        planSequence: Int,
+        stateRevisionAfterApply: Int,
+        admissions: [BatchRequestID],
+        decode: ContinuousBatchPlanDecodeObservation?,
+        prefillIDs: [BatchRequestID],
+        activeSlotCount: Int,
+        queuedSlotCount: Int
+    ) {
+        self.planSequence = planSequence
+        self.stateRevisionAfterApply = stateRevisionAfterApply
+        self.admissions = admissions
+        self.decode = decode
+        self.prefillIDs = prefillIDs
+        self.activeSlotCount = activeSlotCount
+        self.queuedSlotCount = queuedSlotCount
+    }
+}
+
 /// MLX-free orchestration actor around the pure scheduler.
 ///
 /// Publication capacity is reserved before a decode tick. After that reservation, one tick's
@@ -290,6 +344,7 @@ public actor ContinuousBatchCoordinator {
     private let traceLimit: Int
     private var trace: [ContinuousBatchCoordinatorEvent] = []
     private var timingTrace: [ContinuousBatchTimingEvent] = []
+    private var planObservationTrace: [ContinuousBatchPlanObservation] = []
     private var requests: [BatchRequestID: RequestState] = [:]
     private var nextRequestID: UInt64? = 1
     private var driveTask: Task<Void, Never>?
@@ -512,6 +567,22 @@ public actor ContinuousBatchCoordinator {
         return result
     }
 
+    public func timingObservations() -> [ContinuousBatchTimingEvent] {
+        timingTrace
+    }
+
+    public func planObservations() -> [ContinuousBatchPlanObservation] {
+        planObservationTrace
+    }
+
+    /// Returns only this measurement interval's committed plan observations. Clearing is
+    /// actor-isolated, matching `takeExecutionTrace()` and preserving interval boundaries.
+    public func takePlanObservations() -> [ContinuousBatchPlanObservation] {
+        let result = planObservationTrace
+        planObservationTrace.removeAll(keepingCapacity: true)
+        return result
+    }
+
     public func isShutDown() -> Bool { shuttingDown }
 
     private func ensureAutomaticDrive() {
@@ -591,6 +662,7 @@ public actor ContinuousBatchCoordinator {
                 requests[result.id] = state
             }
             for operation in plan.operations { record(.operation(operation)) }
+            recordPlanObservation(plan)
         } catch {
             await release(reservations)
             throw error
@@ -852,6 +924,35 @@ public actor ContinuousBatchCoordinator {
         timingTrace.append(event)
         if timingTrace.count > traceLimit {
             timingTrace.removeFirst(timingTrace.count - traceLimit)
+        }
+    }
+
+    private func recordPlanObservation(_ plan: BatchTickPlan) {
+        guard traceLimit > 0 else { return }
+        let observation = ContinuousBatchPlanObservation(
+            planSequence: plan.sequence,
+            stateRevisionAfterApply: scheduler.currentStateRevision,
+            admissions: plan.admissions,
+            decode: plan.decode.map(ContinuousBatchPlanDecodeObservation.init),
+            prefillIDs: plan.prefills.map(\.id),
+            activeSlotCount: scheduler.activeRequestIDs.count,
+            queuedSlotCount: scheduler.queuedRequestIDs.count)
+        planObservationTrace.append(observation)
+        if planObservationTrace.count > traceLimit {
+            planObservationTrace.removeFirst(planObservationTrace.count - traceLimit)
+        }
+    }
+}
+
+extension ContinuousBatchPlanDecodeObservation {
+    fileprivate init(_ action: BatchDecodeAction) {
+        switch action {
+        case .drainSoloPipeline(let id):
+            self = .drainSoloPipeline(requestID: id)
+        case .solo(let id, let speculationAllowed):
+            self = .solo(requestID: id, speculationAllowed: speculationAllowed)
+        case .batch(let ids, let speculationAllowed):
+            self = .batch(requestIDs: ids, speculationAllowed: speculationAllowed)
         }
     }
 }

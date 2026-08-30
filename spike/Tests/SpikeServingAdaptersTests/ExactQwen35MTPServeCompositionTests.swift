@@ -4,6 +4,7 @@ import os
 import HarnessCore
 import MLXLMCommon
 import ServingCore
+import SpikeCore
 @testable import SpikeServingAdapters
 
 final class ExactQwen35MTPServeCompositionTests: XCTestCase {
@@ -84,6 +85,84 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
         XCTAssertEqual(scalar.snapshot().startCount, 0)
     }
 
+    func testCompositionForwardsExplicitQwen38ArtifactSelectionIntoExactRuntimeLoad() async throws {
+        let events = LockedEvents()
+        let runner = RecordingMTPRunner(descriptor: exactDescriptor(selection: .qwen38_27BMXFP8Depth1))
+
+        let loaded = try await loadExactQwen35MTPServeComposition(
+            configuration: compositionConfiguration(selection: .qwen38_27BMXFP8Depth1),
+            scalarLoader: { configuration in
+                ExactQwen35MTPLoadedScalarFallback(
+                    backend: ScriptedCompositionScalarBackend(),
+                    startupReport: scalarReport(
+                        memory: configuration.memoryLimitBytes,
+                        cache: configuration.cacheLimitBytes))
+            },
+            runtimeLoader: { configuration in
+                events.append("selection:\(configuration.selection.rawValue)")
+                return ExactQwen35MTPServingRuntimeComponents(
+                    runner: runner,
+                    codec: FixtureCompositionCodec(promptTokens: [91, 92]),
+                    descriptor: exactDescriptor(selection: configuration.selection))
+            })
+
+        XCTAssertEqual(events.snapshot(), ["selection:qwen38-27b-mxfp8-depth1"])
+        XCTAssertEqual(loaded.exactStartupReport.descriptor?.artifactSelection, .qwen38_27BMXFP8Depth1)
+        XCTAssertTrue(
+            loaded.exactStartupReport.machineReadableFields()
+                .contains("exact_qwen35_mtp_selection=qwen38-27b-mxfp8-depth1"))
+    }
+
+    func testLocalSnapshotDownloaderUsesSelectedQwen38LockAndRejectsLegacyLock() async throws {
+        let targetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let drafterDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: targetDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: drafterDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: targetDirectory)
+            try? FileManager.default.removeItem(at: drafterDirectory)
+        }
+
+        let downloader = ExactQwen35MTPLocalSnapshotDownloader(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: targetDirectory,
+            drafterDirectory: drafterDirectory)
+        let selected = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        let legacy = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+
+        let target = try await downloader.download(
+            id: selected.targetIdentity.modelID,
+            revision: selected.targetIdentity.revision,
+            matching: ["*.safetensors", "*.json", "*.jinja"],
+            useLatest: false,
+            progressHandler: { _ in })
+        let drafter = try await downloader.download(
+            id: selected.drafterIdentity.modelID,
+            revision: selected.drafterIdentity.revision,
+            matching: ["*.safetensors", "*.json", "*.jinja"],
+            useLatest: false,
+            progressHandler: { _ in })
+
+        XCTAssertEqual(target, targetDirectory)
+        XCTAssertEqual(drafter, drafterDirectory)
+        do {
+            _ = try await downloader.download(
+                id: legacy.targetIdentity.modelID,
+                revision: legacy.targetIdentity.revision,
+                matching: ["*.safetensors", "*.json", "*.jinja"],
+                useLatest: false,
+                progressHandler: { _ in })
+            XCTFail("expected legacy lock request to fail closed")
+        } catch ExactQwen35MTPLocalSnapshotDownloaderError.unexpectedRequest {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
     func testCompositionForwardsOneModelCapabilityIntoExactRunner() async throws {
         let capabilities = try ServingModelCapabilities(
             model: "fixture-model",
@@ -124,7 +203,7 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
         let scalar = ScriptedCompositionScalarBackend()
 
         let loaded = try await loadExactQwen35MTPServeComposition(
-            configuration: compositionConfiguration(),
+            configuration: compositionConfiguration(selection: .qwen38_27BMXFP8Depth1),
             scalarLoader: { configuration in
                 events.append("scalar")
                 return ExactQwen35MTPLoadedScalarFallback(
@@ -143,6 +222,7 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
                 reason: .exactRuntimeUnavailable))
         let line = loaded.exactStartupReport.machineReadableFields()
         XCTAssertTrue(line.contains("exact_qwen35_mtp_status=scalar_fallback"))
+        XCTAssertTrue(line.contains("exact_qwen35_mtp_selection=qwen38-27b-mxfp8-depth1"))
         XCTAssertTrue(line.contains("exact_qwen35_mtp_reason=exact_runtime_unavailable"))
         XCTAssertFalse(line.contains("/secret"))
         XCTAssertFalse(line.contains("/models"))
@@ -239,9 +319,11 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
 }
 
 private func compositionConfiguration(
+    selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1,
     modelCapabilities: ServingModelCapabilities? = nil
 ) -> ExactQwen35MTPServeCompositionConfiguration {
     ExactQwen35MTPServeCompositionConfiguration(
+        selection: selection,
         launchedModel: "fixture-model",
         targetDirectory: URL(fileURLWithPath: "/models/qwen35-target", isDirectory: true),
         drafterDirectory: URL(fileURLWithPath: "/models/qwen35-drafter", isDirectory: true),
@@ -291,9 +373,18 @@ private func scalarReport(memory: Int, cache: Int) -> ScalarServingModelStartupR
         resetParityVerified: true)
 }
 
-private func exactDescriptor() -> ExactQwen35MTPServingDescriptor {
-    let lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+private func exactDescriptor(
+    selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1
+) -> ExactQwen35MTPServingDescriptor {
+    let lock: QwenMTPArtifactLock
+    switch selection {
+    case .qwen35_9BDepth1:
+        lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+    case .qwen38_27BMXFP8Depth1:
+        lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+    }
     return ExactQwen35MTPServingDescriptor(
+        artifactSelection: selection,
         targetModelID: lock.targetIdentity.modelID,
         drafterModelID: lock.drafterIdentity.modelID,
         targetRevision: lock.targetIdentity.revision,
@@ -400,9 +491,10 @@ private final class RecordingMTPRunner: ExactQwen35MTPServingRunner, Sendable {
         let maximumCompletionTokens: Int
     }
 
-    let binding: QwenMTPArtifactBinding? = {
-        let descriptor = exactDescriptor()
-        return QwenMTPArtifactBinding(
+    let binding: QwenMTPArtifactBinding?
+
+    init(descriptor: ExactQwen35MTPServingDescriptor = exactDescriptor()) {
+        self.binding = QwenMTPArtifactBinding(
             targetModelID: descriptor.targetModelID,
             drafterModelID: descriptor.drafterModelID,
             targetRevision: descriptor.targetRevision,
@@ -411,7 +503,7 @@ private final class RecordingMTPRunner: ExactQwen35MTPServingRunner, Sendable {
             architecture: descriptor.architecture,
             runtimeBlockSize: descriptor.runtimeBlockSize,
             maximumAcceptedDraftTokens: descriptor.maximumAcceptedDraftTokens)
-    }()
+    }
 
     private struct State: Sendable {
         var promptTokens: [Int] = []
