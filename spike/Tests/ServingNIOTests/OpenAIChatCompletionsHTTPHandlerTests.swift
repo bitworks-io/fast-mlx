@@ -942,6 +942,258 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await authorizedChannel.finish()
     }
 
+    func testMetricsEndpointRequiresAuthAndReturnsSnapshotPrometheusText()
+        async throws
+    {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 2,
+            coordinatorSlots: 4,
+            reservedKVBytes: 65_536,
+            maxReservedKVBytes: 131_072,
+            mlxActiveBytes: 262_144,
+            mlxCacheBytes: 32_768,
+            mlxPeakBytes: 524_288,
+            fitModeledPeakBytes: 700_000,
+            fitMeasuredPeakBytes: 710_000,
+            fitModeledWeightsBytes: 400_000,
+            fitModeledKVBytes: 200_000,
+            fitModeledTransientBytes: 50_000,
+            fitModeledHeadroomBytes: 50_000)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let unauthorizedBackend = ScriptedBackend(scripts: [])
+        let unauthorizedChannel = try await makeChannel(
+            backend: unauthorizedBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            unauthorizedChannel,
+            method: .GET,
+            uri: "/metrics")
+        let unauthorized = try await collectResponse(from: unauthorizedChannel)
+        XCTAssertEqual(unauthorized.head.status, .unauthorized)
+        XCTAssertEqual(unauthorizedBackend.snapshot().startCount, 0)
+        _ = try await unauthorizedChannel.finish()
+
+        let authorizedBackend = ScriptedBackend(scripts: [])
+        let authorizedChannel = try await makeChannel(
+            backend: authorizedBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            authorizedChannel,
+            method: .GET,
+            uri: "/metrics",
+            authorization: "Bearer secret")
+        let response = try await collectResponse(from: authorizedChannel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(
+            response.head.headers.first(name: "content-type"),
+            "text/plain; version=0.0.4; charset=utf-8")
+        XCTAssertEqual(
+            response.body,
+            """
+            # HELP fastmlx_up fast-mlx serving metrics endpoint availability.
+            # TYPE fastmlx_up gauge
+            fastmlx_up 1
+            # HELP fastmlx_active_requests Active generation requests.
+            # TYPE fastmlx_active_requests gauge
+            fastmlx_active_requests 2
+            # HELP fastmlx_coordinator_slots Coordinator slots currently reserved by serving.
+            # TYPE fastmlx_coordinator_slots gauge
+            fastmlx_coordinator_slots 4
+            # HELP fastmlx_reserved_kv_bytes Reserved KV-cache bytes.
+            # TYPE fastmlx_reserved_kv_bytes gauge
+            fastmlx_reserved_kv_bytes 65536
+            # HELP fastmlx_max_reserved_kv_bytes Peak reserved KV-cache bytes.
+            # TYPE fastmlx_max_reserved_kv_bytes gauge
+            fastmlx_max_reserved_kv_bytes 131072
+            # HELP fastmlx_mlx_active_bytes MLX active allocator bytes.
+            # TYPE fastmlx_mlx_active_bytes gauge
+            fastmlx_mlx_active_bytes 262144
+            # HELP fastmlx_mlx_cache_bytes MLX cache allocator bytes.
+            # TYPE fastmlx_mlx_cache_bytes gauge
+            fastmlx_mlx_cache_bytes 32768
+            # HELP fastmlx_mlx_peak_bytes MLX peak allocator bytes.
+            # TYPE fastmlx_mlx_peak_bytes gauge
+            fastmlx_mlx_peak_bytes 524288
+            # HELP fastmlx_fit_modeled_peak_bytes Fit-check modeled peak bytes.
+            # TYPE fastmlx_fit_modeled_peak_bytes gauge
+            fastmlx_fit_modeled_peak_bytes 700000
+            # HELP fastmlx_fit_measured_peak_bytes Fit-check measured peak bytes.
+            # TYPE fastmlx_fit_measured_peak_bytes gauge
+            fastmlx_fit_measured_peak_bytes 710000
+            # HELP fastmlx_fit_modeled_weights_bytes Fit-check modeled weights bytes.
+            # TYPE fastmlx_fit_modeled_weights_bytes gauge
+            fastmlx_fit_modeled_weights_bytes 400000
+            # HELP fastmlx_fit_modeled_kv_bytes Fit-check modeled KV-cache bytes.
+            # TYPE fastmlx_fit_modeled_kv_bytes gauge
+            fastmlx_fit_modeled_kv_bytes 200000
+            # HELP fastmlx_fit_modeled_transient_bytes Fit-check modeled transient bytes.
+            # TYPE fastmlx_fit_modeled_transient_bytes gauge
+            fastmlx_fit_modeled_transient_bytes 50000
+            # HELP fastmlx_fit_modeled_headroom_bytes Fit-check modeled headroom bytes.
+            # TYPE fastmlx_fit_modeled_headroom_bytes gauge
+            fastmlx_fit_modeled_headroom_bytes 50000
+
+            """)
+        XCTAssertEqual(
+            response.head.headers.first(name: "content-length"),
+            "\(response.body.utf8.count)")
+        XCTAssertFalse(response.body.contains("qwen3-32b"))
+        XCTAssertFalse(response.body.contains("secret"))
+        XCTAssertEqual(authorizedBackend.snapshot().startCount, 0)
+        _ = try await authorizedChannel.finish()
+    }
+
+    func testMetricsEndpointRejectsWrongMethodAndRequestBodyBeforeBackendWork()
+        async throws
+    {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let postBackend = ScriptedBackend(scripts: [])
+        let postChannel = try await makeChannel(
+            backend: postBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            postChannel,
+            method: .POST,
+            uri: "/metrics")
+        let postResponse = try await collectResponse(from: postChannel)
+        XCTAssertEqual(postResponse.head.status, .methodNotAllowed)
+        XCTAssertEqual(postBackend.snapshot().startCount, 0)
+        _ = try await postChannel.finish()
+
+        let bodyBackend = ScriptedBackend(scripts: [])
+        let bodyChannel = try await makeChannel(
+            backend: bodyBackend,
+            configuration: configuration)
+        try await writeHeadWithBodyRequest(
+            bodyChannel,
+            method: .GET,
+            uri: "/metrics",
+            body: "{}")
+        let bodyResponse = try await collectResponse(from: bodyChannel)
+        XCTAssertEqual(bodyResponse.head.status, .badRequest)
+        XCTAssertTrue(
+            bodyResponse.body.contains("GET \\/metrics does not accept a request body"),
+            bodyResponse.body)
+        XCTAssertEqual(bodyBackend.snapshot().startCount, 0)
+        _ = try await bodyChannel.finish()
+    }
+
+    func testMetricsEndpointWithoutSnapshotProviderReturnsDeterministic500WithoutBackendWork()
+        async throws
+    {
+        let backend = ScriptedBackend(scripts: [])
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeHeadOnlyRequest(
+            channel,
+            method: .GET,
+            uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .internalServerError)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        XCTAssertEqual(
+            response.head.headers.first(name: "content-length"),
+            "\(response.body.utf8.count)")
+        XCTAssertNil(response.head.headers.first(name: "connection"))
+        XCTAssertEqual(
+            response.body,
+            """
+            {"error":{"code":"metrics_unavailable","message":"Metrics snapshot is not configured","param":null,"type":"server_error"}}
+            """)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testMetricsEndpointSnapshotFailureReturnsDeterministic500AndReportsFailure()
+        async throws
+    {
+        let backend = ScriptedBackend(scripts: [])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { throw MetricsSnapshotTestError.rejected },
+                record: { _ in },
+                reportFailure: { message in
+                    Task {
+                        await recorder.recordFailure(message)
+                    }
+                }))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeHeadOnlyRequest(
+            channel,
+            method: .GET,
+            uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .internalServerError)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        XCTAssertEqual(
+            response.head.headers.first(name: "content-length"),
+            "\(response.body.utf8.count)")
+        XCTAssertNil(response.head.headers.first(name: "connection"))
+        XCTAssertEqual(
+            response.body,
+            """
+            {"error":{"code":"metrics_snapshot_failed","message":"Metrics snapshot failed","param":null,"type":"server_error"}}
+            """)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        await waitUntil {
+            await recorder.snapshot().failures == ["serving metrics snapshot failed"]
+        }
+        let recorderSnapshot = await recorder.snapshot()
+        XCTAssertEqual(
+            recorderSnapshot.failures,
+            ["serving metrics snapshot failed"])
+        XCTAssertEqual(recorderSnapshot.evidence.count, 0)
+        _ = try await channel.finish()
+    }
+
     func testBackendInvalidRequestWithCodeReturnsHTTP400InsteadOfInternalError()
         async throws
     {
@@ -1477,6 +1729,21 @@ private func writeHeadOnlyRequest(
     _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
 }
 
+private func writeHeadWithBodyRequest(
+    _ channel: NIOAsyncTestingChannel,
+    method: HTTPMethod,
+    uri: String,
+    body: String,
+    authorization: String? = nil
+) async throws {
+    var head = validHead(method: method, uri: uri, authorization: authorization)
+    head.headers.add(name: "content-length", value: "\(body.utf8.count)")
+    _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+    _ = try await channel.writeInbound(
+        HTTPServerRequestPart.body(ByteBuffer(string: body)))
+    _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
 private actor ServingEvidenceRecorder {
     enum RecorderError: Error {
         case rejected
@@ -1496,6 +1763,10 @@ private actor ServingEvidenceRecorder {
     func snapshot() -> (evidence: [ServingEvidence], failures: [String]) {
         (evidence, failures)
     }
+}
+
+private enum MetricsSnapshotTestError: Error {
+    case rejected
 }
 
 private actor ServingSnapshotSequence {

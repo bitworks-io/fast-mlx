@@ -147,6 +147,18 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeModelList(keepAlive: head.isKeepAlive, context: context)
             return
         }
+        if head.method == .GET, head.uri == "/metrics" {
+            guard body.readableBytes == 0 else {
+                writeError(
+                    .invalidRequest("GET /metrics does not accept a request body", param: nil),
+                    status: .badRequest,
+                    keepAlive: head.isKeepAlive,
+                    context: context)
+                return
+            }
+            writeMetrics(keepAlive: head.isKeepAlive, context: context)
+            return
+        }
 
         let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
         let request: OpenAIChatCompletionRequest
@@ -222,12 +234,16 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
         let isChat = head.uri == "/v1/chat/completions"
         let isModels = head.uri == "/v1/models"
-        guard isChat || isModels else {
+        let isMetrics = head.uri == "/metrics"
+        guard isChat || isModels || isMetrics else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
         }
-        guard (isChat && head.method == .POST) || (isModels && head.method == .GET) else {
+        guard (isChat && head.method == .POST)
+            || (isModels && head.method == .GET)
+            || (isMetrics && head.method == .GET)
+        else {
             return (
                 .methodNotAllowed,
                 .invalidRequest("Method is not supported for this route", param: nil))
@@ -245,7 +261,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             }
         }
 
-        if isModels {
+        if isModels || isMetrics {
             let lengthHeaders = head.headers["content-length"]
             guard lengthHeaders.count <= 1 else {
                 return (
@@ -255,9 +271,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             if let rawLength = lengthHeaders.first,
                 (Int(rawLength) ?? -1) != 0
             {
+                let route = isMetrics ? "/metrics" : "/v1/models"
                 return (
                     .badRequest,
-                    .invalidRequest("GET /v1/models does not accept a request body", param: nil))
+                    .invalidRequest("GET \(route) does not accept a request body", param: nil))
             }
             return nil
         }
@@ -330,6 +347,20 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         } catch {
             context.close(promise: nil)
         }
+    }
+
+    private func writeMetrics(
+        keepAlive: Bool,
+        context: ChannelHandlerContext
+    ) {
+        let control = ServingTransportRequestControl()
+        let channel = context.channel
+        activeControl = control
+        activeTask = Self.makeMetricsTask(
+            keepAlive: keepAlive,
+            configuration: configuration,
+            channel: channel,
+            control: control)
     }
 
     private func writeError(
@@ -424,6 +455,84 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         responseAccumulator: responseAccumulator)
                 }
         }
+    }
+
+    static func makeMetricsTask(
+        keepAlive: Bool,
+        configuration: ServingHTTPConfiguration,
+        channel: any Channel,
+        control: ServingTransportRequestControl
+    ) -> Task<Void, Never> {
+        Task.detached {
+            await runMetrics(
+                keepAlive: keepAlive,
+                configuration: configuration,
+                channel: channel,
+                control: control)
+        }
+    }
+
+    static func runMetrics(
+        keepAlive: Bool,
+        configuration: ServingHTTPConfiguration,
+        channel: any Channel,
+        control: ServingTransportRequestControl
+    ) async {
+        defer {
+            control.markTerminal()
+        }
+        guard let snapshotProvider = configuration.evidence?.snapshot else {
+            await writeMetricsFailure(
+                message: "Metrics snapshot is not configured",
+                code: "metrics_unavailable",
+                keepAlive: keepAlive,
+                configuration: configuration,
+                channel: channel)
+            return
+        }
+
+        let bodyText: String
+        do {
+            bodyText = try await metricsText(from: snapshotProvider)
+        } catch is CancellationError {
+            await close(channel)
+            return
+        } catch {
+            configuration.evidence?.reportFailure(
+                "serving metrics snapshot failed")
+            await writeMetricsFailure(
+                message: "Metrics snapshot failed",
+                code: "metrics_snapshot_failed",
+                keepAlive: keepAlive,
+                configuration: configuration,
+                channel: channel)
+            return
+        }
+
+        do {
+            try await writeTextResponse(
+                bodyText,
+                contentType: "text/plain; version=0.0.4; charset=utf-8",
+                keepAlive: keepAlive,
+                channel: channel,
+                timeout: configuration.backpressureStallTimeout)
+            if !keepAlive {
+                await close(channel)
+            }
+        } catch is CancellationError {
+            await close(channel)
+        } catch {
+            await close(channel)
+        }
+    }
+
+    static func metricsText(
+        from snapshotProvider: ServingHTTPEvidenceConfiguration.SnapshotProvider
+    ) async throws -> String {
+        try Task.checkCancellation()
+        let snapshot = try await snapshotProvider()
+        try Task.checkCancellation()
+        return prometheusMetrics(from: snapshot)
     }
 
     static func runGeneration(
@@ -989,6 +1098,31 @@ private extension OpenAIChatCompletionsHTTPHandler {
         try await writePart(.end(nil), channel: channel, timeout: timeout)
     }
 
+    static func writeTextResponse(
+        _ text: String,
+        contentType: String,
+        keepAlive: Bool,
+        channel: any Channel,
+        timeout: Duration
+    ) async throws {
+        let data = Data(text.utf8)
+        var headers = HTTPHeaders()
+        headers.add(name: "content-type", value: contentType)
+        headers.add(name: "content-length", value: "\(data.count)")
+        if !keepAlive {
+            headers.add(name: "connection", value: "close")
+        }
+        let head = HTTPResponseHead(
+            version: .http1_1,
+            status: .ok,
+            headers: headers)
+        try await writePart(.head(head), channel: channel, timeout: timeout)
+        var buffer = channel.allocator.buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
+        try await writePart(.end(nil), channel: channel, timeout: timeout)
+    }
+
     static func waitUntilWritable(
         _ gate: ServingChannelWritabilityGate,
         timeout: Duration
@@ -1183,6 +1317,21 @@ private extension OpenAIChatCompletionsHTTPHandler {
         }
     }
 
+    static func writeMetricsFailure(
+        message: String,
+        code: String,
+        keepAlive: Bool,
+        configuration: ServingHTTPConfiguration,
+        channel: any Channel
+    ) async {
+        let _ = await writeServingFailure(
+            .server(message, code: code),
+            responseStarted: false,
+            keepAlive: keepAlive,
+            channel: channel,
+            timeout: configuration.backpressureStallTimeout)
+    }
+
     static func addCompletionBudgetHeaders(
         from handle: ServingGenerationHandle,
         to headers: inout HTTPHeaders
@@ -1279,6 +1428,107 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func close(_ channel: any Channel) async {
         try? await channel.close().get()
+    }
+
+    static func prometheusMetrics(
+        from snapshot: ServingEvidence.ResourceSnapshot
+    ) -> String {
+        var lines: [String] = []
+        appendMetric(
+            "fastmlx_up",
+            help: "fast-mlx serving metrics endpoint availability.",
+            value: 1,
+            to: &lines)
+        appendMetric(
+            "fastmlx_active_requests",
+            help: "Active generation requests.",
+            value: snapshot.activeRequests,
+            to: &lines)
+        appendMetric(
+            "fastmlx_coordinator_slots",
+            help: "Coordinator slots currently reserved by serving.",
+            value: snapshot.coordinatorSlots,
+            to: &lines)
+        appendMetric(
+            "fastmlx_reserved_kv_bytes",
+            help: "Reserved KV-cache bytes.",
+            value: snapshot.reservedKVBytes,
+            to: &lines)
+        appendMetric(
+            "fastmlx_max_reserved_kv_bytes",
+            help: "Peak reserved KV-cache bytes.",
+            value: snapshot.maxReservedKVBytes,
+            to: &lines)
+        appendMetric(
+            "fastmlx_mlx_active_bytes",
+            help: "MLX active allocator bytes.",
+            value: snapshot.mlxActiveBytes,
+            to: &lines)
+        appendMetric(
+            "fastmlx_mlx_cache_bytes",
+            help: "MLX cache allocator bytes.",
+            value: snapshot.mlxCacheBytes,
+            to: &lines)
+        appendMetric(
+            "fastmlx_mlx_peak_bytes",
+            help: "MLX peak allocator bytes.",
+            value: snapshot.mlxPeakBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_modeled_peak_bytes",
+            help: "Fit-check modeled peak bytes.",
+            value: snapshot.fitModeledPeakBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_measured_peak_bytes",
+            help: "Fit-check measured peak bytes.",
+            value: snapshot.fitMeasuredPeakBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_modeled_weights_bytes",
+            help: "Fit-check modeled weights bytes.",
+            value: snapshot.fitModeledWeightsBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_modeled_kv_bytes",
+            help: "Fit-check modeled KV-cache bytes.",
+            value: snapshot.fitModeledKVBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_modeled_transient_bytes",
+            help: "Fit-check modeled transient bytes.",
+            value: snapshot.fitModeledTransientBytes,
+            to: &lines)
+        appendOptionalMetric(
+            "fastmlx_fit_modeled_headroom_bytes",
+            help: "Fit-check modeled headroom bytes.",
+            value: snapshot.fitModeledHeadroomBytes,
+            to: &lines)
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    static func appendOptionalMetric(
+        _ name: String,
+        help: String,
+        value: Int?,
+        to lines: inout [String]
+    ) {
+        guard let value else {
+            return
+        }
+        appendMetric(name, help: help, value: value, to: &lines)
+    }
+
+    static func appendMetric(
+        _ name: String,
+        help: String,
+        value: Int,
+        to lines: inout [String]
+    ) {
+        precondition(value >= 0, "Prometheus serving metrics must be non-negative")
+        lines.append("# HELP \(name) \(help)")
+        lines.append("# TYPE \(name) gauge")
+        lines.append("\(name) \(value)")
     }
 }
 
