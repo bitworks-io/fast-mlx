@@ -157,6 +157,78 @@ private final class ScriptedBatchRuntime: ContinuousBatchRuntime {
     }
 }
 
+private final class LifetimeTrackedBatchRuntime: ContinuousBatchRuntime, @unchecked Sendable {
+    private let resources: ContinuousBatchRuntimeResourceSnapshot
+    private let failOnPrefill: Bool
+    private var admittedIDs: Set<BatchRequestID> = []
+    private(set) var removedIDs: [BatchRequestID] = []
+
+    init(
+        resources: ContinuousBatchRuntimeResourceSnapshot,
+        failOnPrefill: Bool = false
+    ) {
+        self.resources = resources
+        self.failOnPrefill = failOnPrefill
+    }
+
+    func decodeCohort(
+        for admission: ContinuousBatchRuntimeAdmission
+    ) throws -> BatchDecodeCohort {
+        .unrestricted
+    }
+
+    func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
+        for admission in admissions {
+            admittedIDs.insert(admission.id)
+        }
+    }
+
+    func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { resources }
+
+    func prefill(_ work: ContinuousBatchRuntimePrefill) throws {
+        if failOnPrefill {
+            throw ScriptedBatchRuntimeError.invalidPrefill(work.id)
+        }
+        guard admittedIDs.contains(work.id) else {
+            throw ScriptedBatchRuntimeError.invalidPrefill(work.id)
+        }
+    }
+
+    func decode(_ action: BatchDecodeAction) throws -> [ContinuousBatchRuntimeDecodeResult] {
+        switch action {
+        case .solo(let id, _), .drainSoloPipeline(let id):
+            return [
+                ContinuousBatchRuntimeDecodeResult(
+                    id: id,
+                    tokens: [],
+                    finished: true,
+                    hasPendingSoloLookahead: false)
+            ]
+        case .batch(let ids, _):
+            return ids.map {
+                ContinuousBatchRuntimeDecodeResult(
+                    id: $0,
+                    tokens: [],
+                    finished: true,
+                    hasPendingSoloLookahead: false)
+            }
+        }
+    }
+
+    func remove(_ id: BatchRequestID) {
+        removedIDs.append(id)
+        admittedIDs.remove(id)
+    }
+}
+
+private final class RuntimeLifetimeProbe: @unchecked Sendable {
+    weak var runtime: LifetimeTrackedBatchRuntime?
+
+    init(_ runtime: LifetimeTrackedBatchRuntime?) {
+        self.runtime = runtime
+    }
+}
+
 final class ContinuousBatchCoordinatorTests: XCTestCase {
     private func configuration(
         active: Int = 4, prefill: Int = 2, chunk: Int = 4
@@ -1070,6 +1142,92 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? ContinuousBatchCoordinatorError, .shuttingDown)
         }
+    }
+
+    func testShutdownReleasesRuntimeWhileCoordinatorRemainsAlive() async throws {
+        let speculation = ContinuousBatchRuntimeSpeculationSnapshot(
+            requestedRequests: 3,
+            activeSessions: 2,
+            draftedTokens: 11,
+            acceptedDraftTokens: 7,
+            verificationRounds: 5,
+            fallbackRounds: 1)
+        let resources = ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 262_144,
+            reservedKVBytes: 2_147_491_968,
+            maxReservedKVBytes: 34_359_738_368,
+            speculation: speculation)
+        let terminalResources = ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 262_144,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 34_359_738_368,
+            speculation: ContinuousBatchRuntimeSpeculationSnapshot(
+                requestedRequests: 3,
+                activeSessions: 0,
+                draftedTokens: 11,
+                acceptedDraftTokens: 7,
+                verificationRounds: 5,
+                fallbackRounds: 1))
+        var runtime: LifetimeTrackedBatchRuntime? = LifetimeTrackedBatchRuntime(
+            resources: resources)
+        let runtimeProbe = RuntimeLifetimeProbe(runtime)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(),
+            runtime: runtime!,
+            automaticDrive: false)
+        let handle = try await coordinator.submit(submission([10, 11]))
+        runtime = nil
+
+        await coordinator.shutdown()
+        await coordinator.shutdown()
+
+        let resourceSnapshot = await coordinator.runtimeResourceSnapshot()
+        let retainedSlot = await coordinator.snapshot(for: handle.id)
+        XCTAssertNil(runtimeProbe.runtime)
+        XCTAssertEqual(resourceSnapshot, terminalResources)
+        XCTAssertNil(retainedSlot)
+        do {
+            _ = try await coordinator.runOneTick()
+            XCTFail("shutdown coordinator should fail closed after releasing runtime")
+        } catch {
+            XCTAssertEqual(error as? ContinuousBatchCoordinatorError, .shuttingDown)
+        }
+    }
+
+    func testShutdownAfterTerminalRuntimeFailureReleasesRuntime() async throws {
+        let resources = ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 262_144,
+            reservedKVBytes: 2_147_491_968,
+            maxReservedKVBytes: 34_359_738_368)
+        let terminalResources = ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: 262_144,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 34_359_738_368)
+        var runtime: LifetimeTrackedBatchRuntime? = LifetimeTrackedBatchRuntime(
+            resources: resources,
+            failOnPrefill: true)
+        let runtimeProbe = RuntimeLifetimeProbe(runtime)
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(),
+            runtime: runtime!,
+            automaticDrive: false)
+        _ = try await coordinator.submit(submission([10]))
+        runtime = nil
+
+        do {
+            _ = try await coordinator.runOneTick()
+            XCTFail("runtime failure should terminally fail the coordinator")
+        } catch ScriptedBatchRuntimeError.invalidPrefill {
+            // Expected terminal runtime failure path.
+        }
+
+        await coordinator.shutdown()
+
+        let resourceSnapshot = await coordinator.runtimeResourceSnapshot()
+        let coordinatorIsShutDown = await coordinator.isShutDown()
+        XCTAssertNil(runtimeProbe.runtime)
+        XCTAssertEqual(resourceSnapshot, terminalResources)
+        XCTAssertTrue(coordinatorIsShutDown)
     }
 
     func testMalformedRuntimeOutcomeFailsAtomicallyWithoutYieldingTokens() async throws {

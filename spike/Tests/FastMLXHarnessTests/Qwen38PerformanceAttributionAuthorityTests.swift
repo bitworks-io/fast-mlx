@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Darwin
 import XCTest
@@ -490,6 +491,300 @@ final class Qwen38PerformanceAttributionAuthorityTests: XCTestCase {
 #endif
     }
 
+    func testControllerSignatureAdmitsLiveCollectionWithoutPromotionAuthority() throws {
+        let fixture = makeFixture()
+        let files = try writeFixture(fixture)
+        defer { try? FileManager.default.removeItem(at: files.directory) }
+        let captured = try Loader.load(files: files.inputs)
+        XCTAssertEqual(captured.semanticPolicyDigest, fixture.policy.digest)
+        XCTAssertEqual(captured.productionRouteReceiptDigest, fixture.receipt.digest)
+        XCTAssertEqual(
+            captured.runIdentityDigest,
+            fixture.receipt.runIdentityDigest)
+        XCTAssertEqual(
+            captured.backendBuildIdentityDigest,
+            fixture.receipt.backendBuildIdentityDigest)
+        XCTAssertEqual(captured.observationDigest, fixture.receipt.observationDigest)
+        let controllerKey = try controllerSigningKey(seed: 9)
+        let trustedRoot = try Qwen38PerformanceAttributionControllerSignature
+            .debugTrustedControllerRoot(
+                controllerPublicKeyBase64: controllerKey.publicKeyBase64)
+        let claim = try Qwen38PerformanceAttributionControllerSignature
+            .canonicalClaim(
+                capture: captured,
+                trustedControllerRoot: trustedRoot)
+        let signature = try controllerKey.signingMaterial.signature(
+            for: claim
+        ).base64EncodedString()
+
+        let admission = try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: claim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64: signature)
+
+        XCTAssertTrue(admission.controllerSignatureVerified)
+        XCTAssertTrue(admission.eligibleForLiveCollection)
+        XCTAssertFalse(admission.promotionAuthorized)
+        XCTAssertFalse(admission.runtimeAuthorityGranted)
+
+        let mutationCases: [(Data, String)] = [
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        Qwen38PerformanceAttributionControllerSignature
+                            .claimDomain,
+                    replacement:
+                        "fast-mlx.qwen3.8.performance-attribution.bad-domain"),
+                "bad-domain"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "semantic_policy_digest="
+                            + captured.semanticPolicyDigest,
+                    replacement: "semantic_policy_digest=\(hex("a"))"),
+                "semantic"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "production_route_receipt_digest="
+                            + captured.productionRouteReceiptDigest,
+                    replacement:
+                        "production_route_receipt_digest=\(hex("b"))"),
+                "receipt"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "run_identity_digest=\(captured.runIdentityDigest)",
+                    replacement: "run_identity_digest=\(hex("d"))"),
+                "run-identity"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "backend_build_identity_digest="
+                            + captured.backendBuildIdentityDigest,
+                    replacement:
+                        "backend_build_identity_digest=\(hex("e"))"),
+                "backend"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "observation_digest=\(captured.observationDigest)",
+                    replacement: "observation_digest=\(hex("f"))"),
+                "observation"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "policy_document_sha256=\(captured.policyDocumentSHA256)",
+                    replacement: "policy_document_sha256=\(hex("c"))"),
+                "document"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "policy_pin_document_sha256="
+                            + captured.policyPinDocumentSHA256,
+                    replacement: "policy_pin_document_sha256=\(hex("0"))"),
+                "pin-document"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "production_route_receipt_document_sha256="
+                            + captured.productionRouteReceiptDocumentSHA256,
+                    replacement:
+                        "production_route_receipt_document_sha256=\(hex("2"))"),
+                "receipt-document"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target:
+                        "production_route_receipt_pin_document_sha256="
+                            + captured
+                                .productionRouteReceiptPinDocumentSHA256,
+                    replacement:
+                        "production_route_receipt_pin_document_sha256=\(hex("3"))"),
+                "receipt-pin"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target: "controller_key_id=\(controllerKey.keyID)",
+                    replacement: "controller_key_id=\(hex("4"))"),
+                "controller-key"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target: "version=1",
+                    replacement: "version=2"),
+                "version"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target: "eligible_for_live_collection=true",
+                    replacement: "eligible_for_live_collection=false"),
+                "eligible"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target: "promotion_authorized=false",
+                    replacement: "promotion_authorized=true"),
+                "promotion"
+            ),
+            (
+                try replacing(
+                    in: claim,
+                    target: "runtime_authority_granted=false",
+                    replacement: "runtime_authority_granted=true"),
+                "runtime"
+            ),
+        ]
+        for (mutatedClaim, leakedText) in mutationCases {
+            XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+                .verify(
+                    capture: captured,
+                    claimBytes: mutatedClaim,
+                    trustedControllerRoot: trustedRoot,
+                    controllerSignatureBase64: signature)
+            ) { error in
+                XCTAssertEqual(
+                    error as?
+                        Qwen38PerformanceAttributionControllerSignatureError,
+                    .nonCanonicalClaim)
+                XCTAssertFalse(String(describing: error).contains(leakedText))
+            }
+        }
+
+        let substitutedCapture = copyCapture(
+            captured,
+            semanticPolicyDigest: hex("a"))
+        let substitutedClaim = try Qwen38PerformanceAttributionControllerSignature
+            .canonicalClaim(
+                capture: substitutedCapture,
+                trustedControllerRoot: trustedRoot)
+        let substitutedSignature = try controllerKey.signingMaterial.signature(
+            for: substitutedClaim
+        ).base64EncodedString()
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: substitutedClaim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64: substitutedSignature)
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .nonCanonicalClaim)
+        }
+
+        let otherKey = try controllerSigningKey(seed: 10)
+        let selfIssuedRoot = try Qwen38PerformanceAttributionControllerSignature
+            .debugTrustedControllerRoot(
+                controllerPublicKeyBase64: otherKey.publicKeyBase64)
+        let selfIssuedClaim = try Qwen38PerformanceAttributionControllerSignature
+            .canonicalClaim(
+                capture: captured,
+                trustedControllerRoot: selfIssuedRoot)
+        let selfIssuedSignature = try otherKey.signingMaterial.signature(
+            for: selfIssuedClaim
+        ).base64EncodedString()
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: selfIssuedClaim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64: selfIssuedSignature)
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .nonCanonicalClaim)
+            XCTAssertFalse(String(describing: error).contains(otherKey.keyID))
+        }
+
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: claim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64:
+                    otherKey.signingMaterial.signature(
+                        for: claim
+                    ).base64EncodedString())
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .signatureRejected)
+        }
+
+        var signatureBytes = Data(base64Encoded: signature)!
+        signatureBytes[0] ^= 0xff
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: claim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64: signatureBytes.base64EncodedString())
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .signatureRejected)
+        }
+
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .verify(
+                capture: captured,
+                claimBytes: claim,
+                trustedControllerRoot: trustedRoot,
+                controllerSignatureBase64:
+                    Data(signatureBytes.dropLast()).base64EncodedString())
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .invalidSignatureEncoding)
+        }
+
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .debugTrustedControllerRoot(
+                controllerPublicKeyBase64:
+                    Data(controllerKey.publicKeyBase64.utf8)
+                        .base64EncodedString())
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .invalidPublicKeyEncoding)
+        }
+    }
+
+    func testControllerSignatureProductionRootFailsClosedWhenUnconfigured() throws {
+        XCTAssertThrowsError(try Qwen38PerformanceAttributionControllerSignature
+            .productionTrustedControllerRoot()
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen38PerformanceAttributionControllerSignatureError,
+                .trustedControllerRootUnconfigured)
+        }
+    }
+
     private func makeFixture(
         runIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity? = nil,
         receiptEvidenceID: String? = nil,
@@ -745,5 +1040,65 @@ final class Qwen38PerformanceAttributionAuthorityTests: XCTestCase {
 
     private func hex(_ character: Character) -> String {
         String(repeating: String(character), count: 64)
+    }
+
+    private struct ControllerSigningKey {
+        let signingMaterial: Curve25519.Signing.PrivateKey  // gitleaks:allow
+        let publicKeyBase64: String
+        let keyID: String
+    }
+
+    private func controllerSigningKey(seed: UInt8) throws -> ControllerSigningKey {
+        let signingMaterial = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: Data((0..<32).map { seed &+ UInt8($0) })
+        )
+        let publicBytes = signingMaterial.publicKey.rawRepresentation
+        return ControllerSigningKey(
+            signingMaterial: signingMaterial,
+            publicKeyBase64: publicBytes.base64EncodedString(),
+            keyID: sha256Hex(publicBytes))
+    }
+
+    private func copyCapture(
+        _ capture: Qwen38PerformanceAttributionUnsignedAuthorityCapture,
+        semanticPolicyDigest: String
+    ) -> Qwen38PerformanceAttributionUnsignedAuthorityCapture {
+        Qwen38PerformanceAttributionUnsignedAuthorityCapture(
+            policyDocumentSHA256: capture.policyDocumentSHA256,
+            policyPinDocumentSHA256: capture.policyPinDocumentSHA256,
+            policyBodyIdentity: capture.policyBodyIdentity,
+            policyPinIdentity: capture.policyPinIdentity,
+            productionRouteReceiptDocumentSHA256:
+                capture.productionRouteReceiptDocumentSHA256,
+            productionRouteReceiptPinDocumentSHA256:
+                capture.productionRouteReceiptPinDocumentSHA256,
+            productionRouteReceiptBodyIdentity:
+                capture.productionRouteReceiptBodyIdentity,
+            productionRouteReceiptPinIdentity:
+                capture.productionRouteReceiptPinIdentity,
+            semanticPolicyDigest: semanticPolicyDigest,
+            productionRouteReceiptDigest: capture.productionRouteReceiptDigest,
+            runIdentityDigest: capture.runIdentityDigest,
+            backendBuildIdentityDigest: capture.backendBuildIdentityDigest,
+            observationDigest: capture.observationDigest)
+    }
+
+    private func replacing(
+        in data: Data,
+        target: String,
+        replacement: String
+    ) throws -> Data {
+        guard let text = String(data: data, encoding: .utf8),
+            text.contains(target)
+        else {
+            throw POSIXError(.EIO)
+        }
+        return Data(text.replacingOccurrences(
+            of: target,
+            with: replacement).utf8)
+    }
+
+    private func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }

@@ -121,6 +121,9 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
         XCTAssertEqual(record.payload.pairs.count, 126)
         XCTAssertEqual(record.payload.runPlan.concurrencies, [1, 2, 4])
         XCTAssertEqual(record.payload.runPlan, Gate.runPlan)
+        XCTAssertEqual(
+            record.payload.pairs.map(\.scheduledBenchmarkCells),
+            Gate.runPlan.schedules.map(\.benchmarkCells))
         XCTAssertEqual(record.payload.workload, Gate.requiredWorkload)
         XCTAssertEqual(record.payload.settings, Gate.requiredSettings)
         XCTAssertEqual(record.subcommand, Gate.subcommand)
@@ -240,19 +243,20 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
                 launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
             trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities(
                 candidate: Qwen38MTPPerformanceScorecardModel(
-                    label: "candidate",
+                    label: Gate.modelArtifactLabel,
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic candidate execution identity"),
                     sourceDigest: sharedSourceDigest,
                     gdnMode: .gdnOn,
                     launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
                 reference: Qwen38MTPPerformanceScorecardModel(
-                    label: "reference",
+                    label: Gate.modelArtifactLabel,
+                    executionMode: .scalar,
                     artifact: Gate.requiredArtifact,
                     executionDigest: Gate.promptSHA256("generic reference execution identity"),
                     sourceDigest: sharedSourceDigest,
-                    gdnMode: .gdnOff,
-                    launchBinding: launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("5")))),
+                    gdnMode: .gdnOn,
+                    launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("5")))),
             trustedRunIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity(
                 measurementClass: Gate.measurementClass,
                 hardwareChip: "generic-heavy-chip",
@@ -312,6 +316,7 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
         var requests = schedule.caseIDs.enumerated().map { requestIndex, caseID in
             makeRequest(
                 caseID: caseID,
+                benchmarkCell: schedule.benchmarkCells[requestIndex],
                 requestIndex: requestIndex,
                 seed: schedule.concurrency * 1_000 + schedule.pairIndex * 10 + requestIndex,
                 e2eSeconds: e2e,
@@ -343,6 +348,7 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
 
     private static func makeRequest(
         caseID: String,
+        benchmarkCell: Qwen38MTPPerformanceScorecardBenchmarkCellIdentity,
         requestIndex: Int,
         seed: Int,
         e2eSeconds: Double,
@@ -350,6 +356,7 @@ final class Qwen38MTPPerformanceScorecardProducerTests: XCTestCase {
     ) -> Qwen38MTPPerformanceScorecardRequestMeasurement {
         Qwen38MTPPerformanceScorecardRequestMeasurement(
             caseID: caseID,
+            benchmarkCell: benchmarkCell,
             requestIndex: requestIndex,
             promptSeconds: 0.25,
             prefillSeconds: 0.80,

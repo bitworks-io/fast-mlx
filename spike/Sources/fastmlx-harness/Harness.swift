@@ -1983,6 +1983,17 @@ struct Harness {
                         + qwen38MTPScorecardLiveAdapterExternalDiagnostic(error))
                 exit(2)
             }
+        case "produce-qwen38-production-route-observation":
+            do {
+                print(try await produceQwen38ScorecardProductionRouteObservation(
+                    arguments: Array(arguments.dropFirst(2))))
+            } catch {
+                print(
+                    "qwen38-production-route-observation INVALID: "
+                        + qwen38ScorecardProductionRouteObservationExternalDiagnostic(
+                            error))
+                exit(2)
+            }
         case "validate-qwen38-mtp-performance-scorecard":
             do {
                 print(try validateQwen38MTPPerformanceScorecard(
@@ -2184,6 +2195,15 @@ struct Harness {
                                                validate one sealed Qwen3.8 27B scorecard
           validate-qwen38-mtp-live-exactness --evidence <JSONL>
                                                validate one canonical Qwen3.8 27B exactness row
+          produce-qwen38-production-route-observation
+                 --target <DIR> --drafter <DIR> --output <NEW-JSON>
+                 --host-use dedicated-serving --host-use-source operator-assertion
+                 --expected-chip "Apple M3 Ultra"
+                 --memory-limit-bytes <N> --cache-limit-bytes <N>
+                 --reserved-kv-bytes <N> --reserved-io-bytes <N>
+                 --reserved-prefetch-bytes <N> --os-service-reserve-bytes <N>
+                 --context-tokens <N>          unsigned real-route observation artifact;
+                                               not a promotion receipt
           validate-qwen38-heavy-host-trust-readiness
                  --inventory <JSON> --observed <JSON>
                                                fail-closed local trust/readiness preflight;

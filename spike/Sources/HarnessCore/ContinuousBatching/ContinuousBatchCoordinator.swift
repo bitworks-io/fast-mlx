@@ -338,7 +338,7 @@ public actor ContinuousBatchCoordinator {
     }
 
     private var scheduler: ContinuousBatchScheduler
-    private let runtime: any ContinuousBatchRuntime
+    private var runtime: (any ContinuousBatchRuntime)?
     private let automaticDrive: Bool
     private let configuredPublicationCapacity: Int?
     private let traceLimit: Int
@@ -346,8 +346,11 @@ public actor ContinuousBatchCoordinator {
     private var timingTrace: [ContinuousBatchTimingEvent] = []
     private var planObservationTrace: [ContinuousBatchPlanObservation] = []
     private var requests: [BatchRequestID: RequestState] = [:]
+    private var terminalRuntimeResourceSnapshot: ContinuousBatchRuntimeResourceSnapshot?
     private var nextRequestID: UInt64? = 1
     private var driveTask: Task<Void, Never>?
+    private var runtimeOperationDepth = 0
+    private var shutdownInProgress = false
     private var shuttingDown = false
 
     public init(
@@ -407,6 +410,7 @@ public actor ContinuousBatchCoordinator {
         guard let rawID = nextRequestID else {
             throw ContinuousBatchCoordinatorError.requestIDExhausted
         }
+        let runtime = try liveRuntime()
         _ = try runtime.decodeCohort(
             for: ContinuousBatchRuntimeAdmission(
                 id: BatchRequestID(rawID),
@@ -418,6 +422,7 @@ public actor ContinuousBatchCoordinator {
     {
         guard !shuttingDown else { throw ContinuousBatchCoordinatorError.shuttingDown }
         guard !submissions.isEmpty else { return [] }
+        let runtime = try liveRuntime()
 
         var candidateScheduler = scheduler
         var candidateNextID = nextRequestID
@@ -485,7 +490,7 @@ public actor ContinuousBatchCoordinator {
     public func cancel(_ id: BatchRequestID) async -> BatchCancellationResult {
         let result = scheduler.cancel(id)
         guard let state = requests.removeValue(forKey: id) else { return result }
-        runtime.remove(id)
+        runtime?.remove(id)
         if case .cancelled = result { record(.cancelled(result)) }
         await state.mailbox.cancel()
         return result
@@ -518,16 +523,18 @@ public actor ContinuousBatchCoordinator {
     public func shutdown() async {
         if shuttingDown {
             if let task = driveTask { await task.value }
+            releaseRuntimeAfterShutdownIfIdle()
             return
         }
         shuttingDown = true
+        shutdownInProgress = true
         let task = driveTask
         task?.cancel()
         let ids = Array(requests.keys)
         var mailboxes: [ContinuousBatchTokenMailbox] = []
         for id in ids {
             let result = scheduler.cancel(id)
-            runtime.remove(id)
+            runtime?.remove(id)
             if let state = requests.removeValue(forKey: id) {
                 mailboxes.append(state.mailbox)
             }
@@ -535,6 +542,8 @@ public actor ContinuousBatchCoordinator {
         }
         for mailbox in mailboxes { await mailbox.cancel() }
         if let task { await task.value }
+        shutdownInProgress = false
+        releaseRuntimeAfterShutdownIfIdle()
     }
 
     public func snapshot(for id: BatchRequestID) -> BatchSlotSnapshot? {
@@ -546,7 +555,7 @@ public actor ContinuousBatchCoordinator {
     }
 
     public func runtimeResourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
-        runtime.resourceSnapshot()
+        runtime?.resourceSnapshot() ?? terminalRuntimeResourceSnapshot
     }
 
     public func executionTrace() -> [ContinuousBatchCoordinatorEvent] {
@@ -585,13 +594,58 @@ public actor ContinuousBatchCoordinator {
 
     public func isShutDown() -> Bool { shuttingDown }
 
+    private func liveRuntime() throws -> any ContinuousBatchRuntime {
+        guard let runtime else {
+            throw ContinuousBatchCoordinatorError.shuttingDown
+        }
+        return runtime
+    }
+
+    private func releaseRuntimeAfterShutdownIfIdle() {
+        guard shuttingDown, !shutdownInProgress, driveTask == nil,
+            runtimeOperationDepth == 0, requests.isEmpty
+        else {
+            return
+        }
+        if let snapshot = runtime?.resourceSnapshot() {
+            terminalRuntimeResourceSnapshot = terminalResourceSnapshot(from: snapshot)
+        }
+        runtime = nil
+    }
+
+    private func terminalResourceSnapshot(
+        from snapshot: ContinuousBatchRuntimeResourceSnapshot
+    ) -> ContinuousBatchRuntimeResourceSnapshot {
+        ContinuousBatchRuntimeResourceSnapshot(
+            kvBytesPerToken: snapshot.kvBytesPerToken,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: snapshot.maxReservedKVBytes,
+            speculation: terminalSpeculationSnapshot(from: snapshot.speculation))
+    }
+
+    private func terminalSpeculationSnapshot(
+        from snapshot: ContinuousBatchRuntimeSpeculationSnapshot?
+    ) -> ContinuousBatchRuntimeSpeculationSnapshot? {
+        guard let snapshot else { return nil }
+        return ContinuousBatchRuntimeSpeculationSnapshot(
+            requestedRequests: snapshot.requestedRequests,
+            activeSessions: 0,
+            draftedTokens: snapshot.draftedTokens,
+            acceptedDraftTokens: snapshot.acceptedDraftTokens,
+            verificationRounds: snapshot.verificationRounds,
+            fallbackRounds: snapshot.fallbackRounds)
+    }
+
     private func ensureAutomaticDrive() {
         guard automaticDrive, driveTask == nil, !scheduler.isEmpty, !shuttingDown else { return }
         driveTask = Task { await self.driveUntilIdle() }
     }
 
     private func driveUntilIdle() async {
-        defer { driveTask = nil }
+        defer {
+            driveTask = nil
+            releaseRuntimeAfterShutdownIfIdle()
+        }
         while !Task.isCancelled, !scheduler.isEmpty, !shuttingDown {
             do {
                 try await executeOneTick()
@@ -606,6 +660,11 @@ public actor ContinuousBatchCoordinator {
     }
 
     private func executeOneTick() async throws {
+        runtimeOperationDepth += 1
+        defer {
+            runtimeOperationDepth -= 1
+            releaseRuntimeAfterShutdownIfIdle()
+        }
         let plan: BatchTickPlan
         let reservations: [BatchRequestID: ReservedPublication]
         while true {
@@ -624,6 +683,7 @@ public actor ContinuousBatchCoordinator {
 
         var preparedDecode: [PreparedDecode] = []
         do {
+            let runtime = try liveRuntime()
             for operation in plan.operations {
                 switch operation {
                 case .decode(let action):
@@ -824,6 +884,7 @@ public actor ContinuousBatchCoordinator {
         _ prepared: [PreparedDecode],
         reservations: [BatchRequestID: ReservedPublication]
     ) async throws {
+        let runtime = try liveRuntime()
         var unconsumed = reservations
         for result in prepared {
             guard let publication = unconsumed.removeValue(forKey: result.id) else {
@@ -898,7 +959,7 @@ public actor ContinuousBatchCoordinator {
         var mailboxes: [ContinuousBatchTokenMailbox] = []
         for id in ids {
             _ = scheduler.cancel(id)
-            runtime.remove(id)
+            runtime?.remove(id)
             if let state = requests.removeValue(forKey: id) {
                 mailboxes.append(state.mailbox)
             }
@@ -907,6 +968,9 @@ public actor ContinuousBatchCoordinator {
         if terminal { shuttingDown = true }
         for mailbox in mailboxes {
             await mailbox.fail(error)
+        }
+        if terminal {
+            releaseRuntimeAfterShutdownIfIdle()
         }
     }
 

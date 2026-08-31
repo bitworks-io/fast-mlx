@@ -408,6 +408,17 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     private let expectedKVElementBytes: Int
     private let maxReservedKVBytes: Int
     private let soloPLDConfiguration: SpecDecodeConfig?
+    /// Extra compile state for every compiled decode step: the model (its
+    /// parameters) plus any forward-pass arrays module reflection cannot see
+    /// (e.g. prepared fused projections). Passing these as compile STATE makes
+    /// the traced graph reference them as tracer inputs instead of capturing
+    /// them as constants. MLX traced graphs contain multi-output sibling
+    /// reference cycles that its teardown heuristic can orphan permanently
+    /// (mlx-swift 0.31.6); an orphaned trace that captured the weights as
+    /// constants pins every weight buffer — the production-route observation's
+    /// "post-run active Metal memory did not settle" failure. With weights as
+    /// state, an orphaned trace retains only kilobyte-scale descriptors.
+    private let compiledStepExtraState: [any Updatable]
     private var slots: [BatchRequestID: Slot] = [:]
     private var speculativePromptTokens: [BatchRequestID: [Int]] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
@@ -554,6 +565,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         self.expectedKVElementBytes = proof.elementBytes
         self.maxReservedKVBytes = resolvedKVByteLimit
         self.soloPLDConfiguration = soloPLDConfiguration
+        var extraState: [any Updatable] = [model]
+        if let providing = model as? AuxiliaryCompiledStateProviding {
+            extraState.append(providing.auxiliaryCompiledState)
+        }
+        self.compiledStepExtraState = extraState
     }
 
     convenience init(
@@ -1863,7 +1879,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     logits[0..., -1, 0...]),
             ]
         }
-        return compile(inputs: state, outputs: state, step)
+        // Weights and fused projections enter as compile STATE (tracer inputs),
+        // never captured constants -- see `compiledStepExtraState`.
+        return compile(
+            inputs: state + compiledStepExtraState,
+            outputs: state,
+            step)
     }
 
     private func makeScalarVerifyStep(
@@ -1881,7 +1902,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 CompiledMLXDecoder.greedyTokenOrInvalidSentinel(logits[0]),
             ]
         }
-        return compile(inputs: state, outputs: state, step)
+        // See `compiledStepExtraState`.
+        return compile(
+            inputs: state + compiledStepExtraState,
+            outputs: state,
+            step)
     }
 
     private func makeBatchStep(
@@ -1905,7 +1930,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     logits[0..., -1, 0...]),
             ]
         }
-        return compile(inputs: state, outputs: state, step)
+        // See `compiledStepExtraState`.
+        return compile(
+            inputs: state + compiledStepExtraState,
+            outputs: state,
+            step)
     }
 
     private func ensureScalarCapacity(

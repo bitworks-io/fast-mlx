@@ -462,6 +462,77 @@ final class Qwen35ExactMTPRuntimeFactoryTests: XCTestCase {
         }
     }
 
+    func testQwen38SourceLockedPreloadRejectsUnsupportedSelectionBeforeFilesystem() throws {
+        XCTAssertThrowsError(try Qwen35ExactMTPRuntimeFactory.preloadSourceLockedDepth1Pair(
+            selection: .qwen35_9BDepth1,
+            targetDirectory: URL(fileURLWithPath: "/tmp/missing-target", isDirectory: true),
+            drafterDirectory: URL(fileURLWithPath: "/tmp/missing-drafter", isDirectory: true)
+        )) { error in
+            XCTAssertEqual(
+                error as? Qwen35ExactMTPRuntimeAdmissionError,
+                .unsupportedPreloadSelection(.qwen35_9BDepth1))
+        }
+    }
+
+    func testQwen38SourceLockedPreloadRejectsSyntheticArtifactDriftWithoutLoader() throws {
+        let fixture = try makeQwen38SyntheticPreloadDriftFixture()
+        defer { fixture.cleanup() }
+
+        XCTAssertThrowsError(try Qwen35ExactMTPRuntimeFactory.preloadSourceLockedDepth1Pair(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: fixture.targetDirectory,
+            drafterDirectory: fixture.drafterDirectory
+        )) { error in
+            XCTAssertEqual(
+                error as? Qwen35ExactMTPAdmissionError,
+                .identityMismatch(role: .target, field: "configSHA256"))
+        }
+    }
+
+    func testQwen38SourceLockedPreloadAuthenticatesExactFixtureWhenTokenizerSnapshotConfigured()
+        throws
+    {
+        let fixture = try makeQwen38ExactPreloadFixture()
+        defer { fixture.cleanup() }
+
+        let binding = try Qwen35ExactMTPRuntimeFactory.preloadSourceLockedDepth1Pair(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: fixture.targetDirectory,
+            drafterDirectory: fixture.drafterDirectory)
+        let lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+
+        XCTAssertEqual(binding.targetModelID, lock.targetIdentity.modelID)
+        XCTAssertEqual(binding.drafterModelID, lock.drafterIdentity.modelID)
+        XCTAssertEqual(binding.targetRevision, lock.targetIdentity.revision)
+        XCTAssertEqual(binding.drafterRevision, lock.drafterIdentity.revision)
+        XCTAssertEqual(binding.sourceRevision, lock.sourceRevision)
+        XCTAssertEqual(binding.runtimeBlockSize, 3)
+        XCTAssertEqual(binding.maximumAcceptedDraftTokens, 2)
+    }
+
+    func testQwen38SourceLockedPreloadRejectsTargetConfigDriftWhenTokenizerSnapshotConfigured()
+        throws
+    {
+        let fixture = try makeQwen38ExactPreloadFixture()
+        defer { fixture.cleanup() }
+        let changedConfig = try String(
+            decoding: qwen38PreloadFixtureData(named: "qwen38-27b-target-config"),
+            as: UTF8.self)
+            .replacingOccurrences(of: "\"hidden_size\": 5120", with: "\"hidden_size\": 5121")
+        try Data(changedConfig.utf8).write(
+            to: fixture.targetDirectory.appending(component: "config.json"))
+
+        XCTAssertThrowsError(try Qwen35ExactMTPRuntimeFactory.preloadSourceLockedDepth1Pair(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: fixture.targetDirectory,
+            drafterDirectory: fixture.drafterDirectory
+        )) { error in
+            XCTAssertEqual(
+                error as? Qwen35ExactMTPAdmissionError,
+                .identityMismatch(role: .target, field: "configSHA256"))
+        }
+    }
+
     func testExactSnapshotDownloaderAllowsOnlySelectedQwen38Rows() async throws {
         let target = URL(fileURLWithPath: "/tmp/qwen38-target", isDirectory: true)
         let drafter = URL(fileURLWithPath: "/tmp/qwen38-drafter", isDirectory: true)
@@ -1525,6 +1596,194 @@ private func sha256Hex(_ data: Data) -> String {
 private enum ExactSnapshotDownloaderError: Error {
     case unexpectedDownloadRequest
     case tokenizerLoadReached
+}
+
+private struct Qwen38ExactPreloadFixture {
+    let root: URL
+    let targetDirectory: URL
+    let drafterDirectory: URL
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private struct Qwen38PreloadTensorFixture: Decodable {
+    let name: String
+    let shape: [Int]
+    let dtype: String
+}
+
+private func makeQwen38SyntheticPreloadDriftFixture() throws -> Qwen38ExactPreloadFixture {
+    let root = try qwen38PreloadTemporaryDirectory()
+    let targetDirectory = root.appending(component: "target")
+    let drafterDirectory = root.appending(component: "drafter")
+    try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: drafterDirectory, withIntermediateDirectories: true)
+
+    try qwen38SyntheticTargetConfig()
+        .write(to: targetDirectory.appending(component: "config.json"))
+    try qwen38SyntheticDrafterConfig()
+        .write(to: drafterDirectory.appending(component: "config.json"))
+    try writeQwen38SyntheticTokenizer(to: targetDirectory)
+    try writeQwen38SyntheticTokenizer(to: drafterDirectory)
+    try qwen38PreloadSafetensorHeaderData([
+        .init(name: "model.embed_tokens.weight", shape: [248_320, 4096], dtype: "BF16")
+    ]).write(to: targetDirectory.appending(component: "model.safetensors"))
+    try qwen38PreloadSafetensorHeaderData([
+        .init(name: "fc.weight", shape: [4096, 1280], dtype: "U32")
+    ]).write(to: drafterDirectory.appending(component: "model.safetensors"))
+
+    return Qwen38ExactPreloadFixture(
+        root: root,
+        targetDirectory: targetDirectory,
+        drafterDirectory: drafterDirectory)
+}
+
+private func makeQwen38ExactPreloadFixture() throws -> Qwen38ExactPreloadFixture {
+    let environment = ProcessInfo.processInfo.environment
+    let tokenizerPath = environment["FAST_MLX_QWEN38_TOKENIZER_SNAPSHOT"]
+        ?? environment["FAST_MLX_QWEN38_TARGET_SNAPSHOT"]
+    guard let tokenizerPath else {
+        throw XCTSkip(
+            "exact qwen38 preload fixture requires a local tokenizer snapshot path")
+    }
+    let tokenizerDirectory = URL(fileURLWithPath: tokenizerPath, isDirectory: true)
+    guard FileManager.default.fileExists(
+        atPath: tokenizerDirectory.appending(component: "tokenizer.json").path)
+            || FileManager.default.fileExists(
+                atPath: tokenizerDirectory.appending(component: "vocab.json").path)
+    else {
+        throw XCTSkip(
+            "exact qwen38 preload fixture tokenizer path has no tokenizer.json or vocab.json")
+    }
+
+    let root = try qwen38PreloadTemporaryDirectory()
+    let targetDirectory = root.appending(component: "target")
+    let drafterDirectory = root.appending(component: "drafter")
+    try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: drafterDirectory, withIntermediateDirectories: true)
+
+    try qwen38PreloadFixtureData(named: "qwen38-27b-target-config")
+        .write(to: targetDirectory.appending(component: "config.json"))
+    try qwen38PreloadFixtureData(named: "qwen38-27b-mtp-config")
+        .write(to: drafterDirectory.appending(component: "config.json"))
+    try copyQwen38PreloadTokenizer(from: tokenizerDirectory, to: targetDirectory)
+    try copyQwen38PreloadTokenizer(from: tokenizerDirectory, to: drafterDirectory)
+
+    let targetTensors = try qwen38PreloadTensorFixture(named: "qwen38-27b-target-tensors")
+    try qwen38PreloadSafetensorHeaderData(targetTensors)
+        .write(to: targetDirectory.appending(component: "model.safetensors"))
+    try qwen38PreloadSafetensorHeaderData(
+        Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1.drafterTensors)
+        .write(to: drafterDirectory.appending(component: "model.safetensors"))
+
+    return Qwen38ExactPreloadFixture(
+        root: root,
+        targetDirectory: targetDirectory,
+        drafterDirectory: drafterDirectory)
+}
+
+private func qwen38PreloadFixtureData(named name: String) throws -> Data {
+    let root = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let url = root.appending(component: "Tests/HarnessCoreTests/Fixtures/mtp/\(name).json")
+    var data = try Data(contentsOf: url)
+    if data.last == 0x0a {
+        data.removeLast()
+    }
+    return data
+}
+
+private func qwen38PreloadTensorFixture(named name: String) throws -> [Qwen38PreloadTensorFixture] {
+    try JSONDecoder().decode(
+        [Qwen38PreloadTensorFixture].self,
+        from: qwen38PreloadFixtureData(named: name))
+}
+
+private func copyQwen38PreloadTokenizer(from source: URL, to destination: URL) throws {
+    let manager = FileManager.default
+    for name in ["tokenizer.json", "vocab.json"] {
+        let sourceURL = source.appending(component: name)
+        guard manager.fileExists(atPath: sourceURL.path) else { continue }
+        try Data(contentsOf: sourceURL).write(to: destination.appending(component: name))
+        return
+    }
+    throw Qwen35ExactMTPAdmissionError.missingFile(role: .target, name: "tokenizer.json")
+}
+
+private func writeQwen38SyntheticTokenizer(to directory: URL) throws {
+    let data = try JSONSerialization.data(
+        withJSONObject: ["model": ["vocab": ["token-a": 0, "token-b": 1]]],
+        options: [.sortedKeys])
+    try data.write(to: directory.appending(component: "tokenizer.json"))
+}
+
+private func qwen38SyntheticTargetConfig() -> Data {
+    Data("""
+    {"model_type":"qwen3_5","quantization":{"bits":4,"group_size":64,"mode":"affine"},"text_config":\(qwen38SyntheticTextConfig())}
+    """.utf8)
+}
+
+private func qwen38SyntheticDrafterConfig() -> Data {
+    Data("""
+    {"block_size":3,"model_type":"qwen3_5_mtp","quantization":{"bits":5,"group_size":64,"mode":"affine"},"text_config":\(qwen38SyntheticTextConfig())}
+    """.utf8)
+}
+
+private func qwen38SyntheticTextConfig() -> String {
+    """
+    {"model_type":"qwen3_5_text","hidden_size":4096,"intermediate_size":12288,"vocab_size":248320,"num_hidden_layers":32,"full_attention_interval":4,"num_attention_heads":16,"num_key_value_heads":4,"head_dim":256,"mtp_num_hidden_layers":1,"mtp_use_dedicated_embeddings":false}
+    """
+}
+
+private func qwen38PreloadSafetensorHeaderData(
+    _ tensors: [Qwen38PreloadTensorFixture]
+) throws -> Data {
+    let header = Dictionary(uniqueKeysWithValues: tensors.map {
+        (
+            $0.name,
+            [
+                "dtype": $0.dtype,
+                "shape": $0.shape,
+                "data_offsets": [0, 0],
+            ] as [String: Any]
+        )
+    })
+    let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+    var length = UInt64(headerData.count).littleEndian
+    var data = Data(bytes: &length, count: MemoryLayout<UInt64>.size)
+    data.append(headerData)
+    return data
+}
+
+private func qwen38PreloadSafetensorHeaderData(
+    _ tensors: [Qwen35ExactMTPTensorDescriptor]
+) throws -> Data {
+    let header = Dictionary(uniqueKeysWithValues: tensors.map {
+        (
+            $0.name,
+            [
+                "dtype": $0.dtype,
+                "shape": $0.shape,
+                "data_offsets": [0, 0],
+            ] as [String: Any]
+        )
+    })
+    let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+    var length = UInt64(headerData.count).littleEndian
+    var data = Data(bytes: &length, count: MemoryLayout<UInt64>.size)
+    data.append(headerData)
+    return data
+}
+
+private func qwen38PreloadTemporaryDirectory() throws -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appending(component: "qwen38-exact-preload-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
 }
 
 private struct ExactSnapshotDownloader: Downloader {

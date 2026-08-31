@@ -2,7 +2,7 @@ import Foundation
 
 import HarnessCore
 import ServingCore
-import SpikeServingAdapters
+@_spi(ProductionRouteEvidence) import SpikeServingAdapters
 
 public enum Qwen38ScorecardContinuousRouteError:
     Error, Equatable, CustomStringConvertible, Sendable
@@ -22,6 +22,10 @@ public enum Qwen38ScorecardContinuousRouteError:
         reservedKVBytes: Int)
     case occupancyExceeded(limit: Int, observed: Int)
     case inconsistentPeakSummary
+    case outputAccountingMismatch(
+        index: Int,
+        usageCompletionTokens: Int,
+        outputTokenCount: Int)
 
     public var description: String {
         switch self {
@@ -49,6 +53,8 @@ public enum Qwen38ScorecardContinuousRouteError:
             return "observed occupancy \(observed) exceeds bounded limit \(limit)"
         case .inconsistentPeakSummary:
             return "reported peak occupancy does not match the plan observation trace"
+        case .outputAccountingMismatch(let index, let usage, let count):
+            return "request \(index) usage completionTokens \(usage) != captured output token IDs \(count)"
         }
     }
 }
@@ -69,6 +75,7 @@ public enum Qwen38ScorecardContinuousRouteEvidenceKind:
     String, Equatable, Sendable
 {
     case syntheticPathProof
+    case liveProductionRoute
 }
 
 public enum Qwen38ScorecardContinuousRouteDecodeKind:
@@ -202,7 +209,7 @@ public struct Qwen38ScorecardContinuousRouteResult:
     public let finalReservedKVBytes: Int
     public let requests: [Qwen38ScorecardContinuousRouteRequestResult]
 
-    public init(
+    init(
         evidenceKind: Qwen38ScorecardContinuousRouteEvidenceKind,
         concurrency: Int,
         coordinatorRequestIDs: [UInt64],
@@ -316,12 +323,24 @@ public struct Qwen38ScorecardContinuousRouteResult:
                 .requestIndex ?? 0
             throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
         }
+        let completedFinishReasons: [OpenAIChatFinishReason] =
+            evidenceKind == .liveProductionRoute
+            ? [.stop, .length]
+            : [.stop]
         if let incomplete = requests.first(where: {
-            $0.finishReason != .stop
-                || $0.usage.completionTokens != $0.outputTokenIDs.count
+            !completedFinishReasons.contains($0.finishReason)
         }) {
             throw Qwen38ScorecardContinuousRouteError.incompleteRequest(
                 index: incomplete.requestIndex)
+        }
+        if let mismatch = requests.first(where: {
+            $0.usage.completionTokens != $0.outputTokenIDs.count
+        }) {
+            throw Qwen38ScorecardContinuousRouteError
+                .outputAccountingMismatch(
+                    index: mismatch.requestIndex,
+                    usageCompletionTokens: mismatch.usage.completionTokens,
+                    outputTokenCount: mismatch.outputTokenIDs.count)
         }
         if let wrongRoute = requests.first(where: {
             $0.route != .continuousBatchNoSpec
@@ -344,6 +363,533 @@ public struct Qwen38ScorecardContinuousRouteResult:
                 reservedKVBytes: finalReservedKVBytes)
         }
     }
+}
+
+struct Qwen38ScorecardProductionRouteObservation:
+    Equatable, Sendable
+{
+    let evidenceKind: Qwen38ScorecardContinuousRouteEvidenceKind
+    let c2: Qwen38ScorecardContinuousRouteResult
+    let c4: Qwen38ScorecardContinuousRouteResult
+    let observationDigest: String
+
+    fileprivate init(
+        c2: Qwen38ScorecardContinuousRouteResult,
+        c4: Qwen38ScorecardContinuousRouteResult
+    ) throws {
+        guard c2.evidenceKind == .liveProductionRoute,
+            c4.evidenceKind == .liveProductionRoute,
+            c2.concurrency == 2,
+            c4.concurrency == 4
+        else {
+            throw Qwen38ScorecardContinuousRouteError
+                .missingSharedBatchDecode
+        }
+        try c2.validate()
+        try c4.validate()
+        self.evidenceKind = .liveProductionRoute
+        self.c2 = c2
+        self.c4 = c4
+        self.observationDigest =
+            Qwen38ScorecardProductionRouteRunner.observationDigest(
+                c2: c2,
+                c4: c4)
+    }
+}
+
+struct Qwen38ScorecardProductionRouteStartResult: Sendable {
+    let handle: ServingGenerationHandle
+    let afterRetained: (@Sendable () async -> Void)?
+
+    init(
+        handle: ServingGenerationHandle,
+        afterRetained: (@Sendable () async -> Void)? = nil
+    ) {
+        self.handle = handle
+        self.afterRetained = afterRetained
+    }
+}
+
+enum Qwen38ScorecardProductionRouteRunner {
+    typealias ProductionRouteStartOperation = @Sendable (
+        Int,
+        LoadedContinuousServingModel,
+        ContinuousServingProductionRouteEvidenceAuthorization,
+        ContinuousServingOutputTokenTraceConfiguration,
+        @Sendable (Int, String) -> OpenAIChatCompletionRequest
+    ) async throws -> Qwen38ScorecardProductionRouteStartResult
+
+    static func observeLoaded(
+        _ loaded: LoadedContinuousServingModel,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration
+    ) async throws -> Qwen38ScorecardProductionRouteObservation {
+        let c2 = try await runLoaded(
+            loaded,
+            concurrency: 2,
+            tokenTrace: tokenTrace,
+            request: productionRouteRequest(index:model:))
+        let c4 = try await runLoaded(
+            loaded,
+            concurrency: 4,
+            tokenTrace: tokenTrace,
+            request: productionRouteRequest(index:model:))
+        return try Qwen38ScorecardProductionRouteObservation(c2: c2, c4: c4)
+    }
+
+    static func runLoaded(
+        _ loaded: LoadedContinuousServingModel,
+        concurrency: Int,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration,
+        request: @escaping @Sendable (Int, String) -> OpenAIChatCompletionRequest,
+        start: @escaping ProductionRouteStartOperation =
+            defaultStartProductionRouteEvidence
+    ) async throws -> Qwen38ScorecardContinuousRouteResult {
+        guard concurrency == 2 || concurrency == 4 else {
+            throw Qwen38ScorecardContinuousRouteError.invalidConcurrency(
+                concurrency)
+        }
+        let authorization = try loaded.productionRouteEvidenceAuthorization()
+        guard tokenTrace.enabled else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .invalidTraceLimit(0)
+        }
+        guard tokenTrace.maxCompletedRequests >= concurrency else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .invalidTraceLimit(tokenTrace.maxCompletedRequests)
+        }
+        let baseline = await loaded.backend.scorecardContinuousRouteObservation()
+        guard baseline.activeRequests == 0,
+            baseline.coordinatorSlots.isEmpty,
+            (baseline.runtimeResources?.reservedKVBytes ?? 0) == 0
+        else {
+            throw Qwen38ScorecardContinuousRouteError.incompleteCleanup(
+                activeRequests: baseline.activeRequests,
+                coordinatorSlots: baseline.coordinatorSlots.count,
+                reservedKVBytes:
+                    baseline.runtimeResources?.reservedKVBytes ?? 0)
+        }
+        _ = await loaded.backend.takeScorecardContinuousRouteObservation()
+        let requiredTraceCapacity = requiredScorecardTraceCapacity(
+            concurrency: concurrency,
+            tokenTrace: tokenTrace)
+        let observedTraceCapacity = try await loaded.backend
+            .productionRouteScorecardTraceCapacity(
+                authorization: authorization)
+        guard observedTraceCapacity >= requiredTraceCapacity else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .insufficientScorecardTraceCapacity(
+                    required: requiredTraceCapacity,
+                    observed: observedTraceCapacity)
+        }
+        _ = try await loaded.backend.takeProductionRouteCompletedTokenTraces(
+            authorization: authorization)
+
+        var started: [StartedProductionRequest] = []
+        do {
+            started = try await startProductionRequests(
+                loaded,
+                concurrency: concurrency,
+                authorization: authorization,
+                tokenTrace: tokenTrace,
+                request: request,
+                start: start)
+            let drained = try await drainProductionRequests(started)
+            let final = try await waitForCleanup(loaded.backend)
+            let traces = try await loaded.backend
+                .takeProductionRouteCompletedTokenTraces(
+                    authorization: authorization)
+            let result = try buildProductionResult(
+                concurrency: concurrency,
+                observation: final,
+                drained: drained,
+                tokenTraces: traces)
+            try result.validate()
+            return result
+        } catch {
+            for request in started {
+                _ = await request.handle.lease.cancel(.clientDisconnected)
+            }
+            _ = try? await waitForCleanup(loaded.backend)
+            _ = try? await loaded.backend.takeProductionRouteCompletedTokenTraces(
+                authorization: authorization)
+            _ = await loaded.backend.takeScorecardContinuousRouteObservation()
+            throw error
+        }
+    }
+
+    static func observationDigest(
+        c2: Qwen38ScorecardContinuousRouteResult,
+        c4: Qwen38ScorecardContinuousRouteResult
+    ) -> String {
+        Qwen38PerformanceAttributionScorecardGate.canonicalDigest(
+            Qwen38ScorecardProductionRouteDigestBasis(
+                schemaVersion: 1,
+                evidenceKind:
+                    Qwen38ScorecardContinuousRouteEvidenceKind
+                    .liveProductionRoute.rawValue,
+                results: [digestBasis(c2), digestBasis(c4)]))
+    }
+
+    private static func requiredScorecardTraceCapacity(
+        concurrency: Int,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration
+    ) -> Int {
+        max(concurrency + 2, tokenTrace.maxTokensPerRequest + 2)
+    }
+
+    private static func productionRouteRequest(
+        index: Int,
+        model: String
+    ) -> OpenAIChatCompletionRequest {
+        OpenAIChatCompletionRequest(
+            model: model,
+            messages: [
+                OpenAIChatMessage(
+                    role: .user,
+                    text: "Report a stable one-line scorecard observation \(index)."),
+            ],
+            maxCompletionTokens: 8,
+            temperature: 0,
+            choiceCount: 1,
+            stream: true,
+            stop: [])
+    }
+
+    private struct StartedProductionRequest: Sendable {
+        let requestIndex: Int
+        let handle: ServingGenerationHandle
+        let admittedAtUptime: Double
+    }
+
+    private actor StartedProductionRequestAccumulator {
+        private var values: [StartedProductionRequest] = []
+
+        func append(_ value: StartedProductionRequest) {
+            values.append(value)
+        }
+
+        func snapshot() -> [StartedProductionRequest] {
+            values
+        }
+    }
+
+    private struct DrainedProductionRequest: Sendable {
+        let requestIndex: Int
+        let responseID: String
+        let route: ServingExecutionRoute
+        let finishReason: OpenAIChatFinishReason
+        let usage: OpenAIChatUsage
+        let admittedAtUptime: Double
+        let completedAtUptime: Double
+    }
+
+    private static func startProductionRequests(
+        _ loaded: LoadedContinuousServingModel,
+        concurrency: Int,
+        authorization: ContinuousServingProductionRouteEvidenceAuthorization,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration,
+        request: @escaping @Sendable (Int, String) -> OpenAIChatCompletionRequest,
+        start: @escaping ProductionRouteStartOperation
+    ) async throws -> [StartedProductionRequest] {
+        let accumulator = StartedProductionRequestAccumulator()
+        do {
+            return try await withThrowingTaskGroup(
+                of: StartedProductionRequest.self
+            ) { group in
+                for index in 0 ..< concurrency {
+                    group.addTask {
+                        let startResult = try await start(
+                            index,
+                            loaded,
+                            authorization,
+                            tokenTrace,
+                            request)
+                        let started = StartedProductionRequest(
+                            requestIndex: index,
+                            handle: startResult.handle,
+                            admittedAtUptime:
+                                ProcessInfo.processInfo.systemUptime)
+                        await accumulator.append(started)
+                        if let afterRetained = startResult.afterRetained {
+                            await afterRetained()
+                        }
+                        return started
+                    }
+                }
+                var started: [StartedProductionRequest] = []
+                started.reserveCapacity(concurrency)
+                for try await value in group {
+                    started.append(value)
+                }
+                return started.sorted { $0.requestIndex < $1.requestIndex }
+            }
+        } catch {
+            let retained = await accumulator.snapshot()
+            for request in retained {
+                _ = await request.handle.lease.cancel(.clientDisconnected)
+            }
+            throw error
+        }
+    }
+
+    private static func defaultStartProductionRouteEvidence(
+        index: Int,
+        loaded: LoadedContinuousServingModel,
+        authorization: ContinuousServingProductionRouteEvidenceAuthorization,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration,
+        request: @Sendable (Int, String) -> OpenAIChatCompletionRequest
+    ) async throws -> Qwen38ScorecardProductionRouteStartResult {
+        Qwen38ScorecardProductionRouteStartResult(
+            handle: try await loaded.backend.startProductionRouteEvidence(
+                request(index, loaded.startupReport.launchedModel),
+                authorization: authorization,
+                tokenTrace: tokenTrace))
+    }
+
+    private static func drainProductionRequests(
+        _ started: [StartedProductionRequest]
+    ) async throws -> [DrainedProductionRequest] {
+        try await withThrowingTaskGroup(
+            of: DrainedProductionRequest.self
+        ) { group in
+            for request in started {
+                group.addTask {
+                    var completion: ServingGenerationCompletion?
+                    while let delta = try await request.handle.mailbox.next() {
+                        switch delta {
+                        case .text:
+                            break
+                        case .toolCalls:
+                            throw Qwen38ScorecardContinuousRouteError
+                                .incompleteRequest(
+                                    index: request.requestIndex)
+                        case .completion(let value):
+                            completion = value
+                        }
+                    }
+                    guard let completion else {
+                        throw Qwen38ScorecardContinuousRouteError
+                            .incompleteRequest(
+                                index: request.requestIndex)
+                    }
+                    return DrainedProductionRequest(
+                        requestIndex: request.requestIndex,
+                        responseID: request.handle.responseID,
+                        route: request.handle.route,
+                        finishReason: completion.finishReason,
+                        usage: completion.usage,
+                        admittedAtUptime: request.admittedAtUptime,
+                        completedAtUptime:
+                            ProcessInfo.processInfo.systemUptime)
+                }
+            }
+            var drained: [DrainedProductionRequest] = []
+            drained.reserveCapacity(started.count)
+            for try await value in group {
+                drained.append(value)
+            }
+            return drained.sorted { $0.requestIndex < $1.requestIndex }
+        }
+    }
+
+    private static func waitForCleanup(
+        _ backend: ContinuousServingBackend
+    ) async throws -> ContinuousServingBackendScorecardObservation {
+        var last = await backend.scorecardContinuousRouteObservation()
+        for _ in 0 ..< 100
+        where last.activeRequests != 0
+            || !last.coordinatorSlots.isEmpty
+            || (last.runtimeResources?.reservedKVBytes ?? 0) != 0
+        {
+            await Task.yield()
+            last = await backend.scorecardContinuousRouteObservation()
+        }
+        return await backend.takeScorecardContinuousRouteObservation()
+    }
+
+    private static func buildProductionResult(
+        concurrency: Int,
+        observation: ContinuousServingBackendScorecardObservation,
+        drained: [DrainedProductionRequest],
+        tokenTraces: [ContinuousServingCompletedRequestTokenTrace]
+    ) throws -> Qwen38ScorecardContinuousRouteResult {
+        let tracesByResponseID = try validateUniqueProductionTokenTraces(
+            tokenTraces)
+        let expectedResponseIDs = Set(drained.map(\.responseID))
+        if let unexpected = tracesByResponseID.keys.first(where: {
+            !expectedResponseIDs.contains($0)
+        }) {
+            throw ContinuousServingProductionRouteEvidenceError
+                .unexpectedOutputTokenTrace(responseID: unexpected)
+        }
+        let requests = try drained.map { drained in
+            guard let trace = tracesByResponseID[drained.responseID] else {
+                throw ContinuousServingProductionRouteEvidenceError
+                    .missingOutputTokenTrace(responseID: drained.responseID)
+            }
+            guard !trace.truncated else {
+                throw ContinuousServingProductionRouteEvidenceError
+                    .outputTokenTraceTruncated(responseID: drained.responseID)
+            }
+            guard trace.completionTokenCount == drained.usage.completionTokens,
+                trace.outputTokenIDs.count == drained.usage.completionTokens
+            else {
+                throw Qwen38ScorecardContinuousRouteError
+                    .outputAccountingMismatch(
+                        index: drained.requestIndex,
+                        usageCompletionTokens:
+                            drained.usage.completionTokens,
+                        outputTokenCount: trace.outputTokenIDs.count)
+            }
+            return Qwen38ScorecardContinuousRouteRequestResult(
+                requestIndex: drained.requestIndex,
+                coordinatorRequestID: trace.coordinatorRequestID.rawValue,
+                route: drained.route,
+                outputTokenIDs: trace.outputTokenIDs,
+                finishReason: drained.finishReason,
+                usage: drained.usage,
+                admittedAtUptime: drained.admittedAtUptime,
+                completedAtUptime: drained.completedAtUptime)
+        }
+        let coordinatorRequestIDs = requests.map(\.coordinatorRequestID)
+            .sorted()
+        guard coordinatorRequestIDs.count == concurrency else {
+            throw Qwen38ScorecardContinuousRouteError
+                .missingAdmissionObservation(
+                    expected: concurrency,
+                    actual: coordinatorRequestIDs.count)
+        }
+        guard Set(coordinatorRequestIDs).count == coordinatorRequestIDs.count
+        else {
+            throw Qwen38ScorecardContinuousRouteError
+                .duplicateCoordinatorRequestIDs
+        }
+        return try Qwen38ScorecardContinuousRouteRunner.buildResult(
+            evidenceKind: .liveProductionRoute,
+            concurrency: concurrency,
+            coordinatorRequestIDs: coordinatorRequestIDs,
+            observation: observation,
+            requests: requests)
+    }
+
+    static func validateUniqueProductionTokenTraces(
+        _ tokenTraces: [ContinuousServingCompletedRequestTokenTrace]
+    ) throws -> [String: ContinuousServingCompletedRequestTokenTrace] {
+        var tracesByResponseID:
+            [String: ContinuousServingCompletedRequestTokenTrace] = [:]
+        tracesByResponseID.reserveCapacity(tokenTraces.count)
+        for trace in tokenTraces {
+            guard tracesByResponseID[trace.responseID] == nil else {
+                throw ContinuousServingProductionRouteEvidenceError
+                    .duplicateOutputTokenTrace(responseID: trace.responseID)
+            }
+            tracesByResponseID[trace.responseID] = trace
+        }
+        return tracesByResponseID
+    }
+
+    private static func digestBasis(
+        _ result: Qwen38ScorecardContinuousRouteResult
+    ) -> Qwen38ScorecardProductionRouteResultDigestBasis {
+        Qwen38ScorecardProductionRouteResultDigestBasis(
+            evidenceKind: result.evidenceKind.rawValue,
+            concurrency: result.concurrency,
+            coordinatorRequestIDs: result.coordinatorRequestIDs,
+            coordinatorPlanObservations: result.coordinatorPlanObservations.map {
+                Qwen38ScorecardProductionRoutePlanDigestBasis(
+                    planSequence: $0.planSequence,
+                    stateRevisionAfterApply: $0.stateRevisionAfterApply,
+                    admissions: $0.admissions,
+                    decodeKind: $0.decodeKind.rawValue,
+                    decodeRequestIDs: $0.decodeRequestIDs,
+                    speculationAllowed: $0.speculationAllowed,
+                    prefillRequestIDs: $0.prefillRequestIDs,
+                    activeSlotCount: $0.activeSlotCount,
+                    queuedSlotCount: $0.queuedSlotCount)
+            },
+            planRevisions: result.planRevisions.map {
+                Qwen38ScorecardProductionRouteRevisionDigestBasis(
+                    planSequence: $0.planSequence,
+                    stateRevisionAfterApply: $0.stateRevisionAfterApply)
+            },
+            sharedBatchDecodeRequestIDs: result.sharedBatchDecodeRequestIDs,
+            peakActiveSlots: result.peakActiveSlots,
+            peakBatchOccupancy: result.peakBatchOccupancy,
+            finalActiveRequests: result.finalActiveRequests,
+            finalCoordinatorSlots: result.finalCoordinatorSlots,
+            finalReservedKVBytes: result.finalReservedKVBytes,
+            requests: result.requests.map {
+                Qwen38ScorecardProductionRouteRequestDigestBasis(
+                    requestIndex: $0.requestIndex,
+                    coordinatorRequestID: $0.coordinatorRequestID,
+                    route: $0.route.rawValue,
+                    outputTokenIDs: $0.outputTokenIDs,
+                    finishReason: $0.finishReason.rawValue,
+                    promptTokens: $0.usage.promptTokens,
+                    completionTokens: $0.usage.completionTokens,
+                    totalTokens: $0.usage.totalTokens)
+            })
+    }
+}
+
+private struct Qwen38ScorecardProductionRouteDigestBasis:
+    Codable, Equatable, Sendable
+{
+    let schemaVersion: Int
+    let evidenceKind: String
+    let results: [Qwen38ScorecardProductionRouteResultDigestBasis]
+}
+
+private struct Qwen38ScorecardProductionRouteResultDigestBasis:
+    Codable, Equatable, Sendable
+{
+    let evidenceKind: String
+    let concurrency: Int
+    let coordinatorRequestIDs: [UInt64]
+    let coordinatorPlanObservations:
+        [Qwen38ScorecardProductionRoutePlanDigestBasis]
+    let planRevisions: [Qwen38ScorecardProductionRouteRevisionDigestBasis]
+    let sharedBatchDecodeRequestIDs: [UInt64]
+    let peakActiveSlots: Int
+    let peakBatchOccupancy: Int
+    let finalActiveRequests: Int
+    let finalCoordinatorSlots: Int
+    let finalReservedKVBytes: Int
+    let requests: [Qwen38ScorecardProductionRouteRequestDigestBasis]
+}
+
+private struct Qwen38ScorecardProductionRoutePlanDigestBasis:
+    Codable, Equatable, Sendable
+{
+    let planSequence: Int
+    let stateRevisionAfterApply: Int
+    let admissions: [UInt64]
+    let decodeKind: String
+    let decodeRequestIDs: [UInt64]
+    let speculationAllowed: Bool
+    let prefillRequestIDs: [UInt64]
+    let activeSlotCount: Int
+    let queuedSlotCount: Int
+}
+
+private struct Qwen38ScorecardProductionRouteRevisionDigestBasis:
+    Codable, Equatable, Sendable
+{
+    let planSequence: Int
+    let stateRevisionAfterApply: Int
+}
+
+private struct Qwen38ScorecardProductionRouteRequestDigestBasis:
+    Codable, Equatable, Sendable
+{
+    let requestIndex: Int
+    let coordinatorRequestID: UInt64
+    let route: String
+    let outputTokenIDs: [Int]
+    let finishReason: String
+    let promptTokens: Int
+    let completionTokens: Int
+    let totalTokens: Int
 }
 
 public enum Qwen38ScorecardContinuousRouteRunner {
@@ -429,6 +975,7 @@ public enum Qwen38ScorecardContinuousRouteRunner {
 
             let final = try await waitForCleanup(backend)
             let result = try buildResult(
+                evidenceKind: .syntheticPathProof,
                 concurrency: concurrency,
                 coordinatorRequestIDs: ids,
                 observation: final,
@@ -511,7 +1058,8 @@ public enum Qwen38ScorecardContinuousRouteRunner {
         return await backend.takeScorecardContinuousRouteObservation()
     }
 
-    private static func buildResult(
+    fileprivate static func buildResult(
+        evidenceKind: Qwen38ScorecardContinuousRouteEvidenceKind,
         concurrency: Int,
         coordinatorRequestIDs ids: [UInt64],
         observation: ContinuousServingBackendScorecardObservation,
@@ -542,7 +1090,7 @@ public enum Qwen38ScorecardContinuousRouteRunner {
         }
 
         return Qwen38ScorecardContinuousRouteResult(
-            evidenceKind: .syntheticPathProof,
+            evidenceKind: evidenceKind,
             concurrency: concurrency,
             coordinatorRequestIDs: ids,
             coordinatorPlanObservations: coordinatorPlanObservations,

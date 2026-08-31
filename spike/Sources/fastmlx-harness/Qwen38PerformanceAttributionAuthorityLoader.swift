@@ -98,6 +98,11 @@ struct Qwen38PerformanceAttributionUnsignedAuthorityCapture:
         Qwen38PerformanceAttributionCapturedFileIdentity
     let productionRouteReceiptPinIdentity:
         Qwen38PerformanceAttributionCapturedFileIdentity
+    let semanticPolicyDigest: String
+    let productionRouteReceiptDigest: String
+    let runIdentityDigest: String
+    let backendBuildIdentityDigest: String
+    let observationDigest: String
     let promotionAuthorized: Bool
     let requiresIndependentControllerSignature: Bool
 
@@ -111,7 +116,12 @@ struct Qwen38PerformanceAttributionUnsignedAuthorityCapture:
         productionRouteReceiptBodyIdentity:
             Qwen38PerformanceAttributionCapturedFileIdentity,
         productionRouteReceiptPinIdentity:
-            Qwen38PerformanceAttributionCapturedFileIdentity
+            Qwen38PerformanceAttributionCapturedFileIdentity,
+        semanticPolicyDigest: String,
+        productionRouteReceiptDigest: String,
+        runIdentityDigest: String,
+        backendBuildIdentityDigest: String,
+        observationDigest: String
     ) {
         self.policyDocumentSHA256 = policyDocumentSHA256
         self.policyPinDocumentSHA256 = policyPinDocumentSHA256
@@ -123,6 +133,11 @@ struct Qwen38PerformanceAttributionUnsignedAuthorityCapture:
             productionRouteReceiptPinDocumentSHA256
         self.productionRouteReceiptBodyIdentity = productionRouteReceiptBodyIdentity
         self.productionRouteReceiptPinIdentity = productionRouteReceiptPinIdentity
+        self.semanticPolicyDigest = semanticPolicyDigest
+        self.productionRouteReceiptDigest = productionRouteReceiptDigest
+        self.runIdentityDigest = runIdentityDigest
+        self.backendBuildIdentityDigest = backendBuildIdentityDigest
+        self.observationDigest = observationDigest
         promotionAuthorized = false
         requiresIndependentControllerSignature = true
     }
@@ -174,7 +189,12 @@ enum Qwen38PerformanceAttributionAuthorityLoader {
             productionRouteReceiptBodyIdentity:
                 captured[.productionRouteReceiptBody]!.identity.captured,
             productionRouteReceiptPinIdentity:
-                captured[.productionRouteReceiptPin]!.identity.captured)
+                captured[.productionRouteReceiptPin]!.identity.captured,
+            semanticPolicyDigest: policy.digest,
+            productionRouteReceiptDigest: receipt.digest,
+            runIdentityDigest: receipt.runIdentityDigest,
+            backendBuildIdentityDigest: receipt.backendBuildIdentityDigest,
+            observationDigest: receipt.observationDigest)
     }
 
     static func sha256Hex(_ data: Data) -> String {

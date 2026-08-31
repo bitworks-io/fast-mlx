@@ -248,6 +248,8 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
 public struct LoadedContinuousServingModel: Sendable {
     public let backend: ContinuousServingBackend
     public let startupReport: ContinuousServingModelStartupReport
+    private let retainedProductionRouteEvidenceAuthorization:
+        ContinuousServingProductionRouteEvidenceAuthorization?
 
     public init(
         backend: ContinuousServingBackend,
@@ -255,7 +257,49 @@ public struct LoadedContinuousServingModel: Sendable {
     ) {
         self.backend = backend
         self.startupReport = startupReport
+        self.retainedProductionRouteEvidenceAuthorization = nil
     }
+
+    init(
+        backend: ContinuousServingBackend,
+        startupReport: ContinuousServingModelStartupReport,
+        provenance: ContinuousServingLoadedModelProvenance
+    ) {
+        self.backend = backend
+        self.startupReport = startupReport
+        switch provenance {
+        case .loadedContinuousServingModel:
+            self.retainedProductionRouteEvidenceAuthorization = .init(backend: backend)
+        }
+    }
+
+    @_spi(ProductionRouteEvidence)
+    public func productionRouteEvidenceAuthorization() throws
+        -> ContinuousServingProductionRouteEvidenceAuthorization
+    {
+        guard let retainedProductionRouteEvidenceAuthorization else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .missingLoadedModelProvenance
+        }
+        return retainedProductionRouteEvidenceAuthorization
+    }
+
+    #if DEBUG
+        @_spi(ProductionRouteEvidence)
+        public static func testingLoadedContinuousServingModelWithLoaderProvenance(
+            backend: ContinuousServingBackend,
+            startupReport: ContinuousServingModelStartupReport
+        ) -> Self {
+            Self(
+                backend: backend,
+                startupReport: startupReport,
+                provenance: .loadedContinuousServingModel)
+        }
+    #endif
+}
+
+enum ContinuousServingLoadedModelProvenance: Sendable {
+    case loadedContinuousServingModel
 }
 
 @discardableResult
@@ -447,6 +491,7 @@ public func loadContinuousServingModel(
     var backendConfiguration = configuration.backendConfiguration
     backendConfiguration.toolCallFormat = servingToolCallFormat(
         inferred: context.configuration.toolCallFormat)
+    backendConfiguration.scorecardTraceCapacity = configuration.traceLimit
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,
         coordinator: coordinator,
@@ -482,7 +527,8 @@ public func loadContinuousServingModel(
         modelProofVerified: true)
     return LoadedContinuousServingModel(
         backend: backend,
-        startupReport: report)
+        startupReport: report,
+        provenance: .loadedContinuousServingModel)
 }
 
 func validateContinuousServingKVCacheDecision(
@@ -534,6 +580,7 @@ func validateContinuousServingStartup(
             resources.reservedKVBytes)
     }
     _ = await coordinator.takeExecutionTrace()
+    _ = await coordinator.takePlanObservations()
     _ = await coordinator.takeTimingTrace()
     return generatedTokenCount
 }

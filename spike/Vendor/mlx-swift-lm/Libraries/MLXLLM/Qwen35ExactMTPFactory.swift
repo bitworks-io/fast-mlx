@@ -374,6 +374,21 @@ public enum Qwen35ExactMTPFactory {
             authorizePreflight: authorizePreflight)
     }
 
+    @_spi(FastMLXExactMTP)
+    public static func admitSourceLockedDepth1Pair(
+        selection: Qwen35ExactMTPArtifactSelection,
+        targetDirectory: URL,
+        drafterDirectory: URL
+    ) throws -> Qwen35ExactMTPPreflightEvidence {
+        let lock = selectedLock(selection)
+        return try admitResolvedDepth1Pair(
+            lock: lock,
+            targetDirectory: targetDirectory,
+            targetTokenizerDirectory: targetDirectory,
+            drafterDirectory: drafterDirectory,
+            drafterTokenizerDirectory: drafterDirectory)
+    }
+
     private static func selectedLock(
         _ selection: Qwen35ExactMTPArtifactSelection
     ) -> Qwen35ExactMTPArtifactLock {

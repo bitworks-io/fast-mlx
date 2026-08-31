@@ -6,6 +6,7 @@ import MLXLMCommon
 public enum Qwen35ExactMTPRuntimeAdmissionError: Error, Equatable, Sendable {
     case vendoredLockDrift
     case bindingDrift(field: String)
+    case unsupportedPreloadSelection(Qwen35ExactMTPRuntimeSelection)
 }
 
 public enum Qwen35ExactMTPRuntimeSelection: String, Equatable, Sendable {
@@ -42,9 +43,27 @@ public enum Qwen35ExactMTPRuntimeFactory {
             from: downloader,
             using: tokenizerLoader,
             authorizePreflight: { evidence in
-                try authorize(evidence, selection: selection)
+                _ = try authorize(evidence, selection: selection)
             },
             progressHandler: progressHandler)
+    }
+
+    /// Authenticates already-resolved local Qwen3.8 depth-one MTP artifact directories before any
+    /// tokenizer/model construction or weight loading.
+    public static func preloadSourceLockedDepth1Pair(
+        selection: Qwen35ExactMTPRuntimeSelection = .qwen38_27BMXFP8Depth1,
+        targetDirectory: URL,
+        drafterDirectory: URL
+    ) throws -> QwenMTPArtifactBinding {
+        guard selection == .qwen38_27BMXFP8Depth1 else {
+            throw Qwen35ExactMTPRuntimeAdmissionError.unsupportedPreloadSelection(selection)
+        }
+
+        let evidence = try Qwen35ExactMTPFactory.admitSourceLockedDepth1Pair(
+            selection: vendoredSelection(selection),
+            targetDirectory: targetDirectory,
+            drafterDirectory: drafterDirectory)
+        return try authorize(evidence, selection: selection)
     }
 
     /// Bridges the vendored binding carried by an admitted loaded pair into the independent
@@ -92,7 +111,7 @@ public enum Qwen35ExactMTPRuntimeFactory {
     package static func authorize(
         _ evidence: Qwen35ExactMTPPreflightEvidence,
         selection: Qwen35ExactMTPRuntimeSelection = .qwen35_9BDepth1
-    ) throws {
+    ) throws -> QwenMTPArtifactBinding {
         try validateSelectedVendoredLock(evidence.lock, selection: selection)
         try validateKnownLockParity(selection: selection)
 
@@ -101,6 +120,7 @@ public enum Qwen35ExactMTPRuntimeFactory {
             target: harnessCandidate(evidence.target),
             drafter: harnessCandidate(evidence.drafter))
         try requireEquivalentBinding(vendored: evidence.binding, harness: binding)
+        return binding
     }
 
     private static func vendoredSelection(

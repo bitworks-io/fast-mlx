@@ -22,6 +22,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     public let queueRetryAfterSeconds: Int
     public let mailboxCapacity: BoundedDeltaMailbox.Capacity
     public let admission: ContinuousServingAdmissionMode
+    public var scorecardTraceCapacity: Int
     /// Wire format the model uses to emit tool calls. Defaults to `.json` (Llama/Qwen-standard);
     /// the loader overrides it with the model's inferred format (e.g. `.xmlFunction` for qwen3_5)
     /// so tool calls parse correctly for non-JSON families.
@@ -39,6 +40,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         defaultMaximumCompletionTokens: Int,
         queueRetryAfterSeconds: Int,
         mailboxCapacity: BoundedDeltaMailbox.Capacity,
+        scorecardTraceCapacity: Int = 0,
         admission: ContinuousServingAdmissionMode = .immediateBatchNoSpec,
         toolCallFormat: ToolCallFormat = .json,
         disableThinkingWhenToolsActive: Bool = false,
@@ -53,9 +55,11 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         if case .dynamic(_, .automatic(let duration)) = admission {
             precondition(duration > .zero, "coalescing duration must be positive")
         }
+        precondition(scorecardTraceCapacity >= 0, "scorecardTraceCapacity must be non-negative")
         self.defaultMaximumCompletionTokens = defaultMaximumCompletionTokens
         self.queueRetryAfterSeconds = queueRetryAfterSeconds
         self.mailboxCapacity = mailboxCapacity
+        self.scorecardTraceCapacity = scorecardTraceCapacity
         self.admission = admission
         self.toolCallFormat = toolCallFormat
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
@@ -82,6 +86,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let stopStrings: Set<String>
         let activeTools: [OpenAIToolSpec]
         let completionBudgetResolution: ServingCompletionBudgetResolution?
+        let outputTokenTraceLimit: Int?
+        let completedTraceCapacity: Int
     }
 
     private struct PendingAdmission {
@@ -102,6 +108,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         var detokenizer: any ScalarServingDetokenizer
         var stopFilter: ServingStopStringFilter
         let toolCallProcessor: ToolCallProcessor?
+        let responseID: String
+        let outputTokenTraceLimit: Int?
+        let completedTraceCapacity: Int
+        var outputTokenTrace: [Int] = []
+        var outputTokenTraceTruncated = false
     }
 
     private let launchedModel: String
@@ -123,6 +134,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
     private var cancelledAdmittingRequestIDs: Set<ServingRequestID> = []
     private var coalescingTask: Task<Void, Never>?
     private var acceptingRequests = true
+    private var completedTokenTraces:
+        [ContinuousServingCompletedRequestTokenTrace] = []
 
     public init(
         launchedModel: String,
@@ -181,6 +194,59 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
+        try await start(
+            request,
+            outputTokenTraceLimit: nil,
+            completedTraceCapacity: 0)
+    }
+
+    @_spi(ProductionRouteEvidence)
+    public func startProductionRouteEvidence(
+        _ request: OpenAIChatCompletionRequest,
+        authorization: ContinuousServingProductionRouteEvidenceAuthorization,
+        tokenTrace: ContinuousServingOutputTokenTraceConfiguration
+    ) async throws -> ServingGenerationHandle {
+        guard authorization.authorizes(self) else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .authorizationBackendMismatch
+        }
+        return try await start(
+            request,
+            outputTokenTraceLimit: try tokenTrace.traceLimit,
+            completedTraceCapacity: tokenTrace.enabled
+                ? tokenTrace.maxCompletedRequests
+                : 0)
+    }
+
+    @_spi(ProductionRouteEvidence)
+    public func takeProductionRouteCompletedTokenTraces(
+        authorization: ContinuousServingProductionRouteEvidenceAuthorization
+    ) throws -> [ContinuousServingCompletedRequestTokenTrace] {
+        guard authorization.authorizes(self) else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .authorizationBackendMismatch
+        }
+        let traces = completedTokenTraces
+        completedTokenTraces.removeAll(keepingCapacity: true)
+        return traces
+    }
+
+    @_spi(ProductionRouteEvidence)
+    public func productionRouteScorecardTraceCapacity(
+        authorization: ContinuousServingProductionRouteEvidenceAuthorization
+    ) throws -> Int {
+        guard authorization.authorizes(self) else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .authorizationBackendMismatch
+        }
+        return configuration.scorecardTraceCapacity
+    }
+
+    private func start(
+        _ request: OpenAIChatCompletionRequest,
+        outputTokenTraceLimit: Int?,
+        completedTraceCapacity: Int
+    ) async throws -> ServingGenerationHandle {
         guard acceptingRequests else {
             throw ContinuousServingBackendError.shuttingDown
         }
@@ -219,7 +285,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maximumCompletionTokens: maximumCompletionTokens,
             stopStrings: modelStopStrings.union(request.stop),
             activeTools: activeTools,
-            completionBudgetResolution: completionBudgetResolution)
+            completionBudgetResolution: completionBudgetResolution,
+            outputTokenTraceLimit: outputTokenTraceLimit,
+            completedTraceCapacity: completedTraceCapacity)
         switch configuration.admission {
         case .immediateBatchNoSpec:
             let handles = try await submitToCoordinator(
@@ -676,6 +744,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         route: ServingExecutionRoute
     ) -> ServingGenerationHandle {
         let id = prepared.id
+        let responseID = "chatcmpl-\(UUID().uuidString)"
         let mailbox = BoundedDeltaMailbox(capacity: configuration.mailboxCapacity)
         let lease = ServingRequestLease(
             id: id,
@@ -700,7 +769,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             detokenizer: codec.makeDetokenizer(),
             stopFilter: ServingStopStringFilter(
                 stopStrings: prepared.stopStrings),
-            toolCallProcessor: toolCallProcessor)
+            toolCallProcessor: toolCallProcessor,
+            responseID: responseID,
+            outputTokenTraceLimit: prepared.outputTokenTraceLimit,
+            completedTraceCapacity: prepared.completedTraceCapacity)
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -711,7 +783,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         requests[id]?.task = task
 
         return ServingGenerationHandle(
-            responseID: "chatcmpl-\(UUID().uuidString)",
+            responseID: responseID,
             created: Int(Date().timeIntervalSince1970),
             model: launchedModel,
             route: route,
@@ -767,6 +839,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                         usage: OpenAIChatUsage(
                             promptTokens: request.promptTokenCount,
                             completionTokens: request.generatedTokenCount))))
+            try recordCompletedTokenTraceIfNeeded(request)
             await request.mailbox.finish()
         } catch is CancellationError {
             guard let request = requests[id] else { return }
@@ -802,6 +875,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
 
         request.generatedTokenCount += 1
+        if let limit = request.outputTokenTraceLimit {
+            if request.outputTokenTrace.count < limit {
+                request.outputTokenTrace.append(token)
+            } else {
+                request.outputTokenTraceTruncated = true
+            }
+        }
         request.detokenizer.append(token: token)
         let chunk = request.detokenizer.next()
         let output = chunk.map { request.stopFilter.process($0) }
@@ -823,6 +903,24 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
         try Task.checkCancellation()
         return stopped
+    }
+
+    private func recordCompletedTokenTraceIfNeeded(
+        _ request: ActiveRequest
+    ) throws {
+        guard request.outputTokenTraceLimit != nil else { return }
+        guard completedTokenTraces.count < request.completedTraceCapacity else {
+            throw ContinuousServingProductionRouteEvidenceError
+                .completedTraceCapacityExceeded(
+                    limit: request.completedTraceCapacity)
+        }
+        completedTokenTraces.append(
+            ContinuousServingCompletedRequestTokenTrace(
+                responseID: request.responseID,
+                coordinatorRequestID: request.coordinatorID,
+                outputTokenIDs: request.outputTokenTrace,
+                completionTokenCount: request.generatedTokenCount,
+                truncated: request.outputTokenTraceTruncated))
     }
 
     private func flushStopFilter(for id: ServingRequestID) async throws {

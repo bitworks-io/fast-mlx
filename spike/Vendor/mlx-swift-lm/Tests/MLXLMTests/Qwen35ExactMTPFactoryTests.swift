@@ -115,6 +115,36 @@ func testQwen38ExactMTPSelectedLoaderResolvesFixedPairWithUseLatestFalse() async
 }
 
 @Test
+func testQwen35ExactMTPSourceLockedAdmissionRejectsMissingLocalTargetConfig() throws {
+    let root = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let target = root.appending(component: "target")
+    let drafter = root.appending(component: "drafter")
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: drafter, withIntermediateDirectories: true)
+
+    try expectValidationError(.missingFile(role: .target, name: "config.json")) {
+        _ = try Qwen35ExactMTPFactory.admitSourceLockedDepth1Pair(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: target,
+            drafterDirectory: drafter)
+    }
+}
+
+@Test
+func testQwen35ExactMTPSourceLockedAdmissionRejectsSyntheticArtifactDrift() throws {
+    let fixture = try ExactMTPFixture()
+    defer { fixture.cleanup() }
+
+    try expectValidationError(.identityMismatch(role: .target, field: "configSHA256")) {
+        _ = try Qwen35ExactMTPFactory.admitSourceLockedDepth1Pair(
+            selection: .qwen38_27BMXFP8Depth1,
+            targetDirectory: fixture.directory(role: .target),
+            drafterDirectory: fixture.directory(role: .drafter))
+    }
+}
+
+@Test
 func testQwen35ExactMTPResolvedAdmissionPassesForSyntheticDepthOnePair() throws {
     let fixture = try ExactMTPFixture()
     defer { fixture.cleanup() }

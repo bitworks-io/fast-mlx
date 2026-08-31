@@ -78,6 +78,7 @@ public struct Qwen38MTPPerformanceScorecardProducer: Sendable {
                     < Qwen38MTPPerformanceScorecardGate.runPlan.droppedWarmupPairs,
                 order: schedule.order,
                 scheduledCaseIDs: schedule.caseIDs,
+                scheduledBenchmarkCells: schedule.benchmarkCells,
                 candidate: candidate,
                 reference: reference))
         }

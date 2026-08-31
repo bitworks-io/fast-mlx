@@ -12,6 +12,37 @@ package let qwen35FourGDNEnabled: Bool = {
     return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
 }()
 
+/// Default-off opt-in switch for Qwen3.8 Flash-Next four-projection GDN fusion.
+package let qwen4ExpFourGDNEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN4_EXP_FOUR_GDN"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}()
+
+/// A model whose forward pass reads arrays that are NOT discoverable as module
+/// parameters (for example fused projections held in a
+/// ``FusedQuantizedLinearProjectionCache``, which module reflection cannot see).
+///
+/// Compiled serving steps pass module parameters as compile state so traced
+/// graphs reference them as tracer inputs instead of captured constants; models
+/// with out-of-tree forward arrays must surface them here so those arrays get
+/// the same treatment. Captured constants are retained by the compiled trace,
+/// and MLX traced graphs can leak permanently on teardown (orphaned sibling
+/// reference cycles), pinning every captured constant's buffer.
+public protocol AuxiliaryCompiledStateProviding {
+    /// Arrays read by the forward pass that module reflection cannot surface.
+    /// Order must be deterministic across calls.
+    var auxiliaryCompiledState: [MLXArray] { get }
+}
+
+extension FusedQuantizedLinearProjectionCache {
+    /// The prepared fused projection's arrays, for compiled-step state.
+    package var auxiliaryCompiledState: [MLXArray] {
+        fused?.innerState() ?? []
+    }
+}
+
 /// A fused quantized projection and checkpoint-shaped views into its storage.
 ///
 /// The views let a model keep its public/checkpoint module topology without

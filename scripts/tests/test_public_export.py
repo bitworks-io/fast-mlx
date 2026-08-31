@@ -17,6 +17,10 @@ import validate_public_repository  # noqa: E402
 
 
 PUBLIC_VENDOR_SOURCE_OVERRIDES = {
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift",
+        "sha256": "7185ddfe5847fbbdd5b44b682c645d269ddfc3c33f18e405f6ad00e97e167bd0",
+    },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
         "sha256": "e9b3a174ed61aa172b0f1d4a51312ba9536f8d4cc09ccd0e3dbf28f06a94808f",
@@ -265,8 +269,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 829,
-                "pathModeSha256": "a8f0812c35f3a6a1ad41301fcc110cc1d82da769f36e2daa82b1779ee69b0efe",
+                "pathCount": 835,
+                "pathModeSha256": "fb5a52222f782c73917444629bb8ae25622e394981046f3622474c804e659b00",
             },
         )
 
@@ -353,7 +357,7 @@ class PublicExportTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=output, check=True)
             subprocess.run(["git", "add", "."], cwd=output, check=True)
             reexport_count = export_public_repository.export(output, reexport)
-            self.assertEqual(reexport_count, 829)
+            self.assertEqual(reexport_count, 835)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
