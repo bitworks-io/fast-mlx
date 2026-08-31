@@ -981,7 +981,11 @@ enum Qwen38MTPScorecardProcessFacts {
     }
 
     private static func executableSHA256(pid: pid_t) throws -> String {
-        var buffer = [CChar](repeating: 0, count: 16_384)
+        // proc_pidpath fails with EOVERFLOW for buffer sizes LARGER than
+        // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN = 4096) -- the kernel
+        // treats the limit as an exact upper bound, not a minimum. A 16 KiB
+        // buffer therefore made this collector fail unconditionally.
+        var buffer = [CChar](repeating: 0, count: 4_096)
         let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
         guard length > 0 else {
             throw Qwen38MTPScorecardLiveAdapterError.workerError

@@ -635,7 +635,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 cachedMetalBytes: 10,
                 peakMetalBytes: 10),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
-                activeMetalBytes: 10 + 4 * 1_048_576 + 1,
+                activeMetalBytes: 10 + 65_536 + 1,
                 cachedMetalBytes: 10,
                 peakMetalBytes: 12),
         ])
@@ -685,7 +685,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 cachedMetalBytes: 10,
                 peakMetalBytes: 10),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
-                activeMetalBytes: 10 + 4 * 1_048_576 + 1,
+                activeMetalBytes: 10 + 65_536 + 1,
                 cachedMetalBytes: 10,
                 peakMetalBytes: 12),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
@@ -718,8 +718,10 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         // Reviewed exception 2026-08-31: mlx-swift 0.31.6 compiled-trace
         // teardown leaks kilobyte-scale constant-descriptor buffers per
         // load+serve cycle even with weights passed as compile state, so the
-        // post-run gate admits a documented absolute residual of at most
-        // 4 MiB per Metal metric. Exactly the bound must pass.
+        // post-run gate admits a documented absolute residual per Metal
+        // metric. Ratcheted to 64 KiB after the first passing 27B observation
+        // measured an 11,274-byte floor (max(64 KiB, 4x floor) per the
+        // reviewed ruling). Exactly the bound must pass.
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -729,8 +731,8 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 cachedMetalBytes: 1_000,
                 peakMetalBytes: 1_000),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
-                activeMetalBytes: 1_000 + 4 * 1_048_576,
-                cachedMetalBytes: 1_000 + 4 * 1_048_576,
+                activeMetalBytes: 1_000 + 65_536,
+                cachedMetalBytes: 1_000 + 65_536,
                 peakMetalBytes: 6_000_000),
         ])
 
@@ -763,7 +765,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             baseline,
             hostSnapshot(
                 metalCurrentAllocatedSizeBytes:
-                    baseline.metalCurrentAllocatedSizeBytes + 4 * 1_048_576),
+                    baseline.metalCurrentAllocatedSizeBytes + 65_536),
         ])
 
         _ = try await produceQwen38ScorecardProductionRouteObservation(
@@ -785,7 +787,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
     }
 
     func testResidualToleranceExceptionExpiresOnMLXSwiftUpgrade() throws {
-        // The 4 MiB residual tolerance is a reviewed exception verified
+        // The 64 KiB residual tolerance is a reviewed exception verified
         // against mlx-swift 0.31.6's compiled-trace teardown defect. Any
         // upgrade must first re-verify the strict zero-residual gate (and
         // restore it if upstream fixed the orphaned-cycle teardown); this
@@ -807,7 +809,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             state["version"] as? String,
             "0.31.6",
             """
-            mlx-swift changed: the 4 MiB post-run residual tolerance in \
+            mlx-swift changed: the 64 KiB post-run residual tolerance in \
             Qwen38ScorecardProductionRouteObservationCLI was verified against \
             0.31.6 only. Re-verify the strict zero-residual settle gate on the \
             new version, restore it if the upstream orphaned-cycle teardown \
@@ -919,7 +921,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 cachedMetalBytes: 10,
                 peakMetalBytes: 10),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
-                activeMetalBytes: 10 + 4 * 1_048_576 + 1,
+                activeMetalBytes: 10 + 65_536 + 1,
                 cachedMetalBytes: 10,
                 peakMetalBytes: 12),
         ])
@@ -953,7 +955,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 cachedMetalBytes: 10,
                 peakMetalBytes: 10),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
-                activeMetalBytes: 10 + 4 * 1_048_576 + 1,
+                activeMetalBytes: 10 + 65_536 + 1,
                 cachedMetalBytes: 10,
                 peakMetalBytes: 12),
         ])
@@ -1079,7 +1081,7 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
                 peakMetalBytes: 10),
             Qwen38ScorecardProductionRouteMetalMemorySnapshot(
                 activeMetalBytes: 10,
-                cachedMetalBytes: 10 + 4 * 1_048_576 + 1,
+                cachedMetalBytes: 10 + 65_536 + 1,
                 peakMetalBytes: 12),
         ])
 

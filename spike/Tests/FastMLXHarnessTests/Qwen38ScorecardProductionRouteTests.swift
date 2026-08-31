@@ -465,6 +465,41 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
                     outputTokenCount: 2))
         }
     }
+
+    func testProcessIsolationCollectsRealProcessFactsForSelf() throws {
+        // XNU's proc_pidpath rejects buffer sizes LARGER than
+        // PROC_PIDPATHINFO_MAXSIZE (4096) with EOVERFLOW, so a 16 KiB buffer
+        // meant this collector could never succeed on any host. The failure
+        // stayed latent because every earlier dedicated-host observation died
+        // before the post-cleanup step that first exercises it live.
+        // The collector also resolves qualification provenance, which
+        // correctly refuses a dirty development tree. Reaching that provenance
+        // step already proves the process-facts primitives work (the
+        // historical defect threw workerError before ever getting there), so
+        // a dirty-tree provenance refusal is tolerated; every other error
+        // still fails the test.
+        do {
+            let evidence = try Qwen38MTPScorecardProcessFacts.processIsolation(
+                mode: .gdnOn,
+                observedEnv: Qwen38MTPScorecardProcessFacts.observedGDNEnv(
+                    mode: .gdnOn))
+            XCTAssertEqual(evidence.processID, Int(getpid()))
+            XCTAssertEqual(evidence.executableSHA256.count, 64)
+            XCTAssertTrue(evidence.executableSHA256.allSatisfy { character in
+                character.isNumber || ("a" ... "f").contains(character)
+            })
+            XCTAssertNotEqual(
+                evidence.executableSHA256,
+                String(repeating: "0", count: 64))
+            XCTAssertGreaterThan(evidence.processStartUptimeNanoseconds, 0)
+        } catch let error as KVTunerQualificationCLIError {
+            guard case .invalidHarnessGitSHA(let value) = error,
+                value.hasSuffix("-dirty")
+            else {
+                throw error
+            }
+        }
+    }
 }
 
 private actor ActiveSnapshotBeforeStartReturnProbe {

@@ -20,12 +20,13 @@ private let qwen38ProductionRouteCleanupAttemptLimit = 31
 /// absolute residual per Metal metric. The bound keeps >=20x margin below the
 /// smallest weight-scale leak signal observed (85 MB fused-only at 9B) and
 /// still catches KV-row- and logits-scale leaks. Conditions: every cleanup
-/// attempt logs raw before/observed facts; after the first passing 27B
-/// observation, ratchet to max(64 KiB, 4x the measured floor); the exception
-/// expires on any mlx-swift upgrade (a version-pin regression test fails until
-/// the strict gate is re-verified). See
-/// docs/task-inbox/2026-08-31-teardown-compiled-state-followups.md.
-let qwen38ProductionRouteResidualToleranceBytes: UInt64 = 4 * 1_048_576
+/// attempt logs raw before/observed facts; the exception expires on any
+/// mlx-swift upgrade (a version-pin regression test fails until the strict
+/// gate is re-verified). Ratcheted 2026-08-31 from the initial 4 MiB to
+/// max(64 KiB, 4x measured floor) after the first passing 27B observation
+/// measured an 11,274-byte post-run active residual (C2+C4, GDN fusion on).
+/// See docs/task-inbox/2026-08-31-teardown-compiled-state-followups.md.
+let qwen38ProductionRouteResidualToleranceBytes: UInt64 = 65_536
 
 struct Qwen38ScorecardProductionRouteObservationArguments:
     Equatable, Sendable
