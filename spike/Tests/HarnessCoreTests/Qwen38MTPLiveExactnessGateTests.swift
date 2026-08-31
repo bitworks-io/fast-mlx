@@ -549,22 +549,24 @@ final class Qwen38MTPLiveExactnessGateTests: XCTestCase {
             acceptedLiveExactnessProof: liveProof,
             trustedEngineIdentities: .init(
                 candidate: .init(
-                    label: "candidate",
+                    label: Qwen38MTPPerformanceScorecardGate.modelArtifactLabel,
+                    executionMode: .exactMTP,
                     artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
                     executionDigest: Qwen38MTPPerformanceScorecardGate.promptSHA256(
-                        "generic candidate execution identity"),
+                        "generic exact mtp execution identity"),
                     sourceDigest: sourceID,
                     gdnMode: .gdnOn,
                     launchBinding: liveProof.launchBinding!),
                 reference: .init(
-                    label: "reference",
+                    label: Qwen38MTPPerformanceScorecardGate.modelArtifactLabel,
+                    executionMode: .scalar,
                     artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
                     executionDigest: Qwen38MTPPerformanceScorecardGate.promptSHA256(
-                        "generic reference execution identity"),
+                        "generic scalar execution identity"),
                     sourceDigest: sourceID,
-                    gdnMode: .gdnOff,
+                    gdnMode: .gdnOn,
                     launchBinding: scorecardLaunchBinding(
-                        mode: .gdnOff,
+                        mode: .gdnOn,
                         sourceDigest: sourceID,
                         processIsolationEvidenceID: hex("5")))),
             trustedRunIdentity: .init(

@@ -94,6 +94,62 @@ final class Qwen38PerformanceAttributionScorecardGateTests: XCTestCase {
         }
     }
 
+    func testFrozenQwen38MTPClaimsRequireBothSidesGDNOn() throws {
+        let cases: [(
+            kind: Qwen38PerformanceAttributionClaimKind,
+            candidateGDN: Qwen38MTPPerformanceScorecardGDNMode,
+            referenceGDN: Qwen38MTPPerformanceScorecardGDNMode
+        )] = [
+            (.exactMTP, .gdnOff, .gdnOff),
+            (.exactMTP, .gdnOn, .gdnOff),
+            (.exactMTP, .gdnOff, .gdnOn),
+            (.continuousBatchNoSpec, .gdnOff, .gdnOff),
+            (.continuousBatchNoSpec, .gdnOn, .gdnOff),
+            (.continuousBatchNoSpec, .gdnOff, .gdnOn),
+            (.prefixMatrix, .gdnOff, .gdnOff),
+            (.prefixMatrix, .gdnOn, .gdnOff),
+            (.prefixMatrix, .gdnOff, .gdnOn),
+        ]
+
+        for testCase in cases {
+            var claim = try makeClaim(testCase.kind)
+            let candidateExecutionMode: Qwen38MTPPerformanceScorecardExecutionMode =
+                testCase.kind == .exactMTP ? .exactMTP : .scalar
+            let candidate = model(
+                candidateExecutionMode,
+                testCase.candidateGDN,
+                "\(testCase.kind.rawValue)-candidate-\(testCase.candidateGDN.rawValue)")
+            var reference = model(
+                .scalar,
+                testCase.referenceGDN,
+                "\(testCase.kind.rawValue)-reference-\(testCase.referenceGDN.rawValue)")
+            if testCase.kind == .prefixMatrix {
+                reference.executionDigest = candidate.executionDigest
+            }
+            rebindCandidate(&claim, to: candidate)
+            rebindReference(&claim, to: reference)
+
+            XCTAssertThrowsError(
+                try Gate.evaluateClaim(claim),
+                "\(testCase.kind) \(testCase.candidateGDN)->\(testCase.referenceGDN)"
+            ) { error in
+                XCTAssertEqual(error as? Error, .invalidClaimIdentity(testCase.kind))
+            }
+        }
+    }
+
+    func testRejectsPerMeasurementIdentityDrift() throws {
+        var claim = try makeClaim(.exactMTP)
+        claim.measurements[0].candidate.identity = model(
+            .exactMTP,
+            .gdnOn,
+            "exact-mtp-measurement-drift")
+
+        XCTAssertThrowsError(try Gate.evaluateClaim(claim)) { error in
+            XCTAssertEqual(error as? Error, .invalidCell(.exactMTP, claim.measurements[0].cellID))
+        }
+    }
+
     func testScalarGDNAxisRequiresOrderedModesAndValidIsolatedLaunchBindings() throws {
         var missingMode = try makeClaim(.scalarGDN)
         var missingModeCandidate = missingMode.candidate
