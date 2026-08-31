@@ -17,9 +17,41 @@ import validate_public_repository  # noqa: E402
 
 
 PUBLIC_VENDOR_SOURCE_OVERRIDES = {
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
+        "sha256": "e9b3a174ed61aa172b0f1d4a51312ba9536f8d4cc09ccd0e3dbf28f06a94808f",
+    },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift",
         "sha256": "9f5c926ffe8625b6b17dd7a48056f2d638f29b1a9036b188a6cf1c5e16230d44",
+    },
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/KVCache.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/KVCache.swift",
+        "sha256": "300e934c43eeffbbac0f90d3befdb8818907aa761ed34ef2cec2ed25d808f1c7",
+    },
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift",
+        "sha256": "92961eeae7ebf41df1d6139cef4ec2d0120ce568fe1d735d29cb583fa8f42add",
+    },
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift",
+        "sha256": "dbc0022d335dc58d701f6e63c2c1b021de52bc0d564fa99939e5a4cdbb3fbbcf",
+    },
+    "spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift",
+        "sha256": "0e0cd9862862ab59759c1496db85b217a2adb195f4ae6f25ac18288ea378b275",
+    },
+    "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/KVCacheTests.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/KVCacheTests.swift",
+        "sha256": "af9608bdc3b308a4e4eb61577408ae0568b05ea0d3e95399e6c3a989aeee182f",
+    },
+    "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift",
+        "sha256": "8c85863172a0b83fbd0b43403441fcd19ec2a687aa750f8f0907597eedc9a826",
+    },
+    "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift": {
+        "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift",
+        "sha256": "621e756789d279c062a9b04d40c0ba69ebc65f5c194cc4c0ccdfbe66932e576f",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift",
@@ -233,8 +265,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 827,
-                "pathModeSha256": "75fb7027d1edb296b5114e913bb4d20504d4bd3b4237723638e1c4dea6554a7d",
+                "pathCount": 829,
+                "pathModeSha256": "a8f0812c35f3a6a1ad41301fcc110cc1d82da769f36e2daa82b1779ee69b0efe",
             },
         )
 
@@ -292,6 +324,19 @@ class PublicExportTests(unittest.TestCase):
             )
 
             self.assertFalse((output / "public/sanitized-projection").exists())
+            internal_family_marker = "Qwen" + "4Exp"
+            internal_family_paths = sorted(
+                str(path.relative_to(output))
+                for path in output.rglob(f"*{internal_family_marker}*")
+            )
+            self.assertEqual(internal_family_paths, [])
+            internal_family_content = sorted(
+                str(path.relative_to(output))
+                for path in output.rglob("*")
+                if path.is_file()
+                and internal_family_marker.encode("utf-8") in path.read_bytes()
+            )
+            self.assertEqual(internal_family_content, [])
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 self.assertEqual(
@@ -308,7 +353,7 @@ class PublicExportTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=output, check=True)
             subprocess.run(["git", "add", "."], cwd=output, check=True)
             reexport_count = export_public_repository.export(output, reexport)
-            self.assertEqual(reexport_count, 827)
+            self.assertEqual(reexport_count, 829)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
