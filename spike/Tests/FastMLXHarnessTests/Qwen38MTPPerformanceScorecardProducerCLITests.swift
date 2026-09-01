@@ -183,19 +183,21 @@ final class Qwen38MTPPerformanceScorecardProducerCLITests: XCTestCase {
                 launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
             trustedEngineIdentities: .init(
                 candidate: .init(
-                    label: "candidate",
+                    label: "engine",
+                    executionMode: .exactMTP,
                     artifact: Gate.requiredArtifact,
-                    executionDigest: Gate.promptSHA256("generic candidate execution"),
+                    executionDigest: Gate.promptSHA256("generic exact mtp execution"),
                     sourceDigest: sharedSourceDigest,
                     gdnMode: .gdnOn,
                     launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
                 reference: .init(
-                    label: "reference",
+                    label: "engine",
+                    executionMode: .scalar,
                     artifact: Gate.requiredArtifact,
-                    executionDigest: Gate.promptSHA256("generic reference execution"),
+                    executionDigest: Gate.promptSHA256("generic scalar execution"),
                     sourceDigest: sharedSourceDigest,
-                    gdnMode: .gdnOff,
-                    launchBinding: launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("5")))),
+                    gdnMode: .gdnOn,
+                    launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("5")))),
             trustedRunIdentity: .init(
                 measurementClass: Gate.measurementClass,
                 hardwareChip: "generic-heavy-chip",
@@ -241,6 +243,8 @@ final class Qwen38MTPPerformanceScorecardProducerCLITests: XCTestCase {
                     warmup: schedule.pairIndex < Gate.runPlan.droppedWarmupPairs,
                     order: schedule.order,
                     scheduledCaseIDs: schedule.caseIDs,
+                    scheduledBenchmarkCells: schedule.benchmarkCells,
+                    lane: schedule.lane,
                     candidate: makeEngine(
                         identity: authority.trustedEngineIdentities.candidate,
                         schedule: schedule,
@@ -269,6 +273,7 @@ final class Qwen38MTPPerformanceScorecardProducerCLITests: XCTestCase {
             let identitySeed = "\(schedule.concurrency)-\(schedule.pairIndex)-\(requestIndex)"
             return Qwen38MTPPerformanceScorecardRequestMeasurement(
                 caseID: caseID,
+                benchmarkCell: schedule.benchmarkCells[requestIndex],
                 requestIndex: requestIndex,
                 promptSeconds: 0.25,
                 prefillSeconds: 0.8,

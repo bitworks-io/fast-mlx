@@ -159,6 +159,61 @@ final class Qwen38MTPScorecardLiveAdapterTests: XCTestCase {
         }
     }
 
+    func testCoordinatorRejectsReferenceHandshakeReportingGDNOffLaunch() async throws {
+        let fixture = ScorecardFixture()
+        let candidate = FakeScorecardWorker(
+            role: .candidate,
+            handshake: fixture.handshake(role: .candidate, isolationSeed: "4"),
+            exactnessRecord: fixture.liveExactnessRecord(isolationSeed: "4"),
+            measurements: fixture.measurements(candidate: true))
+        let reference = FakeScorecardWorker(
+            role: .reference,
+            handshake: fixture.handshake(
+                role: .reference,
+                isolationSeed: "5",
+                gdnMode: .gdnOff,
+                observedEnv: .disabled),
+            measurements: fixture.measurements(candidate: false))
+
+        await XCTAssertThrowsErrorAsync(
+            try await Qwen38MTPScorecardLiveCoordinator(
+                candidate: candidate,
+                reference: reference,
+                runIdentity: fixture.runIdentity,
+                provenance: fixture.provenance,
+                releaseBuildObserved: true).run()
+        ) { error in
+            XCTAssertEqual(error as? AdapterError, .invalidHandshake(.reference))
+        }
+    }
+
+    func testCoordinatorRejectsHandshakeWhoseExecutionModeMismatchesItsRole() async throws {
+        let fixture = ScorecardFixture()
+        let candidate = FakeScorecardWorker(
+            role: .candidate,
+            handshake: fixture.handshake(
+                role: .candidate,
+                isolationSeed: "4",
+                executionMode: .scalar),
+            exactnessRecord: fixture.liveExactnessRecord(isolationSeed: "4"),
+            measurements: fixture.measurements(candidate: true))
+        let reference = FakeScorecardWorker(
+            role: .reference,
+            handshake: fixture.handshake(role: .reference, isolationSeed: "5"),
+            measurements: fixture.measurements(candidate: false))
+
+        await XCTAssertThrowsErrorAsync(
+            try await Qwen38MTPScorecardLiveCoordinator(
+                candidate: candidate,
+                reference: reference,
+                runIdentity: fixture.runIdentity,
+                provenance: fixture.provenance,
+                releaseBuildObserved: true).run()
+        ) { error in
+            XCTAssertEqual(error as? AdapterError, .invalidHandshake(.candidate))
+        }
+    }
+
     func testCoordinatorDrainsAndTerminatesBothWorkersOnCancellation() async throws {
         let fixture = ScorecardFixture()
         let candidate = FakeScorecardWorker(
@@ -891,11 +946,11 @@ private struct ScorecardFixture {
 
     func handshake(
         role: Qwen38MTPPerformanceScorecardEngineRole,
-        isolationSeed: Character
+        isolationSeed: Character,
+        gdnMode mode: Qwen38MTPPerformanceScorecardGDNMode = .gdnOn,
+        observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv = .enabled,
+        executionMode: Qwen38MTPPerformanceScorecardExecutionMode? = nil
     ) -> Qwen38MTPScorecardWorkerHandshake {
-        let mode: Qwen38MTPPerformanceScorecardGDNMode = role == .candidate ? .gdnOn : .gdnOff
-        let observedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv =
-            role == .candidate ? .enabled : .disabled
         let isolation = processIsolation(seed: isolationSeed, mode: mode, observedEnv: observedEnv)
         let processID = Qwen38MTPLiveExactnessGate.processIsolationEvidenceID(for: isolation)
         let launchBinding = Qwen38MTPPerformanceScorecardLaunchBinding(
@@ -911,7 +966,8 @@ private struct ScorecardFixture {
         return Qwen38MTPScorecardWorkerHandshake(
             role: role,
             model: Qwen38MTPPerformanceScorecardModel(
-                label: role.rawValue,
+                label: "engine",
+                executionMode: executionMode ?? (role == .candidate ? .exactMTP : .scalar),
                 artifact: Gate.requiredArtifact,
                 executionDigest: hex(role == .candidate ? "c" : "d"),
                 sourceDigest: Qwen38MTPLiveExactnessGate.requiredSourceIdentity.sourceID,
@@ -993,6 +1049,7 @@ private struct ScorecardFixture {
             requests: schedule.caseIDs.enumerated().map { requestIndex, caseID in
                 Qwen38MTPPerformanceScorecardRequestMeasurement(
                     caseID: caseID,
+                    benchmarkCell: schedule.benchmarkCells[requestIndex],
                     requestIndex: requestIndex,
                     promptSeconds: 0.25,
                     prefillSeconds: 0.8,

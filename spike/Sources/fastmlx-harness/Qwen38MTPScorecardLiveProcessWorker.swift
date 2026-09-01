@@ -87,13 +87,10 @@ actor Qwen38MTPScorecardProcessLineTransport: Qwen38MTPScorecardLineTransport {
             "--reserved-prefetch-bytes", "\(arguments.memoryBudget.reservedPrefetchBytes)",
             "--os-service-reserve-bytes", "\(arguments.memoryBudget.osServiceReserveBytes)",
         ]
+        // Fixed-GDN executionMode axis: both workers launch with GDN fusion enabled;
+        // the candidate/reference split is the exact-MTP vs scalar route, not the env.
         var environment = ProcessInfo.processInfo.environment
-        switch role {
-        case .candidate:
-            environment[qwen38MTPScorecardGDNEnvironmentKey] = "1"
-        case .reference:
-            environment.removeValue(forKey: qwen38MTPScorecardGDNEnvironmentKey)
-        }
+        environment[qwen38MTPScorecardGDNEnvironmentKey] = "1"
         process.environment = environment
         process.standardInput = input
         process.standardOutput = output
@@ -364,12 +361,9 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
         else {
             throw Qwen38MTPScorecardLiveAdapterError.invalidMemoryBudget
         }
-        let mode: Qwen38MTPPerformanceScorecardGDNMode =
-            arguments.role == .candidate ? .gdnOn : .gdnOff
+        let mode: Qwen38MTPPerformanceScorecardGDNMode = .gdnOn
         let observedEnv = Qwen38MTPScorecardProcessFacts.observedGDNEnv(mode: mode)
-        guard (arguments.role == .candidate && observedEnv == .enabled)
-            || (arguments.role == .reference && observedEnv == .disabled)
-        else {
+        guard observedEnv == .enabled else {
             throw Qwen38MTPScorecardLiveAdapterError.workerEnvDrift(arguments.role)
         }
         let processIsolation = try Qwen38MTPScorecardProcessFacts.processIsolation(
@@ -398,11 +392,11 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
             throw Qwen38MTPScorecardLiveAdapterError.workerError
         }
         self.pair = loaded
-        let label = arguments.role.rawValue
         self.handshake = Qwen38MTPScorecardWorkerHandshake(
             role: arguments.role,
             model: Qwen38MTPPerformanceScorecardModel(
-                label: label,
+                label: qwen38MTPScorecardSharedEngineLabel,
+                executionMode: arguments.role == .candidate ? .exactMTP : .scalar,
                 artifact: Qwen38MTPPerformanceScorecardGate.requiredArtifact,
                 executionDigest: Qwen38MTPScorecardProcessFacts.executionDigest(
                     role: arguments.role,
@@ -543,6 +537,9 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
         guard request.role == arguments.role else {
             throw Qwen38MTPScorecardLiveAdapterError.invalidWorkerRole(arguments.role)
         }
+        guard request.schedule.benchmarkCells.count == request.schedule.caseIDs.count else {
+            throw Qwen38MTPScorecardLiveAdapterError.workerError
+        }
         let before = qwen38MTPScorecardThermalState()
         let wallStart = ProcessInfo.processInfo.systemUptime
         let results = try await withThrowingTaskGroup(
@@ -586,7 +583,11 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
         }
         return Qwen38MTPPerformanceScorecardEngineMeasurement(
             identity: request.identity,
-            requests: results.map(\.requestMeasurement),
+            requests: results.map { result in
+                var measurement = result.requestMeasurement
+                measurement.benchmarkCell = request.schedule.benchmarkCells[result.requestIndex]
+                return measurement
+            },
             wallSeconds: wallSeconds,
             peakRSSBytes: qwen38MTPScorecardPeakRSSBytes(),
             peakMetalBytes: UInt64(max(Memory.snapshot().peakMemory, 1)),

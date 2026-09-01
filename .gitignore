@@ -7,6 +7,9 @@ CLAUDE.local.md
 /.tmp-*
 # SwiftPM build artifacts (local `swift test` runs in spike/)
 .build/
+# Python bytecode from local unittest/projection-gate runs
+__pycache__/
+*.pyc
 # harness runtime evidence (Task 5): generated per-run, not source
 spike/harness-evidence.jsonl
 spike/*.csv

@@ -191,19 +191,21 @@ final class Qwen38MTPPerformanceScorecardCLITests: XCTestCase {
     private var trustedEngineIdentities: Qwen38MTPPerformanceScorecardTrustedEngineIdentities {
         Qwen38MTPPerformanceScorecardTrustedEngineIdentities(
             candidate: Qwen38MTPPerformanceScorecardModel(
-                label: "candidate",
+                label: "engine",
+                executionMode: .exactMTP,
                 artifact: Gate.requiredArtifact,
-                executionDigest: Gate.promptSHA256("generic candidate execution identity"),
+                executionDigest: Gate.promptSHA256("generic exact mtp execution identity"),
                 sourceDigest: sharedSourceDigest,
                 gdnMode: .gdnOn,
                 launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("4"))),
             reference: Qwen38MTPPerformanceScorecardModel(
-                label: "reference",
+                label: "engine",
+                executionMode: .scalar,
                 artifact: Gate.requiredArtifact,
-                executionDigest: Gate.promptSHA256("generic reference execution identity"),
+                executionDigest: Gate.promptSHA256("generic scalar execution identity"),
                 sourceDigest: sharedSourceDigest,
-                gdnMode: .gdnOff,
-                launchBinding: launchBinding(mode: .gdnOff, processIsolationEvidenceID: hex("5"))))
+                gdnMode: .gdnOn,
+                launchBinding: launchBinding(mode: .gdnOn, processIsolationEvidenceID: hex("5"))))
     }
 
     private var trustedRunIdentity: Qwen38MTPPerformanceScorecardTrustedRunIdentity {
@@ -270,6 +272,8 @@ final class Qwen38MTPPerformanceScorecardCLITests: XCTestCase {
                 warmup: schedule.pairIndex < Gate.runPlan.droppedWarmupPairs,
                 order: schedule.order,
                 scheduledCaseIDs: schedule.caseIDs,
+                scheduledBenchmarkCells: schedule.benchmarkCells,
+                lane: schedule.lane,
                 candidate: makeEngine(
                     identity: trustedEngineIdentities.candidate,
                     schedule: schedule,
@@ -296,6 +300,7 @@ final class Qwen38MTPPerformanceScorecardCLITests: XCTestCase {
             requests: schedule.caseIDs.enumerated().map { requestIndex, caseID in
                 makeRequest(
                     caseID: caseID,
+                    benchmarkCell: schedule.benchmarkCells[requestIndex],
                     requestIndex: requestIndex,
                     seed: offset + requestIndex,
                     e2eSeconds: e2e,
@@ -314,6 +319,7 @@ final class Qwen38MTPPerformanceScorecardCLITests: XCTestCase {
 
     private func makeRequest(
         caseID: String,
+        benchmarkCell: Qwen38MTPPerformanceScorecardBenchmarkCellIdentity,
         requestIndex: Int,
         seed: Int,
         e2eSeconds: Double,
@@ -321,6 +327,7 @@ final class Qwen38MTPPerformanceScorecardCLITests: XCTestCase {
     ) -> Qwen38MTPPerformanceScorecardRequestMeasurement {
         Qwen38MTPPerformanceScorecardRequestMeasurement(
             caseID: caseID,
+            benchmarkCell: benchmarkCell,
             requestIndex: requestIndex,
             promptSeconds: 0.25,
             prefillSeconds: 0.80,

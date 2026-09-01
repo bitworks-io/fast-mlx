@@ -323,6 +323,10 @@ struct Qwen38MTPScorecardFreshOutputSet: Equatable, Sendable {
     }
 }
 
+/// Both live workers run the same engine build on the same artifact; the sealed
+/// authority requires one shared label with the roles split by executionMode.
+let qwen38MTPScorecardSharedEngineLabel = "engine"
+
 struct Qwen38MTPScorecardWorkerHandshake:
     Codable, Equatable, Sendable
 {
@@ -413,15 +417,17 @@ struct Qwen38MTPScorecardLiveCoordinator<Candidate: Qwen38MTPScorecardWorkerClie
         guard handshake.role == expectedRole else {
             throw Qwen38MTPScorecardLiveAdapterError.invalidWorkerRole(handshake.role)
         }
-        let expectedMode: Qwen38MTPPerformanceScorecardGDNMode =
-            expectedRole == .candidate ? .gdnOn : .gdnOff
-        let expectedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv =
-            expectedRole == .candidate ? .enabled : .disabled
-        guard handshake.model.gdnMode == expectedMode,
-            handshake.processIsolation.gdnMode == expectedMode,
-            handshake.processIsolation.observedEnv == expectedEnv,
-            handshake.launchBinding.mode == expectedMode,
-            handshake.launchBinding.observedEnv == expectedEnv,
+        // Fixed-GDN executionMode axis: every worker must observe GDN fusion enabled;
+        // roles differ only in the exact-MTP vs scalar execution route.
+        let expectedExecutionMode: Qwen38MTPPerformanceScorecardExecutionMode =
+            expectedRole == .candidate ? .exactMTP : .scalar
+        guard handshake.model.gdnMode == .gdnOn,
+            handshake.model.executionMode == expectedExecutionMode,
+            handshake.model.label == qwen38MTPScorecardSharedEngineLabel,
+            handshake.processIsolation.gdnMode == .gdnOn,
+            handshake.processIsolation.observedEnv == .enabled,
+            handshake.launchBinding.mode == .gdnOn,
+            handshake.launchBinding.observedEnv == .enabled,
             handshake.model.launchBinding == handshake.launchBinding
         else {
             throw Qwen38MTPScorecardLiveAdapterError.invalidHandshake(expectedRole)
