@@ -269,8 +269,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 835,
-                "pathModeSha256": "fb5a52222f782c73917444629bb8ae25622e394981046f3622474c804e659b00",
+                "pathCount": 839,
+                "pathModeSha256": "316023f4e8bcfa7c6447940643187c1b2ae740fb56981ed25241a16733ca5643",
             },
         )
 
@@ -357,7 +357,7 @@ class PublicExportTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=output, check=True)
             subprocess.run(["git", "add", "."], cwd=output, check=True)
             reexport_count = export_public_repository.export(output, reexport)
-            self.assertEqual(reexport_count, 835)
+            self.assertEqual(reexport_count, 839)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
