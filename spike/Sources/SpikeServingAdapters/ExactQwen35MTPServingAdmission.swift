@@ -134,6 +134,10 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
             QwenMTPKnownArtifactLocks.qwen35_9BDepth1
         case .qwen38_27BMXFP8Depth1:
             QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            // Identity mapping only; the 4-bit row has no ServingCore argument case, so serving
+            // cannot select it until its own live-exactness and quality gates land.
+            QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
         }
     }
 }

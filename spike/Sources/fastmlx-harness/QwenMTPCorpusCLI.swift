@@ -14,9 +14,12 @@ enum QwenMTPCorpusCLIError: Error, CustomStringConvertible {
     case evaluationOrderUsage
     case hiddenFirstRuntimeUsage
     case combinedEvaluationUsage
+    case longProfileUsage
     case evidenceMustBeNewOrEmpty(String)
     case unexpectedDownloadRequest(id: String, revision: String?)
     case releaseBuildRequired
+    case gdnEnvironmentNotPinned
+    case longProfileMeasurementFailure(caseID: String, pairIndex: Int, reason: String)
     case hiddenFirstRuntimeNotQualified
     case cannotCreateEvidence(String)
     case missingEvaluationOrderTelemetry(String)
@@ -25,6 +28,16 @@ enum QwenMTPCorpusCLIError: Error, CustomStringConvertible {
         switch self {
         case .usage:
             return "usage: fastmlx-harness qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL> [--profile true|false]"
+        case .longProfileUsage:
+            return "usage: fastmlx-harness qwen-mtp-long-profile --target <DIR> --drafter <DIR> "
+                + "--evidence <NEW-OR-EMPTY JSONL> [--binding qwen35-9b-depth1|"
+                + "qwen38-27b-mxfp8-depth1|qwen38-27b-4bit-depth1]"
+        case .gdnEnvironmentNotPinned:
+            return "qwen-mtp-long-profile requires MLX_QWEN_FOUR_GDN=1 in the environment: the "
+                + "pre-check contract pins GDN-on for every arm"
+        case .longProfileMeasurementFailure(let caseID, let pairIndex, let reason):
+            return "qwen-mtp-long-profile \(caseID) pair \(pairIndex) failed fail-closed "
+                + "measurement checks: \(reason)"
         case .evaluationOrderUsage:
             return "usage: fastmlx-harness qwen-mtp-eval-order --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>"
         case .hiddenFirstRuntimeUsage:
@@ -1340,4 +1353,285 @@ private func hiddenFirstRuntimeResultRecord(
             corpusContentHash: payload.corpusContentHash,
             nonce: UUID().uuidString),
         payload: payload)
+}
+
+// MARK: - Long-decode (production-completion-shape) non-authoritative profile
+
+func runQwenMTPLongProfile(_ flags: Flags) async throws {
+    let targetPath = try flags.strictString("target", default: "")
+    let drafterPath = try flags.strictString("drafter", default: "")
+    let evidencePath = try flags.strictString("evidence", default: "")
+    let bindingRaw = try flags.strictString(
+        "binding", default: Qwen35ExactMTPRuntimeSelection.qwen35_9BDepth1.rawValue)
+    guard !targetPath.isEmpty, !drafterPath.isEmpty, !evidencePath.isEmpty,
+        let selection = Qwen35ExactMTPRuntimeSelection(rawValue: bindingRaw)
+    else {
+        throw QwenMTPCorpusCLIError.longProfileUsage
+    }
+    guard qwenMTPCorpusReleaseBuildObserved else {
+        throw QwenMTPCorpusCLIError.releaseBuildRequired
+    }
+    let gdnMode: Qwen38MTPPerformanceScorecardGDNMode = .gdnOn
+    let gdnObservedEnv = Qwen38MTPScorecardProcessFacts.observedGDNEnv(mode: gdnMode)
+    guard gdnObservedEnv == .enabled else {
+        throw QwenMTPCorpusCLIError.gdnEnvironmentNotPinned
+    }
+
+    let evidenceURL = URL(fileURLWithPath: evidencePath)
+    try requireNewOrEmptyEvidence(evidenceURL)
+    let downloader = QwenMTPSelectedExactRevisionDownloader(
+        selection: selection,
+        target: URL(fileURLWithPath: targetPath, isDirectory: true),
+        drafter: URL(fileURLWithPath: drafterPath, isDirectory: true))
+    print("qwen-mtp-long-profile loading binding=\(selection.rawValue) gdn=\(gdnMode.rawValue)")
+    let pair = try await Qwen35ExactMTPRuntimeFactory.loadDepth1Pair(
+        selection: selection,
+        from: downloader,
+        using: #huggingFaceTokenizerLoader())
+
+    let plan = QwenMTPLongProfileGate.profilePlan
+    var caseProfiles: [QwenMTPLongProfileCaseProfile] = []
+    var samples: [QwenMTPCorpusProfileSample] = []
+
+    func writeRejectedEvidence() throws {
+        let payload = longProfilePayload(
+            pair: pair,
+            gdnMode: gdnMode,
+            gdnObservedEnv: gdnObservedEnv,
+            caseProfiles: caseProfiles,
+            samples: samples)
+        let rejectedURL = evidenceURL.appendingPathExtension("rejected")
+        try requireNewOrEmptyEvidence(rejectedURL)
+        try RequiredJSONLWriter.append(
+            longProfileResultRecord(
+                payload,
+                targetPath: targetPath,
+                subcommand: QwenMTPLongProfileGate.rejectedSubcommand),
+            to: rejectedURL)
+    }
+
+    for caseID in plan.caseIDs {
+        guard let spec = QwenMTPLongProfileGate.cases.first(where: { $0.id == caseID }) else {
+            throw QwenMTPCorpusCLIError.longProfileUsage
+        }
+        let promptTokens = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
+        guard promptTokens >= QwenMTPLongProfileGate.minimumPromptTokenCount else {
+            throw QwenMTPCorpusCLIError.longProfileMeasurementFailure(
+                caseID: caseID,
+                pairIndex: -1,
+                reason: "prompt tokenizes to \(promptTokens); below long-context floor "
+                    + "\(QwenMTPLongProfileGate.minimumPromptTokenCount) — refusing before any generation")
+        }
+        print("qwen-mtp-long-profile \(caseID) promptTokens=\(promptTokens)")
+        caseProfiles.append(.init(caseID: caseID, promptTokenCount: promptTokens))
+    }
+
+    for (caseIndex, caseID) in plan.caseIDs.enumerated() {
+        let spec = QwenMTPLongProfileGate.cases[caseIndex]
+        for pairIndex in 0..<plan.totalPairsPerCase {
+            let order = plan.orders[pairIndex]
+            let parameters = GenerateParameters(maxTokens: spec.maxTokens, temperature: 0)
+            let scalar: CorpusRun
+            let mtp: CorpusRun
+            switch order {
+            case .scalarThenMTP:
+                scalar = try runScalar(spec, pair: pair, parameters: parameters)
+                mtp = try runMTPDrain(spec, pair: pair, parameters: parameters)
+            case .mtpThenScalar:
+                mtp = try runMTPDrain(spec, pair: pair, parameters: parameters)
+                scalar = try runScalar(spec, pair: pair, parameters: parameters)
+            }
+
+            let exactness = exactnessEvidence(scalar: scalar, mtp: mtp)
+            if let failure = longProfilePairFailure(scalar: scalar, mtp: mtp) {
+                try writeRejectedEvidence()
+                throw QwenMTPCorpusCLIError.longProfileMeasurementFailure(
+                    caseID: caseID, pairIndex: pairIndex, reason: failure)
+            }
+
+            let scalarTPS = Double(scalar.tokens.count) / scalar.timing.e2eSeconds
+            let mtpTPS = Double(mtp.tokens.count) / mtp.timing.e2eSeconds
+            samples.append(.init(
+                caseID: caseID,
+                pairIndex: pairIndex,
+                warmup: pairIndex < plan.droppedWarmupPairs,
+                order: order,
+                exactness: exactness,
+                scalarTiming: scalar.timing,
+                mtpTiming: mtp.timing,
+                scalarTokensPerSecond: scalarTPS,
+                mtpTokensPerSecond: mtpTPS,
+                decodeOnlyRatio: scalar.timing.generationSeconds / mtp.timing.generationSeconds,
+                e2eRatio: mtpTPS / scalarTPS,
+                mtpTelemetry: mtp.mtpTelemetry,
+                mtpPhaseAttribution: mtp.mtpPhaseAttribution!,
+                passthroughReason: mtp.passthroughReason))
+            print(String(
+                format: "qwen-mtp-long-profile %@ pair %d/%d order=%@ warmup=%@ tokens=%d "
+                    + "scalar_decode=%.1fs mtp_decode=%.1fs decode_ratio=%.4f accepted=%d/%d",
+                caseID,
+                pairIndex + 1,
+                plan.totalPairsPerCase,
+                order.rawValue,
+                pairIndex < plan.droppedWarmupPairs ? "yes" : "no",
+                mtp.tokens.count,
+                scalar.timing.generationSeconds,
+                mtp.timing.generationSeconds,
+                scalar.timing.generationSeconds / mtp.timing.generationSeconds,
+                mtp.mtpTelemetry.acceptedDraftTokens,
+                mtp.mtpTelemetry.proposedDraftTokens))
+        }
+    }
+
+    let payload = longProfilePayload(
+        pair: pair,
+        gdnMode: gdnMode,
+        gdnObservedEnv: gdnObservedEnv,
+        caseProfiles: caseProfiles,
+        samples: samples)
+    let summary: QwenMTPLongProfileSummary
+    do {
+        summary = try QwenMTPLongProfileGate.validate(payload)
+    } catch {
+        try writeRejectedEvidence()
+        throw error
+    }
+    try RequiredJSONLWriter.append(
+        longProfileResultRecord(
+            payload,
+            targetPath: targetPath,
+            subcommand: QwenMTPLongProfileGate.subcommand),
+        to: evidenceURL)
+    for caseSummary in summary.perCase {
+        print(String(
+            format: "qwen-mtp-long-profile SUMMARY %@ decode_ratio_median=%.4f "
+                + "e2e_ratio_median=%.4f scalar_decode_tps=%.2f mtp_decode_tps=%.2f "
+                + "acceptance=%.4f",
+            caseSummary.caseID,
+            caseSummary.medianDecodeOnlyRatio,
+            caseSummary.medianE2ERatio,
+            caseSummary.medianScalarDecodeTokensPerSecond,
+            caseSummary.medianMTPDecodeTokensPerSecond,
+            caseSummary.meanDraftAcceptanceRate))
+    }
+    print(String(
+        format: "qwen-mtp-long-profile SUMMARY aggregate decode_ratio_median=%.4f "
+            + "e2e_ratio_median=%.4f (%@, non-authoritative)",
+        summary.aggregateMedianDecodeOnlyRatio,
+        summary.aggregateMedianE2ERatio,
+        payload.binding.targetModelID))
+}
+
+private func longProfilePairFailure(scalar: CorpusRun, mtp: CorpusRun) -> String? {
+    let exact = MTPStreamExactness.compare(candidate: mtp.tokens, baseline: scalar.tokens)
+    if !exact.exact || !exact.lengthMatched {
+        return "token stream divergence at index \(exact.firstDivergenceIndex.map(String.init) ?? "length")"
+    }
+    if scalar.decodedBytesSHA256 != mtp.decodedBytesSHA256 {
+        return "decoded byte digest divergence"
+    }
+    if let mismatch = firstCacheMismatch(scalar.cacheFingerprint, mtp.cacheFingerprint) {
+        return "cache fingerprint divergence: \(mismatch)"
+    }
+    if scalar.stopOutcome != mtp.stopOutcome {
+        return "stop outcome divergence scalar=\(scalar.stopOutcome.rawValue) mtp=\(mtp.stopOutcome.rawValue)"
+    }
+    if mtp.tokens.count < QwenMTPLongProfileGate.minimumGeneratedTokens {
+        return "generated only \(mtp.tokens.count) tokens; below steady-state floor "
+            + "\(QwenMTPLongProfileGate.minimumGeneratedTokens)"
+    }
+    if let reason = mtp.passthroughReason {
+        return "MTP passthrough: \(reason)"
+    }
+    return nil
+}
+
+private func longProfilePayload(
+    pair: Qwen35ExactMTPLoadedPair,
+    gdnMode: Qwen38MTPPerformanceScorecardGDNMode,
+    gdnObservedEnv: Qwen38MTPPerformanceScorecardGDNObservedEnv,
+    caseProfiles: [QwenMTPLongProfileCaseProfile],
+    samples: [QwenMTPCorpusProfileSample]
+) -> QwenMTPLongProfileEvidencePayload {
+    QwenMTPLongProfileEvidencePayload(
+        schemaVersion: QwenMTPLongProfileGate.schemaVersion,
+        corpusID: QwenMTPLongProfileGate.corpusID,
+        corpusContentHash: QwenMTPLongProfileGate.corpusContentHash,
+        measurementClass: QwenMTPLongProfileGate.measurementClass,
+        binding: runtimeBinding(pair.binding),
+        host: .init(
+            chip: ProvenanceCLI.chipBrand(),
+            ramBytes: ProvenanceCLI.ramBytes(),
+            os: ProvenanceCLI.osVersion()),
+        gdnMode: gdnMode,
+        gdnObservedEnv: gdnObservedEnv,
+        releaseBuildRequired: true,
+        releaseBuildObserved: qwenMTPCorpusReleaseBuildObserved,
+        caseProfiles: caseProfiles,
+        samples: samples)
+}
+
+private func longProfileResultRecord(
+    _ payload: QwenMTPLongProfileEvidencePayload,
+    targetPath: String,
+    subcommand: String
+) -> ResultRecord<QwenMTPLongProfileEvidencePayload> {
+    let modelConfig = ProvenanceCLI.modelConfig(at: targetPath)
+    return ResultRecord(
+        subcommand: subcommand,
+        provenance: Provenance(
+            date: ISO8601DateFormatter().string(from: Date()),
+            hardwareChip: ProvenanceCLI.chipBrand(),
+            hardwareRAMBytes: ProvenanceCLI.ramBytes(),
+            hardwareOS: ProvenanceCLI.osVersion(),
+            harnessGitSHA: ProvenanceCLI.harnessGitSHA(),
+            mlxSwiftVersion: ProvenanceCLI.mlxSwiftVersion,
+            referenceMLXVersion: nil,
+            referenceMLXLMVersion: ProvenanceCLI.mlxSwiftLMRevision,
+            modelPath: payload.binding.targetModelID,
+            modelConfigHash: modelConfig.hash,
+            modelCheckpointManifestHash: try? ProvenanceCLI.checkpointManifestHash(at: targetPath),
+            modelQuant: modelConfig.quant,
+            corpusId: QwenMTPLongProfileGate.corpusID,
+            corpusContentHash: QwenMTPLongProfileGate.corpusContentHash,
+            nonce: UUID().uuidString),
+        payload: payload)
+}
+
+private struct QwenMTPSelectedExactRevisionDownloader: Downloader {
+    let selection: Qwen35ExactMTPRuntimeSelection
+    let target: URL
+    let drafter: URL
+
+    func download(
+        id: String,
+        revision: String?,
+        matching patterns: [String],
+        useLatest: Bool,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> URL {
+        guard !useLatest, patterns == ["*.safetensors", "*.json", "*.jinja"] else {
+            throw QwenMTPCorpusCLIError.unexpectedDownloadRequest(id: id, revision: revision)
+        }
+        progressHandler(Progress(totalUnitCount: 1))
+        let lock = knownLock
+        if id == lock.targetIdentity.modelID, revision == lock.targetIdentity.revision {
+            return target
+        }
+        if id == lock.drafterIdentity.modelID, revision == lock.drafterIdentity.revision {
+            return drafter
+        }
+        throw QwenMTPCorpusCLIError.unexpectedDownloadRequest(id: id, revision: revision)
+    }
+
+    private var knownLock: QwenMTPArtifactLock {
+        switch selection {
+        case .qwen35_9BDepth1:
+            QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+        case .qwen38_27BMXFP8Depth1:
+            QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
+        }
+    }
 }

@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import HarnessCore
 import HuggingFace
+import ProofControl
 import MLX
 import MLXHuggingFace
 @_spi(FastMLXExactMTP) import MLXLLM
@@ -952,48 +953,32 @@ enum Qwen38MTPScorecardProcessFacts {
             osServiceReserveBytes: memoryBudget.osServiceReserveBytes)
     }
 
+    // The kernel-reported collectors live in the MLX-free ProofControl
+    // ProcessIdentity module (Slice 0 of the Qwen38 authorization chain) so
+    // the proof runner can mint the same evidence; these wrappers preserve
+    // the worker's historical error surface exactly.
     private static func bootTimeUnixSeconds() throws -> Int {
-        var value = timeval()
-        var size = MemoryLayout<timeval>.stride
-        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
-        let result = mib.withUnsafeMutableBufferPointer {
-            sysctl($0.baseAddress, u_int($0.count), &value, &size, nil, 0)
-        }
-        guard result == 0 else {
+        do {
+            return try ProcessIdentity.bootTimeUnixSeconds()
+        } catch {
             throw Qwen38MTPScorecardLiveAdapterError.workerError
         }
-        return Int(value.tv_sec)
     }
 
     private static func processStartUptimeNanoseconds(pid: pid_t) throws -> UInt64 {
-        var info = proc_bsdinfo()
-        let result = proc_pidinfo(
-            pid,
-            PROC_PIDTBSDINFO,
-            0,
-            &info,
-            Int32(MemoryLayout<proc_bsdinfo>.stride))
-        guard result == Int32(MemoryLayout<proc_bsdinfo>.stride) else {
+        do {
+            return try ProcessIdentity.processStartUptimeNanoseconds(pid: pid)
+        } catch {
             throw Qwen38MTPScorecardLiveAdapterError.workerError
         }
-        let boot = try bootTimeUnixSeconds()
-        let seconds = max(1, Int(info.pbi_start_tvsec) - boot)
-        return UInt64(seconds) * 1_000_000_000 + UInt64(info.pbi_start_tvusec) * 1_000
     }
 
     private static func executableSHA256(pid: pid_t) throws -> String {
-        // proc_pidpath fails with EOVERFLOW for buffer sizes LARGER than
-        // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN = 4096) -- the kernel
-        // treats the limit as an exact upper bound, not a minimum. A 16 KiB
-        // buffer therefore made this collector fail unconditionally.
-        var buffer = [CChar](repeating: 0, count: 4_096)
-        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-        guard length > 0 else {
+        do {
+            return try ProcessIdentity.executableSHA256(pid: pid)
+        } catch {
             throw Qwen38MTPScorecardLiveAdapterError.workerError
         }
-        let pathBytes = buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }
-        let path = String(decoding: pathBytes, as: UTF8.self)
-        return try qwen38MTPScorecardSHA256Hex(Data(contentsOf: URL(fileURLWithPath: path)))
     }
 }
 

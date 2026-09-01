@@ -2014,6 +2014,35 @@ struct Harness {
                         + qwen38MTPLiveExactnessExternalDiagnostic(error))
                 exit(2)
             }
+        case "validate-qwen38-long-profile":
+            do {
+                let evidencePath = try flags.strictString("evidence", default: "")
+                guard !evidencePath.isEmpty else {
+                    print("usage: fastmlx-harness validate-qwen38-long-profile --evidence <JSONL>")
+                    exit(2)
+                }
+                let data = try Data(contentsOf: URL(fileURLWithPath: evidencePath))
+                let summaries = try QwenMTPLongProfileGate.validateJSONL(data)
+                for summary in summaries {
+                    for caseSummary in summary.perCase {
+                        print(String(
+                            format: "qwen38-long-profile VALID %@ decode_ratio_median=%.4f e2e_ratio_median=%.4f scalar_decode_tps=%.2f mtp_decode_tps=%.2f acceptance=%.4f",
+                            caseSummary.caseID,
+                            caseSummary.medianDecodeOnlyRatio,
+                            caseSummary.medianE2ERatio,
+                            caseSummary.medianScalarDecodeTokensPerSecond,
+                            caseSummary.medianMTPDecodeTokensPerSecond,
+                            caseSummary.meanDraftAcceptanceRate))
+                    }
+                    print(String(
+                        format: "qwen38-long-profile VALID aggregate decode_ratio_median=%.4f e2e_ratio_median=%.4f",
+                        summary.aggregateMedianDecodeOnlyRatio,
+                        summary.aggregateMedianE2ERatio))
+                }
+            } catch {
+                print("qwen38-long-profile INVALID: \(error)")
+                exit(2)
+            }
         case "validate-qwen38-heavy-host-trust-readiness":
             do {
                 print(try validateQwen38HeavyHostTrustReadiness(
@@ -2047,6 +2076,13 @@ struct Harness {
                 try await runQwenMTPCorpus(flags)
             } catch {
                 print("qwen-mtp-corpus FAILED: \(error)")
+                exit(1)
+            }
+        case "qwen-mtp-long-profile":
+            do {
+                try await runQwenMTPLongProfile(flags)
+            } catch {
+                print("qwen-mtp-long-profile FAILED: \(error)")
                 exit(1)
             }
         case "qwen-mtp-eval-order":
@@ -2261,6 +2297,10 @@ struct Harness {
                  [--qualification-evidence false] [layout-specific flags]
                                                strict synthetic capture; never dial promotion
           qwen-mtp-corpus --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+          qwen-mtp-long-profile --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
+                 [--binding qwen35-9b-depth1|qwen38-27b-mxfp8-depth1|qwen38-27b-4bit-depth1]
+                 (requires MLX_QWEN_FOUR_GDN=1; Release build; non-authoritative long-decode
+                 scalar-vs-MTP profile at 4K-prompt/4096-token production shape)
                  [--profile true|false]       exact Qwen3.5 9B scalar-vs-native-MTP corpus gate
           qwen-mtp-eval-order --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
                                                long-retrieval cache-first vs hidden-first diagnostic

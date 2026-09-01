@@ -12,6 +12,7 @@ public enum Qwen35ExactMTPRuntimeAdmissionError: Error, Equatable, Sendable {
 public enum Qwen35ExactMTPRuntimeSelection: String, Equatable, Sendable {
     case qwen35_9BDepth1 = "qwen35-9b-depth1"
     case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
+    case qwen38_27B4BitDepth1 = "qwen38-27b-4bit-depth1"
 }
 
 /// Application composition boundary for explicitly selected, reviewed Qwen3 depth-one MTP pairs.
@@ -131,6 +132,8 @@ public enum Qwen35ExactMTPRuntimeFactory {
             .qwen35_9BDepth1
         case .qwen38_27BMXFP8Depth1:
             .qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            .qwen38_27B4BitDepth1
         }
     }
 
@@ -142,6 +145,8 @@ public enum Qwen35ExactMTPRuntimeFactory {
             Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
         case .qwen38_27BMXFP8Depth1:
             Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen38_27B4BitDepth1
         }
     }
 
@@ -153,6 +158,8 @@ public enum Qwen35ExactMTPRuntimeFactory {
             QwenMTPKnownArtifactLocks.qwen35_9BDepth1
         case .qwen38_27BMXFP8Depth1:
             QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
         }
     }
 

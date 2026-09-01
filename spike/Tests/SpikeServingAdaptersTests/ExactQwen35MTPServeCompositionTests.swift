@@ -382,6 +382,8 @@ private func exactDescriptor(
         lock = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
     case .qwen38_27BMXFP8Depth1:
         lock = QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+    case .qwen38_27B4BitDepth1:
+        lock = QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
     }
     return ExactQwen35MTPServingDescriptor(
         artifactSelection: selection,

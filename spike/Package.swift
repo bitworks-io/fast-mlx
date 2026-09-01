@@ -197,6 +197,7 @@ let package = Package(
             name: "fastmlx-harness",
             dependencies: [
                 "HarnessCore",
+                "ProofControl",
                 "ServingCore",
                 "SpikeCore",
                 "SpikeServingAdapters",

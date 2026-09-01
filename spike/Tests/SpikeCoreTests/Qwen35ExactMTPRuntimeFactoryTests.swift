@@ -1837,6 +1837,12 @@ private func selectedSnapshotRow(
             targetRevision: "d48d163bcdf24acaf656474854ab88ea17d65bd1",
             drafterID: "mlx-community/Qwen3.8-27B-MTP-mxfp8",
             drafterRevision: "a50634460045613f166b09b13519466e801c6568")
+    case .qwen38_27B4BitDepth1:
+        ExactSnapshotRow(
+            targetID: "mlx-community/Qwen3.8-27B-4bit",
+            targetRevision: "3e6447f082e89cc7f0bc6e5441afd38dfce760ff",
+            drafterID: "mlx-community/Qwen3.8-27B-MTP-mxfp8",
+            drafterRevision: "a50634460045613f166b09b13519466e801c6568")
     }
 }
 

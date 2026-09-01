@@ -1303,7 +1303,7 @@ public enum QwenMTPCorpusGate {
         }
     }
 
-    private static func validateExactness(_ exactness: QwenMTPCorpusExactnessEvidence, context: String) throws {
+    static func validateExactness(_ exactness: QwenMTPCorpusExactnessEvidence, context: String) throws {
         guard exactness.scalarTokenCount == exactness.mtpTokenCount, exactness.scalarTokenCount > 0 else {
             throw QwenMTPCorpusGateError.correctnessMismatch("\(context) token counts")
         }
@@ -1355,7 +1355,7 @@ public enum QwenMTPCorpusGate {
         }
     }
 
-    private static func validateTelemetry(_ telemetry: QwenMTPCorpusMTPTelemetry, emittedTokenCount: Int, context: String) throws {
+    static func validateTelemetry(_ telemetry: QwenMTPCorpusMTPTelemetry, emittedTokenCount: Int, context: String) throws {
         let counts = [
             telemetry.proposedDraftTokens,
             telemetry.acceptedDraftTokens,
@@ -1387,7 +1387,7 @@ public enum QwenMTPCorpusGate {
         }
     }
 
-    private static func validatePhaseAttribution(
+    static func validatePhaseAttribution(
         _ phase: QwenMTPCorpusMTPPhaseAttribution,
         telemetry: QwenMTPCorpusMTPTelemetry,
         timing: QwenMTPCorpusTiming,
@@ -1689,12 +1689,12 @@ public enum QwenMTPCorpusGate {
         }
     }
 
-    private static func approximatelyEqual(_ lhs: Double, _ rhs: Double) -> Bool {
+    static func approximatelyEqual(_ lhs: Double, _ rhs: Double) -> Bool {
         let scale = max(1, abs(lhs), abs(rhs))
         return abs(lhs - rhs) <= scale * 1e-9
     }
 
-    private static func median(_ values: [Double]) -> Double {
+    static func median(_ values: [Double]) -> Double {
         guard !values.isEmpty else { return .nan }
         let sorted = values.sorted()
         let middle = sorted.count / 2

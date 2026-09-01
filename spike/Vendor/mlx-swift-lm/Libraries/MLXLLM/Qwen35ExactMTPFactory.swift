@@ -194,6 +194,40 @@ public enum Qwen35ExactMTPKnownArtifactLocks {
         drafterQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
         drafterTensors: qwen38_27BMXFP8MTPTensors)
 
+    /// Authenticated Qwen3.8 27B affine-4-bit target paired with the same MXFP8 native MTP
+    /// drafter. The drafter is mxfp8-matched to the mxfp8 target, so acceptance on this row is a
+    /// floor, not a ceiling; target-side verification still guarantees exactness.
+    ///
+    /// This row is selectable only through the exact factory SPI. It does not register the MTP model
+    /// type or grant serving authority; live token/cache equivalence remains a separate gate.
+    public static let qwen38_27B4BitDepth1 = Qwen35ExactMTPArtifactLock(
+        sourceRevision: "01472a78fca830689ff78246a82c6d31ab111a78",
+        target: .init(
+            modelID: "mlx-community/Qwen3.8-27B-4bit",
+            revision: "3e6447f082e89cc7f0bc6e5441afd38dfce760ff",
+            configSHA256: "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "c0a71d953c6e2177681c46e1c7ad19406e09a387f3036b698eabad1030ccd350"),
+        drafter: .init(
+            modelID: "mlx-community/Qwen3.8-27B-MTP-mxfp8",
+            revision: "a50634460045613f166b09b13519466e801c6568",
+            configSHA256: "be0048271c09a95620762f32cac1e487d4a798368ac25f42c7c35d9a9f1b4827",
+            tokenizerSHA256: qwen38TokenizerVocabularySHA256,
+            tensorManifestSHA256: "32ee1b818a5c6ce7191863910131b172ac3fa82f99ce8c23521ddac27cc1fcb7"),
+        architecture: .init(
+            hiddenSize: 5120,
+            intermediateSize: 17408,
+            vocabularySize: 248_320,
+            targetLayerCount: 64,
+            fullAttentionInterval: 4,
+            attentionHeadCount: 24,
+            keyValueHeadCount: 4,
+            headDimension: 256,
+            mtpDepth: 1),
+        targetQuantization: .init(bits: 4, groupSize: 64, mode: "affine"),
+        drafterQuantization: .init(bits: 8, groupSize: 32, mode: "mxfp8"),
+        drafterTensors: qwen38_27BMXFP8MTPTensors)
+
     private static let qwen35_9BMTP5BitTensors: [Qwen35ExactMTPTensorDescriptor] = [
         .init(name: "fc.biases", shape: [4096, 128], dtype: "BF16"),
         .init(name: "fc.scales", shape: [4096, 128], dtype: "BF16"),
@@ -324,6 +358,7 @@ public struct Qwen35ExactMTPLoadedPair {
 public enum Qwen35ExactMTPArtifactSelection: Equatable, Sendable {
     case qwen35_9BDepth1
     case qwen38_27BMXFP8Depth1
+    case qwen38_27B4BitDepth1
 }
 
 @_spi(FastMLXExactMTP)
@@ -397,6 +432,8 @@ public enum Qwen35ExactMTPFactory {
             Qwen35ExactMTPKnownArtifactLocks.qwen35_9BDepth1
         case .qwen38_27BMXFP8Depth1:
             Qwen35ExactMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
+        case .qwen38_27B4BitDepth1:
+            Qwen35ExactMTPKnownArtifactLocks.qwen38_27B4BitDepth1
         }
     }
 
