@@ -1944,6 +1944,18 @@ struct Harness {
         case "corpus": runCorpus()
         case "verify": await runVerify(flags)
         case "bench": await runBench(flags)
+        case "qwen38-scorecard-claim-template":
+            do {
+                print(try qwen38ScorecardClaimTemplate())
+                FileHandle.standardError.write(
+                    Data(
+                        "qwen38-scorecard-claim-template: fill the three placeholder markers; never retype the pinned digests\n"
+                            .utf8))
+            } catch {
+                FileHandle.standardError.write(
+                    Data("qwen38-scorecard-claim-template failed: \(error)\n".utf8))
+                exit(1)
+            }
         case "validate-bench-qualification":
             runBenchQualificationEvidenceValidation(flags)
         case "validate-bench-capacity":

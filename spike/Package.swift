@@ -281,6 +281,7 @@ let package = Package(
             dependencies: [
                 "fastmlx-harness",
                 "HarnessCore",
+                "ProofControl",
                 "ScorecardPairControl",
                 "ServingCore",
                 "SpikeCore",
