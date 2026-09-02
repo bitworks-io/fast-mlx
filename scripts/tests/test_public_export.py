@@ -253,6 +253,55 @@ class PublicExportTests(unittest.TestCase):
                     (REPOSITORY_ROOT / relative).read_bytes(),
                 )
 
+    def test_vendor_tree_excludes_are_absent_from_export(self) -> None:
+        # Development checkouts only: the public checkout's remapped manifest
+        # intentionally carries no development-side exclusion list. Exclusion
+        # REMOVAL is separately guarded by the sealed publicIndex pathCount.
+        public_manifest_path = (
+            REPOSITORY_ROOT / "public/public-repository-public.json"
+        )
+        if not public_manifest_path.is_file():
+            return
+
+        development_manifest = json.loads(
+            (REPOSITORY_ROOT / "public/public-repository.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        vendor_root = "spike/Vendor/mlx-swift-lm"
+        vendor_tree = next(
+            entry
+            for entry in development_manifest["trees"]
+            if entry.get("source") == vendor_root
+            and entry.get("destination") == vendor_root
+        )
+        override_destinations = {
+            entry.get("destination")
+            for entry in development_manifest.get("files", [])
+        }
+        vendor_excludes = [
+            value
+            for value in vendor_tree.get("exclude", [])
+            if (REPOSITORY_ROOT / vendor_root / value).is_file()
+            and f"{vendor_root}/{value}" not in override_destinations
+        ]
+        self.assertTrue(vendor_excludes)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public"
+            output.mkdir()
+            export_public_repository.export(
+                REPOSITORY_ROOT,
+                output,
+                allow_development_manifest=True,
+            )
+            for excluded in vendor_excludes:
+                self.assertFalse(
+                    (output / vendor_root / excluded).exists(),
+                    "internal-only vendor exclusion leaked into the public "
+                    f"export: {excluded}",
+                )
+
     def test_public_projection_uses_sanitized_vendor_overrides(self) -> None:
         development_manifest = json.loads(
             (REPOSITORY_ROOT / "public/public-repository.json").read_text(
