@@ -229,7 +229,12 @@ let package = Package(
         ),
         .testTarget(
             name: "ProofControlTests",
-            dependencies: ["ProofControl"],
+            // HarnessCore (dependency-free, MLX-free) is a TEST-ONLY dependency:
+            // the Slice 3 cross-recipe pin proves the runner-minted process-
+            // isolation evidence ID is byte-identical to the worker-side
+            // HarnessCore recipe. The ProofControl production target itself
+            // stays dependency-free.
+            dependencies: ["ProofControl", "HarnessCore"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // MLX-coupled harness orchestration tests. These must run through Xcode on the bench Mac

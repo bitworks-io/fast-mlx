@@ -44,6 +44,26 @@ public enum ProcessIdentity {
         return UInt64(seconds) * 1_000_000_000 + UInt64(info.pbi_start_tvusec) * 1_000
     }
 
+    /// Kernel-reported parent process ID for `pid` (`proc_bsdinfo.pbi_ppid`).
+    /// A trust chain that spawned a child itself uses this to REQUIRE the
+    /// observed parent to be its own pid — a caller-supplied or recycled pid
+    /// whose kernel-reported parent is someone else must fail closed, because
+    /// evidence minted for it would describe a process the chain never
+    /// spawned.
+    public static func parentProcessID(pid: pid_t) throws -> pid_t {
+        var info = proc_bsdinfo()
+        let result = proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            &info,
+            Int32(MemoryLayout<proc_bsdinfo>.stride))
+        guard result == Int32(MemoryLayout<proc_bsdinfo>.stride) else {
+            throw ProcessIdentityError.processInfoUnavailable(pid: pid)
+        }
+        return pid_t(info.pbi_ppid)
+    }
+
     public static func executablePath(pid: pid_t) throws -> String {
         // proc_pidpath fails with EOVERFLOW for buffer sizes LARGER than
         // PROC_PIDPATHINFO_MAXSIZE (4 * MAXPATHLEN = 4096) — the kernel
