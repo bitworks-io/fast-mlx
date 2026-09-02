@@ -1029,6 +1029,22 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertTrue(FastMLXServeArguments.usage.contains("qwen38-27b-mxfp8-depth1"))
     }
 
+    func testExactQwen35MTPParsesExplicit4BitArtifactSelection() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/qwen38-target",
+            "--model", "qwen38-exact",
+            "--memory-limit-bytes", "171798691840",
+            "--cache-limit-bytes", "34359738368",
+            "--exact-qwen35-mtp",
+            "--exact-mtp-selection", "qwen38-27b-4bit-depth1",
+            "--mtp-drafter-path", "/models/qwen38-drafter",
+        ])
+
+        XCTAssertEqual(arguments.exactMTPSelection, .qwen38_27B4BitDepth1)
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--exact-mtp-selection SELECTION"))
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("qwen38-27b-4bit-depth1"))
+    }
+
     func testExactQwen35MTPDefaultsOffWhenAbsent() throws {
         let arguments = try FastMLXServeArguments.parse([
             "--model-path", "/models/fixture",

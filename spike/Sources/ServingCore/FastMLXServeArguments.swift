@@ -26,6 +26,7 @@ public enum FastMLXServeHostUse: String, Equatable, Sendable {
 public enum FastMLXExactMTPSelection: String, Equatable, Sendable {
     case qwen35_9BDepth1 = "qwen35-9b-depth1"
     case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
+    case qwen38_27B4BitDepth1 = "qwen38-27b-4bit-depth1"
 }
 
 public enum FastMLXServeArgumentError:
@@ -119,7 +120,8 @@ public enum FastMLXServeArgumentError:
         case .mtpDrafterRequiresExactQwen35MTP:
             "--mtp-drafter-path requires --exact-qwen35-mtp"
         case .invalidExactMTPSelection:
-            "--exact-mtp-selection must be qwen35-9b-depth1 or qwen38-27b-mxfp8-depth1"
+            "--exact-mtp-selection must be qwen35-9b-depth1, qwen38-27b-mxfp8-depth1, "
+                + "or qwen38-27b-4bit-depth1"
         case .exactMTPSelectionRequiresExactQwen35MTP:
             "--exact-mtp-selection requires --exact-qwen35-mtp"
         case .exactQwen35MTPWithScripted:
@@ -230,7 +232,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       --model-path and scalar fallback loads first.
           --exact-mtp-selection SELECTION
                                       Reviewed exact-MTP artifact lock
-                                      (qwen35-9b-depth1|qwen38-27b-mxfp8-depth1).
+                                      (qwen35-9b-depth1|qwen38-27b-mxfp8-depth1|
+                                      qwen38-27b-4bit-depth1).
                                       Defaults to qwen35-9b-depth1 for compatibility.
           --mtp-drafter-path PATH     Absolute local drafter snapshot directory for
                                       --exact-qwen35-mtp.

@@ -113,6 +113,34 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
                 .contains("exact_qwen35_mtp_selection=qwen38-27b-mxfp8-depth1"))
     }
 
+    func testCompositionForwardsExplicit4BitArtifactSelectionIntoExactRuntimeLoad() async throws {
+        let events = LockedEvents()
+        let runner = RecordingMTPRunner(descriptor: exactDescriptor(selection: .qwen38_27B4BitDepth1))
+
+        let loaded = try await loadExactQwen35MTPServeComposition(
+            configuration: compositionConfiguration(selection: .qwen38_27B4BitDepth1),
+            scalarLoader: { configuration in
+                ExactQwen35MTPLoadedScalarFallback(
+                    backend: ScriptedCompositionScalarBackend(),
+                    startupReport: scalarReport(
+                        memory: configuration.memoryLimitBytes,
+                        cache: configuration.cacheLimitBytes))
+            },
+            runtimeLoader: { configuration in
+                events.append("selection:\(configuration.selection.rawValue)")
+                return ExactQwen35MTPServingRuntimeComponents(
+                    runner: runner,
+                    codec: FixtureCompositionCodec(promptTokens: [91, 92]),
+                    descriptor: exactDescriptor(selection: configuration.selection))
+            })
+
+        XCTAssertEqual(events.snapshot(), ["selection:qwen38-27b-4bit-depth1"])
+        XCTAssertEqual(loaded.exactStartupReport.descriptor?.artifactSelection, .qwen38_27B4BitDepth1)
+        XCTAssertTrue(
+            loaded.exactStartupReport.machineReadableFields()
+                .contains("exact_qwen35_mtp_selection=qwen38-27b-4bit-depth1"))
+    }
+
     func testLocalSnapshotDownloaderUsesSelectedQwen38LockAndRejectsLegacyLock() async throws {
         let targetDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -149,6 +177,60 @@ final class ExactQwen35MTPServeCompositionTests: XCTestCase {
 
         XCTAssertEqual(target, targetDirectory)
         XCTAssertEqual(drafter, drafterDirectory)
+        do {
+            _ = try await downloader.download(
+                id: legacy.targetIdentity.modelID,
+                revision: legacy.targetIdentity.revision,
+                matching: ["*.safetensors", "*.json", "*.jinja"],
+                useLatest: false,
+                progressHandler: { _ in })
+            XCTFail("expected legacy lock request to fail closed")
+        } catch ExactQwen35MTPLocalSnapshotDownloaderError.unexpectedRequest {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testLocalSnapshotDownloaderUsesSelected4BitLockAndRejectsLegacyLock() async throws {
+        let targetDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let drafterDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: targetDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: drafterDirectory, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: targetDirectory)
+            try? FileManager.default.removeItem(at: drafterDirectory)
+        }
+
+        let downloader = ExactQwen35MTPLocalSnapshotDownloader(
+            selection: .qwen38_27B4BitDepth1,
+            targetDirectory: targetDirectory,
+            drafterDirectory: drafterDirectory)
+        let selected = QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
+        let legacy = QwenMTPKnownArtifactLocks.qwen35_9BDepth1
+
+        let target = try await downloader.download(
+            id: selected.targetIdentity.modelID,
+            revision: selected.targetIdentity.revision,
+            matching: ["*.safetensors", "*.json", "*.jinja"],
+            useLatest: false,
+            progressHandler: { _ in })
+        let drafter = try await downloader.download(
+            id: selected.drafterIdentity.modelID,
+            revision: selected.drafterIdentity.revision,
+            matching: ["*.safetensors", "*.json", "*.jinja"],
+            useLatest: false,
+            progressHandler: { _ in })
+
+        XCTAssertEqual(target, targetDirectory)
+        XCTAssertEqual(drafter, drafterDirectory)
+        // The 4-bit row's drafter is the same MXFP8-native MTP artifact the mxfp8 row uses.
+        XCTAssertEqual(
+            selected.drafterIdentity,
+            QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1.drafterIdentity)
         do {
             _ = try await downloader.download(
                 id: legacy.targetIdentity.modelID,

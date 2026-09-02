@@ -424,8 +424,9 @@ private func selectedHarnessLock(
     case .qwen38_27BMXFP8Depth1:
         QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
     case .qwen38_27B4BitDepth1:
-        // Identity mapping only; the 4-bit row has no ServingCore argument case, so serving
-        // cannot select it until its own live-exactness and quality gates land.
+        // The ServingCore argument case now exists, so serving admission is open infrastructure
+        // here just like the mxfp8 row. PRODUCTION replacement still gates on the 4-bit quality
+        // gate (lever A), the canonical GDN-on live-exactness row, and the concierge deploy handoff.
         QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
     }
 }

@@ -913,6 +913,8 @@ private func exactMTPRuntimeSelection(
         .qwen35_9BDepth1
     case .qwen38_27BMXFP8Depth1:
         .qwen38_27BMXFP8Depth1
+    case .qwen38_27B4BitDepth1:
+        .qwen38_27B4BitDepth1
     }
 }
 
