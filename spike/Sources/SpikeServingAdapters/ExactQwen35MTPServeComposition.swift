@@ -424,9 +424,11 @@ private func selectedHarnessLock(
     case .qwen38_27BMXFP8Depth1:
         QwenMTPKnownArtifactLocks.qwen38_27BMXFP8Depth1
     case .qwen38_27B4BitDepth1:
-        // The ServingCore argument case now exists, so serving admission is open infrastructure
-        // here just like the mxfp8 row. PRODUCTION replacement still gates on the 4-bit quality
-        // gate (lever A), the canonical GDN-on live-exactness row, and the concierge deploy handoff.
+        // Serving admission stays open as parallel infrastructure, but the 4-bit quality gate
+        // resolved NO-GO on 2026-09-01 (frozen band; see the quality-gate design record's
+        // OUTCOME section): this row is quality-refused relative to the mxfp8 incumbent and
+        // must not be promoted, deployed, or represented as quality-endorsed. Selecting it
+        // serves measurement/diagnostic use only.
         QwenMTPKnownArtifactLocks.qwen38_27B4BitDepth1
     }
 }
