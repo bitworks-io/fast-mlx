@@ -969,6 +969,8 @@ public enum Qwen38MTPPerformanceScorecardGateError: Error, Equatable, CustomStri
     case invalidRecordCardinality(Int)
     case wrongSubcommand(String)
     case invalidProvenance(String)
+    case invalidRunnerLaunchObservation
+    case runnerLaunchEqualityRejected(String)
 
     public var description: String {
         switch self {
@@ -997,7 +999,35 @@ public enum Qwen38MTPPerformanceScorecardGateError: Error, Equatable, CustomStri
         case .invalidRecordCardinality(let count): return "invalid JSONL record cardinality: \(count)"
         case .wrongSubcommand(let subcommand): return "wrong subcommand: \(subcommand)"
         case .invalidProvenance(let field): return "invalid provenance: \(field)"
+        case .invalidRunnerLaunchObservation:
+            return "runner launch observation IDs are not two distinct canonical digests"
+        case .runnerLaunchEqualityRejected(let leg):
+            return "worker launch binding does not match the runner-minted observation: \(leg)"
         }
+    }
+}
+
+/// Runner-minted process-isolation evidence IDs for the two spawned worker
+/// legs (chain Slice 4 external-equality input — security-review binding
+/// finding 1). These IDs come from the runner that SPAWNED each worker
+/// itself and observed it through kernel-reported interfaces; they are the
+/// independent counterpart to the worker's self-minted launch binding.
+/// Deliberately Encodable-ONLY (never decodable): observations are only
+/// meaningful when minted in-process by the trusted runner — a decoding
+/// path would let observation IDs be reconstructed from the same
+/// untrusted bytes as the evidence, making the equality check vacuous.
+public struct Qwen38MTPPerformanceScorecardRunnerLaunchObservations: Encodable, Equatable, Sendable {
+    public let candidateProcessIsolationEvidenceID: String
+    public let referenceProcessIsolationEvidenceID: String
+
+    public init(
+        candidateProcessIsolationEvidenceID: String,
+        referenceProcessIsolationEvidenceID: String
+    ) {
+        self.candidateProcessIsolationEvidenceID =
+            candidateProcessIsolationEvidenceID
+        self.referenceProcessIsolationEvidenceID =
+            referenceProcessIsolationEvidenceID
     }
 }
 
@@ -1117,6 +1147,58 @@ public enum Qwen38MTPPerformanceScorecardGate {
         encoder.outputFormatting = [.sortedKeys]
         let data = try! encoder.encode(cases)
         return sha256Hex(data)
+    }
+
+    /// Chain Slice 4 external-equality check (security-review binding
+    /// finding 1). The worker's launch binding is self-minted today, so its
+    /// process-isolation self-consistency check proves only that the worker
+    /// agrees with itself. This check requires each worker-reported
+    /// `launchBinding.processIsolationEvidenceID` to EQUAL the ID the
+    /// runner independently minted while spawning and kernel-observing that
+    /// worker (`Qwen38ScorecardWorkerSpawner` in ProofControl — the
+    /// canonical recipes are cross-pinned byte-for-byte). Two distinct
+    /// runner IDs prove two distinct spawned processes; a mismatch on
+    /// either leg means the evidence was not produced by the process the
+    /// runner spawned, and fails closed. This check supplements — never
+    /// replaces — the existing authority/self-consistency validation.
+    public static func validateRunnerLaunchEquality(
+        _ evidence: Qwen38MTPPerformanceScorecardEvidence,
+        observations: Qwen38MTPPerformanceScorecardRunnerLaunchObservations
+    ) throws {
+        guard
+            isLowerHex(
+                observations.candidateProcessIsolationEvidenceID,
+                count: 64),
+            isLowerHex(
+                observations.referenceProcessIsolationEvidenceID,
+                count: 64),
+            observations.candidateProcessIsolationEvidenceID
+                != observations.referenceProcessIsolationEvidenceID
+        else {
+            throw Qwen38MTPPerformanceScorecardGateError
+                .invalidRunnerLaunchObservation
+        }
+
+        guard let candidateLaunch = evidence.candidate.launchBinding else {
+            throw Qwen38MTPPerformanceScorecardGateError
+                .runnerLaunchEqualityRejected("candidate launch binding missing")
+        }
+        guard candidateLaunch.processIsolationEvidenceID
+            == observations.candidateProcessIsolationEvidenceID
+        else {
+            throw Qwen38MTPPerformanceScorecardGateError
+                .runnerLaunchEqualityRejected("candidate")
+        }
+        guard let referenceLaunch = evidence.reference.launchBinding else {
+            throw Qwen38MTPPerformanceScorecardGateError
+                .runnerLaunchEqualityRejected("reference launch binding missing")
+        }
+        guard referenceLaunch.processIsolationEvidenceID
+            == observations.referenceProcessIsolationEvidenceID
+        else {
+            throw Qwen38MTPPerformanceScorecardGateError
+                .runnerLaunchEqualityRejected("reference")
+        }
     }
 
     public static func validate(

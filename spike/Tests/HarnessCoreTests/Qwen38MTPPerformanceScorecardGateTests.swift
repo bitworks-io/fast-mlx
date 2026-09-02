@@ -1103,4 +1103,139 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
     private func hex(_ character: Character) -> String {
         String(repeating: String(character), count: 64)
     }
+
+    // MARK: - Runner launch equality (chain Slice 4a)
+
+    // The canonical evidence fixture's worker-side launch bindings carry
+    // processIsolationEvidenceID hex("4") (candidate) / hex("5")
+    // (reference); the runner observations below play the independently
+    // minted runner-side IDs.
+    private func runnerObservations(
+        candidate: String,
+        reference: String
+    ) -> Qwen38MTPPerformanceScorecardRunnerLaunchObservations {
+        Qwen38MTPPerformanceScorecardRunnerLaunchObservations(
+            candidateProcessIsolationEvidenceID: candidate,
+            referenceProcessIsolationEvidenceID: reference)
+    }
+
+    func testRunnerLaunchEqualityAcceptsMatchingObservations() throws {
+        let evidence = makeEvidence()
+        XCTAssertNoThrow(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("4"),
+                    reference: hex("5"))))
+    }
+
+    func testRunnerLaunchEqualityRejectsCandidateMismatch() {
+        let evidence = makeEvidence()
+        XCTAssertThrowsError(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("6"),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("candidate"))
+        }
+    }
+
+    func testRunnerLaunchEqualityRejectsReferenceMismatch() {
+        let evidence = makeEvidence()
+        XCTAssertThrowsError(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("4"),
+                    reference: hex("6")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("reference"))
+        }
+    }
+
+    func testRunnerLaunchEqualityRejectsSwappedObservations() {
+        let evidence = makeEvidence()
+        XCTAssertThrowsError(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("5"),
+                    reference: hex("4")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("candidate"))
+        }
+    }
+
+    func testRunnerLaunchEqualityRejectsNonCanonicalOrEqualObservationIDs() {
+        let evidence = makeEvidence()
+        let rejected: [(String, String, String)] = [
+            ("uppercase", String(repeating: "A", count: 64), hex("5")),
+            ("short", String(repeating: "4", count: 63), hex("5")),
+            ("long", String(repeating: "4", count: 65), hex("5")),
+            ("empty", "", hex("5")),
+            ("equal IDs", hex("4"), hex("4")),
+        ]
+        for (label, candidate, reference) in rejected {
+            XCTAssertThrowsError(
+                try Gate.validateRunnerLaunchEquality(
+                    evidence,
+                    observations: runnerObservations(
+                        candidate: candidate,
+                        reference: reference)),
+                label
+            ) { error in
+                XCTAssertEqual(
+                    error as? GateError,
+                    .invalidRunnerLaunchObservation,
+                    label)
+            }
+        }
+    }
+
+    func testRunnerLaunchEqualityRejectsMissingLaunchBindings() {
+        let noBindingAuthority = authority(
+            candidate: model(executionMode: .exactMTP, gdnMode: nil),
+            reference: model(executionMode: .scalar, gdnMode: nil))
+        let evidence = makeEvidence(authority: noBindingAuthority)
+        XCTAssertThrowsError(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("4"),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("candidate launch binding missing"))
+        }
+    }
+
+    /// Candidate binding present (and matching) so the check reaches the
+    /// reference guard — covers the reference-missing fail-closed branch
+    /// on its own.
+    func testRunnerLaunchEqualityRejectsReferenceLaunchBindingMissingAlone() {
+        let mixedAuthority = authority(
+            candidate: model(executionMode: .exactMTP, gdnMode: .gdnOn),
+            reference: model(executionMode: .scalar, gdnMode: nil))
+        let evidence = makeEvidence(authority: mixedAuthority)
+        XCTAssertThrowsError(
+            try Gate.validateRunnerLaunchEquality(
+                evidence,
+                observations: runnerObservations(
+                    candidate: hex("4"),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("reference launch binding missing"))
+        }
+    }
 }

@@ -199,11 +199,16 @@ public enum Qwen38ScorecardWorkerSpawner {
     /// `environment` is passed to the child EXACTLY (full replacement, no
     /// inheritance from the runner); `observedEnv` in the evidence is
     /// derived from it, never asserted. `harnessGitSHA` and `sourceID` are
-    /// validated fail-closed BEFORE any process is created. Slice 4 is
-    /// REQUIRED (recorded binding item, 2026-09-02 addendum) to derive
-    /// them from a `Qwen38ScorecardResolvedRunAuthorization`, never accept
-    /// them independently.
-    public static func spawnAndObserve(
+    /// validated fail-closed BEFORE any process is created.
+    ///
+    /// INTERNAL by design (Slice 4a review): this free-parameter primitive
+    /// would let a pipeline wire worker identity independently of the
+    /// operator-signed claim, so production/runner code can only reach the
+    /// authorized entry point `spawnAndObserveAuthorized`, which derives
+    /// the identity inputs from a `Qwen38ScorecardResolvedRunAuthorization`
+    /// (recorded binding item, 2026-09-02 addendum) — compiler-enforced,
+    /// not doc-enforced. Tests reach this primitive via @testable.
+    static func spawnAndObserve(
         executableURL: URL,
         arguments: [String],
         environment: [String: String],
