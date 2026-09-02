@@ -1201,6 +1201,26 @@ public enum Qwen38MTPPerformanceScorecardGate {
         }
     }
 
+    /// Chain Slice 4b combined validation entry (design verdict P4): one
+    /// call that runs the full scorecard validation AND the runner
+    /// launch-equality check, throwing before any Verdict is returned, so a
+    /// runner pipeline cannot obtain a Verdict without the external
+    /// equality check having passed. The equality check runs AFTER a
+    /// successful validate — it is never skipped because validation passed.
+    /// The standalone checks remain public; the runner's structural gate
+    /// pins that production runner code calls ONLY this entry, and the
+    /// record the runner publishes must be the exact record whose payload
+    /// went through this entry.
+    public static func validateWithRunnerLaunchObservations(
+        _ evidence: Qwen38MTPPerformanceScorecardEvidence,
+        authority: Qwen38MTPPerformanceScorecardAuthorityBundle,
+        observations: Qwen38MTPPerformanceScorecardRunnerLaunchObservations
+    ) throws -> Qwen38MTPPerformanceScorecardVerdict {
+        let verdict = try validate(evidence, authority: authority)
+        try validateRunnerLaunchEquality(evidence, observations: observations)
+        return verdict
+    }
+
     public static func validate(
         _ evidence: Qwen38MTPPerformanceScorecardEvidence
     ) throws -> Qwen38MTPPerformanceScorecardVerdict {

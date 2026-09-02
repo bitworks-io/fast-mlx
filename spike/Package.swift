@@ -198,6 +198,7 @@ let package = Package(
             dependencies: [
                 "HarnessCore",
                 "ProofControl",
+                "ScorecardPairControl",
                 "ServingCore",
                 "SpikeCore",
                 "SpikeServingAdapters",
@@ -215,6 +216,19 @@ let package = Package(
             resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // ScorecardPairControl is the impure (Process/pipes/Metal/sysctl) pair-coordination
+        // layer shared by the live adapter and the proof-runner — deliberately OUTSIDE pure
+        // HarnessCore, in-package only, never a product.
+        .target(
+            name: "ScorecardPairControl",
+            dependencies: ["HarnessCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ScorecardPairControlTests",
+            dependencies: ["ScorecardPairControl", "HarnessCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         // ProofControl is the target-level MLX-free trust root for source/build/evidence
         // admission. Keep its filesystem and process primitives in this dependency-free target.
         .target(
@@ -224,7 +238,21 @@ let package = Package(
         ),
         .executableTarget(
             name: "fastmlx-proof-runner",
-            dependencies: ["ProofControl"],
+            // Slice 4b: the runner links the pure trust kernel, the gate's
+            // home (HarnessCore), and the impure shared pair-control layer;
+            // it is the direct parent of both leg workers.
+            dependencies: ["ProofControl", "HarnessCore", "ScorecardPairControl"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Test-only fixture child for the Slice 4b two-process integration
+        // test: speaks the real wire types and self-mints its launch
+        // binding with the worker-side HarnessCore recipe from argv-passed
+        // claim identity. The argv identity seam is acceptable ONLY here —
+        // the production worker self-observes both fields — and this
+        // target must never become a product.
+        .executableTarget(
+            name: "qwen38-scorecard-fixture-worker",
+            dependencies: ["ProofControl", "HarnessCore", "ScorecardPairControl"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
@@ -233,8 +261,17 @@ let package = Package(
             // the Slice 3 cross-recipe pin proves the runner-minted process-
             // isolation evidence ID is byte-identical to the worker-side
             // HarnessCore recipe. The ProofControl production target itself
-            // stays dependency-free.
-            dependencies: ["ProofControl", "HarnessCore"],
+            // stays dependency-free. ScorecardPairControl and the runner
+            // executable are likewise TEST-ONLY dependencies (Slice 4b): the
+            // fixture test speaks the real wire/transport types, and the
+            // runner's parsing/status pieces are unit-tested directly.
+            dependencies: [
+                "ProofControl",
+                "HarnessCore",
+                "ScorecardPairControl",
+                "fastmlx-proof-runner",
+                "qwen38-scorecard-fixture-worker",
+            ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // MLX-coupled harness orchestration tests. These must run through Xcode on the bench Mac
@@ -244,6 +281,7 @@ let package = Package(
             dependencies: [
                 "fastmlx-harness",
                 "HarnessCore",
+                "ScorecardPairControl",
                 "ServingCore",
                 "SpikeCore",
                 .product(name: "MLX", package: "mlx-swift"),

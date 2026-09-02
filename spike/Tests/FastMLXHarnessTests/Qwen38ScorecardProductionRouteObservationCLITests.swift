@@ -1,5 +1,6 @@
 import Foundation
 import HarnessCore
+import ScorecardPairControl
 import ServingCore
 @_spi(ProductionRouteEvidence) import SpikeServingAdapters
 @_spi(ProductionRouteEvidenceTesting) import SpikeServingAdapters

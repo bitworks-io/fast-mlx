@@ -55,6 +55,19 @@ final class ProofControlNoSelfSignStructuralTests: XCTestCase {
         spikeRoot.appendingPathComponent("Sources/fastmlx-proof-runner")
     }
 
+    /// Slice 4b: the two-process test fixture is production-shaped source
+    /// (an executable target, not test code), so it is scanned too; its
+    /// claim identity arrives via argv precisely so it needs no signing.
+    private static var fixtureWorkerSources: URL {
+        spikeRoot.appendingPathComponent("Sources/qwen38-scorecard-fixture-worker")
+    }
+
+    /// Slice 4b security-review N2: the runner-linked pair-control layer
+    /// is scanned too — it sits inside the runner's trust boundary.
+    private static var scorecardPairControlSources: URL {
+        spikeRoot.appendingPathComponent("Sources/ScorecardPairControl")
+    }
+
     // MARK: - Detector negative controls
 
     /// The scanner must FLAG a fixture containing each forbidden token —
@@ -111,6 +124,17 @@ final class ProofControlNoSelfSignStructuralTests: XCTestCase {
         XCTAssertTrue(
             runnerFiles.map(\.lastPathComponent).contains("main.swift")
         )
+
+        let fixtureFiles = try Self.swiftFiles(in: Self.fixtureWorkerSources)
+        XCTAssertGreaterThanOrEqual(fixtureFiles.count, 1)
+        XCTAssertTrue(
+            fixtureFiles.map(\.lastPathComponent).contains("main.swift")
+        )
+
+        let pairControlFiles = try Self.swiftFiles(
+            in: Self.scorecardPairControlSources
+        )
+        XCTAssertGreaterThanOrEqual(pairControlFiles.count, 6)
     }
 
     // MARK: - The property
@@ -120,6 +144,8 @@ final class ProofControlNoSelfSignStructuralTests: XCTestCase {
         for directory in [
             Self.proofControlSources,
             Self.proofRunnerSources,
+            Self.fixtureWorkerSources,
+            Self.scorecardPairControlSources,
         ] {
             for file in try Self.swiftFiles(in: directory) {
                 let content = try String(contentsOf: file, encoding: .utf8)

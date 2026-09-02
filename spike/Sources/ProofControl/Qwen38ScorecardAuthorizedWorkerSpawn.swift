@@ -25,6 +25,29 @@ extension Qwen38ScorecardResolvedRunAuthorization {
     public var authorizedSourceID: String {
         claim.fields.sourceID
     }
+
+    /// Slice 4b (design verdict P5): the runner mints the trusted run
+    /// identity's model/corpus digests FROM THE SIGNED CLAIM — the gate
+    /// pins them against its own constants in `validateAuthority`, so a
+    /// claim signing wrong digests fails closed rather than the signed
+    /// digests being decorative. Exposed read-only through the resolved
+    /// authorization (the only value that can exist post-verification),
+    /// mirroring the Slice 4a accessor pattern above.
+    public var authorizedModelConfigSHA256: String {
+        claim.fields.modelSHA256
+    }
+
+    public var authorizedTensorManifestSHA256: String {
+        claim.fields.tensorManifestSHA256
+    }
+
+    public var authorizedCorpusID: String {
+        claim.fields.corpusID
+    }
+
+    public var authorizedCorpusContentSHA256: String {
+        claim.fields.corpusContentSHA256
+    }
 }
 
 extension Qwen38ScorecardWorkerSpawner {

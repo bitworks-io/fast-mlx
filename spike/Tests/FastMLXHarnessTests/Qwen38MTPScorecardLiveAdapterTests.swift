@@ -1,6 +1,7 @@
 import Foundation
 import HarnessCore
 import MLXLMCommon
+import ScorecardPairControl
 import XCTest
 
 @testable import fastmlx_harness

@@ -5,6 +5,7 @@ import MLXHuggingFace
 import HarnessCore
 import MLX
 import MLXLMCommon
+import ScorecardPairControl
 import SpikeCore
 import Tokenizers
 

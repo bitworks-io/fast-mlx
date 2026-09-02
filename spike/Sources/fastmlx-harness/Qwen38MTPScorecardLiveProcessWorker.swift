@@ -4,6 +4,7 @@ import Foundation
 import HarnessCore
 import HuggingFace
 import ProofControl
+import ScorecardPairControl
 import MLX
 import MLXHuggingFace
 @_spi(FastMLXExactMTP) import MLXLLM
@@ -13,179 +14,38 @@ import Tokenizers
 
 private let qwen38MTPScorecardGDNEnvironmentKey = "MLX_QWEN_FOUR_GDN"
 
-protocol Qwen38MTPScorecardChildProcess: AnyObject {
-    var isRunning: Bool { get }
-    func terminate()
-    func interrupt()
-    func forceKill()
-}
-
-extension Process: Qwen38MTPScorecardChildProcess {
-    func forceKill() {
-        guard isRunning else { return }
-        _ = Darwin.kill(processIdentifier, SIGKILL)
+/// Adapter-side factory for the self-exec worker child: constructs and runs the
+/// `Process`, then hands the already-running child and its three pipes to the
+/// MLX-free `ScorecardPairControl` transport. Preserves the exact argv, GDN-env
+/// override, and pipe wiring the transport's init used to build inline.
+func qwen38MTPScorecardMakeSelfExecTransport(
+    role: Qwen38MTPPerformanceScorecardEngineRole,
+    arguments: Qwen38MTPScorecardLiveRunArguments
+) throws -> Qwen38MTPScorecardProcessPipesTransport {
+    guard let executableURL = Bundle.main.executableURL else {
+        throw Qwen38MTPScorecardLiveAdapterError.workerError
     }
-}
-
-func qwen38MTPScorecardTerminateChild(
-    _ child: Qwen38MTPScorecardChildProcess,
-    deadlineChecks: Int,
-    pollIntervalMicroseconds: useconds_t = 100_000
-) {
-    guard child.isRunning else { return }
-    child.terminate()
-    for _ in 0 ..< max(0, deadlineChecks) {
-        guard child.isRunning else { return }
-        if pollIntervalMicroseconds > 0 {
-            usleep(pollIntervalMicroseconds)
-        }
-    }
-    guard child.isRunning else { return }
-    child.interrupt()
-    for _ in 0 ..< max(0, deadlineChecks) {
-        guard child.isRunning else { return }
-        if pollIntervalMicroseconds > 0 {
-            usleep(pollIntervalMicroseconds)
-        }
-    }
-    guard child.isRunning else { return }
-    child.forceKill()
-}
-
-actor Qwen38MTPScorecardProcessLineTransport: Qwen38MTPScorecardLineTransport {
-    private let process: Process
-    private let role: Qwen38MTPPerformanceScorecardEngineRole
-    private let stdin: FileHandle
-    private let stdout: FileHandle
-    private let stderr: FileHandle
-    private let stderrDrain: Task<Void, Never>
-    private let stderrSink: Qwen38MTPScorecardBoundedByteSink
-    private var buffer = Data()
-
-    init(
-        role: Qwen38MTPPerformanceScorecardEngineRole,
-        arguments: Qwen38MTPScorecardLiveRunArguments
-    ) throws {
-        guard let executableURL = Bundle.main.executableURL else {
-            throw Qwen38MTPScorecardLiveAdapterError.workerError
-        }
-        let input = Pipe()
-        let output = Pipe()
-        let error = Pipe()
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = [
-            "qwen38-mtp-scorecard-worker",
-            "--role", role.rawValue,
-            "--target", arguments.targetPath,
-            "--drafter", arguments.drafterPath,
-            "--host-use", arguments.hostUse,
-            "--host-use-source", arguments.hostUseSource,
-            "--memory-limit-bytes", "\(arguments.memoryBudget.memoryLimitBytes)",
-            "--cache-limit-bytes", "\(arguments.memoryBudget.cacheLimitBytes)",
-            "--reserved-kv-bytes", "\(arguments.memoryBudget.reservedKVBytes)",
-            "--reserved-io-bytes", "\(arguments.memoryBudget.reservedIOBytes)",
-            "--reserved-prefetch-bytes", "\(arguments.memoryBudget.reservedPrefetchBytes)",
-            "--os-service-reserve-bytes", "\(arguments.memoryBudget.osServiceReserveBytes)",
-        ]
-        // Fixed-GDN executionMode axis: both workers launch with GDN fusion enabled;
-        // the candidate/reference split is the exact-MTP vs scalar route, not the env.
-        var environment = ProcessInfo.processInfo.environment
-        environment[qwen38MTPScorecardGDNEnvironmentKey] = "1"
-        process.environment = environment
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = error
-        try process.run()
-        self.process = process
-        self.role = role
-        self.stdin = input.fileHandleForWriting
-        self.stdout = output.fileHandleForReading
-        self.stderr = error.fileHandleForReading
-        let sink = Qwen38MTPScorecardBoundedByteSink(limit: 64 * 1024)
-        self.stderrSink = sink
-        let stderr = error.fileHandleForReading
-        self.stderrDrain = Task.detached {
-            await qwen38MTPScorecardDrainStderr(from: stderr, into: sink)
-        }
-    }
-
-    func sendLine(_ line: String) async throws {
-        guard process.isRunning else {
-            throw Qwen38MTPScorecardLiveAdapterError.workerExited(role)
-        }
-        var data = Data(line.utf8)
-        data.append(0x0a)
-        try stdin.write(contentsOf: data)
-    }
-
-    func receiveLine() async throws -> String? {
-        while true {
-            if let newline = buffer.firstIndex(of: 0x0a) {
-                let line = buffer[..<newline]
-                buffer.removeSubrange(...newline)
-                return String(data: Data(line), encoding: .utf8)
-            }
-            let chunk = stdout.availableData
-            guard !chunk.isEmpty else { return nil }
-            buffer.append(chunk)
-        }
-    }
-
-    func terminate() async {
-        try? stdin.close()
-        qwen38MTPScorecardTerminateChild(process, deadlineChecks: 20)
-        try? stdout.close()
-        try? stderr.close()
-        stderrDrain.cancel()
-    }
-}
-
-actor Qwen38MTPScorecardBoundedByteSink {
-    private let limit: Int
-    private var retained = Data()
-    private var droppedByteCount = 0
-
-    init(limit: Int) {
-        self.limit = max(0, limit)
-    }
-
-    func append(_ data: Data) {
-        guard !data.isEmpty else { return }
-        let remaining = max(0, limit - retained.count)
-        if remaining > 0 {
-            retained.append(data.prefix(remaining))
-        }
-        droppedByteCount += max(0, data.count - remaining)
-    }
-
-    func snapshot() -> (retained: Data, droppedByteCount: Int) {
-        (retained, droppedByteCount)
-    }
-}
-
-func qwen38MTPScorecardDrainStderr(
-    from handle: FileHandle,
-    into sink: Qwen38MTPScorecardBoundedByteSink
-) async {
-    while !Task.isCancelled {
-        let data = handle.availableData
-        guard !data.isEmpty else { break }
-        await sink.append(data)
-    }
-}
-
-func qwen38MTPScorecardMakeTransportPair<Transport: Qwen38MTPScorecardLineTransport>(
-    makeCandidate: () throws -> Transport,
-    makeReference: () throws -> Transport
-) async throws -> (candidate: Transport, reference: Transport) {
-    let candidate = try makeCandidate()
-    do {
-        return (candidate, try makeReference())
-    } catch {
-        await candidate.terminate()
-        throw error
-    }
+    let input = Pipe()
+    let output = Pipe()
+    let error = Pipe()
+    let process = Process()
+    process.executableURL = executableURL
+    process.arguments = qwen38MTPScorecardWorkerLaunchArguments(role: role, arguments: arguments)
+    // Fixed-GDN executionMode axis: both workers launch with GDN fusion enabled;
+    // the candidate/reference split is the exact-MTP vs scalar route, not the env.
+    var environment = ProcessInfo.processInfo.environment
+    environment[qwen38MTPScorecardGDNEnvironmentKey] = "1"
+    process.environment = environment
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = error
+    try process.run()
+    return Qwen38MTPScorecardProcessPipesTransport(
+        role: role,
+        child: process,
+        stdin: input.fileHandleForWriting,
+        stdout: output.fileHandleForReading,
+        stderr: error.fileHandleForReading)
 }
 
 func runQwen38MTPScorecardLiveAdapter(arguments: [String]) async throws -> String {
@@ -201,12 +61,12 @@ func runQwen38MTPScorecardLiveAdapter(arguments: [String]) async throws -> Strin
         expectedChip: parsed.expectedChip)
     let transports = try await qwen38MTPScorecardMakeTransportPair(
         makeCandidate: {
-            try Qwen38MTPScorecardProcessLineTransport(
+            try qwen38MTPScorecardMakeSelfExecTransport(
                 role: .candidate,
                 arguments: parsed)
         },
         makeReference: {
-            try Qwen38MTPScorecardProcessLineTransport(
+            try qwen38MTPScorecardMakeSelfExecTransport(
                 role: .reference,
                 arguments: parsed)
         })
@@ -219,7 +79,8 @@ func runQwen38MTPScorecardLiveAdapter(arguments: [String]) async throws -> Strin
             transport: transports.reference),
         runIdentity: try Qwen38MTPScorecardProcessFacts.trustedRunIdentity(),
         provenance: try Qwen38MTPScorecardProcessFacts.scorecardProvenance(),
-        releaseBuildObserved: true)
+        releaseBuildObserved: true,
+        expectations: .fixedGDNAxis)
     let result = try await coordinator.run()
     let scorecardData = Data((try result.record.jsonLine() + "\n").utf8)
     let authorityData = try qwen38MTPScorecardCanonicalJSON(result.authority)

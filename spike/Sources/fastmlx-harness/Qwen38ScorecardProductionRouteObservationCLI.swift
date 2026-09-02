@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import HarnessCore
 import MLX
+import ScorecardPairControl
 import ServingCore
 import SpikeCore
 @_spi(ProductionRouteEvidence)

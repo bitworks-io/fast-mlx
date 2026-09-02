@@ -1238,4 +1238,84 @@ final class Qwen38MTPPerformanceScorecardGateTests: XCTestCase {
                 .runnerLaunchEqualityRejected("reference launch binding missing"))
         }
     }
+
+    // MARK: - Combined validation entry (chain Slice 4b, increment B)
+
+    private var combinedEntryAuthority: Qwen38MTPPerformanceScorecardAuthorityBundle {
+        Qwen38MTPPerformanceScorecardAuthorityBundle(
+            acceptedLiveExactnessProof: trustedProof,
+            trustedEngineIdentities: trustedEngineIdentities,
+            trustedRunIdentity: trustedRunIdentity)
+    }
+
+    func testCombinedEntryReturnsVerdictWhenValidationAndEqualityPass() throws {
+        let evidence = makeEvidence()
+        let verdict = try Gate.validateWithRunnerLaunchObservations(
+            evidence,
+            authority: combinedEntryAuthority,
+            observations: runnerObservations(
+                candidate: hex("4"),
+                reference: hex("5")))
+        XCTAssertEqual(verdict, evidence.verdict)
+    }
+
+    /// P4 rider: the equality check must run even though validate passed —
+    /// a green scorecard with mismatched runner observations never yields a
+    /// Verdict.
+    func testCombinedEntryRunsEqualityEvenThoughValidatePasses() {
+        let evidence = makeEvidence()
+        XCTAssertThrowsError(
+            try Gate.validateWithRunnerLaunchObservations(
+                evidence,
+                authority: combinedEntryAuthority,
+                observations: runnerObservations(
+                    candidate: hex("6"),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("candidate"))
+        }
+        XCTAssertThrowsError(
+            try Gate.validateWithRunnerLaunchObservations(
+                evidence,
+                authority: combinedEntryAuthority,
+                observations: runnerObservations(
+                    candidate: hex("5"),
+                    reference: hex("4")))
+        ) { error in
+            XCTAssertEqual(
+                error as? GateError,
+                .runnerLaunchEqualityRejected("candidate"))
+        }
+    }
+
+    func testCombinedEntryPropagatesValidateFailureWithMatchingObservations() {
+        var rejected = makeEvidence()
+        rejected.liveExactnessProof?.accepted = false
+        XCTAssertThrowsError(
+            try Gate.validateWithRunnerLaunchObservations(
+                rejected,
+                authority: combinedEntryAuthority,
+                observations: runnerObservations(
+                    candidate: hex("4"),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(error as? GateError, .invalidLiveExactnessProof)
+        }
+    }
+
+    func testCombinedEntryRejectsMalformedObservationsEvenWithGreenValidate() {
+        let evidence = makeEvidence()
+        XCTAssertThrowsError(
+            try Gate.validateWithRunnerLaunchObservations(
+                evidence,
+                authority: combinedEntryAuthority,
+                observations: runnerObservations(
+                    candidate: String(repeating: "A", count: 64),
+                    reference: hex("5")))
+        ) { error in
+            XCTAssertEqual(error as? GateError, .invalidRunnerLaunchObservation)
+        }
+    }
 }
