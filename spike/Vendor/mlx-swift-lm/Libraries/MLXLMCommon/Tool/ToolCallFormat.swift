@@ -216,6 +216,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
+        // Qwen4-Exp family (qwen4_exp, qwen4_exp_moe, etc.) — e.g. Qwen3.8-Flash-Next
+        if type.hasPrefix("qwen4_exp") {
+            return .xmlFunction
+        }
+
         // Mistral3 family (mistral3, mistral3_text, etc.)
         if type.hasPrefix("mistral3") {
             return .mistral

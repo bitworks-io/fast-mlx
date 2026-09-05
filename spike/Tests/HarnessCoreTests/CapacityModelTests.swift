@@ -382,4 +382,102 @@ final class CapacityModelTests: XCTestCase {
             host.hardwareHoldsBytes(weightsBytes: 10 * Int(gib), osReserveBytes: 4 * Int(gib)),
             101 * Int(gib))
     }
+
+    // MARK: - Qwen3.8-Flash-Next (hybrid-linear): the catalog entry this increment adds.
+    //
+    // Ground truth is the real artifact's own config.json text_config and the 22 safetensors
+    // headers of its published checkpoint, both read directly rather than assumed — see
+    // ModelArchProfile.swift's entry comment for the full arithmetic, the vendored-cache
+    // reconciliation, and the load-bearing caveat on the weights figure.
+
+    /// The entry exists and is retrievable through the catalog's real lookup (`model(_:)` here
+    /// wraps the same `ModelArchProfile.catalog.first(where:)` the production code uses).
+    func testFlashNext_EntryExistsAndRetrievable() {
+        let m = model("Qwen3.8-Flash-Next")
+        XCTAssertEqual(m.modelType, .hybridLinear)
+        XCTAssertEqual(m.nLayers, 48)
+        XCTAssertEqual(m.nAttnLayers, 12)
+        XCTAssertEqual(m.nKVHeads, 2)
+        XCTAssertEqual(m.headDim, 256)
+        XCTAssertEqual(m.nativeMaxContext, 262_144)
+    }
+
+    /// Growing KV/token has TWO terms on this family, not one:
+    ///   standard K+V  = 12 full_attention layers × 2 kv heads × (256 K + 256 V) × 2 B (fp16) = 24,576
+    ///   QSA indexer   = 12 full_attention layers × indexer_head_dim 128 × 2 B                =  3,072
+    ///                                                                                   total = 27,648
+    /// The indexer term was previously omitted here, under-counting by 12.5%. It is a SECOND growing
+    /// per-attention-layer cache (`auxPerLayerKeyDim`): each full-attention layer's QSA indexer keeps
+    /// its own `rawKeys` buffer, grown by `concatenated(..., axis: 1)` and NOT capped by
+    /// `indexer_budget` — that budget caps sparse selection, not the stored raw keys. Verified against
+    /// `spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341`.
+    /// Produced by `CapacityModel.kvBytesPerToken`'s real hybrid-linear dispatch, not restated as a
+    /// standalone literal computation in this test.
+    func testFlashNext_GrowingKVPerToken() {
+        let m = model("Qwen3.8-Flash-Next")
+        let perToken = CapacityModel.kvBytesPerToken(m, kvQuant: .fp16)
+        XCTAssertEqual(perToken, 27_648)
+    }
+
+    /// Growing KV at the model's full native max context (262,144 tokens), 1 sequence: 27,648 B/tok
+    /// × 262,144 = 7,247,757,312 B (6.75 GiB) exactly. This is the growing attention term alone
+    /// (kvBytesPerToken × context) — matching how the existing hybrid-linear entries above pin
+    /// their growing term separately from `fixedStateBytes` (`kvBytesForContext` adds both).
+    /// The 0.75 GiB above the previous 6.00 GiB figure is the QSA indexer `rawKeys` cache that this
+    /// entry used to omit — it is real, resident, and grows with the sequence.
+    func testFlashNext_KVAt262144Tokens() {
+        let m = model("Qwen3.8-Flash-Next")
+        let growingKV = CapacityModel.kvBytesPerToken(m, kvQuant: .fp16) * 262_144
+        XCTAssertEqual(growingKV, 7_247_757_312)
+        assertClose(growingKV / gib, 6.75, tolerance: 0.001, "Qwen3.8-Flash-Next growing KV@262,144")
+    }
+
+    /// Fixed per-sequence GatedDeltaNet state, reconciled against the vendored MambaCache
+    /// allocation in the vendored gated-delta-net implementation: conv state
+    /// (4−1)×10,240×2 B(bf16) = 61,440 +
+    /// recurrent/SSM state 48×128×128×4 B(float32, enforced by `validateCache`) = 3,145,728 →
+    /// 3,207,168 B/linear-layer × 36 linear layers (48 total − 12 full_attention) = 115,458,048 B.
+    func testFlashNext_FixedStateBytesReconciled() {
+        let m = model("Qwen3.8-Flash-Next")
+        XCTAssertEqual(m.fixedStateBytes, 115_458_048)
+    }
+
+    /// End-to-end fit: PLE-offloaded weights (81,324,594,328 B measured) on a 128 GiB SHARED host
+    /// (`.m5Max128`, `hostUse` defaults to `.shared`) at concurrency 1 / context 262,144 (the
+    /// model's own native max) classifies GREEN, and the headroom `hardwareHoldsBytes` computes is
+    /// ~16.26 GiB — the tool now reproduces the docs' hand-computed headroom figure. If this
+    /// diverges from 16.26 GiB, that is a real discrepancy to report, not something to paper over
+    /// by bending the assertion.
+    func testFlashNext_Classify_GreenOn128GiBSharedHost_AtConcurrency1Context262144() {
+        let m = model("Qwen3.8-Flash-Next")
+        let profile = SystemProfile.m5Max128
+        XCTAssertEqual(profile.hostUse.use, .shared, "must be a SHARED host, not dedicated-serving")
+
+        let headroom = profile.hardwareHoldsBytes(
+            weightsBytes: m.weightsBytes4bitEstimate, osReserveBytes: CapacityThresholds.default.osReserveBytes)
+        XCTAssertEqual(headroom, 17_459_653_480)
+        assertClose(Double(headroom) / gib, 16.26, tolerance: 0.01, "Qwen3.8-Flash-Next headroom on m5Max128 shared")
+
+        let prediction = CapacityModel.predictPeakBytes(
+            model: m, context: 262_144, concurrency: 1, kvQuant: .fp16, profile: profile)
+        let verdict = CapacityModel.classify(
+            prediction, profile: profile, weightsBytes: Double(m.weightsBytes4bitEstimate))
+        XCTAssertEqual(verdict.color, .green, "Qwen3.8-Flash-Next @ concurrency 1 / context 262,144 on 128GiB shared")
+        XCTAssertEqual(verdict.bindingConstraint, .fits)
+    }
+
+    /// Negative case: the SAME host/context, at a concurrency high enough that the classifier
+    /// leaves GREEN — proving the catalog entry (not a hardcoded verdict) actually drives the
+    /// classification. Concurrency 3 pushes the non-weights peak past the green threshold.
+    func testFlashNext_Classify_HigherConcurrencyLeavesGreen() {
+        let m = model("Qwen3.8-Flash-Next")
+        let profile = SystemProfile.m5Max128
+
+        let prediction = CapacityModel.predictPeakBytes(
+            model: m, context: 262_144, concurrency: 3, kvQuant: .fp16, profile: profile)
+        let verdict = CapacityModel.classify(
+            prediction, profile: profile, weightsBytes: Double(m.weightsBytes4bitEstimate))
+        XCTAssertNotEqual(verdict.color, .green, "concurrency 3 must push the same model/host/context off GREEN")
+        XCTAssertEqual(verdict.color, .red)
+    }
 }

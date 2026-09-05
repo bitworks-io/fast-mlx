@@ -1000,6 +1000,12 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "qwen3_next_moe") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "QWEN3_NEXT") == .xmlFunction)
 
+        // Qwen4-Exp models (prefix matching), e.g. Qwen3.8-Flash-Next (model_type: qwen4_exp)
+        #expect(ToolCallFormat.infer(from: "qwen4_exp") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "QWEN4_EXP") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen4_exp_moe") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen4") == nil)  // near-miss, not a qwen4_exp prefix
+
         // Mistral3 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
         #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)

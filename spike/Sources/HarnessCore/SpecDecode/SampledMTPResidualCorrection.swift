@@ -142,6 +142,40 @@ public enum SampledMTPResidualCorrection: Equatable, Sendable {
             ])
     }
 
+    public static func proposalToken(draft: [Double], proposalUniform: Double) throws -> Int {
+        try validateDraft(draft)
+        guard isValidUniform(proposalUniform) else {
+            // -1 is a sentinel: no token has been selected because the uniform draw itself is invalid.
+            throw SampledMTPResidualCorrectionError.invalidProposalToken(
+                token: -1,
+                vocabularyCount: draft.count)
+        }
+        return sample(distribution: draft, uniform: proposalUniform)
+    }
+
+    public static func reconstructTargetLaw(target: [Double], draft: [Double]) throws -> [Double] {
+        try validateDistributions(target: target, draft: draft)
+
+        var acceptance = Array(repeating: 0.0, count: target.count)
+        for token in draft.indices where draft[token] > 0.0 {
+            acceptance[token] = try acceptanceProbability(
+                target: target,
+                draft: draft,
+                proposedToken: token)
+        }
+
+        let rejectedMass = zip(draft, acceptance).reduce(0.0) { partial, pair in
+            partial + pair.0 * (1.0 - pair.1)
+        }
+        let residual = rejectedMass > 0.0
+            ? try residualDistribution(target: target, draft: draft)
+            : Array(repeating: 0.0, count: target.count)
+
+        return target.indices.map { token in
+            draft[token] * acceptance[token] + rejectedMass * residual[token]
+        }
+    }
+
     private static func validateDistributions(target: [Double], draft: [Double]) throws {
         guard !target.isEmpty, !draft.isEmpty else {
             throw SampledMTPResidualCorrectionError.emptyDistribution
@@ -157,15 +191,22 @@ public enum SampledMTPResidualCorrection: Equatable, Sendable {
                 throw SampledMTPResidualCorrectionError.invalidTargetProbability(index: index)
             }
         }
+        let targetSum = target.reduce(0.0, +)
+        guard abs(targetSum - 1.0) <= normalizationTolerance else {
+            throw SampledMTPResidualCorrectionError.nonNormalizedTarget(sum: targetSum)
+        }
+
+        try validateDraft(draft)
+    }
+
+    private static func validateDraft(_ draft: [Double]) throws {
+        guard !draft.isEmpty else {
+            throw SampledMTPResidualCorrectionError.emptyDistribution
+        }
         for (index, value) in draft.enumerated() {
             guard value.isFinite, value >= 0.0 else {
                 throw SampledMTPResidualCorrectionError.invalidDraftProbability(index: index)
             }
-        }
-
-        let targetSum = target.reduce(0.0, +)
-        guard abs(targetSum - 1.0) <= normalizationTolerance else {
-            throw SampledMTPResidualCorrectionError.nonNormalizedTarget(sum: targetSum)
         }
         let draftSum = draft.reduce(0.0, +)
         guard abs(draftSum - 1.0) <= normalizationTolerance else {

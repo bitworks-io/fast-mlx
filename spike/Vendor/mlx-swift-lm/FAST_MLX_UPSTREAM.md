@@ -33,6 +33,13 @@ below; a future remote fork may replace this path dependency only at an immutabl
   `QuantizedLinear` projections, and preserves the existing checkpoint-visible
   Qwen text/VLM projection names by replacing them with storage-sharing views
   only after explicit model preparation.
+- `MLXLMCommon.BaseConfiguration.QuantizationContainer` (and its stored properties,
+  `init(from:)`, and `encode(to:)`) is widened from `internal` to `public`. This is a pure
+  access-level change; the interleaved-quantization decode/encode bodies are byte-identical
+  to upstream. A model configuration decoder in the separate `MLXLLM` module names this type
+  across the module boundary to decode a checkpoint's root `quantization` /
+  `quantization_config` blocks by reusing upstream's interleaved quantization parser
+  instead of hand-rolling a second one.
 
 The product remains model-generic. A model whose attention call shape does not use a qualified
 router must fail closed for the packed route and continue to use its existing fp16 path.

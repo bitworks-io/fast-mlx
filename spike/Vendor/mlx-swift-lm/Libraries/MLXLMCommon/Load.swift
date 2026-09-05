@@ -13,28 +13,13 @@ import MLXNN
 /// fallback route then misread the model format (double-shifted norm weights), producing a
 /// model that loads and decodes but is quality-destroyed. Without an index, fall back to
 /// enumerating `*.safetensors` as before (single-file checkpoints).
+///
+/// The index decoding itself lives in ``SafetensorsWeightIndex`` so callers outside this
+/// module can obtain the artifact's declared key set and key->shard mapping without reading
+/// a tensor.
 func modelWeightFileURLs(modelDirectory: URL) throws -> [URL] {
-    struct SafetensorsIndex: Decodable {
-        let weightMap: [String: String]
-
-        enum CodingKeys: String, CodingKey {
-            case weightMap = "weight_map"
-        }
-    }
-
-    let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
-    if let indexData = try? Data(contentsOf: indexURL) {
-        let index = try JSONDecoder().decode(SafetensorsIndex.self, from: indexData)
-        let shards = Set(index.weightMap.values).sorted()
-        let urls = shards.map { modelDirectory.appendingPathComponent($0) }
-        for url in urls {
-            guard FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
-            else {
-                throw ModelFactoryError.invalidConfiguration(
-                    "model.safetensors.index.json maps missing shard \(url.lastPathComponent)")
-            }
-        }
-        return urls
+    if let index = try SafetensorsWeightIndex.load(modelDirectory: modelDirectory) {
+        return try index.shardURLs(in: modelDirectory)
     }
 
     var urls = [URL]()

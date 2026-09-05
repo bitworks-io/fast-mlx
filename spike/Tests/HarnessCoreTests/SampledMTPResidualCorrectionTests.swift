@@ -64,6 +64,28 @@ final class SampledMTPResidualCorrectionTests: XCTestCase {
             draft[token] * acceptance[token] + totalRejectedProposalMass * residual[token]
         }
         assertEqualDoubles(reconstructed, target, accuracy: 1e-15)
+        assertEqualDoubles(
+            try SampledMTPResidualCorrection.reconstructTargetLaw(target: target, draft: draft),
+            target,
+            accuracy: 1e-15)
+    }
+
+    func testProposalSelectionUsesDraftCumulativeTokenOrder() throws {
+        XCTAssertEqual(
+            try SampledMTPResidualCorrection.proposalToken(
+                draft: [0.2, 0.5, 0.3],
+                proposalUniform: 0.0),
+            0)
+        XCTAssertEqual(
+            try SampledMTPResidualCorrection.proposalToken(
+                draft: [0.2, 0.5, 0.3],
+                proposalUniform: 0.69),
+            1)
+        XCTAssertEqual(
+            try SampledMTPResidualCorrection.proposalToken(
+                draft: [0.2, 0.5, 0.3],
+                proposalUniform: 0.99),
+            2)
     }
 
     func testDistributionLawAcrossFixedProbabilityTable() throws {

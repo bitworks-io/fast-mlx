@@ -2,6 +2,7 @@ CLAUDE.local.md
 .agent-reports/
 # Repository-local agent state and machine-owned automation files.
 /.agents/
+/.agent-claim
 /.codex/agents/Explore.toml
 /.harness-sha
 /.tmp-*

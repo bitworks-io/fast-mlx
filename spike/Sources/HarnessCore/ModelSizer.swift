@@ -124,14 +124,14 @@ public enum ModelSizer {
     /// existing formulas against a model whose `weightsBytes4bitEstimate` field has been swapped
     /// for the scaled figure is what keeps this a wrapper rather than a second capacity model.
     private static func scaledModel(_ model: ModelArchProfile, weightBits: Int) -> ModelArchProfile {
-        let scaledWeightsBytes = Int(Double(model.weightsBytes4bitEstimate) * Double(weightBits) / 4.0)
-        return ModelArchProfile(
-            id: model.id, modelType: model.modelType, nLayers: model.nLayers,
-            nAttnLayers: model.nAttnLayers, nKVHeads: model.nKVHeads, headDim: model.headDim,
-            slidingWindow: model.slidingWindow, fixedStateBytes: model.fixedStateBytes,
-            nativeMaxContext: model.nativeMaxContext, weightsBytes4bitEstimate: scaledWeightsBytes,
-            license: model.license, mlaHeads: model.mlaHeads, mlaRopeDim: model.mlaRopeDim,
-            mlaNopeDim: model.mlaNopeDim, mlaVDim: model.mlaVDim
-        )
+        // Copy-and-modify, NOT a field-by-field rebuild: a field list here is exactly what
+        // silently dropped `swaKVHeads`/`swaHeadDim`/`vHeadDim`/`swaVHeadDim`/`auxPerLayerKeyDim`
+        // from every sizer-report row when they were added to `ModelArchProfile` after this
+        // function was last written. `weightsBytes4bitEstimate` is `internal(set) var`
+        // specifically so this can mutate just the one field that actually changes and let every
+        // other field — present or future — pass through untouched.
+        var scaled = model
+        scaled.weightsBytes4bitEstimate = Int(Double(model.weightsBytes4bitEstimate) * Double(weightBits) / 4.0)
+        return scaled
     }
 }

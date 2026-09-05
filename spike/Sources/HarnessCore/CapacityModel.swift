@@ -147,7 +147,15 @@ public enum CapacityModel {
         case .uniformGQA:
             return Double(m.nLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
         case .hybridLinear:
+            // `auxPerLayerKeyDim` (currently only qwen4_exp/qwen4_exp_text's QSA indexer rawKeys
+            // cache) is a SEPARATE growing per-attention-layer term, added on top of the standard
+            // K+V term. The literal `2.0` here is deliberate, not `bpe`: the indexer's `rawKeys` is a
+            // projection output held at model dtype (bf16 = 2 bytes), NOT part of the quantizable KV
+            // cache — scaling it by the KV-quant `bpe` would UNDER-count it under a lossy tier (e.g.
+            // int8's bpe=1 would halve it). Sizing at a fixed 2 bytes over-counts slightly once KV is
+            // quantized, which is the fail-closed direction (spec's "never phantom-GREEN" rule).
             return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe
+                + Double(m.nAttnLayers) * Double(m.auxPerLayerKeyDim ?? 0) * 2.0
         case .interleavedSWA:
             // Global (full-context-growing) layers only; local layers are handled as a fixed cap.
             return Double(m.nAttnLayers) * Double(m.nKVHeads) * Double(m.kvHeadDimSum) * bpe

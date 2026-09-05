@@ -116,9 +116,9 @@ public struct BaseConfiguration: Codable, Sendable {
     /// Quantization configs in MLX often interleave global keys (like `bits`) with
     /// specific layer keys (like `model.layers.0...`). This container uses manual
     /// decoding to separate these interleaved values.
-    struct QuantizationContainer: Codable, Sendable {
-        var quantization: Quantization
-        var perLayerQuantization: PerLayerQuantization
+    public struct QuantizationContainer: Codable, Sendable {
+        public var quantization: Quantization
+        public var perLayerQuantization: PerLayerQuantization
 
         /// A custom CodingKey used to iterate over arbitrary layer names in JSON.
         internal struct _DictionaryCodingKey: CodingKey {
@@ -136,7 +136,7 @@ public struct BaseConfiguration: Codable, Sendable {
             }
         }
 
-        init(from decoder: any Decoder) throws {
+        public init(from decoder: any Decoder) throws {
             // handle the embedded Quantization
             self.quantization = try Quantization(from: decoder)
 
@@ -170,7 +170,7 @@ public struct BaseConfiguration: Codable, Sendable {
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
         }
 
-        func encode(to encoder: any Encoder) throws {
+        public func encode(to encoder: any Encoder) throws {
             try quantization.encode(to: encoder)
 
             var container = encoder.container(keyedBy: _DictionaryCodingKey.self)

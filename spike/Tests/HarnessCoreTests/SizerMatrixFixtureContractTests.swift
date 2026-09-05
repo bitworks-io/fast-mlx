@@ -122,7 +122,13 @@ final class SizerMatrixFixtureContractTests: XCTestCase {
         XCTAssertEqual(artifact.host.mlxCacheLimitBytes, 12_884_901_888)
         XCTAssertLessThan(try XCTUnwrap(artifact.host.mlxCacheLimitBytes), try XCTUnwrap(artifact.host.mlxMemoryLimitBytes))
 
-        XCTAssertEqual(artifact.rows.count, 34)
+        // Derived from the catalog rather than hardcoded: the fixture must carry one row per
+        // catalog entry per weight-bit tier, which is exactly what `decodeValidated` enforces
+        // ("rows must cover the complete catalog matrix", SizerMatrixArtifact.swift:532-536).
+        // A literal here goes stale the moment a model is added -- as it did when the
+        // Qwen3.8-Flash-Next entry landed -- and fails in a way that looks like a fixture
+        // corruption rather than an expected catalog growth.
+        XCTAssertEqual(artifact.rows.count, ModelArchProfile.catalog.count * 2)
         let eightBit = try XCTUnwrap(
             artifact.rows.first { $0.modelID == "Qwen3.5-9B" && $0.weightBits == 8 })
         XCTAssertEqual(eightBit.kvBytesAtContext, 1_125_253_120)
@@ -311,5 +317,60 @@ final class SizerMatrixFixtureContractTests: XCTestCase {
         XCTAssertNil(built.host.metalRecommendedWorkingSetBytes)
         _ = try SizerMatrixArtifact.decodeValidated(
             from: XCTUnwrap(built.encodedJSON().data(using: .utf8)))
+    }
+
+    /// Regression for `ModelSizer.scaledModel`: it used to rebuild `ModelArchProfile` field by
+    /// field, which silently dropped every optional field added after that rebuild was last
+    /// written (`swaKVHeads`/`swaHeadDim`/`vHeadDim`/`swaVHeadDim`/`auxPerLayerKeyDim`). This must
+    /// NOT be proven by recomputing a row and comparing it to another recomputed row: both
+    /// `ModelSizer.report` (the generator) and `SizerMatrixArtifact.validateV2Row` (the fixture
+    /// validator) route through the SAME `scaledModel`, so that comparison is self-consistent and
+    /// cannot detect a dropped field — that self-consistency is exactly why 16/16 fixture tests
+    /// passed while the bug was live. Instead this computes the expected KV bytes on the
+    /// UNSCALED catalog profile via `CapacityModel.kvBytesForContext` directly (a path
+    /// `scaledModel` never touches) and checks it against `ModelSizer.report`'s row for the same
+    /// model/context — a genuine cross-check of the scaling wrapper against the underlying model.
+    func testScaledModelPreservesOptionalGeometryFields() throws {
+        let context = 32768
+        let kvQuant = KVQuantTier.fp16
+
+        // Baichuan-M1-14B (`.dualGeometrySWA`): exercises `swaKVHeads`/`swaHeadDim`, dropped
+        // fields that only affect the SWA (window-capped) layers' term. By hand: growing term
+        // 20 attn layers x 2 kv x (256+256) x 2 B(fp16) = 40,960 B/tok x 32,768 tok =
+        // 1,342,177,280 B; SWA local-cap term 20 local layers x 8 swaKVHeads x (128+128) x 2 B x
+        // 8,192 window = 671,088,640 B; + fixedStateBytes 122,880 B (conv state, added once, not
+        // scaled by context) = 2,013,388,800 B total — the catalog's own reconciled KV@32K figure.
+        try assertKVMatchesCatalogModel(id: "Baichuan-M1-14B", context: context, kvQuant: kvQuant)
+
+        // Qwen3.8-Flash-Next (`.hybridLinear`): exercises `auxPerLayerKeyDim`, the QSA indexer's
+        // growing per-layer key cache. By hand: K+V term 12 attn layers x 2 kv x (256+256) x 2 B =
+        // 24,576 B/tok; indexer term 12 attn layers x 128 auxPerLayerKeyDim x 2 B(fixed, not
+        // kvQuant-scaled) = 3,072 B/tok; total 27,648 B/tok x 32,768 tok = 905,969,664 B, +
+        // fixedStateBytes 115,458,048 B (gated-delta-net recurrent+conv state) = 1,021,427,712 B.
+        try assertKVMatchesCatalogModel(id: "Qwen3.8-Flash-Next", context: context, kvQuant: kvQuant)
+    }
+
+    private func assertKVMatchesCatalogModel(
+        id: String, context: Int, kvQuant: KVQuantTier, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let unscaled = try XCTUnwrap(
+            ModelArchProfile.catalog.first { $0.id == id }, "catalog must still carry \(id)",
+            file: file, line: line)
+        let expectedKVBytes = CapacityModel.kvBytesForContext(
+            unscaled, context: context, kvQuant: kvQuant, concurrency: 1)
+
+        for weightBits in [4, 8] {
+            let rows = ModelSizer.report(
+                box: .m5Max128, context: context, weightBitOptions: [weightBits], kvQuant: kvQuant,
+                concurrency: 1)
+            let row = try XCTUnwrap(
+                rows.first { $0.modelID == id && $0.weightBits == weightBits },
+                "no \(id)/\(weightBits)-bit row", file: file, line: line)
+            XCTAssertEqual(
+                Double(row.kvBytesAtContext), expectedKVBytes, accuracy: 1,
+                "\(id) weightBits=\(weightBits): scaledModel must preserve every optional "
+                    + "geometry field, not just the ones scaledModel's author remembered to list",
+                file: file, line: line)
+        }
     }
 }

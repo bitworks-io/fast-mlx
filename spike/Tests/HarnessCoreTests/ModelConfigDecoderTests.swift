@@ -1739,6 +1739,318 @@ final class ModelConfigDecoderTests: XCTestCase {
         }
     }
 
+    // MARK: - qwen4_exp / qwen4_exp_text (Qwen3.8-Flash-Next): hybrid-linear PLUS a QSA indexer
+    // rawKeys cache the existing formula omits entirely. 48 layers, layer_types = 12 repetitions of
+    // [linear_attention, linear_attention, linear_attention, full_attention] -> 12 full-attention
+    // (growing) layers, 36 linear. Each of the 12 full-attention layers ALSO carries an indexer
+    // rawKeys cache of width `indexer_head_dim`, held at model dtype (bf16, 2 B/elem) and NOT
+    // capped by `indexer_budget` (that budget caps sparse selection, not the stored raw keys) — see
+    // spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341.
+
+    /// Builds the 48-layer layer_types array: 12 reps of [linear, linear, linear, full].
+    private func qwen4ExpLayerTypesJSON() -> String {
+        var layerTypes: [String] = []
+        for _ in 0..<12 { layerTypes += ["linear_attention", "linear_attention", "linear_attention", "full_attention"] }
+        return "[" + layerTypes.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+    }
+
+    /// T1: full valid nested (text_config) qwen4_exp config decodes to .hybridLinear with the
+    /// confirmed 12/36 split and the new `auxPerLayerKeyDim` populated from `indexer_head_dim`.
+    func testQwen4Exp_nestedTextConfig_decodesHybridLinearWithIndexerAux() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "text_config": {
+            "model_type": "qwen4_exp",
+            "num_hidden_layers": 48,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "hidden_size": 4096,
+            "max_position_embeddings": 262144,
+            "full_attention_interval": 4,
+            "layer_types": \(qwen4ExpLayerTypesJSON()),
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "indexer_head_dim": 128,
+            "indexer_kv_heads": 1,
+            "indexer_n_heads": 4,
+            "indexer_budget": 2048
+          }
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "Qwen3.8-Flash-Next-live")
+        XCTAssertEqual(parsed.profile.modelType, .hybridLinear)
+        XCTAssertEqual(parsed.profile.nLayers, 48)
+        XCTAssertEqual(parsed.profile.nAttnLayers, 12)
+        XCTAssertEqual(parsed.profile.nKVHeads, 2)
+        XCTAssertEqual(parsed.profile.headDim, 256)
+        XCTAssertEqual(parsed.profile.nativeMaxContext, 262144)
+        XCTAssertTrue(parsed.profile.isKVDerivable)
+        XCTAssertEqual(parsed.profile.auxPerLayerKeyDim, 128, "indexer_head_dim must populate the aux term")
+    }
+
+    /// T2 (decisive): the indexer aux term makes `kvBytesPerToken` STRICTLY greater than the same
+    /// profile with `auxPerLayerKeyDim` nil, and the total must equal the exact reconciled number —
+    /// 12·2·512·2 (growing K+V) + 12·128·2 (indexer rawKeys, ALWAYS 2 B/elem, never scaled by KV
+    /// quant) = 24,576 + 3,072 = 27,648 B/tok. A future refactor that silently drops the term must
+    /// fail this exact-number assertion, not just a "greater than" check.
+    func testQwen4Exp_kvBytesPerToken_includesIndexerAuxTerm_exactAndStrictlyGreater() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp_text",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-text")
+        let withAux = CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16)
+        XCTAssertEqual(withAux, 27_648)
+
+        var withoutAuxProfile = parsed.profile
+        withoutAuxProfile = ModelArchProfile(
+            id: withoutAuxProfile.id, modelType: withoutAuxProfile.modelType, nLayers: withoutAuxProfile.nLayers,
+            nAttnLayers: withoutAuxProfile.nAttnLayers, nKVHeads: withoutAuxProfile.nKVHeads,
+            headDim: withoutAuxProfile.headDim, slidingWindow: withoutAuxProfile.slidingWindow,
+            fixedStateBytes: withoutAuxProfile.fixedStateBytes, nativeMaxContext: withoutAuxProfile.nativeMaxContext,
+            weightsBytes4bitEstimate: withoutAuxProfile.weightsBytes4bitEstimate, license: withoutAuxProfile.license)
+        let withoutAux = CapacityModel.kvBytesPerToken(withoutAuxProfile, kvQuant: .fp16)
+        XCTAssertEqual(withoutAux, 24_576)
+        XCTAssertGreaterThan(withAux, withoutAux, "the indexer rawKeys term must not be silently droppable")
+    }
+
+    /// T3: `qwen4_exp_text` (root `model_type`, geometry NOT nested under `text_config`) decodes
+    /// equivalently to the nested `qwen4_exp` fixture in T1.
+    func testQwen4ExpText_flatConfig_decodesEquivalently() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp_text",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-text-flat")
+        XCTAssertEqual(parsed.profile.modelType, .hybridLinear)
+        XCTAssertEqual(parsed.profile.nLayers, 48)
+        XCTAssertEqual(parsed.profile.nAttnLayers, 12)
+        XCTAssertEqual(parsed.profile.nKVHeads, 2)
+        XCTAssertEqual(parsed.profile.headDim, 256)
+        XCTAssertEqual(parsed.profile.nativeMaxContext, 262144)
+        XCTAssertEqual(parsed.profile.auxPerLayerKeyDim, 128)
+    }
+
+    /// T4: fail-closed — a qwen4_exp config missing `indexer_head_dim` THROWS rather than decoding
+    /// with the aux term silently omitted (a silent 0 reintroduces the ~12.5% under-count).
+    func testQwen4Exp_missingIndexerHeadDim_failsClosed() {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4
+        }
+        """
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x"),
+            "qwen4_exp without indexer_head_dim must refuse, not silently omit the indexer aux term"
+        ) { error in
+            guard case ModelConfigDecodeError.missingField(let f) = error else {
+                return XCTFail("expected missingField(indexer_head_dim), got \(error)")
+            }
+            XCTAssertTrue(f.contains("indexer_head_dim"), "missing field should name indexer_head_dim, got \(f)")
+        }
+    }
+
+    /// T4b: fail-closed — `indexer_kv_heads` present but != 1. The vendored `Qwen4ExpQSAIndexer.swift:223`
+    /// `precondition(keyValueHeads == 1, ...)` means the modelled `auxPerLayerKeyDim` rawKeys width is
+    /// verified ONLY for one raw-key head; a config declaring 2 must refuse rather than silently
+    /// modelling an unverified shape (multiplying through would assert a shape no one has checked).
+    func testQwen4Exp_indexerKVHeadsNotOne_failsClosed() {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 2
+        }
+        """
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x"),
+            "qwen4_exp with indexer_kv_heads != 1 must refuse rather than model an unverified shape"
+        ) { error in
+            guard case ModelConfigDecodeError.invalidField(let f) = error else {
+                return XCTFail("expected invalidField(indexer_kv_heads), got \(error)")
+            }
+            XCTAssertEqual(f, "indexer_kv_heads")
+        }
+    }
+
+    /// T4c: `indexer_kv_heads: 1` decodes successfully with the aux term and per-token figures
+    /// unchanged from before this field was read at all (mirrors T2's exact 27,648 B/tok assertion).
+    func testQwen4Exp_indexerKVHeadsExplicitOne_decodesUnchanged() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-kvheads-1")
+        XCTAssertEqual(parsed.profile.auxPerLayerKeyDim, 128)
+        XCTAssertEqual(CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16), 27_648)
+    }
+
+    /// T4d: fail-closed — `indexer_kv_heads` absent entirely. The vendored `Qwen4ExpConfiguration`
+    /// (Qwen4ExpConfiguration.swift:349) decodes it via a plain `container.decode(Int.self, forKey:
+    /// .indexerKeyValueHeads)` — a REQUIRED field with no default — so absence is not a legitimate
+    /// config to silently accept as 1; it must fail closed like `indexer_head_dim`'s own absence (T4).
+    func testQwen4Exp_indexerKVHeadsAbsent_failsClosed() {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128
+        }
+        """
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x"),
+            "qwen4_exp without indexer_kv_heads must refuse, not silently default to 1"
+        ) { error in
+            guard case ModelConfigDecodeError.missingField(let f) = error else {
+                return XCTFail("expected missingField(indexer_kv_heads), got \(error)")
+            }
+            XCTAssertEqual(f, "indexer_kv_heads")
+        }
+    }
+
+    /// T4e: non-qwen4_exp families never read/validate `indexer_kv_heads` — an unrelated dense family
+    /// carrying a stray (invalid-for-qwen4_exp) `indexer_kv_heads: 2` field must decode exactly as
+    /// though the field weren't there at all, proving the new check is gated on `isQwen4Exp`.
+    func testNonQwen4Exp_ignoresIndexerKVHeadsField() throws {
+        let json = """
+        {
+          "model_type": "qwen3",
+          "num_hidden_layers": 64,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "hidden_size": 5120,
+          "max_position_embeddings": 40960,
+          "indexer_kv_heads": 2
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen3-stray-indexer-field")
+        XCTAssertEqual(parsed.profile.modelType, .uniformGQA)
+        XCTAssertNil(parsed.profile.auxPerLayerKeyDim, "non-qwen4_exp families must never populate the aux term")
+    }
+
+    /// T5: under an int8 KV quant tier, the growing K/V term scales by int8's 1 B/elem, but the
+    /// indexer aux term stays at 2 B/elem (bf16 projection output, not part of the quantizable KV
+    /// cache) — 12·2·512·1 (growing) + 12·128·2 (aux, unaffected by KV quant) = 12,288 + 3,072 =
+    /// 15,360 B/tok.
+    func testQwen4Exp_int8KVQuant_auxTermStaysAtTwoBytes() throws {
+        XCTAssertEqual(KVQuantTier.int8.bytesPerElement, 1.0, "confirm the int8 tier's bytesPerElement before trusting the expected total below")
+        let json = """
+        {
+          "model_type": "qwen4_exp_text",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-int8")
+        let total = CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .int8)
+        XCTAssertEqual(total, 15_360)
+    }
+
     /// Families that need a NEW `ArchClass` formula (not an allow-list add) must fail closed. openelm
     /// carries a PER-LAYER-VARYING `num_key_value_heads` array (not the scalar every audited class
     /// reads), so uniformGQA's `nKVHeads × head_dim × nAttnLayers` would use the wrong head count on

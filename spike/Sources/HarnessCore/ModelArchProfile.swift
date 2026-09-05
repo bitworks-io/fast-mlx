@@ -59,8 +59,13 @@ public struct ModelArchProfile: Sendable {
     /// true fixed cost is zero.
     public let fixedStateBytes: Int
     public let nativeMaxContext: Int
-    /// 4-bit weights estimate in bytes (spec's "0.5B/param" rule, ⚠️ where flagged).
-    public let weightsBytes4bitEstimate: Int
+    /// 4-bit weights estimate in bytes (spec's "0.5B/param" rule, ⚠️ where flagged). Settable
+    /// (internal-set only — every other field on this type stays `let`) SPECIFICALLY so
+    /// `ModelSizer.scaledModel` can copy-and-modify a whole profile instead of re-listing every
+    /// field to rebuild one. A field-by-field rebuild is what silently dropped `swaKVHeads`/
+    /// `swaHeadDim`/`vHeadDim`/`swaVHeadDim`/`auxPerLayerKeyDim` from every sizer-report row —
+    /// re-listing fields is a defect generator, not a fix.
+    public internal(set) var weightsBytes4bitEstimate: Int
     public let license: String
 
     // MARK: MLA-as-implemented geometry (DeepSeek-R1 only; nil for every other class)
@@ -90,12 +95,26 @@ public struct ModelArchProfile: Sendable {
     /// `nil` falls back to `swaHeadDim` (symmetric). Only meaningful for `.dualGeometrySWA`.
     public let swaVHeadDim: Int?
 
+    // MARK: Auxiliary growing per-layer cache (`.hybridLinear` only; nil for every other class and
+    // every existing hybrid-linear member)
+    /// A per-attention-layer auxiliary key cache width that GROWS with sequence length, on top of
+    /// the standard K+V cache already counted by `nKVHeads`/`kvHeadDimSum`. `nil` for every family
+    /// that has no such second growing cache (every hybrid-linear entry to date). Currently used
+    /// only by the `qwen4_exp`/`qwen4_exp_text` (Qwen3.8-Flash-Next) QSA indexer: each full-attention
+    /// layer's indexer keeps its own `rawKeys` cache of width `indexer_head_dim`, independent of
+    /// `indexer_kv_heads`, NOT capped by `indexer_budget` (that budget caps sparse selection, not the
+    /// stored raw keys) — see `spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/
+    /// Qwen4ExpQSAIndexer.swift:332-341`. Omitting this term under-counts Flash Next's KV footprint
+    /// by ~12.5%.
+    public let auxPerLayerKeyDim: Int?
+
     public init(
         id: String, modelType: ArchClass, nLayers: Int, nAttnLayers: Int, nKVHeads: Int, headDim: Int,
         slidingWindow: Int? = nil, fixedStateBytes: Int = 0, nativeMaxContext: Int,
         weightsBytes4bitEstimate: Int, license: String,
         mlaHeads: Int? = nil, mlaRopeDim: Int? = nil, mlaNopeDim: Int? = nil, mlaVDim: Int? = nil,
-        swaKVHeads: Int? = nil, swaHeadDim: Int? = nil, vHeadDim: Int? = nil, swaVHeadDim: Int? = nil
+        swaKVHeads: Int? = nil, swaHeadDim: Int? = nil, vHeadDim: Int? = nil, swaVHeadDim: Int? = nil,
+        auxPerLayerKeyDim: Int? = nil
     ) {
         self.id = id; self.modelType = modelType; self.nLayers = nLayers; self.nAttnLayers = nAttnLayers
         self.nKVHeads = nKVHeads; self.headDim = headDim; self.slidingWindow = slidingWindow
@@ -104,6 +123,7 @@ public struct ModelArchProfile: Sendable {
         self.mlaHeads = mlaHeads; self.mlaRopeDim = mlaRopeDim; self.mlaNopeDim = mlaNopeDim; self.mlaVDim = mlaVDim
         self.swaKVHeads = swaKVHeads; self.swaHeadDim = swaHeadDim
         self.vHeadDim = vHeadDim; self.swaVHeadDim = swaVHeadDim
+        self.auxPerLayerKeyDim = auxPerLayerKeyDim
     }
 
     /// K+V per-head dim sum for the GLOBAL layers: `headDim + (vHeadDim ?? headDim)`. Recovers the
@@ -316,6 +336,80 @@ public struct ModelArchProfile: Sendable {
             nativeMaxContext: 262_144,
             weightsBytes4bitEstimate: Int(161.83 * Double(gib)), license: "unknown (see model card)",
             swaKVHeads: 8, swaHeadDim: 192, vHeadDim: 128, swaVHeadDim: 128
+        ),
+        // hybrid-linear "Flash Next". Geometry confirmed directly from the real artifact's
+        // config.json text_config: 48 layers, layer_types = 12x full_attention + 36x
+        // linear_attention (full_attention_interval 4) -> nAttnLayers = 12 (only the
+        // full-attention layers grow a KV cache); num_key_value_heads 2, head_dim 256 ->
+        // GROWING KV/tok, K+V term only = 12 x 2 x (256+256) x 2 B(fp16) = 24,576 B/tok. Plus the
+        // QSA indexer term below (12 x 128 x 2 B = 3,072 B/tok): TOTAL GROWING KV/tok = 24,576 +
+        // 3,072 = 27,648 B/tok -> exactly 7,247,757,312 B (6.75 GiB) at the model's own native
+        // max, 262,144 tokens (27,648 x 262,144 = 7,247,757,312). The earlier "24,576 B/tok ->
+        // 6,442,450,944 B (6.00 GiB)" figure that stood here omitted the indexer term entirely —
+        // corrected once that term was counted (see the indexer note below).
+        // nativeMaxContext = 262,144 (max_position_embeddings).
+        //
+        // FIXED term: the 36 linear_attention layers' per-sequence gated-delta-net recurrent+conv
+        // state, reconciled against the VENDORED cache allocation rather than config geometry
+        // alone (per the Qwen3.5-9B convention above). convDim = keyDim*2 + valueDim =
+        // (16x128)x2 + (48x128) = 4,096 + 6,144 = 10,240, from config's linear_num_key_heads 16 /
+        // linear_key_head_dim 128 / linear_num_value_heads 48 / linear_value_head_dim 128. The
+        // conv-state cache allocates [batch, convKernelSize-1, convDim] at the model's bf16/fp16
+        // compute dtype (2 B/elem) = (4-1) x 10,240 x 2 = 61,440 B. The recurrent/SSM state's
+        // shape is [batch, numVHeads, headVDim, headKDim] = [_, 48, 128, 128] and the vendored
+        // code asserts its dtype is ALWAYS float32 regardless of compute dtype: 48 x 128 x 128 x
+        // 4 B = 3,145,728 B. Per linear layer = 61,440 + 3,145,728 = 3,207,168 B; x 36 linear
+        // layers (48 total - 12 full_attention) = 115,458,048 B (110.11 MiB/seq). Both shapes and
+        // dtypes were confirmed against the vendored source, not inferred from config alone.
+        //
+        // weightsBytes4bitEstimate is the MEASURED resident-after-offload figure read from the
+        // artifact's 22 safetensors headers: total 113,324,747,928 B (105.54 GiB) MINUS the
+        // 32,000,153,600 B (29.80 GiB) per-layer-embedding n-gram lookup table =
+        // 81,324,594,328 B (75.74 GiB). This is NOT a 0.5B/param estimate and NOT the full on-disk
+        // size -- it EXCLUDES the n-gram table because that table is designed to be SSD-streamed
+        // rather than held resident. WARNING, LOAD-BEARING: this number is only valid once that
+        // offload is actually wired into the serving path. There is no production call site for it
+        // yet, so any fit verdict consuming this figure describes the offload-enabled
+        // configuration, not the as-shipped one -- loading the full 105.54 GiB would fail the green
+        // verdict most of the current fleet gives it here.
+        //
+        // Consequence for the sizer matrix: the artifact is MIXED precision (base 4-bit/group-32
+        // with 5- and 8-bit per-module overrides), so the `weightBits: 8` row the matrix emits by
+        // doubling this figure is a mechanical extrapolation with no corresponding real build. It
+        // is kept only for matrix uniformity; read the 4-bit row for this model.
+        //
+        // COUNTED as of the cycle-35 correction, via `auxPerLayerKeyDim: 128` below. This entry
+        // previously said the sparse-attention indexer's cache was "indexer_budget 2048 x
+        // indexer_kv_heads 1 x indexer_head_dim 128" and had no term for it. That description was
+        // WRONG in the direction that hides cost, and is corrected here:
+        //   - `indexer_budget` does NOT bound this cache. The budget caps sparse SELECTION -- how
+        //     many tokens attention picks -- not the stored raw keys. Verified in
+        //     Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341:
+        //     `concatenated([existingRawKeys, newRawKeys], axis: 1)` with no truncation on that
+        //     path, and :341 asserts `rawKeys.dim(1) == keyLength`, the FULL key length.
+        //   - The width is exactly `indexer_head_dim` (128), independent of `indexer_kv_heads`:
+        //     `newRawKeys = qkProjection[0..., 0..., split...].reshaped(batch, seq, headDim)`.
+        // So it is a GROWING per-attention-layer term, not a fixed per-sequence one: 12 layers x 128
+        // x 2 B = 3,072 B/token, i.e. ~805 MB at the 262,144 native context, not the ~262 KB the old
+        // budget-based description implied -- roughly 3,000x larger. Sized at model dtype (2 B) and
+        // NOT at the KV-quant bytes/element, because `rawKeys` is a projection output held at model
+        // dtype rather than part of the quantizable KV cache; see `CapacityModel.kvBytesPerToken`.
+        //
+        // NOT counted by this entry or by `CapacityModel`: an MTP (multi-token-prediction) deploy
+        // adds a 13th growing K+V cache PLUS a 13th growing indexer cache on top of the 12 that
+        // `nAttnLayers = 12` models here. The MTP draft head builds its own `.qsa` decoder layer
+        // with its own indexer and allocates its own growing cache (`Vendor/mlx-swift-lm/Libraries/
+        // MLXLLM/Models/Qwen4ExpMTP.swift:459-479,511-513`) — this entry has no attention-layer
+        // count that includes it. Roughly +1/12 (~8%) more growing KV/tok than the 27,648 B/tok
+        // figure above once MTP is in the serving path. Not modeled here; treat any fit verdict
+        // for an MTP-enabled deploy as an under-count by that margin, not as already covering it.
+        // WARNING: Qwen Community License 1.0 -- flagged for legal verification, not a confirmed
+        // clearance (same convention as the other flagged entries above).
+        ModelArchProfile(
+            id: "Qwen3.8-Flash-Next", modelType: .hybridLinear, nLayers: 48, nAttnLayers: 12,
+            nKVHeads: 2, headDim: 256, fixedStateBytes: 115_458_048, nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: 81_324_594_328, license: "⚠️ Qwen Community License 1.0 (verify)",
+            auxPerLayerKeyDim: 128
         ),
     ]
 }
