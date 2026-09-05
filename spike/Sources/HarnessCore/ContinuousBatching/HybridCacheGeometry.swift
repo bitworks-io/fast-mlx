@@ -19,15 +19,57 @@ public struct DenseKVGeometry: Equatable, Sendable {
     public let headDim: Int
     /// Element width of the stored K/V (2 for fp16/bf16, 4 for fp32).
     public let elementBytes: Int
+    /// Width of a per-attention-layer QSA sparse-indexer `rawKeys` auxiliary cache (currently only
+    /// `qwen4_exp`/`qwen4_exp_text`'s indexer — models `indexer_head_dim`), or `nil` when the family
+    /// carries no such term (every other hybrid family, including `qwen3_5`, for which this field
+    /// defaults absent and changes nothing). See
+    /// docs/task-inbox/2026-09-05-qwen4exp-fit-check-qsa-indexer-term-DECISION.md.
+    public let auxPerLayerKeyDim: Int?
 
-    public init(kvHeads: Int, headDim: Int, elementBytes: Int) {
+    /// Fixed element width for the aux term: 2 bytes (model/activation dtype, bf16/fp16) — by the SAME
+    /// reasoning as `RecurrentStateGeometry.ssmStateElementBytes` above, exposed as a `static let`, NOT
+    /// a settable field, so no caller can misconfigure it. The indexer `rawKeys` buffer is a projection
+    /// output held at model dtype; it is not part of the quantizable KV cache, so it must NOT scale with
+    /// `elementBytes` (the KV-quant width): doing so would UNDER-count it under a lossy KV tier (e.g.
+    /// int8's 1 byte/elem would halve the term) — a phantom-GREEN failure. Sizing at a fixed 2 bytes
+    /// OVER-counts slightly once KV is quantized narrower, which is the fail-closed direction. Mirrors
+    /// `CapacityModel.kvBytesPerToken`'s `.hybridLinear` case, which applies the identical fixed-2.0
+    /// literal to the same term on the sizer path.
+    public static let auxElementBytes: Int = 2
+
+    public init(kvHeads: Int, headDim: Int, elementBytes: Int, auxPerLayerKeyDim: Int? = nil) {
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.elementBytes = elementBytes
+        self.auxPerLayerKeyDim = auxPerLayerKeyDim
     }
 
-    /// Bytes added per token per layer: K and V, each `kvHeads × headDim × elementBytes`.
-    public var bytesPerLayerPerToken: Int { 2 * kvHeads * headDim * elementBytes }
+    /// Bytes added per token per layer: K and V, each `kvHeads × headDim × elementBytes`, plus the
+    /// optional fixed-width QSA indexer aux term (`auxPerLayerKeyDim × auxElementBytes` — see
+    /// `auxElementBytes`'s doc comment for why it must never scale with `elementBytes`).
+    public var bytesPerLayerPerToken: Int {
+        2 * kvHeads * headDim * elementBytes + (auxPerLayerKeyDim ?? 0) * Self.auxElementBytes
+    }
+
+    /// Overflow-safe sibling of `bytesPerLayerPerToken`: returns the SAME value on success, `nil` on
+    /// any intermediate overflow (every multiply/add of the K+V and aux terms is checked). This is the
+    /// single source of truth admission-grade callers (`HybridKVByteAdmissionPlan`) must use instead of
+    /// hand-rolling the formula — see docs/task-inbox/2026-09-05-hybrid-admission-aux-term-latent-trap.md.
+    public func bytesPerLayerPerTokenChecked() -> Int? {
+        var kv = 2
+        for factor in [kvHeads, headDim, elementBytes] {
+            let (next, overflow) = kv.multipliedReportingOverflow(by: factor)
+            guard !overflow else { return nil }
+            kv = next
+        }
+        var aux = auxPerLayerKeyDim ?? 0
+        let (auxScaled, auxOverflow) = aux.multipliedReportingOverflow(by: Self.auxElementBytes)
+        guard !auxOverflow else { return nil }
+        aux = auxScaled
+        let (total, totalOverflow) = kv.addingReportingOverflow(aux)
+        guard !totalOverflow else { return nil }
+        return total
+    }
 }
 
 /// The fixed-size recurrent state of a GatedDeltaNet linear-attention layer (qwen3_5 / qwen3_next),
@@ -106,5 +148,18 @@ public struct HybridCacheGeometry: Equatable, Sendable {
     /// capacity accounting adds on top of the growing dense KV.
     public var recurrentBytesTotal: Int {
         recurrent.bytesPerLayer * map.recurrentLayerIndices.count
+    }
+
+    /// Overflow-safe per-token dense charge across all dense layers: `dense.bytesPerLayerPerTokenChecked()
+    /// × map.denseLayerIndices.count`, checked. This is the SINGLE SOURCE OF TRUTH for the dense
+    /// per-token byte charge, already including the fixed-width QSA indexer aux term (see
+    /// `DenseKVGeometry.auxPerLayerKeyDim`). `HybridKVByteAdmissionPlan` must call this rather than
+    /// recomputing the K+V formula itself — a hand-rolled duplicate silently dropped the aux term once
+    /// already (docs/task-inbox/2026-09-05-hybrid-admission-aux-term-latent-trap.md).
+    public func denseBytesPerTokenChecked() -> Int? {
+        guard let perLayer = dense.bytesPerLayerPerTokenChecked() else { return nil }
+        let (total, overflow) = perLayer.multipliedReportingOverflow(by: map.denseLayerIndices.count)
+        guard !overflow else { return nil }
+        return total
     }
 }

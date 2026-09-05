@@ -20,6 +20,15 @@ import HarnessCore
 ///    allowed to fail OPEN with 0 when it cannot resolve geometry, because the sizer is advisory.
 ///    Admission-grade accounting has no such license — under-charging here means admitting more
 ///    concurrent rows than fit, which is a correctness violation, not an advisory miss.
+/// 3. `bytesPerToken` includes the DenseKVGeometry aux term (`auxPerLayerKeyDim × auxElementBytes`) via
+///    `geometry.denseBytesPerTokenChecked()` — never recomputed by hand here. The aux term models a
+///    QSA sparse-indexer `rawKeys` cache (currently only qwen4_exp/qwen4_exp_text) at a FIXED 2 bytes,
+///    NOT scaled by `dense.elementBytes` (the KV-quant width): it is a projection output held at model
+///    dtype, not part of the quantizable KV cache, so scaling it by the KV-quant width would
+///    UNDER-count it under a lossy tier (e.g. int8) — the fail-open direction this admission path must
+///    never take. See docs/task-inbox/2026-09-05-qwen4exp-fit-check-qsa-indexer-term-DECISION.md and
+///    docs/task-inbox/2026-09-05-hybrid-admission-aux-term-latent-trap.md (a hand-rolled duplicate of
+///    the K+V formula here once silently dropped this term entirely).
 struct HybridKVByteAdmissionPlan: Sendable, Equatable, ContinuousKVByteAdmissionPlanning {
     let bytesPerToken: Int
     let recurrentBytesPerRow: Int
@@ -36,19 +45,17 @@ struct HybridKVByteAdmissionPlan: Sendable, Equatable, ContinuousKVByteAdmission
         let recurrentCount = geometry.map.recurrentLayerIndices.count
         guard denseCount > 0, recurrentCount > 0,
             geometry.dense.kvHeads > 0, geometry.dense.headDim > 0, geometry.dense.elementBytes > 0,
+            (geometry.dense.auxPerLayerKeyDim ?? 1) > 0,
             allocationChunk > 0, maxContextTokens > 0,
             allocationChunk <= maxContextTokens
         else {
             throw DenseKVByteAdmissionPlanError.invalidGeometry
         }
 
-        var bytes = denseCount
-        for factor in [2, geometry.dense.kvHeads, geometry.dense.headDim, geometry.dense.elementBytes] {
-            let (next, overflow) = bytes.multipliedReportingOverflow(by: factor)
-            guard !overflow else { throw DenseKVByteAdmissionPlanError.arithmeticOverflow }
-            bytes = next
+        guard let denseBytes = geometry.denseBytesPerTokenChecked() else {
+            throw DenseKVByteAdmissionPlanError.arithmeticOverflow
         }
-        self.bytesPerToken = bytes
+        self.bytesPerToken = denseBytes
 
         self.recurrentBytesPerRow = geometry.recurrentBytesTotal
 

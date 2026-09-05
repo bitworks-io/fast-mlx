@@ -1249,4 +1249,94 @@ public extension ModelConfigDecoder {
         }
         return geometry
     }
+
+    /// Fail-closed derivation of the full `HybridCacheGeometry` for a `qwen4_exp`/`qwen4_exp_text`
+    /// checkpoint (Qwen3.8-Flash-Next). Structurally identical interval-select GatedDeltaNet shape to
+    /// qwen3_5 — CONFIRMED 12 full-attention layers of 48 (`layer_types` is 12 repetitions of
+    /// `[linear_attention, linear_attention, linear_attention, full_attention]`), and the SAME
+    /// `linear_num_key_heads`/`linear_num_value_heads`/`linear_key_head_dim`/`linear_value_head_dim`/
+    /// `linear_conv_kernel_dim` field names as qwen3_5 (verified against the fixtures in
+    /// `ModelConfigDecoderTests.swift`'s `qwen4ExpLayerTypesJSON`/T1-T4e and against `decode`'s
+    /// existing `resolveHybridFixedStateBytes` call, which already reuses this exact field set for
+    /// qwen4_exp's fixed recurrent state on the sizer path) — so the recurrent geometry below is
+    /// derived, not invented.
+    ///
+    /// UNLIKE qwen3_5, each full-attention layer here ALSO carries the QSA sparse-indexer `rawKeys`
+    /// aux cache (`DenseKVGeometry.auxPerLayerKeyDim`), resolved from `indexer_head_dim` with the SAME
+    /// fail-closed `indexer_kv_heads == 1` precondition check the sizer path already applies
+    /// (`decode`'s `isSparseIndexerHybrid` block) — verified against the vendored sparse-attention
+    /// indexer's `precondition(keyValueHeads == 1, ...)`. See
+    /// docs/task-inbox/2026-09-05-qwen4exp-fit-check-qsa-indexer-term-DECISION.md.
+    public static func qwen4ExpHybridGeometry(configJSON: Data) throws -> HybridCacheGeometry {
+        guard let root = (try? JSONSerialization.jsonObject(with: configJSON)) as? [String: Any] else {
+            throw ModelConfigDecodeError.malformedJSON
+        }
+        let textScope = (root["text_config"] as? [String: Any]) ?? [:]
+        func geom(_ key: String) -> Any? { textScope[key] ?? root[key] }
+
+        // Family gate (root is authoritative for a VL wrapper; fall back to text scope).
+        let rawModelType = (root["model_type"] as? String) ?? (textScope["model_type"] as? String)
+        guard let modelType = rawModelType?.lowercased() else {
+            throw ModelConfigDecodeError.missingField("model_type")
+        }
+        guard modelType == "qwen4_exp" || modelType == "qwen4_exp_text" else {
+            throw ModelConfigDecodeError.unsupportedModelType(
+                "\(modelType) (qwen4ExpHybridGeometry is qwen4_exp/qwen4_exp_text-scoped)")
+        }
+
+        // Structure.
+        let nLayers = try requirePositiveInt(geom, "num_hidden_layers")
+        let attnIndices = try hybridAttentionLayerIndices(geom: geom, nLayers: nLayers)
+        guard let map = HybridLayerKindMap.from(attentionLayerIndices: attnIndices, layerCount: nLayers) else {
+            throw ModelConfigDecodeError.invalidField(
+                "attention layer indices \(attnIndices.sorted()) out of range for \(nLayers) layers")
+        }
+
+        // Dense K/V geometry + element width from dtype.
+        let elementBytes: Int
+        switch (geom("torch_dtype") as? String) ?? (geom("dtype") as? String) {
+        case "float16", "bfloat16": elementBytes = 2
+        case "float32": elementBytes = 4
+        case let other:
+            throw ModelConfigDecodeError.invalidField("torch_dtype/dtype (\(other ?? "absent"))")
+        }
+
+        // QSA indexer rawKeys aux term. `indexer_head_dim` sizes the width (fails closed, never
+        // defaults to 0 — see `DenseKVGeometry.auxElementBytes`'s doc comment for the fixed-width
+        // rule). `indexer_kv_heads` must be present and exactly 1 — the only shape the vendored
+        // indexer's `precondition` ever verifies; absence or any other value refuses rather than
+        // silently modelling an unverified tensor shape, mirroring `decode`'s `isSparseIndexerHybrid`
+        // check exactly.
+        let auxPerLayerKeyDim = try requirePositiveInt(geom, "indexer_head_dim")
+        guard let indexerKVHeads = intOf(geom("indexer_kv_heads")) else {
+            throw ModelConfigDecodeError.missingField("indexer_kv_heads")
+        }
+        guard indexerKVHeads == 1 else {
+            throw ModelConfigDecodeError.invalidField("indexer_kv_heads")
+        }
+
+        let dense = DenseKVGeometry(
+            kvHeads: try requirePositiveInt(geom, "num_key_value_heads"),
+            headDim: try requirePositiveInt(geom, "head_dim"),
+            elementBytes: elementBytes,
+            auxPerLayerKeyDim: auxPerLayerKeyDim)
+
+        // Recurrent conv/SSM geometry — identical GatedDeltaNet formula to qwen3_5 (see the doc comment
+        // above this function for the field-name verification).
+        let nKHeads = try requirePositiveInt(geom, "linear_num_key_heads")
+        let nVHeads = try requirePositiveInt(geom, "linear_num_value_heads")
+        let kHeadDim = try requirePositiveInt(geom, "linear_key_head_dim")
+        let vHeadDim = try requirePositiveInt(geom, "linear_value_head_dim")
+        let convKernel = try requirePositiveInt(geom, "linear_conv_kernel_dim")
+        let convDim = 2 * (kHeadDim * nKHeads) + (vHeadDim * nVHeads)
+        let recurrent = RecurrentStateGeometry(
+            convKernelSize: convKernel, convDim: convDim, valueHeads: nVHeads,
+            valueHeadDim: vHeadDim, keyHeadDim: kHeadDim, convElementBytes: elementBytes)
+
+        guard let geometry = HybridCacheGeometry(map: map, dense: dense, recurrent: recurrent) else {
+            throw ModelConfigDecodeError.invalidField(
+                "qwen4_exp config resolves to an all-dense (non-heterogeneous) map — route .fp16, not hybrid")
+        }
+        return geometry
+    }
 }
