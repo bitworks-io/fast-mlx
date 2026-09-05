@@ -227,11 +227,12 @@ public enum ModelConfigDecoder {
         // 36 linear (GatedDeltaNet), reusing `resolveHybridAttnLayers`/`resolveHybridFixedStateBytes`
         // exactly like qwen3_5. UNLIKE every other hybrid-linear member, each of the 12 full-attention
         // layers ALSO carries a SECOND growing cache: the QSA indexer's `rawKeys` buffer, width
-        // `indexer_head_dim`, verified directly against the vendored
-        // `Qwen4ExpQSAIndexer.swift:332-341` (`concatenated([existingRawKeys, newRawKeys], axis: 1)`,
+        // `indexer_head_dim`, verified directly against the vendored sparse-attention indexer
+        // implementation (`concatenated([existingRawKeys, newRawKeys], axis: 1)`,
         // NOT capped by `indexer_budget` — that budget caps sparse selection, not the stored raw
         // keys). Was previously modeled with this term OMITTED (a ~12.5% under-count, ~805 MB at the
-        // 262,144 native context) — see the `auxPerLayerKeyDim` resolution below (`decode`, `isQwen4Exp`).
+        // 262,144 native context) — see the `auxPerLayerKeyDim` resolution below (`decode`,
+        // `isSparseIndexerHybrid`).
         // Before this entry, qwen4_exp/qwen4_exp_text were entirely unclassified (`.unsupportedModelType`
         // -> fit-check skipped -> flat serve.sh limits) — a fit-check GAP, not merely an under-count.
         "qwen4_exp", "qwen4_exp_text",
@@ -367,7 +368,7 @@ public enum ModelConfigDecoder {
         // qwen4_exp/qwen4_exp_text: hybrid-linear via the same interval-select path as qwen3_5, PLUS
         // a QSA indexer `rawKeys` cache on the full-attention layers (see `auxPerLayerKeyDim`
         // resolution below).
-        let isQwen4Exp = (modelType == "qwen4_exp" || modelType == "qwen4_exp_text")
+        let isSparseIndexerHybrid = (modelType == "qwen4_exp" || modelType == "qwen4_exp_text")
 
         let archClass: ArchClass
         if modelType == "mistral3" {
@@ -630,11 +631,12 @@ public enum ModelConfigDecoder {
         // the ~12.5% under-count this entry exists to fix, unlike the small conv-term resolvers above
         // that fail open. `nil` for every other class/family.
         let auxPerLayerKeyDim: Int?
-        if isQwen4Exp {
+        if isSparseIndexerHybrid {
             auxPerLayerKeyDim = try requirePositiveInt(geom, "indexer_head_dim")
-            // `auxPerLayerKeyDim` models the rawKeys width for exactly ONE raw-key head — the vendored
-            // `Qwen4ExpQSAIndexer.swift:223` `precondition(keyValueHeads == 1, ...)` is the only shape
-            // ever run/verified. `indexer_kv_heads` is a REQUIRED field in the vendored Codable (a plain
+            // `auxPerLayerKeyDim` models the rawKeys width for exactly ONE raw-key head — verified
+            // directly against the vendored sparse-attention indexer implementation, whose
+            // `precondition(keyValueHeads == 1, ...)` is the only shape ever run/verified.
+            // `indexer_kv_heads` is a REQUIRED field in the vendored Codable (a plain
             // `container.decode`, no default), so absence fails closed too. A value != 1 must reject
             // rather than multiply through: multiplying would assert an unverified tensor shape, and
             // ignoring it would under-count — both reopen the phantom-GREEN hole this term exists to close.

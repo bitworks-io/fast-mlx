@@ -1744,8 +1744,8 @@ final class ModelConfigDecoderTests: XCTestCase {
     // [linear_attention, linear_attention, linear_attention, full_attention] -> 12 full-attention
     // (growing) layers, 36 linear. Each of the 12 full-attention layers ALSO carries an indexer
     // rawKeys cache of width `indexer_head_dim`, held at model dtype (bf16, 2 B/elem) and NOT
-    // capped by `indexer_budget` (that budget caps sparse selection, not the stored raw keys) — see
-    // spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341.
+    // capped by `indexer_budget` (that budget caps sparse selection, not the stored raw keys) —
+    // verified directly against the vendored sparse-attention indexer implementation.
 
     /// Builds the 48-layer layer_types array: 12 reps of [linear, linear, linear, full].
     private func qwen4ExpLayerTypesJSON() -> String {
@@ -1754,9 +1754,9 @@ final class ModelConfigDecoderTests: XCTestCase {
         return "[" + layerTypes.map { "\"\($0)\"" }.joined(separator: ",") + "]"
     }
 
-    /// T1: full valid nested (text_config) qwen4_exp config decodes to .hybridLinear with the
+    /// T1: full valid nested (text_config) `qwen4_exp` config decodes to .hybridLinear with the
     /// confirmed 12/36 split and the new `auxPerLayerKeyDim` populated from `indexer_head_dim`.
-    func testQwen4Exp_nestedTextConfig_decodesHybridLinearWithIndexerAux() throws {
+    func testSparseIndexerHybrid_nestedTextConfig_decodesHybridLinearWithIndexerAux() throws {
         let json = """
         {
           "model_type": "qwen4_exp",
@@ -1798,7 +1798,7 @@ final class ModelConfigDecoderTests: XCTestCase {
     /// 12·2·512·2 (growing K+V) + 12·128·2 (indexer rawKeys, ALWAYS 2 B/elem, never scaled by KV
     /// quant) = 24,576 + 3,072 = 27,648 B/tok. A future refactor that silently drops the term must
     /// fail this exact-number assertion, not just a "greater than" check.
-    func testQwen4Exp_kvBytesPerToken_includesIndexerAuxTerm_exactAndStrictlyGreater() throws {
+    func testSparseIndexerHybrid_kvBytesPerToken_includesIndexerAuxTerm_exactAndStrictlyGreater() throws {
         let json = """
         {
           "model_type": "qwen4_exp_text",
@@ -1837,7 +1837,7 @@ final class ModelConfigDecoderTests: XCTestCase {
 
     /// T3: `qwen4_exp_text` (root `model_type`, geometry NOT nested under `text_config`) decodes
     /// equivalently to the nested `qwen4_exp` fixture in T1.
-    func testQwen4ExpText_flatConfig_decodesEquivalently() throws {
+    func testSparseIndexerHybridText_flatConfig_decodesEquivalently() throws {
         let json = """
         {
           "model_type": "qwen4_exp_text",
@@ -1870,7 +1870,7 @@ final class ModelConfigDecoderTests: XCTestCase {
 
     /// T4: fail-closed — a qwen4_exp config missing `indexer_head_dim` THROWS rather than decoding
     /// with the aux term silently omitted (a silent 0 reintroduces the ~12.5% under-count).
-    func testQwen4Exp_missingIndexerHeadDim_failsClosed() {
+    func testSparseIndexerHybrid_missingIndexerHeadDim_failsClosed() {
         let json = """
         {
           "model_type": "qwen4_exp",
@@ -1900,11 +1900,12 @@ final class ModelConfigDecoderTests: XCTestCase {
         }
     }
 
-    /// T4b: fail-closed — `indexer_kv_heads` present but != 1. The vendored `Qwen4ExpQSAIndexer.swift:223`
-    /// `precondition(keyValueHeads == 1, ...)` means the modelled `auxPerLayerKeyDim` rawKeys width is
+    /// T4b: fail-closed — `indexer_kv_heads` present but != 1. Verified directly against the
+    /// vendored sparse-attention indexer implementation's `precondition(keyValueHeads == 1, ...)`,
+    /// which means the modelled `auxPerLayerKeyDim` rawKeys width is
     /// verified ONLY for one raw-key head; a config declaring 2 must refuse rather than silently
     /// modelling an unverified shape (multiplying through would assert a shape no one has checked).
-    func testQwen4Exp_indexerKVHeadsNotOne_failsClosed() {
+    func testSparseIndexerHybrid_indexerKVHeadsNotOne_failsClosed() {
         let json = """
         {
           "model_type": "qwen4_exp",
@@ -1938,7 +1939,7 @@ final class ModelConfigDecoderTests: XCTestCase {
 
     /// T4c: `indexer_kv_heads: 1` decodes successfully with the aux term and per-token figures
     /// unchanged from before this field was read at all (mirrors T2's exact 27,648 B/tok assertion).
-    func testQwen4Exp_indexerKVHeadsExplicitOne_decodesUnchanged() throws {
+    func testSparseIndexerHybrid_indexerKVHeadsExplicitOne_decodesUnchanged() throws {
         let json = """
         {
           "model_type": "qwen4_exp",
@@ -1964,11 +1965,11 @@ final class ModelConfigDecoderTests: XCTestCase {
         XCTAssertEqual(CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16), 27_648)
     }
 
-    /// T4d: fail-closed — `indexer_kv_heads` absent entirely. The vendored `Qwen4ExpConfiguration`
-    /// (Qwen4ExpConfiguration.swift:349) decodes it via a plain `container.decode(Int.self, forKey:
-    /// .indexerKeyValueHeads)` — a REQUIRED field with no default — so absence is not a legitimate
+    /// T4d: fail-closed — `indexer_kv_heads` absent entirely. The vendored configuration for the
+    /// `qwen4_exp` family decodes this field with a plain non-optional `container.decode`, so it has
+    /// no default — so absence is not a legitimate
     /// config to silently accept as 1; it must fail closed like `indexer_head_dim`'s own absence (T4).
-    func testQwen4Exp_indexerKVHeadsAbsent_failsClosed() {
+    func testSparseIndexerHybrid_indexerKVHeadsAbsent_failsClosed() {
         let json = """
         {
           "model_type": "qwen4_exp",
@@ -1999,10 +2000,10 @@ final class ModelConfigDecoderTests: XCTestCase {
         }
     }
 
-    /// T4e: non-qwen4_exp families never read/validate `indexer_kv_heads` — an unrelated dense family
-    /// carrying a stray (invalid-for-qwen4_exp) `indexer_kv_heads: 2` field must decode exactly as
-    /// though the field weren't there at all, proving the new check is gated on `isQwen4Exp`.
-    func testNonQwen4Exp_ignoresIndexerKVHeadsField() throws {
+    /// T4e: non-`qwen4_exp` families never read/validate `indexer_kv_heads` — an unrelated dense family
+    /// carrying a stray (invalid-for-`qwen4_exp`) `indexer_kv_heads: 2` field must decode exactly as
+    /// though the field weren't there at all, proving the new check is gated on `isSparseIndexerHybrid`.
+    func testNonSparseIndexerHybrid_ignoresIndexerKVHeadsField() throws {
         let json = """
         {
           "model_type": "qwen3",
@@ -2024,7 +2025,7 @@ final class ModelConfigDecoderTests: XCTestCase {
     /// indexer aux term stays at 2 B/elem (bf16 projection output, not part of the quantizable KV
     /// cache) — 12·2·512·1 (growing) + 12·128·2 (aux, unaffected by KV quant) = 12,288 + 3,072 =
     /// 15,360 B/tok.
-    func testQwen4Exp_int8KVQuant_auxTermStaysAtTwoBytes() throws {
+    func testSparseIndexerHybrid_int8KVQuant_auxTermStaysAtTwoBytes() throws {
         XCTAssertEqual(KVQuantTier.int8.bytesPerElement, 1.0, "confirm the int8 tier's bytesPerElement before trusting the expected total below")
         let json = """
         {

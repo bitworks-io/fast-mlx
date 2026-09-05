@@ -409,8 +409,8 @@ final class CapacityModelTests: XCTestCase {
     /// The indexer term was previously omitted here, under-counting by 12.5%. It is a SECOND growing
     /// per-attention-layer cache (`auxPerLayerKeyDim`): each full-attention layer's QSA indexer keeps
     /// its own `rawKeys` buffer, grown by `concatenated(..., axis: 1)` and NOT capped by
-    /// `indexer_budget` — that budget caps sparse selection, not the stored raw keys. Verified against
-    /// `spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341`.
+    /// `indexer_budget` — that budget caps sparse selection, not the stored raw keys. Verified
+    /// directly against the vendored sparse-attention indexer implementation.
     /// Produced by `CapacityModel.kvBytesPerToken`'s real hybrid-linear dispatch, not restated as a
     /// standalone literal computation in this test.
     func testFlashNext_GrowingKVPerToken() {

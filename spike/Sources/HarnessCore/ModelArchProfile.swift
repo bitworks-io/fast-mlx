@@ -103,8 +103,8 @@ public struct ModelArchProfile: Sendable {
     /// only by the `qwen4_exp`/`qwen4_exp_text` (Qwen3.8-Flash-Next) QSA indexer: each full-attention
     /// layer's indexer keeps its own `rawKeys` cache of width `indexer_head_dim`, independent of
     /// `indexer_kv_heads`, NOT capped by `indexer_budget` (that budget caps sparse selection, not the
-    /// stored raw keys) — see `spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/
-    /// Qwen4ExpQSAIndexer.swift:332-341`. Omitting this term under-counts Flash Next's KV footprint
+    /// stored raw keys) — verified directly against the vendored sparse-attention indexer
+    /// implementation. Omitting this term under-counts Flash Next's KV footprint
     /// by ~12.5%.
     public let auxPerLayerKeyDim: Int?
 
@@ -383,10 +383,11 @@ public struct ModelArchProfile: Sendable {
         // indexer_kv_heads 1 x indexer_head_dim 128" and had no term for it. That description was
         // WRONG in the direction that hides cost, and is corrected here:
         //   - `indexer_budget` does NOT bound this cache. The budget caps sparse SELECTION -- how
-        //     many tokens attention picks -- not the stored raw keys. Verified in
-        //     Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen4ExpQSAIndexer.swift:332-341:
+        //     many tokens attention picks -- not the stored raw keys. Verified directly against the
+        //     vendored sparse-attention indexer implementation:
         //     `concatenated([existingRawKeys, newRawKeys], axis: 1)` with no truncation on that
-        //     path, and :341 asserts `rawKeys.dim(1) == keyLength`, the FULL key length.
+        //     path, and a subsequent assertion that `rawKeys.dim(1) == keyLength`, the FULL key
+        //     length.
         //   - The width is exactly `indexer_head_dim` (128), independent of `indexer_kv_heads`:
         //     `newRawKeys = qkProjection[0..., 0..., split...].reshaped(batch, seq, headDim)`.
         // So it is a GROWING per-attention-layer term, not a fixed per-sequence one: 12 layers x 128
@@ -398,8 +399,8 @@ public struct ModelArchProfile: Sendable {
         // NOT counted by this entry or by `CapacityModel`: an MTP (multi-token-prediction) deploy
         // adds a 13th growing K+V cache PLUS a 13th growing indexer cache on top of the 12 that
         // `nAttnLayers = 12` models here. The MTP draft head builds its own `.qsa` decoder layer
-        // with its own indexer and allocates its own growing cache (`Vendor/mlx-swift-lm/Libraries/
-        // MLXLLM/Models/Qwen4ExpMTP.swift:459-479,511-513`) — this entry has no attention-layer
+        // with its own indexer and allocates its own growing cache (verified directly against the
+        // vendored MTP draft-head implementation) — this entry has no attention-layer
         // count that includes it. Roughly +1/12 (~8%) more growing KV/tok than the 27,648 B/tok
         // figure above once MTP is in the serving path. Not modeled here; treat any fit verdict
         // for an MTP-enabled deploy as an under-count by that margin, not as already covering it.
