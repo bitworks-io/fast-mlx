@@ -24,6 +24,13 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN RSA" + " PRIVATE KEY",
 )
 
+# The internal implementation-family marker below is assembled by string
+# concatenation, never written as a literal. This script is itself part of
+# the public projection it validates, so a literal occurrence here would
+# match its own scan on every future publish. Do not "tidy" this into a
+# single literal string.
+INTERNAL_FAMILY_MARKER = "Qwen" + "4Exp"
+
 APACHE_2_LICENSE_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 REQUIRED_NOTICE_LINES: Tuple[str, ...] = (
     "fast-mlx",
@@ -259,6 +266,32 @@ def validate_public_identity_manifest(repository: Path) -> List[str]:
     return failures
 
 
+def validate_no_internal_family_marker(repository: Path) -> List[str]:
+    failures: List[str] = []
+    marker_bytes = INTERNAL_FAMILY_MARKER.encode("utf-8")
+    for path in repository.rglob("*"):
+        relative = path.relative_to(repository)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        relative_text = relative.as_posix()
+        if INTERNAL_FAMILY_MARKER in relative_text:
+            failures.append(
+                "projected path contains an internal implementation-family "
+                f"marker: {relative}"
+            )
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if marker_bytes in data:
+            failures.append(
+                f"projected file contains an internal implementation-family marker: {relative}"
+            )
+    return failures
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repository", type=Path, help="exported candidate root")
@@ -273,6 +306,7 @@ def validate(repository: Path) -> List[str]:
             failures.append(f"missing required public file: {required}")
 
     failures.extend(validate_public_identity_manifest(repository))
+    failures.extend(validate_no_internal_family_marker(repository))
 
     license_path = repository / "LICENSE"
     if license_path.is_file():

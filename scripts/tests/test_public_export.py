@@ -900,5 +900,35 @@ class PublicExportTests(unittest.TestCase):
 
             self.assertEqual(list(output.iterdir()), [])
 
+    def test_validator_rejects_internal_family_marker(self) -> None:
+        # Never spell this out as a literal: the marker must be assembled by
+        # concatenation, both here and in the validator, so this test file
+        # (itself part of the public projection) does not trip the scan it
+        # is exercising.
+        internal_family_marker = "Qwen" + "4Exp"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clean_file = root / "clean.txt"
+            clean_file.write_text("nothing to see here\n", encoding="utf-8")
+
+            self.assertEqual(
+                validate_public_repository.validate_no_internal_family_marker(root),
+                [],
+            )
+
+            tainted_file = root / "tainted.txt"
+            tainted_file.write_text(
+                f"internal note referencing {internal_family_marker}\n",
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate_no_internal_family_marker(
+                root
+            )
+            self.assertTrue(
+                any("tainted.txt" in failure for failure in failures),
+                failures,
+            )
+
 if __name__ == "__main__":
     unittest.main()
