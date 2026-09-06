@@ -164,6 +164,10 @@ let package = Package(
             name: "SpikeCoreTests",
             dependencies: [
                 "SpikeCore",
+                // Test-only. Lets one test assert MLXDecoder's prefill chunk size equals the
+                // capacity model's priced chunk size. HarnessCore itself stays PURE — this is a
+                // test target depending on it, never the reverse.
+                "HarnessCore",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),

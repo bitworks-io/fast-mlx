@@ -442,35 +442,144 @@ final class CapacityModelTests: XCTestCase {
         XCTAssertEqual(m.fixedStateBytes, 115_458_048)
     }
 
-    /// End-to-end fit: PLE-offloaded weights (81,324,594,328 B measured) on a 128 GiB SHARED host
-    /// (`.m5Max128`, `hostUse` defaults to `.shared`) at concurrency 1 / context 262,144 (the
-    /// model's own native max) classifies GREEN, and the headroom `hardwareHoldsBytes` computes is
-    /// ~16.26 GiB — the tool now reproduces the docs' hand-computed headroom figure. If this
-    /// diverges from 16.26 GiB, that is a real discrepancy to report, not something to paper over
-    /// by bending the assertion.
-    func testFlashNext_Classify_GreenOn128GiBSharedHost_AtConcurrency1Context262144() {
+    /// End-to-end (non-)fit: the catalog now models the FULL measured weights (113,324,747,928 B,
+    /// 105.54 GiB) because the vendored PLE-offloaded `qwen4_exp` loader is not `public` — no
+    /// serving path can reach the PLE n-gram offload, so nothing resident-shrinks this model. On a
+    /// 128 GiB SHARED host (`.m5Max128`, `hostUse` defaults to `.shared`, 96 GiB effective ceiling)
+    /// at concurrency 1 / context 262,144 (the model's own native max) that honestly REFUSES:
+    /// `hardwareHoldsBytes` goes negative (the overshoot past the ceiling) and classification is
+    /// RED / wiredLimit. This is the intended "never phantom-GREEN a configuration nobody can
+    /// build" behavior — see `Qwen3.8-Flash-Next`'s catalog entry comment. If this diverges from
+    /// -14,540,500,120, that is a real discrepancy to report, not something to paper over by
+    /// bending the assertion.
+    func testFlashNext_Classify_RedOn128GiBSharedHost_AtConcurrency1Context262144() {
         let m = model("Qwen3.8-Flash-Next")
         let profile = SystemProfile.m5Max128
         XCTAssertEqual(profile.hostUse.use, .shared, "must be a SHARED host, not dedicated-serving")
 
         let headroom = profile.hardwareHoldsBytes(
             weightsBytes: m.weightsBytes4bitEstimate, osReserveBytes: CapacityThresholds.default.osReserveBytes)
-        XCTAssertEqual(headroom, 17_459_653_480)
-        assertClose(Double(headroom) / gib, 16.26, tolerance: 0.01, "Qwen3.8-Flash-Next headroom on m5Max128 shared")
+        XCTAssertEqual(headroom, -14_540_500_120)
 
         let prediction = CapacityModel.predictPeakBytes(
             model: m, context: 262_144, concurrency: 1, kvQuant: .fp16, profile: profile)
         let verdict = CapacityModel.classify(
             prediction, profile: profile, weightsBytes: Double(m.weightsBytes4bitEstimate))
-        XCTAssertEqual(verdict.color, .green, "Qwen3.8-Flash-Next @ concurrency 1 / context 262,144 on 128GiB shared")
+        XCTAssertEqual(
+            verdict.color, .red,
+            "Qwen3.8-Flash-Next @ concurrency 1 / context 262,144 on 128GiB shared must honestly refuse")
+        XCTAssertEqual(verdict.bindingConstraint, .wiredLimit)
+    }
+
+    /// NO LONGER HYPOTHETICAL: the precondition the earlier version of this test recorded (a real,
+    /// `public` serving call site for the PLE n-gram offload) is now met -- see
+    /// `loadOffloadedNGramModelContext` (LLMModelFactory.swift), `loadScalarServingModel`
+    /// (MLXScalarServing.swift), and the `--ngram-offload-plan` CLI flag chain
+    /// (FastMLXServeArguments.swift / FastMLXServe.swift). That configuration is now modelled by its
+    /// own catalog entry, "Qwen3.8-Flash-Next (n-gram offload)", rather than by locally mutating the
+    /// base entry's weights figure -- this test now reads that entry from the catalog instead of
+    /// re-deriving the projection inline, so the two cannot drift apart. Its weights are the full
+    /// measured total minus the offloaded n-gram table (29.80 GiB):
+    ///   113,324,747,928 − 32,000,153,600 = 81,324,594,328 B (75.74 GiB)
+    /// On the same 128 GiB SHARED host at concurrency 1 / context 262,144, the headroom
+    /// `hardwareHoldsBytes` computes is ~16.26 GiB — the figure the docs hand-computed before the
+    /// catalog was corrected. If this diverges from 16.26 GiB, that is a real discrepancy to report,
+    /// not something to paper over by bending the assertion. This test is evidence the OFFLOAD entry
+    /// is GREEN at this operating point; it says nothing about the base entry, which stays RED here
+    /// (see the RED test above) because it models a deploy with no offload plan configured.
+    func testFlashNext_Classify_GreenOn128GiBSharedHost_UnderPLEOffloadProjection() {
+        let m = model("Qwen3.8-Flash-Next (n-gram offload)")
+        XCTAssertEqual(m.weightsBytes4bitEstimate, 81_324_594_328)
+
+        let profile = SystemProfile.m5Max128
+        XCTAssertEqual(profile.hostUse.use, .shared, "must be a SHARED host, not dedicated-serving")
+
+        let headroom = profile.hardwareHoldsBytes(
+            weightsBytes: m.weightsBytes4bitEstimate, osReserveBytes: CapacityThresholds.default.osReserveBytes)
+        XCTAssertEqual(headroom, 17_459_653_480)
+        assertClose(
+            Double(headroom) / gib, 16.26, tolerance: 0.01,
+            "Qwen3.8-Flash-Next (n-gram offload) headroom on m5Max128 shared")
+
+        let prediction = CapacityModel.predictPeakBytes(
+            model: m, context: 262_144, concurrency: 1, kvQuant: .fp16, profile: profile)
+        let verdict = CapacityModel.classify(
+            prediction, profile: profile, weightsBytes: Double(m.weightsBytes4bitEstimate))
+        XCTAssertEqual(
+            verdict.color, .green,
+            "Qwen3.8-Flash-Next (n-gram offload) @ concurrency 1 / context 262,144 on 128GiB shared")
         XCTAssertEqual(verdict.bindingConstraint, .fits)
     }
 
-    /// Negative case: the SAME host/context, at a concurrency high enough that the classifier
-    /// leaves GREEN — proving the catalog entry (not a hardcoded verdict) actually drives the
-    /// classification. Concurrency 3 pushes the non-weights peak past the green threshold.
+    /// The two catalog entries in full: `id`, `weightsBytes4bitEstimate` (computed from the base
+    /// entry at runtime, not restated as a literal, so the two rows cannot silently drift apart),
+    /// and every remaining field asserted equal between the two.
+    func testFlashNextOffload_EntryExistsAndMatchesBaseExceptWeights() {
+        let base = model("Qwen3.8-Flash-Next")
+        let offload = model("Qwen3.8-Flash-Next (n-gram offload)")
+
+        let nGramTableBytes = 32_000_153_600
+        XCTAssertEqual(offload.weightsBytes4bitEstimate, base.weightsBytes4bitEstimate - nGramTableBytes)
+
+        XCTAssertEqual(offload.modelType, base.modelType)
+        XCTAssertEqual(offload.nLayers, base.nLayers)
+        XCTAssertEqual(offload.nAttnLayers, base.nAttnLayers)
+        XCTAssertEqual(offload.nKVHeads, base.nKVHeads)
+        XCTAssertEqual(offload.headDim, base.headDim)
+        XCTAssertEqual(offload.slidingWindow, base.slidingWindow)
+        XCTAssertEqual(offload.fixedStateBytes, base.fixedStateBytes)
+        XCTAssertEqual(offload.nativeMaxContext, base.nativeMaxContext)
+        XCTAssertEqual(offload.license, base.license)
+        XCTAssertEqual(offload.mlaHeads, base.mlaHeads)
+        XCTAssertEqual(offload.mlaRopeDim, base.mlaRopeDim)
+        XCTAssertEqual(offload.mlaNopeDim, base.mlaNopeDim)
+        XCTAssertEqual(offload.mlaVDim, base.mlaVDim)
+        XCTAssertEqual(offload.swaKVHeads, base.swaKVHeads)
+        XCTAssertEqual(offload.swaHeadDim, base.swaHeadDim)
+        XCTAssertEqual(offload.vHeadDim, base.vHeadDim)
+        XCTAssertEqual(offload.swaVHeadDim, base.swaVHeadDim)
+        XCTAssertEqual(offload.auxPerLayerKeyDim, base.auxPerLayerKeyDim)
+
+        XCTAssertNotEqual(offload.id, base.id)
+        XCTAssertEqual(offload.id, "Qwen3.8-Flash-Next (n-gram offload)")
+    }
+
+    /// NON-VACUITY: the two entries must actually disagree on some real operating point, or the new
+    /// entry changes no answer and is inert. At the SAME host / context / concurrency exercised by
+    /// the RED test above (`m5Max128`, context 262,144, concurrency 1), the base entry (no offload
+    /// plan configured) is RED while the offload entry (plan configured) is GREEN — proven here via
+    /// the same `CapacityModel.classify` helper the other `testFlashNext_Classify_*` tests use.
+    func testFlashNextOffload_ChangesVerdictFromBaseAtSameOperatingPoint() {
+        let profile = SystemProfile.m5Max128
+
+        let base = model("Qwen3.8-Flash-Next")
+        let basePrediction = CapacityModel.predictPeakBytes(
+            model: base, context: 262_144, concurrency: 1, kvQuant: .fp16, profile: profile)
+        let baseVerdict = CapacityModel.classify(
+            basePrediction, profile: profile, weightsBytes: Double(base.weightsBytes4bitEstimate))
+        XCTAssertEqual(baseVerdict.color, .red, "base entry (no offload plan) must stay RED here")
+
+        let offload = model("Qwen3.8-Flash-Next (n-gram offload)")
+        let offloadPrediction = CapacityModel.predictPeakBytes(
+            model: offload, context: 262_144, concurrency: 1, kvQuant: .fp16, profile: profile)
+        let offloadVerdict = CapacityModel.classify(
+            offloadPrediction, profile: profile, weightsBytes: Double(offload.weightsBytes4bitEstimate))
+        XCTAssertEqual(offloadVerdict.color, .green, "offload entry (plan configured) must clear GREEN here")
+
+        XCTAssertNotEqual(
+            baseVerdict.color, offloadVerdict.color,
+            "the offload entry must change the fit verdict at this operating point, or it is inert")
+    }
+
+    /// Negative case, run against the SAME PLE-offload projection as the green cross-check above
+    /// (not the catalog's full-measured value, which is already RED at concurrency 1 — see the RED
+    /// test above, there is no green-to-red contrast left to demonstrate on that value). At
+    /// concurrency 3 the non-weights peak grows enough to push the projected model off GREEN, which
+    /// is what proves the classifier's verdict is actually driven by the predicted peak (and by the
+    /// model's own fields), not a hardcoded outcome.
     func testFlashNext_Classify_HigherConcurrencyLeavesGreen() {
-        let m = model("Qwen3.8-Flash-Next")
+        var m = model("Qwen3.8-Flash-Next")
+        m.weightsBytes4bitEstimate = m.weightsBytes4bitEstimate - 32_000_153_600
         let profile = SystemProfile.m5Max128
 
         let prediction = CapacityModel.predictPeakBytes(

@@ -509,6 +509,92 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     }
 }
 
+/// Derives the generation-time settings (`eosTokenIds`, `stopStrings`, `toolCallFormat`) that
+/// `_load` needs before it has a model or tokenizer, from `config.json` (already decoded into
+/// `baseConfig`/`configData`) and the optional `generation_config.json` on disk.
+///
+/// - `eosTokenIds` from `config.json` is *replaced* (not unioned) by `generation_config.json`'s
+///   `eos_token_id`, matching Python mlx-lm behavior.
+/// - `stopStrings` from `generation_config.json` are *unioned* into the incoming configuration's
+///   `stopStrings`.
+/// - `toolCallFormat` is only inferred from `baseConfig.modelType` when the incoming
+///   configuration's `toolCallFormat` is `nil`; an explicitly supplied format is preserved.
+///
+/// A missing, unreadable, or malformed `generation_config.json` is treated the same as an absent
+/// one: the `config.json`-derived `eosTokenIds` is left intact and no error is thrown.
+func resolveGenerationSettings(
+    into configuration: ResolvedModelConfiguration,
+    baseConfig: BaseConfiguration,
+    configData: Data,
+    modelDirectory: URL
+) -> ResolvedModelConfiguration {
+    // Load EOS token IDs from config.json, with optional override from generation_config.json
+    var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+    let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+    let generationConfig: GenerationConfigFile? =
+        if let generationData = try? Data(contentsOf: generationConfigURL) {
+            try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
+        } else {
+            nil
+        }
+    if let genEosIds = generationConfig?.eosTokenIds?.values {
+        eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+    }
+
+    // Build a ModelConfiguration with loaded EOS token IDs and tool call format
+    var mutableConfiguration = configuration
+    mutableConfiguration.eosTokenIds = eosTokenIds
+    mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+    if mutableConfiguration.toolCallFormat == nil {
+        mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+            from: baseConfig.modelType, configData: configData)
+    }
+
+    return mutableConfiguration
+}
+
+/// Assembles the `ModelContext` tail of `_load`: once weights are loaded and the tokenizer is
+/// ready, this picks the `MessageGenerator` (a model-supplied one when the model conforms to
+/// ``LLMModel``, otherwise ``DefaultMessageGenerator``), derives the `TokenizerSource` for the
+/// resulting `ModelConfiguration` (`nil` when the tokenizer directory is the model directory,
+/// `.directory(...)` otherwise), and builds the `LLMUserInputProcessor` and `ModelContext`.
+func assembleModelContext(
+    model: LanguageModel,
+    tokenizer: Tokenizer,
+    configuration: ResolvedModelConfiguration
+) -> ModelContext {
+    let modelDirectory = configuration.modelDirectory
+
+    let messageGenerator =
+        if let model = model as? LLMModel {
+            model.messageGenerator(tokenizer: tokenizer)
+        } else {
+            DefaultMessageGenerator()
+        }
+
+    // Build a ModelConfiguration for the ModelContext
+    let tokenizerSource: TokenizerSource? =
+        configuration.tokenizerDirectory == modelDirectory
+        ? nil
+        : .directory(configuration.tokenizerDirectory)
+    let modelConfig = ModelConfiguration(
+        directory: modelDirectory,
+        tokenizerSource: tokenizerSource,
+        defaultPrompt: configuration.defaultPrompt,
+        extraEOSTokens: configuration.extraEOSTokens,
+        stopStrings: configuration.stopStrings,
+        eosTokenIds: configuration.eosTokenIds,
+        toolCallFormat: configuration.toolCallFormat)
+
+    let processor = LLMUserInputProcessor(
+        tokenizer: tokenizer, configuration: modelConfig,
+        messageGenerator: messageGenerator)
+
+    return .init(
+        configuration: modelConfig, model: model, processor: processor,
+        tokenizer: tokenizer)
+}
+
 /// Factory for creating new LLMs.
 ///
 /// Callers can use the `shared` instance or create a new instance if custom configuration
@@ -572,27 +658,11 @@ public final class LLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
-        let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        let generationConfig: GenerationConfigFile? =
-            if let generationData = try? Data(contentsOf: generationConfigURL) {
-                try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
-            } else {
-                nil
-            }
-        if let genEosIds = generationConfig?.eosTokenIds?.values {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
-        }
-
-        // Build a ModelConfiguration with loaded EOS token IDs and tool call format
-        var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds
-        mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
-                from: baseConfig.modelType, configData: configData)
-        }
+        let mutableConfiguration = resolveGenerationSettings(
+            into: configuration,
+            baseConfig: baseConfig,
+            configData: configData,
+            modelDirectory: modelDirectory)
 
         // Load tokenizer and weights in parallel
         async let tokenizerTask = tokenizerLoader.load(
@@ -604,36 +674,34 @@ public final class LLMModelFactory: GenericModelFactory {
 
         let tokenizer = try await tokenizerTask
 
-        let messageGenerator =
-            if let model = model as? LLMModel {
-                model.messageGenerator(tokenizer: tokenizer)
-            } else {
-                DefaultMessageGenerator()
-            }
-
-        // Build a ModelConfiguration for the ModelContext
-        let tokenizerSource: TokenizerSource? =
-            configuration.tokenizerDirectory == modelDirectory
-            ? nil
-            : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
-            directory: modelDirectory,
-            tokenizerSource: tokenizerSource,
-            defaultPrompt: configuration.defaultPrompt,
-            extraEOSTokens: mutableConfiguration.extraEOSTokens,
-            stopStrings: mutableConfiguration.stopStrings,
-            eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
-
-        let processor = LLMUserInputProcessor(
-            tokenizer: tokenizer, configuration: modelConfig,
-            messageGenerator: messageGenerator)
-
-        return .init(
-            configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+        return assembleModelContext(
+            model: model, tokenizer: tokenizer, configuration: mutableConfiguration)
     }
 
+}
+
+// MARK: - Offloaded n-gram table facade
+//
+// The real (non-projected) `LLMModelFactory.swift` adds
+// `loadOffloadedNGramModelContext` here as the public facade onto an
+// offloaded n-gram-table serving path that is internal to `MLXLLM` --
+// see that file's own doc comment on this function for the full design.
+// That path, and every type its real implementation touches, is excluded
+// from the public projection, so this twin keeps the identical public
+// signature but fails closed instead of duplicating any of it.
+
+/// Public-projection twin of the real `loadOffloadedNGramModelContext`.
+/// The offloaded n-gram-table serving path this signature fronts is not
+/// part of the public projection, so this always throws
+/// `ModelFactoryError.unsupportedModelType` rather than attempting any of
+/// the real function's plan resolution or model loading.
+public func loadOffloadedNGramModelContext(
+    modelDirectory: URL,
+    planFileURL: URL,
+    tokenizerLoader: any TokenizerLoader
+) async throws -> ModelContext {
+    throw ModelFactoryError.unsupportedModelType(
+        "the offloaded n-gram table serving path is not part of the public projection")
 }
 
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {

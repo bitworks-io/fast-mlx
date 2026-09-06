@@ -121,14 +121,14 @@ actor CtxProbeActor {
     }
 
     /// The serving path: CompiledMLXDecoder prefill + a few compiled decode steps.
-    func runGenerate(tokens: [Int], decodeSteps: Int) {
+    func runGenerate(tokens: [Int], decodeSteps: Int) throws {
         var decoder = CompiledMLXDecoder(model: model)
         memReport("generate: start (prompt=\(tokens.count))")
-        var tok = decoder.prefill(tokens)
+        var tok = try decoder.prefill(tokens)
         memReport("generate: after prefill")
         var out = [tok]
         for _ in 0..<decodeSteps {
-            tok = decoder.step(last: tok)
+            tok = try decoder.step(last: tok)
             out.append(tok)
         }
         memReport("generate: after \(decodeSteps) decode steps")
@@ -178,7 +178,7 @@ func runCtxProbe(_ flags: Flags) async {
         case "prefill":
             await probe.runPrefill(tokens: tokens)
         case "generate":
-            await probe.runGenerate(tokens: tokens, decodeSteps: flags.int("decode-steps", default: 8))
+            try await probe.runGenerate(tokens: tokens, decodeSteps: flags.int("decode-steps", default: 8))
         default:
             print("ctxprobe FAILED: unknown mode \(mode)")
             exit(2)

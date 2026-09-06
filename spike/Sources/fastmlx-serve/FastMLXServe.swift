@@ -627,7 +627,8 @@ private func loadScalarServingBackend(
             // Thread the requested KV tier into the load path so `selectKVCacheQuant` resolves it
             // fail-closed at cache-construction time. Validated once at startup (run()) and re-validated
             // here as the single source that reaches the runtime; nil (omitted flag) → `.fp16`.
-            kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16))
+            kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
+            ngramOffloadPlanURL: arguments.ngramOffloadPlanURL))
     return PreparedServingBackend(
         backend: loaded.backend,
         evidenceSnapshot: nil,

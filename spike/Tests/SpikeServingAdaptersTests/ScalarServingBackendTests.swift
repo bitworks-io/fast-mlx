@@ -454,6 +454,152 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(snapshot.queuedRequests, 1)
         await backend.shutdown()
     }
+
+    // A model family's OWN forward-path input validation reaches specific token IDs via a
+    // `preconditionFailure` (a process abort). Generated tokens are already masked away from these
+    // IDs, but prompt tokens are not, so an admitted request that merely tokenizes to one of them
+    // would be an HTTP-reachable way to kill the server. Configuring `rejectedPromptTokenIDs` must
+    // reject such a request at admission with a machine-readable code instead.
+    // Model capabilities are supplied so this exercises the EARLY screen inside the
+    // model-capabilities branch (before budget resolution), independent of queue state.
+    func testRejectsPromptContainingRejectedTokenID() async throws {
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 6,
+            requestedDefaultCompletionTokens: 4,
+            maximumNonStreamingCompletionTokens: 4,
+            completionLimitPolicy: .clamp)
+        let backend = makeBackend(
+            script: [1, 99],
+            pieces: [1: "hi"],
+            promptTokens: [10, 7, 11],
+            modelCapabilities: capabilities,
+            rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(request(maxTokens: 4))
+            XCTFail("Expected rejection for a prompt containing a rejected token ID")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+            XCTAssertEqual(error.openAIError.type, .invalidRequest)
+        }
+    }
+
+    // The default `rejectedPromptTokenIDs` is empty — proving today's behavior (before this field
+    // existed) is completely unchanged for every model family that reports nothing. This is the
+    // critical regression guard: it must remain green even though the SAME token ID (7) appears in
+    // the rendered prompt as in the rejection test above.
+    func testDefaultRejectedPromptTokenIDsIsInertAndAdmitsNormally() async throws {
+        let backend = makeBackend(
+            script: [1, 99],
+            pieces: [1: "hi"],
+            promptTokens: [10, 7, 11])
+
+        let handle = try await backend.start(request(maxTokens: 4))
+        let events = try await collect(handle.mailbox)
+
+        XCTAssertEqual(
+            events,
+            [
+                .text("hi"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 3, completionTokens: 1))),
+            ])
+    }
+
+    // Only the token IDs actually configured are rejected; a prompt made up of other IDs is admitted
+    // normally even though the configuration is non-empty.
+    func testOnlyConfiguredRejectedTokenIDsAreRejected() async throws {
+        let backend = makeBackend(
+            script: [1, 99],
+            pieces: [1: "hi"],
+            promptTokens: [10, 11, 12],
+            rejectedPromptTokenIDs: [7])
+
+        let handle = try await backend.start(request(maxTokens: 4))
+        let events = try await collect(handle.mailbox)
+
+        XCTAssertEqual(
+            events,
+            [
+                .text("hi"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 3, completionTokens: 1))),
+            ])
+    }
+
+    // Mirrors `testModelAwareInvalidBudgetPrecedesQueueFullAndDoesNotEnqueue`: a permanently-invalid
+    // request (a rejected prompt token) must win over a retryable queue-full rejection. Otherwise a
+    // client would retry-after a request that can never succeed. Model capabilities are supplied so
+    // this exercises the EARLY screen inside the capabilities branch, before the queue-full check.
+    func testRejectedPromptTokenPrecedesQueueFullAndDoesNotEnqueue() async throws {
+        let renderCounter = RenderCounter()
+        let capabilities = try ServingModelCapabilities(
+            model: "fixture-model",
+            nativeMaxContextTokens: 8,
+            effectiveMaxContextTokens: 8,
+            requestedDefaultCompletionTokens: 2,
+            maximumNonStreamingCompletionTokens: 8,
+            completionLimitPolicy: .reject)
+        // The fixture codec renders a fixed prompt regardless of message text, so the active and
+        // queued requests below (no tools) render the plain, clean prompt; only the third request
+        // (with a tool attached) renders the extra rejected token — proving the rejection is a
+        // property of THAT request, not a permanent property of the backend, and that it wins over
+        // the queue-full check for that one request without disturbing the two already admitted.
+        let backend = makeBackend(
+            script: [1, 2, 3, 99],
+            pieces: [1: "a", 2: "b", 3: "c"],
+            promptTokens: [10],
+            mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
+            maximumQueuedRequests: 1,
+            renderCounter: renderCounter,
+            modelCapabilities: capabilities,
+            rejectedPromptTokenIDs: [7],
+            extraPromptTokensWhenToolsPresent: [7])
+
+        let active = try await backend.start(request(maxTokens: 3))
+        await waitUntil {
+            let mailbox = await active.mailbox.snapshot()
+            return mailbox.bufferedDeltas == 1 && mailbox.waitingProducers == 1
+        }
+        _ = try await backend.start(request(maxTokens: 3))
+
+        do {
+            _ = try await backend.start(request(maxTokens: 3, tools: [weatherTool]))
+            XCTFail("Expected unsupported_prompt_token rejection, not queueFull")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+        }
+
+        let snapshot = await backend.snapshot()
+        XCTAssertEqual(snapshot.activeRequests, 1)
+        XCTAssertEqual(snapshot.queuedRequests, 1)
+        await backend.shutdown()
+    }
+
+    // The fallback branch (no `modelCapabilities`) defers rendering until AFTER the queue-full check,
+    // so it can only be covered by the second (post-render) screen. This proves that site independently
+    // catches the rejection when `modelCapabilities` is nil.
+    func testRejectedPromptTokenIsCaughtInFallbackBranchWithoutModelCapabilities() async throws {
+        let backend = makeBackend(
+            script: [1, 99],
+            pieces: [1: "hi"],
+            promptTokens: [10, 7, 11],
+            modelCapabilities: nil,
+            rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(request(maxTokens: 4))
+            XCTFail("Expected rejection for a prompt containing a rejected token ID")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+        }
+    }
 }
 
 private func makeBackend(
@@ -468,7 +614,9 @@ private func makeBackend(
     toolCallFormat: ToolCallFormat = .json,
     thinksByDefault: Bool = false,
     disableThinkingWhenToolsActive: Bool = false,
-    modelCapabilities: ServingModelCapabilities? = nil
+    modelCapabilities: ServingModelCapabilities? = nil,
+    rejectedPromptTokenIDs: Set<Int> = [],
+    extraPromptTokensWhenToolsPresent: [Int] = []
 ) -> ScalarServingBackend {
     ScalarServingBackend(
         launchedModel: "fixture-model",
@@ -477,7 +625,8 @@ private func makeBackend(
         codec: FixtureScalarTextCodec(
             promptTokens: promptTokens,
             pieces: pieces,
-            renderCounter: renderCounter),
+            renderCounter: renderCounter,
+            extraPromptTokensWhenToolsPresent: extraPromptTokensWhenToolsPresent),
         stopTokenIDs: [99],
         modelStopStrings: [],
         configuration: .init(
@@ -488,7 +637,8 @@ private func makeBackend(
             toolCallFormat: toolCallFormat,
             disableThinkingWhenToolsActive: disableThinkingWhenToolsActive,
             thinksByDefault: thinksByDefault,
-            modelCapabilities: modelCapabilities))
+            modelCapabilities: modelCapabilities,
+            rejectedPromptTokenIDs: rejectedPromptTokenIDs))
 }
 
 private let weatherTool = OpenAIToolSpec(
@@ -578,6 +728,10 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
     let promptTokens: [Int]
     let pieces: [Int: String]
     let renderCounter: RenderCounter?
+    // Lets a single backend instance render two distinct prompts across a sequence of `start(...)`
+    // calls (e.g. to prove a per-request rejection without disturbing earlier admitted requests that
+    // share the same backend/codec) by appending extra tokens only when the request carries tools.
+    var extraPromptTokensWhenToolsPresent: [Int] = []
 
     func render(
         messages: [OpenAIChatMessage],
@@ -586,7 +740,7 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
         reasoningEffort: String?
     ) throws -> [Int] {
         renderCounter?.increment()
-        return promptTokens
+        return tools.isEmpty ? promptTokens : promptTokens + extraPromptTokensWhenToolsPresent
     }
 
     func makeDetokenizer() -> any ScalarServingDetokenizer {

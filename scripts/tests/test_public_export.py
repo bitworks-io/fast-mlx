@@ -19,7 +19,7 @@ import validate_public_repository  # noqa: E402
 PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift",
-        "sha256": "7185ddfe5847fbbdd5b44b682c645d269ddfc3c33f18e405f6ad00e97e167bd0",
+        "sha256": "68699882566bcec018cc9d3e8ef47b3fa9e07bec49ec2b86c8cd7eb0118129fa",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
@@ -315,11 +315,35 @@ class PublicExportTests(unittest.TestCase):
             if has_development_manifest
             else development_manifest
         )
+        # DELIBERATELY HARDCODED, not recomputed: this literal is the tripwire that forces a
+        # conscious decision whenever the public path set changes. Recomputing it here would make
+        # it agree with any projection, including one that leaked a file. When it fails, do NOT
+        # just paste the actual value -- first confirm the added/removed path belongs in public,
+        # then update ALL THREE places that encode the path count together:
+        #   1. this literal,
+        #   2. public/public-repository-public.json's stored seal,
+        #   3. the `reexport_count` assertion in
+        #      test_public_projection_uses_sanitized_vendor_overrides (below), which has moved in
+        #      lockstep with this value through every reseal in this file's history.
+        # Updating only some of them leaves the suite red at HEAD: 4a15e78 missed (1) and (3), and
+        # the repair that fixed (1) still missed (3).
+        #
+        # 871 -> 872 (4a15e78) added spike/Tests/SpikeCoreTests/MLXDecoderEvaluateThrowingPropagationTests.swift.
+        # That commit resealed the manifest but missed this literal, so the full suite failed while
+        # the narrow projection regression still passed -- which is exactly why a change touching
+        # projected files must run this whole suite, not just the narrow regression.
+        #
+        # 872 -> 873 added spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/LLMModelFactoryLoadTests.swift,
+        # the coverage for the `LLMModelFactory._load` extraction seam. Confirmed to belong in
+        # public before reseal: it is ordinary XCTest coverage of a projected loading contract,
+        # every sibling MLXLMTests file is already projected, and it carries no internal family
+        # marker, infrastructure detail, or machine-local path. All three places moved together
+        # this time.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 871,
-                "pathModeSha256": "3f235057bd8508618472f8ef2d647b8825235725bc6e40370207dcd9141a0227",
+                "pathCount": 873,
+                "pathModeSha256": "cfe8758e76a31d4127e4f395e1f5227c488f117dd55ccbfc218c51fa07c5ad15",
             },
         )
 
@@ -406,7 +430,14 @@ class PublicExportTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=output, check=True)
             subprocess.run(["git", "add", "."], cwd=output, check=True)
             reexport_count = export_public_repository.export(output, reexport)
-            self.assertEqual(reexport_count, 871)
+            # Same hardcoded-tripwire rule as the `pathCount` literal in
+            # test_public_export_matches_sealed_public_manifest -- see that comment for the
+            # three-places update obligation. This assertion is the third place, and it is the one
+            # that gets missed: 4a15e78 moved the projection 871 -> 872 and updated neither, and the
+            # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
+            # a second time. Re-exporting the already-projected tree must reproduce the same path
+            # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
+            self.assertEqual(reexport_count, 873)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

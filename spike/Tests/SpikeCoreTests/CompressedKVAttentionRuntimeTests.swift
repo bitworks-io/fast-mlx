@@ -118,8 +118,8 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             kvCache: .affine(.k4v2G64),
             affineAttentionMode: .splitQuantizedMM)
 
-        _ = decoder.prefill([1, 2])
-        _ = decoder.step(last: 2)
+        _ = try decoder.prefill([1, 2])
+        _ = try decoder.step(last: 2)
         let telemetry = try XCTUnwrap(decoder.affineKVTelemetry())
 
         XCTAssertEqual(telemetry.attentionOperation, .splitQuantizedMM)
@@ -135,7 +135,7 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             reserve: 8,
             kvCache: .affine(.k4v2G64))
 
-        _ = decoder.prefill([1, 2])
+        _ = try decoder.prefill([1, 2])
         let telemetry = try XCTUnwrap(decoder.affineKVTelemetry())
 
         XCTAssertEqual(telemetry.attentionOperation, .materializedKV)
@@ -219,8 +219,8 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             .uncompiledCorrectness)
 
         let prompt = (0 ..< 254).map { ($0 % 31) + 1 }
-        let first = decoder.prefill(prompt)
-        let controlFirst = materializedControl.prefill(prompt)
+        let first = try decoder.prefill(prompt)
+        let controlFirst = try materializedControl.prefill(prompt)
         XCTAssertEqual(first, controlFirst)
         XCTAssertNotEqual(
             controlFirst, 0,
@@ -231,8 +231,8 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
         XCTAssertEqual(beforeBoundary.materializationWorkspaceBytes, 0)
         XCTAssertEqual(beforeBoundary.attentionOperation, .splitQuantizedMM)
 
-        let second = decoder.step(last: first)
-        let controlSecond = materializedControl.step(last: controlFirst)
+        let second = try decoder.step(last: first)
+        let controlSecond = try materializedControl.step(last: controlFirst)
         XCTAssertEqual(second, controlSecond)
         let atBoundary = try XCTUnwrap(decoder.kvarnKVTelemetry())
         XCTAssertEqual(atBoundary.cachedTokens, 256)
@@ -241,8 +241,8 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
         XCTAssertEqual(atBoundary.materializationWorkspaceBytes, 0)
         XCTAssertGreaterThan(atBoundary.attentionWorkspaceBytes, 0)
 
-        let third = decoder.step(last: second)
-        let controlThird = materializedControl.step(last: controlSecond)
+        let third = try decoder.step(last: second)
+        let controlThird = try materializedControl.step(last: controlSecond)
         XCTAssertEqual(third, controlThird)
         let afterBoundary = try XCTUnwrap(decoder.kvarnKVTelemetry())
         XCTAssertEqual(afterBoundary.cachedTokens, 257)
@@ -254,15 +254,15 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
         decoder.reset()
         materializedControl.reset()
         let resetPrompt = (0 ..< 126).map { ($0 % 31) + 1 }
-        let reusedFirst = decoder.prefill(resetPrompt)
-        let controlReusedFirst = materializedControl.prefill(resetPrompt)
+        let reusedFirst = try decoder.prefill(resetPrompt)
+        let controlReusedFirst = try materializedControl.prefill(resetPrompt)
         XCTAssertEqual(reusedFirst, controlReusedFirst)
-        let reusedSecond = decoder.step(last: reusedFirst)
-        let controlReusedSecond = materializedControl.step(
+        let reusedSecond = try decoder.step(last: reusedFirst)
+        let controlReusedSecond = try materializedControl.step(
             last: controlReusedFirst)
         XCTAssertEqual(reusedSecond, controlReusedSecond)
-        let reusedThird = decoder.step(last: reusedSecond)
-        let controlReusedThird = materializedControl.step(
+        let reusedThird = try decoder.step(last: reusedSecond)
+        let controlReusedThird = try materializedControl.step(
             last: controlReusedSecond)
         XCTAssertEqual(reusedThird, controlReusedThird)
         let reused = try XCTUnwrap(decoder.kvarnKVTelemetry())
@@ -288,7 +288,7 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             affineAttentionMode: .splitQuantizedMM)
         let prompt = (0..<513).map { ($0 % 31) + 1 }
 
-        _ = decoder.prefill(prompt)
+        _ = try decoder.prefill(prompt)
 
         XCTAssertEqual(
             Array(model.forwardTokenCounts.prefix(2)),
@@ -304,7 +304,7 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             kvarnAttentionMode: .splitQuantizedMM)
         let prompt = (0..<513).map { ($0 % 31) + 1 }
 
-        _ = decoder.prefill(prompt)
+        _ = try decoder.prefill(prompt)
 
         XCTAssertEqual(
             Array(model.forwardTokenCounts.prefix(2)),
@@ -318,11 +318,11 @@ final class CompressedKVAttentionRuntimeTests: XCTestCase {
             kvCache: .affine(.k4v2G64),
             affineAttentionMode: .splitQuantizedMM)
 
-        _ = decoder.prefill([1, 2, 3, 4])
+        _ = try decoder.prefill([1, 2, 3, 4])
         let longRun = try XCTUnwrap(decoder.affineKVTelemetry())
 
         decoder.reset()
-        _ = decoder.prefill([1])
+        _ = try decoder.prefill([1])
         let shortRun = try XCTUnwrap(decoder.affineKVTelemetry())
 
         XCTAssertGreaterThan(

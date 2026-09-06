@@ -1,7 +1,9 @@
 import Foundation
 import XCTest
 
+import MLX
 import MLXLMCommon
+import MLXNN
 import ServingCore
 import SpikeCore
 @testable import SpikeServingAdapters
@@ -65,6 +67,238 @@ final class MLXScalarServingTests: XCTestCase {
                 .recurrentState,
                 .composite,
             ])
+    }
+
+    /// Regression guard: the marker-protocol probe must not change classification of any of the
+    /// five concrete types the classifier has always recognized, and each must report source
+    /// `.concreteType`.
+    ///
+    /// Note that `KVCacheSimple` DOES conform to `ServingCacheKindReporting` inside this test
+    /// target (see the retroactive conformance at the bottom of this file), and deliberately
+    /// reports a kind that disagrees with its concrete-type classification. So this test is not
+    /// merely asserting the status quo — for that one case it is also asserting that the
+    /// concrete-type switch wins over the marker probe.
+    func testNativeCacheClassifierEntryStillMatchesFiveConcreteTypesBySourceConcreteType() {
+        let denseAttention = classifyScalarServingNativeCacheEntry(KVCacheSimple())
+        let rotatingAttention = classifyScalarServingNativeCacheEntry(
+            RotatingKVCache(maxSize: 128, keep: 4))
+        let mambaRecurrentState = classifyScalarServingNativeCacheEntry(MambaCache())
+        let arraysRecurrentState = classifyScalarServingNativeCacheEntry(ArraysCache(size: 1))
+        let composite = classifyScalarServingNativeCacheEntry(
+            CacheList(KVCacheSimple(), MambaCache()))
+
+        XCTAssertTrue(denseAttention == (.denseAttention, .concreteType))
+        XCTAssertTrue(rotatingAttention == (.rotatingAttention, .concreteType))
+        XCTAssertTrue(mambaRecurrentState == (.recurrentState, .concreteType))
+        XCTAssertTrue(arraysRecurrentState == (.recurrentState, .concreteType))
+        XCTAssertTrue(composite == (.composite, .concreteType))
+    }
+
+    /// Every `ServingCacheLayerKind` case must map to the matching `ScalarServingNativeCacheKind`
+    /// with source `.markerProtocol`, driven off `.allCases` so a future 5th case fails this test
+    /// (rather than silently compiling to `.unknown`) until the classifier's exhaustive switch is
+    /// updated to handle it.
+    func testNativeCacheClassifierEntryMapsEveryMarkerLayerKindExhaustively() {
+        let expectedKindByLayerKind: [ServingCacheLayerKind: ScalarServingNativeCacheKind] = [
+            .denseAttention: .denseAttention,
+            .rotatingAttention: .rotatingAttention,
+            .recurrentState: .recurrentState,
+            .composite: .composite,
+        ]
+
+        for layerKind in ServingCacheLayerKind.allCases {
+            let (kind, source) = classifyScalarServingNativeCacheEntry(
+                MarkerReportingFakeCache(servingCacheLayerKind: layerKind))
+
+            XCTAssertEqual(
+                kind, expectedKindByLayerKind[layerKind],
+                "unexpected kind for marker layer kind \(layerKind)")
+            XCTAssertEqual(
+                source, .markerProtocol,
+                "expected .markerProtocol source for marker layer kind \(layerKind)")
+        }
+    }
+
+    /// A cache that is neither one of the five concrete types nor `ServingCacheKindReporting`
+    /// still yields `(.unknown, .unclassified)` — the classifier's fully-unrecognized fallback.
+    func testNativeCacheClassifierEntryReturnsUnknownUnclassifiedForNeitherConcreteNorMarker() {
+        let (kind, source) = classifyScalarServingNativeCacheEntry(NonReportingFakeCache())
+
+        XCTAssertEqual(kind, .unknown)
+        XCTAssertEqual(source, .unclassified)
+    }
+
+    /// Order regression: a cache that is BOTH a concrete type AND `ServingCacheKindReporting`
+    /// (with a DIFFERENT reported kind) must still classify via the concrete-type path, source
+    /// `.concreteType`. None of the five real concrete types conform to the marker protocol today,
+    /// so this synthetic fixture is the only way to actually exercise the "concrete type wins"
+    /// ordering guarantee documented on `classifyScalarServingNativeCacheEntry` — without it, an
+    /// accidental reordering of the probe and the switch would compile and pass every other test.
+    func testConcreteTypeConformingToMarkerProtocolStillClassifiesByConcreteType() {
+        let (kind, source) = classifyScalarServingNativeCacheEntry(KVCacheSimple())
+
+        XCTAssertEqual(kind, .denseAttention)
+        XCTAssertEqual(source, .concreteType)
+    }
+
+    /// A mixed vector mimicking the real 48-layer topology (36 recurrent-reporting + 12
+    /// dense-reporting caches, all classified via the marker protocol) must still route through
+    /// `classifyScalarServingDecoderRoute` to `.nativeHeterogeneous`, exactly as the equivalent
+    /// concrete-typed vector would — the marker protocol changes HOW a cache is classified, not
+    /// what decoder route a given classification produces.
+    func testMixedMarkerClassifiedVectorRoutesToNativeHeterogeneous() throws {
+        let caches: [any KVCache] =
+            (0..<36).map { _ in MarkerReportingFakeCache(servingCacheLayerKind: .recurrentState) }
+            + (0..<12).map { _ in MarkerReportingFakeCache(servingCacheLayerKind: .denseAttention) }
+
+        let kinds = classifyScalarServingNativeCaches(caches)
+        let route = try classifyScalarServingDecoderRoute(kinds)
+
+        XCTAssertEqual(route, .nativeHeterogeneous)
+    }
+
+    /// No-regression guarantee for every family serving today: when every classification came
+    /// from a concrete-type match, the gate never triggers, regardless of family — including a
+    /// nil (unreadable config.json) family.
+    func testMarkerFamilyAdmissionAdmitsAllConcreteTypeClassificationsRegardlessOfFamily() {
+        let allConcrete: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.denseAttention, .concreteType),
+            (.recurrentState, .concreteType),
+            (.composite, .concreteType),
+        ]
+
+        XCTAssertNil(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: allConcrete, family: "qwen3", offloadedNGramPlanResolved: false))
+        XCTAssertNil(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: allConcrete, family: nil, offloadedNGramPlanResolved: false))
+    }
+
+    /// Any marker-classified entry for a family not on the proof allowlist is refused, carrying
+    /// that family lowercased.
+    func testMarkerFamilyAdmissionRefusesUnprovenFamilyWithMarkerClassification() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.recurrentState, .markerProtocol)
+        ]
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "SomeNewFamily",
+                offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("somenewfamily"))
+    }
+
+    /// A missing/unreadable family becomes "unknown" before the allowlist check and the refusal.
+    func testMarkerFamilyAdmissionRefusesNilFamilyAsUnknown() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.denseAttention, .markerProtocol)
+        ]
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: nil, offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("unknown"))
+    }
+
+    /// Realistic mixed vector mirroring the real 48-layer topology (36 recurrent + 12 dense, all
+    /// marker-classified) is refused for an unproven family.
+    func testMarkerFamilyAdmissionRefusesRealistic48LayerMarkerTopology() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] =
+            (0..<36).map { _ in (kind: ScalarServingNativeCacheKind.recurrentState, source: ScalarServingCacheClassificationSource.markerProtocol) }
+            + (0..<12).map { _ in (kind: ScalarServingNativeCacheKind.denseAttention, source: ScalarServingCacheClassificationSource.markerProtocol) }
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen3_5",
+                offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("qwen3_5"))
+    }
+
+    /// An `.unclassified` entry alongside concrete ones is NOT this gate's concern — rejecting
+    /// `.unknown` kinds is the route classifier's job, not this admission gate's. No marker
+    /// classification is present, so the gate admits.
+    func testMarkerFamilyAdmissionIgnoresUnclassifiedEntriesAlongsideConcreteOnes() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.denseAttention, .concreteType),
+            (.unknown, .unclassified),
+        ]
+
+        XCTAssertNil(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen3", offloadedNGramPlanResolved: false))
+    }
+
+    /// The gate triggers on ANY marker-classified entry, not only when every entry is
+    /// marker-classified — a mixed-source vector with just one marker entry is still refused.
+    func testMarkerFamilyAdmissionRefusesMixedSourceVectorWithAnyMarkerEntry() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.denseAttention, .concreteType),
+            (.recurrentState, .markerProtocol),
+            (.composite, .concreteType),
+        ]
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen3", offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("qwen3"))
+    }
+
+    /// The load-bearing leg for `qwen4_exp` (Qwen3.8-Flash-Next): a marker-classified vector for
+    /// the proven family IS admitted when the caller attests the offloaded n-gram plan actually
+    /// resolved for this load.
+    func testMarkerFamilyAdmissionAdmitsFlashNextOnlyWhenOffloadedNGramPlanResolved() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] =
+            (0..<36).map { _ in (kind: ScalarServingNativeCacheKind.recurrentState, source: ScalarServingCacheClassificationSource.markerProtocol) }
+            + (0..<12).map { _ in (kind: ScalarServingNativeCacheKind.denseAttention, source: ScalarServingCacheClassificationSource.markerProtocol) }
+
+        XCTAssertNil(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen4_exp", offloadedNGramPlanResolved: true))
+    }
+
+    /// The load-bearing leg's inverse: `qwen4_exp` is refused when the offloaded n-gram plan did
+    /// NOT resolve — this is what keeps the ~106 GiB fully-resident `loadModel` route from being
+    /// silently admitted by a bare family allowlist.
+    func testMarkerFamilyAdmissionRefusesFlashNextWhenOffloadedNGramPlanDidNotResolve() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] =
+            (0..<36).map { _ in (kind: ScalarServingNativeCacheKind.recurrentState, source: ScalarServingCacheClassificationSource.markerProtocol) }
+            + (0..<12).map { _ in (kind: ScalarServingNativeCacheKind.denseAttention, source: ScalarServingCacheClassificationSource.markerProtocol) }
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen4_exp", offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("qwen4_exp"))
+    }
+
+    /// A resolved offload plan is not a blanket bypass: an unrelated family is still refused even
+    /// when the caller attests the offloaded n-gram plan resolved.
+    func testMarkerFamilyAdmissionRefusesUnrelatedFamilyEvenWithOffloadedNGramPlanResolved() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.recurrentState, .markerProtocol)
+        ]
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "SomeNewFamily",
+                offloadedNGramPlanResolved: true),
+            .unprovenServingFamily("somenewfamily"))
+    }
+
+    /// Case-folding leg: the family comparison is case-insensitive on both the allowlist check and
+    /// the offload-plan-resolved admission, so `"QWEN4_EXP"` behaves identically to `"qwen4_exp"`.
+    func testMarkerFamilyAdmissionFlashNextIsCaseInsensitive() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.recurrentState, .markerProtocol)
+        ]
+
+        XCTAssertNil(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "QWEN4_EXP", offloadedNGramPlanResolved: true))
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "QWEN4_EXP", offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("qwen4_exp"))
     }
 
     func testResetParityPreflightAcceptsTwoExactOneTokenRuns() async throws {
@@ -192,6 +426,53 @@ final class MLXScalarServingTests: XCTestCase {
             "mlx_active_bytes=0 mlx_cache_bytes=0 mlx_peak_bytes=0")
     }
 
+    // MARK: - rejectedPromptTokenIDs: mapping a loaded model's own reported unsupported input
+    // token IDs (`UnsupportedInputTokenReporting`) into the scalar backend's screen.
+
+    /// A model reporting unsupported input token IDs has them returned, converted to `Int`.
+    func testRejectedPromptTokenIDsReturnsAConformingModelsReportedIDsConvertedToInt() {
+        let model = FixtureUnsupportedTokenReportingModel(
+            unsupportedInputTokenIDs: [100, 200, 300])
+
+        XCTAssertEqual(
+            servingRejectedPromptTokenIDs(model: model),
+            [100, 200, 300])
+    }
+
+    /// A model that does NOT conform to `UnsupportedInputTokenReporting` — every family today —
+    /// must map to the empty set, so the screen stays inert (today's unchanged behavior).
+    func testRejectedPromptTokenIDsReturnsEmptyForANonConformingModel() {
+        let model = FixtureNonReportingModel()
+
+        XCTAssertEqual(servingRejectedPromptTokenIDs(model: model), [])
+    }
+
+    /// A conforming model that reports no unsupported input tokens maps to the empty set.
+    func testRejectedPromptTokenIDsReturnsEmptyForAConformingModelWithAnEmptyReport() {
+        let model = FixtureUnsupportedTokenReportingModel(unsupportedInputTokenIDs: [])
+
+        XCTAssertEqual(servingRejectedPromptTokenIDs(model: model), [])
+    }
+
+    /// The mapping is a correct, total identity over the full `Int64` domain, extremes included.
+    ///
+    /// `servingRejectedPromptTokenIDs` uses `Int(exactly:)` and SKIPS a non-representable ID. On
+    /// every platform this package deploys to, `Int` and `Int64` are both 64-bit with identical
+    /// range, so no `Int64` value exists that `Int(exactly:)` would reject — the skip branch is
+    /// defensive/forward-looking and is **unreachable here**. That is stated rather than faked: a
+    /// test claiming to exercise the skip would need a fake whose reported value cannot occur by
+    /// construction, which would assert a false claim about tested behavior. This test instead pins
+    /// what IS verifiable — that nothing is silently dropped anywhere in the domain, including both
+    /// extremes, so a future narrowing of the conversion would fail here.
+    func testRejectedPromptTokenIDsPreservesEveryValueAcrossTheFullInt64RangeIncludingItsExtremes() {
+        let model = FixtureUnsupportedTokenReportingModel(
+            unsupportedInputTokenIDs: [Int64.min, -1, 0, 1, Int64.max])
+
+        XCTAssertEqual(
+            servingRejectedPromptTokenIDs(model: model),
+            [Int(Int64.min), -1, 0, 1, Int(Int64.max)])
+    }
+
     // MARK: - qwen3_5 scalar-route gated-delta kernel viability guard (Dk%32)
 
     /// VL-wrapped qwen3_5 config with `linear_key_head_dim = 48` — a valid positive-integer geometry the
@@ -277,6 +558,171 @@ final class MLXScalarServingTests: XCTestCase {
             .appendingPathComponent("scalar-serving-guard-absent-\(UUID().uuidString)", isDirectory: true)
         XCTAssertNil(scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: absent))
     }
+
+    // MARK: - ngramOffloadPlanURL: offloaded n-gram serving dispatch seam (qwen4_exp only)
+
+    private func fixtureBackendConfiguration() -> ScalarServingBackendConfiguration {
+        ScalarServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 32,
+            maximumQueuedRequests: 2,
+            queueRetryAfterSeconds: 1,
+            mailboxCapacity: .init(maxDeltas: 8, maxBytes: 4_096))
+    }
+
+    private func writePlanFile() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scalar-serving-ngram-plan-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let planURL = directory.appendingPathComponent("plan.json")
+        try Data("{}".utf8).write(to: planURL)
+        return planURL
+    }
+
+    /// Default-nil compatibility: constructing a configuration without the new parameter yields
+    /// `ngramOffloadPlanURL == nil`, and validation accepts an otherwise-valid configuration
+    /// unchanged — every existing call site (none of which passes this parameter) keeps compiling
+    /// and passing validation exactly as before.
+    func testNgramOffloadPlanURLDefaultsToNilAndValidationAcceptsUnchangedConfiguration() throws {
+        let configuration = ScalarServingModelLoadConfiguration(
+            launchedModel: "fixture",
+            modelDirectory: URL(fileURLWithPath: "/tmp"),
+            memoryLimitBytes: 4_096,
+            cacheLimitBytes: 1_024,
+            backendConfiguration: fixtureBackendConfiguration())
+
+        XCTAssertNil(configuration.ngramOffloadPlanURL)
+        let validated = try validateScalarServingModelLoadConfiguration(configuration)
+        XCTAssertNil(validated.ngramOffloadPlanURL)
+    }
+
+    /// A relative (non-file) plan URL is refused before any other plan-file check, mirroring the
+    /// existing `modelDirectory` absolute-path guard.
+    func testNgramOffloadPlanURLMustBeAbsoluteFileURLRejectsRelativeURL() {
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: URL(string: "relative-plan.json")!))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .ngramOffloadPlanMustBeAbsolute)
+        }
+    }
+
+    /// An absolute plan URL pointing at a path that does not exist on disk is refused.
+    func testNgramOffloadPlanURLUnavailableForMissingPath() {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "scalar-serving-ngram-missing-\(UUID().uuidString).json")
+
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: missing))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .ngramOffloadPlanUnavailable)
+        }
+    }
+
+    /// An absolute plan URL pointing at a DIRECTORY (not a regular file) is refused with the same
+    /// error as a missing path — proving the regular-file check, not merely existence.
+    func testNgramOffloadPlanURLUnavailableForDirectoryPath() {
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: URL(fileURLWithPath: "/tmp", isDirectory: true)))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .ngramOffloadPlanUnavailable)
+        }
+    }
+
+    /// Acceptance: a valid plan file supplied against a checkpoint whose `config.json` names a
+    /// different family (`qwen3`) is refused BEFORE any weight load or global `Memory` mutation —
+    /// the offloaded n-gram path is specific to the qwen4_exp checkpoint layout, so a plan against
+    /// any other family is an operator error caught at load, not at decode.
+    func testLoadRejectsNgramOffloadPlanAgainstAWrongFamilyCheckpointBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(#"{"model_type":"qwen3","num_hidden_layers":4}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let planURL = try writePlanFile()
+        defer {
+            try? FileManager.default.removeItem(
+                at: planURL.deletingLastPathComponent())
+        }
+        let memoryLimitBefore = Memory.memoryLimit
+        let cacheLimitBefore = Memory.cacheLimit
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-ngram-offload",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: planURL))
+            XCTFail("A plan file against a non-qwen4_exp family must fail closed before weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .ngramOffloadPlanUnsupportedFamily("qwen3"))
+        }
+
+        XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
+        XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
+    }
+
+    /// Same acceptance as above for a directory with no readable `config.json`: the observed model
+    /// type is `nil`, carried as such rather than defaulted to a placeholder string.
+    func testLoadRejectsNgramOffloadPlanAgainstAnUnreadableConfigBeforeWeightLoad() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "scalar-serving-ngram-no-config-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let planURL = try writePlanFile()
+        defer {
+            try? FileManager.default.removeItem(
+                at: planURL.deletingLastPathComponent())
+        }
+        let memoryLimitBefore = Memory.memoryLimit
+        let cacheLimitBefore = Memory.cacheLimit
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-ngram-offload",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: planURL))
+            XCTFail("A plan file against an unreadable config.json must fail closed before weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .ngramOffloadPlanUnsupportedFamily(nil))
+        }
+
+        XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
+        XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
+    }
 }
 
 private enum FixtureTokenizerError: Error {
@@ -354,5 +800,131 @@ private struct ResetSensitiveDecoder: Decoder {
 
     mutating func reset() {
         resetCount += 1
+    }
+}
+
+/// Minimal `LanguageModel` conforming to `UnsupportedInputTokenReporting`, reporting a fixed set of
+/// input token IDs its (fake) forward path would otherwise `preconditionFailure` on. Mirrors the
+/// minimal-fake shape of `CacheFactorySpyModel` (SpikeCoreTests/MLXDecoderCacheFactoryTests.swift):
+/// only the two required methods are implemented — the rest of `LanguageModel` has default
+/// implementations via protocol extension, and nothing here ever runs a real forward pass.
+private final class FixtureUnsupportedTokenReportingModel: Module, LanguageModel,
+    UnsupportedInputTokenReporting
+{
+    let unsupportedInputTokenIDs: Set<Int64>
+
+    init(unsupportedInputTokenIDs: Set<Int64>) {
+        self.unsupportedInputTokenIDs = unsupportedInputTokenIDs
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        []
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([inputs.dim(0), inputs.dim(1), 8])
+    }
+}
+
+/// A `LanguageModel` that does NOT conform to `UnsupportedInputTokenReporting` — every family
+/// today except the ones that opt in — used to prove `servingRejectedPromptTokenIDs` stays a
+/// no-op (empty set) for the unchanged-behavior case.
+private final class FixtureNonReportingModel: Module, LanguageModel {
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        []
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([inputs.dim(0), inputs.dim(1), 8])
+    }
+}
+
+/// Minimal `KVCache` conforming to `ServingCacheKindReporting`, with an injectable
+/// `servingCacheLayerKind`. Never runs a real forward pass; every method is a stub. Mirrors the
+/// minimal-fake shape of `FixtureUnsupportedTokenReportingModel` above.
+private final class MarkerReportingFakeCache: KVCache, ServingCacheKindReporting {
+    var offset: Int = 0
+    var maxSize: Int? { nil }
+    var state: [MLXArray] = []
+    var metaState: [String] = [""]
+    var isTrimmable: Bool { false }
+    let servingCacheLayerKind: ServingCacheLayerKind
+
+    init(servingCacheLayerKind: ServingCacheLayerKind) {
+        self.servingCacheLayerKind = servingCacheLayerKind
+    }
+
+    func innerState() -> [MLXArray] { [] }
+
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        (keys, values)
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int { 0 }
+
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+
+    func copy() -> any KVCache {
+        MarkerReportingFakeCache(servingCacheLayerKind: servingCacheLayerKind)
+    }
+}
+
+/// A concrete `KVCacheSimple` instance that ALSO conforms to `ServingCacheKindReporting`,
+/// reporting a DIFFERENT kind (`.rotatingAttention`) than its true concrete-type classification
+/// (`.denseAttention`). `KVCacheSimple` is `public` but not `open`, so it cannot be subclassed
+/// outside its defining module; this retroactive conformance (test-target-scoped, added ONLY to
+/// prove the ordering guarantee below) is the only available way to construct a value that is
+/// simultaneously a real concrete-type match and a marker-protocol conformer. It is safe for every
+/// OTHER test that constructs a bare `KVCacheSimple()`: the classifier always checks the
+/// concrete-type switch first (that is precisely the guarantee under test), so this added
+/// conformance changes no other test's observed classification.
+///
+/// Exists only to make the classifier's "concrete type wins" ordering guarantee observable in a
+/// test: none of the five real concrete types conform to the marker protocol today, so without
+/// this fixture a reordering of the probe and the concrete-type switch would be undetectable.
+extension KVCacheSimple: ServingCacheKindReporting {
+    public var servingCacheLayerKind: ServingCacheLayerKind { .rotatingAttention }
+}
+
+/// Minimal `KVCache` that conforms to neither one of the five concrete types the classifier
+/// recognizes NOR `ServingCacheKindReporting` — the classifier's fully-unrecognized fallthrough
+/// case.
+private final class NonReportingFakeCache: KVCache {
+    var offset: Int = 0
+    var maxSize: Int? { nil }
+    var state: [MLXArray] = []
+    var metaState: [String] = [""]
+    var isTrimmable: Bool { false }
+
+    func innerState() -> [MLXArray] { [] }
+
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        (keys, values)
+    }
+
+    @discardableResult
+    func trim(_ n: Int) -> Int { 0 }
+
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+
+    func copy() -> any KVCache {
+        NonReportingFakeCache()
     }
 }

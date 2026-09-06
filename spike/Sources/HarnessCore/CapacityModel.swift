@@ -241,11 +241,22 @@ public enum CapacityModel {
         return coefficient * perTokenUnit * Double(chunkTokens)
     }
 
+    /// Prompt tokens per prefill forward that `transientPrefillPeakBytes` prices the transient
+    /// against. This is not a free parameter: the serving runtime must actually chunk its prefill at
+    /// this size, or the predicted peak stops describing what the process does. `MLXDecoder`
+    /// (`SpikeCore`) chunks at `MLXDecoder.defaultPrefillChunkSize` and
+    /// `MLXDecoderPrefillChunkSizeMatchesCapacityModelTests` asserts the two stay equal — named as a
+    /// constant rather than left as a bare default argument precisely so that assertion can exist.
+    ///
+    /// Before cycle 46 the runtime chunked nothing while this term priced a 2048-token chunk; the
+    /// transient's own comment notes that dropping it is what killed processes at the 7K wall.
+    public static let defaultPrefillChunkTokens = 2048
+
     /// `weights + N_concurrent × KV(context) + transient_prefill_peak + allocator_headroom` (spec
     /// §2's peak formula), broken into inspectable terms.
     public static func predictPeakBytes(
         model: ModelArchProfile, context: Int, concurrency: Int, kvQuant: KVQuantTier, profile: SystemProfile,
-        chunkTokens: Int = 2048, transientPrefillCoefficient: Double = 8.0,
+        chunkTokens: Int = CapacityModel.defaultPrefillChunkTokens, transientPrefillCoefficient: Double = 8.0,
         allocatorHeadroomBytes: Double = 2 * 1024 * 1024 * 1024
     ) -> CapacityPrediction {
         let weights = Double(model.weightsBytes4bitEstimate)

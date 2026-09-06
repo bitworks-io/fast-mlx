@@ -93,11 +93,11 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         _ decoder: inout CompiledMLXDecoder,
         first: Int,
         additionalTokens: Int
-    ) -> [Int] {
+    ) throws -> [Int] {
         var output = [first]
         var token = first
         for _ in 0 ..< additionalTokens {
-            token = decoder.step(last: token)
+            token = try decoder.step(last: token)
             output.append(token)
         }
         return output
@@ -119,19 +119,19 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
             staged.snapshot.totalNBytes,
             staged.snapshot.arrayNBytes + staged.snapshot.controlNBytes)
 
-        _ = decode(&decoder, first: staged.firstToken, additionalTokens: 2)
+        _ = try decode(&decoder, first: staged.firstToken, additionalTokens: 2)
         decoder.reset()
         let callsBeforeRestore = model.forwardTokenCounts.count
         let restoredFirst = try decoder.prefillRestoredPrefix(
             staged.snapshot, tailTokens: [])
-        let restored = decode(
+        let restored = try decode(
             &decoder, first: restoredFirst, additionalTokens: 3)
 
         let controlModel = TinyPrefixSnapshotModel()
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
-        let controlFirst = control.prefill(prompt)
-        let expected = decode(
+        let controlFirst = try control.prefill(prompt)
+        let expected = try decode(
             &control, first: controlFirst, additionalTokens: 3)
 
         XCTAssertEqual(restored, expected)
@@ -156,15 +156,15 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         decoder.reset()
         let restoredFirst = try decoder.prefillRestoredPrefix(
             staged.snapshot, tailTokens: [5])
-        let restored = decode(
+        let restored = try decode(
             &decoder, first: restoredFirst, additionalTokens: 2)
 
         let controlModel = TinyPrefixSnapshotModel(
             cacheDType: .bfloat16)
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
-        let controlFirst = control.prefill(prompt + [5])
-        let expected = decode(
+        let controlFirst = try control.prefill(prompt + [5])
+        let expected = try decode(
             &control, first: controlFirst, additionalTokens: 2)
         XCTAssertEqual(restored, expected)
     }
@@ -177,20 +177,20 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
             model: model, reserve: 1, kvCache: .fp16)
 
         let staged = try decoder.prefillCapturingPromptSnapshot(prefix)
-        _ = decode(&decoder, first: staged.firstToken, additionalTokens: 2)
+        _ = try decode(&decoder, first: staged.firstToken, additionalTokens: 2)
         decoder.reset()
         let callsBeforeRestore = model.forwardTokenCounts.count
 
         let restoredFirst = try decoder.prefillRestoredPrefix(
             staged.snapshot, tailTokens: tail)
-        let restored = decode(
+        let restored = try decode(
             &decoder, first: restoredFirst, additionalTokens: 3)
 
         let controlModel = TinyPrefixSnapshotModel()
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
-        let controlFirst = control.prefill(prefix + tail)
-        let expected = decode(
+        let controlFirst = try control.prefill(prefix + tail)
+        let expected = try decode(
             &control, first: controlFirst, additionalTokens: 3)
 
         XCTAssertEqual(restored, expected)
@@ -207,8 +207,8 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         var decoder = CompiledMLXDecoder(
             model: model, reserve: 1, kvCache: .fp16)
 
-        let first = decoder.prefill(prompt)
-        let generated = decode(
+        let first = try decoder.prefill(prompt)
+        let generated = try decode(
             &decoder, first: first, additionalTokens: 1)
         let snapshot = try decoder.captureContinuationSnapshot()
         XCTAssertEqual(
@@ -218,14 +218,14 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         decoder.reset()
         let restoredFirst = try decoder.prefillRestoredPrefix(
             snapshot, tailTokens: tail)
-        let restored = decode(
+        let restored = try decode(
             &decoder, first: restoredFirst, additionalTokens: 2)
 
         let controlModel = TinyPrefixSnapshotModel()
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
-        let controlFirst = control.prefill(prompt + generated + tail)
-        let expected = decode(
+        let controlFirst = try control.prefill(prompt + generated + tail)
+        let expected = try decode(
             &control, first: controlFirst, additionalTokens: 2)
         XCTAssertEqual(restored, expected)
     }
@@ -245,7 +245,7 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         let controlModel = TinyPrefixSnapshotModel()
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
-        XCTAssertEqual(restored, control.prefill(prefix + tail))
+        XCTAssertEqual(restored, try control.prefill(prefix + tail))
     }
 
     func testSnapshotRoutesAndMalformedRestoreFailClosed() throws {
@@ -347,8 +347,8 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
             reserve: 1,
             kvCache: .fp16)
         var recovered = control
-        let recoveredFirst = source.prefill([1, 2])
-        let controlFirst = recovered.prefill([1, 2])
+        let recoveredFirst = try source.prefill([1, 2])
+        let controlFirst = try recovered.prefill([1, 2])
         XCTAssertEqual(recoveredFirst, controlFirst)
     }
 
@@ -384,8 +384,8 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         var control = CompiledMLXDecoder(
             model: controlModel, reserve: 1, kvCache: .fp16)
         XCTAssertEqual(
-            decoder.prefill([1, 2]),
-            control.prefill([1, 2]),
+            try decoder.prefill([1, 2]),
+            try control.prefill([1, 2]),
             "failure recovery must leave the decoder reusable")
     }
 
@@ -393,7 +393,7 @@ final class CompiledMLXDecoderSnapshotTests: XCTestCase {
         let model = TinyPrefixSnapshotModel()
         var decoder = CompiledMLXDecoder(
             model: model, reserve: 1, kvCache: .fp16)
-        let speculative = decoder.generateSpec(
+        let speculative = try decoder.generateSpec(
             prompt: [1, 1],
             maxTokens: 2,
             eos: 4_095,

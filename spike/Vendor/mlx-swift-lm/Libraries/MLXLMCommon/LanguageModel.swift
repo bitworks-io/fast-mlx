@@ -273,6 +273,17 @@ public protocol LanguageModel: BaseLanguageModel {
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
 
+    /// Throwing counterpart to ``callAsFunction(_:cache:state:)-9kuvf``.
+    ///
+    /// `callAsFunction` cannot throw, so a model whose own step-time validation fails has no
+    /// non-aborting way to report it: some conformers resolve that by calling `fatalError` /
+    /// `preconditionFailure` from inside `callAsFunction`, which kills the process instead of
+    /// surfacing an ordinary Swift error. This requirement gives such a model a throwing seam a
+    /// caller can actually catch. The default implementation just forwards to `callAsFunction`,
+    /// so existing conformers are unaffected unless they choose to override it.
+    func evaluateThrowing(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        throws -> LMOutput
+
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
 
@@ -294,6 +305,16 @@ extension LanguageModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
+    }
+
+    /// Default: forward to the non-throwing entry point. Models whose `callAsFunction`
+    /// aborts the process on internal validation failure should override this to route
+    /// through their throwing validation path instead — see the protocol requirement's
+    /// doc comment.
+    public func evaluateThrowing(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        throws -> LMOutput
+    {
+        callAsFunction(input, cache: cache, state: state)
     }
 }
 
@@ -318,4 +339,30 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
             return (0 ..< numLayers).map { _ in KVCacheSimple() }
         }
     }
+}
+
+/// Family-neutral serving-compatibility kind for one layer's cache.
+public enum ServingCacheLayerKind: String, Sendable, Equatable, CaseIterable {
+    case denseAttention
+    case rotatingAttention
+    case recurrentState
+    case composite
+}
+
+/// A `KVCache` that reports its own serving-compatibility kind.
+///
+/// The scalar serving route classifies a loaded model's native caches to pick a decoder route.
+/// Its classifier recognizes a fixed set of concrete cache types; a model family whose cache is a
+/// bespoke wrapper is otherwise unclassifiable and cannot be loaded at all. Conforming lets such a
+/// cache declare its kind directly, without the classifier naming the family.
+public protocol ServingCacheKindReporting {
+    var servingCacheLayerKind: ServingCacheLayerKind { get }
+}
+
+/// A model that cannot accept certain input token IDs at all.
+///
+/// Reported so the serving layer can reject a request containing one with a client error, instead
+/// of reaching a model-internal validation failure that aborts the process.
+public protocol UnsupportedInputTokenReporting {
+    var unsupportedInputTokenIDs: Set<Int64> { get }
 }

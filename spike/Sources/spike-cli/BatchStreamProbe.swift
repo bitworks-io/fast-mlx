@@ -114,12 +114,12 @@ func batchStreamProbe(
                 actual: maxTokens)
         }
         let baselines = [
-            scalarGreedyBaseline(
+            try scalarGreedyBaseline(
                 model: loaded.model,
                 prompt: prompts[0],
                 maxTokens: outputBudgets[0],
                 eos: eos),
-            scalarGreedyBaseline(
+            try scalarGreedyBaseline(
                 model: loaded.model,
                 prompt: prompts[1],
                 maxTokens: outputBudgets[1],
@@ -290,8 +290,8 @@ func batchMembershipProbe(
             tokenizer.encode(text: "Batch row beta differs."),
             tokenizer.encode(text: "Batch row gamma stays active."),
         ]
-        let baselines = prompts.map {
-            scalarGreedyBaseline(
+        let baselines = try prompts.map {
+            try scalarGreedyBaseline(
                 model: loaded.model,
                 prompt: $0,
                 maxTokens: maxTokens,
@@ -484,15 +484,15 @@ private func scalarGreedyBaseline(
     prompt: [Int],
     maxTokens: Int,
     eos: Int
-) -> [Int] {
+) throws -> [Int] {
     var decoder = CompiledMLXDecoder(model: model, reserve: maxTokens + 16)
-    var current = decoder.prefill(prompt)
+    var current = try decoder.prefill(prompt)
     var tokens: [Int] = []
     tokens.reserveCapacity(maxTokens)
     while tokens.count < maxTokens, current != eos {
         tokens.append(current)
         if tokens.count < maxTokens {
-            current = decoder.step(last: current)
+            current = try decoder.step(last: current)
         }
     }
     return tokens

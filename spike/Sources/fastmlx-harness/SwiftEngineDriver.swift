@@ -799,8 +799,8 @@ actor HarnessEngineActor {
         let startedAt = ProcessInfo.processInfo.systemUptime
         for prompt in [[1], Array(repeating: 1, count: 8)] {
             decoder.reset()
-            let first = decoder.prefill(prompt)
-            _ = decoder.step(last: first)
+            let first = try decoder.prefill(prompt)
+            _ = try decoder.step(last: first)
         }
         decoder.reset()
         let duration =
@@ -1003,7 +1003,7 @@ actor HarnessEngineActor {
                     decoder.reset()
                     let coldPrefillStartedAt =
                         ProcessInfo.processInfo.systemUptime
-                    tok = decoder.prefill(prompt)
+                    tok = try decoder.prefill(prompt)
                     physicalPrefillDuration = max(
                         ProcessInfo.processInfo.systemUptime
                             - coldPrefillStartedAt,
@@ -1058,7 +1058,7 @@ actor HarnessEngineActor {
                     decoder.reset()
                     let fallbackPrefillStartedAt =
                         ProcessInfo.processInfo.systemUptime
-                    tok = decoder.prefill(prompt)
+                    tok = try decoder.prefill(prompt)
                     physicalPrefillDuration = max(
                         ProcessInfo.processInfo.systemUptime
                             - fallbackPrefillStartedAt,
@@ -1086,7 +1086,7 @@ actor HarnessEngineActor {
             } else {
                 let coldPrefillStartedAt =
                     ProcessInfo.processInfo.systemUptime
-                tok = decoder.prefill(prompt)
+                tok = try decoder.prefill(prompt)
                 physicalPrefillDuration = max(
                     ProcessInfo.processInfo.systemUptime
                         - coldPrefillStartedAt,
@@ -1112,7 +1112,7 @@ actor HarnessEngineActor {
                 Date().timeIntervalSinceReferenceDate,
             ]
             while tokens.count < maxTokens && tok != eos {
-                tok = decoder.step(last: tok)
+                tok = try decoder.step(last: tok)
                 tokens.append(tok)
                 tokenTimes.append(
                     Date().timeIntervalSinceReferenceDate)
@@ -1344,12 +1344,12 @@ actor HarnessEngineActor {
         for (promptOrdinal, prompt) in prompts.enumerated() {
             decoder.reset()
             var tokens: [Int] = []
-            var token = decoder.prefill(prompt)
+            var token = try decoder.prefill(prompt)
             tokens.append(token)
             while tokens.count < maxTokens
                 && token != kvtunerRuntimeIdentity.eosTokenID
             {
-                token = decoder.step(last: token)
+                token = try decoder.step(last: token)
                 tokens.append(token)
             }
             guard let telemetry = decoder.kvtunerCandidateKVTelemetry() else {
@@ -1409,7 +1409,7 @@ actor HarnessEngineActor {
     /// byte-identical to the plain greedy loop at temp 0 by construction. Same decoder-per-kind
     /// reuse as `generate` (compiled step + compiled verify survive across runs; in-place reset).
     func generateSpec(prompt: [Int], maxTokens: Int, eos: Int, kvCache kind: KVCacheKind, spec: SpecDecodeConfig)
-        -> (
+        throws -> (
             tokens: [Int], submitTime: Double, tokenTimes: [Double],
             prefillDurationSeconds: Double?, stats: SpecDecodeStats
         )
@@ -1425,7 +1425,7 @@ actor HarnessEngineActor {
         var decoder = decoders[decoderKey]!
         defer { decoders[decoderKey] = decoder }
         decoder.reset() // in-place KV reset: compiled graph stays valid across runs
-        return decoder.generateSpec(prompt: prompt, maxTokens: maxTokens, eos: eos, spec: spec)
+        return try decoder.generateSpec(prompt: prompt, maxTokens: maxTokens, eos: eos, spec: spec)
     }
 
     /// Full-vocab RAW LOGITS per generated position at temp=0 — the `EngineDriver.logprobs`
@@ -1946,7 +1946,7 @@ struct SwiftEngineDriver: EngineDriver {
             }
         }
         if let spec = try Self.specConfig(config) {
-            let out = await engine.generateSpec(
+            let out = try await engine.generateSpec(
                 prompt: prompt, maxTokens: config.maxTokens, eos: eos, kvCache: kind, spec: spec)
             // Engagement telemetry for the spec triad: `spec_drafted` is the marker proving
             // drafting actually happened (byte-identical output with zero drafts would be a

@@ -252,7 +252,10 @@ public struct CompiledMLXDecoder: Decoder {
         }
     }
 
-    public mutating func prefill(_ promptTokens: [Int]) -> Int {
+    // `throws` only to satisfy the `Decoder` protocol's now-throwing requirement (see
+    // `LanguageModel.evaluateThrowing`); `prefillCore` still calls the model directly and does not
+    // itself throw. NOT converted in this increment — tracked as a residual risk in the report.
+    public mutating func prefill(_ promptTokens: [Int]) throws -> Int {
         let first = prefillCore(promptTokens)
         return armLookahead(from: first)
     }
@@ -686,7 +689,9 @@ public struct CompiledMLXDecoder: Decoder {
         return value
     }
 
-    public mutating func step(last: Int) -> Int {
+    // `throws` only to satisfy the `Decoder` protocol; not converted internally in this
+    // increment (see `prefill`'s comment above).
+    public mutating func step(last: Int) throws -> Int {
         guard let next = pendingNext, let compiledStep else {
             fatalError("CompiledMLXDecoder.step called before prefill")
         }
@@ -720,9 +725,11 @@ public struct CompiledMLXDecoder: Decoder {
     /// the plain loop's budget/eos stopping rules over each batch. Speculation changes how
     /// many tokens one forward emits, never which tokens.
     ///
+    // `throws` because this drives the now-throwing `prefill`/`step` internally (see their
+    // comments above); not converted itself in this increment.
     public mutating func generateSpec(
         prompt: [Int], maxTokens: Int, eos: Int, spec: SpecDecodeConfig
-    ) -> (
+    ) throws -> (
         tokens: [Int], submitTime: Double, tokenTimes: [Double],
         prefillDurationSeconds: Double?, stats: SpecDecodeStats
     ) {
@@ -740,7 +747,7 @@ public struct CompiledMLXDecoder: Decoder {
         // stay on the base pipeline from token one; a hot request pays one transition verify,
         // then remains in the one-forward-per-round speculative invariant.
         let prefillStartedAt = ProcessInfo.processInfo.systemUptime
-        var last = prefill(prompt)
+        var last = try prefill(prompt)
         let prefillDurationSeconds =
             ProcessInfo.processInfo.systemUptime - prefillStartedAt
         let prefillEnd = Date().timeIntervalSinceReferenceDate
@@ -765,7 +772,7 @@ public struct CompiledMLXDecoder: Decoder {
                 if pendingNext != nil {
                     // Already on the base loop's pipeline: submit the following forward before
                     // reading this token, exactly as PLD-off does.
-                    last = step(last: last)
+                    last = try step(last: last)
                 } else {
                     // One-time speculative -> pipelined transition. The current `lastArr` is
                     // not in KV, so consume it, submit the following token too, and only then

@@ -428,14 +428,14 @@ final class KVTunerKVCacheSelectionTests: XCTestCase {
             model: TinyKVTunerCandidateModel(),
             kvCache: .kvtunerCandidate(policy))
 
-        let first = decoder.prefill([1, 2])
+        let first = try decoder.prefill([1, 2])
         XCTAssertEqual(first, 2)
         var telemetry = try XCTUnwrap(
             decoder.kvtunerCandidateKVTelemetry())
         XCTAssertEqual(telemetry.cachedTokens, 3)
         XCTAssertEqual(telemetry.capacityTokens, 512)
 
-        let second = decoder.step(last: first)
+        let second = try decoder.step(last: first)
         XCTAssertEqual(second, 2)
         telemetry = try XCTUnwrap(
             decoder.kvtunerCandidateKVTelemetry())

@@ -1415,4 +1415,133 @@ final class FastMLXServeArgumentsTests: XCTestCase {
             XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--auto-quant"))
         }
     }
+
+    // MARK: - --ngram-offload-plan: an absolute local path to an offloaded n-gram serving plan,
+    // selecting the offloaded load path for a qwen4_exp checkpoint at the scalar load call site.
+    // Default nil preserves today's load path. Not supported on continuous batching or
+    // --exact-qwen35-mtp, since neither route reaches the scalar-load seam that consumes it.
+
+    func testNgramOffloadPlanParsesAsAbsolutePathOnScalarServe() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+        ])
+
+        XCTAssertEqual(
+            arguments.ngramOffloadPlanURL,
+            URL(fileURLWithPath: "/abs/path/plan.json"))
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--ngram-offload-plan PATH"))
+    }
+
+    func testNgramOffloadPlanRejectsRelativePath() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "relative/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanMustBeAbsolute)
+        }
+    }
+
+    func testNgramOffloadPlanRejectedWithQuantPickOnly() {
+        // --quant-pick-only returns early WITHOUT threading ngramOffloadPlanURL, so without this
+        // guard the flag would be silently dropped rather than merely unused. Unlike
+        // --mtp-drafter-path, this flag has no transitive block against a quant source.
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--quant-pick-only",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithQuantPickOnly)
+        }
+    }
+
+    func testNgramOffloadPlanRequiresAValue() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .missingValue("--ngram-offload-plan"))
+        }
+    }
+
+    func testNgramOffloadPlanDefaultsNilAndDoesNotChangeOtherwiseValidParse() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ])
+        XCTAssertNil(arguments.ngramOffloadPlanURL)
+        XCTAssertEqual(
+            arguments.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/fixture", isDirectory: true),
+                memoryLimitBytes: 68_719_476_736,
+                cacheLimitBytes: 8_589_934_592))
+    }
+
+    func testNgramOffloadPlanRejectedWithContinuousBatching() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-batch-no-spec",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "103079215104",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithContinuousBatch)
+        }
+    }
+
+    func testNgramOffloadPlanRejectedWithExactQwen35MTP() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithExactQwen35MTP)
+        }
+    }
+
+    func testNgramOffloadPlanAppearsInHelpOutput() throws {
+        let arguments = try FastMLXServeArguments.parse(["--help"])
+        XCTAssertTrue(arguments.showHelp)
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--ngram-offload-plan PATH"))
+    }
 }

@@ -2,6 +2,7 @@ import Foundation
 
 import MLX
 import MLXHuggingFace
+import MLXLLM
 import MLXLMCommon
 import HarnessCore
 import HuggingFace
@@ -94,6 +95,29 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// (`ContinuousServingModelLoadError.hybridKernelKeyHeadDimUnaligned`) for the scalar route that
     /// serves qwen3_5 by default (continuous admission is opt-in). Carries the offending Dk.
     case hybridKernelKeyHeadDimUnaligned(Int)
+    /// At least one of the model's native caches classified ONLY via the family-neutral
+    /// `ServingCacheKindReporting` marker protocol (no concrete-type match), and the model's family
+    /// is not admitted for the load path that actually resolved — see
+    /// `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan`. The marker protocol lets a
+    /// bespoke cache wrapper report a serving-compatible shape without the classifier naming the
+    /// family, but a shape match alone is not a serving proof — only a RECORDED live serving run is.
+    /// Carries the lowercased family name; lifted by recording that proof and (for a family proven
+    /// only on the offloaded n-gram route) confirming the offload plan actually resolved.
+    case unprovenServingFamily(String)
+    /// `ScalarServingModelLoadConfiguration.ngramOffloadPlanURL` was supplied but is not an absolute
+    /// file URL — mirrors `modelDirectoryMustBeAbsolute`'s guard for the model directory.
+    case ngramOffloadPlanMustBeAbsolute
+    /// `ScalarServingModelLoadConfiguration.ngramOffloadPlanURL` was supplied but does not resolve to
+    /// an existing regular file (missing path, or a directory) — mirrors
+    /// `modelDirectoryUnavailable`'s existence guard for the model directory.
+    case ngramOffloadPlanUnavailable
+    /// A plan URL was supplied, but the checkpoint at `modelDirectory` is not the qwen4_exp family the
+    /// offloaded n-gram path is built for (per `scalarServingModelType(modelDirectory:)`). The
+    /// offloaded path's on-disk layout (sealed row file, chunk seal, PLE geometry) is specific to that
+    /// checkpoint, so a plan supplied against any other family is an operator error, refused here
+    /// before any weight load. Carries the observed `model_type` (`nil` when `config.json` is
+    /// unreadable/absent).
+    case ngramOffloadPlanUnsupportedFamily(String?)
 }
 
 enum ScalarServingDecoderStrategy: Equatable {
@@ -138,6 +162,11 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// Requested KV-cache storage tier for this serve. Default `.fp16` (the runtime's always-valid
     /// native storage). Non-fp16 tiers remain fail-closed until their runtime + quality gate passes.
     public let kvQuantTier: KVQuantTier
+    /// When supplied, selects the offloaded n-gram load path (`loadOffloadedNGramModelContext`)
+    /// instead of the default `loadModel(from:using:)`. Absent (`nil`, the default) means the
+    /// default path — every existing call site is unaffected. Restricted to the qwen4_exp family;
+    /// see `ScalarServingModelLoadError.ngramOffloadPlanUnsupportedFamily`.
+    public let ngramOffloadPlanURL: URL?
 
     public init(
         launchedModel: String,
@@ -146,7 +175,8 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         cacheLimitBytes: Int,
         backendConfiguration: ScalarServingBackendConfiguration,
         startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages,
-        kvQuantTier: KVQuantTier = .fp16
+        kvQuantTier: KVQuantTier = .fp16,
+        ngramOffloadPlanURL: URL? = nil
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -155,6 +185,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         self.backendConfiguration = backendConfiguration
         self.startupMessages = startupMessages
         self.kvQuantTier = kvQuantTier
+        self.ngramOffloadPlanURL = ngramOffloadPlanURL
     }
 }
 
@@ -280,6 +311,21 @@ public func validateScalarServingModelLoadConfiguration(
     guard !configuration.startupMessages.isEmpty else {
         throw ScalarServingModelLoadError.emptyStartupPrompt
     }
+    if let ngramOffloadPlanURL = configuration.ngramOffloadPlanURL {
+        guard ngramOffloadPlanURL.isFileURL,
+            ngramOffloadPlanURL.path.hasPrefix("/")
+        else {
+            throw ScalarServingModelLoadError.ngramOffloadPlanMustBeAbsolute
+        }
+        var planIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: ngramOffloadPlanURL.path,
+            isDirectory: &planIsDirectory),
+            !planIsDirectory.boolValue
+        else {
+            throw ScalarServingModelLoadError.ngramOffloadPlanUnavailable
+        }
+    }
     return configuration
 }
 
@@ -304,20 +350,67 @@ public func loadScalarServingModel(
         throw ScalarServingModelLoadError.hybridKernelKeyHeadDimUnaligned(recurrentKeyHeadDim)
     }
 
+    // Fail-closed family check for the offloaded n-gram dispatch seam. The offloaded path's on-disk
+    // layout (sealed row file, chunk seal, PLE geometry) is specific to the qwen4_exp checkpoint, so a
+    // plan file supplied against any other family is an operator error — refuse it HERE, before any
+    // weight load or global `Memory` mutation, exactly like the qwen3_5 guard above.
+    if configuration.ngramOffloadPlanURL != nil {
+        let observedModelType = scalarServingModelType(modelDirectory: configuration.modelDirectory)
+        guard observedModelType == "qwen4_exp" else {
+            throw ScalarServingModelLoadError.ngramOffloadPlanUnsupportedFamily(observedModelType)
+        }
+    }
+
     Memory.memoryLimit = configuration.memoryLimitBytes
     Memory.cacheLimit = configuration.cacheLimitBytes
     Memory.clearCache()
     try validateScalarServingMemoryLimits(configuration)
 
-    let context = try await loadModel(
-        from: configuration.modelDirectory,
-        using: #huggingFaceTokenizerLoader())
+    // Both branches yield the same `ModelContext`, so decoder-route classification and KV tier
+    // selection downstream are unaffected by which path loaded it. The marker-family admission gate
+    // below, however, DOES care which branch actually resolved: `offloadedNGramPlanResolved` is set
+    // immediately after the branch that ran it succeeds, so it reflects the real load path rather
+    // than a constant or the mere presence of a requested plan URL.
+    let context: ModelContext
+    let offloadedNGramPlanResolved: Bool
+    if let ngramOffloadPlanURL = configuration.ngramOffloadPlanURL {
+        context = try await loadOffloadedNGramModelContext(
+            modelDirectory: configuration.modelDirectory,
+            planFileURL: ngramOffloadPlanURL,
+            tokenizerLoader: #huggingFaceTokenizerLoader())
+        offloadedNGramPlanResolved = true
+    } else {
+        context = try await loadModel(
+            from: configuration.modelDirectory,
+            using: #huggingFaceTokenizerLoader())
+        offloadedNGramPlanResolved = false
+    }
     try validateScalarServingMemoryLimits(configuration)
 
     let tokenizer = context.tokenizer
     let modelConfiguration = context.configuration
-    let nativeCacheKinds = classifyScalarServingNativeCaches(
-        context.model.newCache(parameters: nil))
+    // Read this BEFORE `context.model` is `sending`-consumed into the `InferenceActor` below (both
+    // decoder-strategy branches send it into the actor). A subsequent read of the same non-Sendable
+    // model value after it has been sent into another isolation domain is a data-race risk the
+    // compiler correctly rejects, so this must be captured now and threaded through as a plain value.
+    let rejectedPromptTokenIDs = servingRejectedPromptTokenIDs(model: context.model)
+    let nativeCacheClassifications = context.model.newCache(parameters: nil)
+        .map(classifyScalarServingNativeCacheEntry)
+    let nativeCacheKinds = nativeCacheClassifications.map(\.kind)
+    // Fail-closed admission gate: a cache classified ONLY via the family-neutral marker protocol
+    // (no concrete-type match) makes the family LOADABLE but proves nothing about live serving
+    // correctness — the marker only asserts a cache-shape claim. Refuse here for the honest reason
+    // unless this family already has a RECORDED live serving proof on the load path that actually
+    // resolved (`ScalarServingModelLoadError` doc comment and
+    // `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan`). Scoped strictly to
+    // marker-classified entries: any family classified entirely by concrete type (qwen3, qwen3_5,
+    // every dense model) is completely unaffected.
+    if let admissionError = scalarServingMarkerFamilyAdmissionError(
+        classifications: nativeCacheClassifications,
+        family: scalarServingModelType(modelDirectory: configuration.modelDirectory),
+        offloadedNGramPlanResolved: offloadedNGramPlanResolved) {
+        throw admissionError
+    }
     let decoderRoute = try classifyScalarServingDecoderRoute(nativeCacheKinds)
     // Fail-closed KV-cache tier selection before a live request cache is built. Production policy keeps
     // int8 unwired after its dated quality NO-GO, so a request throws instead of silently downgrading.
@@ -373,16 +466,27 @@ public func loadScalarServingModel(
     var backendConfiguration = configuration.backendConfiguration
     backendConfiguration.toolCallFormat = servingToolCallFormat(
         inferred: modelConfiguration.toolCallFormat)
-    // Thinking-with-tools policy. The agentic hybrid family (qwen3_5: Qwen3.5/3.6/3.8, the
-    // `.nativeHeterogeneous` route) is trained to think AND call tools, so respect its template
-    // default (flag off). Keep the legacy `enable_thinking:false` workaround only for dense
-    // (compiled) models, where thinking-with-tools regressed reliability (QwenLM/Qwen3 #1817).
-    backendConfiguration.disableThinkingWhenToolsActive = (decoderRoute == .compiled)
-    // Streaming reasoning separation: the qwen3_5 hybrid family (.nativeHeterogeneous) emits its
-    // reasoning block from token 0 with no leading <think> opener (live-attested 93e606a), so its
-    // streamed thinking must be split into reasoning_content/content. Dense/compiled stays false
-    // (passthrough) until a live capture attests its streamed shape — a recorded handoff, not a guess.
-    backendConfiguration.thinksByDefault = servingThinksByDefault(route: decoderRoute)
+    // Thinking-with-tools policy and streaming reasoning separation are keyed on the model FAMILY
+    // (`model_type`), not the decoder route alone: `.nativeHeterogeneous` is a cache-shape route that
+    // can carry more than one family, and only the live-attested qwen3_5 hybrid family (Qwen3.5/3.6/3.8)
+    // is known to think AND call tools with a no-opener reasoning stream (live-attested 93e606a). Any
+    // other `.nativeHeterogeneous` family conservatively keeps the legacy `enable_thinking:false`
+    // workaround (dense/compiled always does, per QwenLM/Qwen3 #1817) and stays passthrough
+    // (non-separating) until it is live-captured — see `StreamingReasoningPolicy.swift`.
+    backendConfiguration.disableThinkingWhenToolsActive = servingDisablesThinkingWhenToolsActive(
+        route: decoderRoute,
+        modelType: scalarServingModelType(modelDirectory: configuration.modelDirectory))
+    backendConfiguration.thinksByDefault = servingThinksByDefault(
+        route: decoderRoute,
+        modelType: scalarServingModelType(modelDirectory: configuration.modelDirectory))
+    // Some model families `preconditionFailure` inside their forward path on specific input token
+    // IDs (media sentinels the model never expects as free-standing prompt tokens); on the scalar
+    // route that precondition failure aborts the server process. Generated tokens are already
+    // masked away from these IDs, but a rendered PROMPT is not, so without this screen an admitted
+    // chat request that merely tokenizes to one of them would be an HTTP-reachable process kill.
+    // `rejectedPromptTokenIDs` was captured earlier, before `context.model` was sent into the
+    // decoder actor — see the comment at its capture site.
+    backendConfiguration.rejectedPromptTokenIDs = rejectedPromptTokenIDs
     let backend = ScalarServingBackend(
         launchedModel: configuration.launchedModel,
         inference: inference,
@@ -427,24 +531,140 @@ func scalarServingQwen35RecurrentKeyHeadDim(modelDirectory: URL) -> Int? {
     return geometry.recurrent.keyHeadDim
 }
 
+/// The loaded model's `model_type` string from `config.json`, or nil if it is missing/unreadable.
+/// `ModelConfiguration` (the vendored loader's identifier/name/EOS type, `context.configuration`) has
+/// no model-type field — it only carries the model's HF id/directory and display name — so config.json
+/// is the only reliable source available here. Used to key the family-scoped thinking-flag gates
+/// (`servingThinksByDefault`/`servingDisablesThinkingWhenToolsActive` in `StreamingReasoningPolicy.swift`)
+/// to the actual model family rather than the decoder route alone, so a second family sharing
+/// `.nativeHeterogeneous`'s cache shape does not silently inherit qwen3_5's attested streamed shape.
+/// Mirrors `scalarServingQwen35RecurrentKeyHeadDim`'s config.json read above.
+func scalarServingModelType(modelDirectory: URL) -> String? {
+    let configURL = modelDirectory.appendingPathComponent("config.json")
+    guard let data = try? Data(contentsOf: configURL),
+        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    else {
+        return nil
+    }
+    return root["model_type"] as? String
+}
+
+/// How one cache's serving kind was determined by `classifyScalarServingNativeCacheEntry`.
+public enum ScalarServingCacheClassificationSource: Equatable, Sendable {
+    /// Matched one of the five audited concrete cache types.
+    case concreteType
+    /// Matched none of the five concrete types but conformed to `ServingCacheKindReporting`.
+    case markerProtocol
+    /// Matched neither — classified as `.unknown`.
+    case unclassified
+}
+
+/// Classify one native cache into its serving-compatibility kind, and record how that kind was
+/// determined.
+///
+/// The five concrete types are checked FIRST, in the same fixed order the classifier has always
+/// used, each yielding `.concreteType`. Only in the fall-through arm — a cache that is none of the
+/// five — is the family-neutral `ServingCacheKindReporting` marker protocol consulted, yielding
+/// `.markerProtocol`. This order is load-bearing, not incidental: if the marker probe ran BEFORE the
+/// concrete-type switch, a future mlx-swift-lm release that added `ServingCacheKindReporting`
+/// conformance to one of the five existing types (e.g. `RotatingKVCache`) would silently reroute
+/// every already-supported family through the marker path instead of the audited concrete-type path
+/// — an invisible regression in cache classification for families that work today. Keeping the
+/// concrete-type switch first means the marker protocol can only ever affect a cache type that
+/// matches none of the five, so it never overrides an existing, audited classification.
+///
+/// The marker's `ServingCacheLayerKind` is mapped through an EXHAUSTIVE switch with NO `default:`
+/// clause, so a future 5th `ServingCacheLayerKind` case is a compile error here rather than silently
+/// classifying as `.unknown`.
+public func classifyScalarServingNativeCacheEntry(
+    _ cache: any KVCache
+) -> (kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource) {
+    switch cache {
+    case is CacheList:
+        return (.composite, .concreteType)
+    case is MambaCache, is ArraysCache:
+        return (.recurrentState, .concreteType)
+    case is RotatingKVCache:
+        return (.rotatingAttention, .concreteType)
+    case is KVCacheSimple:
+        return (.denseAttention, .concreteType)
+    default:
+        if let reporting = cache as? ServingCacheKindReporting {
+            let kind: ScalarServingNativeCacheKind
+            switch reporting.servingCacheLayerKind {
+            case .denseAttention:
+                kind = .denseAttention
+            case .rotatingAttention:
+                kind = .rotatingAttention
+            case .recurrentState:
+                kind = .recurrentState
+            case .composite:
+                kind = .composite
+            }
+            return (kind, .markerProtocol)
+        }
+        return (.unknown, .unclassified)
+    }
+}
+
 /// Map the loaded model's native state shape into the pure serving compatibility contract.
 public func classifyScalarServingNativeCaches(
     _ caches: [any KVCache]
 ) -> [ScalarServingNativeCacheKind] {
-    caches.map { cache in
-        switch cache {
-        case is CacheList:
-            .composite
-        case is MambaCache, is ArraysCache:
-            .recurrentState
-        case is RotatingKVCache:
-            .rotatingAttention
-        case is KVCacheSimple:
-            .denseAttention
-        default:
-            .unknown
-        }
+    caches.map { classifyScalarServingNativeCacheEntry($0).kind }
+}
+
+/// Families whose caches classify ONLY via `ServingCacheKindReporting` (no concrete-type match) and
+/// that have a RECORDED LIVE serving proof — but ONLY on the specific load path that proof was
+/// captured on. The marker protocol lets a bespoke cache wrapper report a serving-compatible shape
+/// without the classifier naming the family, but a shape claim alone is not a serving proof.
+///
+/// Membership here means the family's live serving proof exists ONLY for the offloaded n-gram
+/// route (`loadOffloadedNGramModelContext`), never for the plain, fully-resident `loadModel` route
+/// that runs when no offload plan is configured. `qwen4_exp` (Qwen3.8-Flash-Next) is proven this
+/// way: the fully-resident load is a ~106 GiB checkpoint with no live serving attestation of its
+/// own and is a memory-fit disaster on a 128 GB production host, so a bare family allowlist would
+/// wrongly admit that unproven, dangerous path too. `scalarServingMarkerFamilyAdmissionError` refuses
+/// a listed family unless the caller also attests, via `offloadedNGramPlanResolved`, that the
+/// offloaded route is the one that actually resolved for THIS load.
+///
+/// A family not listed here stays fail-closed exactly as before this gate existed, regardless of
+/// which path loaded it. Mirrors `scalarHybridServingFamilies`
+/// (`ServingCore/ScalarServingCacheLayoutPolicy.swift`): fail-closed by construction, exact-match
+/// only (lowercased compare), and narrower than any structural classification — this is a
+/// *serving-proof* allowlist, not a cache-shape allowlist.
+private let markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan: Set<String> = [
+    "qwen4_exp"
+]
+
+/// Pure admission decision for the marker-classified serving gate. Separated from
+/// `loadScalarServingModel` specifically so it is testable without a real checkpoint on disk:
+/// the gate previously lived inline after `loadModel`, where no unit test could reach it.
+///
+/// Refuses only when at least one classification has source `.markerProtocol`. The family is
+/// lowercased before comparison (a `nil`/missing family is treated as `"unknown"`), so comparisons
+/// and the carried refusal string are both exact-match on the lowercased form. A family not in
+/// `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` is refused unconditionally. A
+/// LISTED family is admitted only when `offloadedNGramPlanResolved` is also `true` — a resolved
+/// offload plan is never a blanket bypass for every marker-classified family, and a listed family
+/// is never admitted on the plain, fully-resident load path. Returns `nil` to admit.
+public func scalarServingMarkerFamilyAdmissionError(
+    classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)],
+    family: String?,
+    offloadedNGramPlanResolved: Bool
+) -> ScalarServingModelLoadError? {
+    guard classifications.contains(where: { $0.source == .markerProtocol }) else {
+        return nil
     }
+    let resolvedFamily = (family ?? "unknown").lowercased()
+    guard markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan.contains(resolvedFamily)
+    else {
+        return .unprovenServingFamily(resolvedFamily)
+    }
+    guard offloadedNGramPlanResolved else {
+        return .unprovenServingFamily(resolvedFamily)
+    }
+    return nil
 }
 
 /// Match the pinned MLX generation loop's complete stop-token construction.

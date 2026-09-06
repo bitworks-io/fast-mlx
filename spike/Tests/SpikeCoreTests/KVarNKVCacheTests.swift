@@ -2499,7 +2499,7 @@ final class KVarNKVCacheTests: XCTestCase {
             kvCache: .kvarn(.k4v2G128I16), compileStep: true)
         XCTAssertEqual(decoder.executionMode, .uncompiledCorrectness)
 
-        _ = decoder.prefill([1, 2])
+        _ = try decoder.prefill([1, 2])
         let telemetry = try XCTUnwrap(decoder.kvarnKVTelemetry())
         XCTAssertEqual(telemetry.tier, .k4v2G128)
         XCTAssertEqual(telemetry.iterations, 16)

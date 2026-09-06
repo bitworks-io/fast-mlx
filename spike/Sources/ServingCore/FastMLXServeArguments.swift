@@ -56,6 +56,10 @@ public enum FastMLXServeArgumentError:
     case invalidAutoQuantBase
     case mtpDrafterPathMustBeAbsolute
     case mtpDrafterRequiresExactQwen35MTP
+    case ngramOffloadPlanMustBeAbsolute
+    case ngramOffloadPlanWithContinuousBatch
+    case ngramOffloadPlanWithExactQwen35MTP
+    case ngramOffloadPlanWithQuantPickOnly
     case invalidExactMTPSelection
     case exactMTPSelectionRequiresExactQwen35MTP
     case exactQwen35MTPWithScripted
@@ -119,6 +123,14 @@ public enum FastMLXServeArgumentError:
             "--mtp-drafter-path must be an absolute local path"
         case .mtpDrafterRequiresExactQwen35MTP:
             "--mtp-drafter-path requires --exact-qwen35-mtp"
+        case .ngramOffloadPlanMustBeAbsolute:
+            "--ngram-offload-plan must be an absolute local path"
+        case .ngramOffloadPlanWithContinuousBatch:
+            "--ngram-offload-plan is not supported with continuous batching"
+        case .ngramOffloadPlanWithExactQwen35MTP:
+            "--ngram-offload-plan is not supported with --exact-qwen35-mtp"
+        case .ngramOffloadPlanWithQuantPickOnly:
+            "--ngram-offload-plan is not supported with --quant-pick-only"
         case .invalidExactMTPSelection:
             "--exact-mtp-selection must be qwen35-9b-depth1, qwen38-27b-mxfp8-depth1, "
                 + "or qwen38-27b-4bit-depth1"
@@ -237,6 +249,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       Defaults to qwen35-9b-depth1 for compatibility.
           --mtp-drafter-path PATH     Absolute local drafter snapshot directory for
                                       --exact-qwen35-mtp.
+          --ngram-offload-plan PATH   Absolute local path to an offloaded n-gram serving
+                                      plan. Selects the offloaded load path for a
+                                      qwen4_exp checkpoint; omitted means the default
+                                      load path.
           --host HOST                 Bind host (default: 127.0.0.1).
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
@@ -360,6 +376,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// Defaults to the original 9B lock so existing invocations stay compatible.
     public let exactMTPSelection: FastMLXExactMTPSelection
     public let mtpDrafterDirectory: URL?
+    /// `--ngram-offload-plan`: an absolute local path to an offloaded n-gram serving plan. Selects
+    /// the offloaded load path for a `qwen4_exp` checkpoint at the scalar load call site; `nil`
+    /// (the default) preserves today's load path. Fail-closed at the parser: not supported combined
+    /// with continuous batching or `--exact-qwen35-mtp`, because neither route reaches the scalar-load
+    /// seam that consumes it — accepting the flag there would silently ignore an operator's request.
+    public let ngramOffloadPlanURL: URL?
 
     private init(
         backend: FastMLXServeBackend?,
@@ -392,7 +414,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         allowHybridQwen35: Bool = false,
         exactQwen35MTP: Bool = false,
         exactMTPSelection: FastMLXExactMTPSelection = .qwen35_9BDepth1,
-        mtpDrafterDirectory: URL? = nil
+        mtpDrafterDirectory: URL? = nil,
+        ngramOffloadPlanURL: URL? = nil
     ) {
         self.backend = backend
         self.host = host
@@ -424,6 +447,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.exactQwen35MTP = exactQwen35MTP
         self.exactMTPSelection = exactMTPSelection
         self.mtpDrafterDirectory = mtpDrafterDirectory
+        self.ngramOffloadPlanURL = ngramOffloadPlanURL
     }
 
     public static func parse<S: Sequence>(
@@ -468,6 +492,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var exactMTPSelection = FastMLXExactMTPSelection.qwen35_9BDepth1
         var exactMTPSelectionWasExplicit = false
         var mtpDrafterDirectory: URL?
+        var ngramOffloadPlanURL: URL?
         var evidencePath: URL?
 
         var index = 0
@@ -653,6 +678,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.mtpDrafterPathMustBeAbsolute
                 }
                 mtpDrafterDirectory = URL(fileURLWithPath: path, isDirectory: true)
+            case "--ngram-offload-plan":
+                index += 1
+                let path = try value(at: index, in: arguments, for: argument)
+                guard path.hasPrefix("/") else {
+                    throw FastMLXServeArgumentError.ngramOffloadPlanMustBeAbsolute
+                }
+                ngramOffloadPlanURL = URL(fileURLWithPath: path)
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -707,6 +739,24 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             throw FastMLXServeArgumentError.conflictingBackendModes
         }
         let continuousModeSelected = continuousBatchNoSpec || continuousDynamicPLD
+
+        // --ngram-offload-plan is consumed only at the scalar-load call site (`loadScalarServingBackend`
+        // → `ScalarServingModelLoadConfiguration`). Neither the continuous-batch routes nor the exact
+        // Qwen3.5 MTP composition reach that seam, so silently accepting the flag there would drop an
+        // operator's explicit request on the floor — fail closed instead.
+        if ngramOffloadPlanURL != nil, continuousModeSelected {
+            throw FastMLXServeArgumentError.ngramOffloadPlanWithContinuousBatch
+        }
+        if ngramOffloadPlanURL != nil, exactQwen35MTP {
+            throw FastMLXServeArgumentError.ngramOffloadPlanWithExactQwen35MTP
+        }
+        // --quant-pick-only returns early below WITHOUT threading this field, so the flag would be
+        // silently dropped rather than merely unused. `--mtp-drafter-path` avoids the same trap only
+        // transitively (it requires --exact-qwen35-mtp, which already conflicts with a quant source);
+        // this flag has no such transitive block, so it needs an explicit one.
+        if ngramOffloadPlanURL != nil, quantPickOnly {
+            throw FastMLXServeArgumentError.ngramOffloadPlanWithQuantPickOnly
+        }
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
         // not built): mutually exclusive with the local --quant-candidates source, and usable only
@@ -942,7 +992,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             allowHybridQwen35: allowHybridQwen35,
             exactQwen35MTP: exactQwen35MTP,
             exactMTPSelection: exactMTPSelection,
-            mtpDrafterDirectory: mtpDrafterDirectory)
+            mtpDrafterDirectory: mtpDrafterDirectory,
+            ngramOffloadPlanURL: ngramOffloadPlanURL)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -981,6 +1032,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--exact-qwen35-mtp",
         "--exact-mtp-selection",
         "--mtp-drafter-path",
+        "--ngram-offload-plan",
     ]
 
     private static func value(

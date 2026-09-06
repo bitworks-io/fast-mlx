@@ -43,10 +43,13 @@ public struct DecoderPenalties: Equatable, Sendable {
 
 /// Abstraction over "one decode step" so the actor's loop is testable without MLX.
 public protocol Decoder {
-    /// Prefill the prompt and return the first token id.
-    mutating func prefill(_ promptTokens: [Int]) -> Int
-    /// Given the last token, produce the next.
-    mutating func step(last: Int) -> Int
+    /// Prefill the prompt and return the first token id. Throws when model evaluation itself
+    /// fails validation (e.g. `qwen4_exp`'s cache/PLE-ownership checks) — a genuine caller bug
+    /// (empty prompt) still aborts via `preconditionFailure`, never via this throw.
+    mutating func prefill(_ promptTokens: [Int]) throws -> Int
+    /// Given the last token, produce the next. Throws for the same reason as `prefill`; calling
+    /// `step` before `prefill` remains a caller bug and still aborts via `fatalError`.
+    mutating func step(last: Int) throws -> Int
     /// Discard any per-conversation state (e.g. KV cache) so the next `prefill` starts
     /// fresh, without reconstructing the decoder (and re-crossing the actor boundary with
     /// a fresh non-Sendable model reference — see MLXDecoder.reset()).
@@ -76,6 +79,8 @@ public struct ScriptedDecoder: Decoder {
     public init(script: [Int], eos: Int) { self.script = script; self.eos = eos }
     public mutating func prefill(_ p: [Int]) -> Int { defer { i += 1 }; return script[i] }
     public mutating func step(last: Int) -> Int { defer { i += 1 }; return script[i] }
+    // Non-throwing overrides satisfy the `Decoder` protocol's throwing requirements: a script
+    // replay never fails model evaluation, so this conformer stays byte-identical to before.
     public mutating func reset() { i = 0 }
 }
 
@@ -206,7 +211,7 @@ public actor InferenceActor {
         }
 
         try Task.checkCancellation()
-        var token = decoder.prefill(promptTokens)
+        var token = try decoder.prefill(promptTokens)
         var generatedTokenCount = 0
 
         while true {
@@ -237,7 +242,7 @@ public actor InferenceActor {
             }
 
             try Task.checkCancellation()
-            token = decoder.step(last: token)
+            token = try decoder.step(last: token)
         }
     }
 
@@ -250,15 +255,24 @@ public actor InferenceActor {
                 throwing: InferenceActorError.generationAlreadyActive)
             return
         }
-        var tok = decoder.prefill(prompt)
-        var n = 0
-        while n < maxTokens {
-            if tok == eos { break }
-            cont.yield(tok)
-            n += 1
-            if Task.isCancelled { break }
-            tok = decoder.step(last: tok)
+        // `decoder.prefill`/`.step` can now throw when model evaluation itself fails validation
+        // (e.g. `qwen4_exp`'s cache/PLE-ownership checks). This path predates `AsyncThrowingStream`
+        // adoption of a suspending consumer; report the failure the same way every other error on
+        // this stream is reported — finish the continuation with the thrown error — rather than
+        // letting it propagate out of a non-throwing function and abort the process.
+        do {
+            var tok = try decoder.prefill(prompt)
+            var n = 0
+            while n < maxTokens {
+                if tok == eos { break }
+                cont.yield(tok)
+                n += 1
+                if Task.isCancelled { break }
+                tok = try decoder.step(last: tok)
+            }
+            cont.finish()
+        } catch {
+            cont.finish(throwing: error)
         }
-        cont.finish()
     }
 }

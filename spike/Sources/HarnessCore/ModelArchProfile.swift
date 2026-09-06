@@ -362,16 +362,49 @@ public struct ModelArchProfile: Sendable {
         // layers (48 total - 12 full_attention) = 115,458,048 B (110.11 MiB/seq). Both shapes and
         // dtypes were confirmed against the vendored source, not inferred from config alone.
         //
-        // weightsBytes4bitEstimate is the MEASURED resident-after-offload figure read from the
-        // artifact's 22 safetensors headers: total 113,324,747,928 B (105.54 GiB) MINUS the
-        // 32,000,153,600 B (29.80 GiB) per-layer-embedding n-gram lookup table =
-        // 81,324,594,328 B (75.74 GiB). This is NOT a 0.5B/param estimate and NOT the full on-disk
-        // size -- it EXCLUDES the n-gram table because that table is designed to be SSD-streamed
-        // rather than held resident. WARNING, LOAD-BEARING: this number is only valid once that
-        // offload is actually wired into the serving path. There is no production call site for it
-        // yet, so any fit verdict consuming this figure describes the offload-enabled
-        // configuration, not the as-shipped one -- loading the full 105.54 GiB would fail the green
-        // verdict most of the current fleet gives it here.
+        // weightsBytes4bitEstimate is the MEASURED FULL resident figure read from the artifact's
+        // 22 safetensors headers: 113,324,747,928 B (105.54 GiB). Not a 0.5B/param estimate --
+        // actual summed header bytes.
+        //
+        // It previously carried 81,324,594,328 B (75.74 GiB), the same total MINUS the
+        // 32,000,153,600 B (29.80 GiB) per-layer-embedding n-gram lookup table, on the reasoning
+        // that the table is designed to be SSD-streamed rather than held resident. That is kept
+        // here as the OFFLOAD-ENABLED PROJECTION and is deliberately NOT the modelled value,
+        // because nothing can build that configuration today. Modelling it made this the one
+        // catalog entry describing a machine nobody has: it produced a GREEN verdict, fits = true,
+        // and maxContextThatFits = 262,144 on a 128 GiB shared box for a load that would not fit.
+        //
+        // Two things in this file already said it should be the full figure. MiMo-V2-Flash above
+        // keeps its full measured 161.83 GiB, reds every box, and calls that "the honest refusal
+        // is the differentiator working, not a bug". And `ModelConfigDecoder` classifies this exact
+        // tensor class as resident WEIGHTS, not per-sequence state ("gemma4's PLE per-layer
+        // embeddings are weights -- captured in safetensors bytes"). The catalog and the decoder
+        // now agree.
+        //
+        // A note on what does NOT consume this field, so the change is not over-read: the SERVE
+        // path never reads the catalog. `fastmlx-serve` sizes a real directory from
+        // `ModelConfigDecoder.decodeModelDirectory`, i.e. real on-disk safetensors bytes, and
+        // refuses rather than falling back here. So no serve verdict was ever wrong because of
+        // this value -- the consumers are the planning tools (`ModelSizer.report`, the sizer
+        // matrix, `fastmlx-capacity`). This is a planning-time honesty fix.
+        //
+        // Status of the offload itself, stated precisely because the previous wording ("there is
+        // no production call site") is now stale: the precondition it set has been met. The
+        // vendored MLXLLM module now exposes `public func loadOffloadedNGramModelContext(...)
+        // async throws -> ModelContext` (LLMModelFactory.swift), its own doc comment describing it
+        // as "the narrow, `public`, `ModelContext`-returning seam that closes that module
+        // boundary". It is called from the serving adapter's `loadScalarServingModel`
+        // (MLXScalarServing.swift), reached from the CLI flag `--ngram-offload-plan`
+        // (FastMLXServeArguments.swift, wired in FastMLXServe.swift), and `loadScalarServingModel`
+        // fail-closed refuses that plan against any non-`qwen4_exp` checkpoint before any weight
+        // load. So the 75.74 GiB figure is no longer hypothetical -- but it is also not simply
+        // restored as THIS entry's value, because the fit verdict must track the CONFIGURATION
+        // (whether an operator actually supplies `--ngram-offload-plan`), not the mere capability
+        // to do so. That would recreate the same phantom-GREEN under a different excuse: green
+        // because offload is possible, not because it is configured. Instead the offload-enabled
+        // shape lives in its own catalog entry, "Qwen3.8-Flash-Next (n-gram offload)", immediately
+        // below. This entry stays at the full 105.54 GiB so a default serve started with no plan
+        // file continues to size honestly.
         //
         // Consequence for the sizer matrix: the artifact is MIXED precision (base 4-bit/group-32
         // with 5- and 8-bit per-module overrides), so the `weightBits: 8` row the matrix emits by
@@ -408,6 +441,25 @@ public struct ModelArchProfile: Sendable {
         // clearance (same convention as the other flagged entries above).
         ModelArchProfile(
             id: "Qwen3.8-Flash-Next", modelType: .hybridLinear, nLayers: 48, nAttnLayers: 12,
+            nKVHeads: 2, headDim: 256, fixedStateBytes: 115_458_048, nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: 113_324_747_928, license: "⚠️ Qwen Community License 1.0 (verify)",
+            auxPerLayerKeyDim: 128
+        ),
+        // Second catalog entry for the SAME artifact, modelling the OFFLOAD-CONFIGURED deploy
+        // shape: an operator serve started WITH `--ngram-offload-plan` supplied, so the per-layer-
+        // embedding n-gram lookup table is SSD-streamed rather than held resident. Every field is
+        // identical to the base "Qwen3.8-Flash-Next" entry above EXCEPT the weights figure, which is
+        // exactly the base entry's measured total minus the 32,000,153,600 B (29.80 GiB) n-gram
+        // table: 113,324,747,928 − 32,000,153,600 = 81,324,594,328 B (75.74 GiB). This is buildable
+        // today, not hypothetical: `loadOffloadedNGramModelContext` (public, LLMModelFactory.swift)
+        // is called from `loadScalarServingModel` (MLXScalarServing.swift), reached from the CLI
+        // flag `--ngram-offload-plan` (FastMLXServeArguments.swift / FastMLXServe.swift), and that
+        // loader fail-closed refuses the plan against any non-`qwen4_exp` checkpoint before any
+        // weight load. The base entry above remains the correct row for a default serve with no
+        // plan file -- that deploy genuinely needs the full 105.54 GiB, and this entry does not
+        // replace it.
+        ModelArchProfile(
+            id: "Qwen3.8-Flash-Next (n-gram offload)", modelType: .hybridLinear, nLayers: 48, nAttnLayers: 12,
             nKVHeads: 2, headDim: 256, fixedStateBytes: 115_458_048, nativeMaxContext: 262_144,
             weightsBytes4bitEstimate: 81_324_594_328, license: "⚠️ Qwen Community License 1.0 (verify)",
             auxPerLayerKeyDim: 128
