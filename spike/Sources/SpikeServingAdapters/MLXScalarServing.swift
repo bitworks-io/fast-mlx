@@ -467,18 +467,26 @@ public func loadScalarServingModel(
     backendConfiguration.toolCallFormat = servingToolCallFormat(
         inferred: modelConfiguration.toolCallFormat)
     // Thinking-with-tools policy and streaming reasoning separation are keyed on the model FAMILY
-    // (`model_type`), not the decoder route alone: `.nativeHeterogeneous` is a cache-shape route that
-    // can carry more than one family, and only the live-attested qwen3_5 hybrid family (Qwen3.5/3.6/3.8)
-    // is known to think AND call tools with a no-opener reasoning stream (live-attested 93e606a). Any
-    // other `.nativeHeterogeneous` family conservatively keeps the legacy `enable_thinking:false`
-    // workaround (dense/compiled always does, per QwenLM/Qwen3 #1817) and stays passthrough
-    // (non-separating) until it is live-captured — see `StreamingReasoningPolicy.swift`.
+    // (`model_type`) AND the loaded checkpoint's own chat template, not the decoder route alone:
+    // `.nativeHeterogeneous` is a cache-shape route that can carry more than one family, and a family
+    // string alone does not prove a specific checkpoint's template actually emits the markers the
+    // streaming splitter hardcodes. Two families are live-attested today: qwen3_5 (Qwen3.5/3.6/3.8,
+    // 93e606a) and qwen4_exp (Flash Next, captured THIS cycle at harness c771346e — see
+    // `StreamingReasoningPolicy.swift` for the full capture). Any other `.nativeHeterogeneous` family,
+    // or an attested family whose loaded template does not attest the markers, conservatively keeps
+    // the legacy `enable_thinking:false` workaround (dense/compiled always does, per QwenLM/Qwen3
+    // #1817) and stays passthrough (non-separating) until it is live-captured.
+    let observedFamilyModelType = scalarServingModelType(modelDirectory: configuration.modelDirectory)
+    let templateAttestsThinkMarkers = scalarServingChatTemplateAttestsThinkMarkers(
+        modelDirectory: configuration.modelDirectory)
     backendConfiguration.disableThinkingWhenToolsActive = servingDisablesThinkingWhenToolsActive(
         route: decoderRoute,
-        modelType: scalarServingModelType(modelDirectory: configuration.modelDirectory))
+        modelType: observedFamilyModelType,
+        templateAttestsThinkMarkers: templateAttestsThinkMarkers)
     backendConfiguration.thinksByDefault = servingThinksByDefault(
         route: decoderRoute,
-        modelType: scalarServingModelType(modelDirectory: configuration.modelDirectory))
+        modelType: observedFamilyModelType,
+        templateAttestsThinkMarkers: templateAttestsThinkMarkers)
     // Some model families `preconditionFailure` inside their forward path on specific input token
     // IDs (media sentinels the model never expects as free-standing prompt tokens); on the scalar
     // route that precondition failure aborts the server process. Generated tokens are already
@@ -547,6 +555,59 @@ func scalarServingModelType(modelDirectory: URL) -> String? {
         return nil
     }
     return root["model_type"] as? String
+}
+
+/// The literal markers `StreamingReasoningGate`/the streaming splitter hardcode when deciding whether
+/// a stream carries a separable reasoning block.
+private let scalarServingThinkMarkerAttestationStrings = ["<think>", "</think>"]
+
+/// Artifact-derived attestation probe: does the LOADED checkpoint's own chat template contain the
+/// `<think>`/`</think>` markers the streaming reasoning splitter hardcodes?
+///
+/// Resolves the same template Hugging Face tokenizers actually render from — `tokenizer_config.json`'s
+/// `chat_template` string field takes precedence, falling back to a sibling `chat_template.jinja` file
+/// only when `tokenizer_config.json` is missing/unreadable or does not carry that key. Returns `false`
+/// (fail-closed) when neither source resolves to a template, or when the resolved template text does
+/// not contain BOTH markers: an unreadable or non-attesting template must degrade
+/// `servingThinksByDefault` to today's byte-identical passthrough, never promote it to separation,
+/// because promoting content to `reasoning_content` on an unproven template is exactly the
+/// answer-loss class `StreamingReasoningPolicy.swift`'s callers structurally avoid.
+///
+/// Captured live this cycle (harness `c771346e`, checkpoint `flashnext-oq4-mtp`): the Flash Next
+/// checkpoint's `tokenizer_config.json` `chat_template` and its sibling `chat_template.jinja` are
+/// byte-identical (8952 bytes), each containing `<think>` x3 and `</think>` x2 — either resolution
+/// path attests the same markers for that checkpoint. The qwen3_5 incumbent's template carries the
+/// identical marker profile, so this probe does not regress it.
+///
+/// Mirrors `scalarServingModelType`'s config-directory read pattern above; used to key
+/// `servingThinksByDefault`/`servingDisablesThinkingWhenToolsActive` (`StreamingReasoningPolicy.swift`)
+/// to the loaded artifact rather than a compile-time assumption about the family.
+func scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: URL) -> Bool {
+    guard let template = scalarServingResolvedChatTemplateText(modelDirectory: modelDirectory) else {
+        return false
+    }
+    return scalarServingThinkMarkerAttestationStrings.allSatisfy(template.contains)
+}
+
+/// Resolve the chat template text the tokenizer actually renders from, preferring
+/// `tokenizer_config.json`'s `chat_template` field and falling back to a sibling
+/// `chat_template.jinja` file only when that field is absent from a readable
+/// `tokenizer_config.json`, or `tokenizer_config.json` itself is missing/unreadable.
+private func scalarServingResolvedChatTemplateText(modelDirectory: URL) -> String? {
+    let tokenizerConfigURL = modelDirectory.appendingPathComponent("tokenizer_config.json")
+    if let data = try? Data(contentsOf: tokenizerConfigURL),
+        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+        let template = root["chat_template"] as? String
+    {
+        return template
+    }
+    let jinjaURL = modelDirectory.appendingPathComponent("chat_template.jinja")
+    guard let data = try? Data(contentsOf: jinjaURL),
+        let text = String(data: data, encoding: .utf8)
+    else {
+        return nil
+    }
+    return text
 }
 
 /// How one cache's serving kind was determined by `classifyScalarServingNativeCacheEntry`.

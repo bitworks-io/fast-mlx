@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "31e11dadde996d29ed486c64cb63f44e1d4f7e440eef7fea38e5b3e69b98cbb0"
+    "f7b59ef77cca25e82c44c6fc37c0aae64e5a7d23e3f95cdb3e3610abcacc683b"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "f1007caf99fcd53073f7010eb890df8635c2ac3ffdd089f4176abd4730a54a9b"
+    "58be27910c64e4f3c0ff223f403d28cadd762c5f26ea1e638dffc3b5beea8f90"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "25 published research notes",
+    "26 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -485,6 +485,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
 )
 REVIEWED_ARTICLE_PATHS = (
     "research/the-fit-check-refused-a-model-that-fit/",
+    "research/a-family-name-is-not-evidence-about-a-checkpoint/",
     "research/the-4k-limit-was-not-the-model-limit/",
     "research/how-the-autonomous-loop-builds-fast-mlx/",
     "research/the-state-was-right-the-ledger-was-frozen/",
@@ -512,6 +513,7 @@ REVIEWED_ARTICLE_PATHS = (
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-fit-check-refused-a-model-that-fit/": ("2026-09-06", "2026-09-06"),
+    "research/a-family-name-is-not-evidence-about-a-checkpoint/": ("2026-09-06", "2026-09-06"),
     "research/the-4k-limit-was-not-the-model-limit/": ("2026-08-29", "2026-08-29"),
     "research/how-the-autonomous-loop-builds-fast-mlx/": ("2026-08-22", "2026-08-22"),
     "research/the-state-was-right-the-ledger-was-frozen/": ("2026-08-20", "2026-08-22"),
@@ -807,6 +809,12 @@ REVIEWED_PAGE_METADATA: Dict[
     "research/the-fit-check-refused-a-model-that-fit/": (
         "The fit-check refused a model that fit — fast-mlx",
         "An earlier note — The bytes were derivable. We refused anyway. — set out the rule the fit-check lives by: fail toward RED. The number the engine computes before it loads anything answers one operator question — will…",
+        "article",
+        "Serving big models on Apple Silicon",
+    ),
+    "research/a-family-name-is-not-evidence-about-a-checkpoint/": (
+        "A family name is not evidence about a checkpoint — fast-mlx",
+        "fast-mlx keeps a served model's chain-of-thought out of the answer a caller sees. The OpenAI-shaped completion carries two fields: content, which is the answer, and reasoningcontent, which is everything the model…",
         "article",
         "Serving big models on Apple Silicon",
     ),
