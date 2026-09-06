@@ -477,7 +477,7 @@ private func resolveServingLimits(
     providedMemory: Int, providedCache: Int, providedReservedKV: Int?,
     preParsed: ParsedModelArch? = nil, advisorySlotCount: Int? = nil
 ) throws -> ResolvedServingLimits {
-    let parsed: ParsedModelArch
+    var parsed: ParsedModelArch
     if let preParsed {
         // The quant auto-pick already decoded the winning directory — reuse it instead of a second
         // disk read + JSON parse.
@@ -489,6 +489,39 @@ private func resolveServingLimits(
             // No decoded config means no fit decision. Refuse here instead of loading with provided
             // limits; `--force` applies only to an explicit RED verdict from ServingFitPlanner.
             try refuseUnprovenFit(error)
+        }
+    }
+
+    // `--ngram-offload-plan` streams the qwen4_exp PLE n-gram table from a sealed on-disk row
+    // store instead of holding it resident, so the ordinary full-resident `parsed` figure above
+    // over-counts this one configuration's real footprint (a false RED on a host that would
+    // actually fit). Composing the corrected figure is attempted ONLY when the flag is present —
+    // when it is `nil`, `parsed` is untouched and this whole block is a no-op, so behavior stays
+    // byte-identical to today for every other serve. Any failure here (parse error, missing/wrong
+    // checkpoint shape, malformed plan) must NOT reduce the figure — keep the conservative
+    // full-resident `parsed` and only note the miss, since an optimistic fit that loads and OOMs
+    // is worse than the false RED this composition exists to fix.
+    if let ngramOffloadPlanURL = arguments.ngramOffloadPlanURL {
+        do {
+            let composed = try NGramOffloadFitComposition.make(
+                base: parsed, modelDirectory: modelDirectory, planFileURL: ngramOffloadPlanURL)
+            let wholeFileTotal = parsed.profile.weightsBytes4bitEstimate
+            let offloadedBytes = try NGramOffloadFitComposition.offloadedNGramTensorBytes(
+                inModelDirectory: modelDirectory)
+            let residencyBudget = try NGramOffloadFitComposition.planMaxResidentBytes(
+                atPlanFileURL: ngramOffloadPlanURL)
+            emitFitCheck([
+                "ngram offload fit adjustment: whole-file total \(wholeFileTotal) B "
+                    + "- offloaded n-gram bytes \(offloadedBytes) B "
+                    + "+ row-store residency budget \(residencyBudget) B "
+                    + "= adjusted weights \(composed.profile.weightsBytes4bitEstimate) B",
+            ])
+            parsed = composed
+        } catch {
+            emitFitCheck([
+                "ngram offload fit adjustment could not be computed (\(error)); "
+                    + "sizing the full-resident checkpoint instead",
+            ])
         }
     }
 

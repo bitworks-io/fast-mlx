@@ -145,6 +145,12 @@
       "slug": "the-4k-limit-was-not-the-model-limit",
       "status": "published",
       "reviewedAt": "2026-08-29"
+    },
+    {
+      "source": "docs/content/2026-09-06-the-fit-check-refused-a-model-that-fit.md",
+      "slug": "the-fit-check-refused-a-model-that-fit",
+      "status": "published",
+      "reviewedAt": "2026-09-06"
     }
   ]
 }

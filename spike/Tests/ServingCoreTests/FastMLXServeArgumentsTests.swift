@@ -1470,6 +1470,60 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         }
     }
 
+    func testNgramOffloadPlanRejectedWithQuantCandidates() {
+        // The plan is sealed against ONE specific on-disk artifact. `resolveServedDirectory` runs
+        // the quant auto-pick (QuantCandidateResolver.resolve) BEFORE resolveServingLimits' offload-
+        // aware fit adjustment ever sees the request, so on a host where the full-resident figure
+        // alone would refuse, the pick fails closed on the unadjusted figure and never reaches the
+        // adjustment the offload plan exists to unlock — and even if it didn't, the winning candidate
+        // need not be the artifact the plan was sealed against. Reject the combination outright rather
+        // than let auto-pick silently pair the plan with a mismatched checkpoint.
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--model", "qwen3",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithQuantCandidates)
+        }
+    }
+
+    func testNgramOffloadPlanAloneRemainsAcceptedWithoutQuantCandidates() throws {
+        // Non-regression: the new guard above must not over-reach and reject the flag when it is
+        // used on its own, as documented in testNgramOffloadPlanParsesAsAbsolutePathOnScalarServe.
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+        ])
+
+        XCTAssertEqual(
+            arguments.ngramOffloadPlanURL,
+            URL(fileURLWithPath: "/abs/path/plan.json"))
+        XCTAssertTrue(arguments.quantCandidateDirectories.isEmpty)
+    }
+
+    func testQuantCandidatesAloneRemainsAcceptedWithoutNgramOffloadPlan() throws {
+        // Non-regression: the new guard above must not over-reach and reject --quant-candidates
+        // when it is used on its own, without an offload plan in play.
+        let arguments = try FastMLXServeArguments.parse([
+            "--quant-candidates", "/models/a,/models/b",
+            "--model", "qwen3",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ])
+
+        XCTAssertEqual(arguments.quantCandidateDirectories.count, 2)
+        XCTAssertNil(arguments.ngramOffloadPlanURL)
+    }
+
     func testNgramOffloadPlanRequiresAValue() {
         XCTAssertThrowsError(
             try FastMLXServeArguments.parse([

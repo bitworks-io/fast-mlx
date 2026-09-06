@@ -60,6 +60,7 @@ public enum FastMLXServeArgumentError:
     case ngramOffloadPlanWithContinuousBatch
     case ngramOffloadPlanWithExactQwen35MTP
     case ngramOffloadPlanWithQuantPickOnly
+    case ngramOffloadPlanWithQuantCandidates
     case invalidExactMTPSelection
     case exactMTPSelectionRequiresExactQwen35MTP
     case exactQwen35MTPWithScripted
@@ -131,6 +132,10 @@ public enum FastMLXServeArgumentError:
             "--ngram-offload-plan is not supported with --exact-qwen35-mtp"
         case .ngramOffloadPlanWithQuantPickOnly:
             "--ngram-offload-plan is not supported with --quant-pick-only"
+        case .ngramOffloadPlanWithQuantCandidates:
+            "--ngram-offload-plan is sealed against one specific artifact and cannot be combined "
+                + "with --quant-candidates auto-pick across several candidate directories; pass the "
+                + "single sealed model directory explicitly via --model-path instead"
         case .invalidExactMTPSelection:
             "--exact-mtp-selection must be qwen35-9b-depth1, qwen38-27b-mxfp8-depth1, "
                 + "or qwen38-27b-4bit-depth1"
@@ -756,6 +761,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // this flag has no such transitive block, so it needs an explicit one.
         if ngramOffloadPlanURL != nil, quantPickOnly {
             throw FastMLXServeArgumentError.ngramOffloadPlanWithQuantPickOnly
+        }
+        // The plan is sealed against ONE specific on-disk artifact, so pairing it with an auto-pick
+        // across several candidate directories is semantically incoherent — the winning candidate
+        // need not be the artifact the plan was sealed against. It is also unreachable in practice:
+        // `resolveServedDirectory` runs the quant auto-pick and can throw `FitCheckRefusal` on the
+        // unadjusted full-resident figure BEFORE `resolveServingLimits` and its offload-aware fit
+        // adjustment ever run, so the very refusal this flag exists to eliminate would still fire.
+        // Fail closed and point the operator at the single sealed directory via --model-path instead.
+        if ngramOffloadPlanURL != nil, !quantCandidateDirs.isEmpty {
+            throw FastMLXServeArgumentError.ngramOffloadPlanWithQuantCandidates
         }
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
