@@ -19,6 +19,13 @@ public struct MLXDecoder: Decoder {
     /// (`spike/Sources/HarnessCore/CapacityModel.swift`): that capacity fit already prices
     /// prefill as if it were chunked at 2048 tokens. If the two constants drift apart, the fit
     /// check stops describing what the runtime actually does.
+    ///
+    /// SECOND CONSUMER: `MTPSpeculativeDecoder.buildParameters()` also reads this constant, to set
+    /// `GenerateParameters.prefillStepSize` for the MTP speculative serving route. That route does
+    /// not otherwise share this decoder's prefill loop, so without that assignment it would
+    /// silently prefill at the vendored `GenerateParameters` default (512) instead — a
+    /// monolithic-vs-chunked geometry difference between the two serving routes unrelated to
+    /// speculation. Changing this value changes BOTH routes' prefill chunking, not just this one's.
     public static let defaultPrefillChunkSize = 2048
 
     private let model: any LanguageModel

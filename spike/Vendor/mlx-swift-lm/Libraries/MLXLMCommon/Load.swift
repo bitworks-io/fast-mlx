@@ -74,9 +74,39 @@ public func loadWeights(
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
+    try applySanitizedWeights(
+        model: model,
+        sanitizedWeights: weights,
+        quantization: quantization,
+        perLayerQuantization: perLayerQuantization)
+}
+
+/// Validates, quantizes, and binds already-sanitized weights onto `model`, then prepares and
+/// evaluates it.
+///
+/// This is everything ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFilter:)``
+/// does from quantization validation onward, extracted so there is exactly ONE implementation
+/// of the validate/quantize/bind sequence.
+///
+/// A model family whose drafter weights live inside its TARGET checkpoint needs this same
+/// sequence but cannot route through `loadWeights` itself, for two reasons. It must narrow to
+/// the specific shards holding those weights rather than reading the artifact's whole shard
+/// set, and it must sanitize through a THROWING family sanitizer rather than the non-throwing
+/// ``BaseLanguageModel/sanitize(weights:metadata:)`` entry point `loadWeights` calls above --
+/// a drafter's implementation of that protocol method may deliberately swallow sanitize
+/// failures and return `[:]`, which would turn a precise diagnostic into a generic "unset
+/// parameters" failure here. Such a loader sanitizes on its own terms and then calls this
+/// function; without the extraction it would have to duplicate the quantize/bind logic below,
+/// and the two copies could drift apart.
+public func applySanitizedWeights(
+    model: BaseLanguageModel,
+    sanitizedWeights: [String: MLXArray],
+    quantization: BaseConfiguration.Quantization?,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+) throws {
     if let validator = model as? SanitizedWeightQuantizationValidator {
         try validator.validateSanitizedWeightQuantization(
-            weights: weights,
+            weights: sanitizedWeights,
             quantization: quantization,
             perLayerQuantization: perLayerQuantization)
     }
@@ -84,7 +114,7 @@ public func loadWeights(
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
+            if sanitizedWeights["\(path).scales"] != nil {
                 if let perLayerQuantization {
                     let sourcePath =
                         (model as? WeightQuantizationPathResolver)?
@@ -106,7 +136,7 @@ public func loadWeights(
     }
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
+    let parameters = ModuleParameters.unflattened(sanitizedWeights)
     try model.update(parameters: parameters, verify: [.all])
 
     if let languageModel = model as? LanguageModel {

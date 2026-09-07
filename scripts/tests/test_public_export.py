@@ -39,7 +39,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift",
-        "sha256": "dbc0022d335dc58d701f6e63c2c1b021de52bc0d564fa99939e5a4cdbb3fbbcf",
+        "sha256": "8f104d0955510b979d994d29fda922fe4ab9a2158f029ca136749df02078aaa2",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift",
@@ -339,11 +339,64 @@ class PublicExportTests(unittest.TestCase):
         # every sibling MLXLMTests file is already projected, and it carries no internal family
         # marker, infrastructure detail, or machine-local path. All three places moved together
         # this time.
+        # 879 -> 880 added spike/Tests/ServingCoreTests/InCheckpointMTPSelectionTests.swift,
+        # the coverage for the in-checkpoint MTP selection's pinned deployment values. Confirmed to
+        # belong in public before reseal: it is ordinary XCTest coverage of a projected serving
+        # contract, its sibling ServingCoreTests files are already projected, and it carries no
+        # internal family marker, infrastructure detail, or machine-local path. The two vendored
+        # facade files added in the same increment are NOT here because they carry exclusion
+        # entries -- only this one reaches the projection. All three places moved together.
+        # 886 -> 887 added
+        # spike/Tests/SpikeCoreTests/MTPSpeculativeDecoderPrefillChunkParityTests.swift, the
+        # regression for a real prefill chunk-size defect: the speculative decoder silently
+        # inherited the vendored 512 default while the scalar route and the capacity fit both
+        # use 2048, so the two serving routes chunked prefill differently for reasons unrelated
+        # to speculation. Confirmed to belong in public before reseal: it is ordinary coverage
+        # of projected serving-core behavior, it drives weight-free synthetic mocks rather than
+        # any real checkpoint, and it carries no internal family marker, infrastructure detail,
+        # or machine-local path. All three places moved together.
+        # 885 -> 886 added
+        # spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/TokenIteratorThrowingEntryPointTests.swift,
+        # the coverage for TokenIterator's new throwing entry point -- the half of the startup
+        # gate's abort hazard that was specified but never landed. Confirmed to belong in public
+        # before reseal: it is ordinary coverage of a projected, non-excluded vendored contract
+        # (Evaluate.swift is itself projected), it drives a synthetic stub model rather than any
+        # real checkpoint, and it carries no internal family marker, infrastructure detail, or
+        # machine-local path -- unlike the target-family-specific throwing-entry-point sibling in
+        # the same directory, which carries an exclusion entry. All three places moved together.
+        # 884 -> 885 added
+        # spike/Tests/SpikeServingAdaptersTests/MTPDecoderBridgeSelectionTests.swift, which
+        # covers the serving-load wiring that gives the speculative decoder its first
+        # production consumer: the fail-closed decoder-strategy guard, the cache-factory
+        # shared between the speculative and plain decoder branches, and the decoder
+        # selection itself. Confirmed to belong in public before reseal: ordinary XCTest
+        # coverage of an already-projected serving contract, carrying no internal family
+        # marker, infrastructure detail, or machine-local path. All three places moved
+        # together.
+        # 881 -> 884 added, in one increment: the speculative serving decoder
+        # (spike/Sources/SpikeCore/MTPSpeculativeDecoder.swift), its XCTest coverage
+        # (spike/Tests/SpikeServingAdaptersTests/MTPSpeculativeDecoderTests.swift), and the
+        # mock target/drafter fixtures extracted, access-level-only, out of the startup-gate
+        # test file (.../InCheckpointMTPMockFixtures.swift) so both suites can share them.
+        # Confirmed to belong in public before reseal: all three are ordinary source/XCTest
+        # coverage of an already-projected serving contract, and each was checked to carry no
+        # internal family marker, infrastructure detail, or machine-local path -- the first
+        # projection attempt FAILED the marker gate on two of them and they were reworded to
+        # describe the target family by role. All three places moved together.
+        # 880 -> 881 added
+        # spike/Tests/SpikeServingAdaptersTests/InCheckpointMTPStartupGateEndToEndTests.swift,
+        # the first end-to-end coverage of the in-checkpoint MTP startup equivalence gate --
+        # it drives the real MLX token iterators through a weight-free mock target/drafter pair
+        # rather than asserting on hand-written struct literals. Confirmed to belong in public
+        # before reseal: it is ordinary XCTest coverage of a projected serving contract, its
+        # sibling SpikeServingAdaptersTests files are already projected, and it carries no
+        # internal family marker, infrastructure detail, or machine-local path. All three places
+        # moved together.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 879,
-                "pathModeSha256": "9305d7f0dd56460399cadf4289690c09fb54d103ae8039bc94c5f2989ada2deb",
+                "pathCount": 887,
+                "pathModeSha256": "feaf8abda713deb421f57543935025f284566919d631500f712642d067922c8b",
             },
         )
 
@@ -437,7 +490,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 879)
+            self.assertEqual(reexport_count, 887)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

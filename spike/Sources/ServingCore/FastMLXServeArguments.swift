@@ -34,6 +34,62 @@ public enum FastMLXExactMTPSelection: String, Equatable, Sendable {
     case qwen38_27B4BitDepth1 = "qwen38-27b-4bit-depth1"
 }
 
+/// MLX-free mirror of `MLXLLM`'s own in-checkpoint MTP namespace-selection enum (the vendored
+/// MTP drafter facade module) -- `ServingCore` has zero dependencies (see this target's
+/// entry in `Package.swift`), so it cannot import MLXLLM and name that type directly.
+/// `SpikeServingAdapters` maps this to the runtime enum with an exhaustive switch, mirroring
+/// `FastMLXExactMTPSelection` -> `Qwen35ExactMTPRuntimeSelection`
+/// (`exactMTPRuntimeSelection`, `FastMLXServe.swift:975`).
+public enum FastMLXInCheckpointMTPNamespace: String, Equatable, Sendable, CaseIterable {
+    /// Raw MTP source keys prefixed `mtp.` -- the official BF16 artifact's layout.
+    case official
+    /// Raw MTP source keys prefixed `language_model.mtp.` -- the converted/quantized artifact's
+    /// layout.
+    case converted
+}
+
+/// Selects which in-checkpoint Qwen4-Exp (Flash Next, `qwen4_exp`) MTP drafter artifact
+/// `loadScalarServingModel` should load from the served target's own checkpoint directory and
+/// gate at startup. Mirrors `FastMLXExactMTPSelection`'s shape -- a pinned, per-artifact
+/// deployment-policy row joined to the `MLXLLM` runtime layout enum by a mapping function in
+/// `SpikeServingAdapters` -- because a checkpoint's namespace is a LAYOUT fact (belongs in the
+/// vendored module) while which artifact to serve is DEPLOYMENT POLICY (belongs here); see
+/// `docs/task-inbox/2026-09-07-qwen4exp-mtp-serving-wiring-DECISION.md`.
+///
+/// ONLY the converted 4-bit artifact is serve-eligible. `Qwen/Qwen3.8-Flash-Next` (the official
+/// BF16 artifact) is 360,023,351,514 bytes and fits no host this project owns -- the largest is
+/// 256 GB (~178.7 GiB at the 75% shared ceiling). Because this drafter loads FROM
+/// INSIDE the target checkpoint's own shard set, not a separate drafter directory, selecting the
+/// official artifact would mean serving the 360 GB target itself, not merely a larger drafter.
+/// That artifact stays loader-level only -- already tested inside the vendored in-checkpoint MTP
+/// drafter loader's own `mtpSourceKeys(in:namespace:)` -- and is deliberately not a case here.
+public enum FastMLXInCheckpointMTPSelection: String, Equatable, Sendable, CaseIterable {
+    case converted4Bit = "converted-4bit"
+
+    /// The checkpoint layout this selection's artifact carries.
+    public var namespace: FastMLXInCheckpointMTPNamespace {
+        switch self {
+        case .converted4Bit: .converted
+        }
+    }
+
+    /// The MTP source-key count `Vontra/Qwen3.8-Flash-Next-MLX-oQ4-MTP`'s own index declares
+    /// under the `converted` namespace's prefix, independently verified (35 files /
+    /// 113,348,682,948 bytes, `revision_match=true` -- see the decision doc above).
+    public var expectedSourceKeyCount: Int {
+        switch self {
+        case .converted4Bit: 76
+        }
+    }
+
+    /// The pinned upstream revision this artifact's `expectedSourceKeyCount` was verified against.
+    public var revision: String {
+        switch self {
+        case .converted4Bit: "43a82b3f0ff64fa417fd09ca046580f08d19b0d6"
+        }
+    }
+}
+
 public enum FastMLXServeArgumentError:
     Error, Equatable, CustomStringConvertible, Sendable
 {
@@ -76,6 +132,18 @@ public enum FastMLXServeArgumentError:
     case osServiceReserveRequiresDedicatedServing
     case invalidCompletionLimitPolicy
     case defaultCompletionTokensExceedsMaximumCompletionTokens
+    /// `--qwen4exp-mtp` without `--ngram-offload-plan`: the marker-family admission gate
+    /// (`scalarServingMarkerFamilyAdmissionError` in `SpikeServingAdapters/MLXScalarServing.swift`)
+    /// admits a marker-classified family only when `offloadedNGramPlanResolved` is true, so this
+    /// pairing would otherwise spend minutes loading weights and then throw a confusing
+    /// `unprovenServingFamily` error deep in the load path. Refuse at parse time instead.
+    case qwen4ExpMTPRequiresNGramOffloadPlan
+    /// `--qwen4exp-mtp` with `--scripted`: the transport-only scripted backend loads no model, so
+    /// the flag would be silently dropped. `hasLoadedModelOptions` does NOT include this flag (it
+    /// only requires `--ngram-offload-plan`, which is not itself a "loaded model option" flag
+    /// either), so the existing `conflictingBackendModes` check does not cover this combination —
+    /// an explicit refusal is required.
+    case qwen4ExpMTPWithScripted
 
     public var description: String {
         switch self {
@@ -165,6 +233,10 @@ public enum FastMLXServeArgumentError:
             "--completion-limit-policy must be reject or clamp"
         case .defaultCompletionTokensExceedsMaximumCompletionTokens:
             "--default-completion-tokens cannot exceed an explicit --max-completion-tokens"
+        case .qwen4ExpMTPRequiresNGramOffloadPlan:
+            "--qwen4exp-mtp requires --ngram-offload-plan"
+        case .qwen4ExpMTPWithScripted:
+            "--qwen4exp-mtp loads a model and cannot be combined with --scripted"
         }
     }
 }
@@ -263,6 +335,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       plan. Selects the offloaded load path for a
                                       qwen4_exp checkpoint; omitted means the default
                                       load path.
+          --qwen4exp-mtp              Load the in-checkpoint Qwen4-Exp (Flash Next)
+                                      converted 4-bit MTP drafter from the served
+                                      target's own checkpoint and gate it at startup.
+                                      Requires --ngram-offload-plan (the marker-family
+                                      admission gate only admits this family when an
+                                      offloaded plan resolved). A bare flag: only one
+                                      artifact is serve-eligible today; a second
+                                      artifact would add a valued
+                                      --qwen4exp-mtp-selection flag mirroring
+                                      --exact-qwen35-mtp / --exact-mtp-selection.
           --host HOST                 Bind host (default: 127.0.0.1).
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
@@ -392,6 +474,20 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// with continuous batching or `--exact-qwen35-mtp`, because neither route reaches the scalar-load
     /// seam that consumes it — accepting the flag there would silently ignore an operator's request.
     public let ngramOffloadPlanURL: URL?
+    /// `--qwen4exp-mtp`: opt-in to load the in-checkpoint Qwen4-Exp (Flash Next, `qwen4_exp`) MTP
+    /// drafter from the served target's own checkpoint and gate it at startup
+    /// (`loadScalarServingModel`, which already implements the gate). `nil` (the default) preserves
+    /// today's load path. A BARE flag rather than a valued one: only the converted 4-bit artifact
+    /// (`FastMLXInCheckpointMTPSelection.converted4Bit`) is serve-eligible today, so there is
+    /// exactly one case to select. A future second artifact would add a valued
+    /// `--qwen4exp-mtp-selection` flag, mirroring how `--exact-qwen35-mtp` (bare, opt-in) pairs
+    /// with `--exact-mtp-selection` (valued, picks among several reviewed locks). Fail-closed at
+    /// the parser: requires `--ngram-offload-plan` (see `qwen4ExpMTPRequiresNGramOffloadPlan`) and
+    /// cannot be combined with `--scripted` (see `qwen4ExpMTPWithScripted`); every other conflicting
+    /// mode (continuous batching, `--exact-qwen35-mtp`, `--quant-pick-only`, `--quant-candidates`)
+    /// is covered TRANSITIVELY through the `--ngram-offload-plan` requirement, which already
+    /// refuses all four combinations itself.
+    public let inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection?
     /// The operator's raw `--memory-limit-bytes` payload, threaded independently of `backend` so it
     /// reaches every consumer that plans against the host envelope — including `--quant-pick-only`,
     /// whose early-return carries no `backend` case at all (`backend == nil`) and would otherwise
@@ -433,6 +529,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         exactMTPSelection: FastMLXExactMTPSelection = .qwen35_9BDepth1,
         mtpDrafterDirectory: URL? = nil,
         ngramOffloadPlanURL: URL? = nil,
+        inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
         memoryLimitBytes: Int? = nil
     ) {
         self.backend = backend
@@ -466,6 +563,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.exactMTPSelection = exactMTPSelection
         self.mtpDrafterDirectory = mtpDrafterDirectory
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
+        self.inCheckpointMTPSelection = inCheckpointMTPSelection
         self.memoryLimitBytes = memoryLimitBytes
     }
 
@@ -512,6 +610,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var exactMTPSelectionWasExplicit = false
         var mtpDrafterDirectory: URL?
         var ngramOffloadPlanURL: URL?
+        var qwen4ExpMTP = false
         var evidencePath: URL?
 
         var index = 0
@@ -682,6 +781,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 allowHybridQwen35 = true
             case "--exact-qwen35-mtp":
                 exactQwen35MTP = true
+            case "--qwen4exp-mtp":
+                qwen4ExpMTP = true
             case "--exact-mtp-selection":
                 index += 1
                 let rawSelection = try value(at: index, in: arguments, for: argument)
@@ -785,6 +886,19 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // Fail closed and point the operator at the single sealed directory via --model-path instead.
         if ngramOffloadPlanURL != nil, !quantCandidateDirs.isEmpty {
             throw FastMLXServeArgumentError.ngramOffloadPlanWithQuantCandidates
+        }
+
+        // --qwen4exp-mtp requires --ngram-offload-plan (the marker-family admission gate only
+        // admits this family when an offloaded plan resolved — see the error case doc comment).
+        // Placed AFTER the --ngram-offload-plan refusal block above so that, when both flags plus
+        // a conflicting mode are given, the more specific ngram error fires first. This also gives
+        // --qwen4exp-mtp TRANSITIVE coverage against continuous batching, --exact-qwen35-mtp,
+        // --quant-pick-only, and --quant-candidates: each of those four is already refused above
+        // whenever --ngram-offload-plan is present, so a separate --qwen4exp-mtp-specific refusal
+        // for any of them would be unreachable dead code. This mirrors the existing
+        // --mtp-drafter-path comment describing the same transitive-coverage trap.
+        if qwen4ExpMTP, ngramOffloadPlanURL == nil {
+            throw FastMLXServeArgumentError.qwen4ExpMTPRequiresNGramOffloadPlan
         }
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
@@ -901,6 +1015,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // scripted backend loads no model, so the combination is a misconfig — fail closed.
         if scripted, allowHybridQwen35 {
             throw FastMLXServeArgumentError.allowHybridWithScripted
+        }
+        // --qwen4exp-mtp loads a model from the served target's own checkpoint; the transport-only
+        // scripted backend loads no model, so the flag would be silently dropped. Not covered by
+        // the earlier `hasLoadedModelOptions` check (that set intentionally excludes this flag, the
+        // same way it excludes --ngram-offload-plan itself) — an explicit refusal is required.
+        if scripted, qwen4ExpMTP {
+            throw FastMLXServeArgumentError.qwen4ExpMTPWithScripted
         }
         if continuousDynamicPLD, allowHybridQwen35 {
             throw FastMLXServeArgumentError.dynamicPLDWithHybridQwen35
@@ -1024,6 +1145,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             exactMTPSelection: exactMTPSelection,
             mtpDrafterDirectory: mtpDrafterDirectory,
             ngramOffloadPlanURL: ngramOffloadPlanURL,
+            inCheckpointMTPSelection: qwen4ExpMTP ? .converted4Bit : nil,
             memoryLimitBytes: memoryLimitBytes)
     }
 
@@ -1064,6 +1186,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--exact-mtp-selection",
         "--mtp-drafter-path",
         "--ngram-offload-plan",
+        "--qwen4exp-mtp",
     ]
 
     private static func value(

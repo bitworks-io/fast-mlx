@@ -1647,4 +1647,191 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertTrue(
             FastMLXServeArguments.usage.contains("--ngram-offload-plan PATH"))
     }
+
+    // MARK: - --qwen4exp-mtp: a bare opt-in flag that loads the in-checkpoint Qwen4-Exp (Flash
+    // Next) converted 4-bit MTP drafter from the served target's own checkpoint and gates it at
+    // startup. Only one artifact is serve-eligible today, so it resolves to the single
+    // FastMLXInCheckpointMTPSelection.converted4Bit case rather than taking a value. Requires
+    // --ngram-offload-plan (the marker-family admission gate only admits this family when an
+    // offloaded plan resolved) and cannot be combined with --scripted (which loads no model).
+    // Every other conflicting mode is refused TRANSITIVELY through the --ngram-offload-plan
+    // requirement itself.
+
+    /// Acceptance criterion 1: --qwen4exp-mtp with --ngram-offload-plan and an otherwise valid
+    /// loaded-model invocation parses to inCheckpointMTPSelection == .converted4Bit.
+    func testInCheckpointMTPWithNgramOffloadPlanParsesAsConverted4Bit() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+        ])
+
+        XCTAssertEqual(arguments.inCheckpointMTPSelection, .converted4Bit)
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--qwen4exp-mtp"))
+    }
+
+    /// Acceptance criterion 2: absent the flag, inCheckpointMTPSelection == nil — existing
+    /// invocations (including the plain --ngram-offload-plan case) are unaffected.
+    func testInCheckpointMTPDefaultsNilAndDoesNotChangeOtherwiseValidParse() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+        ])
+
+        XCTAssertNil(arguments.inCheckpointMTPSelection)
+    }
+
+    /// Acceptance criterion 3: --qwen4exp-mtp without --ngram-offload-plan throws
+    /// .qwen4ExpMTPRequiresNGramOffloadPlan.
+    func testInCheckpointMTPRequiresNgramOffloadPlan() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .qwen4ExpMTPRequiresNGramOffloadPlan)
+        }
+    }
+
+    /// Acceptance criterion 4: --qwen4exp-mtp with --scripted throws .qwen4ExpMTPWithScripted.
+    /// --ngram-offload-plan is included so the requires-check above does not fire first — this
+    /// isolates the scripted-specific refusal.
+    func testInCheckpointMTPWithScripted() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .qwen4ExpMTPWithScripted)
+        }
+    }
+
+    /// Acceptance criterion 5a (transitive coverage): --qwen4exp-mtp + --ngram-offload-plan +
+    /// continuous batching throws the EXISTING .ngramOffloadPlanWithContinuousBatch error, proving
+    /// no separate --qwen4exp-mtp-specific continuous-batch refusal is needed.
+    func testInCheckpointMTPWithNgramOffloadPlanAndContinuousBatchThrowsExistingNgramError() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-batch-no-spec",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "103079215104",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithContinuousBatch)
+        }
+    }
+
+    /// Acceptance criterion 5b (transitive coverage): --qwen4exp-mtp + --ngram-offload-plan +
+    /// --exact-qwen35-mtp throws the EXISTING .ngramOffloadPlanWithExactQwen35MTP error.
+    func testInCheckpointMTPWithNgramOffloadPlanAndExactQwen35MTPThrowsExistingNgramError() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithExactQwen35MTP)
+        }
+    }
+
+    /// Acceptance criterion 5c (transitive coverage): --qwen4exp-mtp + --ngram-offload-plan +
+    /// --quant-pick-only throws the EXISTING .ngramOffloadPlanWithQuantPickOnly error.
+    func testInCheckpointMTPWithNgramOffloadPlanAndQuantPickOnlyThrowsExistingNgramError() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--quant-pick-only",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithQuantPickOnly)
+        }
+    }
+
+    /// Acceptance criterion 5d (transitive coverage): --qwen4exp-mtp + --ngram-offload-plan +
+    /// --quant-candidates throws the EXISTING .ngramOffloadPlanWithQuantCandidates error.
+    func testInCheckpointMTPWithNgramOffloadPlanAndQuantCandidatesThrowsExistingNgramError() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--model", "qwen3",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithQuantCandidates)
+        }
+    }
+
+    /// Acceptance criterion 6: --qwen4exp-mtp is a recognized supported option, not rejected as
+    /// .unknownArgument — the happy-path parse above (criterion 1) succeeding is the positive
+    /// proof; this asserts the negative directly against the specific failure mode a forgotten
+    /// supportedOptions entry would produce.
+    func testInCheckpointMTPIsNotRejectedAsUnknownArgument() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+        ])
+        XCTAssertNotNil(arguments.inCheckpointMTPSelection)
+
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+                "--qwen4exp-mtp",
+            ])
+        ) { error in
+            // Duplicate detection also proves the option is registered: an unregistered option
+            // would throw .unknownArgument on the FIRST occurrence, never reaching .duplicateOption.
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .duplicateOption("--qwen4exp-mtp"))
+        }
+    }
 }

@@ -71,6 +71,31 @@ extension Decoder {
     public mutating func setPenalties(_ penalties: DecoderPenalties) {}
 }
 
+/// Point-in-time speculative-decoding counters. `Sendable`/`Equatable` so a snapshot can cross
+/// the actor boundary and be compared directly in tests. `passthroughReason` is `nil` when the
+/// decoder speculated for the entire observed lifetime (across resets — see
+/// `MTPSpeculativeDecoder.reset()`), and set once sticky passthrough engages.
+public struct SpeculativeTelemetrySnapshot: Equatable, Sendable {
+    public let proposedCount: Int
+    public let acceptedCount: Int
+    public let passthroughReason: String?
+
+    public init(proposedCount: Int, acceptedCount: Int, passthroughReason: String?) {
+        self.proposedCount = proposedCount
+        self.acceptedCount = acceptedCount
+        self.passthroughReason = passthroughReason
+    }
+}
+
+/// Optional capability a `Decoder` may add to expose speculative-decoding telemetry. Kept
+/// separate from `Decoder` itself (rather than widening every conformer) because most decoders
+/// (`MLXDecoder`, `ScriptedDecoder`, ...) have no speculative counters to report.
+public protocol SpeculativeTelemetryProviding {
+    /// Cumulative counters, safe to read at any time — including after the owning decoder's
+    /// per-request state (e.g. its `MTPSpeculativeTokenIterator`) has been torn down by `reset()`.
+    var speculativeTelemetrySnapshot: SpeculativeTelemetrySnapshot { get }
+}
+
 /// Test double: replays a fixed script.
 public struct ScriptedDecoder: Decoder {
     let script: [Int]
@@ -135,6 +160,15 @@ public actor InferenceActor {
             throw InferenceActorError.generationAlreadyActive
         }
         decoder.reset()
+    }
+
+    /// Actor-isolated read of the current decoder's speculative-decoding telemetry, or `nil` when
+    /// the decoder does not conform to `SpeculativeTelemetryProviding` (e.g. `MLXDecoder`,
+    /// `ScriptedDecoder`). This is the only sanctioned way to read those counters: the decoder
+    /// (and any non-Sendable model it owns) never leaves the actor, so this method — not a direct
+    /// reference to the decoder or its iterator — is what a caller or test awaits.
+    public func speculativeTelemetry() -> SpeculativeTelemetrySnapshot? {
+        (decoder as? SpeculativeTelemetryProviding)?.speculativeTelemetrySnapshot
     }
 
     /// Non-blocking: returns a stream immediately; decode runs inside the actor.

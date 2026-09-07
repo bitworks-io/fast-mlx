@@ -723,6 +723,277 @@ final class MLXScalarServingTests: XCTestCase {
         XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
         XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
     }
+
+    // MARK: - qwen4_exp in-checkpoint MTP drafter (item 4 wiring)
+
+    /// Default-nil compatibility: constructing a configuration without the new parameter yields
+    /// `inCheckpointMTPSelection == nil`, and validation accepts an otherwise-valid configuration
+    /// unchanged — every existing call site (none of which passes this parameter) keeps compiling
+    /// and passing validation exactly as before.
+    func testInCheckpointMTPSelectionDefaultsToNilAndValidationAcceptsUnchangedConfiguration() throws {
+        let configuration = ScalarServingModelLoadConfiguration(
+            launchedModel: "fixture",
+            modelDirectory: URL(fileURLWithPath: "/tmp"),
+            memoryLimitBytes: 4_096,
+            cacheLimitBytes: 1_024,
+            backendConfiguration: fixtureBackendConfiguration())
+
+        XCTAssertNil(configuration.inCheckpointMTPSelection)
+        let validated = try validateScalarServingModelLoadConfiguration(configuration)
+        XCTAssertNil(validated.inCheckpointMTPSelection)
+    }
+
+    /// Acceptance: a selection supplied against a non-qwen4_exp checkpoint fails closed BEFORE any
+    /// weight load or global `Memory` mutation — same shape and same guard block as
+    /// `testLoadRejectsNgramOffloadPlanAgainstAWrongFamilyCheckpointBeforeWeightLoad`.
+    func testLoadRejectsInCheckpointMTPSelectionAgainstAWrongFamilyCheckpointBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(#"{"model_type":"qwen3","num_hidden_layers":4}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let memoryLimitBefore = Memory.memoryLimit
+        let cacheLimitBefore = Memory.cacheLimit
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-mtp",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    inCheckpointMTPSelection: .converted4Bit))
+            XCTFail("A qwen4_exp MTP selection against a non-qwen4_exp family must fail closed before weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .inCheckpointMTPUnsupportedFamily("qwen3"))
+        }
+
+        XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
+        XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
+    }
+
+    /// Same acceptance as above for a directory with no readable `config.json`: the observed model
+    /// type is `nil`, carried as such rather than defaulted to a placeholder string.
+    func testLoadRejectsInCheckpointMTPSelectionAgainstAnUnreadableConfigBeforeWeightLoad() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "scalar-serving-qwen4exp-mtp-no-config-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let memoryLimitBefore = Memory.memoryLimit
+        let cacheLimitBefore = Memory.cacheLimit
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-mtp",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    inCheckpointMTPSelection: .converted4Bit))
+            XCTFail("A qwen4_exp MTP selection against an unreadable config.json must fail closed before weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .inCheckpointMTPUnsupportedFamily(nil))
+        }
+
+        XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
+        XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
+    }
+
+    /// Exhaustive mapping regression: `ServingCore`'s MLX-free namespace mirror must map to the
+    /// SAME `MLXLLM` runtime case it names, for both known cases. A future third case in either
+    /// enum is a compile error at the mapping function's `switch`, not a silent mismap here.
+    func testInCheckpointMTPRuntimeNamespaceMapsBothCasesToTheMatchingRuntimeCase() {
+        XCTAssertEqual(inCheckpointMTPRuntimeNamespace(.official), .official)
+        XCTAssertEqual(inCheckpointMTPRuntimeNamespace(.converted), .converted)
+    }
+
+    /// Acceptance (happy path): identical token sequences, no passthrough, and at least one
+    /// accepted draft token together yield a passing verdict carrying the observed telemetry.
+    func testStartupEquivalenceDecisionAdmitsIdenticalSequencesWithGenuineSpeculation() throws {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            passthroughReason: nil)
+
+        let verdict = try inCheckpointMTPStartupEquivalenceDecision(
+            promptTokenCount: 5, scalar: scalar, speculative: speculative)
+
+        XCTAssertEqual(verdict.promptTokenCount, 5)
+        XCTAssertEqual(verdict.generatedTokenCount, 3)
+        XCTAssertEqual(verdict.proposedDraftTokens, 4)
+        XCTAssertEqual(verdict.acceptedDraftTokens, 2)
+    }
+
+    /// Clause (i): a token-count divergence fails closed without ever reaching clause (ii).
+    func testStartupEquivalenceDecisionRejectsDivergentTokenCounts() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22],
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            passthroughReason: nil)
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupEquivalenceDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError, .inCheckpointMTPStartupTokenSequenceMismatch)
+        }
+    }
+
+    /// Clause (i): same-length but different-content sequences also fail closed — the SHA-256
+    /// fold, not just the count, discriminates.
+    func testStartupEquivalenceDecisionRejectsSameLengthDivergentTokenContent() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 34],
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            passthroughReason: nil)
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupEquivalenceDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError, .inCheckpointMTPStartupTokenSequenceMismatch)
+        }
+    }
+
+    /// THE ANTI-VACUITY MUTATION for clause (ii): scalar and speculative token sequences are
+    /// IDENTICAL — clause (i) alone would pass this vacuously, exactly the way it would if the
+    /// iterator silently degraded to passthrough and simply replayed scalar decode. Only because
+    /// clause (ii) separately asserts `passthroughReason == nil` does this run still fail closed.
+    /// This is the "stub `supportsSpeculation` to false" mutation from the decision doc, applied
+    /// at the decision function's own boundary (its input already reflects that stub's effect —
+    /// passthrough engaged despite byte-identical output).
+    func testStartupEquivalenceDecisionRejectsIdenticalSequencesWhenPassthroughEngaged() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: "drafter does not support this target model")
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupEquivalenceDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .inCheckpointMTPStartupDidNotSpeculate(
+                    reason: "drafter does not support this target model",
+                    proposedDraftTokens: 0,
+                    acceptedDraftTokens: 0))
+        }
+    }
+
+    /// Passthrough refuses even when the iterator ran at least one genuine round BEFORE degrading:
+    /// `proposedDraftTokens > 0` does not rescue a run whose `passthroughReason != nil` — clause
+    /// (ii)'s passthrough guard fires unconditionally, ahead of (and independent from) the
+    /// proposed-count guard below it. Sticky passthrough is a statement about the REST of the run,
+    /// not just the round that measured `proposedDraftTokens`.
+    func testStartupEquivalenceDecisionRejectsPassthroughEvenAfterAGenuineRound() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            passthroughReason: "drafter does not support this target model")
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupEquivalenceDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .inCheckpointMTPStartupDidNotSpeculate(
+                    reason: "drafter does not support this target model",
+                    proposedDraftTokens: 4,
+                    acceptedDraftTokens: 2))
+        }
+    }
+
+    /// DELIBERATELY INVERTED from this test's prior form (which required REFUSAL here — that WAS
+    /// the production-availability bug this change fixes). `MTPSpeculativeTokenIterator`'s greedy
+    /// acceptance walk legitimately sets `accepted == 0` whenever the drafter's first proposal for
+    /// a round differs from the target's own greedy token: the iterator still emits the target's
+    /// greedy token (clause (i) stays byte-exact) and the round completed — `draftBlock` was called,
+    /// so `proposedDraftTokens` is real. Gating startup on `acceptedDraftTokens > 0` turned that
+    /// legitimate, deterministic outcome into a PERMANENT boot failure for a CORRECT drafter
+    /// whenever its first-token prediction for the fixed startup prompt happened to diverge once.
+    /// Acceptance is a PERFORMANCE property, not an availability one — it is now reported on the
+    /// verdict (`acceptedDraftTokens == 0` is visible to the caller) rather than gated.
+    func testStartupEquivalenceDecisionAdmitsGenuineSpeculationThatAcceptedZeroDraftTokens() throws {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 2,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+
+        let verdict = try inCheckpointMTPStartupEquivalenceDecision(
+            promptTokenCount: 5, scalar: scalar, speculative: speculative)
+
+        XCTAssertEqual(verdict.proposedDraftTokens, 2)
+        XCTAssertEqual(verdict.acceptedDraftTokens, 0)
+    }
+
+    /// THE anti-vacuity test for the fixed clause (ii): identical sequences, `passthroughReason ==
+    /// nil` (the iterator claims it stayed speculative end to end), but `proposedDraftTokens == 0`
+    /// — `drafter.draftBlock` was never actually called. This is the case the proposed-based
+    /// conjunct exists to catch: it is the only remaining way a vacuous scalar-decode replay could
+    /// slip past clause (i) alone now that acceptance is no longer gated.
+    func testStartupEquivalenceDecisionRejectsIdenticalSequencesWithZeroProposedDraftTokens() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupEquivalenceDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .inCheckpointMTPStartupDidNotSpeculate(
+                    reason: nil, proposedDraftTokens: 0, acceptedDraftTokens: 0))
+        }
+    }
 }
 
 private enum FixtureTokenizerError: Error {

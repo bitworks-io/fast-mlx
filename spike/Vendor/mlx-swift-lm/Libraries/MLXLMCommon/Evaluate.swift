@@ -747,6 +747,53 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         return previousY.tokens.item(Int.self)
     }
+
+    /// Throwing counterpart to ``step(previous:)``, propagating a target
+    /// validation failure surfaced through `evaluateThrowing` instead of
+    /// letting it reach a non-throwing entry point that would have no choice
+    /// but to abort.
+    mutating func stepThrowing(previous: LMInput.Text) throws -> MLXArray {
+        let result = try withPreparedCache(cache, lengths: previous.sequenceLengths) {
+            try model.evaluateThrowing(
+                previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        }
+        self.state = result.state
+
+        // Apply dynamic cache quantization after each step
+        maybeQuantizeKVCache(
+            cache: &cache,
+            kvBits: kvBits,
+            kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme
+        )
+
+        return convertToToken(logits: result.logits)
+    }
+
+    /// Throwing counterpart to ``next()``, propagating a target validation
+    /// failure surfaced through `evaluateThrowing` on this step's forward
+    /// call, instead of letting it reach a non-throwing entry point that
+    /// would have no choice but to abort. Callers that can act on a caught
+    /// error (for example an ordinary-request serving loop) should prefer
+    /// this over ``next()``.
+    public mutating func nextThrowing() throws -> Int? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        // save current value -- this will be returned
+        let previousY = y
+
+        // compute the next state and async eval the next token
+        let token = try stepThrowing(previous: previousY)
+        y = .init(tokens: token)
+        asyncEval(token)
+
+        tokenCount += 1
+
+        return previousY.tokens.item(Int.self)
+    }
 }
 
 /// Generator of tokens using speculative decoding.

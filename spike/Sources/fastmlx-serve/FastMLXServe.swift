@@ -238,6 +238,7 @@ private struct PreparedServingBackend {
                 scalarFallbackRoute = ""
             }
             let exactMTP = exactMTPReport?.machineReadableFields() ?? ""
+            let inCheckpointMTP = report.inCheckpointMTPStartupVerdict?.machineReadableFields() ?? ""
             let memory = hostReport.machineReadableServingFields(
                 memoryLimitBytes: report.memoryLimitBytes,
                 cacheLimitBytes: report.cacheLimitBytes,
@@ -260,6 +261,7 @@ private struct PreparedServingBackend {
                 \(memory) \
                 \(scalarFallbackRoute) \
                 \(exactMTP) \
+                \(inCheckpointMTP) \
                 \(fit) \
                 listening=\(localAddress)
                 """
@@ -690,7 +692,8 @@ private func loadScalarServingBackend(
             // fail-closed at cache-construction time. Validated once at startup (run()) and re-validated
             // here as the single source that reaches the runtime; nil (omitted flag) → `.fp16`.
             kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
-            ngramOffloadPlanURL: arguments.ngramOffloadPlanURL))
+            ngramOffloadPlanURL: arguments.ngramOffloadPlanURL,
+            inCheckpointMTPSelection: arguments.inCheckpointMTPSelection))
     return PreparedServingBackend(
         backend: loaded.backend,
         evidenceSnapshot: nil,

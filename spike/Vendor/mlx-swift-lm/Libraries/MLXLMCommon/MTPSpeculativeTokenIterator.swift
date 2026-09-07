@@ -289,10 +289,16 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             processor?.didSample(token: token)
             y = .init(tokens: token)
             mainState = result.state
-            // Yield the bonus to the iterator's consumer. Without this,
-            // the iterator silently starts 1 position ahead of an
-            // equivalent autoregressive run, violating speculative
-            // decoding's bit-exact-equivalence-to-greedy guarantee.
+            // Yield the bonus to the iterator's consumer. Without this, the
+            // iterator would silently start 1 position ahead of its own
+            // autoregressive continuation, dropping a token from what is
+            // otherwise a deterministic, self-consistent argmax path over
+            // this iterator's own verify forward. That path is the target
+            // model's own argmax, but it is not asserted to be
+            // token-identical to a scalar single-position decode of the
+            // same prompt -- the two forward geometries need not round
+            // identically -- only that this iterator's own output stays
+            // internally consistent.
             pendingTokens.append(token.item(Int.self))
         case .logits(let prefillResult):
             // Some `prepare` implementations evaluate the final position
