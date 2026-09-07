@@ -505,6 +505,30 @@ private func resolveServingLimits(
         }
     }
 
+    // `--qwen4exp-mtp` loads an in-checkpoint MTP drafter that allocates its own additional
+    // `.qsa` decoder layer's K+V and QSA-indexer caches (verified against the vendored MTP
+    // draft-head implementation — see `InCheckpointMTPFitComposition`'s doc comment), which
+    // the ordinary decoded `parsed.profile.nAttnLayers` (12) does not count. Correct it here, BEFORE
+    // the `--ngram-offload-plan` composition below, so that composition's own field-by-field copy
+    // carries the corrected `nAttnLayers` (13) through unchanged — a real deploy always supplies
+    // both flags together (`--qwen4exp-mtp` requires `--ngram-offload-plan` at argument-parse time),
+    // so the two compositions must stack rather than either one silently winning. This composition
+    // is pure geometry (no on-disk read), so unlike the offload block below it has no failure mode
+    // to guard: when the flag is absent, `parsed` is untouched and behavior stays byte-identical.
+    if arguments.inCheckpointMTPSelection != nil {
+        let composedProfile = InCheckpointMTPFitComposition.make(base: parsed.profile)
+        emitFitCheck([
+            "qwen4exp mtp fit adjustment: nAttnLayers \(parsed.profile.nAttnLayers) "
+                + "-> \(composedProfile.nAttnLayers) (in-checkpoint MTP drafter's additional "
+                + "K+V + QSA-indexer cache)",
+        ])
+        parsed = ParsedModelArch(
+            profile: composedProfile,
+            weightsAreMeasured: parsed.weightsAreMeasured,
+            weightsAreDeclared: parsed.weightsAreDeclared,
+            quantBits: parsed.quantBits)
+    }
+
     // `--ngram-offload-plan` streams the qwen4_exp PLE n-gram table from a sealed on-disk row
     // store instead of holding it resident, so the ordinary full-resident `parsed` figure above
     // over-counts this one configuration's real footprint (a false RED on a host that would

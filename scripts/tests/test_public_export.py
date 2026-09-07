@@ -392,11 +392,26 @@ class PublicExportTests(unittest.TestCase):
         # sibling SpikeServingAdaptersTests files are already projected, and it carries no
         # internal family marker, infrastructure detail, or machine-local path. All three places
         # moved together.
+        # 887 -> 889 added, in one increment:
+        # spike/Sources/SpikeServingAdapters/InCheckpointMTPFitComposition.swift and its
+        # spike/Tests/SpikeServingAdaptersTests/InCheckpointMTPFitCompositionTests.swift coverage
+        # -- the fit-check correction that counts the in-checkpoint MTP drafter's own additional
+        # growing attention cache (nAttnLayers 12 -> 13) when --qwen4exp-mtp is passed. Confirmed
+        # to belong in public before reseal: they are ordinary source/XCTest coverage of an
+        # already-projected serving/capacity contract (the sibling NGramOffloadFitComposition and
+        # the fastmlx-serve call site are both projected), they are pure geometry over synthetic
+        # profile fixtures rather than any real checkpoint, and they carry no infrastructure
+        # detail or machine-local path. As with 881 -> 884, the FIRST projection attempt FAILED
+        # the marker gate: the type was originally named with the internal family marker, which
+        # also dragged the marker into the already-projected fastmlx-serve call site. Renaming it
+        # to InCheckpointMTPFitComposition and describing the family by role (lowercase
+        # qwen4_exp, as the projected sibling already does) cleared the gate. All three places
+        # moved together.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 887,
-                "pathModeSha256": "feaf8abda713deb421f57543935025f284566919d631500f712642d067922c8b",
+                "pathCount": 889,
+                "pathModeSha256": "5e311a96bd9b2aa8a2c2cbb9dec23894b18d44c853619d4fea83f761cddb9bf2",
             },
         )
 
@@ -490,7 +505,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 887)
+            self.assertEqual(reexport_count, 889)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
