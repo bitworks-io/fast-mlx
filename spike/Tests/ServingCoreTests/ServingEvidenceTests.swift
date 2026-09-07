@@ -553,6 +553,38 @@ final class ServingEvidenceTests: XCTestCase {
         XCTAssertNil(decodedOld.speculativeDecoding)
     }
 
+    /// `passthroughActive` is a third state INSIDE a present `speculativeDecoding` block (see the
+    /// type's doc comment): sticky-passthrough-in-effect vs the ordinary accepted-nothing-yet case
+    /// the surrounding counters already cover. Must round-trip, and must default to `false` (not
+    /// throw) when an older on-disk payload omits the key entirely.
+    func testSpeculativeDecodingCountersPassthroughActiveRoundTripsAndDefaultsFalseWhenOmitted() throws {
+        let withPassthroughActive = try ServingEvidence.SpeculativeDecodingCounters(
+            proposedDraftTokens: 30,
+            acceptedDraftTokens: 21,
+            verifyRounds: 9,
+            passthroughActive: true)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(
+            String(data: encoder.encode(withPassthroughActive), encoding: .utf8))
+        XCTAssertTrue(json.contains(#""passthrough_active":true"#), json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                ServingEvidence.SpeculativeDecodingCounters.self, from: Data(json.utf8)),
+            withPassthroughActive)
+
+        // A payload predating this field (no `passthrough_active` key at all) must still decode,
+        // with the flag resolving to `false` rather than failing closed.
+        let oldPayload = Data(
+            #"""
+            {"proposed_draft_tokens":30,"accepted_draft_tokens":21,"verify_rounds":9}
+            """#.utf8)
+        let decodedOld = try JSONDecoder().decode(
+            ServingEvidence.SpeculativeDecodingCounters.self, from: oldPayload)
+        XCTAssertFalse(decodedOld.passthroughActive)
+    }
+
     func testFitDriftFieldsSurviveTheProductionCanonicalEvidencePath() throws {
         // The acceptance for differentiator #2: the drift fields must survive the SERIALIZER production
         // actually uses — ServingEvidence.canonicalJSONData() (the JSONL sink) and decodeCanonicalJSONData

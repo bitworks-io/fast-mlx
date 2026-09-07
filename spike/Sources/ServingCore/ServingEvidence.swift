@@ -711,11 +711,21 @@ extension ServingEvidence {
         public let proposedDraftTokens: Int
         public let acceptedDraftTokens: Int
         public let verifyRounds: Int
+        /// Whether MTP speculative decoding has entered sticky passthrough (permanently off for
+        /// this serve) as of the scrape that produced this block. Absent-on-decode (an older
+        /// on-disk payload predating this field) reads as `false`, not an error. This is a THIRD
+        /// state living INSIDE a present block — distinct from the no-drafter-bound vs
+        /// drafter-bound-but-present distinction that already lives one level up, at the
+        /// enclosing `ResourceSnapshot.speculativeDecoding` optional (see that property's doc
+        /// comment). A present block with `passthroughActive == true` means: drafter bound,
+        /// speculation attempted at some point, but no longer proposing draft tokens.
+        public let passthroughActive: Bool
 
         public init(
             proposedDraftTokens: Int,
             acceptedDraftTokens: Int,
-            verifyRounds: Int
+            verifyRounds: Int,
+            passthroughActive: Bool = false
         ) throws {
             try ServingEvidence.validateNonNegative(proposedDraftTokens, field: "proposedDraftTokens")
             try ServingEvidence.validateNonNegative(acceptedDraftTokens, field: "acceptedDraftTokens")
@@ -723,12 +733,14 @@ extension ServingEvidence {
             self.proposedDraftTokens = proposedDraftTokens
             self.acceptedDraftTokens = acceptedDraftTokens
             self.verifyRounds = verifyRounds
+            self.passthroughActive = passthroughActive
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
             case proposedDraftTokens = "proposed_draft_tokens"
             case acceptedDraftTokens = "accepted_draft_tokens"
             case verifyRounds = "verify_rounds"
+            case passthroughActive = "passthrough_active"
         }
 
         public init(from decoder: Decoder) throws {
@@ -739,7 +751,9 @@ extension ServingEvidence {
             try self.init(
                 proposedDraftTokens: container.decode(Int.self, forKey: .proposedDraftTokens),
                 acceptedDraftTokens: container.decode(Int.self, forKey: .acceptedDraftTokens),
-                verifyRounds: container.decode(Int.self, forKey: .verifyRounds))
+                verifyRounds: container.decode(Int.self, forKey: .verifyRounds),
+                passthroughActive: container.decodeIfPresent(
+                    Bool.self, forKey: .passthroughActive) ?? false)
         }
     }
 

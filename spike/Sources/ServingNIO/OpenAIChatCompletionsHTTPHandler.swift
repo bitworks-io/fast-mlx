@@ -1509,7 +1509,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
         // `nil`, which is correct for the fit-check fields above but wrong here — a present block
         // with all-zero counters (a bound drafter that has accepted/proposed nothing yet) is a
         // meaningful, must-be-visible outcome, indistinguishable from "no drafter bound" if it were
-        // silently omitted the same way `nil` is. The whole block is present or wholly absent.
+        // silently omitted the same way `nil` is. The whole block is present or wholly absent. The
+        // same reasoning applies to `passthroughActive` below: a `false` reading (speculation still
+        // live) must render as `0`, not be dropped, or an operator could not tell "not in
+        // passthrough" apart from "no drafter bound" either.
         if let counters = snapshot.speculativeDecoding {
             appendCounterMetric(
                 "fastmlx_mtp_proposed_draft_tokens_total",
@@ -1525,6 +1528,19 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 "fastmlx_mtp_verify_rounds_total",
                 help: "Cumulative MTP speculative-decoding verify rounds.",
                 value: counters.verifyRounds,
+                to: &lines)
+            // A gauge, not a counter: this is a 0/1 state (sticky passthrough in effect as of this
+            // scrape), not a monotonic total, so it goes through `appendMetric` directly.
+            appendMetric(
+                "fastmlx_mtp_passthrough_active",
+                // Help text deliberately does NOT begin with the digit `1`: `appendMetric` renders
+                // `# HELP <name> <help>`, so a help string starting with "1 when ..." would make
+                // the HELP line itself contain the substring `<name> 1` and silently satisfy any
+                // `contains("fastmlx_mtp_passthrough_active 1")` assertion regardless of the real
+                // value. The tests assert on exact lines for the same reason.
+                help: "Set to 1 when MTP speculative decoding has entered sticky passthrough and "
+                    + "is no longer proposing draft tokens; 0 otherwise.",
+                value: counters.passthroughActive ? 1 : 0,
                 to: &lines)
         }
         return lines.joined(separator: "\n") + "\n"

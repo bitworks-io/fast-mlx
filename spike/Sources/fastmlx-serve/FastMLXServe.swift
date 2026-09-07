@@ -721,7 +721,12 @@ private func loadScalarServingBackend(
                 try ServingEvidence.SpeculativeDecodingCounters(
                     proposedDraftTokens: telemetry.proposedCount,
                     acceptedDraftTokens: telemetry.acceptedCount,
-                    verifyRounds: telemetry.verifyRoundCount)
+                    verifyRounds: telemetry.verifyRoundCount,
+                    // `passthroughReason` only ever moves from `nil` to non-nil and then stays
+                    // there (sticky) — see `InferenceActor.SpeculativeTelemetrySnapshot`'s doc
+                    // comment — so `true` here means passthrough was in effect as of this scrape
+                    // and will remain so for the rest of this serve.
+                    passthroughActive: telemetry.passthroughReason != nil)
             }
             return try ServingEvidence.ResourceSnapshot(
                 activeRequests: snapshot.activeRequests,

@@ -1174,6 +1174,99 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    /// `passthroughActive: true` renders `fastmlx_mtp_passthrough_active 1` as a `gauge` (not a
+    /// `counter` — it is a 0/1 state, not a monotonic total). This is the case an operator needs:
+    /// MTP bound but sticky passthrough means it will never propose another draft token this serve.
+    func testMetricsEndpointRendersPassthroughActiveAsGaugeOne() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0,
+                acceptedDraftTokens: 0,
+                verifyRounds: 0,
+                passthroughActive: true))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        // Exact LINE match, never `contains`: the rendered `# HELP <name> <help>` line begins with
+        // the metric name, so a substring check for "<name> 1" can be satisfied by the help text
+        // alone and would pass even if the sampled value were 0.
+        let lines = response.body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        XCTAssertTrue(
+            lines.contains("fastmlx_mtp_passthrough_active 1"),
+            "expected an exact `fastmlx_mtp_passthrough_active 1` line; body was:\n\(response.body)")
+        XCTAssertFalse(lines.contains("fastmlx_mtp_passthrough_active 0"))
+        XCTAssertTrue(lines.contains("# TYPE fastmlx_mtp_passthrough_active gauge"))
+        _ = try await channel.finish()
+    }
+
+    /// `passthroughActive: false` must still render `fastmlx_mtp_passthrough_active 0` — proving
+    /// the falsy value is NOT omitted, which is the entire point of routing this field through
+    /// `appendMetric` directly rather than `appendOptionalMetric`.
+    func testMetricsEndpointRendersPassthroughActiveAsGaugeZeroNotOmitted() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0,
+                acceptedDraftTokens: 0,
+                verifyRounds: 0,
+                passthroughActive: false))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        // Same exact-line discipline as the `1` case above.
+        let lines = response.body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        XCTAssertTrue(
+            lines.contains("fastmlx_mtp_passthrough_active 0"),
+            "expected an exact `fastmlx_mtp_passthrough_active 0` line — a falsy reading must "
+                + "render, not be omitted; body was:\n\(response.body)")
+        XCTAssertFalse(lines.contains("fastmlx_mtp_passthrough_active 1"))
+        XCTAssertTrue(lines.contains("# TYPE fastmlx_mtp_passthrough_active gauge"))
+        _ = try await channel.finish()
+    }
+
     func testMetricsEndpointRejectsWrongMethodAndRequestBodyBeforeBackendWork()
         async throws
     {
