@@ -108,6 +108,36 @@ final class ServingFitAnnounceContractTests: XCTestCase {
         ], "fit_forced remains the last token even with fit_plan_concurrency present")
     }
 
+    // MARK: - operator-budget-envelope-shape decision, item 3: `fit_binding` gets a new VALUE
+    // (`operatorBudget`) while the frozen KEY set/order above is untouched. No pre-existing test
+    // enumerated `fit_binding`'s closed value set (only the key set/order is locked above), so this
+    // is new coverage rather than an update to an existing enumeration — added deliberately per the
+    // decision's instruction not to let the new value ship covered only by accident.
+
+    /// A budget tight enough that even the model's weights don't fit must classify the binding
+    /// constraint as `.operatorBudget`, NOT a generic RAM/wired-limit constraint — the whole point of
+    /// item 3 is that the operator's own flag, not the hardware, is the first lever named. Confirms
+    /// the new value renders on the actual machine-readable wire line, and that the frozen key
+    /// set/order from the tests above is unaffected by a new legal value in an existing key's slot.
+    func testMachineLine_operatorBudgetBinding_rendersNewFitBindingValueWithoutDisturbingFrozenKeys() {
+        let budgeted = SystemProfile(
+            chip: "test dedicated", totalRAMBytes: 128 * gib, wiredLimitBytes: 115 * gib,
+            wiredLimitIsMeasured: true, hostUse: .operatorAssertedDedicatedServing(),
+            operatorMemoryBudgetBytes: 5 * gib)
+        let d = ServingFitPlanner.decide(
+            profile: profile("Qwen3-32B"), weightsAreMeasured: true, host: budgeted)
+
+        XCTAssertEqual(d.color, .red, "precondition: a 5 GiB budget must not hold Qwen3-32B's weights")
+        XCTAssertEqual(d.bindingConstraint, .operatorBudget)
+        let fields = d.machineReadableFields()
+        XCTAssertTrue(fields.contains("fit_binding=operatorBudget"))
+        XCTAssertEqual(keys(fields), [
+            "fit_check", "fit_binding", "weights_measured", "wired_limit_measured",
+            "fit_estimate_measured", "fit_quant_bits", "fit_served_context",
+            "fit_context_ceiling", "fit_context_capped",
+        ], "a new fit_binding VALUE must not change the frozen key set/order")
+    }
+
     // MARK: - contextCeiling == 0 ⇒ red, fail-closed (invariant now pinned across every cause)
 
     /// Every distinct cause of `contextCeiling == 0` must drive `decide` to a red, fail-closed

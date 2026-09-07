@@ -49,7 +49,29 @@ public enum ModelSizer {
     public static func provenanceNotes(box: SystemProfile, kvQuant: KVQuantTier) -> [String] {
         var notes: [String] = []
 
-        switch box.effectiveMemoryCeiling.source {
+        if box.effectiveMemoryCeiling.source == .operatorBudget {
+            // Deliberately NOT phrased as "approximate": an operator budget is an exact figure the
+            // operator supplied. What it is not is a hardware observation — it bounds planning
+            // below what this host could otherwise hold, which is the fact worth surfacing. This
+            // note is layered ON TOP OF, not instead of, whatever note the underlying host
+            // ceiling's own source earns below — a synthesized/advisory host ceiling stays
+            // disclosed underneath a binding operator budget.
+            notes.append(
+                "NOTE: the effective memory ceiling is an operator-supplied budget (--memory-limit-bytes), not a hardware observation — it bounds planning below this host's own ceiling.")
+        } else if let operatorBudgetBytes = box.operatorMemoryBudgetBytes {
+            // The other half of item 7: a budget was SUPPLIED but did not bind (it is >= the host
+            // ceiling, including the exactly-equal case — the binding rule is a strict `<`
+            // deliberately, see the operator-budget-envelope-shape decision's production-skew safety
+            // note). This replaces what was previously a silent discard; naming both figures keeps
+            // it from becoming a silent no-op in its own right.
+            let hostCeiling = box.hostCeilingBeforeOperatorBudget
+            notes.append(
+                "NOTE: the operator-supplied --memory-limit-bytes budget (\(operatorBudgetBytes) B) did not bind — the host ceiling (\(hostCeiling.bytes) B, source: \(hostCeiling.source.rawValue)) is tighter or equal.")
+        }
+
+        // Always the HOST's own pre-budget source, so a synthesized/advisory host ceiling is
+        // still disclosed even when an operator budget is what actually binds.
+        switch box.hostCeilingBeforeOperatorBudget.source {
         case .sharedPolicy:
             notes.append(
                 "NOTE: the effective memory ceiling is synthesized by shared policy (not measured) — headroom numbers are approximate.")
@@ -62,7 +84,11 @@ public enum ModelSizer {
         case .physicalRAM:
             notes.append(
                 "NOTE: physical-RAM measurement provenance is unavailable — headroom numbers are approximate.")
-        case .wiredLimit:
+        case .wiredLimit, .operatorBudget:
+            // `.operatorBudget` is unreachable here by construction: `hostCeilingBeforeOperatorBudget`
+            // is computed before any operator budget is considered and never carries this source.
+            // Grouped with the measured `.wiredLimit` fallback (also a no-note case) rather than a
+            // `default:`, so the switch stays exhaustive over every `EffectiveMemoryCeiling.Source`.
             break
         }
 
@@ -71,6 +97,25 @@ public enum ModelSizer {
                 "NOTE: \(kvQuant.rawValue) is an ⚠️ EXPERIMENTAL/UNMEASURED placeholder KV tier — treat fit/ceiling numbers as more speculative than usual.")
         }
         return notes
+    }
+
+    /// The APPLIED cache limit (operator-budget-envelope-shape decision, item 5): the sizer's own
+    /// `cache <= memory` figure, further bounded by an explicitly supplied `--cache-limit-bytes`
+    /// operator ask — which can only REDUCE the applied limit, never raise it above what the sizer
+    /// already computed. An absent `providedCacheLimitBytes` is inert by construction (an `if let`,
+    /// not a `?? Int.max` sentinel, so the absence path cannot be silently made untestable). Pulled
+    /// out as pure arithmetic — `fastmlx-serve` is an executable target with no test target of its
+    /// own, so this is the independently testable half of the fix the decision's item 5 requires
+    /// ("2 GiB requested, 24 GiB applied" is the defect this replaces; acceptance is on the APPLIED
+    /// limit, never on what was merely forwarded in argv).
+    public static func appliedCacheLimitBytes(
+        sizerCacheLimitBytes: Int, sizerMemoryLimitBytes: Int, providedCacheLimitBytes: Int?
+    ) -> Int {
+        var cache = min(sizerCacheLimitBytes, sizerMemoryLimitBytes)
+        if let providedCacheLimitBytes, providedCacheLimitBytes < cache {
+            cache = providedCacheLimitBytes
+        }
+        return cache
     }
 
     /// Report every cataloged model at the given weight-bit assumptions (default 4-bit and 8-bit)

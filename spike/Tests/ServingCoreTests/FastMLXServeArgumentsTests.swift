@@ -551,18 +551,20 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         }
     }
 
-    func testScalarModeRejectsPartialRelativeOrUnsafeMemoryConfiguration() {
-        XCTAssertThrowsError(
-            try FastMLXServeArguments.parse([
-                "--model-path", "/models/fixture",
-                "--model", "fixture",
-                "--memory-limit-bytes", "4096",
-            ])
-        ) { error in
-            XCTAssertEqual(
-                error as? FastMLXServeArgumentError,
-                .missingRequiredOption("--cache-limit-bytes"))
-        }
+    func testScalarModeRejectsPartialRelativeOrUnsafeMemoryConfiguration() throws {
+        // Item 1: omitting --cache-limit-bytes is no longer a missing-required-option error — the
+        // absent flag reaches the backend as `nil`, which is the explicitness signal itself.
+        let cacheOmitted = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "4096",
+        ])
+        XCTAssertEqual(
+            cacheOmitted.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/fixture", isDirectory: true),
+                memoryLimitBytes: 4_096,
+                cacheLimitBytes: nil))
 
         XCTAssertThrowsError(
             try FastMLXServeArguments.parse([
@@ -604,6 +606,50 @@ final class FastMLXServeArgumentsTests: XCTestCase {
                 error as? FastMLXServeArgumentError,
                 .reservedKVLimitExceedsMemoryLimit)
         }
+    }
+
+    /// Item 1, the headline case: omitting BOTH --memory-limit-bytes and --cache-limit-bytes now
+    /// parses successfully instead of throwing `.missingRequiredOption("--memory-limit-bytes")` —
+    /// the absent flags reach the top-level `memoryLimitBytes` field AND the backend's own payload
+    /// as `nil`, which is the explicitness signal a downstream sizer-derived figure should apply.
+    /// This is what lets a parsed `FastMLXServeArguments` reach the host-probe path at all; the old
+    /// required-option guard refused before the host was ever probed.
+    func testScalarModeParsesSuccessfullyWithBothMemoryLimitsOmitted() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+        ])
+        XCTAssertNil(arguments.memoryLimitBytes,
+            "an omitted --memory-limit-bytes must reach the top-level field as nil")
+        XCTAssertEqual(
+            arguments.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/fixture", isDirectory: true),
+                memoryLimitBytes: nil,
+                cacheLimitBytes: nil))
+    }
+
+    /// Item 3: the `--max-reserved-kv-bytes <= --memory-limit-bytes` guard must be SKIPPED (not
+    /// silently compared against a bogus stand-in) when `--memory-limit-bytes` is absent. A reserved
+    /// KV figure that would obviously exceed any real memory limit must still parse successfully —
+    /// proving the comparison did not fire against some fabricated default. The "WITH memory
+    /// present" half of this validation is already locked immediately above
+    /// (`.reservedKVLimitExceedsMemoryLimit`, both flags supplied).
+    func testMaxReservedKVBytesValidationSkippedWhenMemoryLimitOmitted() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--continuous-batch-no-spec",
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--cache-limit-bytes", "1024",
+            "--max-reserved-kv-bytes", "999999999999",
+        ])
+        XCTAssertEqual(
+            arguments.backend,
+            .continuousBatchNoSpec(
+                modelDirectory: URL(fileURLWithPath: "/models/fixture", isDirectory: true),
+                memoryLimitBytes: nil,
+                cacheLimitBytes: 1_024,
+                maxReservedKVBytes: 999_999_999_999))
     }
 
     func testDuplicateUnknownAndInvalidNumericOptionsFailClosed() {
@@ -826,22 +872,25 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         }
     }
 
-    /// Non-regression lock: adding pick-only must NOT weaken the load modes' required-option
-    /// validation. A normal candidates-mode serve (no --quant-pick-only) still requires the runtime
-    /// memory limit — the early-return mode is the ONLY path that skips it.
-    func testQuantPickOnlyDoesNotWeakenLoadModeRequirements() {
-        XCTAssertThrowsError(
-            try FastMLXServeArguments.parse([
-                "--quant-candidates", "/models/a,/models/b",
-                "--model", "qwen3",
-                "--cache-limit-bytes", "8589934592",
-            ]),
-            "candidates mode without --quant-pick-only still requires --memory-limit-bytes"
-        ) { error in
-            XCTAssertEqual(
-                error as? FastMLXServeArgumentError,
-                .missingRequiredOption("--memory-limit-bytes"))
-        }
+    /// Non-regression lock, UPDATED for the operator-budget-envelope-shape decision:
+    /// `--memory-limit-bytes` is no longer a required option on any path (item 1) — an omitted flag
+    /// is the explicitness signal that no operator budget should bind, not a missing requirement the
+    /// sizer needs filled in. A normal candidates-mode serve (no --quant-pick-only) without the flag
+    /// now parses successfully, carrying `memoryLimitBytes == nil` all the way to the backend.
+    func testCandidatesModeWithoutPickOnlyParsesWithOmittedMemoryLimit() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--quant-candidates", "/models/a,/models/b",
+            "--model", "qwen3",
+            "--cache-limit-bytes", "8589934592",
+        ])
+        XCTAssertNil(arguments.memoryLimitBytes,
+            "an omitted --memory-limit-bytes must reach the top-level field as nil")
+        XCTAssertEqual(
+            arguments.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/a", isDirectory: true),
+                memoryLimitBytes: nil,
+                cacheLimitBytes: 8_589_934_592))
     }
 
     // MARK: - --quant-reliability: an ADVISORY artifact overlaid on the pick-only announce. It is an

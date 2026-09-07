@@ -223,4 +223,119 @@ final class SystemProfilerTests: XCTestCase {
                 + "mlx_cache_limit_bytes=not-applicable "
                 + "mlx_kv_budget_bytes=not-applicable"))
     }
+
+    // MARK: - operator-budget-envelope-shape decision: the `--host-use` silent-drop guard.
+    //
+    // The decision's "single most likely silent defect" is a budget stored ON `HostReport` being
+    // dropped by `applyingHostUse` (which re-lists every field explicitly) whenever `--host-use` is
+    // passed — which the live production serve does. The shipped fix keeps the budget OFF
+    // `HostReport` entirely and applies it only to the `SystemProfile` derived AFTER `applyingHostUse`
+    // has already resolved the classification — exactly the composition
+    // `report.applyingHostUse(explicit).systemProfile.withOperatorMemoryBudget(bytes)` a real
+    // `--host-use`-carrying serve invocation performs. This test locks that composition, not merely
+    // the two halves in isolation: it is mutation-checked below by proving a dropped `--host-use`
+    // classification (or a dropped budget) produces an observably different, WRONG ceiling — so a
+    // regression that silently discards either one fails this test rather than passing by
+    // coincidence.
+    func testOperatorBudgetSurvivesAcrossAnExplicitHostUseClassification() {
+        let gib = 1_073_741_824
+        // Chosen so shared vs. dedicated-serving classification, and budget-binds vs.
+        // budget-inert, are all four distinguishable outcomes:
+        //   shared ceiling      = floor(0.75 * 256 GiB) = 192 GiB (wired 220 GiB does not undercut it)
+        //   dedicated ceiling   = min(wired, RAM)        = 220 GiB (wired < RAM)
+        //   operator budget     = 200 GiB (binds under dedicated: 200 < 220; inert under shared: 200 !< 192)
+        let report = HostReport(
+            chip: "Apple Test",
+            totalRAMBytes: 256 * gib,
+            wiredLimitBytes: 220 * gib,
+            wiredLimitIsDefault: false,
+            pCores: 16,
+            eCores: 8,
+            currentGPUAllocBytes: nil,
+            recommendedWorkingSetBytes: nil,
+            diskInternal: nil,
+            diskFreeBytes: nil,
+            hostUse: .automaticShared)
+        let budgetBytes = 200 * gib
+
+        // The seam under test: --host-use dedicated-serving is applied to the ONE probed snapshot
+        // BEFORE the operator's memory budget is layered onto the derived profile.
+        let dedicatedThenBudgeted = report
+            .applyingHostUse(.operatorAssertedDedicatedServing())
+            .systemProfile
+            .withOperatorMemoryBudget(budgetBytes)
+
+        XCTAssertEqual(dedicatedThenBudgeted.hostUse.rawValue, "dedicated-serving",
+            "the --host-use classification must survive into the budgeted profile")
+        XCTAssertEqual(dedicatedThenBudgeted.hostCeilingBeforeOperatorBudget.bytes, 220 * gib,
+            "precondition: dedicated-serving ceiling is min(wired, RAM) = 220 GiB")
+        XCTAssertEqual(dedicatedThenBudgeted.effectiveMemoryCeiling.bytes, budgetBytes,
+            "the operator budget must bind against the DEDICATED ceiling, not a dropped/default one")
+        XCTAssertEqual(dedicatedThenBudgeted.effectiveMemoryCeiling.source, .operatorBudget)
+
+        // Mutation check #1: if the --host-use classification were silently dropped (the profile
+        // stayed on the default `.automaticShared` classification the raw probe returns), the SAME
+        // budget would be inert against the shared ceiling — a materially different, wrong outcome
+        // this test would catch.
+        let sharedThenBudgeted = report.systemProfile.withOperatorMemoryBudget(budgetBytes)
+        XCTAssertEqual(sharedThenBudgeted.hostCeilingBeforeOperatorBudget.bytes, 192 * gib,
+            "precondition: shared-policy ceiling is floor(0.75 * 256 GiB) = 192 GiB")
+        XCTAssertEqual(sharedThenBudgeted.effectiveMemoryCeiling.bytes, 192 * gib,
+            "precondition: 200 GiB budget is NOT tighter than 192 GiB, so it must stay inert")
+        XCTAssertEqual(sharedThenBudgeted.effectiveMemoryCeiling.source, .sharedPolicy)
+        XCTAssertNotEqual(
+            dedicatedThenBudgeted.effectiveMemoryCeiling.bytes,
+            sharedThenBudgeted.effectiveMemoryCeiling.bytes,
+            "dropping --host-use must be observable: the dedicated and (wrongly) shared outcomes differ")
+
+        // Mutation check #2: if the budget itself were dropped (the field never threaded through —
+        // the exact hazard the decision calls out for a budget stored ON `HostReport`), the dedicated
+        // classification alone would report its own unbudgeted ceiling, not the operator's 200 GiB.
+        let dedicatedWithoutBudget = report
+            .applyingHostUse(.operatorAssertedDedicatedServing())
+            .systemProfile
+        XCTAssertEqual(dedicatedWithoutBudget.effectiveMemoryCeiling.bytes, 220 * gib)
+        XCTAssertEqual(dedicatedWithoutBudget.effectiveMemoryCeiling.source, .wiredLimit)
+        XCTAssertNotEqual(
+            dedicatedWithoutBudget.effectiveMemoryCeiling.bytes,
+            dedicatedThenBudgeted.effectiveMemoryCeiling.bytes,
+            "dropping the budget must be observable: the unbudgeted dedicated ceiling differs from the budgeted one")
+    }
+
+    /// The version-skew safety property: an existing deployment can already be passing
+    /// `--memory-limit-bytes` EQUAL to its own shared ceiling, because the flag used to be required
+    /// and callers supplied the same figure the sizer would have derived. The binding rule is a
+    /// strict `<`, so an equal budget must be inert — that is what makes a stale, byte-identical
+    /// argv safe across a binary upgrade that makes the flag load-bearing for the first time.
+    func testOperatorBudgetExactlyEqualToHostCeilingIsInertNotBinding() {
+        let gib = 1_073_741_824
+        let report = HostReport(
+            chip: "Apple Test",
+            totalRAMBytes: 137_438_953_472, // 128 GiB
+            wiredLimitBytes: 115 * gib, // measured, but shared policy caps below it on this box
+            wiredLimitIsDefault: false,
+            pCores: 16,
+            eCores: 8,
+            currentGPUAllocBytes: nil,
+            recommendedWorkingSetBytes: nil,
+            diskInternal: nil,
+            diskFreeBytes: nil,
+            hostUse: .automaticShared)
+
+        // Shared ceiling = floor(0.75 * 137,438,953,472) = 103,079,215,104 — the exact bytes the
+        // deployed argv supplies as --memory-limit-bytes.
+        let sharedCeiling = report.systemProfile.hostCeilingBeforeOperatorBudget
+        XCTAssertEqual(sharedCeiling.bytes, 103_079_215_104, "precondition: matches the deployed argv")
+
+        let budgeted = report
+            .applyingHostUse(.operatorAssertedShared())
+            .systemProfile
+            .withOperatorMemoryBudget(103_079_215_104)
+
+        XCTAssertEqual(budgeted.effectiveMemoryCeiling.bytes, sharedCeiling.bytes,
+            "an equal budget must not change the effective ceiling")
+        XCTAssertEqual(budgeted.effectiveMemoryCeiling.source, sharedCeiling.source,
+            "an equal budget must not relabel the ceiling's source as operator-budget")
+        XCTAssertNotEqual(budgeted.effectiveMemoryCeiling.source, .operatorBudget)
+    }
 }

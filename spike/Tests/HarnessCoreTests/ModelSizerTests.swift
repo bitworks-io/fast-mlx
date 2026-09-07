@@ -202,4 +202,51 @@ final class ModelSizerTests: XCTestCase {
             host.wiredLimitIsMeasured,
             "effective shared-policy provenance must not rewrite the measured wired input fact")
     }
+
+    // MARK: - appliedCacheLimitBytes (operator-budget-envelope-shape decision, item 5): the cache
+    // half must actually bind. Pulled out of `fastmlx-serve` (an executable target with no test
+    // target of its own) so it is independently testable.
+
+    /// The originating defect, reproduced directly: a 2 GiB operator ask against a 24 GiB sizer
+    /// figure must APPLY 2 GiB, not 24 GiB.
+    func testAppliedCacheLimitBytes_ExplicitSmallerCacheBindsOverTheSizerFigure() {
+        let applied = ModelSizer.appliedCacheLimitBytes(
+            sizerCacheLimitBytes: 24 * Int(gib), sizerMemoryLimitBytes: 96 * Int(gib),
+            providedCacheLimitBytes: 2 * Int(gib))
+        XCTAssertEqual(applied, 2 * Int(gib))
+    }
+
+    /// A generous operator ask (>= the sizer's own figure) is inert — the sizer's figure applies
+    /// unchanged, never raised by the operator's flag.
+    func testAppliedCacheLimitBytes_LargerOrEqualProvidedCacheIsInert() {
+        XCTAssertEqual(
+            ModelSizer.appliedCacheLimitBytes(
+                sizerCacheLimitBytes: 8 * Int(gib), sizerMemoryLimitBytes: 96 * Int(gib),
+                providedCacheLimitBytes: 24 * Int(gib)),
+            8 * Int(gib))
+        XCTAssertEqual(
+            ModelSizer.appliedCacheLimitBytes(
+                sizerCacheLimitBytes: 8 * Int(gib), sizerMemoryLimitBytes: 96 * Int(gib),
+                providedCacheLimitBytes: 8 * Int(gib)),
+            8 * Int(gib), "an exactly-equal provided cache must not be treated as tighter")
+    }
+
+    /// Absence is inert by construction (an `if let`, not a `?? Int.max` sentinel): omitting
+    /// --cache-limit-bytes leaves the sizer's own cache<=memory figure untouched.
+    func testAppliedCacheLimitBytes_AbsentProvidedCacheLeavesSizerFigureUntouched() {
+        XCTAssertEqual(
+            ModelSizer.appliedCacheLimitBytes(
+                sizerCacheLimitBytes: 24 * Int(gib), sizerMemoryLimitBytes: 96 * Int(gib),
+                providedCacheLimitBytes: nil),
+            24 * Int(gib))
+    }
+
+    /// The sizer's own cache<=memory clamp still applies even when the operator supplied nothing.
+    func testAppliedCacheLimitBytes_StillClampsToSizerMemoryWhenCacheExceedsIt() {
+        XCTAssertEqual(
+            ModelSizer.appliedCacheLimitBytes(
+                sizerCacheLimitBytes: 24 * Int(gib), sizerMemoryLimitBytes: 16 * Int(gib),
+                providedCacheLimitBytes: nil),
+            16 * Int(gib))
+    }
 }

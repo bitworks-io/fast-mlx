@@ -87,9 +87,16 @@ struct FastMLXServe {
         }
 
         let hostReport = detectedServingHostReport(arguments)
+        // Apply the operator's own `--memory-limit-bytes` as a further planning bound on top of the
+        // host-use-derived envelope — deliberately on the DERIVED `SystemProfile`, never stored on
+        // `HostReport` itself: `HostReport.applyingHostUse` re-lists every field explicitly, so a
+        // budget stored there would be silently dropped whenever `--host-use` is passed (which the
+        // live production serve does). See the operator-budget-envelope-shape decision.
+        let planningProfile = hostReport.systemProfile.withOperatorMemoryBudget(
+            arguments.memoryLimitBytes)
 
         if arguments.quantPickOnly {
-            try runQuantPickOnly(arguments, host: hostReport.systemProfile)
+            try runQuantPickOnly(arguments, host: planningProfile)
             return
         }
 
@@ -474,7 +481,7 @@ private func emitQuantReliabilityOverlay(arguments: FastMLXServeArguments, pick:
 private func resolveServingLimits(
     modelDirectory: URL, arguments: FastMLXServeArguments,
     host: SystemProfile,
-    providedMemory: Int, providedCache: Int, providedReservedKV: Int?,
+    providedMemory: Int?, providedCache: Int?, providedReservedKV: Int?,
     preParsed: ParsedModelArch? = nil, advisorySlotCount: Int? = nil
 ) throws -> ResolvedServingLimits {
     var parsed: ParsedModelArch
@@ -547,6 +554,20 @@ private func resolveServingLimits(
         allowContextCapping: servePolicy?.allowContextCapping ?? true)
     emitFitCheck(decision.summaryLines())
 
+    // Operator-budget-envelope-shape decision item 7: name which ceiling the fit decision above was
+    // actually made against — whether an operator-supplied --memory-limit-bytes budget bound it, or
+    // was supplied but did NOT bind (the two halves `ModelSizer.provenanceNotes` distinguishes), plus
+    // any advisory-provenance/experimental-KV-tier notes on the host ceiling itself. Emitted here,
+    // BEFORE the `shouldProceed` refusal guard below, so a refusal caused by a tight operator budget
+    // still carries this note — the case the operator most needs it for. `host` already carries
+    // `operatorMemoryBudgetBytes` (set by `withOperatorMemoryBudget` at the call site above this
+    // function). Composed against `.fp16`: `decision` above was computed with the `decide(...)`
+    // default KV tier (no `kvQuant:` argument is passed there), and the enforced serving backend is
+    // fp16-only KV regardless of `--kv-quant` (see the `enforcedPathKVAdvisory` note just below), so
+    // `.fp16` is the tier this fit decision is actually measuring, not an arbitrary hardcoded default.
+    let ceilingProvenanceNotes = ModelSizer.provenanceNotes(box: host, kvQuant: .fp16)
+    if !ceilingProvenanceNotes.isEmpty { emitFitCheck(ceilingProvenanceNotes) }
+
     // Sizing-only advisory for a requested non-fp16 KV-cache tier. Emitted BEFORE the refusal guard
     // so an operator whose fp16 verdict is red still sees the mitigation ("int8 would fit at ceiling
     // X"). The what-if decision is HarnessCore's; every line is labeled runtime_not_wired. The
@@ -575,7 +596,15 @@ private func resolveServingLimits(
     // reject valid concurrent/long requests that the provided (generous, e.g. serve.sh 30%-RAM) cap
     // admits — and --force does not relax runtime caps. Pass the provided reserved-KV through.
     let memory = decision.memoryLimitBytes
-    let cache = min(decision.cacheLimitBytes, memory)
+    // An explicitly supplied --cache-limit-bytes further bounds the APPLIED cache limit — it can
+    // only reduce it, never raise it above the sizer's own cache<=memory figure. This is the cache
+    // half of the operator-budget fix: an operator asking for a 2 GiB cache used to get the sizer's
+    // (larger, e.g. 24 GiB) figure applied regardless of what was forwarded in argv. The pure
+    // arithmetic lives in `ModelSizer.appliedCacheLimitBytes` (independently unit-tested there —
+    // this executable target has no test target of its own).
+    let cache = ModelSizer.appliedCacheLimitBytes(
+        sizerCacheLimitBytes: decision.cacheLimitBytes, sizerMemoryLimitBytes: memory,
+        providedCacheLimitBytes: providedCache)
     // Enforce the admitted served context on every path. Omitting --context lets the fit planner
     // choose the largest safe value; it does not authorize runtime/discovery to claim native context
     // when the current host fit is smaller.
@@ -701,7 +730,9 @@ private func prepareBackend(
         let memoryLimitBytes,
         let cacheLimitBytes
     ):
-        let host = hostReport.systemProfile
+        // Same single written rule as the pick-only seam above: apply the operator's own
+        // `--memory-limit-bytes` on the derived `SystemProfile`, never on `hostReport` itself.
+        let host = hostReport.systemProfile.withOperatorMemoryBudget(arguments.memoryLimitBytes)
         let served = try resolveServedDirectory(arguments, fallback: modelDirectory, host: host)
         let exactDrafterDirectory: URL?
         if arguments.exactQwen35MTP {
@@ -818,7 +849,9 @@ private func prepareBackend(
             admission = .immediateBatchNoSpec
             soloPLDPolicy = nil
         }
-        let host = hostReport.systemProfile
+        // Same single written rule as the pick-only seam above: apply the operator's own
+        // `--memory-limit-bytes` on the derived `SystemProfile`, never on `hostReport` itself.
+        let host = hostReport.systemProfile.withOperatorMemoryBudget(arguments.memoryLimitBytes)
         let served = try resolveServedDirectory(arguments, fallback: modelDirectory, host: host)
         let limits = try resolveServingLimits(
             modelDirectory: served.directory, arguments: arguments, host: host,

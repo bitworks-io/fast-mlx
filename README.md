@@ -70,9 +70,14 @@ shipped metallib, and serves on `127.0.0.1:8080`. Already have the weights local
 ./scripts/serve.sh --model-path ./my-model-dir --model my-name
 ```
 
-`serve.sh` derives sensible MLX memory limits from your machine's RAM — pass explicit
-`--memory-limit-bytes` / `--host` / `--port` to override. Set `FASTMLX_API_KEY` to require Bearer
-auth (mandatory for a non-loopback `--host`).
+A pre-load fit-check sizes the model against your machine and derives the MLX memory and cache
+limits from that, so you don't have to supply them. Passing `--memory-limit-bytes` (or
+`--cache-limit-bytes`) is optional and means something specific: it's a budget that bounds planning
+*below* what this machine would otherwise allow — useful when something else on the box needs the
+headroom. It can only lower the ceiling, never raise it, and startup tells you which ceiling
+actually bound, including when your budget turned out to be the loose one. Use `--host` / `--port`
+to change where it listens, and set `FASTMLX_API_KEY` to require Bearer auth (mandatory for a
+non-loopback `--host`).
 
 Call it with the standard OpenAI shape, including tools:
 

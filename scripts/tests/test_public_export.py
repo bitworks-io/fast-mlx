@@ -342,8 +342,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 878,
-                "pathModeSha256": "e6b3ce13f28917bc7cbbe7f5fcac9609f97ebe7bbcfa9d7433b86b71dc02220a",
+                "pathCount": 879,
+                "pathModeSha256": "9305d7f0dd56460399cadf4289690c09fb54d103ae8039bc94c5f2989ada2deb",
             },
         )
 
@@ -437,7 +437,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 878)
+            self.assertEqual(reexport_count, 879)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

@@ -2,19 +2,24 @@ import Foundation
 
 public enum FastMLXServeBackend: Equatable, Sendable {
     case scripted
+    // `memoryLimitBytes`/`cacheLimitBytes` are `Int?`: an omitted `--memory-limit-bytes` or
+    // `--cache-limit-bytes` reaches here as `nil` (the operator-budget-envelope-shape decision) —
+    // the sizer's derived figures are what actually apply; the flags were never load-bearing
+    // requirements, only an optional tighter operator ask. `maxReservedKVBytes` is unaffected and
+    // stays a required `Int` on the continuous routes.
     case scalar(
         modelDirectory: URL,
-        memoryLimitBytes: Int,
-        cacheLimitBytes: Int)
+        memoryLimitBytes: Int?,
+        cacheLimitBytes: Int?)
     case continuousBatchNoSpec(
         modelDirectory: URL,
-        memoryLimitBytes: Int,
-        cacheLimitBytes: Int,
+        memoryLimitBytes: Int?,
+        cacheLimitBytes: Int?,
         maxReservedKVBytes: Int)
     case continuousDynamicPLD(
         modelDirectory: URL,
-        memoryLimitBytes: Int,
-        cacheLimitBytes: Int,
+        memoryLimitBytes: Int?,
+        cacheLimitBytes: Int?,
         maxReservedKVBytes: Int)
 }
 
@@ -387,6 +392,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// with continuous batching or `--exact-qwen35-mtp`, because neither route reaches the scalar-load
     /// seam that consumes it — accepting the flag there would silently ignore an operator's request.
     public let ngramOffloadPlanURL: URL?
+    /// The operator's raw `--memory-limit-bytes` payload, threaded independently of `backend` so it
+    /// reaches every consumer that plans against the host envelope — including `--quant-pick-only`,
+    /// whose early-return carries no `backend` case at all (`backend == nil`) and would otherwise
+    /// silently drop an operator budget the pre-load quant pick should have planned against. `nil`
+    /// when the flag was omitted; omission IS the signal that no operator budget should bind (see
+    /// docs/task-inbox/2026-09-06-operator-budget-envelope-shape-DECISION.md).
+    public let memoryLimitBytes: Int?
 
     private init(
         backend: FastMLXServeBackend?,
@@ -420,7 +432,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         exactQwen35MTP: Bool = false,
         exactMTPSelection: FastMLXExactMTPSelection = .qwen35_9BDepth1,
         mtpDrafterDirectory: URL? = nil,
-        ngramOffloadPlanURL: URL? = nil
+        ngramOffloadPlanURL: URL? = nil,
+        memoryLimitBytes: Int? = nil
     ) {
         self.backend = backend
         self.host = host
@@ -453,6 +466,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.exactMTPSelection = exactMTPSelection
         self.mtpDrafterDirectory = mtpDrafterDirectory
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
+        self.memoryLimitBytes = memoryLimitBytes
     }
 
     public static func parse<S: Sequence>(
@@ -837,7 +851,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     serveTier: serveTier,
                     planConcurrency: planConcurrency,
                     preferMode: preferMode,
-                    autoQuantBase: base)
+                    autoQuantBase: base,
+                    memoryLimitBytes: memoryLimitBytes)
             }
             guard !quantCandidateDirs.isEmpty else {
                 throw FastMLXServeArgumentError.missingRequiredOption("--quant-candidates")
@@ -866,7 +881,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 quantReliabilityPath: quantReliabilityPath,
                 serveTier: serveTier,
                 planConcurrency: planConcurrency,
-                preferMode: preferMode)
+                preferMode: preferMode,
+                memoryLimitBytes: memoryLimitBytes)
         }
 
         let hasQuantCandidates = !quantCandidateDirs.isEmpty
@@ -939,15 +955,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             throw FastMLXServeArgumentError.missingRequiredOption("--model")
         }
         let launchedModel = try validatedModel(model)
-        guard let memoryLimitBytes else {
-            throw FastMLXServeArgumentError.missingRequiredOption(
-                "--memory-limit-bytes")
-        }
-        guard let cacheLimitBytes else {
-            throw FastMLXServeArgumentError.missingRequiredOption(
-                "--cache-limit-bytes")
-        }
-        guard cacheLimitBytes <= memoryLimitBytes else {
+        // --memory-limit-bytes/--cache-limit-bytes are OPTIONAL (operator-budget-envelope-shape
+        // decision): the sizer derives concrete bytes downstream regardless, so an omitted flag is
+        // not a missing requirement — it is the explicit signal that no operator budget should bind.
+        // The ordering invariant below still holds whenever BOTH are actually present; it is simply
+        // not evaluated when either is absent (never compared against a fabricated placeholder).
+        if let cacheLimitBytes, let memoryLimitBytes, cacheLimitBytes > memoryLimitBytes {
             throw FastMLXServeArgumentError.cacheLimitExceedsMemoryLimit
         }
         let resolvedMaxReservedKVBytes: Int?
@@ -956,7 +969,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 throw FastMLXServeArgumentError.missingRequiredOption(
                     "--max-reserved-kv-bytes")
             }
-            guard maxReservedKVBytes <= memoryLimitBytes else {
+            // Only enforced when --memory-limit-bytes was actually supplied; skipped (not silently
+            // compared against a bogus stand-in) when it is absent.
+            if let memoryLimitBytes, maxReservedKVBytes > memoryLimitBytes {
                 throw FastMLXServeArgumentError
                     .reservedKVLimitExceedsMemoryLimit
             }
@@ -1008,7 +1023,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             exactQwen35MTP: exactQwen35MTP,
             exactMTPSelection: exactMTPSelection,
             mtpDrafterDirectory: mtpDrafterDirectory,
-            ngramOffloadPlanURL: ngramOffloadPlanURL)
+            ngramOffloadPlanURL: ngramOffloadPlanURL,
+            memoryLimitBytes: memoryLimitBytes)
     }
 
     private static let supportedOptions: Set<String> = [

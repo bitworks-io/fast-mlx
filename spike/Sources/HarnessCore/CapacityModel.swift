@@ -55,6 +55,10 @@ public enum BindingConstraint: String, Sendable {
     /// count, or an out-of-scope arch) — we cannot honestly say whether it fits. Reported instead
     /// of a misleading under-count (spec §2.1 "do not multiply blind"; §8).
     case kvNotDerivable
+    /// The operator's own explicit memory budget (`--memory-limit-bytes`) is the lowest envelope —
+    /// tighter than anything this host's hardware or policy imposes. Unlike every other memory
+    /// constraint here, the first lever is the operator's flag, not the workload or the hardware.
+    case operatorBudget
 }
 
 public enum CapacityColor: String, Sendable { case green, yellow, red }
@@ -343,6 +347,8 @@ public enum CapacityModel {
             return "model's native max is below the 32K tunable default — effective default is the native max"
         case .kvNotDerivable:
             return "KV cost not derivable (unconfirmed attention-layer count or out-of-scope arch) — confirm the model config before trusting any fit estimate"
+        case .operatorBudget:
+            return "the explicit --memory-limit-bytes budget is below the predicted peak — raise or drop that flag, or reduce KV tier/concurrency/context to fit inside it"
         case .wiredLimit, .physicalRAM, .recommendedWorkingSet:
             return "drop KV to a lossy quant tier, then reduce concurrency, then pick a lighter-footprint model"
         }
@@ -356,6 +362,8 @@ public enum CapacityModel {
             return .recommendedWorkingSet
         case .sharedPolicy, .wiredLimit:
             return .wiredLimit
+        case .operatorBudget:
+            return .operatorBudget
         }
     }
 

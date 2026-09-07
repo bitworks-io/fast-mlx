@@ -90,6 +90,7 @@ public struct EffectiveMemoryCeiling: Sendable, Equatable {
         case sharedPolicy = "shared-policy"
         case wiredLimit = "wired-limit"
         case recommendedWorkingSet = "metal-recommended-working-set"
+        case operatorBudget = "operator-budget"
     }
 
     public let bytes: Int
@@ -125,6 +126,12 @@ public struct SystemProfile: Sendable {
     /// dedicated-serving qualification remains a separate operator-controlled gate.
     public let recommendedWorkingSetBytes: Int?
     public let hostUse: HostUseClassification
+    /// An operator-asserted planning budget, in bytes. Applied as a FURTHER reduction of the
+    /// `effectiveMemoryCeiling` that `hostUse` already computed — never an increase, and never a
+    /// substitute for an already-tighter measured/advisory bound. `nil` (the default) preserves
+    /// every existing call site's behavior exactly. Declared last, with a default, so existing
+    /// positional/keyword call sites keep compiling unchanged.
+    public let operatorMemoryBudgetBytes: Int?
 
     public init(
         chip: String,
@@ -132,7 +139,8 @@ public struct SystemProfile: Sendable {
         wiredLimitBytes: Int,
         wiredLimitIsMeasured: Bool = true,
         recommendedWorkingSetBytes: Int? = nil,
-        hostUse: HostUseClassification = .defaultShared
+        hostUse: HostUseClassification = .defaultShared,
+        operatorMemoryBudgetBytes: Int? = nil
     ) {
         self.chip = chip
         self.totalRAMBytes = totalRAMBytes
@@ -140,57 +148,102 @@ public struct SystemProfile: Sendable {
         self.wiredLimitIsMeasured = wiredLimitIsMeasured
         self.recommendedWorkingSetBytes = recommendedWorkingSetBytes
         self.hostUse = hostUse
+        self.operatorMemoryBudgetBytes = operatorMemoryBudgetBytes
     }
 
-    /// The envelope all capacity, admission, and allocator/cache budgeting must consume.
+    /// The host-use-driven envelope BEFORE any operator budget is applied: exactly what
+    /// `hostUse`'s shared/dedicated-serving policy computes from the host's own observations,
+    /// including the `totalRAMBytes <= 0` early return. This is the single place that branch
+    /// logic is written; `effectiveMemoryCeiling` is defined in terms of this property plus the
+    /// operator budget. Its `.source` is never `.operatorBudget` — an operator budget cannot be
+    /// "applied" here because it hasn't been considered yet.
     ///
     /// Shared hosts are capped at exact integer `floor(75% * physical RAM)`, then further bounded
     /// by a lower positive wired-limit observation and a lower positive Metal recommended working
     /// set. Missing/non-positive Metal observations are unavailable rather than zero-byte limits.
     /// Dedicated-serving retains the pre-existing `min(wired limit, physical RAM)` behavior here;
     /// its separate qualification path owns any future Metal/OS/service-reserve policy.
-    public var effectiveMemoryCeiling: EffectiveMemoryCeiling {
+    public var hostCeilingBeforeOperatorBudget: EffectiveMemoryCeiling {
         guard totalRAMBytes > 0 else {
             return EffectiveMemoryCeiling(bytes: 0, source: .physicalRAM)
         }
 
         switch hostUse.use {
         case .shared:
-            var result = EffectiveMemoryCeiling(
+            var shared = EffectiveMemoryCeiling(
                 bytes: Self.estimatedWiredLimitBytes(totalRAMBytes: totalRAMBytes),
                 source: .sharedPolicy)
-            if wiredLimitBytes > 0, wiredLimitBytes < result.bytes {
-                result = EffectiveMemoryCeiling(bytes: wiredLimitBytes, source: .wiredLimit)
+            if wiredLimitBytes > 0, wiredLimitBytes < shared.bytes {
+                shared = EffectiveMemoryCeiling(bytes: wiredLimitBytes, source: .wiredLimit)
             }
             if let recommendedWorkingSetBytes,
                 recommendedWorkingSetBytes > 0,
-                recommendedWorkingSetBytes < result.bytes
+                recommendedWorkingSetBytes < shared.bytes
             {
-                result = EffectiveMemoryCeiling(
+                shared = EffectiveMemoryCeiling(
                     bytes: recommendedWorkingSetBytes,
                     source: .recommendedWorkingSet)
             }
-            return result
+            return shared
 
         case .dedicatedServing:
             if wiredLimitBytes <= 0 {
                 return EffectiveMemoryCeiling(bytes: 0, source: .wiredLimit)
-            }
-            if wiredLimitBytes < totalRAMBytes {
+            } else if wiredLimitBytes < totalRAMBytes {
                 return EffectiveMemoryCeiling(bytes: wiredLimitBytes, source: .wiredLimit)
+            } else {
+                return EffectiveMemoryCeiling(bytes: totalRAMBytes, source: .physicalRAM)
             }
-            return EffectiveMemoryCeiling(bytes: totalRAMBytes, source: .physicalRAM)
         }
     }
 
-    /// Whether the observation that actually selected `effectiveMemoryCeiling` is measured rather
-    /// than synthesized or advisory. Physical-RAM provenance is not represented by this type yet,
-    /// and Metal documents its recommendation as an approximation, so both remain conservative.
+    /// The envelope all capacity, admission, and allocator/cache budgeting must consume: the
+    /// `hostCeilingBeforeOperatorBudget` policy result, further bounded by an operator-asserted
+    /// budget when one binds.
+    public var effectiveMemoryCeiling: EffectiveMemoryCeiling {
+        Self.applyOperatorBudget(hostCeilingBeforeOperatorBudget, operatorMemoryBudgetBytes)
+    }
+
+    /// The single place the operator budget rule is written: it binds only when it is a positive,
+    /// strictly-tighter bound than whatever the hostUse-driven policy already computed. A budget
+    /// can only ever reduce the envelope, never raise it or stand in for an already-tighter bound
+    /// (equal is not "binding" — ties keep the pre-existing source).
+    private static func applyOperatorBudget(
+        _ result: EffectiveMemoryCeiling,
+        _ operatorMemoryBudgetBytes: Int?
+    ) -> EffectiveMemoryCeiling {
+        guard let operatorMemoryBudgetBytes,
+            operatorMemoryBudgetBytes > 0,
+            operatorMemoryBudgetBytes < result.bytes
+        else {
+            return result
+        }
+        return EffectiveMemoryCeiling(bytes: operatorMemoryBudgetBytes, source: .operatorBudget)
+    }
+
+    /// Whether the observation that selected `hostCeilingBeforeOperatorBudget` — the host's own
+    /// policy result, BEFORE any operator budget is applied — is measured rather than synthesized
+    /// or advisory. Physical-RAM provenance is not represented by this type yet, and Metal
+    /// documents its recommendation as an approximation, so both remain conservative.
+    ///
+    /// This deliberately switches on `hostCeilingBeforeOperatorBudget.source`, not
+    /// `effectiveMemoryCeiling.source`: this field describes the provenance of the *host
+    /// observation*, and an operator budget does not degrade that provenance merely by binding
+    /// tighter than it. An operator-supplied budget is an exact figure the operator chose — it
+    /// erases which host observation would otherwise have bound, but it does not make that
+    /// observation's own provenance any less measured. (Review finding: making this switch on
+    /// `effectiveMemoryCeiling.source` with a `.operatorBudget -> false` arm would flip
+    /// `fit_estimate_measured` from `true` to `false` on a fully-measured host purely because an
+    /// operator supplied a budget, implying headroom became approximate when it did not.)
     public var effectiveMemoryCeilingIsMeasured: Bool {
-        switch effectiveMemoryCeiling.source {
+        switch hostCeilingBeforeOperatorBudget.source {
         case .wiredLimit:
             return wiredLimitIsMeasured
-        case .physicalRAM, .sharedPolicy, .recommendedWorkingSet:
+        case .physicalRAM, .sharedPolicy, .recommendedWorkingSet, .operatorBudget:
+            // `.operatorBudget` is unreachable here by construction: `hostCeilingBeforeOperatorBudget`
+            // is computed before any operator budget is considered and never carries this source.
+            // Kept explicit (grouped, not a `default:`) so the switch stays exhaustive and visibly
+            // covers every `EffectiveMemoryCeiling.Source` case.
             return false
         }
     }
@@ -201,6 +254,19 @@ public struct SystemProfile: Sendable {
     /// single headroom computation both the context ceiling and the capacity advisor share.
     public func hardwareHoldsBytes(weightsBytes: Int, osReserveBytes: Int) -> Int {
         effectiveMemoryCeiling.bytes - weightsBytes - osReserveBytes
+    }
+
+    /// Returns a copy of this profile with `operatorMemoryBudgetBytes` replaced by `bytes` and
+    /// every other field preserved. Pass `nil` to clear a previously-set budget.
+    public func withOperatorMemoryBudget(_ bytes: Int?) -> SystemProfile {
+        SystemProfile(
+            chip: chip,
+            totalRAMBytes: totalRAMBytes,
+            wiredLimitBytes: wiredLimitBytes,
+            wiredLimitIsMeasured: wiredLimitIsMeasured,
+            recommendedWorkingSetBytes: recommendedWorkingSetBytes,
+            hostUse: hostUse,
+            operatorMemoryBudgetBytes: bytes)
     }
 
     private static let gib = 1024 * 1024 * 1024
