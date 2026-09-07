@@ -481,7 +481,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         defer {
             control.markTerminal()
         }
-        guard let snapshotProvider = configuration.evidence?.snapshot else {
+        guard let snapshotProvider = configuration.evidence?.snapshot ?? configuration.metricsSnapshot
+        else {
             await writeMetricsFailure(
                 message: "Metrics snapshot is not configured",
                 code: "metrics_unavailable",
@@ -1504,6 +1505,28 @@ private extension OpenAIChatCompletionsHTTPHandler {
             help: "Fit-check modeled headroom bytes.",
             value: snapshot.fitModeledHeadroomBytes,
             to: &lines)
+        // Deliberately NOT routed through `appendOptionalMetric`: that helper returns early on
+        // `nil`, which is correct for the fit-check fields above but wrong here — a present block
+        // with all-zero counters (a bound drafter that has accepted/proposed nothing yet) is a
+        // meaningful, must-be-visible outcome, indistinguishable from "no drafter bound" if it were
+        // silently omitted the same way `nil` is. The whole block is present or wholly absent.
+        if let counters = snapshot.speculativeDecoding {
+            appendCounterMetric(
+                "fastmlx_mtp_proposed_draft_tokens_total",
+                help: "Cumulative MTP speculative-decoding draft tokens proposed.",
+                value: counters.proposedDraftTokens,
+                to: &lines)
+            appendCounterMetric(
+                "fastmlx_mtp_accepted_draft_tokens_total",
+                help: "Cumulative MTP speculative-decoding draft tokens accepted.",
+                value: counters.acceptedDraftTokens,
+                to: &lines)
+            appendCounterMetric(
+                "fastmlx_mtp_verify_rounds_total",
+                help: "Cumulative MTP speculative-decoding verify rounds.",
+                value: counters.verifyRounds,
+                to: &lines)
+        }
         return lines.joined(separator: "\n") + "\n"
     }
 
@@ -1528,6 +1551,21 @@ private extension OpenAIChatCompletionsHTTPHandler {
         precondition(value >= 0, "Prometheus serving metrics must be non-negative")
         lines.append("# HELP \(name) \(help)")
         lines.append("# TYPE \(name) gauge")
+        lines.append("\(name) \(value)")
+    }
+
+    /// Sibling of `appendMetric` for monotonic counters (e.g. cumulative MTP speculative-decoding
+    /// totals) rather than point-in-time gauges — emits `# TYPE <name> counter`. Does not alter
+    /// `appendMetric`'s own behavior for existing gauge metrics.
+    static func appendCounterMetric(
+        _ name: String,
+        help: String,
+        value: Int,
+        to lines: inout [String]
+    ) {
+        precondition(value >= 0, "Prometheus serving metrics must be non-negative")
+        lines.append("# HELP \(name) \(help)")
+        lines.append("# TYPE \(name) counter")
         lines.append("\(name) \(value)")
     }
 }

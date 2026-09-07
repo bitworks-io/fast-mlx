@@ -143,7 +143,11 @@ struct FastMLXServe {
             // Scripted mode is transport-only and has no tokenizer/model-derived context.
             modelCapabilities: prepared.usesPostRenderBudgetResolver
                 ? prepared.modelCapabilities
-                : nil)
+                : nil,
+            // Carry the /metrics snapshot independently of `evidence` (which is nil without
+            // `--evidence`), on every route, so `/metrics` works whether or not an evidence sink
+            // was configured. See `ServingHTTPConfiguration.metricsSnapshot`.
+            metricsSnapshot: prepared.evidenceSnapshot)
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(
@@ -696,7 +700,50 @@ private func loadScalarServingBackend(
             inCheckpointMTPSelection: arguments.inCheckpointMTPSelection))
     return PreparedServingBackend(
         backend: loaded.backend,
-        evidenceSnapshot: nil,
+        evidenceSnapshot: {
+            let snapshot = await loaded.backend.snapshot()
+            // Measured-vs-modeled drift (differentiator #2): compare the sizer's modeled peak
+            // (+ term breakdown) against the live allocator high-water mark. Present only when the
+            // fit-check ran; mirrors the continuous route's drift composition exactly.
+            let drift = fitDecision.map { decision in
+                FitCheckMeasuredReport(
+                    prediction: decision.prediction,
+                    measuredPeakBytes: snapshot.mlxPeakBytes,
+                    measuredActiveBytes: snapshot.mlxActiveBytes,
+                    measuredCacheBytes: snapshot.mlxCacheBytes)
+            }
+            // MTP acceptance counters (cycle 2c): the scalar route IS the MTP serving route, so read
+            // the cumulative telemetry straight off the backend. `nil` here means the bound decoder
+            // is a plain `MLXDecoder` (no drafter) — that nil/non-nil distinction must survive into
+            // the rendered `/metrics` body unchanged, never collapsed to an all-zero block.
+            let speculativeTelemetry = await loaded.backend.speculativeTelemetry()
+            let speculativeDecoding = try speculativeTelemetry.map { telemetry in
+                try ServingEvidence.SpeculativeDecodingCounters(
+                    proposedDraftTokens: telemetry.proposedCount,
+                    acceptedDraftTokens: telemetry.acceptedCount,
+                    verifyRounds: telemetry.verifyRoundCount)
+            }
+            return try ServingEvidence.ResourceSnapshot(
+                activeRequests: snapshot.activeRequests,
+                // The scalar route reserves no coordinator slots and makes no KV reservation
+                // (it has no coordinator/KV-budget concept at all) — these are structurally zero
+                // here, not unmeasured. Do not mistake a future zero here for a wiring bug.
+                coordinatorSlots: 0,
+                reservedKVBytes: 0,
+                maxReservedKVBytes: 0,
+                mlxActiveBytes: snapshot.mlxActiveBytes,
+                mlxCacheBytes: snapshot.mlxCacheBytes,
+                mlxPeakBytes: snapshot.mlxPeakBytes,
+                fitModeledPeakBytes: drift?.modeledPeakBytes,
+                fitMeasuredPeakBytes: drift?.measuredPeakBytes,
+                fitDriftVerdict: drift?.drift.rawValue,
+                fitDriftFraction: drift?.deltaFraction,
+                fitModeledWeightsBytes: drift?.modeledWeightsBytes,
+                fitModeledKVBytes: drift?.modeledKVBytes,
+                fitModeledTransientBytes: drift?.modeledTransientBytes,
+                fitModeledHeadroomBytes: drift?.modeledHeadroomBytes,
+                speculativeDecoding: speculativeDecoding)
+        },
         mode: "scalar",
         launchedModel: arguments.model,
         startupReport: .scalar(loaded.startupReport),
@@ -800,7 +847,55 @@ private func prepareBackend(
             }
             return PreparedServingBackend(
                 backend: loaded.backend,
-                evidenceSnapshot: nil,
+                evidenceSnapshot: {
+                    // `loaded.backend` is `any ServingGenerationBackend`: on a scalar-fallback
+                    // outcome its dynamic type is the concrete `ScalarServingBackend` (the exact
+                    // composition's own fallback loader returns that instance directly), so this
+                    // downcast recovers a real snapshot including in-flight request counts. On an
+                    // exact-success outcome the dynamic type is `ExactQwen35MTPServingBackend`, whose
+                    // own snapshot shape has no activeRequests field; extending it is out of this
+                    // increment's scope. Either way the allocator bytes are real: `Memory.snapshot()`
+                    // is process-global, so `.processAllocatorSample()` reports the true resident
+                    // figures for whichever backend is actually serving — only `activeRequests` stays
+                    // under-reported (0) on the exact-success path.
+                    let scalarSnapshot = await (loaded.backend as? ScalarServingBackend)?.snapshot()
+                        ?? .processAllocatorSample()
+                    // Measured-vs-modeled drift (differentiator #2), mirroring the continuous and
+                    // scalar routes: compare the sizer's modeled peak against the live allocator
+                    // high-water mark, which is always real regardless of the downcast outcome above.
+                    let drift = limits.fitDecision.map { decision in
+                        FitCheckMeasuredReport(
+                            prediction: decision.prediction,
+                            measuredPeakBytes: scalarSnapshot.mlxPeakBytes,
+                            measuredActiveBytes: scalarSnapshot.mlxActiveBytes,
+                            measuredCacheBytes: scalarSnapshot.mlxCacheBytes)
+                    }
+                    return try ServingEvidence.ResourceSnapshot(
+                        activeRequests: scalarSnapshot.activeRequests,
+                        // The scalar/exact-MTP route reserves no coordinator slots and makes no KV
+                        // reservation (it has no coordinator/KV-budget concept at all) — these are
+                        // structurally zero here, not unmeasured. Do not mistake a future zero here
+                        // for a wiring bug.
+                        coordinatorSlots: 0,
+                        reservedKVBytes: 0,
+                        maxReservedKVBytes: 0,
+                        mlxActiveBytes: scalarSnapshot.mlxActiveBytes,
+                        mlxCacheBytes: scalarSnapshot.mlxCacheBytes,
+                        mlxPeakBytes: scalarSnapshot.mlxPeakBytes,
+                        fitModeledPeakBytes: drift?.modeledPeakBytes,
+                        fitMeasuredPeakBytes: drift?.measuredPeakBytes,
+                        fitDriftVerdict: drift?.drift.rawValue,
+                        fitDriftFraction: drift?.deltaFraction,
+                        fitModeledWeightsBytes: drift?.modeledWeightsBytes,
+                        fitModeledKVBytes: drift?.modeledKVBytes,
+                        fitModeledTransientBytes: drift?.modeledTransientBytes,
+                        fitModeledHeadroomBytes: drift?.modeledHeadroomBytes,
+                        // `ExactQwen35MTPServingBackend` exposes no speculative-telemetry seam (only
+                        // the scalar-fallback downcast above would have one, and that path's own
+                        // `speculativeTelemetry()` is intentionally not read here — out of this
+                        // increment's scope); nil is the honest "no counters reachable" here.
+                        speculativeDecoding: nil)
+                },
                 mode: mode,
                 launchedModel: arguments.model,
                 startupReport: .scalar(loaded.scalarStartupReport),

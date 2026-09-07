@@ -501,6 +501,58 @@ final class ServingEvidenceTests: XCTestCase {
                                                 from: Data(plainJSON.utf8)), noDrift)
     }
 
+    func testSpeculativeDecodingCountersRoundTripAndOldPayloadsWithoutTheKeyStillDecode() throws {
+        let withCounters = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 1,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 30,
+                acceptedDraftTokens: 21,
+                verifyRounds: 9))
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(String(data: encoder.encode(withCounters), encoding: .utf8))
+        XCTAssertTrue(json.contains(#""speculative_decoding":{"#), json)
+        XCTAssertTrue(json.contains(#""proposed_draft_tokens":30"#), json)
+        XCTAssertTrue(json.contains(#""accepted_draft_tokens":21"#), json)
+        XCTAssertTrue(json.contains(#""verify_rounds":9"#), json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: Data(json.utf8)),
+            withCounters)
+
+        // A snapshot with NO speculative-decoding block (no drafter bound) omits the key entirely,
+        // rather than encoding a null or an all-zero placeholder.
+        let withoutCounters = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let plainJSON = try XCTUnwrap(String(data: encoder.encode(withoutCounters), encoding: .utf8))
+        XCTAssertFalse(plainJSON.contains("speculative_decoding"), plainJSON)
+        XCTAssertNil(
+            try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: Data(plainJSON.utf8))
+                .speculativeDecoding)
+
+        // An old on-disk payload predating this field (no `speculative_decoding` key at all) must
+        // still decode, with the field resolving to nil rather than failing closed.
+        let oldPayload = Data(
+            #"""
+            {"active_requests":0,"coordinator_slots":0,"reserved_kv_bytes":0,\#
+            "max_reserved_kv_bytes":0,"mlx_active_bytes":0,"mlx_cache_bytes":0,"mlx_peak_bytes":0}
+            """#.utf8)
+        let decodedOld = try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: oldPayload)
+        XCTAssertNil(decodedOld.speculativeDecoding)
+    }
+
     func testFitDriftFieldsSurviveTheProductionCanonicalEvidencePath() throws {
         // The acceptance for differentiator #2: the drift fields must survive the SERIALIZER production
         // actually uses — ServingEvidence.canonicalJSONData() (the JSONL sink) and decodeCanonicalJSONData

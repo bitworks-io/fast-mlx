@@ -1,6 +1,7 @@
 import XCTest
 import os
 
+import MLX
 import MLXLMCommon
 import ServingCore
 import SpikeCore
@@ -142,6 +143,47 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(snapshot.queuedRequests, 0)
     }
 
+    // Work item A: `ScalarServingBackendSnapshot` must report the live MLX allocator bytes,
+    // wired from `Memory.snapshot()` (mirroring `ContinuousServingBackendSnapshot.current`), not a
+    // hardcoded value. Force a real allocation first so `mlxActiveBytes`/`mlxPeakBytes` are
+    // provably nonzero — a stub hardcoded to 0 would fail the `XCTAssertGreaterThan` below.
+    func testSnapshotReportsAllocatorBytesWiredFromMemorySnapshot() async throws {
+        let backend = makeBackend(
+            script: [1, 99], pieces: [1: "hi"], promptTokens: [10])
+
+        let allocation = MLXArray.zeros([1_024, 1_024], type: Float32.self)
+        allocation.eval()
+        withExtendedLifetime(allocation) {}
+
+        let snapshot = await backend.snapshot()
+
+        XCTAssertGreaterThan(snapshot.mlxActiveBytes, 0, "expected a real allocation to be visible")
+        XCTAssertGreaterThanOrEqual(snapshot.mlxCacheBytes, 0)
+        // Peak active memory is a process-wide high-water mark of active memory alone (never a
+        // sum with cache — see MLX's Memory.Snapshot doc), so it must be >= the current active
+        // figure at this point in the same process.
+        XCTAssertGreaterThanOrEqual(snapshot.mlxPeakBytes, snapshot.mlxActiveBytes)
+    }
+
+    // The exact-MTP route falls back to `ScalarServingBackendSnapshot.processAllocatorSample()`
+    // when the concrete backend it is serving does not downcast to `ScalarServingBackend` (e.g. an
+    // exact-success `ExactQwen35MTPServingBackend`). `Memory.snapshot()` is process-global, so this
+    // fallback must report the REAL resident allocator bytes, not a fabricated zero — a zero there
+    // would also poison the fit-check's measured-vs-modeled drift comparison. Force a real
+    // allocation first, mirroring `testSnapshotReportsAllocatorBytesWiredFromMemorySnapshot`.
+    func testProcessAllocatorSampleReportsRealBytesWithNoRequestCounts() {
+        let allocation = MLXArray.zeros([1_024, 1_024], type: Float32.self)
+        allocation.eval()
+        withExtendedLifetime(allocation) {}
+
+        let snapshot = ScalarServingBackendSnapshot.processAllocatorSample()
+
+        XCTAssertGreaterThan(snapshot.mlxActiveBytes, 0, "expected a real allocation to be visible")
+        XCTAssertGreaterThanOrEqual(snapshot.mlxPeakBytes, snapshot.mlxActiveBytes)
+        XCTAssertEqual(snapshot.activeRequests, 0)
+        XCTAssertEqual(snapshot.queuedRequests, 0)
+    }
+
     func testRequestStopSplitAcrossTokenChunksIsNotPublished() async throws {
         let backend = makeBackend(
             script: [1, 2, 3, 4, 99],
@@ -251,11 +293,13 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(activeLeaseState, .cancelled(.shutdown))
         XCTAssertEqual(queuedLeaseState, .cancelled(.shutdown))
         let snapshot = await backend.snapshot()
-        XCTAssertEqual(
-            snapshot,
-            ScalarServingBackendSnapshot(
-                activeRequests: 0,
-                queuedRequests: 0))
+        // Assert only the two fields this test is actually about — `mlxCacheBytes`/`mlxPeakBytes`
+        // reflect the whole process's live MLX allocator state (shared across every test in this
+        // executable, see `testSnapshotReportsAllocatorBytesWiredFromMemorySnapshot`), so a
+        // full-struct equality against a hardcoded-zero allocator snapshot would be a false
+        // failure once those fields are wired to `Memory.snapshot()` instead of unmeasured.
+        XCTAssertEqual(snapshot.activeRequests, 0)
+        XCTAssertEqual(snapshot.queuedRequests, 0)
 
         do {
             _ = try await backend.start(request(maxTokens: 1))
@@ -312,11 +356,10 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(
             activeLeaseState,
             .cancelled(.shutdown))
-        XCTAssertEqual(
-            finalSnapshot,
-            ScalarServingBackendSnapshot(
-                activeRequests: 0,
-                queuedRequests: 0))
+        // See the comment in `testShutdownCancelsActiveAndQueuedRequestsAndRejectsNewWork` for why
+        // this asserts scalars rather than full-struct equality against a hardcoded-zero snapshot.
+        XCTAssertEqual(finalSnapshot.activeRequests, 0)
+        XCTAssertEqual(finalSnapshot.queuedRequests, 0)
     }
 
     func testActiveShutdownCancellationStopsAdmissionAndNeverLaunchesQueuedWork() async throws {
@@ -343,11 +386,10 @@ final class ScalarServingBackendTests: XCTestCase {
         let queuedLeaseState = await queued.lease.state
         XCTAssertEqual(queuedLeaseState, .cancelled(.shutdown))
         let snapshot = await backend.snapshot()
-        XCTAssertEqual(
-            snapshot,
-            ScalarServingBackendSnapshot(
-                activeRequests: 0,
-                queuedRequests: 0))
+        // See the comment in `testShutdownCancelsActiveAndQueuedRequestsAndRejectsNewWork` for why
+        // this asserts scalars rather than full-struct equality against a hardcoded-zero snapshot.
+        XCTAssertEqual(snapshot.activeRequests, 0)
+        XCTAssertEqual(snapshot.queuedRequests, 0)
         do {
             _ = try await backend.start(request(maxTokens: 1))
             XCTFail("Expected shutdown rejection")

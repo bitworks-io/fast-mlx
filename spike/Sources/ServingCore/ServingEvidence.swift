@@ -552,6 +552,14 @@ extension ServingEvidence {
         public let mlxCacheBytes: Int
         public let mlxPeakBytes: Int
 
+        /// Cumulative MTP speculative-decoding counters (proposed/accepted draft tokens, verify
+        /// rounds), forwarded from `InferenceActor.speculativeTelemetry()`. Optional and canonically
+        /// OMITTED — not merely all-zero — when no drafter is bound (a plain `MLXDecoder` route,
+        /// or a backend like `ExactQwen35MTPServingBackend` that exposes no such telemetry). A
+        /// PRESENT block with all-zero members is a distinct, meaningful outcome (a bound drafter
+        /// that has accepted/proposed nothing yet) and must render on `/metrics`, not be dropped.
+        public let speculativeDecoding: SpeculativeDecodingCounters?
+
         // Measured-vs-modeled drift (fit-checked-serve differentiator #2). Optional and canonically
         // OMITTED when the sizer produced no prediction (fit-check skipped) — so old snapshots stay
         // byte-identical. ServingCore stays HarnessCore-free by construction: the serve binary builds
@@ -584,7 +592,8 @@ extension ServingEvidence {
             fitModeledWeightsBytes: Int? = nil,
             fitModeledKVBytes: Int? = nil,
             fitModeledTransientBytes: Int? = nil,
-            fitModeledHeadroomBytes: Int? = nil
+            fitModeledHeadroomBytes: Int? = nil,
+            speculativeDecoding: SpeculativeDecodingCounters? = nil
         ) throws {
             let values = [
                 ("activeRequests", activeRequests),
@@ -630,6 +639,7 @@ extension ServingEvidence {
             self.fitModeledKVBytes = fitModeledKVBytes
             self.fitModeledTransientBytes = fitModeledTransientBytes
             self.fitModeledHeadroomBytes = fitModeledHeadroomBytes
+            self.speculativeDecoding = speculativeDecoding
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
@@ -648,6 +658,7 @@ extension ServingEvidence {
             case fitModeledKVBytes = "fit_modeled_kv_bytes"
             case fitModeledTransientBytes = "fit_modeled_transient_bytes"
             case fitModeledHeadroomBytes = "fit_modeled_headroom_bytes"
+            case speculativeDecoding = "speculative_decoding"
         }
 
         public init(from decoder: Decoder) throws {
@@ -686,7 +697,49 @@ extension ServingEvidence {
                     field: "fit_modeled_transient_bytes"),
                 fitModeledHeadroomBytes: ServingEvidence.decodeCanonicalOptional(
                     Int.self, from: container, forKey: .fitModeledHeadroomBytes,
-                    field: "fit_modeled_headroom_bytes"))
+                    field: "fit_modeled_headroom_bytes"),
+                speculativeDecoding: ServingEvidence.decodeCanonicalOptional(
+                    SpeculativeDecodingCounters.self, from: container, forKey: .speculativeDecoding,
+                    field: "speculative_decoding"))
+        }
+    }
+
+    /// Cumulative MTP speculative-decoding counters. Members are non-optional `Int`s BY DESIGN: the
+    /// absent/present distinction lives at the `ResourceSnapshot.speculativeDecoding` optional one
+    /// level up (no drafter bound vs a drafter bound that has done nothing yet), not per-field here.
+    public struct SpeculativeDecodingCounters: Codable, Equatable, Sendable {
+        public let proposedDraftTokens: Int
+        public let acceptedDraftTokens: Int
+        public let verifyRounds: Int
+
+        public init(
+            proposedDraftTokens: Int,
+            acceptedDraftTokens: Int,
+            verifyRounds: Int
+        ) throws {
+            try ServingEvidence.validateNonNegative(proposedDraftTokens, field: "proposedDraftTokens")
+            try ServingEvidence.validateNonNegative(acceptedDraftTokens, field: "acceptedDraftTokens")
+            try ServingEvidence.validateNonNegative(verifyRounds, field: "verifyRounds")
+            self.proposedDraftTokens = proposedDraftTokens
+            self.acceptedDraftTokens = acceptedDraftTokens
+            self.verifyRounds = verifyRounds
+        }
+
+        private enum CodingKeys: String, CodingKey, CaseIterable {
+            case proposedDraftTokens = "proposed_draft_tokens"
+            case acceptedDraftTokens = "accepted_draft_tokens"
+            case verifyRounds = "verify_rounds"
+        }
+
+        public init(from decoder: Decoder) throws {
+            try ServingEvidence.rejectUnknownKeys(
+                from: decoder,
+                allowed: CodingKeys.allCases.map(\.rawValue))
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            try self.init(
+                proposedDraftTokens: container.decode(Int.self, forKey: .proposedDraftTokens),
+                acceptedDraftTokens: container.decode(Int.self, forKey: .acceptedDraftTokens),
+                verifyRounds: container.decode(Int.self, forKey: .verifyRounds))
         }
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 
+import MLX
 import MLXLMCommon
 import ServingCore
 import SpikeCore
@@ -126,10 +127,41 @@ public struct ScalarServingBackendConfiguration: Sendable {
 public struct ScalarServingBackendSnapshot: Equatable, Sendable {
     public let activeRequests: Int
     public let queuedRequests: Int
+    public let mlxActiveBytes: Int
+    public let mlxCacheBytes: Int
+    public let mlxPeakBytes: Int
 
-    public init(activeRequests: Int, queuedRequests: Int) {
+    public init(
+        activeRequests: Int,
+        queuedRequests: Int,
+        mlxActiveBytes: Int = 0,
+        mlxCacheBytes: Int = 0,
+        mlxPeakBytes: Int = 0
+    ) {
         self.activeRequests = activeRequests
         self.queuedRequests = queuedRequests
+        self.mlxActiveBytes = mlxActiveBytes
+        self.mlxCacheBytes = mlxCacheBytes
+        self.mlxPeakBytes = mlxPeakBytes
+    }
+}
+
+extension ScalarServingBackendSnapshot {
+    /// The live process-wide MLX allocator sample, with no in-flight request counts.
+    ///
+    /// `Memory.snapshot()` is process-global, so the allocator figures are correct no matter which
+    /// backend type is serving. Routes whose concrete backend publishes no snapshot shape use this
+    /// rather than reporting a fabricated zero for an allocator that has a model resident — a zero
+    /// there would also poison the measured-vs-modeled drift comparison, which divides by the
+    /// modeled peak.
+    public static func processAllocatorSample() -> ScalarServingBackendSnapshot {
+        let memory = Memory.snapshot()
+        return ScalarServingBackendSnapshot(
+            activeRequests: 0,
+            queuedRequests: 0,
+            mlxActiveBytes: memory.activeMemory,
+            mlxCacheBytes: memory.cacheMemory,
+            mlxPeakBytes: memory.peakMemory)
     }
 }
 
@@ -337,9 +369,20 @@ public actor ScalarServingBackend: ServingGenerationBackend {
     }
 
     public func snapshot() -> ScalarServingBackendSnapshot {
-        ScalarServingBackendSnapshot(
+        let memory = Memory.snapshot()
+        return ScalarServingBackendSnapshot(
             activeRequests: active == nil ? 0 : 1,
-            queuedRequests: queue.count)
+            queuedRequests: queue.count,
+            mlxActiveBytes: memory.activeMemory,
+            mlxCacheBytes: memory.cacheMemory,
+            mlxPeakBytes: memory.peakMemory)
+    }
+
+    /// Cumulative MTP speculative-decoding counters, forwarded from `InferenceActor`. `nil` means
+    /// the bound decoder does not conform to `SpeculativeTelemetryProviding` (a plain `MLXDecoder`,
+    /// not an `MTPSpeculativeDecoder`) — preserve that nil/non-nil distinction to callers.
+    public func speculativeTelemetry() async -> SpeculativeTelemetrySnapshot? {
+        await inference.speculativeTelemetry()
     }
 
     /// Stop admission and cancel every active or queued request before returning.

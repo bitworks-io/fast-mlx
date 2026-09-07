@@ -1054,6 +1054,126 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await authorizedChannel.finish()
     }
 
+    /// A present `speculativeDecoding` block — even all-zero — must render as `0`, not be dropped.
+    /// This is the specific bug `appendOptionalMetric`'s early-return-on-nil would reintroduce (see
+    /// the sibling absent-case test below; together the two prove `0` and "absent" are
+    /// distinguishable on the wire, which is the entire point of this increment).
+    func testMetricsEndpointRendersPresentZeroSpeculativeDecodingCountersNotOmitted() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0,
+                acceptedDraftTokens: 0,
+                verifyRounds: 0))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(
+            response.body.contains("fastmlx_mtp_proposed_draft_tokens_total 0"),
+            "an all-zero present block must still render the metric line, not be omitted")
+        XCTAssertTrue(response.body.contains("fastmlx_mtp_accepted_draft_tokens_total 0"))
+        XCTAssertTrue(response.body.contains("fastmlx_mtp_verify_rounds_total 0"))
+        XCTAssertTrue(response.body.contains("# TYPE fastmlx_mtp_proposed_draft_tokens_total counter"))
+        _ = try await channel.finish()
+    }
+
+    /// A `nil` `speculativeDecoding` (no drafter bound) must render NO `fastmlx_mtp_` substring at
+    /// all. Alone this test is inert (it would also pass if the feature were never implemented);
+    /// paired with the present-zero test above it proves the renderer distinguishes "absent" from
+    /// "present with 0", which a `appendOptionalMetric`-style early-return-on-nil route cannot do
+    /// once the block itself starts routing through it (see the mutation check in the increment
+    /// report).
+    func testMetricsEndpointOmitsSpeculativeDecodingMetricsEntirelyWhenNoDrafterBound() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0)
+        XCTAssertNil(snapshot.speculativeDecoding)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertFalse(response.body.contains("fastmlx_mtp_"))
+        _ = try await channel.finish()
+    }
+
+    /// Nonzero counters render their real values and the `# TYPE` line says `counter`, matching the
+    /// Prometheus convention for a monotonic total (never `gauge`, which `appendMetric` emits).
+    func testMetricsEndpointRendersNonzeroSpeculativeDecodingCountersAsCounterType() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 17,
+                acceptedDraftTokens: 11,
+                verifyRounds: 5))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains("fastmlx_mtp_proposed_draft_tokens_total 17"))
+        XCTAssertTrue(response.body.contains("fastmlx_mtp_accepted_draft_tokens_total 11"))
+        XCTAssertTrue(response.body.contains("fastmlx_mtp_verify_rounds_total 5"))
+        XCTAssertTrue(response.body.contains("# TYPE fastmlx_mtp_accepted_draft_tokens_total counter"))
+        XCTAssertFalse(response.body.contains("# TYPE fastmlx_mtp_accepted_draft_tokens_total gauge"))
+        _ = try await channel.finish()
+    }
+
     func testMetricsEndpointRejectsWrongMethodAndRequestBodyBeforeBackendWork()
         async throws
     {
@@ -1105,6 +1225,132 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
             bodyResponse.body)
         XCTAssertEqual(bodyBackend.snapshot().startCount, 0)
         _ = try await bodyChannel.finish()
+    }
+
+    // Proves the gate-2 fix: a scalar (or exact-MTP) serve has NO `--evidence` sink, so
+    // `configuration.evidence` is `nil` — but `configuration.metricsSnapshot` (populated
+    // unconditionally by FastMLXServe from `PreparedServingBackend.evidenceSnapshot`) must still
+    // let `/metrics` render a real Prometheus body instead of `metrics_unavailable`.
+    func testMetricsEndpointWithMetricsSnapshotButNoEvidenceRendersPrometheusText()
+        async throws
+    {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 1,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 4_096,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 8_192)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { snapshot })
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            channel,
+            method: .GET,
+            uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(
+            response.head.headers.first(name: "content-type"),
+            "text/plain; version=0.0.4; charset=utf-8")
+        XCTAssertTrue(response.body.contains("fastmlx_up 1"), response.body)
+        XCTAssertTrue(response.body.contains("fastmlx_active_requests 1"), response.body)
+        XCTAssertFalse(response.body.contains("metrics_unavailable"), response.body)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    // Regression guard: when BOTH `evidence` and `metricsSnapshot` are absent, `/metrics` must
+    // still fail closed with `metrics_unavailable` — the fix above must not make the guard
+    // unconditionally true.
+    func testMetricsEndpointWithoutEvidenceOrMetricsSnapshotStillReturnsUnavailable()
+        async throws
+    {
+        let backend = ScriptedBackend(scripts: [])
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+
+        try await writeHeadOnlyRequest(
+            channel,
+            method: .GET,
+            uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .internalServerError)
+        XCTAssertEqual(
+            response.body,
+            """
+            {"error":{"code":"metrics_unavailable","message":"Metrics snapshot is not configured","param":null,"type":"server_error"}}
+            """)
+        _ = try await channel.finish()
+    }
+
+    // Regression guard: when `evidence.snapshot` IS present it still takes precedence over
+    // `metricsSnapshot` (the continuous route only ever supplies `evidence`, never
+    // `metricsSnapshot`, but this locks the precedence order even if both were ever set).
+    func testMetricsEndpointPrefersEvidenceSnapshotOverMetricsSnapshot()
+        async throws
+    {
+        let evidenceSnapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 9,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0)
+        let metricsOnlySnapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 3,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0)
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { evidenceSnapshot },
+                record: { _ in },
+                reportFailure: { _ in }),
+            metricsSnapshot: { metricsOnlySnapshot })
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(
+            channel,
+            method: .GET,
+            uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains("fastmlx_active_requests 9"), response.body)
+        XCTAssertFalse(response.body.contains("fastmlx_active_requests 3"), response.body)
+        _ = try await channel.finish()
     }
 
     func testMetricsEndpointWithoutSnapshotProviderReturnsDeterministic500WithoutBackendWork()

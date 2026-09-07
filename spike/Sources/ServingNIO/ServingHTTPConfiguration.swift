@@ -84,6 +84,12 @@ public struct ServingHTTPConfiguration: Sendable {
     public let backpressureStallTimeout: Duration
     public let evidence: ServingHTTPEvidenceConfiguration?
     public let modelCapabilities: ServingModelCapabilities?
+    /// Carries the `/metrics` snapshot provider independently of `evidence`, so routes that supply
+    /// no `--evidence` sink (and therefore no `ServingHTTPEvidenceConfiguration` — see its
+    /// fail-closed admission tracker) can still serve real metrics. `runMetrics` reads
+    /// `evidence?.snapshot ?? metricsSnapshot`. `nil` by default so every existing construction
+    /// site keeps compiling unchanged.
+    public let metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider?
 
     public init(
         launchedModel: String,
@@ -92,7 +98,8 @@ public struct ServingHTTPConfiguration: Sendable {
         maximumNonStreamingResponseBytes: Int,
         backpressureStallTimeout: Duration,
         evidence: ServingHTTPEvidenceConfiguration? = nil,
-        modelCapabilities: ServingModelCapabilities? = nil
+        modelCapabilities: ServingModelCapabilities? = nil,
+        metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -114,6 +121,7 @@ public struct ServingHTTPConfiguration: Sendable {
         self.backpressureStallTimeout = backpressureStallTimeout
         self.evidence = evidence
         self.modelCapabilities = modelCapabilities
+        self.metricsSnapshot = metricsSnapshot
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")
