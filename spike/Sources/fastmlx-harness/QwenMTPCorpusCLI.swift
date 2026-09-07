@@ -610,7 +610,7 @@ private func runScalar(
         modelConfiguration: pair.target.configuration,
         tokenizer: pair.target.tokenizer)
     var stopOutcome: QwenMTPCorpusStopOutcome = .stop
-    while let token = iterator.next() {
+    while let token = try iterator.nextThrowing() {
         if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
             iterator.discardGeneratedToken()
             stopOutcome = .stop
@@ -694,7 +694,7 @@ private func runMTPDrain(
         modelConfiguration: pair.target.configuration,
         tokenizer: pair.target.tokenizer)
     var stopOutcome: QwenMTPCorpusStopOutcome = .stop
-    while let token = iterator.next() {
+    while let token = try iterator.nextThrowing() {
         if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
             iterator.discardGeneratedToken()
             stopOutcome = .stop
@@ -789,7 +789,7 @@ private func runMTPCancelAfterExtraGenerated(
         tokenizer: pair.target.tokenizer)
     var stopOutcome: QwenMTPCorpusStopOutcome?
     while tokens.count < retainedTokens {
-        guard let token = iterator.next() else { break }
+        guard let token = try iterator.nextThrowing() else { break }
         if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
             iterator.discardGeneratedToken()
             stopOutcome = .stop
@@ -798,7 +798,7 @@ private func runMTPCancelAfterExtraGenerated(
         tokens.append(token)
     }
     var discardedExtraGeneratedToken = false
-    if stopOutcome == nil, tokens.count == retainedTokens, iterator.next() != nil {
+    if stopOutcome == nil, tokens.count == retainedTokens, try iterator.nextThrowing() != nil {
         iterator.discardGeneratedToken()
         discardedExtraGeneratedToken = true
     }
@@ -855,7 +855,7 @@ private func runMTPCancelAfterAcceptedDraft(
         tokenizer: pair.target.tokenizer)
     var stopped = false
     while tokens.count < safetyCap, iterator.acceptedCount <= 0 {
-        guard let token = iterator.next() else { break }
+        guard let token = try iterator.nextThrowing() else { break }
         if token == pair.target.tokenizer.unknownTokenId || stopTokenIds.contains(token) {
             iterator.discardGeneratedToken()
             stopped = true
@@ -865,7 +865,7 @@ private func runMTPCancelAfterAcceptedDraft(
     }
     let acceptedDraftObserved = iterator.acceptedCount > 0
     var discardedExtraGeneratedToken = false
-    if acceptedDraftObserved, !stopped, iterator.next() != nil {
+    if acceptedDraftObserved, !stopped, try iterator.nextThrowing() != nil {
         iterator.discardGeneratedToken()
         discardedExtraGeneratedToken = true
     }

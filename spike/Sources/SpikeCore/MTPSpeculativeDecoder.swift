@@ -61,12 +61,20 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     /// never cleared once observed, mirroring the iterator's own "sticky" semantics.
     private var accumulatedProposedCount = 0
     private var accumulatedAcceptedCount = 0
+    /// See `SpeculativeTelemetrySnapshot.verifyRoundCount`'s doc comment: the iterator's own
+    /// `speculativeDecodingTelemetry` is `nil` exactly when its `roundCount == 0` (a legitimate
+    /// "no rounds run yet" state), so every read of it below is coalesced with `?? 0` rather than
+    /// propagated as `nil` — a live iterator with zero rounds must read as `0`, not fall back to
+    /// `stickyPassthroughReason`-style "unknown".
+    private var accumulatedVerifyRoundCount = 0
     private var stickyPassthroughReason: String?
 
     public var speculativeTelemetrySnapshot: SpeculativeTelemetrySnapshot {
         SpeculativeTelemetrySnapshot(
             proposedCount: accumulatedProposedCount + (iterator?.proposedDraftTokens ?? 0),
             acceptedCount: accumulatedAcceptedCount + (iterator?.acceptedDraftTokens ?? 0),
+            verifyRoundCount: accumulatedVerifyRoundCount
+                + (iterator?.speculativeDecodingTelemetry?.roundCount ?? 0),
             passthroughReason: iterator?.passthroughReason ?? stickyPassthroughReason)
     }
 
@@ -182,6 +190,7 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
         if let iterator {
             accumulatedProposedCount += iterator.proposedDraftTokens
             accumulatedAcceptedCount += iterator.acceptedDraftTokens
+            accumulatedVerifyRoundCount += iterator.speculativeDecodingTelemetry?.roundCount ?? 0
             if let reason = iterator.passthroughReason {
                 stickyPassthroughReason = reason
             }

@@ -40,6 +40,25 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         [0, 0, bonusValue] + Array(repeating: tailValue, count: count)
     }
 
+    /// Forces a REAL rejection inside an otherwise-accepting run — unlike `acceptAllPlannedTokens`
+    /// paired with a drafter that always proposes the tail value (every draft matches by
+    /// construction, so an "accepted < proposed" assertion built on it alone can never fail).
+    /// Index 4 is the one planned value that does NOT equal `draftedTokenValue`; every other index
+    /// from 3 onward does. With `blockSize == 3` (`numDraft == 2`) and a drafter that always
+    /// proposes `draftedTokenValue` for both slots, this makes round 1's SECOND slot mismatch —
+    /// `k == 1` accepted that round — while every later round (starting at the next planned index)
+    /// accepts both slots — `k == 2`. See
+    /// `testPerRequestDeltaMatchesIndependentlyComputedArithmeticForBlockSizeThree`'s doc comment
+    /// for the full round-by-round derivation this fixture is built to support.
+    private static func mismatchThenAcceptPlannedTokens(
+        bonusValue: Int32 = 5, draftedTokenValue: Int32 = 6, divergentValue: Int32 = 7,
+        count: Int = 80
+    ) -> [Int32] {
+        var tokens: [Int32] = [0, 0, bonusValue] + Array(repeating: draftedTokenValue, count: count)
+        tokens[4] = divergentValue
+        return tokens
+    }
+
     // MARK: - 1. Anti-inertness (load-bearing)
 
     /// At `blockSize` 3, a genuinely speculating accept-all run of N emitted tokens costs roughly
@@ -335,6 +354,162 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         let telemetrySnapshot = await actor.speculativeTelemetry()
         let telemetry = try XCTUnwrap(telemetrySnapshot)
         XCTAssertNotNil(telemetry.passthroughReason)
+    }
+
+    // MARK: - 8. Per-request telemetry delta (observability)
+
+    /// Independently-derived expected value, NOT the observed output pinned after the fact (see
+    /// this file's own doc comment on `mismatchThenAcceptPlannedTokens` and the repeated project
+    /// lesson that a pinned-without-derivation number is not a real check).
+    ///
+    /// Round-by-round arithmetic for `mismatchThenAcceptPlannedTokens()` (bonus=5, drafted=6,
+    /// divergent=7 at planned index 4), prompt `[1, 2, 3]` (length 3), `blockSize == 3`
+    /// (`numDraft == blockSize - 1 == 2`):
+    ///
+    /// - Prefill returns the prepare-time bonus token (planned index 2 == 5). This does NOT go
+    ///   through `speculateRound()` — it is appended to `pendingTokens` directly during `prepare()`
+    ///   — so it contributes nothing to `proposedCount`/`acceptedCount`/`verifyRoundCount`. The mock
+    ///   target's cache offset is now 3 (the 3 prompt positions consumed).
+    /// - Round 1 starts at cache offset (global planned index) 3. Draft slot 0 vs planned[3] == 6:
+    ///   match. Draft slot 1 vs planned[4] == 7 (the injected divergence): drafted value is 6, so
+    ///   this MISMATCHES — the accept loop stops with `accepted == 1` (`k == 1`), and the
+    ///   mismatching target token (planned[4] == 7) is appended as the round's correction instead
+    ///   of a bonus row. Round 1 emits `accepted + 1 == 2` tokens (values 6, 7).
+    ///   `proposedCount += numDraft (2)`, `acceptedCount += accepted (1)`. The (real, non-mock) KV
+    ///   cache trim advances the next round's start offset by exactly `accepted + 1 == 2`, so round
+    ///   2 starts at offset `3 + 2 == 5`.
+    /// - Round 2 starts at offset 5. Draft slot 0 vs planned[5] == 6: match. Draft slot 1 vs
+    ///   planned[6] == 6: match — `accepted == numDraft == 2` (`k == 2`), so a bonus row is sampled
+    ///   from planned[7] == 6. Round 2 emits 3 tokens (6, 6, 6). `proposedCount += 2` (running total
+    ///   4), `acceptedCount += 2` (running total 3). Next round starts at offset `5 + 3 == 8`.
+    /// - Round 3 starts at offset 8. Draft slot 0 vs planned[8] == 6: match. Draft slot 1 vs
+    ///   planned[9] == 6: match — `k == 2` again, bonus from planned[10] == 6. Round 3 emits 3
+    ///   tokens (6, 6, 6). `proposedCount += 2` (running total 6), `acceptedCount += 2` (running
+    ///   total 5).
+    ///
+    /// Total emitted tokens: 1 (prefill bonus) + 2 (round 1) + 3 (round 2) + 3 (round 3) == 9,
+    /// which is exactly `maxTokens` below — the run ends precisely at round 3's last token with no
+    /// partial 4th round, so the accumulated counters ARE this request's whole delta (a fresh actor
+    /// starts every counter at 0). Independently-computed expected values: `proposedDraftTokens ==
+    /// 6`, `acceptedDraftTokens == 5` (strictly less than proposed, from round 1's real rejection —
+    /// not a constant), `verifyRoundCount == 3`.
+    func testPerRequestDeltaMatchesIndependentlyComputedArithmeticForBlockSizeThree() async throws {
+        let plannedTokens = Self.mismatchThenAcceptPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 9
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let delta = try XCTUnwrap(summary.speculativeDelta)
+        XCTAssertEqual(delta.proposedDraftTokens, 6)
+        XCTAssertEqual(delta.acceptedDraftTokens, 5)
+        XCTAssertLessThan(delta.acceptedDraftTokens, delta.proposedDraftTokens)
+        XCTAssertNil(delta.passthroughReason)
+
+        // Independent second axis (round count), not derivable from proposed/accepted alone: three
+        // `speculateRound()` calls (one per round above), reachable only through the actor's own
+        // cumulative-snapshot API since it is not threaded onto `InferenceRunSummary`.
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        XCTAssertEqual(telemetry.verifyRoundCount, 3)
+    }
+
+    /// Companion to the arithmetic test above: a drafter whose fixed proposal never matches ANY
+    /// planned continuation (every round rejects immediately, `k == 0`) still yields
+    /// `acceptedDraftTokens` strictly less than `proposedDraftTokens` on the per-request delta —
+    /// proving the reported number tracks real acceptance rather than being pinned to a constant
+    /// (e.g. always reporting 0, or always reporting the proposed count unchanged).
+    func testMismatchedDrafterYieldsPerRequestDeltaAcceptedStrictlyLessThanProposed() async throws {
+        let plannedTokens = Self.acceptAllPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        // 3 never matches the target's real continuation (5 for the bonus, 6 for everything
+        // after) — every proposal in every round is rejected, so accepted stays 0 for the whole run
+        // while proposed keeps growing.
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 3)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 9
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        let delta = try XCTUnwrap(summary.speculativeDelta)
+        XCTAssertEqual(delta.acceptedDraftTokens, 0)
+        XCTAssertGreaterThan(delta.proposedDraftTokens, 0)
+        XCTAssertLessThan(delta.acceptedDraftTokens, delta.proposedDraftTokens)
+    }
+
+    /// THE load-bearing test for this increment: proves the reported number is a PER-REQUEST rate,
+    /// not the decoder's lifetime cumulative counter. `MTPSpeculativeDecoder`'s counters are
+    /// cumulative and deliberately survive `reset()` (see `testResetStartsFreshAndTelemetryAccumulatesAcrossRuns`
+    /// above) — so a caller reading `InferenceRunSummary.speculativeDelta` on a SECOND request must
+    /// see that request's OWN contribution, not the running total across both requests. Two
+    /// identically-configured accept-all runs of `maxTokens == 6` each drive exactly 2 speculation
+    /// rounds apiece (both full-accept, `k == 2`): `proposedCount += 2` per round (total 4),
+    /// `acceptedCount += 2` per round (total 4) — matching
+    /// `testResetStartsFreshAndTelemetryAccumulatesAcrossRuns`'s already-passing cumulative
+    /// assertion that the SECOND run's cumulative snapshot equals exactly double the first's. If
+    /// the second request's delta were computed wrong (e.g. reporting the cumulative snapshot
+    /// instead of a delta), it would read `(8, 8)` here, not `(4, 4)`.
+    func testSuccessiveRequestsReportPerRequestDeltasNotCumulativeTotals() async throws {
+        let plannedTokens = Self.acceptAllPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 6
+        let firstSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99
+        ) { _ in .continueGeneration }
+        let secondSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(firstSummary.finishReason, .length)
+        XCTAssertEqual(secondSummary.finishReason, .length)
+
+        let firstDelta = try XCTUnwrap(firstSummary.speculativeDelta)
+        let secondDelta = try XCTUnwrap(secondSummary.speculativeDelta)
+
+        XCTAssertEqual(firstDelta.proposedDraftTokens, 4)
+        XCTAssertEqual(firstDelta.acceptedDraftTokens, 4)
+        // The load-bearing assertions: the SECOND request's own delta, not the running total.
+        // A decoder that reported the cumulative snapshot instead of a delta would read (8, 8).
+        XCTAssertEqual(secondDelta.proposedDraftTokens, 4)
+        XCTAssertEqual(secondDelta.acceptedDraftTokens, 4)
+    }
+
+    /// `ScriptedDecoder` does not conform to `SpeculativeTelemetryProviding`, so
+    /// `InferenceRunSummary.speculativeDelta` must be `nil` — ABSENT, not a zero-valued delta.
+    /// Zero is a legitimate speculative outcome (see the mismatched-drafter test above); `nil` is
+    /// reserved for "this decoder has no speculative counters at all". Collapsing the two would
+    /// make a non-speculative route indistinguishable from a speculative route that never accepts.
+    func testNonSpeculativeDecoderReportsSpeculativeDeltaAsAbsentNotZero() async throws {
+        let decoder = ScriptedDecoder(script: [1, 2, 3, 99], eos: 99)
+        let actor = InferenceActor(decoder: decoder)
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [7], maxTokens: 10, eos: 99
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .endOfSequence)
+        XCTAssertNil(summary.speculativeDelta)
     }
 }
 

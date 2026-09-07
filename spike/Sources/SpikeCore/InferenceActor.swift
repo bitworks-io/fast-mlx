@@ -78,11 +78,21 @@ extension Decoder {
 public struct SpeculativeTelemetrySnapshot: Equatable, Sendable {
     public let proposedCount: Int
     public let acceptedCount: Int
+    /// Number of speculative verify rounds run (one `speculateRound()` call each, regardless of
+    /// how many draft tokens that round accepted — including a round that accepted zero). Sourced
+    /// from `MTPSpeculativeTokenIterator.speculativeDecodingTelemetry?.roundCount`, which is `nil`
+    /// exactly when `roundCount == 0` (a legitimate "no rounds yet" state, not an error) — callers
+    /// populating this field must coalesce that `nil` to `0`, never let it collapse this whole
+    /// snapshot to absent.
+    public let verifyRoundCount: Int
     public let passthroughReason: String?
 
-    public init(proposedCount: Int, acceptedCount: Int, passthroughReason: String?) {
+    public init(
+        proposedCount: Int, acceptedCount: Int, verifyRoundCount: Int, passthroughReason: String?
+    ) {
         self.proposedCount = proposedCount
         self.acceptedCount = acceptedCount
+        self.verifyRoundCount = verifyRoundCount
         self.passthroughReason = passthroughReason
     }
 }
@@ -128,19 +138,53 @@ public enum InferenceRunFinishReason: Equatable, Sendable {
     case length
 }
 
+/// Per-request speculative-decoding telemetry, computed as a DELTA between the decoder's
+/// cumulative `SpeculativeTelemetrySnapshot` sampled immediately before this request's generation
+/// began and immediately after it ended. The underlying counters are cumulative across the
+/// decoder's whole life and deliberately SURVIVE `reset()` (see `MTPSpeculativeDecoder.reset()`),
+/// so without this delta a caller reading `InferenceActor.speculativeTelemetry()` after N requests
+/// would see the lifetime total, not this request's contribution to it.
+///
+/// `InferenceRunSummary.speculativeDelta` is `nil` when the decoder is not speculative at all
+/// (does not conform to `SpeculativeTelemetryProviding`) — distinct from a speculative decoder
+/// that proposed and accepted exactly zero draft tokens this request, which is a legitimate,
+/// meaningful outcome represented by a non-nil value with `proposedDraftTokens == 0`.
+public struct InferenceRunSpeculativeDelta: Equatable, Sendable {
+    public let proposedDraftTokens: Int
+    public let acceptedDraftTokens: Int
+    /// The decoder's sticky passthrough reason as of the END of this request — not itself a delta.
+    /// `passthroughReason` only ever moves from `nil` to a value and then stays there (see
+    /// `SpeculativeTelemetrySnapshot`'s doc comment), so a non-nil value here means passthrough was
+    /// in effect by the time this request finished, whether it engaged during this request or an
+    /// earlier one.
+    public let passthroughReason: String?
+
+    public init(proposedDraftTokens: Int, acceptedDraftTokens: Int, passthroughReason: String?) {
+        self.proposedDraftTokens = proposedDraftTokens
+        self.acceptedDraftTokens = acceptedDraftTokens
+        self.passthroughReason = passthroughReason
+    }
+}
+
 public struct InferenceRunSummary: Equatable, Sendable {
     public let promptTokenCount: Int
     public let generatedTokenCount: Int
     public let finishReason: InferenceRunFinishReason
+    /// `nil` for a non-speculative decoder; see `InferenceRunSpeculativeDelta`'s doc comment for
+    /// why absent and zero must stay distinguishable. Defaults to `nil` so existing call sites
+    /// that predate this field keep compiling unchanged.
+    public let speculativeDelta: InferenceRunSpeculativeDelta?
 
     public init(
         promptTokenCount: Int,
         generatedTokenCount: Int,
-        finishReason: InferenceRunFinishReason
+        finishReason: InferenceRunFinishReason,
+        speculativeDelta: InferenceRunSpeculativeDelta? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generatedTokenCount = generatedTokenCount
         self.finishReason = finishReason
+        self.speculativeDelta = speculativeDelta
     }
 }
 
@@ -244,6 +288,36 @@ public actor InferenceActor {
             boundedGenerationActive = false
         }
 
+        // Sampled BEFORE this request's `prefill`, so the delta computed in `runSummary` below
+        // reflects only what THIS request contributed to the decoder's cumulative counters — not
+        // the lifetime total. `nil` here (a non-speculative decoder) propagates straight through
+        // to `InferenceRunSummary.speculativeDelta == nil`.
+        let telemetryBefore = (decoder as? SpeculativeTelemetryProviding)?.speculativeTelemetrySnapshot
+
+        // Single computed helper shared by every non-throwing exit below, so a future new return
+        // point cannot silently omit the telemetry the way past bugs in this codebase have shipped
+        // a field that was silently absent on one path among several.
+        func runSummary(
+            generatedTokenCount: Int, finishReason: InferenceRunFinishReason
+        ) -> InferenceRunSummary {
+            let speculativeDelta: InferenceRunSpeculativeDelta?
+            if let telemetryBefore,
+                let telemetryAfter =
+                    (decoder as? SpeculativeTelemetryProviding)?.speculativeTelemetrySnapshot {
+                speculativeDelta = InferenceRunSpeculativeDelta(
+                    proposedDraftTokens: telemetryAfter.proposedCount - telemetryBefore.proposedCount,
+                    acceptedDraftTokens: telemetryAfter.acceptedCount - telemetryBefore.acceptedCount,
+                    passthroughReason: telemetryAfter.passthroughReason)
+            } else {
+                speculativeDelta = nil
+            }
+            return InferenceRunSummary(
+                promptTokenCount: promptTokens.count,
+                generatedTokenCount: generatedTokenCount,
+                finishReason: finishReason,
+                speculativeDelta: speculativeDelta)
+        }
+
         try Task.checkCancellation()
         var token = try decoder.prefill(promptTokens)
         var generatedTokenCount = 0
@@ -251,10 +325,8 @@ public actor InferenceActor {
         while true {
             try Task.checkCancellation()
             if stopTokenIDs.contains(token) {
-                return InferenceRunSummary(
-                    promptTokenCount: promptTokens.count,
-                    generatedTokenCount: generatedTokenCount,
-                    finishReason: .endOfSequence)
+                return runSummary(
+                    generatedTokenCount: generatedTokenCount, finishReason: .endOfSequence)
             }
             guard token >= 0 else {
                 throw InferenceActorError.invalidTokenID(token)
@@ -263,16 +335,12 @@ public actor InferenceActor {
             generatedTokenCount += 1
             let disposition = try await consume(token)
             if disposition == .stopGeneration {
-                return InferenceRunSummary(
-                    promptTokenCount: promptTokens.count,
-                    generatedTokenCount: generatedTokenCount,
-                    finishReason: .consumerStop)
+                return runSummary(
+                    generatedTokenCount: generatedTokenCount, finishReason: .consumerStop)
             }
             if generatedTokenCount == maxTokens {
-                return InferenceRunSummary(
-                    promptTokenCount: promptTokens.count,
-                    generatedTokenCount: generatedTokenCount,
-                    finishReason: .length)
+                return runSummary(
+                    generatedTokenCount: generatedTokenCount, finishReason: .length)
             }
 
             try Task.checkCancellation()

@@ -482,7 +482,7 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
         var tokens: [Int] = []
         var firstTokenTime: Double?
         let decodeStart = ProcessInfo.processInfo.systemUptime
-        while let token = iterator.next(), tokens.count < maxTokens {
+        while let token = try iterator.nextThrowing(), tokens.count < maxTokens {
             firstTokenTime = firstTokenTime ?? ProcessInfo.processInfo.systemUptime
             tokens.append(token)
         }
@@ -532,7 +532,7 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
         var tokens: [Int] = []
         var firstTokenTime: Double?
         let decodeStart = ProcessInfo.processInfo.systemUptime
-        while let token = iterator.next(), tokens.count < maxTokens {
+        while let token = try iterator.nextThrowing(), tokens.count < maxTokens {
             firstTokenTime = firstTokenTime ?? ProcessInfo.processInfo.systemUptime
             tokens.append(token)
         }

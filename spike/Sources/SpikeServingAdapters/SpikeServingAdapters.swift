@@ -462,6 +462,32 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         active?.task = task
     }
 
+    /// Machine-readable per-request MTP telemetry line: space-separated `key=value`, matching the
+    /// convention of `ScalarServingInCheckpointMTPStartupVerdict.machineReadableFields()`
+    /// (`MLXScalarServing.swift`). Prefixed `mtp_request_` — distinct from BOTH the startup line's
+    /// `in_checkpoint_mtp_*`/`exact_qwen35_mtp_*` keys and the offline gate's `mtp_*` keys
+    /// (`mtp_exact`, `mtp_accept_rate`, ...), so a log scraper can never confuse a per-request line
+    /// with either. All fields are always present, including zero-valued ones (`acceptedDraftTokens
+    /// == 0` is a legitimate, meaningful outcome per `InferenceRunSpeculativeDelta`'s own doc
+    /// comment — it must be visible, not silently omitted).
+    private static func mtpRequestTelemetryLine(
+        requestID: ServingRequestID, generatedTokenCount: Int, delta: InferenceRunSpeculativeDelta
+    ) -> String {
+        // `passthroughReason` strings contain spaces (e.g. "main model did not emit drafter
+        // state" — see `MTPSpeculativeTokenIterator.switchToPassthrough`), which would otherwise
+        // split a space-separated `key=value` line into multiple bogus tokens.
+        let passthroughReason =
+            delta.passthroughReason.map { $0.replacingOccurrences(of: " ", with: "_") } ?? "none"
+        return [
+            "mtp_request_telemetry=true",
+            "mtp_request_id=\(requestID.rawValue)",
+            "mtp_request_proposed_draft_tokens=\(delta.proposedDraftTokens)",
+            "mtp_request_accepted_draft_tokens=\(delta.acceptedDraftTokens)",
+            "mtp_request_generated_token_count=\(generatedTokenCount)",
+            "mtp_request_passthrough_reason=\(passthroughReason)",
+        ].joined(separator: " ")
+    }
+
     private func execute(id: ServingRequestID) async {
         guard let request = active?.request, request.id == id else {
             return
@@ -479,6 +505,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                     throw CancellationError()
                 }
                 return try await self.publish(token: token, for: id)
+            }
+            // Emitted for EVERY completed speculative request, including a zero-acceptance or
+            // passthrough one (`delta` itself, not any of its fields, gates this) — a field
+            // silently omitted on a legitimate zero has already shipped as a real bug in this
+            // codebase once. `nil` (a non-speculative decoder/route) emits nothing, matching
+            // `speculativeDelta`'s own absent-vs-zero contract. Uses the same bare `print` (stdout)
+            // mechanism as `FastMLXServe.startupLine`, not a new logging path, so this line is
+            // readable off a live serve the same way the startup line already is.
+            if let delta = summary.speculativeDelta {
+                print(
+                    Self.mtpRequestTelemetryLine(
+                        requestID: id, generatedTokenCount: summary.generatedTokenCount,
+                        delta: delta))
             }
             try Task.checkCancellation()
             try await flushStopFilter(for: id)
