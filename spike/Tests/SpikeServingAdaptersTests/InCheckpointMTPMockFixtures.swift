@@ -38,7 +38,7 @@ import MLXNN
 //      not a persistent per-instance call counter (unlike the vendored original). This is a
 //      deliberate generalization: the same mock instance must drive BOTH the scalar-reference
 //      (`TokenIterator`) and speculative (`MTPSpeculativeTokenIterator`) decode paths in the
-//      SAME test — exactly what `verifyInCheckpointMTPStartupEquivalence` itself does — each
+//      SAME test — exactly what `verifyInCheckpointMTPStartupReadiness` itself does — each
 //      starting from its own fresh cache at offset 0. A shared call counter would let the first
 //      run's calls silently consume planned tokens the second run then never sees.
 
@@ -101,13 +101,23 @@ final class InCheckpointMTPMockTargetModel: Module, LanguageModel {
     /// than the mock silently falling back to the same one.
     private(set) var prepareForMTPCallCount = 0
 
+    /// Every `windowSize` observed at `prepare(_:cache:windowSize:)`, in call order —
+    /// `TokenIterator`/`MTPSpeculativeTokenIterator` both thread `parameters.prefillStepSize`
+    /// straight through as this parameter (`Evaluate.swift:643,905`, and see
+    /// `MTPSpeculativeDecoderPrefillChunkParityTests.swift` for the precedent this mirrors), so
+    /// this is the nearest observable proxy for what each gate arm actually set. One entry per
+    /// arm when the SAME target instance drives both `runInCheckpointMTPScalarReference` and
+    /// `runInCheckpointMTPSpeculativeDecode` in sequence.
+    private(set) var observedPrepareWindowSizes: [Int?] = []
+
     init(plannedTokens: [Int32]) {
         self.plannedTokens = plannedTokens
         super.init()
     }
 
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        .tokens(input.text)
+        observedPrepareWindowSizes.append(windowSize)
+        return .tokens(input.text)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -200,6 +210,141 @@ extension InCheckpointMTPMockTargetModel: MTPPromptHiddenStatePreparingModel {
         let output = callAsFunction(promptText, cache: cache, state: state)
         guard let hidden = output.state?[mtpLastHiddenStatesKey] else { return nil }
         return MTPPromptPreparation(result: .logits(output), targetHidden: hidden)
+    }
+}
+
+// MARK: - Divergent-arm fixtures (Change 1's "degrade FIRES" coverage)
+//
+// `InCheckpointMTPMockTargetModel` above is deterministic purely by ABSOLUTE CACHE POSITION, so
+// scalar decode (`TokenIterator`) and speculative decode (`MTPSpeculativeTokenIterator`) driven
+// against the SAME instance always read the SAME planned-token table and therefore always agree
+// -- it cannot exercise a genuinely divergent pair. The real divergence this repository measured
+// (`docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`) comes from the two
+// arms' DIFFERENT forward call geometry (scalar evaluates one position per step past prefill;
+// the speculative verify forward evaluates several at once), which this weight-free mock cannot
+// reproduce bit-for-bit. Instead, this fixture manufactures a DIFFERENT, verifiable form of the
+// same OBSERVABLE property the gate actually cares about: the same target instance, driven
+// through both arms in one gate call, produces two genuinely different resulting token
+// sequences. It does this by tagging each arm's own KV cache (`newCache` is called exactly once
+// per arm, in a fixed, sequential order — scalar reference first, speculative decode second, per
+// `verifyInCheckpointMTPStartupReadiness`'s own call order) and reading a DIFFERENT planned-token
+// table depending on which arm's cache is driving the current forward call.
+
+/// Minimal `KVCache` mock identical to `InCheckpointMTPMockCountingKVCache` except it also tags
+/// which of the two gate arms it belongs to, fixed at construction.
+final class InCheckpointMTPMockArmTaggedKVCache: KVCache {
+    var offset: Int = 0
+    let isSecondArm: Bool
+    var maxSize: Int? { nil }
+
+    init(isSecondArm: Bool) {
+        self.isSecondArm = isSecondArm
+    }
+
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) { (keys, values) }
+    var state: [MLXArray] {
+        get { [] }
+        set {}
+    }
+    var metaState: [String] {
+        get { [] }
+        set {}
+    }
+    var isTrimmable: Bool { true }
+    @discardableResult
+    func trim(_ n: Int) -> Int {
+        let removed = Swift.min(n, offset)
+        offset -= removed
+        return removed
+    }
+    func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .none
+    }
+    func copy() -> any KVCache {
+        let copy = InCheckpointMTPMockArmTaggedKVCache(isSecondArm: isSecondArm)
+        copy.offset = offset
+        return copy
+    }
+    func innerState() -> [MLXArray] { [] }
+}
+
+/// `LanguageModel` mock whose OWN greedy prediction genuinely differs between the two gate arms
+/// driven against it, by reading a different table depending on which tagged cache
+/// (`InCheckpointMTPMockArmTaggedKVCache.isSecondArm`) is presented at each forward call. See this
+/// section's header comment for why this is the deliberate, controllable stand-in for the real
+/// forward-geometry divergence this fixture cannot reproduce directly.
+final class InCheckpointMTPMockDivergentTargetModel: Module, LanguageModel {
+    let firstArmPlannedTokens: [Int32]
+    let secondArmPlannedTokens: [Int32]
+    /// Counts `newCache` calls so the FIRST call (the scalar reference arm, per
+    /// `verifyInCheckpointMTPStartupReadiness`'s fixed call order) tags its cache
+    /// `isSecondArm == false` and every call after it tags `isSecondArm == true`.
+    private var vendedCacheCount = 0
+
+    init(firstArmPlannedTokens: [Int32], secondArmPlannedTokens: [Int32]) {
+        self.firstArmPlannedTokens = firstArmPlannedTokens
+        self.secondArmPlannedTokens = secondArmPlannedTokens
+        super.init()
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let table = plannedTokens(for: cache)
+        return makeLogits(table: table, startIndex: 0, positions: inputs.dim(-1))
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let positions = input.tokens.dim(-1)
+        let taggedCache = cache?.first as? InCheckpointMTPMockArmTaggedKVCache
+        let startIndex = taggedCache?.offset ?? 0
+        let table = plannedTokens(for: cache)
+        let logits = makeLogits(table: table, startIndex: startIndex, positions: positions)
+        taggedCache?.offset = startIndex + positions
+
+        guard state?[mtpEmitFlagKey] ?? false else {
+            return LMOutput(logits: logits)
+        }
+        let kvSpan = taggedCache?.offset ?? positions
+        var out = state ?? LMOutput.State()
+        out[mtpLastHiddenStatesKey] = MLXArray.zeros([1, positions, 4])
+        out[mtpSharedKVStatesKey] = [
+            "full_attention": (
+                MLXArray.zeros([1, 1, kvSpan, 4]),
+                MLXArray.zeros([1, 1, kvSpan, 4])
+            )
+        ]
+        return LMOutput(logits: logits, state: out)
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        vendedCacheCount += 1
+        return [InCheckpointMTPMockArmTaggedKVCache(isSecondArm: vendedCacheCount >= 2)]
+    }
+
+    private func plannedTokens(for cache: [KVCache]?) -> [Int32] {
+        let taggedCache = cache?.first as? InCheckpointMTPMockArmTaggedKVCache
+        return (taggedCache?.isSecondArm ?? false) ? secondArmPlannedTokens : firstArmPlannedTokens
+    }
+
+    private func makeLogits(table: [Int32], startIndex: Int, positions: Int) -> MLXArray {
+        let vocab = 20
+        var data = [Float](repeating: 0, count: positions * vocab)
+        for i in 0..<positions {
+            let tokIdx = startIndex + i
+            let tok = tokIdx < table.count ? Int(table[tokIdx]) : 0
+            precondition(
+                tok >= 0 && tok < vocab,
+                "planned token \(tok) at index \(tokIdx) is outside the mock's \(vocab)-token vocabulary")
+            data[i * vocab + tok] = 100
+        }
+        return MLXArray(data, [1, positions, vocab])
     }
 }
 

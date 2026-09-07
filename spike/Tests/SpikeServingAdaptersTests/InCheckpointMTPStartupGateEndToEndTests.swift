@@ -4,17 +4,23 @@ import XCTest
 import MLX
 import MLXLMCommon
 import MLXNN
+import SpikeCore
 @testable import SpikeServingAdapters
 
 final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
 
     /// SUCCESS PATH (the whole point): a matched target+drafter pair where the drafter's fixed
     /// proposal equals the target's own greedy continuation, so the run's single speculative
-    /// round fully accepts. Drives `verifyInCheckpointMTPStartupEquivalence` end to end through
+    /// round fully accepts. Drives `verifyInCheckpointMTPStartupReadiness` end to end through
     /// the REAL MLX `TokenIterator`/`MTPSpeculativeTokenIterator` machinery — the first test in
     /// this repository to do so (previously only the extracted, hand-fed decision function was
     /// covered). Asserts the call returns (does not throw) and that its reported telemetry
     /// reflects genuine speculation.
+    ///
+    /// REQUIRED TEST 2 ("degrade does NOT fire"): also asserts `tokenSequencesMatched == true` —
+    /// the control side of the pair with `testStartupReadinessDegradesRatherThanRefusingOnGenuineTokenSequenceDivergence`
+    /// below (either alone is inert: without this assertion a gate that ALWAYS reported
+    /// `tokenSequencesMatched == false` would still pass every other test in this file).
     func testVerifyStartupEquivalenceSucceedsWithGenuineAcceptedSpeculation() throws {
         // plannedTokens[2] is the "bonus" sampled from forwarding the 3-token prompt;
         // plannedTokens[3]/[4] are what the target itself greedily predicts next. Setting the
@@ -24,11 +30,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         let target = InCheckpointMTPMockTargetModel(plannedTokens: plannedTokens)
         let drafter = InCheckpointMTPMockDrafter(draftedTokenValue: 7)
 
-        let verdict = try verifyInCheckpointMTPStartupEquivalence(
+        let verdict = try verifyInCheckpointMTPStartupReadiness(
             mainModel: target,
             drafter: drafter,
             promptTokens: [1, 2, 3],
             stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
             maxTokens: 4,
             blockSize: 3)
 
@@ -37,6 +44,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         XCTAssertGreaterThan(verdict.proposedDraftTokens, 0)
         XCTAssertEqual(verdict.proposedDraftTokens, 2)
         XCTAssertEqual(verdict.acceptedDraftTokens, 2)
+        XCTAssertTrue(verdict.tokenSequencesMatched)
         XCTAssertEqual(drafter.draftBlockCallCount, 1)
         // ANTI-VACUITY, the other direction: this run's drafter has
         // `requiresPromptPrefill == false`, so none of the four `prepareForMTP`-reaching branches
@@ -49,20 +57,49 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         XCTAssertEqual(target.prepareForMTPCallCount, 0)
     }
 
+    /// REQUIRED TEST 1 ("degrade FIRES"): a target+drafter pair that produces genuinely divergent
+    /// greedy token sequences between the scalar-reference and speculative-decode arms — using
+    /// `InCheckpointMTPMockDivergentTargetModel` (see `InCheckpointMTPMockFixtures.swift`'s header
+    /// comment on that type for why it tags arms by KV cache rather than by call geometry). The
+    /// gate call must SUCCEED (not throw) and report `tokenSequencesMatched == false`. Clause (ii)
+    /// still passes here (`supportsTarget` stays true, so no passthrough, and the drafter's fixed
+    /// proposal is genuinely rejected against the SECOND arm's own diverging table, which still
+    /// counts as a real `draftBlock` call) — proving clause (i)'s demotion to data is independent
+    /// of clause (ii) staying fail-closed.
+    func testStartupReadinessDegradesRatherThanRefusingOnGenuineTokenSequenceDivergence() throws {
+        let target = InCheckpointMTPMockDivergentTargetModel(
+            firstArmPlannedTokens: [0, 0, 5, 7, 7, 9],
+            secondArmPlannedTokens: [0, 0, 5, 2, 2, 9])
+        let drafter = InCheckpointMTPMockDrafter(draftedTokenValue: 7)
+
+        let verdict = try verifyInCheckpointMTPStartupReadiness(
+            mainModel: target,
+            drafter: drafter,
+            promptTokens: [1, 2, 3],
+            stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
+            maxTokens: 4,
+            blockSize: 3)
+
+        XCTAssertFalse(verdict.tokenSequencesMatched)
+        XCTAssertGreaterThan(verdict.proposedDraftTokens, 0)
+        XCTAssertGreaterThan(drafter.draftBlockCallCount, 0)
+    }
+
     /// THE REGRESSION TEST FOR THE BUG FIXED IN cfcec033 — highest value in this increment.
     /// `draftedTokenValue` (3) never matches the target's own greedy continuation (7), so every
     /// proposal in the run's one full speculative round is rejected: `acceptedDraftTokens == 0`
     /// while `proposedDraftTokens > 0` (the round genuinely ran — `draftBlock` was actually
     /// called, once, with 1 proposed token). Before cfcec033,
-    /// `inCheckpointMTPStartupEquivalenceDecision` gated on `acceptedDraftTokens > 0`, so this
+    /// `inCheckpointMTPStartupReadinessDecision` gated on `acceptedDraftTokens > 0`, so this
     /// EXACT telemetry shape — a correct, genuinely-exercised drafter whose one proposal for the
     /// fixed startup prompt happens to diverge from the target's greedy path — would have
     /// PERMANENTLY refused to boot. This test reproduces that state end to end, with REAL
     /// telemetry from the real MLX iterator machinery (not a hand-written
     /// `InCheckpointMTPGreedyDecodeResult` literal), and proves the fixed gate boots it anyway.
     ///
-    /// `verifyInCheckpointMTPStartupEquivalence`'s success return type does not expose
-    /// `passthroughReason` directly, but `inCheckpointMTPStartupEquivalenceDecision` throws
+    /// `verifyInCheckpointMTPStartupReadiness`'s success return type does not expose
+    /// `passthroughReason` directly, but `inCheckpointMTPStartupReadinessDecision` throws
     /// `.inCheckpointMTPStartupDidNotSpeculate` whenever `passthroughReason != nil` BEFORE ever
     /// reaching its return statement — so this call succeeding is itself the proof that
     /// `passthroughReason == nil` here, not merely an assumption.
@@ -71,11 +108,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         let target = InCheckpointMTPMockTargetModel(plannedTokens: plannedTokens)
         let drafter = InCheckpointMTPMockDrafter(draftedTokenValue: 3)
 
-        let verdict = try verifyInCheckpointMTPStartupEquivalence(
+        let verdict = try verifyInCheckpointMTPStartupReadiness(
             mainModel: target,
             drafter: drafter,
             promptTokens: [1, 2, 3],
             stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
             maxTokens: 3,
             blockSize: 2)
 
@@ -97,11 +135,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         drafter.supportsTarget = false
 
         XCTAssertThrowsError(
-            try verifyInCheckpointMTPStartupEquivalence(
+            try verifyInCheckpointMTPStartupReadiness(
                 mainModel: target,
                 drafter: drafter,
                 promptTokens: [1, 2, 3],
                 stopTokenIDs: [99],
+                cacheFactory: { target.newCache(parameters: nil) },
                 maxTokens: 3,
                 blockSize: 2)
         ) { error in
@@ -133,11 +172,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         let drafter = InCheckpointMTPMockDrafter(draftedTokenValue: 7)
 
         XCTAssertThrowsError(
-            try verifyInCheckpointMTPStartupEquivalence(
+            try verifyInCheckpointMTPStartupReadiness(
                 mainModel: target,
                 drafter: drafter,
                 promptTokens: [1, 2, 3],
                 stopTokenIDs: [5],
+                cacheFactory: { target.newCache(parameters: nil) },
                 maxTokens: 8,
                 blockSize: 3)
         ) { error in
@@ -179,11 +219,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         let target = InCheckpointMTPMockTargetModel(plannedTokens: plannedTokens)
         let drafter = InCheckpointMTPMockStatefulDrafter(draftedTokenValue: 7)
 
-        let verdict = try verifyInCheckpointMTPStartupEquivalence(
+        let verdict = try verifyInCheckpointMTPStartupReadiness(
             mainModel: target,
             drafter: drafter,
             promptTokens: [1, 2, 3],
             stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
             maxTokens: 4,
             blockSize: 3)
 
@@ -192,6 +233,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         XCTAssertGreaterThan(verdict.proposedDraftTokens, 0)
         XCTAssertEqual(verdict.proposedDraftTokens, 2)
         XCTAssertEqual(verdict.acceptedDraftTokens, 2)
+        XCTAssertTrue(verdict.tokenSequencesMatched)
         XCTAssertEqual(drafter.draftBlockCallCount, 1)
         XCTAssertGreaterThan(target.prepareForMTPCallCount, 0)
         XCTAssertGreaterThan(drafter.makeStateCallCount, 0)
@@ -212,11 +254,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         let target = InCheckpointMTPMockTargetModel(plannedTokens: plannedTokens)
         let drafter = InCheckpointMTPMockStatefulDrafter(draftedTokenValue: 3)
 
-        let verdict = try verifyInCheckpointMTPStartupEquivalence(
+        let verdict = try verifyInCheckpointMTPStartupReadiness(
             mainModel: target,
             drafter: drafter,
             promptTokens: [1, 2, 3],
             stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
             maxTokens: 3,
             blockSize: 2)
 
@@ -247,11 +290,12 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         drafter.supportsTarget = false
 
         XCTAssertThrowsError(
-            try verifyInCheckpointMTPStartupEquivalence(
+            try verifyInCheckpointMTPStartupReadiness(
                 mainModel: target,
                 drafter: drafter,
                 promptTokens: [1, 2, 3],
                 stopTokenIDs: [99],
+                cacheFactory: { target.newCache(parameters: nil) },
                 maxTokens: 3,
                 blockSize: 2)
         ) { error in
@@ -275,7 +319,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
     /// decode loops — mirroring, rather than calling, `runInCheckpointMTPScalarReference`/
     /// `runInCheckpointMTPSpeculativeDecode` (both `private`, so unreachable from a test target
     /// even with `@testable import`) — and asserts their raw token arrays actually match. This
-    /// proves clause (i) of `inCheckpointMTPStartupEquivalenceDecision` compares two GENUINELY
+    /// proves clause (i) of `inCheckpointMTPStartupReadinessDecision` compares two GENUINELY
     /// DIFFERENT call patterns against the same target (batched draft+verify calls vs sequential
     /// single-token steps), rather than being unreachable or vacuous: a position-tracking or
     /// batching bug in either loop would show up here as a mismatch. Compares by count and then
@@ -332,6 +376,42 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         XCTAssertNil(speculativeIterator.passthroughReason)
     }
 
+    // MARK: - Change 3: both gate arms must chunk prefill at the SAME size production does
+
+    /// TDD RED, quoted in the report: written and run BEFORE `runInCheckpointMTPScalarReference`/
+    /// `runInCheckpointMTPSpeculativeDecode` set `prefillStepSize`, this fails showing both
+    /// observed window sizes as 512 (the vendored `GenerateParameters` default,
+    /// `Evaluate.swift:134`) rather than `MLXDecoder.defaultPrefillChunkSize` (2048) — the size
+    /// `MTPSpeculativeDecoder.buildParameters()` actually uses in production
+    /// (`MTPSpeculativeDecoderPrefillChunkParityTests.swift` is the precedent for this exact
+    /// technique). NOTE: the startup prompt this gate actually runs
+    /// (`ScalarServingModelLoadConfiguration.defaultStartupMessages`, ~15 tokens) is far below
+    /// EITHER chunk size, so this has no observable effect on today's real startup run — it is a
+    /// correctness/representativeness fix for what the gate's arms are calibrated against, not a
+    /// behavior fix.
+    func testStartupGateArmsThreadProductionPrefillChunkSizeNotTheVendoredDefault() throws {
+        let plannedTokens: [Int32] = [0, 0, 5, 7, 7, 9]
+        let target = InCheckpointMTPMockTargetModel(plannedTokens: plannedTokens)
+        let drafter = InCheckpointMTPMockDrafter(draftedTokenValue: 7)
+
+        _ = try verifyInCheckpointMTPStartupReadiness(
+            mainModel: target,
+            drafter: drafter,
+            promptTokens: [1, 2, 3],
+            stopTokenIDs: [99],
+            cacheFactory: { target.newCache(parameters: nil) },
+            maxTokens: 4,
+            blockSize: 3)
+
+        // Both arms (scalar reference, then speculative decode) call `prepare` exactly once each
+        // on this shared target instance, in that order.
+        XCTAssertEqual(target.observedPrepareWindowSizes.count, 2)
+        for windowSize in target.observedPrepareWindowSizes {
+            XCTAssertEqual(windowSize, MLXDecoder.defaultPrefillChunkSize)
+            XCTAssertNotEqual(windowSize, 512)
+        }
+    }
+
     // MARK: - ScalarServingInCheckpointMTPStartupVerdict.machineReadableFields()
     //
     // The startup gate above proves the verdict's NUMBERS are correct. These tests prove those
@@ -354,6 +434,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
             generatedTokenCount: 33,
             proposedDraftTokens: 44,
             acceptedDraftTokens: 55,
+            drafterServing: true,
             drafterActiveBytesDelta: 66,
             drafterCacheBytesDelta: 77)
 
@@ -367,8 +448,33 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
         XCTAssertTrue(fields.contains("in_checkpoint_mtp_generated_token_count=33"))
         XCTAssertTrue(fields.contains("in_checkpoint_mtp_proposed_draft_tokens=44"))
         XCTAssertTrue(fields.contains("in_checkpoint_mtp_accepted_draft_tokens=55"))
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp_drafter_serving=true"))
         XCTAssertTrue(fields.contains("in_checkpoint_mtp_drafter_active_bytes_delta=66"))
         XCTAssertTrue(fields.contains("in_checkpoint_mtp_drafter_cache_bytes_delta=77"))
+    }
+
+    /// THE DIVERGENCE-REFUSAL CASE MADE LOUD: `drafterServing == false` (a divergence-refused
+    /// load, per Change 1/2) renders `in_checkpoint_mtp_drafter_serving=false` explicitly, and the
+    /// fragment is otherwise fully populated -- this must NEVER render identically to "MTP was
+    /// never requested" (that case never constructs this verdict at all: the field is empty at
+    /// the call site, `report.inCheckpointMTPStartupVerdict?.machineReadableFields() ?? ""`).
+    func testMachineReadableFieldsRendersDrafterServingFalseExplicitlyOnADivergenceRefusedVerdict() {
+        let verdict = ScalarServingInCheckpointMTPStartupVerdict(
+            namespace: .converted,
+            revision: "rev1",
+            sourceKeyCount: 9,
+            promptTokenCount: 3,
+            generatedTokenCount: 8,
+            proposedDraftTokens: 2,
+            acceptedDraftTokens: 0,
+            drafterServing: false,
+            drafterActiveBytesDelta: 12,
+            drafterCacheBytesDelta: 34)
+
+        let fields = verdict.machineReadableFields()
+
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp=true"))
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp_drafter_serving=false"))
     }
 
     /// ANTI-VACUITY, THE CASE THAT MATTERS MOST: a run where every draft proposal was rejected
@@ -389,6 +495,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
             generatedTokenCount: 1,
             proposedDraftTokens: 0,
             acceptedDraftTokens: 0,
+            drafterServing: true,
             drafterActiveBytesDelta: 0,
             drafterCacheBytesDelta: 0)
 
@@ -415,6 +522,7 @@ final class InCheckpointMTPStartupGateEndToEndTests: XCTestCase {
             generatedTokenCount: 1,
             proposedDraftTokens: 2,
             acceptedDraftTokens: 1,
+            drafterServing: true,
             drafterActiveBytesDelta: 5,
             drafterCacheBytesDelta: 6)
 

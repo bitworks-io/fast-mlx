@@ -809,8 +809,10 @@ final class MLXScalarServingTests: XCTestCase {
     }
 
     /// Acceptance (happy path): identical token sequences, no passthrough, and at least one
-    /// accepted draft token together yield a passing verdict carrying the observed telemetry.
-    func testStartupEquivalenceDecisionAdmitsIdenticalSequencesWithGenuineSpeculation() throws {
+    /// accepted draft token together yield a passing verdict carrying the observed telemetry, AND
+    /// report `tokenSequencesMatched == true` — the "degrade does NOT fire" control for the
+    /// divergent-pair coverage below (either alone is inert; see this file's `MARK` for the pair).
+    func testStartupReadinessDecisionAdmitsIdenticalSequencesWithGenuineSpeculation() throws {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -822,17 +824,25 @@ final class MLXScalarServingTests: XCTestCase {
             acceptedDraftTokens: 2,
             passthroughReason: nil)
 
-        let verdict = try inCheckpointMTPStartupEquivalenceDecision(
+        let verdict = try inCheckpointMTPStartupReadinessDecision(
             promptTokenCount: 5, scalar: scalar, speculative: speculative)
 
         XCTAssertEqual(verdict.promptTokenCount, 5)
         XCTAssertEqual(verdict.generatedTokenCount, 3)
         XCTAssertEqual(verdict.proposedDraftTokens, 4)
         XCTAssertEqual(verdict.acceptedDraftTokens, 2)
+        XCTAssertTrue(verdict.tokenSequencesMatched)
     }
 
-    /// Clause (i): a token-count divergence fails closed without ever reaching clause (ii).
-    func testStartupEquivalenceDecisionRejectsDivergentTokenCounts() {
+    /// Clause (i) is DATA, not a throw: a token-count divergence — clause (ii) still fully
+    /// evaluated and passing here — SUCCEEDS with `tokenSequencesMatched == false`. This is the
+    /// "degrade FIRES" case at the decision-function boundary: a real, previously-measured
+    /// architectural divergence between the scalar and speculative arms
+    /// (`docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`) must not refuse a
+    /// correct integration.
+    func testStartupReadinessDecisionReportsDivergentTokenCountsAsUnmatchedRatherThanThrowing()
+        throws
+    {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -844,18 +854,18 @@ final class MLXScalarServingTests: XCTestCase {
             acceptedDraftTokens: 2,
             passthroughReason: nil)
 
-        XCTAssertThrowsError(
-            try inCheckpointMTPStartupEquivalenceDecision(
-                promptTokenCount: 5, scalar: scalar, speculative: speculative)
-        ) { error in
-            XCTAssertEqual(
-                error as? ScalarServingModelLoadError, .inCheckpointMTPStartupTokenSequenceMismatch)
-        }
+        let verdict = try inCheckpointMTPStartupReadinessDecision(
+            promptTokenCount: 5, scalar: scalar, speculative: speculative)
+
+        XCTAssertFalse(verdict.tokenSequencesMatched)
+        XCTAssertEqual(verdict.proposedDraftTokens, 4)
+        XCTAssertEqual(verdict.acceptedDraftTokens, 2)
     }
 
-    /// Clause (i): same-length but different-content sequences also fail closed — the SHA-256
-    /// fold, not just the count, discriminates.
-    func testStartupEquivalenceDecisionRejectsSameLengthDivergentTokenContent() {
+    /// Clause (i) is DATA: same-length but different-content sequences also report
+    /// `tokenSequencesMatched == false` rather than throwing — the SHA-256 fold, not just the
+    /// count, discriminates, exactly as it did when this clause threw.
+    func testStartupReadinessDecisionReportsSameLengthDivergentTokenContentAsUnmatched() throws {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -867,13 +877,10 @@ final class MLXScalarServingTests: XCTestCase {
             acceptedDraftTokens: 2,
             passthroughReason: nil)
 
-        XCTAssertThrowsError(
-            try inCheckpointMTPStartupEquivalenceDecision(
-                promptTokenCount: 5, scalar: scalar, speculative: speculative)
-        ) { error in
-            XCTAssertEqual(
-                error as? ScalarServingModelLoadError, .inCheckpointMTPStartupTokenSequenceMismatch)
-        }
+        let verdict = try inCheckpointMTPStartupReadinessDecision(
+            promptTokenCount: 5, scalar: scalar, speculative: speculative)
+
+        XCTAssertFalse(verdict.tokenSequencesMatched)
     }
 
     /// THE ANTI-VACUITY MUTATION for clause (ii): scalar and speculative token sequences are
@@ -883,7 +890,7 @@ final class MLXScalarServingTests: XCTestCase {
     /// This is the "stub `supportsSpeculation` to false" mutation from the decision doc, applied
     /// at the decision function's own boundary (its input already reflects that stub's effect —
     /// passthrough engaged despite byte-identical output).
-    func testStartupEquivalenceDecisionRejectsIdenticalSequencesWhenPassthroughEngaged() {
+    func testStartupReadinessDecisionRejectsIdenticalSequencesWhenPassthroughEngaged() {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -896,7 +903,7 @@ final class MLXScalarServingTests: XCTestCase {
             passthroughReason: "drafter does not support this target model")
 
         XCTAssertThrowsError(
-            try inCheckpointMTPStartupEquivalenceDecision(
+            try inCheckpointMTPStartupReadinessDecision(
                 promptTokenCount: 5, scalar: scalar, speculative: speculative)
         ) { error in
             XCTAssertEqual(
@@ -913,7 +920,7 @@ final class MLXScalarServingTests: XCTestCase {
     /// (ii)'s passthrough guard fires unconditionally, ahead of (and independent from) the
     /// proposed-count guard below it. Sticky passthrough is a statement about the REST of the run,
     /// not just the round that measured `proposedDraftTokens`.
-    func testStartupEquivalenceDecisionRejectsPassthroughEvenAfterAGenuineRound() {
+    func testStartupReadinessDecisionRejectsPassthroughEvenAfterAGenuineRound() {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -926,7 +933,7 @@ final class MLXScalarServingTests: XCTestCase {
             passthroughReason: "drafter does not support this target model")
 
         XCTAssertThrowsError(
-            try inCheckpointMTPStartupEquivalenceDecision(
+            try inCheckpointMTPStartupReadinessDecision(
                 promptTokenCount: 5, scalar: scalar, speculative: speculative)
         ) { error in
             XCTAssertEqual(
@@ -935,6 +942,46 @@ final class MLXScalarServingTests: XCTestCase {
                     reason: "drafter does not support this target model",
                     proposedDraftTokens: 4,
                     acceptedDraftTokens: 2))
+        }
+    }
+
+    /// REQUIRED TEST 3 (task background): divergence AND passthrough together still THROW
+    /// `didNotSpeculate` — proves clause (ii) stays fail-closed and that clause (i)'s demotion to
+    /// data did NOT swallow an availability failure. `scalar`/`speculative` here diverge in BOTH
+    /// count and content (unlike the passthrough tests above, which reuse identical sequences),
+    /// so this is a genuinely different input from either of the two tests above, not a
+    /// recombination: clause (i) would report `tokenSequencesMatched == false` if it ever reached
+    /// the return statement, and clause (ii) refuses before it gets the chance. This is inherently
+    /// a property of the pure decision function's ORDERING (clause (ii) evaluated regardless of
+    /// clause (i)'s outcome) — real MLX iterator machinery cannot construct this combination
+    /// end to end, because `MTPSpeculativeTokenIterator`'s sticky passthrough is decided entirely
+    /// at `init` (`MTPSpeculativeTokenIterator.swift:219-220`) and, once engaged, drives every
+    /// subsequent forward through the identical single-token path scalar decode itself uses
+    /// (`passthroughStep()`, `MTPSpeculativeTokenIterator.swift:905-927`), so a real passthrough
+    /// run against a deterministic target can only ever reproduce clause (i)'s own reference
+    /// sequence, never diverge from it.
+    func testStartupReadinessDecisionThrowsDidNotSpeculateWhenDivergentAndPassthroughEngaged() {
+        let scalar = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 22, 33],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: nil)
+        let speculative = InCheckpointMTPGreedyDecodeResult(
+            tokens: [11, 99],
+            proposedDraftTokens: 0,
+            acceptedDraftTokens: 0,
+            passthroughReason: "drafter does not support this prompt input")
+
+        XCTAssertThrowsError(
+            try inCheckpointMTPStartupReadinessDecision(
+                promptTokenCount: 5, scalar: scalar, speculative: speculative)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .inCheckpointMTPStartupDidNotSpeculate(
+                    reason: "drafter does not support this prompt input",
+                    proposedDraftTokens: 0,
+                    acceptedDraftTokens: 0))
         }
     }
 
@@ -948,7 +995,7 @@ final class MLXScalarServingTests: XCTestCase {
     /// whenever its first-token prediction for the fixed startup prompt happened to diverge once.
     /// Acceptance is a PERFORMANCE property, not an availability one — it is now reported on the
     /// verdict (`acceptedDraftTokens == 0` is visible to the caller) rather than gated.
-    func testStartupEquivalenceDecisionAdmitsGenuineSpeculationThatAcceptedZeroDraftTokens() throws {
+    func testStartupReadinessDecisionAdmitsGenuineSpeculationThatAcceptedZeroDraftTokens() throws {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -960,7 +1007,7 @@ final class MLXScalarServingTests: XCTestCase {
             acceptedDraftTokens: 0,
             passthroughReason: nil)
 
-        let verdict = try inCheckpointMTPStartupEquivalenceDecision(
+        let verdict = try inCheckpointMTPStartupReadinessDecision(
             promptTokenCount: 5, scalar: scalar, speculative: speculative)
 
         XCTAssertEqual(verdict.proposedDraftTokens, 2)
@@ -972,7 +1019,7 @@ final class MLXScalarServingTests: XCTestCase {
     /// — `drafter.draftBlock` was never actually called. This is the case the proposed-based
     /// conjunct exists to catch: it is the only remaining way a vacuous scalar-decode replay could
     /// slip past clause (i) alone now that acceptance is no longer gated.
-    func testStartupEquivalenceDecisionRejectsIdenticalSequencesWithZeroProposedDraftTokens() {
+    func testStartupReadinessDecisionRejectsIdenticalSequencesWithZeroProposedDraftTokens() {
         let scalar = InCheckpointMTPGreedyDecodeResult(
             tokens: [11, 22, 33],
             proposedDraftTokens: 0,
@@ -985,13 +1032,116 @@ final class MLXScalarServingTests: XCTestCase {
             passthroughReason: nil)
 
         XCTAssertThrowsError(
-            try inCheckpointMTPStartupEquivalenceDecision(
+            try inCheckpointMTPStartupReadinessDecision(
                 promptTokenCount: 5, scalar: scalar, speculative: speculative)
         ) { error in
             XCTAssertEqual(
                 error as? ScalarServingModelLoadError,
                 .inCheckpointMTPStartupDidNotSpeculate(
                     reason: nil, proposedDraftTokens: 0, acceptedDraftTokens: 0))
+        }
+    }
+
+    // MARK: - inCheckpointMTPDrafterRetentionDecision (the retention/reporting desync gap)
+    //
+    // Mutation-found gap (cycle 82 continuation): `loadScalarServingModel` used to read
+    // `readiness.tokenSequencesMatched` TWICE, independently -- once for the reported
+    // `drafterServing` field, once for the `if` that actually retains the drafter into
+    // `retainedInCheckpointMTPDrafter`. Mutating the retention `if` to unconditional retention left
+    // the full `SpikeServingAdaptersTests` suite (257 tests) green, because nothing asserted the
+    // two reads agree. `inCheckpointMTPDrafterRetentionDecision` is now the ONE function both
+    // reads call, and `loadScalarServingModel` binds its result to a single local `let` shared by
+    // both.
+    //
+    // STATED HONESTLY: `testDrafterRetentionDecisionIsFalseWhenTokenSequencesDiverged` below is
+    // the test that actually catches a regression -- re-mutating
+    // `inCheckpointMTPDrafterRetentionDecision` to hardcode `true` was verified to fail exactly
+    // that one test (260 executed, 1 failure). `testRetainedDrafterPresenceAndReportedDrafterServingAlwaysAgree`
+    // below does NOT independently catch that same mutation: it computes both the "retained"
+    // stand-in and `verdict.drafterServing` from the identical local, so a wrong-but-*consistent*
+    // return value from the helper still leaves them agreeing with each other, just agreeing on
+    // the wrong thing. Its purpose is narrower and was verified separately (re-deleting the
+    // production `if` guard entirely, so retention and reporting read the helper's result
+    // differently, was NOT caught by anything in this file -- see the doc comment on
+    // `inCheckpointMTPDrafterRetentionDecision` for that residual, honestly disclosed rather than
+    // implied fixed): it pins the INTENDED shape of the call site as an executable mirror, and
+    // documents the invariant for a future reader, rather than exercising
+    // `loadScalarServingModel`'s own body (fleet-only limitation, same as the rest of this file --
+    // see the class-level "WHAT THIS FILE CANNOT PROVE" note in `MTPDecoderBridgeSelectionTests.swift`).
+
+    /// Retention decision mirrors clause (i) exactly: `false` when the readiness gate's scalar and
+    /// speculative arms diverged -- the "do not retain a pairing this run gave no evidence for"
+    /// case `loadScalarServingModel`'s comment above the `if` describes.
+    func testDrafterRetentionDecisionIsFalseWhenTokenSequencesDiverged() {
+        let readiness = InCheckpointMTPStartupReadiness(
+            promptTokenCount: 5,
+            generatedTokenCount: 8,
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            tokenSequencesMatched: false)
+
+        XCTAssertFalse(inCheckpointMTPDrafterRetentionDecision(readiness: readiness))
+    }
+
+    /// The other half of the same mapping: `true` when the arms matched. Paired with the test
+    /// above so neither a stub `{ true }` nor a stub `{ false }` implementation of
+    /// `inCheckpointMTPDrafterRetentionDecision` could pass both.
+    func testDrafterRetentionDecisionIsTrueWhenTokenSequencesMatched() {
+        let readiness = InCheckpointMTPStartupReadiness(
+            promptTokenCount: 5,
+            generatedTokenCount: 8,
+            proposedDraftTokens: 4,
+            acceptedDraftTokens: 2,
+            tokenSequencesMatched: true)
+
+        XCTAssertTrue(inCheckpointMTPDrafterRetentionDecision(readiness: readiness))
+    }
+
+    /// Executable mirror of `loadScalarServingModel`'s call site: a single
+    /// `drafterRetentionDecision` local feeds BOTH the retained-drafter presence (modeled here as
+    /// `retainedDrafter: Bool?` standing in for `retainedInCheckpointMTPDrafter`, since this file
+    /// cannot construct a real `MTPDrafterModel`) and `ScalarServingInCheckpointMTPStartupVerdict.drafterServing`.
+    /// Run for both `tokenSequencesMatched` values so this is not vacuously true for a single
+    /// hardcoded outcome. Documents the intended shape and pins it against an accidental future
+    /// rewrite of the mirror itself -- see this file's `MARK` comment above for what this test
+    /// does NOT independently catch (a wrong-but-internally-consistent helper return value, or a
+    /// production edit that deletes the retention `if` guard), verified by mutation rather than
+    /// assumed.
+    func testRetainedDrafterPresenceAndReportedDrafterServingAlwaysAgree() {
+        for tokenSequencesMatched in [true, false] {
+            let readiness = InCheckpointMTPStartupReadiness(
+                promptTokenCount: 5,
+                generatedTokenCount: 8,
+                proposedDraftTokens: 4,
+                acceptedDraftTokens: 2,
+                tokenSequencesMatched: tokenSequencesMatched)
+
+            // Exactly what `loadScalarServingModel` now does: ONE call, ONE local `let`, read by
+            // both consumers below.
+            let drafterRetentionDecision = inCheckpointMTPDrafterRetentionDecision(
+                readiness: readiness)
+
+            var retainedDrafter: Bool?
+            if drafterRetentionDecision {
+                retainedDrafter = true
+            }
+            let verdict = ScalarServingInCheckpointMTPStartupVerdict(
+                namespace: .converted,
+                revision: "rev-desync-check",
+                sourceKeyCount: 1,
+                promptTokenCount: readiness.promptTokenCount,
+                generatedTokenCount: readiness.generatedTokenCount,
+                proposedDraftTokens: readiness.proposedDraftTokens,
+                acceptedDraftTokens: readiness.acceptedDraftTokens,
+                drafterServing: drafterRetentionDecision,
+                drafterActiveBytesDelta: 0,
+                drafterCacheBytesDelta: 0)
+
+            XCTAssertEqual(
+                retainedDrafter != nil, verdict.drafterServing,
+                "retained-drafter presence and the reported drafter_serving value must always "
+                    + "agree (tokenSequencesMatched=\(tokenSequencesMatched))")
+            XCTAssertEqual(retainedDrafter != nil, drafterRetentionDecision)
         }
     }
 }

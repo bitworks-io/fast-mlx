@@ -126,31 +126,26 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// weight load. Mirrors `ngramOffloadPlanUnsupportedFamily`'s shape exactly. Carries the
     /// observed `model_type` (`nil` when `config.json` is unreadable/absent).
     case inCheckpointMTPUnsupportedFamily(String?)
-    /// The loaded in-checkpoint MTP drafter's greedy token sequence, run through
-    /// `MTPSpeculativeTokenIterator` against the SAME target, diverged from the target's own
-    /// scalar-greedy decode of the identical startup prompt. What IS guaranteed: every token the
-    /// speculative iterator emits is the target's own argmax as evaluated by its verify forward --
-    /// deterministic and self-consistent. What is NOT guaranteed: token-for-token identity with a
-    /// scalar single-position decode of the same prompt, since the two forward geometries do not
-    /// round identically on this build. This gate refuses to serve on divergence anyway, since a
-    /// mismatch is evidence the pairing may be unsafe, even though it is not proof the drafter
-    /// itself is broken.
-    case inCheckpointMTPStartupTokenSequenceMismatch
     /// The token sequences matched, but the iterator did not GENUINELY speculate: either it
     /// engaged sticky passthrough (carried, when known, as the iterator's own
     /// `passthroughReason`) or `drafter.draftBlock` was never actually invoked
-    /// (`proposedDraftTokens == 0`). Without this check the equivalence gate above passes
-    /// vacuously by comparing scalar decode to scalar decode -- `MTPSpeculativeTokenIterator`
-    /// degrades to single-token passthrough SILENTLY rather than failing
+    /// (`proposedDraftTokens == 0`). Without this check the readiness gate would pass vacuously by
+    /// comparing scalar decode to scalar decode -- `MTPSpeculativeTokenIterator` degrades to
+    /// single-token passthrough SILENTLY rather than failing
     /// (`MTPSpeculativeTokenIterator.swift:167-176`), so a passing token-sequence comparison alone
     /// proves nothing about whether the drafter was ever exercised. Carries the observed telemetry
     /// (`proposedDraftTokens`, `acceptedDraftTokens`) alongside the iterator's `passthroughReason`
     /// so an operator hitting this sees what was measured, not just that the gate refused. NOTE:
     /// `acceptedDraftTokens == 0` alone is NOT what this case gates on -- see
-    /// `inCheckpointMTPStartupEquivalenceDecision`'s clause (ii) comment for why gating startup on
+    /// `inCheckpointMTPStartupReadinessDecision`'s clause (ii) comment for why gating startup on
     /// acceptance (rather than proposal) was a production-availability bug: a correct drafter whose
     /// first proposal for a round legitimately diverges from the target's greedy token completes
     /// that round with `accepted == 0`, and would previously never boot.
+    ///
+    /// This case, unlike clause (i)'s former `inCheckpointMTPStartupTokenSequenceMismatch` (removed
+    /// -- see `docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`), remains
+    /// fail-closed: a passthrough/never-speculated run proves NOTHING about the drafter, whereas a
+    /// token-sequence divergence alone is expected architecture, not evidence of a broken pairing.
     case inCheckpointMTPStartupDidNotSpeculate(
         reason: String?, proposedDraftTokens: Int, acceptedDraftTokens: Int)
     /// `configuration.inCheckpointMTPSelection` was supplied but the RESOLVED decoder strategy is
@@ -257,7 +252,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// see `ScalarServingModelLoadError.ngramOffloadPlanUnsupportedFamily`.
     public let ngramOffloadPlanURL: URL?
     /// When supplied, loads the qwen4_exp (Qwen3.8-Flash-Next) in-checkpoint MTP drafter from
-    /// `modelDirectory` and proves it at startup — see `verifyInCheckpointMTPStartupEquivalence`.
+    /// `modelDirectory` and proves it at startup — see `verifyInCheckpointMTPStartupReadiness`.
     /// Absent (`nil`, the default) skips the drafter entirely — every existing call site is
     /// unaffected. Restricted to the qwen4_exp family; see
     /// `ScalarServingModelLoadError.inCheckpointMTPUnsupportedFamily`.
@@ -311,11 +306,12 @@ public struct ScalarServingStartupParity: Equatable, Sendable {
     }
 }
 
-/// Result of the startup-time equivalence gate `verifyInCheckpointMTPStartupEquivalence` runs when
+/// Result of the startup-time readiness gate `verifyInCheckpointMTPStartupReadiness` runs when
 /// `ScalarServingModelLoadConfiguration.inCheckpointMTPSelection` is supplied. GREEDY ONLY — this
-/// proves the greedy decode path matches the target's own scalar decode and that
-/// `MTPSpeculativeTokenIterator` genuinely speculated (not sticky passthrough); it says nothing
-/// about the SAMPLED (temperature != 0) generation path.
+/// proves `MTPSpeculativeTokenIterator` genuinely speculated (not sticky passthrough) against the
+/// target; it says nothing about the SAMPLED (temperature != 0) generation path. It does NOT prove
+/// the speculative route reproduces the target's own single-position scalar decode
+/// token-for-token — see `drafterServing`'s doc comment.
 public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     public let namespace: FastMLXInCheckpointMTPNamespace
     public let revision: String
@@ -326,6 +322,21 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     public let generatedTokenCount: Int
     public let proposedDraftTokens: Int
     public let acceptedDraftTokens: Int
+    /// Whether the drafter was actually RETAINED and is serving requests, distinct from both "MTP
+    /// was never requested" (`ScalarServingModelStartupReport.inCheckpointMTPStartupVerdict ==
+    /// nil` — this verdict is never constructed at all in that case) and "drafter bound and
+    /// serving". `true` when this run's scalar-reference and speculative-decode arms produced
+    /// token-identical greedy sequences (clause (i)); `false` when they diverged, in which case
+    /// `loadScalarServingModel` did NOT retain the drafter and this load fell back to the plain
+    /// `MLXDecoder` scalar route instead. `false` is an EXPECTED, architecture-level outcome, not
+    /// evidence of a broken pairing — see `inCheckpointMTPStartupGateMaxTokens`'s doc comment and
+    /// `docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`: the speculative verify
+    /// forward evaluates multiple positions at once while scalar decode evaluates one, so the two
+    /// routes' forward geometries do not round identically past prefill. This verdict is only ever
+    /// constructed once clause (ii) (the anti-vacuity, genuinely-fail-closed check) has already
+    /// passed, so `drafterServing == false` here always means "diverged but genuinely speculated",
+    /// never "never exercised" — that state still throws before this type is built.
+    public let drafterServing: Bool
     /// Bytes attributable to the drafter alone, sampled as the delta between `Memory.snapshot()`
     /// immediately before `loadInCheckpointMTPDrafter` and immediately after — reported separately
     /// so an operator can see the drafter's own footprint in isolation, decomposed from the
@@ -352,6 +363,7 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
         generatedTokenCount: Int,
         proposedDraftTokens: Int,
         acceptedDraftTokens: Int,
+        drafterServing: Bool,
         drafterActiveBytesDelta: Int,
         drafterCacheBytesDelta: Int
     ) {
@@ -362,6 +374,7 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
         self.generatedTokenCount = generatedTokenCount
         self.proposedDraftTokens = proposedDraftTokens
         self.acceptedDraftTokens = acceptedDraftTokens
+        self.drafterServing = drafterServing
         self.drafterActiveBytesDelta = drafterActiveBytesDelta
         self.drafterCacheBytesDelta = drafterCacheBytesDelta
     }
@@ -373,6 +386,11 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     /// frozen key namespace already emitted on the same startup line. All fields are always
     /// present, including zero-valued ones (`accepted_draft_tokens=0` is a legitimate, meaningful
     /// outcome per this type's own doc comment -- it must be visible, not silently omitted).
+    /// `in_checkpoint_mtp_drafter_serving` is what makes a divergence-refused load LOUD on this
+    /// line -- see `drafterServing`'s doc comment for why this must never render identically to
+    /// "MTP was never requested" (that case never reaches this function at all: the whole
+    /// `in_checkpoint_mtp*` fragment is empty, per `FastMLXServe.swift`'s
+    /// `report.inCheckpointMTPStartupVerdict?.machineReadableFields() ?? ""`).
     public func machineReadableFields() -> String {
         [
             "in_checkpoint_mtp=true",
@@ -383,6 +401,7 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
             "in_checkpoint_mtp_generated_token_count=\(generatedTokenCount)",
             "in_checkpoint_mtp_proposed_draft_tokens=\(proposedDraftTokens)",
             "in_checkpoint_mtp_accepted_draft_tokens=\(acceptedDraftTokens)",
+            "in_checkpoint_mtp_drafter_serving=\(drafterServing)",
             "in_checkpoint_mtp_drafter_active_bytes_delta=\(drafterActiveBytesDelta)",
             "in_checkpoint_mtp_drafter_cache_bytes_delta=\(drafterCacheBytesDelta)",
         ].joined(separator: " ")
@@ -666,6 +685,14 @@ public func loadScalarServingModel(
     // `InferenceActor` as `MTPSpeculativeDecoder`'s drafter — the same actor-confinement discipline
     // `context.model` already gets, never exposed as a field on the `Sendable`
     // `LoadedScalarServingModel`.
+    //
+    // UPDATED AGAIN (`docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`): this
+    // gate's clause (i) (token-sequence identity between the scalar and speculative arms) no
+    // longer refuses the whole serve on divergence — see `verifyInCheckpointMTPStartupReadiness`'s
+    // doc comment for why identity was never a real property of this build. A diverged run still
+    // succeeds here; `readiness.tokenSequencesMatched` decides below whether the drafter is
+    // retained, and a THROWN error from this call still means clause (ii) (genuine speculation)
+    // failed, which stays fail-closed exactly as before.
     var inCheckpointMTPStartupVerdict: ScalarServingInCheckpointMTPStartupVerdict?
     var retainedInCheckpointMTPDrafter: (any MTPDrafterModel)?
     if let inCheckpointMTPSelection = configuration.inCheckpointMTPSelection {
@@ -681,26 +708,59 @@ public func loadScalarServingModel(
             expectedSourceKeyCount: inCheckpointMTPSelection.expectedSourceKeyCount,
             revision: inCheckpointMTPSelection.revision)
         let postDrafterMemory = Memory.snapshot()
-        let equivalence = try verifyInCheckpointMTPStartupEquivalence(
+        // `decoderStrategy` is provably `.nativeCaches` here: `scalarServingInCheckpointMTPDecoderStrategyError`
+        // above already refused any pairing of `inCheckpointMTPSelection` with `.compiledFP16`
+        // before this block could ever run. Extracted via `if case` (never force-unwrapped) so
+        // that invariant stays machine-checked rather than assumed, matching this file's existing
+        // style — see that error function's own doc comment for why the combination is provably
+        // unreachable for qwen4_exp today. Building the SAME `scalarServingNativeCacheFactory` the
+        // decoder-strategy switch below builds (rather than a bare `newCache(parameters: nil)`
+        // call local to the gate) makes the readiness gate exercise the operator's actual
+        // KV-cache tier selection, not always plain native fp16.
+        guard case .nativeCaches(let inCheckpointMTPGateCacheDecision) = decoderStrategy else {
+            throw ScalarServingModelLoadError.inCheckpointMTPIncompatibleWithCompiledDecoderStrategy
+        }
+        let inCheckpointMTPGateCacheFactory = scalarServingNativeCacheFactory(
+            decision: inCheckpointMTPGateCacheDecision, model: context.model)
+        let readiness = try verifyInCheckpointMTPStartupReadiness(
             mainModel: context.model,
             drafter: loadedDrafter.drafter,
             promptTokens: startupPrompt,
-            stopTokenIDs: stopTokenIDs)
+            stopTokenIDs: stopTokenIDs,
+            cacheFactory: inCheckpointMTPGateCacheFactory)
+        // The SINGLE call to `inCheckpointMTPDrafterRetentionDecision` for this readiness result —
+        // both `drafterServing` below and the `retainedInCheckpointMTPDrafter` assignment read
+        // THIS `let`, never `readiness.tokenSequencesMatched` directly, so they cannot disagree by
+        // reading two different values of the same underlying field — see that function's doc
+        // comment for the mutation test that found the prior desync hazard, and for the residual
+        // (smaller, single-line) way this `if` guard could still be edited to reintroduce it.
+        let drafterRetentionDecision = inCheckpointMTPDrafterRetentionDecision(readiness: readiness)
         inCheckpointMTPStartupVerdict = ScalarServingInCheckpointMTPStartupVerdict(
             namespace: inCheckpointMTPSelection.namespace,
             revision: inCheckpointMTPSelection.revision,
             sourceKeyCount: loadedDrafter.sourceKeyCount,
-            promptTokenCount: equivalence.promptTokenCount,
-            generatedTokenCount: equivalence.generatedTokenCount,
-            proposedDraftTokens: equivalence.proposedDraftTokens,
-            acceptedDraftTokens: equivalence.acceptedDraftTokens,
+            promptTokenCount: readiness.promptTokenCount,
+            generatedTokenCount: readiness.generatedTokenCount,
+            proposedDraftTokens: readiness.proposedDraftTokens,
+            acceptedDraftTokens: readiness.acceptedDraftTokens,
+            drafterServing: drafterRetentionDecision,
             drafterActiveBytesDelta: postDrafterMemory.activeMemory - preDrafterMemory.activeMemory,
             drafterCacheBytesDelta: postDrafterMemory.cacheMemory - preDrafterMemory.cacheMemory)
         // Retained across this block's closing brace — see the comment above this `if let` for
-        // why. `Memory.clearCache()` below only reclaims the equivalence gate's own transient
+        // why. `Memory.clearCache()` below only reclaims the readiness gate's own transient
         // scratch buffers (its reference + speculative decode passes); it does not and must not
         // free the drafter's weight buffers, which stay referenced through this variable.
-        retainedInCheckpointMTPDrafter = loadedDrafter.drafter
+        //
+        // ONLY retained when `drafterRetentionDecision` is true (clause (i) matched — see
+        // `inCheckpointMTPDrafterRetentionDecision`'s doc comment). A divergent run already passed
+        // clause (ii) (genuine speculation, still fail-closed above via `try`), so the drafter
+        // itself is provably not broken — but this run gave no evidence the PAIRING is safe to
+        // serve, so `retainedInCheckpointMTPDrafter` stays nil and the `if let drafter =` below
+        // falls through to the plain `MLXDecoder` scalar route instead of refusing the whole
+        // serve.
+        if drafterRetentionDecision {
+            retainedInCheckpointMTPDrafter = loadedDrafter.drafter
+        }
         Memory.clearCache()
         try validateScalarServingMemoryLimits(configuration)
     }
@@ -1159,13 +1219,24 @@ func inCheckpointMTPRuntimeNamespace(
 /// `MTPSpeculativeTokenIterator.init` (`Swift.min(blockSize, drafter.maximumBlockSize ?? blockSize)`).
 let inCheckpointMTPStartupGateBlockSize = 3
 
-/// How many tokens the startup equivalence gate generates. This is an UPPER BOUND on decode work,
+/// How many tokens the startup readiness gate generates. This is an UPPER BOUND on decode work,
 /// NOT a guarantee that at least one full speculative round runs: if the prepare-time bonus token
 /// is itself a stop token, the decode loop breaks immediately after draining that bonus -- zero
 /// rounds run, `drafter.draftBlock` is never called, `proposedDraftTokens == 0` -- because the
 /// stop-token break dominates this budget regardless of its size. A startup prompt whose very
 /// first generated token is a stop token will still fail clause (ii)'s `proposedDraftTokens > 0`
 /// check no matter how large this value is.
+///
+/// DO NOT raise this to "make clause (i) discriminating" or to try to reach the point where the
+/// scalar and speculative arms are expected to diverge. That divergence is ARCHITECTURAL, not a
+/// bug this budget is hiding: the speculative verify forward evaluates multiple positions per
+/// call while scalar decode evaluates one, so the two arms' forward geometries do not round
+/// identically once decode runs long enough — measured, on real weights, to first appear near
+/// token ~200 (`docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md`). Raising this
+/// constant would not fix that; it would turn clause (i) from "rarely reached" into "reliably
+/// reached and reliably refuses a correct integration" -- a false-refusal machine, not a stronger
+/// gate. Clause (i)'s outcome is DATA (`InCheckpointMTPStartupReadiness.tokenSequencesMatched`),
+/// not a throw, precisely because of this.
 let inCheckpointMTPStartupGateMaxTokens = 8
 
 /// One greedy decode's tokens plus the speculative-decoding telemetry that run produced (zeroed
@@ -1177,21 +1248,40 @@ struct InCheckpointMTPGreedyDecodeResult {
     let passthroughReason: String?
 }
 
-/// Successful result of `verifyInCheckpointMTPStartupEquivalence`.
-struct InCheckpointMTPStartupEquivalence {
+/// Successful result of `verifyInCheckpointMTPStartupReadiness`.
+struct InCheckpointMTPStartupReadiness {
     let promptTokenCount: Int
     let generatedTokenCount: Int
     let proposedDraftTokens: Int
     let acceptedDraftTokens: Int
+    /// Clause (i)'s outcome, carried as DATA rather than thrown: whether this run's scalar
+    /// reference and speculative-decode arms produced token-identical greedy sequences.
+    ///
+    /// `false` is an EXPECTED, architecture-level outcome once decode runs long enough to reach
+    /// it (see `inCheckpointMTPStartupGateMaxTokens`'s doc comment) — it is NOT by itself evidence
+    /// of a broken drafter or a broken pairing. The call site
+    /// (`loadScalarServingModel`) treats `false` as "do not retain the drafter for this serve",
+    /// never as a reason to refuse the whole load: clause (ii) below is what stays fail-closed.
+    let tokenSequencesMatched: Bool
 }
 
-/// Fail-closed gate: the target's in-checkpoint MTP drafter, once loaded, must reproduce the SAME
-/// greedy token sequence as scalar decode against the SAME target, AND
-/// `MTPSpeculativeTokenIterator` must have genuinely speculated rather than silently degraded to
-/// passthrough (`MTPSpeculativeTokenIterator.swift:167-176` documents exactly that silent
-/// degradation). Without both checks the gate would pass vacuously by comparing scalar decode to
-/// scalar decode — see
-/// `docs/task-inbox/2026-09-07-qwen4exp-mtp-serving-wiring-DECISION.md`'s Increment B.
+/// Startup readiness gate for the qwen4_exp in-checkpoint MTP drafter. Runs the SAME target
+/// through both a plain scalar-greedy reference decode and `MTPSpeculativeTokenIterator`, and
+/// reports two independent things:
+///
+///   (i) whether the two arms' greedy token sequences matched on this run (DATA, in the returned
+///       `InCheckpointMTPStartupReadiness.tokenSequencesMatched` — never thrown; see that field's
+///       doc comment for why token-for-token identity is not a real property of this build), and
+///   (ii) whether `MTPSpeculativeTokenIterator` genuinely speculated rather than silently
+///        degrading to passthrough (`MTPSpeculativeTokenIterator.swift:167-176` documents exactly
+///        that silent degradation) — this clause STAYS fail-closed (`throws`), because a
+///        passthrough/never-speculated run proves NOTHING about the drafter, whereas a token
+///        sequence divergence alone is expected geometry, not evidence of a broken pairing. See
+///        `docs/task-inbox/2026-09-07-mtp-scalar-route-divergence-DECISION.md` for the real-weight
+///        A/B that established this, and
+///        `docs/task-inbox/2026-09-07-qwen4exp-mtp-serving-wiring-DECISION.md`'s Increment B for
+///        why clause (ii) exists at all (without it this gate would pass vacuously by comparing
+///        scalar decode to scalar decode).
 ///
 /// Protocol-typed (`any LanguageModel`/`any MTPDrafterModel`) rather than concretely bound to
 /// `context.model`/the production vendored draft model, so this function is itself reusable
@@ -1199,60 +1289,73 @@ struct InCheckpointMTPStartupEquivalence {
 /// No fixture on this repository's 24 GiB dev box is small enough to exercise that path against
 /// the REAL Flash Next artifact today (the converted checkpoint is 113 GB) — that remains provable
 /// only on the larger production-shaped hosts.
-func verifyInCheckpointMTPStartupEquivalence(
+///
+/// `cacheFactory` builds BOTH arms' KV caches — the SAME factory `loadScalarServingModel` hands
+/// `MLXDecoder`/`MTPSpeculativeDecoder` for real requests (`scalarServingNativeCacheFactory`),
+/// rather than a bare `mainModel.newCache(parameters: nil)` call local to this gate. Without this
+/// the gate would always construct plain native (fp16) caches regardless of the operator's
+/// selected KV-cache storage tier, making it blind to a non-fp16 tier's own cache wrapper. No
+/// default: every caller must be explicit about which factory it is proving.
+func verifyInCheckpointMTPStartupReadiness(
     mainModel: any LanguageModel,
     drafter: any MTPDrafterModel,
     promptTokens: [Int],
     stopTokenIDs: Set<Int>,
+    cacheFactory: () -> [KVCache],
     maxTokens: Int = inCheckpointMTPStartupGateMaxTokens,
     blockSize: Int = inCheckpointMTPStartupGateBlockSize
-) throws -> InCheckpointMTPStartupEquivalence {
+) throws -> InCheckpointMTPStartupReadiness {
     let scalar = try runInCheckpointMTPScalarReference(
         mainModel: mainModel,
         promptTokens: promptTokens,
         stopTokenIDs: stopTokenIDs,
-        maxTokens: maxTokens)
+        maxTokens: maxTokens,
+        cacheFactory: cacheFactory)
     let speculative = try runInCheckpointMTPSpeculativeDecode(
         mainModel: mainModel,
         drafter: drafter,
         promptTokens: promptTokens,
         stopTokenIDs: stopTokenIDs,
         maxTokens: maxTokens,
-        blockSize: blockSize)
+        blockSize: blockSize,
+        cacheFactory: cacheFactory)
 
-    return try inCheckpointMTPStartupEquivalenceDecision(
+    return try inCheckpointMTPStartupReadinessDecision(
         promptTokenCount: promptTokens.count,
         scalar: scalar,
         speculative: speculative)
 }
 
-/// Pure pass/fail decision for the startup equivalence gate, given ALREADY-COMPUTED greedy decode
-/// results from both paths. Separated from `verifyInCheckpointMTPStartupEquivalence` specifically so
+/// Pure pass/fail decision for the startup readiness gate, given ALREADY-COMPUTED greedy decode
+/// results from both paths. Separated from `verifyInCheckpointMTPStartupReadiness` specifically so
 /// both clauses — including clause (ii), the anti-vacuity clause — are unit-testable without a
 /// real MLX model or drafter, mirroring `scalarServingMarkerFamilyAdmissionError`'s separation
 /// from `loadScalarServingModel` for the identical reason.
-func inCheckpointMTPStartupEquivalenceDecision(
+///
+/// Order matters and is deliberate: clause (ii) is evaluated and can throw EVEN WHEN clause (i)
+/// diverged. A run that both diverged (clause (i)) AND degraded to passthrough (clause (ii)) must
+/// still throw `didNotSpeculate` — passthrough is an availability failure regardless of what
+/// clause (i) measured, so clause (i)'s demotion to data must never swallow it.
+func inCheckpointMTPStartupReadinessDecision(
     promptTokenCount: Int,
     scalar: InCheckpointMTPGreedyDecodeResult,
     speculative: InCheckpointMTPGreedyDecodeResult
-) throws -> InCheckpointMTPStartupEquivalence {
-    // Clause (i): identical greedy token sequences. Count first (a cheap, always-safe scalar
-    // check), THEN a SHA-256 fold of the sequence — never `Array ==`, which triggers a Myers diff
-    // on failure (`never-expect-equality-of-large-collections`).
-    guard scalar.tokens.count == speculative.tokens.count else {
-        throw ScalarServingModelLoadError.inCheckpointMTPStartupTokenSequenceMismatch
-    }
-    guard inCheckpointMTPTokenSequenceFingerprint(scalar.tokens)
-        == inCheckpointMTPTokenSequenceFingerprint(speculative.tokens)
-    else {
-        throw ScalarServingModelLoadError.inCheckpointMTPStartupTokenSequenceMismatch
-    }
+) throws -> InCheckpointMTPStartupReadiness {
+    // Clause (i): identical greedy token sequences -- now DATA, never thrown (see
+    // `InCheckpointMTPStartupReadiness.tokenSequencesMatched`'s doc comment). Count first (a
+    // cheap, always-safe scalar check), THEN a SHA-256 fold of the sequence — never `Array ==`,
+    // which triggers a Myers diff on failure (`never-expect-equality-of-large-collections`).
+    let tokenSequencesMatched =
+        scalar.tokens.count == speculative.tokens.count
+        && inCheckpointMTPTokenSequenceFingerprint(scalar.tokens)
+            == inCheckpointMTPTokenSequenceFingerprint(speculative.tokens)
 
     // Clause (ii), the anti-vacuity clause: the iterator must have genuinely speculated. Sticky
     // passthrough (`passthroughReason != nil`) means this run proved nothing about the drafter —
-    // it degraded to (or never left) scalar decode. This check runs AFTER clause (i) passes, which
-    // is exactly the vacuous-pass scenario it exists to catch: identical token sequences alone are
-    // not evidence of speculation.
+    // it degraded to (or never left) scalar decode. Evaluated regardless of clause (i)'s outcome
+    // above (see this function's own doc comment on ordering) — a diverged run gets no pass here
+    // just because it diverged, and a matched run is not spared this check either: identical
+    // token sequences alone are not evidence of speculation.
     guard speculative.passthroughReason == nil else {
         throw ScalarServingModelLoadError.inCheckpointMTPStartupDidNotSpeculate(
             reason: speculative.passthroughReason,
@@ -1272,13 +1375,12 @@ func inCheckpointMTPStartupEquivalenceDecision(
     //
     // `MTPSpeculativeTokenIterator`'s greedy acceptance walk sets `accepted == 0` whenever the
     // drafter's FIRST proposal in a round differs from the target's own greedy token — the
-    // iterator still emits the target's greedy token (so clause (i) above stays byte-exact) and
-    // trims the rejected drafts from the cache. `accepted == 0` is a legitimate outcome of a
-    // COMPLETED round by a CORRECT drafter, not evidence the drafter was never exercised. Gating
-    // startup on `acceptedDraftTokens > 0` made that single, deterministic Bernoulli trial (this
-    // gate runs one short, fixed startup prompt with `maxTokens: 8`, `blockSize: 3` — effectively
-    // one speculative round) decide, permanently, whether a correctly loaded artifact could ever
-    // boot with MTP enabled.
+    // iterator still emits the target's greedy token and trims the rejected drafts from the
+    // cache. `accepted == 0` is a legitimate outcome of a COMPLETED round by a CORRECT drafter,
+    // not evidence the drafter was never exercised. Gating startup on `acceptedDraftTokens > 0`
+    // made that single, deterministic Bernoulli trial (this gate runs one short, fixed startup
+    // prompt with `maxTokens: 8`, `blockSize: 3` — effectively one speculative round) decide,
+    // permanently, whether a correctly loaded artifact could ever boot with MTP enabled.
     //
     // Tradeoff, stated honestly: this gives up a weak, low-power signal that a mis-bound or
     // mis-quantized drafter would propose garbage that is never accepted. `acceptedDraftTokens`
@@ -1291,21 +1393,64 @@ func inCheckpointMTPStartupEquivalenceDecision(
             acceptedDraftTokens: speculative.acceptedDraftTokens)
     }
 
-    return InCheckpointMTPStartupEquivalence(
+    return InCheckpointMTPStartupReadiness(
         promptTokenCount: promptTokenCount,
         generatedTokenCount: speculative.tokens.count,
         proposedDraftTokens: speculative.proposedDraftTokens,
-        acceptedDraftTokens: speculative.acceptedDraftTokens)
+        acceptedDraftTokens: speculative.acceptedDraftTokens,
+        tokenSequencesMatched: tokenSequencesMatched)
+}
+
+/// Pure retention decision for the qwen4_exp in-checkpoint MTP drafter, given the startup
+/// readiness gate's already-computed verdict. Separated from `loadScalarServingModel` specifically
+/// so it is unit-testable without a real MLX model or drafter, mirroring
+/// `inCheckpointMTPStartupReadinessDecision`'s and `scalarServingMarkerFamilyAdmissionError`'s
+/// separation from that same function for the identical reason.
+///
+/// This is the ONE function both the retained drafter's presence
+/// (`retainedInCheckpointMTPDrafter` in `loadScalarServingModel`) and the reported
+/// `ScalarServingInCheckpointMTPStartupVerdict.drafterServing` value must derive from — a mutation
+/// test caught the desync hazard directly: before this extraction, the two were independent reads
+/// of `readiness.tokenSequencesMatched`, and mutating the retention call site to unconditionally
+/// retain the drafter (while `drafterServing` still read the real field) left the existing suite
+/// green, because nothing exercised the two reads' agreement. `loadScalarServingModel` now binds
+/// this call's result to a single local `let` (`drafterRetentionDecision`) that both the
+/// retention `if` and the verdict's `drafterServing:` argument read, which closes the ORIGINAL
+/// hazard class — two independent reads of the same source silently drifting apart. It does NOT
+/// make every desync structurally impossible: a future edit could still delete the retention `if`
+/// guard and unconditionally assign `retainedInCheckpointMTPDrafter`, reintroducing the same
+/// mismatch in a different shape. That residual edit is a single, visually obvious line in a
+/// small function, not two field reads scattered ~15 lines apart — and, like the rest of this
+/// gate, it is exercised only by the unit tests below at the pure-function boundary, never by
+/// executing `loadScalarServingModel`'s own body (fleet-only; see
+/// `MTPDecoderBridgeSelectionTests.swift`'s class doc comment).
+func inCheckpointMTPDrafterRetentionDecision(readiness: InCheckpointMTPStartupReadiness) -> Bool {
+    readiness.tokenSequencesMatched
 }
 
 private func runInCheckpointMTPScalarReference(
     mainModel: any LanguageModel,
     promptTokens: [Int],
     stopTokenIDs: Set<Int>,
-    maxTokens: Int
+    maxTokens: Int,
+    cacheFactory: () -> [KVCache]
 ) throws -> InCheckpointMTPGreedyDecodeResult {
-    let parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
-    let cache = mainModel.newCache(parameters: parameters)
+    var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+    // Otherwise this silently inherits the vendored `GenerateParameters` default of 512
+    // (`Evaluate.swift:134`) instead of the 2048 production actually chunks prefill at
+    // (`MLXDecoder.defaultPrefillChunkSize`, threaded into `MTPSpeculativeDecoder.buildParameters`
+    // at `MTPSpeculativeDecoder.swift:129`) — see the matching comment on the speculative arm
+    // below for why a mismatch here is a real, previously-measured geometry divergence, not a
+    // hypothetical one. HONESTLY: the fixed startup prompt this gate actually runs
+    // (`ScalarServingModelLoadConfiguration.defaultStartupMessages`, ~15 tokens) is far below
+    // EITHER chunk size, so this line has NO observable effect on today's startup run. It keeps
+    // this gate's arms calibrated against what production actually does, for the day a longer
+    // startup prompt (or a differently-sized chunk boundary) makes it observable.
+    parameters.prefillStepSize = MLXDecoder.defaultPrefillChunkSize
+    // Built through the SAME `cacheFactory` production hands the real decoders, not a bare
+    // `mainModel.newCache(parameters:)` call — see `verifyInCheckpointMTPStartupReadiness`'s doc
+    // comment on `cacheFactory` for why.
+    let cache = cacheFactory()
     var iterator = try TokenIterator(
         input: LMInput(tokens: MLXArray(promptTokens.map { Int32($0) })),
         model: mainModel,
@@ -1338,14 +1483,20 @@ private func runInCheckpointMTPSpeculativeDecode(
     promptTokens: [Int],
     stopTokenIDs: Set<Int>,
     maxTokens: Int,
-    blockSize: Int
+    blockSize: Int,
+    cacheFactory: () -> [KVCache]
 ) throws -> InCheckpointMTPGreedyDecodeResult {
-    let parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+    var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+    // Same reasoning and same HONESTLY caveat as `runInCheckpointMTPScalarReference`'s identical
+    // line above -- named constant, never a second `2048` literal.
+    parameters.prefillStepSize = MLXDecoder.defaultPrefillChunkSize
+    // Same `cacheFactory` reasoning as the scalar reference arm above -- both arms must be blind
+    // to the operator's KV-cache tier selection in the SAME way production is, not differently.
     var iterator = try MTPSpeculativeTokenIterator(
         input: LMInput(tokens: MLXArray(promptTokens.map { Int32($0) })),
         mainModel: mainModel,
         drafter: drafter,
-        mainCache: mainModel.newCache(parameters: parameters),
+        mainCache: cacheFactory(),
         parameters: parameters,
         blockSize: blockSize)
     var tokens: [Int] = []
