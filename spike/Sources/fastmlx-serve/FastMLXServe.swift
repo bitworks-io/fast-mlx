@@ -58,6 +58,16 @@ struct FastMLXServe {
                         .appending(error.description + "\n")
                         .utf8))
             exit(2)
+        } catch let error as ScalarServingModelLoadError {
+            // Catches the WHOLE ~30-case error type (not just the one case with a bespoke remedy):
+            // `scalarServingModelLoadRefusalAnnounceLine` renders every other case with its own
+            // honest, generic line rather than mislabeling it under the bespoke reason, so no case
+            // here gets a misleading `reason=` it didn't earn. Same clean-exit rationale as the
+            // `FitCheckRefusal`/`ServingModelCapabilitiesError` arms above: avoid a Swift top-level
+            // fatalError trap (exit 133, doubled message) for an error already meant for the operator.
+            FileHandle.standardError.write(
+                Data((scalarServingModelLoadRefusalAnnounceLine(error) + "\n").utf8))
+            exit(2)
         }
     }
 

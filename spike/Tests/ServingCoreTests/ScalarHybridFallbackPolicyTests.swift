@@ -23,9 +23,24 @@ final class ScalarHybridFallbackPolicyTests: XCTestCase {
 
     func testSizerHybridLinearButServingUnprovenFamiliesFailClosed() {
         // These are classified hybrid-linear by the sizer (ModelConfigDecoder) but
-        // have NO live scalar-serving proof; qwen3_5_moe is additionally the
-        // human-gated weights>RAM MoE bet. None may silently fall back.
-        for family in ["qwen3_next", "qwen3_5_moe"] {
+        // have NO live scalar-serving proof for the path this fallback takes;
+        // qwen3_5_moe is additionally the human-gated weights>RAM MoE bet. None may
+        // silently fall back.
+        //
+        // qwen4_exp is the subtle one, and it is listed here deliberately. It DOES have a
+        // live serving proof — but a route-scoped one, covering only the offloaded n-gram
+        // route (`markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` in
+        // SpikeServingAdapters/MLXScalarServing.swift). This predicate takes a family and
+        // nothing else, so it cannot express that scoping. The fallback threads
+        // `arguments.ngramOffloadPlanURL`, which the parser guarantees is nil under
+        // continuous batching, so admitting qwen4_exp here would always land on the plain
+        // fully-resident load — ~106 GiB of weights loaded AFTER the memory-limit mutation
+        // and only THEN refused by the marker gate. Since the sizer classifies qwen4_exp as
+        // hybrid-linear, its absence from the allowlist keeps looking like a missing entry;
+        // this case is the lock that stops it being "fixed".
+        // Reasoning and both reopen conditions:
+        // docs/task-inbox/2026-09-08-qwen4exp-scalar-fallback-allowlist-NO-GO.md
+        for family in ["qwen3_next", "qwen3_5_moe", "qwen4_exp"] {
             XCTAssertFalse(
                 isScalarHybridServingFamily(family),
                 "\(family) has no live scalar-serving proof and must fail closed")

@@ -259,7 +259,10 @@ final class MLXScalarServingTests: XCTestCase {
 
     /// The load-bearing leg's inverse: `qwen4_exp` is refused when the offloaded n-gram plan did
     /// NOT resolve — this is what keeps the ~106 GiB fully-resident `loadModel` route from being
-    /// silently admitted by a bare family allowlist.
+    /// silently admitted by a bare family allowlist. This refuses via
+    /// `servingFamilyRequiresResolvedOffloadedNGramPlan`, NOT `unprovenServingFamily` — the family's
+    /// serving proof is real, only this load's route is wrong, which is a different, actionable
+    /// condition from a family having no proof at all.
     func testMarkerFamilyAdmissionRefusesFlashNextWhenOffloadedNGramPlanDidNotResolve() {
         let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] =
             (0..<36).map { _ in (kind: ScalarServingNativeCacheKind.recurrentState, source: ScalarServingCacheClassificationSource.markerProtocol) }
@@ -268,7 +271,7 @@ final class MLXScalarServingTests: XCTestCase {
         XCTAssertEqual(
             scalarServingMarkerFamilyAdmissionError(
                 classifications: classifications, family: "qwen4_exp", offloadedNGramPlanResolved: false),
-            .unprovenServingFamily("qwen4_exp"))
+            .servingFamilyRequiresResolvedOffloadedNGramPlan("qwen4_exp"))
     }
 
     /// A resolved offload plan is not a blanket bypass: an unrelated family is still refused even
@@ -298,7 +301,91 @@ final class MLXScalarServingTests: XCTestCase {
         XCTAssertEqual(
             scalarServingMarkerFamilyAdmissionError(
                 classifications: classifications, family: "QWEN4_EXP", offloadedNGramPlanResolved: false),
-            .unprovenServingFamily("qwen4_exp"))
+            .servingFamilyRequiresResolvedOffloadedNGramPlan("qwen4_exp"))
+    }
+
+    /// An UNLISTED family with a `.markerProtocol` classification still refuses via the generic
+    /// `unprovenServingFamily` — only a family on
+    /// `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` can ever resolve to the
+    /// more specific `servingFamilyRequiresResolvedOffloadedNGramPlan` case.
+    func testMarkerFamilyAdmissionRefusesUnlistedFamilyAsUnprovenServingFamily() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.recurrentState, .markerProtocol)
+        ]
+
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "llama", offloadedNGramPlanResolved: false),
+            .unprovenServingFamily("llama"))
+        XCTAssertEqual(
+            scalarServingMarkerFamilyAdmissionError(
+                classifications: classifications, family: "qwen3", offloadedNGramPlanResolved: true),
+            .unprovenServingFamily("qwen3"))
+    }
+
+    /// Locks the operator-facing announce line for `servingFamilyRequiresResolvedOffloadedNGramPlan`
+    /// so it cannot silently regress into something that no longer names the concrete remedy flag.
+    /// Mirrors `testFallbackAnnounceLineFormatIsLocked`'s locked-string shape for
+    /// `scalarHybridFallbackAnnounceLine`.
+    func testServingFamilyRequiresResolvedOffloadedNGramPlanAnnounceLineNamesTheRemedyFlag() {
+        let error = ScalarServingModelLoadError.servingFamilyRequiresResolvedOffloadedNGramPlan(
+            "qwen4_exp")
+
+        XCTAssertEqual(
+            scalarServingModelLoadRefusalAnnounceLine(error),
+            "fastmlx-serve configuration=refused reason=serving_family_requires_offload_plan "
+                + "model_type=qwen4_exp remedy=--ngram-offload-plan")
+    }
+
+    /// A case with no bespoke remedy must render an ACCURATE, non-misleading line naming its own
+    /// case rather than borrowing the offload-plan reason/remedy it did not earn — the top-level
+    /// catch in `FastMLXServe.main` handles the whole `ScalarServingModelLoadError` type, so a
+    /// case with no dedicated branch must never collapse into a reason string implying it does.
+    func testUnprovenServingFamilyAnnounceLineIsGenericAndDoesNotNameTheOffloadPlanRemedy() {
+        let line = scalarServingModelLoadRefusalAnnounceLine(
+            ScalarServingModelLoadError.unprovenServingFamily("qwen3"))
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=scalar_serving_model_load_error "
+                + "detail=unprovenServingFamily(\"qwen3\")")
+        XCTAssertFalse(line.contains("--ngram-offload-plan"))
+        XCTAssertFalse(line.contains("serving_family_requires_offload_plan"))
+    }
+
+    /// Anti-vacuity, load-bearing test: a LISTED family (`qwen4_exp`) refused only because the
+    /// offloaded n-gram plan did not resolve must NOT collapse into the same error case as an
+    /// UNLISTED family that has no serving proof at all. Comparing the two `ScalarServingModelLoadError`
+    /// VALUES directly (e.g. `XCTAssertNotEqual`) would be vacuous here — the associated family
+    /// string differs ("qwen4_exp" vs "llama") regardless of whether the underlying CASE collapsed,
+    /// so that comparison would pass both before and after the fix. Discriminating on the case
+    /// itself (ignoring the associated payload) is what actually exercises the bug: today both
+    /// inputs produce `.unprovenServingFamily`, so `isUnprovenServingFamily(listedButUnresolved)`
+    /// is `true` and the `XCTAssertFalse` below fails. After the fix it resolves to its own
+    /// actionable case instead.
+    func testMarkerFamilyAdmissionListedUnresolvedAndUnlistedFamilyUseDifferentErrorCases() {
+        let classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)] = [
+            (.recurrentState, .markerProtocol)
+        ]
+
+        let listedButUnresolved = scalarServingMarkerFamilyAdmissionError(
+            classifications: classifications, family: "qwen4_exp", offloadedNGramPlanResolved: false)
+        let unlistedFamily = scalarServingMarkerFamilyAdmissionError(
+            classifications: classifications, family: "llama", offloadedNGramPlanResolved: false)
+
+        func isUnprovenServingFamily(_ error: ScalarServingModelLoadError?) -> Bool {
+            if case .unprovenServingFamily = error { return true }
+            return false
+        }
+
+        XCTAssertTrue(
+            isUnprovenServingFamily(unlistedFamily),
+            "an unlisted family must still refuse via .unprovenServingFamily")
+        XCTAssertFalse(
+            isUnprovenServingFamily(listedButUnresolved),
+            "a LISTED family with an unresolved offload plan must refuse via its own actionable "
+                + "case, not collapse into the generic .unprovenServingFamily used for families "
+                + "with no serving proof at all")
     }
 
     func testResetParityPreflightAcceptsTwoExactOneTokenRuns() async throws {

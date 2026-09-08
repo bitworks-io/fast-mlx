@@ -105,6 +105,16 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// Carries the lowercased family name; lifted by recording that proof and (for a family proven
     /// only on the offloaded n-gram route) confirming the offload plan actually resolved.
     case unprovenServingFamily(String)
+    /// At least one of the model's native caches classified ONLY via the family-neutral
+    /// `ServingCacheKindReporting` marker protocol (no concrete-type match), and the resolved family
+    /// IS listed in `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` — its serving
+    /// proof is real — but this load did not resolve the offloaded n-gram plan the proof was
+    /// captured on. Distinct from `unprovenServingFamily`: that case means the family has NO serving
+    /// proof at all; this case means the family's ONLY proof is the offloaded n-gram route, and this
+    /// specific load took the plain, fully-resident route instead. Carries the lowercased family
+    /// name. Lifted by loading through the offloaded n-gram route (`--ngram-offload-plan`) rather
+    /// than by any change to this family's proof status.
+    case servingFamilyRequiresResolvedOffloadedNGramPlan(String)
     /// `ScalarServingModelLoadConfiguration.ngramOffloadPlanURL` was supplied but is not an absolute
     /// file URL — mirrors `modelDirectoryMustBeAbsolute`'s guard for the model directory.
     case ngramOffloadPlanMustBeAbsolute
@@ -1046,11 +1056,17 @@ private let markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan: Set
 ///
 /// Refuses only when at least one classification has source `.markerProtocol`. The family is
 /// lowercased before comparison (a `nil`/missing family is treated as `"unknown"`), so comparisons
-/// and the carried refusal string are both exact-match on the lowercased form. A family not in
-/// `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` is refused unconditionally. A
-/// LISTED family is admitted only when `offloadedNGramPlanResolved` is also `true` — a resolved
-/// offload plan is never a blanket bypass for every marker-classified family, and a listed family
-/// is never admitted on the plain, fully-resident load path. Returns `nil` to admit.
+/// and the carried refusal string are both exact-match on the lowercased form. This gate has TWO
+/// structurally distinct refusals, returned as two distinct error cases so an operator sees which
+/// one applies:
+///   1. The family is NOT in `markerClassifiedFamiliesProvenOnlyViaResolvedOffloadedNGramPlan` —
+///      genuinely unsupported; refused unconditionally as `.unprovenServingFamily`.
+///   2. The family IS listed (its serving proof is real), but `offloadedNGramPlanResolved` is
+///      `false` for this load — refused, actionably, as
+///      `.servingFamilyRequiresResolvedOffloadedNGramPlan`; a resolved offload plan is never a
+///      blanket bypass for every marker-classified family, and a listed family is never admitted
+///      on the plain, fully-resident load path.
+/// Returns `nil` to admit.
 public func scalarServingMarkerFamilyAdmissionError(
     classifications: [(kind: ScalarServingNativeCacheKind, source: ScalarServingCacheClassificationSource)],
     family: String?,
@@ -1065,9 +1081,47 @@ public func scalarServingMarkerFamilyAdmissionError(
         return .unprovenServingFamily(resolvedFamily)
     }
     guard offloadedNGramPlanResolved else {
-        return .unprovenServingFamily(resolvedFamily)
+        return .servingFamilyRequiresResolvedOffloadedNGramPlan(resolvedFamily)
     }
     return nil
+}
+
+/// Operator-facing announce line for `FastMLXServe.main`'s top-level catch of
+/// `ScalarServingModelLoadError`. Without this, an error that survives to `main()` unwrapped traps
+/// via Swift's top-level fatalError (exit 133, doubled message) instead of exiting cleanly with
+/// exit(2) — see the sibling `catch let error as ServingModelCapabilitiesError` arm in
+/// `FastMLXServe.swift`, whose comment names this exact failure mode.
+///
+/// Declared HERE, next to `ScalarServingModelLoadError`, rather than alongside
+/// `scalarHybridFallbackAnnounceLine` in `ServingCore/ScalarServingCacheLayoutPolicy.swift`:
+/// `ServingCore` has zero target dependencies (see `Package.swift`) and cannot see this type at
+/// all. `SpikeServingAdapters` depends on `ServingCore`, never the reverse, so `ServingCore` is not
+/// an option for a function whose signature names a `SpikeServingAdapters` type.
+///
+/// `.servingFamilyRequiresResolvedOffloadedNGramPlan` is the one case with a genuine, concrete
+/// remedy (`--ngram-offload-plan`) and gets a fixed-key-order, machine-readable line naming both
+/// the offending family and the flag — mirroring `scalarHybridFallbackAnnounceLine`'s
+/// `key=value`-per-token shape. This REPLACES `scalarServingRemedyDescription`, which had zero
+/// production callers (only tests) and so never actually reached an operator; there is now exactly
+/// one source of this message, not two overlapping ones.
+///
+/// Every OTHER case renders a generic, honest line carrying the case's own description rather than
+/// inventing a remedy that doesn't exist — an accurate raw dump beats a misleading bespoke reason.
+/// That generic branch is deliberately NOT forced into single-token `key=value` fields: some cases
+/// carry associated values with spaces (e.g. `memoryLimitNotApplied(expected: 1, observed: 2)`),
+/// and mirrors the existing `ServingModelCapabilitiesError` catch arm's own idiom of appending a
+/// free-text description after a fixed, parseable prefix rather than fabricating false structure.
+public func scalarServingModelLoadRefusalAnnounceLine(
+    _ error: ScalarServingModelLoadError
+) -> String {
+    switch error {
+    case .servingFamilyRequiresResolvedOffloadedNGramPlan(let family):
+        return "fastmlx-serve configuration=refused reason=serving_family_requires_offload_plan "
+            + "model_type=\(family) remedy=--ngram-offload-plan"
+    default:
+        return "fastmlx-serve configuration=refused reason=scalar_serving_model_load_error "
+            + "detail=\(error)"
+    }
 }
 
 /// Match the pinned MLX generation loop's complete stop-token construction.
