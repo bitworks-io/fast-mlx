@@ -144,6 +144,14 @@ public enum FastMLXServeArgumentError:
     /// either), so the existing `conflictingBackendModes` check does not cover this combination —
     /// an explicit refusal is required.
     case qwen4ExpMTPWithScripted
+    /// `--ngram-offload-plan` with `--scripted`: the flag is consumed only at the scalar-load call
+    /// site (`loadScalarServingBackend` → `ScalarServingModelLoadConfiguration`); the transport-only
+    /// scripted backend loads no model and never reaches that seam, so the plan would be silently
+    /// dropped. `hasLoadedModelOptions` deliberately does NOT include this flag (the same set the
+    /// `qwen4ExpMTPWithScripted` doc comment above describes), so the existing
+    /// `conflictingBackendModes` check does not cover this combination — an explicit refusal is
+    /// required.
+    case ngramOffloadPlanWithScripted
 
     public var description: String {
         switch self {
@@ -237,6 +245,8 @@ public enum FastMLXServeArgumentError:
             "--qwen4exp-mtp requires --ngram-offload-plan"
         case .qwen4ExpMTPWithScripted:
             "--qwen4exp-mtp loads a model and cannot be combined with --scripted"
+        case .ngramOffloadPlanWithScripted:
+            "--ngram-offload-plan loads a model and cannot be combined with --scripted"
         }
     }
 }
@@ -932,6 +942,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             }
         }
 
+        // --quant-pick-only is its own early-return mode below, which returns `backend: nil` and
+        // never reaches the general `--scripted` conflict check further down (that check runs only
+        // on the loaded-model path, past this early return). Without this guard, --scripted paired
+        // with --quant-pick-only would silently discard the requested --scripted transport-only
+        // backend and fall through into a quant-pick run instead. Both are legitimate backend-mode
+        // selections, so treat the pairing as the same general conflictingBackendModes case used
+        // everywhere else in this file, checked BEFORE the early return can fire.
+        if scripted, quantPickOnly {
+            throw FastMLXServeArgumentError.conflictingBackendModes
+        }
         // --quant-pick-only is its own early-return mode: it resolves the pick and exits without a
         // load, so it needs ONLY the candidate list (+ optional --context). It deliberately does NOT
         // reach the load-mode required-option guards below — nothing is loaded, so demanding
@@ -1022,6 +1042,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // same way it excludes --ngram-offload-plan itself) — an explicit refusal is required.
         if scripted, qwen4ExpMTP {
             throw FastMLXServeArgumentError.qwen4ExpMTPWithScripted
+        }
+        // --ngram-offload-plan is consumed only at the scalar-load seam (see the doc comment on
+        // .ngramOffloadPlanWithScripted); the transport-only scripted backend loads no model, so the
+        // flag would be silently dropped. Placed AFTER the --qwen4exp-mtp-with-scripted check above
+        // so that --scripted --qwen4exp-mtp --ngram-offload-plan keeps reporting the more specific
+        // qwen4ExpMTPWithScripted error (see testInCheckpointMTPWithScripted) rather than this one.
+        if scripted, ngramOffloadPlanURL != nil {
+            throw FastMLXServeArgumentError.ngramOffloadPlanWithScripted
         }
         if continuousDynamicPLD, allowHybridQwen35 {
             throw FastMLXServeArgumentError.dynamicPLDWithHybridQwen35

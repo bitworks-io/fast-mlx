@@ -1329,6 +1329,294 @@ final class MLXScalarServingTests: XCTestCase {
             result.stderr.contains("hybridKernelKeyHeadDimUnaligned(33)"),
             "unexpected stderr: \(result.stderr)")
     }
+
+    // MARK: - Black-box CLI coverage: `resolveServingLimits`'s pre-load fit-composition block
+    // (`--qwen4exp-mtp` / `--ngram-offload-plan`), driven through the real binary rather than
+    // re-implemented locally — see the module doc comments on `InCheckpointMTPFitComposition` and
+    // `NGramOffloadFitComposition` for the formulas these tests independently reconstruct.
+
+    /// Builds the 48-layer `layer_types` array a `qwen4_exp`/`qwen4_exp_text` config carries: 12
+    /// repetitions of [linear_attention, linear_attention, linear_attention, full_attention] -> 12
+    /// growing full-attention layers, 36 linear — the same shape `ModelConfigDecoderTests`'s own
+    /// qwen4_exp fixtures use, confirmed there to decode to `nAttnLayers == 12`.
+    private func qwen4ExpLayerTypesJSON() -> String {
+        var layerTypes: [String] = []
+        for _ in 0..<12 {
+            layerTypes += ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        }
+        return "[" + layerTypes.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+    }
+
+    /// A minimal flat (root `model_type`) `qwen4_exp_text` `config.json` that decodes successfully
+    /// via `ModelConfigDecoder.decodeModelDirectory` — the field set mirrors
+    /// `ModelConfigDecoderTests`'s own equivalent fixture: a 12/36 hybrid-linear split plus the
+    /// sparse-indexer aux term (`indexer_head_dim`) the qwen4_exp family requires to decode at all.
+    private func qwen4ExpConfigJSON() -> String {
+        """
+        {
+          "model_type": "qwen4_exp_text",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+    }
+
+    /// Writes a minimal, well-formed safetensors container at `url`: an 8-byte little-endian header
+    /// length, the header JSON itself (one entry per `tensors`, sequential non-overlapping
+    /// `data_offsets`), then a zero-filled data blob exactly covering the declared offsets — the
+    /// same three-part layout `NGramOffloadFitComposition.readSafetensorsTensorByteSizes` parses.
+    /// Declared `dtype`/`shape` are cosmetic (the composition only trusts `data_offsets` for byte
+    /// sizing, never the blob or the declared shape). Returns the resulting file's exact byte
+    /// count, so a caller knows the real "whole-file total" the production composition will
+    /// independently re-measure, without reading it back off the binary's own output.
+    @discardableResult
+    private func writeSafetensorsShard(
+        at url: URL, tensors: [(key: String, byteSize: Int)]
+    ) throws -> Int {
+        var header: [String: Any] = [:]
+        var offset = 0
+        for tensor in tensors {
+            header[tensor.key] = [
+                "dtype": "F32",
+                "shape": [max(1, tensor.byteSize / 4)],
+                "data_offsets": [offset, offset + tensor.byteSize],
+            ]
+            offset += tensor.byteSize
+        }
+        let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        var headerLength = UInt64(headerData.count)
+        var lengthBytes = [UInt8](repeating: 0, count: 8)
+        for index in 0..<8 {
+            lengthBytes[index] = UInt8(headerLength & 0xff)
+            headerLength >>= 8
+        }
+        var file = Data(lengthBytes)
+        file.append(headerData)
+        file.append(Data(count: offset))
+        try file.write(to: url)
+        return file.count
+    }
+
+    /// Writes an offload plan file carrying only the one field `NGramOffloadFitComposition
+    /// .planMaxResidentBytes` reads.
+    private func writeNGramOffloadPlanFile(at url: URL, maxResidentBytes: Int) throws {
+        let json = #"{"limits":{"maxResidentBytes":\#(maxResidentBytes)}}"#
+        try Data(json.utf8).write(to: url)
+    }
+
+    /// Synthetic `qwen4_exp_text` checkpoint directory carrying exactly one real offloaded n-gram
+    /// PLE shard pair (`shard_0`/`shard_1`, dense `weight`-only fields, layer 0) under the bare
+    /// `"model."` text-module prefix `NGramOffloadFitComposition.matchOffloadedNGramShardKey`
+    /// recognises — satisfying its structural audit (single layer index, contiguous `0..<2` shard
+    /// run, identical single-field shard sets). The two tensor byte sizes are caller-chosen and
+    /// therefore known exactly to the test, and the returned whole-file total is the REAL on-disk
+    /// size of the one shard file written (`ModelConfigDecoder.sumSafetensorsBytes` measures it
+    /// directly, and the accompanying index.json declares the identical total so the measured path
+    /// is used unambiguously) — so a test can independently reconstruct every number the production
+    /// composition is expected to print.
+    private func writeOffloadShardCheckpointDirectory(
+        shard0Bytes: Int, shard1Bytes: Int
+    ) throws -> (directory: URL, wholeFileTotal: Int) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ngram-offload-cli-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(qwen4ExpConfigJSON().utf8).write(to: directory.appendingPathComponent("config.json"))
+        let shardURL = directory.appendingPathComponent("model-00001-of-00001.safetensors")
+        let wholeFileTotal = try writeSafetensorsShard(
+            at: shardURL,
+            tensors: [
+                ("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", shard0Bytes),
+                ("model.layers.0.ple.ple_embedding.ngram_embedding.shard_1.weight", shard1Bytes),
+            ])
+        let indexJSON = #"{"metadata":{"total_size":\#(wholeFileTotal)}}"#
+        try Data(indexJSON.utf8).write(
+            to: directory.appendingPathComponent("model.safetensors.index.json"))
+        return (directory, wholeFileTotal)
+    }
+
+    /// Synthetic `qwen4_exp_text` checkpoint directory with NO `*.safetensors` shard on disk at
+    /// all — only a declared `model.safetensors.index.json` total
+    /// (`ModelConfigDecoder.decodeModelDirectory` accepts a declared-only checkpoint,
+    /// `weightsAreDeclared = true`, when no real shard is present). `NGramOffloadFitComposition`
+    /// then scans zero shard files, matches zero offloaded n-gram shard keys, and throws
+    /// `.noMatchingOffloadedShardKeys` — a realistic "wrong/missing checkpoint shape" failure
+    /// mode, not a contrived one, and one that needs no real tensor content at all: the declared
+    /// total alone is what the subsequent fit decision must still size honestly.
+    private func writeDeclaredOnlyCheckpointDirectory(declaredTotalBytes: Int) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "ngram-offload-declared-only-cli-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(qwen4ExpConfigJSON().utf8).write(to: directory.appendingPathComponent("config.json"))
+        let indexJSON = #"{"metadata":{"total_size":\#(declaredTotalBytes)}}"#
+        try Data(indexJSON.utf8).write(
+            to: directory.appendingPathComponent("model.safetensors.index.json"))
+        return directory
+    }
+
+    /// Extracts the two integers from a `"qwen4exp mtp fit adjustment: nAttnLayers <N> -> <M> ..."`
+    /// stderr line (`nil` when no such line is present), so a test asserts on the ACTUAL numbers the
+    /// binary printed rather than embedding both sides of the comparison as authored literals.
+    private func extractedMTPFitAdjustment(from stderr: String) -> (before: Int, after: Int)? {
+        guard let markerRange = stderr.range(of: "nAttnLayers ") else { return nil }
+        let scanner = Scanner(string: String(stderr[markerRange.upperBound...]))
+        guard let before = scanner.scanInt() else { return nil }
+        guard scanner.scanString("->") != nil else { return nil }
+        guard let after = scanner.scanInt() else { return nil }
+        return (before, after)
+    }
+
+    /// Acceptance A (decisive): the `--ngram-offload-plan` fit correction in
+    /// `resolveServingLimits` is really applied by the real serve binary, and the four numbers it
+    /// prints on stderr are exactly the ones this test independently computed from its own fixture
+    /// (never scraped from the binary's own output). Every quantity is asserted separately per
+    /// the project's separation-of-quantities discipline; the anti-vacuity check
+    /// (`assertLessThan`, not `!=`) proves the correction actually shrinks the resident figure.
+    func testServeCLINGramOffloadFitAdjustmentAppliesIndependentlyComputedNumbers() throws {
+        let (directory, wholeFileTotal) = try writeOffloadShardCheckpointDirectory(
+            shard0Bytes: 4096, shard1Bytes: 6144)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let offloadedBytes = 4096 + 6144
+        let residencyBudget = 3072
+        let adjustedWeights = wholeFileTotal - offloadedBytes + residencyBudget
+
+        let planURL = directory.appendingPathComponent("ngram-offload-plan.json")
+        try writeNGramOffloadPlanFile(at: planURL, maxResidentBytes: residencyBudget)
+
+        let result = try runServe(arguments: [
+            "--model", "qwen4-exp-cli-fixture-offload",
+            "--model-path", directory.path,
+            "--ngram-offload-plan", planURL.path,
+            "--host", "127.0.0.1",
+            "--port", "58733",
+        ])
+
+        XCTAssertTrue(
+            result.stderr.contains("ngram offload fit adjustment: whole-file total \(wholeFileTotal) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("offloaded n-gram bytes \(offloadedBytes) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("row-store residency budget \(residencyBudget) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("adjusted weights \(adjustedWeights) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertLessThan(
+            adjustedWeights, wholeFileTotal,
+            "an offload correction must always reduce the resident-weights figure, never grow it")
+    }
+
+    /// Acceptance B: when the `--ngram-offload-plan` composition FAILS (here: a checkpoint with no
+    /// matching offloaded n-gram shard keys on disk at all, a realistic "wrong artifact" shape), the
+    /// load-bearing `catch` in `resolveServingLimits` must keep sizing the conservative full-resident
+    /// figure rather than silently reducing it. Proven two ways: the `could not be computed` fallback
+    /// line names the exact failure this fixture triggers, and the subsequent fit-decision summary's
+    /// `weights=` figure equals the UNADJUSTED declared total (computed independently here with the
+    /// same `%.2f GiB` formula `ServingFitDecision.summaryLines()` uses), never anything smaller.
+    func testServeCLINGramOffloadFitAdjustmentFailureKeepsFullResidentFigure() throws {
+        let declaredTotal = 5_368_709_120  // exactly 5 GiB — a round figure under the same
+        // formatter the summary line uses, so the expected substring is exact, not approximate.
+        let directory = try writeDeclaredOnlyCheckpointDirectory(
+            declaredTotalBytes: declaredTotal)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let planURL = directory.appendingPathComponent("ngram-offload-plan.json")
+        try writeNGramOffloadPlanFile(at: planURL, maxResidentBytes: 1024)
+
+        let result = try runServe(arguments: [
+            "--model", "qwen4-exp-cli-fixture-declared-only",
+            "--model-path", directory.path,
+            "--ngram-offload-plan", planURL.path,
+            "--host", "127.0.0.1",
+            "--port", "58734",
+        ])
+
+        XCTAssertTrue(
+            result.stderr.contains(
+                "ngram offload fit adjustment could not be computed (noMatchingOffloadedShardKeys); "
+                    + "sizing the full-resident checkpoint instead"),
+            "unexpected stderr: \(result.stderr)")
+
+        let expectedGiB = String(format: "%.2f GiB", Double(declaredTotal) / 1_073_741_824.0)
+        XCTAssertTrue(
+            result.stderr.contains("weights=\(expectedGiB) (declared)"),
+            "the fit decision must size the UNADJUSTED declared total when the offload composition "
+                + "fails, proving the failure did not reduce the resident-weights figure; "
+                + "unexpected stderr: \(result.stderr)")
+    }
+
+    /// Acceptance C: `--qwen4exp-mtp` and `--ngram-offload-plan` BOTH run in one invocation (the
+    /// parser requires the plan whenever the MTP flag is present) rather than either composition
+    /// silently winning. The MTP line's `nAttnLayers <N> -> <M>` is parsed from the REAL stderr
+    /// output (not both sides of the comparison hardcoded) and asserted `M == N + 1` in addition to
+    /// matching this fixture's known 12/13 split; the offload line from the SAME run is asserted
+    /// with the identical independently-computed numbers Acceptance A uses.
+    ///
+    /// Scope, stated honestly: this proves CO-OCCURRENCE, not composition ORDER. A mutation that
+    /// swaps the two blocks in `resolveServingLimits` leaves every assertion here passing, and that
+    /// is correct rather than a gap in the test — the two compositions touch disjoint profile
+    /// fields (the MTP one rewrites only `nAttnLayers`; the offload one reads and rewrites only
+    /// `weightsBytes4bitEstimate`), so neither can observe the other's edit and the order is not an
+    /// observable property today. If a future composition ever reads a field its sibling writes,
+    /// order becomes real and this test must be extended to discriminate it.
+    func testServeCLIMTPAndNGramOffloadFitAdjustmentsBothRunInOneInvocation() throws {
+        let (directory, wholeFileTotal) = try writeOffloadShardCheckpointDirectory(
+            shard0Bytes: 2048, shard1Bytes: 2048)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let offloadedBytes = 2048 + 2048
+        let residencyBudget = 4096
+        let adjustedWeights = wholeFileTotal - offloadedBytes + residencyBudget
+
+        let planURL = directory.appendingPathComponent("ngram-offload-plan.json")
+        try writeNGramOffloadPlanFile(at: planURL, maxResidentBytes: residencyBudget)
+
+        let result = try runServe(arguments: [
+            "--model", "qwen4-exp-cli-fixture-mtp-stack",
+            "--model-path", directory.path,
+            "--qwen4exp-mtp",
+            "--ngram-offload-plan", planURL.path,
+            "--host", "127.0.0.1",
+            "--port", "58735",
+        ])
+
+        guard let mtpAdjustment = extractedMTPFitAdjustment(from: result.stderr) else {
+            XCTFail("no qwen4exp mtp fit adjustment line found in stderr: \(result.stderr)")
+            return
+        }
+        XCTAssertEqual(mtpAdjustment.before, 12, "unexpected stderr: \(result.stderr)")
+        XCTAssertEqual(mtpAdjustment.after, 13, "unexpected stderr: \(result.stderr)")
+        XCTAssertGreaterThan(
+            mtpAdjustment.after, mtpAdjustment.before,
+            "the MTP drafter's additional cache layer must strictly grow nAttnLayers")
+
+        XCTAssertTrue(
+            result.stderr.contains("ngram offload fit adjustment: whole-file total \(wholeFileTotal) B"),
+            "the offload composition must ALSO run in the same invocation, proving neither "
+                + "composition silently wins; unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("offloaded n-gram bytes \(offloadedBytes) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("row-store residency budget \(residencyBudget) B"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("adjusted weights \(adjustedWeights) B"),
+            "unexpected stderr: \(result.stderr)")
+    }
 }
 
 private enum FixtureTokenizerError: Error {

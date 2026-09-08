@@ -1834,4 +1834,64 @@ final class FastMLXServeArgumentsTests: XCTestCase {
                 .duplicateOption("--qwen4exp-mtp"))
         }
     }
+
+    /// Acceptance criterion: --ngram-offload-plan is consumed only at the scalar-load seam
+    /// (`loadScalarServingBackend` → `ScalarServingModelLoadConfiguration`); the transport-only
+    /// --scripted backend loads no model and never reaches that seam, so pairing the two would
+    /// otherwise silently drop the operator's explicit plan. --scripted --ngram-offload-plan alone
+    /// (no --qwen4exp-mtp) throws .ngramOffloadPlanWithScripted.
+    func testNgramOffloadPlanRejectedWithScripted() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithScripted)
+        }
+    }
+
+    /// Acceptance criterion: --quant-pick-only is its own early-return backend-mode (`backend:
+    /// nil`) that never reaches the general --scripted conflict check further down. Without an
+    /// explicit guard, --scripted --quant-pick-only would silently discard the requested
+    /// --scripted transport-only backend and fall through into a quant-pick run instead. This
+    /// asserts the pairing throws the same .conflictingBackendModes used for every other
+    /// backend-mode conflict in this file.
+    func testQuantPickOnlyRejectedWithScripted() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--quant-candidates", "/models/a,/models/b",
+                "--quant-pick-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .conflictingBackendModes)
+        }
+    }
+
+    /// Acceptance criterion: .ngramOffloadPlanWithContinuousBatch fires for BOTH continuous
+    /// routes; testNgramOffloadPlanRejectedWithContinuousBatching above covers only
+    /// --continuous-batch-no-spec, leaving the --continuous-dynamic-pld arm covered by
+    /// construction only. This exercises that arm directly.
+    func testNgramOffloadPlanRejectedWithContinuousDynamicPLD() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-dynamic-pld",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "103079215104",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .ngramOffloadPlanWithContinuousBatch)
+        }
+    }
 }
