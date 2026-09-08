@@ -174,6 +174,90 @@ final class InCheckpointMTPFitCompositionTests: XCTestCase {
         XCTAssertEqual(composed.id, "\(base.id)+qwen4exp-mtp-composition")
     }
 
+    // MARK: - (f) Sentinel refusal: the fail-open this composition must not reintroduce
+
+    /// A `nAttnLayers: 0` profile is `ModelArchProfile`'s deliberate sentinel for "growing-attention-
+    /// layer count unconfirmed — do not multiply blind" (`ModelArchProfile.isKVDerivable`'s doc
+    /// comment). `make` must refuse to touch it at all: incrementing 0 -> 1 would convert an honest
+    /// "not derivable" refusal into a fabricated, computed fit color. Asserts `nAttnLayers`, `id`
+    /// (NOT relabeled — relabeling would claim a composition happened when none did), and
+    /// `isKVDerivable` are unchanged by the call.
+    func testSentinelProfileWithZeroAttnLayersIsReturnedCompletelyUnchanged() {
+        let sentinel = ModelArchProfile(
+            id: "sentinel-unconfirmed-attn-layers",
+            modelType: .hybridMamba2MoE,
+            nLayers: 48,
+            nAttnLayers: 0,
+            nKVHeads: 2,
+            headDim: 256,
+            nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: 10_000_000_000,
+            license: "fixture-license")
+
+        XCTAssertEqual(sentinel.nAttnLayers, 0)
+        XCTAssertFalse(sentinel.isKVDerivable)
+
+        let result = InCheckpointMTPFitComposition.make(base: sentinel)
+
+        XCTAssertEqual(result.nAttnLayers, 0)
+        XCTAssertEqual(result.id, sentinel.id)
+        XCTAssertFalse(result.isKVDerivable)
+    }
+
+    /// The consequence that makes the sentinel guard meaningful rather than cosmetic: a
+    /// `CapacityPrediction` built for the sentinel profile must still classify to RED
+    /// `.kvNotDerivable` AFTER passing through `make` — proving the guard actually prevents a
+    /// fabricated fit color downstream, not merely that a raw field happens to read `0`.
+    func testSentinelProfileStillClassifiesAsKVNotDerivableAfterComposition() {
+        let sentinel = ModelArchProfile(
+            id: "sentinel-unconfirmed-attn-layers",
+            modelType: .hybridMamba2MoE,
+            nLayers: 48,
+            nAttnLayers: 0,
+            nKVHeads: 2,
+            headDim: 256,
+            nativeMaxContext: 262_144,
+            weightsBytes4bitEstimate: 10_000_000_000,
+            license: "fixture-license")
+
+        let composed = InCheckpointMTPFitComposition.make(base: sentinel)
+
+        let prediction = CapacityModel.predictPeakBytes(
+            model: composed, context: 4096, concurrency: 1, kvQuant: .fp16,
+            profile: .m5Max128)
+        let verdict = CapacityModel.classify(
+            prediction, profile: .m5Max128, weightsBytes: Double(composed.weightsBytes4bitEstimate))
+
+        XCTAssertEqual(verdict.color, .red)
+        XCTAssertEqual(verdict.bindingConstraint, .kvNotDerivable)
+    }
+
+    /// The guard must be DISCRIMINATING, not a blanket "small values are suspicious" check: a
+    /// non-sentinel profile with `nAttnLayers == 1` (the smallest legitimate confirmed count) IS
+    /// composed to 2, exactly like every other non-sentinel value. This is what proves the guard
+    /// fires only on the `== 0` sentinel, not on every small `nAttnLayers`.
+    func testProfileWithOneAttnLayerIsComposedToTwoNotTreatedAsSentinel() {
+        let base = flashNextProfile()
+        let oneLayer = ModelArchProfile(
+            id: base.id,
+            modelType: base.modelType,
+            nLayers: base.nLayers,
+            nAttnLayers: 1,
+            nKVHeads: base.nKVHeads,
+            headDim: base.headDim,
+            fixedStateBytes: base.fixedStateBytes,
+            nativeMaxContext: base.nativeMaxContext,
+            weightsBytes4bitEstimate: base.weightsBytes4bitEstimate,
+            license: base.license,
+            auxPerLayerKeyDim: base.auxPerLayerKeyDim)
+
+        let composed = InCheckpointMTPFitComposition.make(base: oneLayer)
+
+        XCTAssertEqual(oneLayer.nAttnLayers, 1)
+        XCTAssertEqual(composed.nAttnLayers, 2)
+        XCTAssertEqual(composed.id, "\(oneLayer.id)+qwen4exp-mtp-composition")
+    }
+
     // MARK: - (d) The wire: argument→fit seam
 
     /// `resolveServingLimits` (private, `fastmlx-serve`'s `FastMLXServe.swift`) has no test target of

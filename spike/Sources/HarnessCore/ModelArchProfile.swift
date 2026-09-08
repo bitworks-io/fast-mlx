@@ -429,14 +429,24 @@ public struct ModelArchProfile: Sendable {
         // NOT at the KV-quant bytes/element, because `rawKeys` is a projection output held at model
         // dtype rather than part of the quantizable KV cache; see `CapacityModel.kvBytesPerToken`.
         //
-        // NOT counted by this entry or by `CapacityModel`: an MTP (multi-token-prediction) deploy
-        // adds a 13th growing K+V cache PLUS a 13th growing indexer cache on top of the 12 that
-        // `nAttnLayers = 12` models here. The MTP draft head builds its own `.qsa` decoder layer
-        // with its own indexer and allocates its own growing cache (verified directly against the
-        // vendored MTP draft-head implementation) — this entry has no attention-layer
-        // count that includes it. Roughly +1/12 (~8%) more growing KV/tok than the 27,648 B/tok
-        // figure above once MTP is in the serving path. Not modeled here; treat any fit verdict
-        // for an MTP-enabled deploy as an under-count by that margin, not as already covering it.
+        // NOT counted by this entry itself: an MTP (multi-token-prediction) deploy adds a 13th
+        // growing K+V cache PLUS a 13th growing indexer cache on top of the 12 that `nAttnLayers = 12`
+        // models here. The MTP draft head builds its own `.qsa` decoder layer with its own indexer
+        // and allocates its own growing cache (verified directly against the vendored MTP draft-head
+        // implementation) — this raw catalog entry has no attention-layer count that includes it.
+        // Roughly +1/12 (~8%) more growing KV/tok than the 27,648 B/tok figure above once MTP is in
+        // the serving path.
+        //
+        // The SERVE path counts it: `resolveServingLimits` (`fastmlx-serve/FastMLXServe.swift`)
+        // applies `InCheckpointMTPFitComposition.make` whenever `--qwen4exp-mtp` is selected, which
+        // composes this entry's `nAttnLayers` to 13 before any fit color is computed — so a live
+        // `--qwen4exp-mtp` serve's fit verdict already includes this term, not just this entry's raw
+        // 12-layer figure. Any OTHER consumer that reads `ModelArchProfile.catalog` directly, without
+        // going through that composition, still gets the raw 12-layer under-count: `ModelSizer.report`
+        // (`ModelSizer.swift`, iterates `ModelArchProfile.catalog` directly) and the `fastmlx-capacity`
+        // CLI's `runCatalogTable`/`runSizerTable` (`fastmlx-capacity/main.swift`, same direct catalog
+        // iteration). Treat any fit verdict from those two raw-catalog consumers for an MTP-enabled
+        // deploy as an under-count by that margin, not as already covering it.
         // WARNING: Qwen Community License 1.0 -- flagged for legal verification, not a confirmed
         // clearance (same convention as the other flagged entries above).
         ModelArchProfile(

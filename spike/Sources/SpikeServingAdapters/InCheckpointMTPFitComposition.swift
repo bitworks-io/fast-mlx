@@ -34,11 +34,32 @@ import HarnessCore
 public enum InCheckpointMTPFitComposition {
     /// Builds the corrected `ModelArchProfile` for a `qwen4_exp` checkpoint served with the
     /// in-checkpoint MTP drafter enabled. Pure and non-throwing: unlike `NGramOffloadFitComposition`
-    /// and `ExactQwen35MTPCompositeFitProfile`, this composition reads no additional on-disk state —
-    /// it is a fixed, always-applicable geometry correction (+1 growing attention layer) with no
-    /// failure mode to fail closed against.
+    /// and `ExactQwen35MTPCompositeFitProfile`, this composition reads no additional on-disk state.
+    /// It DOES have one failure mode to fail closed against, and it is checked first: `base.nAttnLayers
+    /// == 0` is `ModelArchProfile`'s deliberate sentinel for "growing-attention-layer count
+    /// unconfirmed — do not multiply blind" (see `ModelArchProfile.isKVDerivable`'s doc comment),
+    /// which `CapacityModel.classify` turns into an honest RED `.kvNotDerivable` rather than a
+    /// fabricated fit. Incrementing that sentinel unconditionally (0 -> 1) would silently convert
+    /// "not derivable" into "derivable" and hand `classify` a computed — but fabricated — fit color
+    /// for an architecture whose attention-layer count was never confirmed. So `make` refuses to
+    /// touch a sentinel profile at all: it returns `base` completely unchanged, INCLUDING `id` (not
+    /// relabeled — relabeling would claim a composition happened when none did), leaving
+    /// `isKVDerivable` and the resulting `.kvNotDerivable` verdict exactly as honest as they were
+    /// before this composition ran.
+    ///
+    /// Deliberately NOT modeled by this composition, for the record rather than as a future TODO:
+    /// MTP-on also holds a transient duplicate of the GatedDeltaNet recurrent state.
+    /// `checkpointSpeculativePromptCacheBeforeAppend` (`Vendor/mlx-swift-lm/Libraries/MLXLMCommon/
+    /// KVCache.swift:2953-2981`) snapshots every recurrent cache entry once per speculative round, and
+    /// the `qwen4_exp` per-layer cache's own speculative checkpoint additionally copies the PLE
+    /// continuation alongside it. That duplicate is bounded by another fixed-size term — a second
+    /// `fixedStateBytes` (115,458,048 B ≈ 110 MiB) — and does not move any context ceiling (it is
+    /// context-independent, unlike the `nAttnLayers` term this composition does correct). It is
+    /// recorded here rather than added as a term because this composition's contract is the growing
+    /// per-attention-layer correction only.
     public static func make(base: ModelArchProfile) -> ModelArchProfile {
-        ModelArchProfile(
+        guard base.nAttnLayers > 0 else { return base }
+        return ModelArchProfile(
             id: "\(base.id)+qwen4exp-mtp-composition",
             modelType: base.modelType,
             nLayers: base.nLayers,

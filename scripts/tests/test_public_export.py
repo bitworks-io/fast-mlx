@@ -407,11 +407,23 @@ class PublicExportTests(unittest.TestCase):
         # to InCheckpointMTPFitComposition and describing the family by role (lowercase
         # qwen4_exp, as the projected sibling already does) cleared the gate. All three places
         # moved together.
+        # 889 -> 890 added, in one increment:
+        # spike/Tests/SpikeServingAdaptersTests/FitCompositionStackTests.swift -- coverage for the
+        # STACK of the two fit compositions (in-checkpoint MTP, then n-gram offload), which is the
+        # only reachable MTP serving shape because --qwen4exp-mtp requires --ngram-offload-plan at
+        # argument-parse time. Ordinary XCTest coverage of an already-projected contract; pure
+        # geometry over synthetic fixtures, no real checkpoint, no infrastructure detail. The same
+        # increment edited three already-projected files in place (byte-only, no reseal of their
+        # own): the composition gained a sentinel guard, its tests gained the refusal cases, and the
+        # catalog's now-stale "treat MTP-on as an under-count" warning was scoped to the raw-catalog
+        # consumers that still under-count. For the THIRD time the marker gate caught a real leak
+        # first: a doc-comment citation reintroduced the CamelCase family marker into this very
+        # file, and was rewritten to name the cache by role. All three places moved together.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 889,
-                "pathModeSha256": "5e311a96bd9b2aa8a2c2cbb9dec23894b18d44c853619d4fea83f761cddb9bf2",
+                "pathCount": 890,
+                "pathModeSha256": "589e6189989c451e41fb8ca7d6af803a4240a64d4678bfd9bfa18c90caa34e1d",
             },
         )
 
@@ -505,7 +517,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 889)
+            self.assertEqual(reexport_count, 890)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
