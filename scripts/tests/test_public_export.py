@@ -419,6 +419,19 @@ class PublicExportTests(unittest.TestCase):
         # consumers that still under-count. For the THIRD time the marker gate caught a real leak
         # first: a doc-comment citation reintroduced the CamelCase family marker into this very
         # file, and was rewritten to name the cache by role. All three places moved together.
+        # 891 -> 892 added, in one increment:
+        # spike/Tests/SpikeServingAdaptersTests/ServingDeveloperRoleMappingTests.swift -- end-to-end
+        # coverage for the render boundary's wire-role mapping: OpenAI's `developer` role is now
+        # translated to the template's `system` vocabulary before rendering, because no served
+        # template has a `developer` branch and the role therefore hit the template's own terminal
+        # raise_exception(...). Ordinary XCTest coverage of an already-projected serving contract. It
+        # inlines a small Jinja excerpt as a string literal rather than reading any deployment asset
+        # at runtime, precisely so this published test carries no dependency on a path the public
+        # distribution does not ship; it holds no checkpoint text, no infrastructure detail and no
+        # machine-local path. The same increment edited two already-projected files in place
+        # (byte-only, no reseal of their own): the codec gained the role-mapping seam and its
+        # existing fixture test flipped to pin the mapped role. All three places moved together.
+        #
         # 890 -> 891 added, in one increment:
         # spike/Tests/SpikeServingAdaptersTests/ServingChatTemplateRefusalTests.swift -- coverage
         # for ServingChatTemplateRefusal, which converts a chat template's own raise_exception(...)
@@ -431,8 +444,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 891,
-                "pathModeSha256": "4ee42ca7fafc8dd4665d30326b4ae2edf2055c19dcfbe022936781cf705e6ee5",
+                "pathCount": 892,
+                "pathModeSha256": "6f57fa06ff5c81e5a970db75a640687517c55c0173e20caaa18142f20ccd7a0c",
             },
         )
 
@@ -526,7 +539,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 891)
+            self.assertEqual(reexport_count, 892)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

@@ -9,7 +9,18 @@ import SpikeCore
 @testable import SpikeServingAdapters
 
 final class MLXScalarServingTests: XCTestCase {
-    func testCodecRendersExactOpenAIRolesAndContentThroughChatTemplate() throws {
+    /// Pins that `render` maps the wire `.developer` role onto the template's `"system"`
+    /// vocabulary (`MLXScalarTextCodec.scalarServingTemplateRoleName(for:)`) while every other
+    /// role passes through unchanged. `FixtureTokenizer.applyChatTemplate` below is the decisive
+    /// boundary check: it hardcodes the EXPECTED post-mapping role for each position and throws
+    /// `FixtureTokenizerError.unexpectedMessages` on any mismatch (including a message still
+    /// carrying the raw `"developer"` role), so if the mapping is ever removed this test fails
+    /// with a thrown error, not a silently wrong success. Because message 0 (`.developer`) and
+    /// message 1 (`.system`) both map to `"system"`, this request shape now renders as two
+    /// consecutive `"system"` role dictionaries — the served template's own patched loop (see
+    /// `ServingDeveloperRoleMappingTests.swift`) is what actually distinguishes "leading" from
+    /// "mid-conversation" system turns; this fixture only proves the codec's role labels.
+    func testCodecRendersExactOpenAIRolesAndContentThroughChatTemplateWithDeveloperMappedToSystem() throws {
         let codec = MLXScalarTextCodec(tokenizer: FixtureTokenizer())
 
         let tokens = try codec.render(
@@ -1722,8 +1733,13 @@ private struct FixtureTokenizer: Tokenizer {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
+        // Position 0 pins the mapped role, not the wire role: the codec maps `.developer` ->
+        // `"system"` at the render boundary (`scalarServingTemplateRoleName(for:)`), so a message
+        // decoded with `role: .developer` must arrive here already labeled `"system"`. If that
+        // mapping is ever removed, this position mismatches and the fixture throws
+        // `FixtureTokenizerError.unexpectedMessages` — see the test's doc comment above.
         let expected = [
-            ("developer", "developer text"),
+            ("system", "developer text"),
             ("system", "system text"),
             ("user", "user text"),
             ("assistant", "assistant text"),

@@ -20,6 +20,19 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
         self.tokenizer = tokenizer
     }
 
+    /// Maps the wire `role` OpenAI decodes (`OpenAIMessageRole`, a closed enum kept faithful to
+    /// the OpenAI Chat Completions API — see `OpenAIChatCompletionsTests.swift`'s pin on
+    /// `.developer` surviving decode) onto the role vocabulary the served chat template actually
+    /// branches on. No Qwen template (stock or patched) has a `developer` branch — only `system`,
+    /// `user`, `assistant`, and `tool` — so a `developer` message rendered verbatim hits the
+    /// template's own `raise_exception('Unexpected message role.')` and surfaces as an HTTP 400.
+    /// `developer` is OpenAI's request-shape refinement of `system` (both carry steering
+    /// instructions to the model); mapping it onto `system` here is a faithful translation, not a
+    /// content change. Every other role passes through unchanged.
+    private static func scalarServingTemplateRoleName(for role: OpenAIMessageRole) -> String {
+        role == .developer ? OpenAIMessageRole.system.rawValue : role.rawValue
+    }
+
     public func render(
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
@@ -28,7 +41,7 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
     ) throws -> [Int] {
         let templateMessages: [[String: any Sendable]] = messages.map { message in
             var dict: [String: any Sendable] = [
-                "role": message.role.rawValue,
+                "role": Self.scalarServingTemplateRoleName(for: message.role),
                 "content": message.text,
             ]
             if !message.toolCalls.isEmpty {
@@ -73,6 +86,21 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             // message), so this layer must not encode or duplicate the rule itself. It only
             // reports whatever the template decided, faithfully, as a client-shape error instead
             // of letting it fall through to the generic 500 catch-all.
+            //
+            // `scalarServingTemplateRoleName(for:)` above is a different act from this: it maps
+            // the WIRE role vocabulary (OpenAI's `developer`/`system`/`user`/`assistant`/`tool`)
+            // onto the template's own vocabulary before the template ever sees a message, the same
+            // way this method already reshapes `tool_calls` into the template's expected shape
+            // above and translates `enable_thinking`/`reasoning_effort` into template context
+            // below. Encoding the template's CONSTRAINTS over that vocabulary (ordering, content
+            // rules) is this catch block's job; translating the VOCABULARY itself, so the
+            // constraints even have a chance to evaluate sensibly, is the role mapper's job — this
+            // layer still does not decide what the template permits, only what the template can
+            // recognize as input. Accepted residual: if a served template ever grows its own
+            // `developer` branch, this mapping renders `developer` messages through the template's
+            // `system` branch instead of that new branch — a fidelity loss (the template loses the
+            // chance to treat `developer` specially), not a breakage, because every template that
+            // has a `developer` branch also still accepts `system`.
             throw ServingChatTemplateRefusal.translated(error)
         }
     }
@@ -562,7 +590,11 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     /// Machine-readable startup-line fragment attesting whether the resolved chat template still
     /// contains the stock non-leading-system-message refusal anchor. Mirrors `memoryFieldsFragment`'s
     /// style/naming convention. See `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc
-    /// comment for what `true`/`false` do and do not prove.
+    /// comment for what `true`/`false` do and do not prove. Because `MLXScalarTextCodec.render`
+    /// maps a wire `developer` role onto `system` before the template ever sees it
+    /// (`scalarServingTemplateRoleName(for:)`), this attestation also silently governs non-leading
+    /// `developer` messages — they arrive at the template as `system` and are subject to the exact
+    /// same anchor this probe checks for.
     public var chatTemplateRefusesNonLeadingSystemMessageFragment: String {
         "chat_template_refuses_non_leading_system_message="
             + "\(chatTemplateRefusesNonLeadingSystemMessage)"
@@ -1061,6 +1093,12 @@ private let scalarServingNonLeadingSystemMessageRefusalAnchor =
 /// requiring positive evidence — "the template was read AND does not contain the stock anchor" — so
 /// the unresolvable case must land on `true`, the conservative "assume still broken, keep warning"
 /// outcome, not the silent-success outcome that let cycle 96 ship undetected.
+///
+/// This probe checks for the stock `system`-only anchor text; it says nothing directly about
+/// `developer` messages. But `MLXScalarTextCodec.render` maps `developer` onto `system`
+/// (`scalarServingTemplateRoleName(for:)`) before any request reaches the template, so a
+/// non-leading `developer` message is refused (or accepted) by the exact same anchor this probe
+/// attests — this function governs both roles even though its name only says `system`.
 func scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: URL) -> Bool {
     guard let template = scalarServingResolvedChatTemplateText(modelDirectory: modelDirectory) else {
         return true
