@@ -90,6 +90,15 @@ public struct ServingHTTPConfiguration: Sendable {
     /// `evidence?.snapshot ?? metricsSnapshot`. `nil` by default so every existing construction
     /// site keeps compiling unchanged.
     public let metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider?
+    /// Carries a sink for the cause swallowed by `runGeneration`'s catch-all, independently of
+    /// `evidence`, for the same reason `metricsSnapshot` is independent of it: `evidence` is `nil`
+    /// on the default serve path (no `--evidence`), and constructing a
+    /// `ServingHTTPEvidenceConfiguration` merely to carry a reporter would arm its fail-closed
+    /// admission tracker (see `ServingHTTPEvidenceTracker`). This field must not be routed through
+    /// `evidence.reportFailure` — it exists precisely so a swallowed generation error is reportable
+    /// even when no evidence sink was configured. `nil` by default so every existing construction
+    /// site keeps compiling unchanged.
+    public let requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter?
 
     public init(
         launchedModel: String,
@@ -99,7 +108,8 @@ public struct ServingHTTPConfiguration: Sendable {
         backpressureStallTimeout: Duration,
         evidence: ServingHTTPEvidenceConfiguration? = nil,
         modelCapabilities: ServingModelCapabilities? = nil,
-        metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil
+        metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil,
+        requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter? = nil
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -122,6 +132,7 @@ public struct ServingHTTPConfiguration: Sendable {
         self.evidence = evidence
         self.modelCapabilities = modelCapabilities
         self.metricsSnapshot = metricsSnapshot
+        self.requestFailureReporter = requestFailureReporter
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")

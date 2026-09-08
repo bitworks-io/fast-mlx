@@ -157,7 +157,12 @@ struct FastMLXServe {
             // Carry the /metrics snapshot independently of `evidence` (which is nil without
             // `--evidence`), on every route, so `/metrics` works whether or not an evidence sink
             // was configured. See `ServingHTTPConfiguration.metricsSnapshot`.
-            metricsSnapshot: prepared.evidenceSnapshot)
+            metricsSnapshot: prepared.evidenceSnapshot,
+            // Independent of `evidence` for the same reason `metricsSnapshot` is (see
+            // `ServingHTTPConfiguration.requestFailureReporter`). Uses the same bare `print`
+            // (stdout) mechanism as `startupLine` and the `mtp_request_*` line, so a swallowed
+            // generation failure is readable off a live serve the same way those already are.
+            requestFailureReporter: { line in print(line) })
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(

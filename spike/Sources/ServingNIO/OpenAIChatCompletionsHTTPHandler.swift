@@ -755,6 +755,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
             if handle == nil {
                 admission = .backendFailure
             }
+            configuration.requestFailureReporter?(
+                requestFailureDiagnosticLine(
+                    requestID: handle?.responseID ?? configuration.launchedModel,
+                    error: error))
             _ = await handle?.lease.fail("generation failed")
             if let writeCancellation = await writeFailureIfPossible(
                 responseStarted: responseStarted,
@@ -1201,6 +1205,21 @@ private extension OpenAIChatCompletionsHTTPHandler {
         } catch {
             throw RunError.writeFailure
         }
+    }
+
+    /// Machine-readable diagnostic line for the cause `runGeneration`'s catch-all would otherwise
+    /// swallow: space-separated `key=value`, matching the convention of
+    /// `SpikeServingAdapters.mtpRequestTelemetryLine`. `String(describing: error)` can itself
+    /// contain spaces (error descriptions are free text), which would otherwise split a
+    /// space-separated `key=value` line into multiple bogus tokens — replaced with `_` for the
+    /// same documented reason `mtpRequestTelemetryLine` replaces spaces in `passthroughReason`.
+    internal static func requestFailureDiagnosticLine(requestID: String, error: any Error) -> String {
+        let reason = String(describing: error).replacingOccurrences(of: " ", with: "_")
+        return [
+            "request_failure=true",
+            "request_id=\(requestID)",
+            "request_failure_reason=\(reason)",
+        ].joined(separator: " ")
     }
 
     static func writeFailureIfPossible(

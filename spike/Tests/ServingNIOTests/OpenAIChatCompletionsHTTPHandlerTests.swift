@@ -328,6 +328,64 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish(acceptAlreadyClosed: true)
     }
 
+    func testRequestFailureDiagnosticLineFormatsReasonWithSpacesAsUnderscores() {
+        struct SpacedError: Error, CustomStringConvertible {
+            var description: String { "backend exploded during render" }
+        }
+        let line = OpenAIChatCompletionsHTTPHandler.requestFailureDiagnosticLine(
+            requestID: "chatcmpl-42",
+            error: SpacedError())
+        XCTAssertEqual(
+            line,
+            "request_failure=true request_id=chatcmpl-42 "
+                + "request_failure_reason=backend_exploded_during_render")
+    }
+
+    func testGenerationFailureReportsSwallowedCauseToRequestFailureReporter() async throws {
+        let backend = ScriptedBackend(scripts: [.untypedFailure])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            requestFailureReporter: { line in
+                Task { await recorder.recordFailure(line) }
+            })
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        _ = try await collectResponse(from: channel)
+        await waitUntil { await recorder.failures.count == 1 }
+
+        let reported = await recorder.snapshot()
+        let line = try XCTUnwrap(reported.failures.first)
+        // Anti-vacuity: assert on the distinctive error's own text, not merely that some line
+        // arrived — a reporter that fired with an unrelated or empty message must fail this.
+        XCTAssertTrue(
+            line.contains("DISTINCTIVE-UNTYPED-GENERATION-FAILURE-7f2c9a41"),
+            "expected the swallowed error's text in the reported line, got: \(line)")
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+    }
+
+    func testSuccessfulRequestReportsNoRequestFailure() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["done"], promptTokens: 1, completionTokens: 1)
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            requestFailureReporter: { line in
+                Task { await recorder.recordFailure(line) }
+            })
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .ok)
+        // Give any spuriously-scheduled reporter Task a chance to land before asserting absence.
+        try await Task.sleep(for: .milliseconds(20))
+
+        let reported = await recorder.snapshot()
+        XCTAssertTrue(reported.failures.isEmpty)
+        _ = try await channel.finish()
+    }
+
     func testNonStreamingRequestReturnsOpenAIJSONAndAllowsSequentialKeepAlive() async throws {
         let backend = ScriptedBackend(scripts: [
             .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2),
@@ -1966,6 +2024,18 @@ private func defaultConfiguration(
         evidence: evidence)
 }
 
+private func defaultConfiguration(
+    requestFailureReporter: @escaping ServingHTTPEvidenceConfiguration.FailureReporter
+) -> ServingHTTPConfiguration {
+    ServingHTTPConfiguration(
+        launchedModel: "qwen3-32b",
+        requestLimits: .productionDefault,
+        requiredBearerToken: nil,
+        maximumNonStreamingResponseBytes: 1_048_576,
+        backpressureStallTimeout: .seconds(1),
+        requestFailureReporter: requestFailureReporter)
+}
+
 private func requestBody(stream: Bool) -> String {
     """
     {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":\(stream)}
@@ -2108,6 +2178,15 @@ private enum MetricsSnapshotTestError: Error {
     case rejected
 }
 
+/// A distinctively-named error, deliberately typed as neither `OpenAIServingError` nor any of
+/// `runGeneration`'s other typed catch clauses, so it can only be observed by the untyped
+/// catch-all. `description` embeds a marker string with no internal spaces so tests can assert on
+/// its presence without also re-exercising `requestFailureDiagnosticLine`'s space-to-underscore
+/// substitution (covered separately by the formatter unit test).
+private struct DistinctiveUntypedGenerationFailure: Error, Sendable, CustomStringConvertible {
+    var description: String { "DISTINCTIVE-UNTYPED-GENERATION-FAILURE-7f2c9a41" }
+}
+
 private actor ServingSnapshotSequence {
     private var index = 0
 
@@ -2207,6 +2286,11 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
         case servingError(OpenAIServingError)
         case cancelled(ServingCancellationReason)
         case admissionRejected(ServingBackendAdmissionError)
+        /// Throws an error typed as neither `OpenAIServingError`, `ServingBackendAdmissionError`,
+        /// `CancellationError`, `ServingChannelWritabilityGate.GateError`, `ServingMailboxError`,
+        /// nor `RunError` — so it lands in `runGeneration`'s untyped catch-all rather than any of
+        /// its typed `catch` clauses. This is the only script variant that exercises that path.
+        case untypedFailure
         case held
         case heldWithDelayedCancel(DelayedCancellationGate)
     }
@@ -2277,6 +2361,8 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
             throw error
         } else if case .servingError(let error) = script {
             throw error
+        } else if case .untypedFailure = script {
+            throw DistinctiveUntypedGenerationFailure()
         } else if case .completed(let text, let finishReason, let promptTokens, let completionTokens, _) = script {
             Task {
                 do {
