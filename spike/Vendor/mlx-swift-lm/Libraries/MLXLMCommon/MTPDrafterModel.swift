@@ -325,6 +325,24 @@ public struct MTPDrafterState {
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
 
+    /// Set when the drafter's own cache could not shed every entry the target
+    /// REJECTED, so those entries are still resident (see
+    /// ``trimDrafterCacheTrackingShortTrim(_:numTokens:)``).
+    ///
+    /// Note carefully what this does NOT mean. Once that helper decrements
+    /// `nextPosition` by the ACTUAL trim, position and cache offset are in
+    /// lockstep for any outcome -- so this flag is not a position/offset
+    /// mismatch. It is a drafter-versus-target divergence: the drafter is
+    /// still conditioned on tokens the target threw away, so every further
+    /// proposal it makes is drawn from a history the target does not share.
+    /// The caller must retire this state (drop it and fall back to the
+    /// target-only path) rather than keep drafting from it.
+    ///
+    /// Deliberately given an inline default rather than an `init` parameter:
+    /// every existing `MTPDrafterState(...)` call site (including ones this
+    /// change's write set does not touch) must keep compiling unchanged.
+    public var drafterCacheDesynchronized: Bool = false
+
     public init(
         cache: [KVCache],
         nextPosition: Int = 0,
@@ -389,6 +407,53 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
     )
 }
 
+/// Trim the drafter's own cache, keep `nextPosition` consistent with what the
+/// cache ACTUALLY did rather than with what was requested, and report whether
+/// any rejected entry is still stranded in the cache afterwards.
+///
+/// `trimPromptCache` is `@discardableResult` precisely because a trim can
+/// legitimately return less than `numTokens` was asked for -- a cache entry
+/// may refuse the trim outright and return 0, and `ChunkedKVCache.trim`
+/// clamps to `min(offset - startPosition, n)`. The naive
+/// `state.nextPosition -= numTokens` assumes the request was always fully
+/// honored; when it is not, `nextPosition` silently drifts away from the
+/// cache's real offset, and because `MTPDrafterState` lives for the whole
+/// request, that drift compounds on every subsequent partial-acceptance
+/// round without ever raising a signal. Decrementing by the ACTUAL trimmed
+/// count keeps the two in lockstep, and flagging the mismatch via
+/// `MTPDrafterState/drafterCacheDesynchronized` lets the caller retire the
+/// drafter state instead of continuing to draft against a cache it can no
+/// longer locate.
+///
+/// `package` (not `public`) so model-specific `commitDrafterState` overrides
+/// in the `MLXLLM` and `MLXVLM` targets can share this exact bookkeeping
+/// instead of each re-deriving it.
+@discardableResult
+package func trimDrafterCacheTrackingShortTrim(
+    _ state: inout MTPDrafterState, numTokens: Int
+) -> Int {
+    guard numTokens > 0 else { return 0 }
+    let trimmed = trimPromptCache(state.cache, numTokens: numTokens)
+    state.nextPosition -= trimmed
+    // An EMPTY drafter cache is a legitimate refusal, not a divergence, and
+    // must not raise the flag. `trimPromptCache` returns 0 for an empty array
+    // by its very first guard, so the naive `trimmed != numTokens` reads
+    // `0 != numTokens` and degrades a perfectly healthy drafter -- one that
+    // simply keeps no cache of its own, and therefore has no rejected entry
+    // to strand and no position to drift. That false positive reached a
+    // fail-closed startup gate and refused an entire equivalence check
+    // before it was caught.
+    //
+    // A non-empty cache that trims short is the real thing: whether it came
+    // up short because an entry is not trimmable at all or because it
+    // clamped, `numTokens - trimmed` entries the target rejected are still
+    // resident and still conditioning this drafter.
+    if !state.cache.isEmpty, trimmed != numTokens {
+        state.drafterCacheDesynchronized = true
+    }
+    return trimmed
+}
+
 extension StatefulMTPDrafterModel {
     public func prepareDrafterState(
         target _: any LanguageModel,
@@ -411,9 +476,7 @@ extension StatefulMTPDrafterModel {
         sampler _: any LogitSampler
     ) {
         let rejected = draftTokens.dim(-1) - acceptedCount
-        if rejected > 0 {
-            trimPromptCache(state.cache, numTokens: rejected)
-        }
+        trimDrafterCacheTrackingShortTrim(&state, numTokens: rejected)
     }
 }
 

@@ -35,7 +35,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift",
-        "sha256": "92961eeae7ebf41df1d6139cef4ec2d0120ce568fe1d735d29cb583fa8f42add",
+        "sha256": "9cc537a054f0d609406aaeefc1ff0969ea11de9a23fe349585415b2e7f311ff0",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift",
@@ -55,7 +55,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift",
-        "sha256": "621e756789d279c062a9b04d40c0ba69ebc65f5c194cc4c0ccdfbe66932e576f",
+        "sha256": "95110581a01bf827cbaa74b3ea2fdd45b4ac0bd7fe74e489f907a9f45f443741",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift",

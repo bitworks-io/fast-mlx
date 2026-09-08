@@ -183,9 +183,13 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     /// iterator, and `generateBounded`'s `defer { decoder.reset() }` would make every request's
     /// telemetry unobservable by the time a caller could read it.
     ///
-    /// Deliberately does NOT call `iterator.finalizeGeneration()`: that method holds hard
-    /// `precondition`s on the native-rewind path that would abort the process, and there is nothing
-    /// left to finalize — the cache this iterator was tracking is being discarded in the same call.
+    /// Deliberately does NOT call `iterator.finalizeGeneration()`: there is nothing left to
+    /// finalize, because the cache this iterator was tracking is being discarded in the same call.
+    /// Finalizing would rewind and replay a cache that is about to be dropped.
+    ///
+    /// This comment previously also cited hard `precondition`s on the native-rewind path that
+    /// "would abort the process". Do not restore this call on the grounds that the abort risk has
+    /// been reduced — the reason above is the durable one and is sufficient on its own.
     public mutating func reset() {
         if let iterator {
             accumulatedProposedCount += iterator.proposedDraftTokens

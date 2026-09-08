@@ -679,6 +679,98 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35CommitDrafterStateFlagsDesyncOnShortTrim() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+
+        // Prime the drafter with a single-token prompt so its own cache offset
+        // (1) is strictly smaller than the trim `commitDrafterState` will
+        // request below (3) -- the short-trim precondition
+        // `trimDrafterCacheTrackingShortTrim` exists to detect.
+        var state = drafter.makeState(parameters: nil)
+        let promptTokens = MLXArray([Int32(1)]).reshaped([1, 1])
+        let prepareHidden = MLXArray.zeros([1, 1, cfg.hiddenSize])
+        let bonus = MLXArray([Int32(4)])
+        drafter.prepareDrafterState(
+            target: target, promptTokens: promptTokens, targetHidden: prepareHidden,
+            firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+        #expect(state.cache.allSatisfy { $0.offset == 1 })
+        #expect(state.nextPosition == 1)
+
+        // Force a trim request larger than the cache can actually supply --
+        // the drafter's cache cannot shed every rejected entry.
+        state.proposalAppended = 3
+
+        let targetHidden = MLXArray.zeros([1, 1, cfg.hiddenSize])
+        let draftTokens = MLXArray([Int32(1), Int32(2), Int32(3)]).reshaped([1, 3])
+        let finalToken = MLXArray([Int32(5)])
+        drafter.commitDrafterState(
+            target: target, targetHidden: targetHidden, draftTokens: draftTokens,
+            acceptedCount: 0, finalToken: finalToken, positionDeltas: nil,
+            state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+
+        // `trim(3)` on a cache with offset 1 can only shed 1 entry, then the
+        // commit's own forward pass re-appends exactly 1 (the final token),
+        // so a correctly tracked cache and position both land back on 1.
+        #expect(state.cache.allSatisfy { $0.offset == 1 })
+        #expect(state.nextPosition == 1)
+        #expect(state.drafterCacheDesynchronized == true)
+    }
+
+    @Test
+    func testQwen35CommitDrafterStateClearsDesyncFlagWhenCacheAbsorbsFullTrim() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+
+        var targetState = LMOutput.State()
+        targetState[mtpEmitFlagKey] = true
+        let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
+        let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
+
+        var state = drafter.makeState(parameters: nil)
+        let bonus = MLXArray([Int32(4)])
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: promptHidden,
+            firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+
+        // A normal proposal never asks the cache to shed more than it holds:
+        // the appended entries sit on top of a cache that already has at
+        // least that many, so the requested trim is always fully satisfiable.
+        let proposal = drafter.draftBlock(
+            target: target, lastToken: bonus,
+            lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
+            positionDeltas: nil, queryOffset: state.nextPosition, blockSize: 3,
+            state: &state, sampler: sampler)
+        eval(proposal)
+        #expect(state.proposalAppended == 1)
+        #expect(state.cache.allSatisfy { $0.offset == 4 })
+
+        let verifyHidden = MLXArray.zeros([1, 3, cfg.hiddenSize])
+        let finalToken = MLXArray([Int32(9)])
+        drafter.commitDrafterState(
+            target: target, targetHidden: verifyHidden, draftTokens: proposal,
+            acceptedCount: 0, finalToken: finalToken, positionDeltas: nil,
+            state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+
+        #expect(state.cache.allSatisfy { $0.offset == 4 })
+        #expect(state.nextPosition == 4)
+        #expect(!state.drafterCacheDesynchronized)
+    }
+
+    @Test
     func testQwen35GDNCheckpointMatchesPrefixWithoutReplayingProjections() throws {
         MLXRandom.seed(42)
         let cfg = try JSONDecoder().decode(

@@ -232,10 +232,7 @@ package final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         }
         let keepAppended = Swift.min(acceptedCount, state.proposalAppended)
         let trim = state.proposalAppended - keepAppended
-        if trim > 0 {
-            trimPromptCache(state.cache, numTokens: trim)
-            state.nextPosition -= trim
-        }
+        trimDrafterCacheTrackingShortTrim(&state, numTokens: trim)
 
         var tokens = [MLXArray]()
         var hiddens = [MLXArray]()
