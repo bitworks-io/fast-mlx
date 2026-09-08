@@ -275,6 +275,7 @@ private struct PreparedServingBackend {
                 startup_prompt_token_count=\(report.startupPromptTokenCount) \
                 startup_generated_token_count=\(report.startupGeneratedTokenCount) \
                 reset_parity_verified=\(report.resetParityVerified) \
+                \(report.chatTemplateRefusesNonLeadingSystemMessageFragment) \
                 \(modelCapabilityFields) \
                 \(report.memoryFieldsFragment) \
                 \(memory) \

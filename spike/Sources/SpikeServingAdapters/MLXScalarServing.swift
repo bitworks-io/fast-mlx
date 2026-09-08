@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 
+import Jinja
 import MLX
 import MLXHuggingFace
 import MLXLLM
@@ -60,14 +61,74 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             if let reasoningEffort { context["reasoning_effort"] = reasoningEffort }
             additionalContext = context
         }
-        return try tokenizer.applyChatTemplate(
-            messages: templateMessages,
-            tools: toolSpecs,
-            additionalContext: additionalContext)
+        do {
+            return try tokenizer.applyChatTemplate(
+                messages: templateMessages,
+                tools: toolSpecs,
+                additionalContext: additionalContext)
+        } catch {
+            // The served model ships its own chat template, and that template is the ONLY
+            // authority on message-ordering/content constraints (e.g. "system must be first") —
+            // engines differ per model (some patched templates accept a non-leading system
+            // message), so this layer must not encode or duplicate the rule itself. It only
+            // reports whatever the template decided, faithfully, as a client-shape error instead
+            // of letting it fall through to the generic 500 catch-all.
+            throw ServingChatTemplateRefusal.translated(error)
+        }
     }
 
     public func makeDetokenizer() -> any ScalarServingDetokenizer {
         MLXScalarDetokenizer(tokenizer: tokenizer)
+    }
+}
+
+/// Translates a Jinja chat-template's own `raise_exception(...)` refusal — surfaced to Swift as
+/// `Jinja.TemplateException` — into a typed `OpenAIServingError.invalidRequestWithCode`, so the
+/// HTTP layer reports it as a client request-shape error (400) instead of an opaque 500. Every
+/// other error type (including a missing/unparseable template, which IS a server misconfiguration)
+/// must pass through completely unchanged.
+public enum ServingChatTemplateRefusal {
+    /// Falls back to this when `TemplateException`'s message can't be recovered.
+    static let genericMessage =
+        "The model's chat template rejected this request."
+
+    /// Returns `error` unchanged unless it is a `Jinja.TemplateException`, in which case it
+    /// returns an `OpenAIServingError.invalidRequestWithCode` carrying the template's own
+    /// refusal text.
+    public static func translated(_ error: any Error) -> any Error {
+        guard error is TemplateException else { return error }
+        let detail = extractMessage(from: error) ?? genericMessage
+        return OpenAIServingError.invalidRequestWithCode(
+            "The model's chat template rejected this request: \(detail)",
+            param: "messages",
+            code: "chat_template_rejected")
+    }
+
+    /// `TemplateException.message` is internal (not visible outside the `Jinja` module), so the
+    /// only way to recover the template author's own text is `Mirror` reflection over the
+    /// struct's single stored property, matched by name (`"message"`) rather than parsed back out
+    /// of a printed description — a substring parse over `String(describing:)` would mis-extract
+    /// any template message that itself contains a quote character. The reflected child's value
+    /// arrives as `Any` wrapping the property's declared type, `Optional<String>`; Swift's dynamic
+    /// casts can present that either as a bare `String` (when populated) or as `String?` (either
+    /// case), so both shapes are tried explicitly rather than assumed. This is deliberately
+    /// defensive: any shape mismatch (no `message` child, absent message, empty message, or a
+    /// future rename/reflection-format change upstream) falls back to `genericMessage` rather than
+    /// crashing or silently losing the refusal.
+    private static func extractMessage(from error: any Error) -> String? {
+        guard let messageChild = Mirror(reflecting: error).children
+            .first(where: { $0.label == "message" })
+        else { return nil }
+        let text: String?
+        if let unwrapped = messageChild.value as? String {
+            text = unwrapped
+        } else if let optionallyWrapped = messageChild.value as? String? {
+            text = optionallyWrapped
+        } else {
+            text = nil
+        }
+        guard let text, !text.isEmpty else { return nil }
+        return text
     }
 }
 
@@ -449,6 +510,11 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     /// unaffected case for every existing call site — no request ever reaches the qwen4_exp
     /// in-checkpoint MTP drafter unless the caller opted in.
     public let inCheckpointMTPStartupVerdict: ScalarServingInCheckpointMTPStartupVerdict?
+    /// `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s result for the loaded checkpoint,
+    /// sampled at the same point `templateAttestsThinkMarkers` is. Default `true` matches that
+    /// probe's own fail-closed value (see its doc comment) so a fixture that doesn't pass this
+    /// explicitly reports the conservative "still refuses" state rather than a silently-safe one.
+    public let chatTemplateRefusesNonLeadingSystemMessage: Bool
 
     public init(
         launchedModel: String,
@@ -464,7 +530,8 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         mlxActiveBytes: Int = 0,
         mlxCacheBytes: Int = 0,
         mlxPeakBytes: Int = 0,
-        inCheckpointMTPStartupVerdict: ScalarServingInCheckpointMTPStartupVerdict? = nil
+        inCheckpointMTPStartupVerdict: ScalarServingInCheckpointMTPStartupVerdict? = nil,
+        chatTemplateRefusesNonLeadingSystemMessage: Bool = true
     ) {
         self.launchedModel = launchedModel
         self.route = route
@@ -480,6 +547,7 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         self.mlxCacheBytes = mlxCacheBytes
         self.mlxPeakBytes = mlxPeakBytes
         self.inCheckpointMTPStartupVerdict = inCheckpointMTPStartupVerdict
+        self.chatTemplateRefusesNonLeadingSystemMessage = chatTemplateRefusesNonLeadingSystemMessage
     }
 
     /// Machine-readable startup-line fragment for the sampled MLX allocator bytes,
@@ -489,6 +557,15 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     public var memoryFieldsFragment: String {
         "mlx_active_bytes=\(mlxActiveBytes) mlx_cache_bytes=\(mlxCacheBytes) "
             + "mlx_peak_bytes=\(mlxPeakBytes)"
+    }
+
+    /// Machine-readable startup-line fragment attesting whether the resolved chat template still
+    /// contains the stock non-leading-system-message refusal anchor. Mirrors `memoryFieldsFragment`'s
+    /// style/naming convention. See `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc
+    /// comment for what `true`/`false` do and do not prove.
+    public var chatTemplateRefusesNonLeadingSystemMessageFragment: String {
+        "chat_template_refuses_non_leading_system_message="
+            + "\(chatTemplateRefusesNonLeadingSystemMessage)"
     }
 }
 
@@ -838,6 +915,14 @@ public func loadScalarServingModel(
         route: decoderRoute,
         modelType: observedFamilyModelType,
         templateAttestsThinkMarkers: templateAttestsThinkMarkers)
+    // Boot-time visibility for the deployment runbook's manual "drop a patched chat_template.jinja
+    // into the model directory" step: sampled from the SAME resolved template
+    // `templateAttestsThinkMarkers` above reads, so a live serve on a checkpoint whose template was
+    // never (re-)patched shows it on the startup line instead of shipping silently — see
+    // `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc comment.
+    let chatTemplateRefusesNonLeadingSystemMessage =
+        scalarServingChatTemplateRefusesNonLeadingSystemMessage(
+            modelDirectory: configuration.modelDirectory)
     // Some model families `preconditionFailure` inside their forward path on specific input token
     // IDs (media sentinels the model never expects as free-standing prompt tokens); on the scalar
     // route that precondition failure aborts the server process. Generated tokens are already
@@ -867,7 +952,8 @@ public func loadScalarServingModel(
         mlxActiveBytes: memory.activeMemory,
         mlxCacheBytes: memory.cacheMemory,
         mlxPeakBytes: memory.peakMemory,
-        inCheckpointMTPStartupVerdict: inCheckpointMTPStartupVerdict)
+        inCheckpointMTPStartupVerdict: inCheckpointMTPStartupVerdict,
+        chatTemplateRefusesNonLeadingSystemMessage: chatTemplateRefusesNonLeadingSystemMessage)
     return LoadedScalarServingModel(
         backend: backend,
         startupReport: report)
@@ -916,9 +1002,12 @@ private let scalarServingThinkMarkerAttestationStrings = ["<think>", "</think>"]
 /// Artifact-derived attestation probe: does the LOADED checkpoint's own chat template contain the
 /// `<think>`/`</think>` markers the streaming reasoning splitter hardcodes?
 ///
-/// Resolves the same template Hugging Face tokenizers actually render from — `tokenizer_config.json`'s
-/// `chat_template` string field takes precedence, falling back to a sibling `chat_template.jinja` file
-/// only when `tokenizer_config.json` is missing/unreadable or does not carry that key. Returns `false`
+/// Resolves the same template Hugging Face tokenizers actually render from. swift-transformers'
+/// `Hub.swift` ("Check for chat template and merge if available") prefers a sibling
+/// `chat_template.jinja` file when present and OVERWRITES `tokenizer_config.json`'s `chat_template`
+/// field with its contents; this probe mirrors that precedence exactly, falling back to
+/// `tokenizer_config.json`'s `chat_template` string field only when `chat_template.jinja` is
+/// missing or unreadable. Returns `false`
 /// (fail-closed) when neither source resolves to a template, or when the resolved template text does
 /// not contain BOTH markers: an unreadable or non-attesting template must degrade
 /// `servingThinksByDefault` to today's byte-identical passthrough, never promote it to separation,
@@ -941,25 +1030,70 @@ func scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: URL) -> Bool {
     return scalarServingThinkMarkerAttestationStrings.allSatisfy(template.contains)
 }
 
-/// Resolve the chat template text the tokenizer actually renders from, preferring
-/// `tokenizer_config.json`'s `chat_template` field and falling back to a sibling
-/// `chat_template.jinja` file only when that field is absent from a readable
-/// `tokenizer_config.json`, or `tokenizer_config.json` itself is missing/unreadable.
+/// The literal `raise_exception(...)` argument the stock (un-patched) template anchor uses to
+/// refuse any non-leading `system` message. A checkpoint whose template still carries this anchor
+/// has not had the permissive patch applied to it. See
+/// `ServingChatTemplateRefusalTests.swift`'s `nonLeadingSystemGuardTemplate` fixture,
+/// which excerpts this exact guard to provoke a genuine `Jinja.TemplateException` at request time.
+/// This probe checks for the anchor's TEXT at load time, before any request is ever rendered.
+private let scalarServingNonLeadingSystemMessageRefusalAnchor =
+    "raise_exception('System message must be at the beginning.')"
+
+/// Artifact-derived attestation probe: does the LOADED checkpoint's own chat template still contain
+/// the stock refusal anchor that rejects any `system` message which is not first in the list?
+///
+/// Uses the SAME `scalarServingResolvedChatTemplateText` resolution `scalarServingChatTemplateAttestsThinkMarkers`
+/// uses above (`chat_template.jinja` preferred, `tokenizer_config.json` fallback) — this probe exists
+/// specifically to catch the case where the deployment runbook's "drop a patched `chat_template.jinja`
+/// into the model directory" step was never (re-)applied: a live production-candidate serve shipped
+/// on exactly that stale checkpoint once, undetected, because nothing attested the resolved template
+/// at boot (`docs/task-inbox/` cycle-96 finding). Reading from a different (wrong-precedence) source
+/// than the tokenizer actually renders from would silently defeat this probe's whole purpose, which
+/// is why it shares the resolver this file already fixed to match `Hub.swift`.
+///
+/// Fail-closed shape: returns `true` (i.e. "still refuses", the unsafe/alerting state) when NO
+/// template resolves at all. An unresolvable template is NOT evidence that an operator successfully
+/// patched it — it is evidence of nothing — so this probe must not report `false` (which reads as
+/// "confirmed patched, safe to serve non-leading system messages") on the strength of an absence.
+/// This is the opposite fail-closed direction from `scalarServingChatTemplateAttestsThinkMarkers`
+/// (which fails closed to `false` because THAT probe's `true` is the claim requiring positive
+/// evidence, to avoid over-promoting streamed reasoning separation); here `false` is the claim
+/// requiring positive evidence — "the template was read AND does not contain the stock anchor" — so
+/// the unresolvable case must land on `true`, the conservative "assume still broken, keep warning"
+/// outcome, not the silent-success outcome that let cycle 96 ship undetected.
+func scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: URL) -> Bool {
+    guard let template = scalarServingResolvedChatTemplateText(modelDirectory: modelDirectory) else {
+        return true
+    }
+    return template.contains(scalarServingNonLeadingSystemMessageRefusalAnchor)
+}
+
+/// Resolve the chat template text the tokenizer actually renders from, preferring a sibling
+/// `chat_template.jinja` file and falling back to `tokenizer_config.json`'s `chat_template` field
+/// only when `chat_template.jinja` is missing or unreadable.
+///
+/// This mirrors swift-transformers' own precedence, not the reverse: `Hub.swift`
+/// ("Check for chat template and merge if available") prefers `chat_template.jinja` when it exists
+/// and OVERWRITES `tokenizer_config.json`'s `chat_template` field with its contents before handing
+/// the merged config to the tokenizer. Reading `tokenizer_config.json` first would attest whatever
+/// checkpoint template shipped originally even after an operator drops a patched
+/// `chat_template.jinja` alongside it — the tokenizer would render the patched file while this
+/// probe kept reading the stale one.
 private func scalarServingResolvedChatTemplateText(modelDirectory: URL) -> String? {
+    let jinjaURL = modelDirectory.appendingPathComponent("chat_template.jinja")
+    if let data = try? Data(contentsOf: jinjaURL),
+        let text = String(data: data, encoding: .utf8)
+    {
+        return text
+    }
     let tokenizerConfigURL = modelDirectory.appendingPathComponent("tokenizer_config.json")
-    if let data = try? Data(contentsOf: tokenizerConfigURL),
+    guard let data = try? Data(contentsOf: tokenizerConfigURL),
         let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
         let template = root["chat_template"] as? String
-    {
-        return template
-    }
-    let jinjaURL = modelDirectory.appendingPathComponent("chat_template.jinja")
-    guard let data = try? Data(contentsOf: jinjaURL),
-        let text = String(data: data, encoding: .utf8)
     else {
         return nil
     }
-    return text
+    return template
 }
 
 /// How one cache's serving kind was determined by `classifyScalarServingNativeCacheEntry`.

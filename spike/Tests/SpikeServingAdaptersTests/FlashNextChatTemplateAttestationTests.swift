@@ -18,9 +18,10 @@ import XCTest
 ///
 /// Fixture note: the Flash Next checkpoint's `tokenizer_config.json` `chat_template` and its sibling
 /// `chat_template.jinja` are byte-identical (8952 bytes) and both contain `<think>` x3 and `</think>`
-/// x2 — the fixtures below exercise the resolution order (`tokenizer_config.json` preferred, falling
-/// back to `chat_template.jinja`) and the fail-closed behavior when neither attests the markers or
-/// neither is readable.
+/// x2 — the fixtures below exercise the resolution order (`chat_template.jinja` preferred, matching
+/// swift-transformers' `Hub.swift`; falling back to `tokenizer_config.json` only when
+/// `chat_template.jinja` is missing or unreadable) and the fail-closed behavior when neither
+/// attests the markers or neither is readable.
 final class FlashNextChatTemplateAttestationTests: XCTestCase {
     private func writeModelDirectory(
         tokenizerConfigJSON: String? = nil,
@@ -79,9 +80,10 @@ final class FlashNextChatTemplateAttestationTests: XCTestCase {
         XCTAssertFalse(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: absent))
     }
 
-    /// Fallback path: `tokenizer_config.json` has no `chat_template` key (and no file at all in this
-    /// case), so resolution falls back to a sibling `chat_template.jinja` that DOES attest.
-    func testFallsBackToChatTemplateJinjaWhenTokenizerConfigHasNoChatTemplateKey() throws {
+    /// `tokenizer_config.json` has no `chat_template` key and `chat_template.jinja` DOES attest —
+    /// resolution succeeds from the preferred `chat_template.jinja` source regardless of what (or
+    /// whether) `tokenizer_config.json` carries.
+    func testResolvesFromChatTemplateJinjaWhenTokenizerConfigHasNoChatTemplateKey() throws {
         let directory = try writeModelDirectory(
             tokenizerConfigJSON: #"{"tokenizer_class": "PreTrainedTokenizerFast"}"#,
             chatTemplateJinja: attestingTemplateText)
@@ -90,10 +92,10 @@ final class FlashNextChatTemplateAttestationTests: XCTestCase {
         XCTAssertTrue(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: directory))
     }
 
-    /// `tokenizer_config.json` carries the template and `chat_template.jinja` is absent — resolution
-    /// must succeed from `tokenizer_config.json` alone, proving the fallback is not load-bearing when
-    /// the preferred source already resolves.
-    func testResolvesFromTokenizerConfigAloneWhenChatTemplateJinjaIsAbsent() throws {
+    /// Fallback path: `chat_template.jinja` is absent, so resolution falls back to
+    /// `tokenizer_config.json`'s `chat_template` field, proving the fallback source is load-bearing
+    /// when the preferred `chat_template.jinja` source does not resolve.
+    func testFallsBackToTokenizerConfigWhenChatTemplateJinjaIsAbsent() throws {
         let json = #"{"chat_template": "\#(attestingTemplateText)"}"#
         let directory = try writeModelDirectory(tokenizerConfigJSON: json, chatTemplateJinja: nil)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -104,13 +106,125 @@ final class FlashNextChatTemplateAttestationTests: XCTestCase {
         XCTAssertTrue(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: directory))
     }
 
-    /// `tokenizer_config.json` is present but unreadable JSON — falls back to `chat_template.jinja`.
-    func testFallsBackToChatTemplateJinjaWhenTokenizerConfigIsUnparseableJSON() throws {
+    /// `chat_template.jinja` is present and attests, and `tokenizer_config.json` is present but
+    /// unreadable JSON — resolution still succeeds via the preferred `chat_template.jinja` source,
+    /// so the malformed fallback source never even gets read.
+    func testResolvesFromChatTemplateJinjaWhenTokenizerConfigIsUnparseableJSON() throws {
         let directory = try writeModelDirectory(
             tokenizerConfigJSON: "{ not valid json",
             chatTemplateJinja: attestingTemplateText)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         XCTAssertTrue(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: directory))
+    }
+
+    /// Decisive precedence test: BOTH sources are present with DIFFERENT content —
+    /// `chat_template.jinja` attests the markers, `tokenizer_config.json`'s `chat_template` field
+    /// does NOT. Resolution must follow `chat_template.jinja`'s content and attest `true`. This is
+    /// the scenario the deployment runbook actually creates when an operator drops a patched
+    /// `chat_template.jinja` next to a stale `tokenizer_config.json`: swift-transformers' `Hub.swift`
+    /// renders from the `.jinja` file, so this probe must read the same file or it attests the wrong
+    /// template entirely.
+    func testChatTemplateJinjaContentWinsWhenBothSourcesArePresentAndDiffer() throws {
+        let tokenizerConfigJSON = #"{"chat_template": "\#(nonAttestingTemplateText)"}"#
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: tokenizerConfigJSON,
+            chatTemplateJinja: attestingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertTrue(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: directory))
+    }
+
+    /// The converse of the decisive test above: `chat_template.jinja` does NOT attest while
+    /// `tokenizer_config.json`'s `chat_template` field DOES. Resolution must still follow
+    /// `chat_template.jinja` and attest `false` — proving `chat_template.jinja`'s content wins
+    /// outright, not merely "wins when it happens to attest".
+    func testChatTemplateJinjaContentWinsEvenWhenItDoesNotAttestAndTokenizerConfigDoes() throws {
+        let tokenizerConfigJSON = #"{"chat_template": "\#(attestingTemplateText)"}"#
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: tokenizerConfigJSON,
+            chatTemplateJinja: nonAttestingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertFalse(scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: directory))
+    }
+
+    // MARK: - scalarServingChatTemplateRefusesNonLeadingSystemMessage
+    //
+    // Boot-time visibility for the deployment runbook's manual "drop a patched chat_template.jinja
+    // into the model directory" step (cycle 96: a live serve shipped on a checkpoint whose template
+    // was never re-patched, undetected). Uses the SAME resolver the tests above exercise, so these
+    // fixtures reuse `writeModelDirectory`/`attestingTemplateText`-style helpers rather than
+    // re-deriving resolution order.
+
+    private let refusingTemplateText =
+        """
+        {%- for message in messages %}
+        {%- if message.role == "system" %}
+        {%- if not loop.first %}
+        {{- raise_exception('System message must be at the beginning.') }}
+        {%- endif %}
+        {%- endif %}
+        {%- endfor %}
+        """
+
+    private let nonRefusingTemplateText =
+        "{% for message in messages %}{{ message.content }}{% endfor %}"
+
+    /// Positive: the resolved template still contains the stock refusal anchor — the un-patched,
+    /// unsafe-for-non-leading-system-messages state this probe exists to surface.
+    func testRefusesNonLeadingSystemMessageTrueWhenAnchorPresent() throws {
+        let directory = try writeModelDirectory(chatTemplateJinja: refusingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+    }
+
+    /// Negative: a readable, resolved template that does NOT contain the anchor — the patched,
+    /// safe state.
+    func testRefusesNonLeadingSystemMessageFalseWhenAnchorAbsent() throws {
+        let directory = try writeModelDirectory(chatTemplateJinja: nonRefusingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertFalse(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+    }
+
+    /// Fail-closed: no template resolves at all (neither source present). An unresolvable template
+    /// is NOT evidence of a successful patch, so this must report `true` (the conservative
+    /// "assume still refuses, keep warning" state), never `false` (which would read as "confirmed
+    /// patched") — see the probe's doc comment.
+    func testRefusesNonLeadingSystemMessageTrueWhenNoTemplateResolves() throws {
+        let directory = try writeModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+    }
+
+    /// Same fail-closed value for a wholly unreadable/absent model directory, not just an empty one.
+    func testRefusesNonLeadingSystemMessageTrueForAnUnreadableModelDirectory() {
+        let absent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("flashnext-refusal-probe-absent-\(UUID().uuidString)")
+
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: absent))
+    }
+
+    /// Resolution precedence applies to this probe too: `chat_template.jinja` (patched, anchor
+    /// removed) wins over a stale `tokenizer_config.json` that still carries the anchor — the exact
+    /// scenario the deployment runbook creates and this probe exists to attest correctly.
+    func testRefusesNonLeadingSystemMessageFollowsChatTemplateJinjaPrecedenceOverStaleTokenizerConfig()
+        throws
+    {
+        let tokenizerConfigJSON = #"{"chat_template": "\#(refusingTemplateText)"}"#
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: tokenizerConfigJSON,
+            chatTemplateJinja: nonRefusingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertFalse(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
     }
 }

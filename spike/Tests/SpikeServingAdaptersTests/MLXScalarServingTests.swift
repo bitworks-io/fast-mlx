@@ -513,6 +513,70 @@ final class MLXScalarServingTests: XCTestCase {
             "mlx_active_bytes=0 mlx_cache_bytes=0 mlx_peak_bytes=0")
     }
 
+    // MARK: - chatTemplateRefusesNonLeadingSystemMessageFragment: the startup-line rendering of
+    // `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s result. `FlashNextChatTemplateAttestationTests.swift`
+    // proves the probe's own logic; these tests prove the report threads that value into a
+    // correctly-keyed snake_case startup-line fragment, mirroring
+    // `testStartupReportMemoryFieldsFragmentRendersSnakeCaseBytes`'s style.
+
+    func testChatTemplateRefusesNonLeadingSystemMessageFragmentRendersTrue() {
+        let report = ScalarServingModelStartupReport(
+            launchedModel: "fixture",
+            route: .scalarGreedy,
+            memoryLimitBytes: 8,
+            cacheLimitBytes: 4,
+            stopTokenCount: 1,
+            stopStringCount: 0,
+            nativeCacheKinds: [.denseAttention],
+            startupPromptTokenCount: 2,
+            startupGeneratedTokenCount: 1,
+            resetParityVerified: true,
+            chatTemplateRefusesNonLeadingSystemMessage: true)
+        XCTAssertEqual(
+            report.chatTemplateRefusesNonLeadingSystemMessageFragment,
+            "chat_template_refuses_non_leading_system_message=true")
+    }
+
+    func testChatTemplateRefusesNonLeadingSystemMessageFragmentRendersFalse() {
+        let report = ScalarServingModelStartupReport(
+            launchedModel: "fixture",
+            route: .scalarGreedy,
+            memoryLimitBytes: 8,
+            cacheLimitBytes: 4,
+            stopTokenCount: 1,
+            stopStringCount: 0,
+            nativeCacheKinds: [.denseAttention],
+            startupPromptTokenCount: 2,
+            startupGeneratedTokenCount: 1,
+            resetParityVerified: true,
+            chatTemplateRefusesNonLeadingSystemMessage: false)
+        XCTAssertEqual(
+            report.chatTemplateRefusesNonLeadingSystemMessageFragment,
+            "chat_template_refuses_non_leading_system_message=false")
+    }
+
+    /// Backward-compatible init: a construction site that doesn't pass this field explicitly gets
+    /// the conservative fail-closed default (`true`, "still refuses") — see
+    /// `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc comment for why `true`, not
+    /// `false`, is the safe default here.
+    func testChatTemplateRefusesNonLeadingSystemMessageDefaultsToTrueWhenUnspecified() {
+        let report = ScalarServingModelStartupReport(
+            launchedModel: "fixture",
+            route: .scalarGreedy,
+            memoryLimitBytes: 8,
+            cacheLimitBytes: 4,
+            stopTokenCount: 1,
+            stopStringCount: 0,
+            nativeCacheKinds: [.denseAttention],
+            startupPromptTokenCount: 2,
+            startupGeneratedTokenCount: 1,
+            resetParityVerified: true)
+        XCTAssertTrue(report.chatTemplateRefusesNonLeadingSystemMessage)
+        XCTAssertEqual(
+            report.chatTemplateRefusesNonLeadingSystemMessageFragment,
+            "chat_template_refuses_non_leading_system_message=true")
+    }
+
     // MARK: - rejectedPromptTokenIDs: mapping a loaded model's own reported unsupported input
     // token IDs (`UnsupportedInputTokenReporting`) into the scalar backend's screen.
 

@@ -419,11 +419,20 @@ class PublicExportTests(unittest.TestCase):
         # consumers that still under-count. For the THIRD time the marker gate caught a real leak
         # first: a doc-comment citation reintroduced the CamelCase family marker into this very
         # file, and was rewritten to name the cache by role. All three places moved together.
+        # 890 -> 891 added, in one increment:
+        # spike/Tests/SpikeServingAdaptersTests/ServingChatTemplateRefusalTests.swift -- coverage
+        # for ServingChatTemplateRefusal, which converts a chat template's own raise_exception(...)
+        # refusal into a typed 400 instead of an opaque 500. Ordinary XCTest coverage of an
+        # already-projected serving contract; it renders small hand-written Jinja templates inline,
+        # so it carries no checkpoint text, no infrastructure detail and no machine-local path. The
+        # same increment edited two already-projected files in place (byte-only, no reseal of their
+        # own): the codec gained the translation seam and Package.swift declared the Jinja product
+        # that was already resolved transitively. All three places moved together.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 890,
-                "pathModeSha256": "589e6189989c451e41fb8ca7d6af803a4240a64d4678bfd9bfa18c90caa34e1d",
+                "pathCount": 891,
+                "pathModeSha256": "4ee42ca7fafc8dd4665d30326b4ae2edf2055c19dcfbe022936781cf705e6ee5",
             },
         )
 
@@ -517,7 +526,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 890)
+            self.assertEqual(reexport_count, 891)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

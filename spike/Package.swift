@@ -21,6 +21,11 @@ let package = Package(
         .package(path: "Vendor/mlx-swift-lm"),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        // Already present transitively via swift-transformers; declared directly here so
+        // SpikeServingAdapters can `import Jinja` and translate its `TemplateException` (a
+        // request-shape refusal raised by the model's own chat template) instead of letting it
+        // fall through to the serving layer's untyped 500 catch-all.
+        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.2"),
     ],
     targets: [
@@ -99,6 +104,7 @@ let package = Package(
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "swift-jinja"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -118,6 +124,10 @@ let package = Package(
                 "SpikeServingAdapters",
                 "fastmlx-serve",
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                // Needed so the chat-template-refusal test can build a real `Jinja.Template` and
+                // provoke a genuine `TemplateException` (its memberwise init is internal — a real
+                // render is the only way to obtain one).
+                .product(name: "Jinja", package: "swift-jinja"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
