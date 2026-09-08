@@ -270,6 +270,29 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// doc comment for why this combination is provably unreachable for qwen4_exp today, and why
     /// the guard is asserted here anyway rather than assumed.
     case inCheckpointMTPIncompatibleWithCompiledDecoderStrategy
+    /// The offloaded-n-gram branch of `loadScalarServingModel` (`loadOffloadedNGramModelContext`)
+    /// threw ANY error. This is a BROAD catch, not a narrow one — it covers every step
+    /// the offloaded n-gram plan resolver performs (plan-file/acceptance-record parsing, the
+    /// live `fstat`-based `fingerprintMismatch` check, the chunk-seal read, and
+    /// `eligibilityDenied`) and whatever the offloaded-model loader itself can throw once the
+    /// plan resolves. It is deliberately NOT named or worded after any single one of those causes
+    /// — `detail` (`String(describing:)` on the caught error) is what actually distinguishes
+    /// them; do not read this case, its `reason=` token, or its doc comment as naming the
+    /// fingerprint check, eligibility, or any other specific step.
+    ///
+    /// Exists so this failure escapes `loadScalarServingModel` as a typed
+    /// `ScalarServingModelLoadError` — which one of `FastMLXServe.main()`'s three typed catch
+    /// arms already knows how to render and exit 2 on. The plan layer's own error type is
+    /// declared with no access modifier, so it is `internal` to the vendored `MLXLLM` module,
+    /// matches none of those three arms, and left unconverted escapes into the Swift top-level
+    /// trap (exit 133, doubled message) instead of a clean, fail-closed refusal.
+    ///
+    /// Production motivation: an acceptance record sealed on one host and copied to another
+    /// (along with the 32 GB rows file it approves) necessarily disagrees with the new host's
+    /// live `fstat` on `device`/`inode` — the plan layer's own `fingerprintMismatch` — and that
+    /// used to crash an operator's first `--qwen4exp-mtp` start with no stated remedy instead of
+    /// reporting this case's line.
+    case offloadedNGramPlanLoadFailed(detail: String)
 }
 
 enum ScalarServingDecoderStrategy: Equatable {
@@ -817,10 +840,24 @@ public func loadScalarServingModel(
     let context: ModelContext
     let offloadedNGramPlanResolved: Bool
     if let ngramOffloadPlanURL = configuration.ngramOffloadPlanURL {
-        context = try await loadOffloadedNGramModelContext(
-            modelDirectory: configuration.modelDirectory,
-            planFileURL: ngramOffloadPlanURL,
-            tokenizerLoader: #huggingFaceTokenizerLoader())
+        do {
+            context = try await loadOffloadedNGramModelContext(
+                modelDirectory: configuration.modelDirectory,
+                planFileURL: ngramOffloadPlanURL,
+                tokenizerLoader: #huggingFaceTokenizerLoader())
+        } catch {
+            // Deliberately broad: `loadOffloadedNGramModelContext` can throw the plan layer's
+            // own error type (`internal` to `MLXLLM` — declared with no access modifier) from
+            // any of its resolution steps, the eligibility layer's own error type, or whatever
+            // the offloaded-model loader throws once the plan resolves. None of those match
+            // `FastMLXServe.main()`'s three typed catch arms, so left unconverted they escape
+            // into the Swift top-level trap (exit 133, doubled message) instead of the clean
+            // refusal those arms exist to provide. `detail` — not
+            // this case's name — is what distinguishes WHICH failure actually happened; see
+            // `ScalarServingModelLoadError.offloadedNGramPlanLoadFailed`'s doc comment.
+            throw ScalarServingModelLoadError.offloadedNGramPlanLoadFailed(
+                detail: String(describing: error))
+        }
         offloadedNGramPlanResolved = true
     } else {
         context = try await loadModel(
@@ -1514,6 +1551,16 @@ public func scalarServingModelLoadRefusalAnnounceLine(
     case .servingFamilyRequiresResolvedOffloadedNGramPlan(let family):
         return "fastmlx-serve configuration=refused reason=serving_family_requires_offload_plan "
             + "model_type=\(family) remedy=--ngram-offload-plan"
+    case .offloadedNGramPlanLoadFailed(let detail):
+        // `detail` covers every step the offloaded n-gram plan resolver and
+        // the offloaded-model loader can fail on (fingerprint mismatch, denied eligibility,
+        // an unreadable plan/acceptance/chunk-seal file, ...) — see this error case's own doc
+        // comment. `remedy=` names the one fix that actually applies to the production motivation
+        // for this case (an acceptance record copied from another host), not necessarily every
+        // cause `detail` can report; an operator hitting a different cause should read `detail`
+        // itself rather than assume the remedy token covers it.
+        return "fastmlx-serve configuration=refused reason=offloaded_ngram_plan_load_failed "
+            + "detail=\(detail) remedy=reseal_acceptance_record_on_this_host"
     default:
         return "fastmlx-serve configuration=refused reason=scalar_serving_model_load_error "
             + "detail=\(error)"

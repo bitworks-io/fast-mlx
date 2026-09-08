@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -884,6 +885,185 @@ final class MLXScalarServingTests: XCTestCase {
 
         XCTAssertEqual(Memory.memoryLimit, memoryLimitBefore)
         XCTAssertEqual(Memory.cacheLimit, cacheLimitBefore)
+    }
+
+    // MARK: - offloadedNGramPlanLoadFailed: converting the the vendored offloaded n-gram plan
+    // resolution trap into a typed, reportable refusal. See that new case's own doc comment on
+    // `ScalarServingModelLoadError` for exactly what it does and does not cover -- these two
+    // tests are the two arms that doc comment's honesty constraint depends on: Arm A is the
+    // production defect (a fingerprint that cannot match because the acceptance record was
+    // sealed on a different host), Arm B is the anti-vacuity control proving `detail` actually
+    // tracks the cause rather than being a constant string.
+
+    /// Builds every on-disk input the offloaded n-gram plan resolver
+    /// (the vendored plan source) requires: a qwen4_exp `config.json` directory, a
+    /// 16-byte rows file, its (unparsed) chunk seal, an acceptance record whose `fingerprint` is
+    /// stamped from a REAL `stat` of the rows file (so the untouched fixture would actually
+    /// resolve), and -- unless `omitEligibilityFile` asks otherwise -- an eligibility file.
+    /// `inodeOffset` is added to ONLY the acceptance record's recorded `fingerprint.inode`; every
+    /// other fingerprint field is left exactly as observed. `inodeOffset: 1` reproduces the
+    /// production defect verbatim: an acceptance record sealed on a different host necessarily
+    /// disagrees with this host's live `fstat` on `device`/`inode` (copying the 32 GB rows file
+    /// to a new host cannot carry the old host's inode number with it).
+    private func writeNGramOffloadPlanFixture(
+        inodeOffset: Int,
+        omitEligibilityFile: Bool
+    ) throws -> (modelDirectory: URL, planURL: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scalar-serving-ngram-offload-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let modelDirectory = root.appendingPathComponent("model", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data(#"{"model_type":"qwen4_exp","num_hidden_layers":4}"#.utf8)
+            .write(to: modelDirectory.appendingPathComponent("config.json"))
+
+        let planDirectory = root.appendingPathComponent("plan", isDirectory: true)
+        try FileManager.default.createDirectory(at: planDirectory, withIntermediateDirectories: true)
+
+        let rowsFileURL = planDirectory.appendingPathComponent("ngram_rows.bin")
+        try Data(repeating: 0, count: 16).write(to: rowsFileURL)
+
+        // `fstat` on an opened descriptor, exactly like the offloaded n-gram plan resolver
+        // itself does (that file, around :475-490) -- never a path-based `stat`, and for the same
+        // reason: this is the one fingerprint call this codebase treats as trustworthy.
+        let fd = Darwin.open(rowsFileURL.path, O_RDONLY)
+        guard fd >= 0 else {
+            struct FixtureOpenFailed: Error {}
+            throw FixtureOpenFailed()
+        }
+        defer { Darwin.close(fd) }
+        var fileStat = stat()
+        guard Darwin.fstat(fd, &fileStat) == 0 else {
+            struct FixtureStatFailed: Error {}
+            throw FixtureStatFailed()
+        }
+        let realByteCount = Int(fileStat.st_size)
+
+        try Data("{}".utf8).write(to: planDirectory.appendingPathComponent("seal.json"))
+
+        if !omitEligibilityFile {
+            try Data(#"{"host":"test-host","operatorReference":"test-ref"}"#.utf8)
+                .write(to: planDirectory.appendingPathComponent("eligibility.json"))
+        }
+
+        let acceptanceRecord: [String: Any] = [
+            "source": [
+                "kind": "bf16Base",
+                "modelID": "test-model",
+                "resolvedRevision": "abc123",
+                "fileName": "ngram_rows.bin",
+                "byteCount": realByteCount,
+                "sha256": String(repeating: "0", count: 64),
+            ],
+            "descriptor": [
+                "rowCount": 4,
+                "rowByteCount": realByteCount / 4,
+            ],
+            "fingerprint": [
+                "device": Int(fileStat.st_dev),
+                "inode": Int(fileStat.st_ino) + inodeOffset,
+                "byteCount": realByteCount,
+                "modifiedSeconds": Int(fileStat.st_mtimespec.tv_sec),
+                "modifiedNanoseconds": Int(fileStat.st_mtimespec.tv_nsec),
+                "changedSeconds": Int(fileStat.st_ctimespec.tv_sec),
+                "changedNanoseconds": Int(fileStat.st_ctimespec.tv_nsec),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: acceptanceRecord)
+            .write(to: planDirectory.appendingPathComponent("acceptance.json"))
+
+        let plan: [String: Any] = [
+            "rowsFile": "ngram_rows.bin",
+            "chunkSeal": "seal.json",
+            "acceptanceRecord": "acceptance.json",
+            "eligibility": "eligibility.json",
+            "limits": [
+                "maxResidentRows": 1_024,
+                "maxResidentBytes": 1_048_576,
+                "maxRequestRows": 256,
+                "maxInFlightBytes": 65_536,
+            ],
+        ]
+        let planURL = planDirectory.appendingPathComponent("plan.json")
+        try JSONSerialization.data(withJSONObject: plan).write(to: planURL)
+
+        return (modelDirectory: modelDirectory, planURL: planURL)
+    }
+
+    /// Arm A (the defect): an acceptance record whose recorded `fingerprint.inode` is the rows
+    /// file's real inode plus one -- reproducing "sealed on a different host" without needing a
+    /// second host. Drives the REAL call site (`loadScalarServingModel`'s `ngramOffloadPlanURL`
+    /// branch), not the offloaded n-gram plan resolver/`loadOffloadedNGramModelContext`
+    /// directly, so this test can observe the call site's `catch` being deleted (see this
+    /// cycle's mutation check). Before the fix this trapped (Swift top-level trap, exit 133)
+    /// because the plan layer's own `fingerprintMismatch` is `internal` to the
+    /// vendored `MLXLLM` module and matches none of `FastMLXServe.main()`'s three typed catch
+    /// arms.
+    func testLoadWrapsFingerprintMismatchIntoOffloadedNGramPlanLoadFailedWithDetail() async throws {
+        let fixture = try writeNGramOffloadPlanFixture(inodeOffset: 1, omitEligibilityFile: false)
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-ngram-offload",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL))
+            XCTFail("A fingerprint-mismatched acceptance record must fail closed, not trap")
+        } catch let error as ScalarServingModelLoadError {
+            guard case .offloadedNGramPlanLoadFailed(let detail) = error else {
+                XCTFail("expected .offloadedNGramPlanLoadFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(
+                detail.contains("fingerprintMismatch"),
+                "detail must name the actual cause: \(detail)")
+            let announceLine = scalarServingModelLoadRefusalAnnounceLine(error)
+            XCTAssertTrue(
+                announceLine.contains("reason=offloaded_ngram_plan_load_failed"),
+                announceLine)
+            XCTAssertTrue(announceLine.contains("remedy="), announceLine)
+        }
+    }
+
+    /// Arm B (anti-vacuity): the SAME fixture with only the eligibility file left unwritten.
+    /// Plan resolution now fails one step later -- the offload eligibility resolver
+    /// quietly denies (file absent), which the offloaded n-gram plan resolver escalates to
+    /// `.eligibilityDenied` -- so the SAME typed case, `offloadedNGramPlanLoadFailed`, must carry
+    /// a DIFFERENT `detail`. This is what proves `detail` is doing real work distinguishing
+    /// causes rather than being a constant the catch always produces regardless of what failed.
+    func testLoadWrapsEligibilityDeniedIntoOffloadedNGramPlanLoadFailedWithDifferentDetail() async throws {
+        let fixture = try writeNGramOffloadPlanFixture(inodeOffset: 0, omitEligibilityFile: true)
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-ngram-offload",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL))
+            XCTFail("A missing eligibility file must fail closed, not trap")
+        } catch let error as ScalarServingModelLoadError {
+            guard case .offloadedNGramPlanLoadFailed(let detail) = error else {
+                XCTFail("expected .offloadedNGramPlanLoadFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("eligibilityDenied"), "detail: \(detail)")
+            XCTAssertFalse(detail.contains("fingerprintMismatch"), "detail: \(detail)")
+        }
     }
 
     // MARK: - qwen4_exp in-checkpoint MTP drafter (item 4 wiring)
