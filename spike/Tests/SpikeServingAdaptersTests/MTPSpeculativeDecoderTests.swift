@@ -495,6 +495,98 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         XCTAssertEqual(secondDelta.acceptedDraftTokens, 4)
     }
 
+    /// THE regression this increment fixes:
+    /// `docs/task-inbox/2026-09-08-mtp-passthrough-reason-sticky-leak.md`. Unlike every test above
+    /// (each of which uses a FRESH decoder per case), this drives ONE decoder/actor through a
+    /// passed-through request followed by a genuinely speculating one — exactly the serving
+    /// shape (one decoder bound at load, reused for every request). Before the fix,
+    /// `InferenceActor.runSummary` read `passthroughReason` from the decoder's cumulative
+    /// snapshot, whose `stickyPassthroughReason` never clears
+    /// (`MTPSpeculativeDecoder.speculativeTelemetrySnapshot`) — so the second request's reason
+    /// would still read the first request's, even though the second demonstrably speculated
+    /// (nonzero `acceptedDraftTokens`, asserted below so this cannot pass vacuously on a request
+    /// that simply did not speculate).
+    func testPassthroughReasonDoesNotLeakIntoALaterSpeculatingRequestOnTheSameDecoder() async throws {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        // `requiresGreedySampling == true`, but still functions as an ordinary fixed-proposal
+        // drafter on a GREEDY request — see the second request below.
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        // First request: sampled against a drafter that requires greedy sampling -> sticky
+        // passthrough, exactly like `testSampledRequestAgainstAGreedyOnlyDrafterIsNotRefusedAndGoesPassthrough`.
+        let firstSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: 5, eos: 99,
+            sampling: .sampled(temperature: 0.8, topP: 1.0, topK: nil, minP: nil, seed: 42)
+        ) { _ in .continueGeneration }
+        XCTAssertEqual(firstSummary.finishReason, .length)
+        let firstDelta = try XCTUnwrap(firstSummary.speculativeDelta)
+        XCTAssertNotNil(
+            firstDelta.passthroughReason,
+            "the passed-through request itself must still report its own reason — the fix must "
+                + "not degenerate into 'never report a reason'")
+
+        // Second request: an ORDINARY GREEDY request against the same decoder/drafter. The
+        // drafter's fixed proposal (6) matches the target's accept-all continuation, so this
+        // request genuinely speculates.
+        let secondSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: 6, eos: 99
+        ) { _ in .continueGeneration }
+        XCTAssertEqual(secondSummary.finishReason, .length)
+        let secondDelta = try XCTUnwrap(secondSummary.speculativeDelta)
+        XCTAssertGreaterThan(
+            secondDelta.acceptedDraftTokens, 0,
+            "the second request must have genuinely accepted draft tokens, or a nil "
+                + "passthroughReason assertion below would pass vacuously on a request that "
+                + "simply did not speculate")
+        XCTAssertNil(
+            secondDelta.passthroughReason,
+            "a later, genuinely speculating request must not inherit an earlier request's sticky "
+                + "passthrough reason")
+    }
+
+    /// The trap this fix must avoid (see the task-inbox doc's "fix is not a plain string delta"
+    /// section): comparing the cumulative snapshot's reason before/after a request looks like a
+    /// delta but is wrong, because TWO consecutive requests that both legitimately pass through
+    /// for the SAME reason would compare equal and the second would be falsely reported as
+    /// `nil` (speculating). Both requests here must report a non-nil reason.
+    func testConsecutivePassthroughRequestsBothReportTheirOwnReason() async throws {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let sampling: DecoderSampling = .sampled(
+            temperature: 0.8, topP: 1.0, topK: nil, minP: nil, seed: 42)
+
+        let firstSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: 5, eos: 99, sampling: sampling
+        ) { _ in .continueGeneration }
+        let secondSummary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: 5, eos: 99, sampling: sampling
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(firstSummary.finishReason, .length)
+        XCTAssertEqual(secondSummary.finishReason, .length)
+        let firstDelta = try XCTUnwrap(firstSummary.speculativeDelta)
+        let secondDelta = try XCTUnwrap(secondSummary.speculativeDelta)
+
+        XCTAssertNotNil(
+            firstDelta.passthroughReason,
+            "guards against the fix degenerating into 'never report a reason'")
+        XCTAssertNotNil(
+            secondDelta.passthroughReason,
+            "a naive 'reason changed since the previous cumulative snapshot' delta would report "
+                + "nil here, since both requests pass through for the identical reason")
+    }
+
     /// `ScriptedDecoder` does not conform to `SpeculativeTelemetryProviding`, so
     /// `InferenceRunSummary.speculativeDelta` must be `nil` — ABSENT, not a zero-valued delta.
     /// Zero is a legitimate speculative outcome (see the mismatched-drafter test above); `nil` is

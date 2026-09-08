@@ -157,6 +157,12 @@
       "slug": "a-family-name-is-not-evidence-about-a-checkpoint",
       "status": "published",
       "reviewedAt": "2026-09-06"
+    },
+    {
+      "source": "docs/content/2026-09-08-every-tool-call-took-the-path-we-never-tested.md",
+      "slug": "every-tool-call-took-the-path-we-never-tested",
+      "status": "published",
+      "reviewedAt": "2026-09-08"
     }
   ]
 }

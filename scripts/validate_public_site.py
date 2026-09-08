@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "f7b59ef77cca25e82c44c6fc37c0aae64e5a7d23e3f95cdb3e3610abcacc683b"
+    "8004ce90020f59f8969dce783d13bc01fd19d235de7c80162b947f79559ac159"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "58be27910c64e4f3c0ff223f403d28cadd762c5f26ea1e638dffc3b5beea8f90"
+    "5c4d81a3b31cacc5de795d79b8118f5888676a810340e2ab804f31fc7174c8f9"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "26 published research notes",
+    "27 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -484,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/every-tool-call-took-the-path-we-never-tested/",
     "research/the-fit-check-refused-a-model-that-fit/",
     "research/a-family-name-is-not-evidence-about-a-checkpoint/",
     "research/the-4k-limit-was-not-the-model-limit/",
@@ -512,6 +513,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/every-tool-call-took-the-path-we-never-tested/": ("2026-09-08", "2026-09-08"),
     "research/the-fit-check-refused-a-model-that-fit/": ("2026-09-06", "2026-09-06"),
     "research/a-family-name-is-not-evidence-about-a-checkpoint/": ("2026-09-06", "2026-09-06"),
     "research/the-4k-limit-was-not-the-model-limit/": ("2026-08-29", "2026-08-29"),
@@ -805,6 +807,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/every-tool-call-took-the-path-we-never-tested/": (
+        "Every tool call took the path we never tested — fast-mlx",
+        "We had a test for tool calling. We had a lot of tests for speculative decoding. We had no test for tool calling with speculative decoding — and because speculation is bound when the server loads the model rather than…",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/the-fit-check-refused-a-model-that-fit/": (
         "The fit-check refused a model that fit — fast-mlx",

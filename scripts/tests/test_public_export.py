@@ -419,6 +419,31 @@ class PublicExportTests(unittest.TestCase):
         # consumers that still under-count. For the THIRD time the marker gate caught a real leak
         # first: a doc-comment citation reintroduced the CamelCase family marker into this very
         # file, and was rewritten to name the cache by role. All three places moved together.
+        # 893 -> 894 added, in one increment:
+        # docs/content/2026-09-08-every-tool-call-took-the-path-we-never-tested.md -- the cycle's
+        # published engineering note, registered in site/publications.json, on why a default that
+        # binds at load rather than per request meant every tool call took an untested path, and on
+        # building the gate to measure the discriminating quantity rather than the observable one.
+        # Articles are projected only when named in site/publications.json; this one reports
+        # fast-mlx's own measurements only and names no third party, no host and no machine-local
+        # path. The same increment edited one already-projected file in place (byte-only, no reseal
+        # of its own): site/publications.json gained the entry. All three places moved together.
+        #
+        # 892 -> 893 added, in one increment:
+        # spike/Tests/SpikeServingAdaptersTests/ToolCallChunkBoundaryTests.swift -- chunk-boundary
+        # invariance for the XML-function tool-call streaming parser, the format ToolCallFormat.infer
+        # selects for the served hybrid MoE family. Speculative decoding can change how generated text
+        # is segmented into chunks without changing the text, so the parser must produce the same
+        # parsed call, and the same ABSENCE of one, under every segmentation. Deliberately
+        # unconditional: it uses no tokenizer and no checkpoint, so it is the CI-visible control for
+        # the env-gated template suite next to it, which skips wherever no local tokenizer fixture
+        # exists. It holds only hand-written wire-format string literals -- no checkpoint text, no
+        # infrastructure detail, no machine-local path, and it reads no deployment asset at runtime.
+        # The same increment edited one already-projected file in place (byte-only, no reseal of its
+        # own): the template render suite gained the tools-with-a-non-leading-system-message case,
+        # the intersection its two neighbouring tests each covered only one axis of. All three
+        # places moved together.
+        #
         # 891 -> 892 added, in one increment:
         # spike/Tests/SpikeServingAdaptersTests/ServingDeveloperRoleMappingTests.swift -- end-to-end
         # coverage for the render boundary's wire-role mapping: OpenAI's `developer` role is now
@@ -444,8 +469,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 892,
-                "pathModeSha256": "6f57fa06ff5c81e5a970db75a640687517c55c0173e20caaa18142f20ccd7a0c",
+                "pathCount": 894,
+                "pathModeSha256": "bc0cdedadc5d6817b260843f931053984bd1b883591f0965758eb51febe4e063",
             },
         )
 
@@ -539,7 +564,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 892)
+            self.assertEqual(reexport_count, 894)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

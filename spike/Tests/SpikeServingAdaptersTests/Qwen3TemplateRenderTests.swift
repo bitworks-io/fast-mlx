@@ -357,4 +357,110 @@ final class Qwen3TemplateRenderTests: XCTestCase {
             caught is TemplateException,
             "expected a genuine Jinja.TemplateException, got \(String(describing: caught))")
     }
+
+    // MARK: - Tools x non-leading system message (the intersection of the two axes above)
+
+    private static let toolPolicyMarkerContent =
+        "TOOL_POLICY_MARKER_CONTENT_9e1b4d: only call get_product for a named product."
+
+    private static let toolsWithNonLeadingSystemRequestJSON = """
+        {"model":"qwen3","messages":[
+          {"role":"user","content":"do you have the RTX 6000 Ada in stock?"},
+          {"role":"assistant","content":"Let me check that for you."},
+          {"role":"system","content":"\(toolPolicyMarkerContent)"},
+          {"role":"user","content":"and what about the price?"}
+        ],"tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"max_tokens":384}
+        """
+
+    /// Loads the REAL production override text straight off disk — `deploy/qwen3.8-27b/chat_template.jinja`
+    /// — rather than a toy excerpt, so the derivation comment on the test below can cite exact line
+    /// numbers in the file this test actually renders through.
+    private func productionChatTemplateText() throws -> String {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // Qwen3TemplateRenderTests.swift
+            .deletingLastPathComponent()  // SpikeServingAdaptersTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // spike
+        let templateURL = repoRoot.appendingPathComponent("deploy/qwen3.8-27b/chat_template.jinja")
+        // `deploy/` is an internal deployment asset and is deliberately not part of the public
+        // distribution, while this test file IS published. Skip rather than fail there: without
+        // this guard, setting the tokenizer variable on a source-only checkout would produce a
+        // confusing read error for a file that checkout is not supposed to contain.
+        guard FileManager.default.fileExists(atPath: templateURL.path) else {
+            throw XCTSkip(
+                "deployment chat template is not present in this checkout; skipping the "
+                    + "tools-with-non-leading-system render proof")
+        }
+        return try String(contentsOf: templateURL, encoding: .utf8)
+    }
+
+    /// (e) Tools x non-leading system message — the exact INTERSECTION of the two axes each of the
+    /// suites above cover individually: `testMultiTurnToolRerenderMatchesQwen3ChatTemplate` (tools +
+    /// LEADING system only) and `testOverrideRendersNonLeadingSystemMessageInPlace` /
+    /// `testNoOverrideStockTemplateRaisesOnNonLeadingSystemMessage` (non-leading system, NO tools).
+    /// The production agent/tool-calling shape is exactly this combination, and it was untested
+    /// (project lesson: "the intersection of two individually-covered axes is uncovered").
+    ///
+    /// Renders through the REAL production override — the full, on-disk
+    /// `deploy/qwen3.8-27b/chat_template.jinja` text (loaded above, not a toy excerpt) — applied via
+    /// `scalarServingTokenizerWithChatTemplateOverride` onto a real Qwen3 tokenizer/vocabulary built
+    /// from a STOCK-shaped fixture directory (`writeStockShapedModelDirectory()`; its own on-disk
+    /// `chat_template.jinja` is irrelevant here because the override function replaces the
+    /// tokenizer_config's `chat_template` dictionary entry outright, never reading the on-disk
+    /// `chat_template.jinja` file — see `scalarServingTokenizerWithChatTemplateOverride`'s doc
+    /// comment). That production file's own PATCH comment (search "PATCH (bitworks/fast-mlx" in the
+    /// template) is what renders a mid-conversation system turn in place instead of raising, exactly
+    /// as this test proves under the tools-attached shape.
+    ///
+    /// `<|im_start|>system` occurrence-count derivation (read directly from
+    /// `deploy/qwen3.8-27b/chat_template.jinja`, not guessed): with `tools` present, the template's
+    /// `{%- if tools and tools is iterable and tools is not mapping %}` branch (line 57) always
+    /// emits exactly ONE `<|im_start|>system` opening the tools/leading-system block, regardless of
+    /// `messages[0].role` (line 69 only controls whether the ORIGINAL leading system message's OWN
+    /// content is appended inside that SAME already-open block — here `messages[0]` is `user`, so it
+    /// is not, but the opening tag at line 58 has already been emitted unconditionally). The main
+    /// per-message loop (line 102) then emits a SECOND `<|im_start|>system` for the mid-conversation
+    /// `system` message at index 2, because it is not `loop.first` (line 105's
+    /// `{%- if not loop.first %}` guard — the PATCH branch that renders in place instead of raising).
+    /// No other branch in the template can emit `<|im_start|>system` for this message shape (no
+    /// bare `reasoning_instructions` preamble is possible once the `tools` branch is taken; see line
+    /// 76's `{%- else %}`). Expected count: 2.
+    func testOverrideRendersToolsWithNonLeadingSystemMessage() async throws {
+        let directory = try await writeStockShapedModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let productionTemplateText = try productionChatTemplateText()
+        let overriddenTokenizer = try await scalarServingTokenizerWithChatTemplateOverride(
+            modelDirectory: directory, overrideTemplateText: productionTemplateText)
+        let codec = MLXScalarTextCodec(tokenizer: overriddenTokenizer)
+
+        let data = Self.toolsWithNonLeadingSystemRequestJSON.data(using: .utf8)!
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: data)
+
+        // Does not throw — the stock (pre-patch) guard would raise here; see
+        // `testNoOverrideStockTemplateRaisesOnNonLeadingSystemMessage` for that refusal proved
+        // directly against a toy excerpt of the same guard.
+        let tokens = try codec.render(
+            messages: request.messages, tools: request.tools, enableThinking: false,
+            reasoningEffort: nil)
+        let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+
+        // The tool schema block is present exactly once.
+        XCTAssertEqual(
+            occurrenceCount(of: "<tools>", in: rendered), 1,
+            "expected exactly one <tools> block, in:\n\(rendered)")
+        XCTAssertTrue(
+            rendered.contains("get_product"),
+            "expected the tool name 'get_product' in:\n\(rendered)")
+
+        // Exactly two <|im_start|>system turns — see the derivation comment above this test.
+        XCTAssertEqual(
+            occurrenceCount(of: "<|im_start|>system", in: rendered), 2,
+            "expected exactly two system turns (tools block + mid-conversation system), in:\n\(rendered)"
+        )
+
+        // The mid-conversation system content was not dropped.
+        XCTAssertTrue(
+            rendered.contains(Self.toolPolicyMarkerContent),
+            "expected the tool policy content to survive rendering, in:\n\(rendered)")
+    }
 }

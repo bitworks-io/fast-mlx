@@ -78,6 +78,17 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
             passthroughReason: iterator?.passthroughReason ?? stickyPassthroughReason)
     }
 
+    /// The CURRENT iterator's own passthrough reason — deliberately WITHOUT the `??
+    /// stickyPassthroughReason` fallback above. `runSummary` (`InferenceActor.swift`) reads this,
+    /// not `speculativeTelemetrySnapshot.passthroughReason`, so a per-request delta cannot inherit
+    /// an earlier request's sticky reason on this same (load-once, reused) decoder. `nil` both
+    /// before the first `prefill` and whenever the current iterator itself is not in passthrough,
+    /// which is exactly the per-request truth this accessor exists to expose. See
+    /// `docs/task-inbox/2026-09-08-mtp-passthrough-reason-sticky-leak.md`.
+    public var currentRequestPassthroughReason: String? {
+        iterator?.passthroughReason
+    }
+
     /// - Parameters:
     ///   - target: The main (verifying) model. Retained non-Sendable; must stay actor-confined.
     ///   - drafter: The MTP drafter proposing candidate blocks against `target`.

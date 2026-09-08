@@ -104,6 +104,20 @@ public protocol SpeculativeTelemetryProviding {
     /// Cumulative counters, safe to read at any time — including after the owning decoder's
     /// per-request state (e.g. its `MTPSpeculativeTokenIterator`) has been torn down by `reset()`.
     var speculativeTelemetrySnapshot: SpeculativeTelemetrySnapshot { get }
+
+    /// The CURRENT request's own passthrough reason, with NO sticky/cumulative fallback — `nil`
+    /// whenever the live per-request state (e.g. the current `MTPSpeculativeTokenIterator`) is
+    /// itself not in passthrough, even if an earlier request on this same decoder was. Distinct
+    /// from `speculativeTelemetrySnapshot.passthroughReason`, which is deliberately sticky/
+    /// cumulative for its existing callers (see `MTPSpeculativeDecoder`'s doc comments) — this
+    /// accessor exists so `InferenceActor.runSummary` can report a genuinely per-request reason
+    /// without changing that cumulative snapshot's meaning. Defaulted to `nil` so an existing or
+    /// future conformer with no such notion (or none at all) keeps compiling unchanged.
+    var currentRequestPassthroughReason: String? { get }
+}
+
+extension SpeculativeTelemetryProviding {
+    public var currentRequestPassthroughReason: String? { nil }
 }
 
 /// Test double: replays a fixed script.
@@ -304,10 +318,20 @@ public actor InferenceActor {
             if let telemetryBefore,
                 let telemetryAfter =
                     (decoder as? SpeculativeTelemetryProviding)?.speculativeTelemetrySnapshot {
+                // `passthroughReason` is read from the CURRENT request's own live state, NOT from
+                // `telemetryAfter` (the cumulative, sticky snapshot) — see
+                // `docs/task-inbox/2026-09-08-mtp-passthrough-reason-sticky-leak.md`. Reading
+                // `telemetryAfter.passthroughReason` here would report the decoder's LIFETIME
+                // sticky reason, mislabeling every later speculating request once any earlier
+                // request on this same (load-once, reused) decoder had passed through even once.
+                // A naive `telemetryAfter != telemetryBefore` delta is also wrong: two consecutive
+                // passthrough requests with the SAME reason would compare equal and the second
+                // would be falsely reported as speculating.
                 speculativeDelta = InferenceRunSpeculativeDelta(
                     proposedDraftTokens: telemetryAfter.proposedCount - telemetryBefore.proposedCount,
                     acceptedDraftTokens: telemetryAfter.acceptedCount - telemetryBefore.acceptedCount,
-                    passthroughReason: telemetryAfter.passthroughReason)
+                    passthroughReason: (decoder as? SpeculativeTelemetryProviding)?
+                        .currentRequestPassthroughReason)
             } else {
                 speculativeDelta = nil
             }
