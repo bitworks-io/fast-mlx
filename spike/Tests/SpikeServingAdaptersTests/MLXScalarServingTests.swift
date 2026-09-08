@@ -1692,6 +1692,131 @@ final class MLXScalarServingTests: XCTestCase {
             result.stderr.contains("adjusted weights \(adjustedWeights) B"),
             "unexpected stderr: \(result.stderr)")
     }
+
+    // MARK: - chatTemplateOverrideURL: `--chat-template`'s scalar-load fail-closed refusal
+    // (missing/unreadable file), checked BEFORE any weight load. Mirrors the ngramOffloadPlanURL
+    // guard tests immediately above in shape.
+
+    /// Default-nil compatibility: constructing a configuration without the new parameter yields
+    /// `chatTemplateOverrideURL == nil`, and validation accepts an otherwise-valid configuration
+    /// unchanged — every existing call site (none of which passes this parameter) keeps compiling
+    /// and passing validation exactly as before.
+    func testChatTemplateOverrideURLDefaultsToNilAndValidationAcceptsUnchangedConfiguration() throws {
+        let configuration = ScalarServingModelLoadConfiguration(
+            launchedModel: "fixture",
+            modelDirectory: URL(fileURLWithPath: "/tmp"),
+            memoryLimitBytes: 4_096,
+            cacheLimitBytes: 1_024,
+            backendConfiguration: fixtureBackendConfiguration())
+
+        XCTAssertNil(configuration.chatTemplateOverrideURL)
+        let validated = try validateScalarServingModelLoadConfiguration(configuration)
+        XCTAssertNil(validated.chatTemplateOverrideURL)
+    }
+
+    /// A relative (non-file) override URL is refused before any other override-file check,
+    /// mirroring the existing `ngramOffloadPlanURL` absolute-path guard.
+    func testChatTemplateOverrideURLMustBeAbsoluteFileURLRejectsRelativeURL() {
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    chatTemplateOverrideURL: URL(string: "relative-template.jinja")!))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .chatTemplateOverrideMustBeAbsolute)
+        }
+    }
+
+    /// An absolute override URL pointing at a path that does not exist on disk is refused BEFORE
+    /// any weight load — the decisive acceptance criterion for "missing or unreadable refuses to
+    /// start rather than silently falling back to the checkpoint's own template."
+    func testChatTemplateOverrideURLUnavailableForMissingPathRefusesBeforeWeightLoad() async throws {
+        let directory = try writeConfigDirectory(#"{"model_type":"qwen3","num_hidden_layers":4}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "scalar-serving-chat-template-missing-\(UUID().uuidString).jinja")
+
+        // Level 1: the narrow validation function alone.
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    chatTemplateOverrideURL: missing))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .chatTemplateOverrideUnavailable(missing.path))
+        }
+
+        // Level 2: the full load entry point — refuses at the SAME validation call, before
+        // `loadModel(from:using:)` ever runs (this fixture's `directory` has no real weight
+        // shards at all, so reaching the loader would fail a completely different, unrelated
+        // way — this proves the chat-template guard fires FIRST).
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: directory,
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    chatTemplateOverrideURL: missing))
+            XCTFail("a missing --chat-template override must refuse before any weight load")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .chatTemplateOverrideUnavailable(missing.path))
+        }
+    }
+
+    /// An absolute override URL pointing at a DIRECTORY (not a regular file) is refused with the
+    /// same error as a missing path — proving the readable-UTF-8-file check, not merely existence.
+    func testChatTemplateOverrideURLUnavailableForDirectoryPath() {
+        let directoryAsOverride = URL(fileURLWithPath: "/tmp", isDirectory: true)
+        XCTAssertThrowsError(
+            try validateScalarServingModelLoadConfiguration(
+                ScalarServingModelLoadConfiguration(
+                    launchedModel: "fixture",
+                    modelDirectory: URL(fileURLWithPath: "/tmp"),
+                    memoryLimitBytes: 4_096,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    chatTemplateOverrideURL: directoryAsOverride))
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .chatTemplateOverrideUnavailable(directoryAsOverride.path))
+        }
+    }
+
+    /// A present, readable, valid-UTF-8 override file passes validation unchanged (the guard is
+    /// discriminating, not unconditionally refusing).
+    func testChatTemplateOverrideURLPresentAndReadablePassesValidation() throws {
+        let directory = try writeConfigDirectory(#"{"model_type":"qwen3","num_hidden_layers":4}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let overrideURL = directory.appendingPathComponent("override_template.jinja")
+        try Data("{{ messages }}".utf8).write(to: overrideURL)
+
+        let validated = try validateScalarServingModelLoadConfiguration(
+            ScalarServingModelLoadConfiguration(
+                launchedModel: "fixture",
+                modelDirectory: directory,
+                memoryLimitBytes: 4_096,
+                cacheLimitBytes: 1_024,
+                backendConfiguration: fixtureBackendConfiguration(),
+                chatTemplateOverrideURL: overrideURL))
+
+        XCTAssertEqual(validated.chatTemplateOverrideURL, overrideURL)
+    }
 }
 
 private enum FixtureTokenizerError: Error {

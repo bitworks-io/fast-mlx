@@ -105,6 +105,14 @@ let package = Package(
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "Jinja", package: "swift-jinja"),
+                // `--chat-template` builds an override tokenizer by re-reading the checkpoint's own
+                // tokenizer_config.json/tokenizer.json through `Hub.LanguageModelConfigurationFromHub`
+                // and `Hub.Config` (the same types `Tokenizers.AutoTokenizer.from(modelFolder:)`
+                // already uses internally) with only the `chat_template` field swapped, then
+                // constructing `PreTrainedTokenizer` directly -- never `AutoTokenizer.from`, whose
+                // `tokenizerClass(for:)` dispatch could silently select a different tokenizer
+                // subclass on the override path than the checkpoint's own load already resolved.
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -128,6 +136,10 @@ let package = Package(
                 // provoke a genuine `TemplateException` (its memberwise init is internal — a real
                 // render is the only way to obtain one).
                 .product(name: "Jinja", package: "swift-jinja"),
+                // Needed so the `--chat-template` override test can drive the real
+                // `AutoTokenizer.from(modelFolder:)` load path and its override counterpart,
+                // `scalarServingTokenizerWithChatTemplateOverride`, end to end.
+                .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),

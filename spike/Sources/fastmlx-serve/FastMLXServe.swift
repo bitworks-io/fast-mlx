@@ -276,6 +276,7 @@ private struct PreparedServingBackend {
                 startup_generated_token_count=\(report.startupGeneratedTokenCount) \
                 reset_parity_verified=\(report.resetParityVerified) \
                 \(report.chatTemplateRefusesNonLeadingSystemMessageFragment) \
+                \(report.chatTemplateProvenanceFragment) \
                 \(modelCapabilityFields) \
                 \(report.memoryFieldsFragment) \
                 \(memory) \
@@ -737,7 +738,8 @@ private func loadScalarServingBackend(
             // here as the single source that reaches the runtime; nil (omitted flag) → `.fp16`.
             kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
             ngramOffloadPlanURL: arguments.ngramOffloadPlanURL,
-            inCheckpointMTPSelection: arguments.inCheckpointMTPSelection))
+            inCheckpointMTPSelection: arguments.inCheckpointMTPSelection,
+            chatTemplateOverrideURL: arguments.chatTemplateURL))
     return PreparedServingBackend(
         backend: loaded.backend,
         evidenceSnapshot: {

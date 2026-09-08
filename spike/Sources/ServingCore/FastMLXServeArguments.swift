@@ -152,6 +152,25 @@ public enum FastMLXServeArgumentError:
     /// `conflictingBackendModes` check does not cover this combination — an explicit refusal is
     /// required.
     case ngramOffloadPlanWithScripted
+    /// `--chat-template` was supplied but the value does not begin with `/` — mirrors
+    /// `ngramOffloadPlanMustBeAbsolute`'s guard exactly (same shape, same rationale: an absolute
+    /// local path is required so the resolved file is unambiguous regardless of the process's
+    /// working directory).
+    case chatTemplateMustBeAbsolute
+    /// `--chat-template` is consumed only at the scalar-load call site
+    /// (`ScalarServingModelLoadConfiguration.chatTemplateOverrideURL`); the transport-only
+    /// scripted backend loads no model, so the flag would be silently dropped.
+    case chatTemplateWithScripted
+    /// `--chat-template` is consumed only at the scalar-load call site; neither continuous route
+    /// constructs its tokenizer through that seam, so the flag would be silently dropped.
+    case chatTemplateWithContinuousBatch
+    /// `--chat-template` is consumed only at the scalar-load call site; the exact Qwen3.5 MTP
+    /// composition constructs its own tokenizer separately and does not reach that seam, so the
+    /// flag would be silently dropped.
+    case chatTemplateWithExactQwen35MTP
+    /// `--quant-pick-only` returns early below without threading `chatTemplateURL` at all — no
+    /// model is loaded on that dry-run path, so the flag would be silently dropped.
+    case chatTemplateWithQuantPickOnly
 
     public var description: String {
         switch self {
@@ -247,6 +266,16 @@ public enum FastMLXServeArgumentError:
             "--qwen4exp-mtp loads a model and cannot be combined with --scripted"
         case .ngramOffloadPlanWithScripted:
             "--ngram-offload-plan loads a model and cannot be combined with --scripted"
+        case .chatTemplateMustBeAbsolute:
+            "--chat-template must be an absolute local path"
+        case .chatTemplateWithScripted:
+            "--chat-template loads a model and cannot be combined with --scripted"
+        case .chatTemplateWithContinuousBatch:
+            "--chat-template is not supported with continuous batching"
+        case .chatTemplateWithExactQwen35MTP:
+            "--chat-template is not supported with --exact-qwen35-mtp"
+        case .chatTemplateWithQuantPickOnly:
+            "--chat-template is not supported with --quant-pick-only"
         }
     }
 }
@@ -355,6 +384,17 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       artifact would add a valued
                                       --qwen4exp-mtp-selection flag mirroring
                                       --exact-qwen35-mtp / --exact-mtp-selection.
+          --chat-template PATH        Absolute local path to a chat-template file that overrides
+                                      the served checkpoint's own resolved template for BOTH
+                                      rendering and the boot attestation probe (the same resolved
+                                      text feeds both, so the attestation can never lie about what
+                                      is actually rendered). Omitted (default) preserves today's
+                                      resolution from the model directory unchanged. Missing or
+                                      unreadable refuses to start, before the weight load, rather
+                                      than silently falling back to the checkpoint's own template.
+                                      Applies only to the loaded scalar-serve route; not supported
+                                      with --scripted, continuous batching, --exact-qwen35-mtp, or
+                                      --quant-pick-only.
           --host HOST                 Bind host (default: 127.0.0.1).
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
@@ -505,6 +545,22 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// when the flag was omitted; omission IS the signal that no operator budget should bind (see
     /// docs/task-inbox/2026-09-06-operator-budget-envelope-shape-DECISION.md).
     public let memoryLimitBytes: Int?
+    /// `--chat-template`: an absolute local path to a chat-template file that overrides the served
+    /// checkpoint's own resolved template. `nil` (the default) preserves today's resolution from
+    /// the model directory (`chat_template.jinja`, falling back to `chat_template.json`, then
+    /// `tokenizer_config.json`) unchanged, byte-for-byte. Consumed only at the scalar-load call
+    /// site (`ScalarServingModelLoadConfiguration.chatTemplateOverrideURL`,
+    /// `SpikeServingAdapters`), mirroring `ngramOffloadPlanURL`'s dependency-boundary idiom
+    /// exactly: `ServingCore` carries the validated `URL?`, never the file's contents, and the
+    /// load-time seam re-validates and reads it. Fail-closed at the parser against every mode
+    /// that would silently drop the flag rather than merely leave it unused — `--scripted`
+    /// (`chatTemplateWithScripted`), either continuous route (`chatTemplateWithContinuousBatch`),
+    /// `--exact-qwen35-mtp` (`chatTemplateWithExactQwen35MTP`), and `--quant-pick-only`
+    /// (`chatTemplateWithQuantPickOnly`) — none of those routes reach the scalar-load seam that
+    /// consumes this field. `--quant-candidates` (the loaded, non-pick-only auto-pick route) is
+    /// deliberately NOT refused: the resolved winning directory still loads through the same
+    /// scalar-load seam, so the override applies normally there.
+    public let chatTemplateURL: URL?
 
     private init(
         backend: FastMLXServeBackend?,
@@ -540,7 +596,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         mtpDrafterDirectory: URL? = nil,
         ngramOffloadPlanURL: URL? = nil,
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
-        memoryLimitBytes: Int? = nil
+        memoryLimitBytes: Int? = nil,
+        chatTemplateURL: URL? = nil
     ) {
         self.backend = backend
         self.host = host
@@ -575,6 +632,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
         self.memoryLimitBytes = memoryLimitBytes
+        self.chatTemplateURL = chatTemplateURL
     }
 
     public static func parse<S: Sequence>(
@@ -622,6 +680,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var ngramOffloadPlanURL: URL?
         var qwen4ExpMTP = false
         var evidencePath: URL?
+        var chatTemplateURL: URL?
 
         var index = 0
         while index < arguments.count {
@@ -815,6 +874,13 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.ngramOffloadPlanMustBeAbsolute
                 }
                 ngramOffloadPlanURL = URL(fileURLWithPath: path)
+            case "--chat-template":
+                index += 1
+                let path = try value(at: index, in: arguments, for: argument)
+                guard path.hasPrefix("/") else {
+                    throw FastMLXServeArgumentError.chatTemplateMustBeAbsolute
+                }
+                chatTemplateURL = URL(fileURLWithPath: path)
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -896,6 +962,27 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // Fail closed and point the operator at the single sealed directory via --model-path instead.
         if ngramOffloadPlanURL != nil, !quantCandidateDirs.isEmpty {
             throw FastMLXServeArgumentError.ngramOffloadPlanWithQuantCandidates
+        }
+
+        // --chat-template overrides the resolved chat template only at the scalar-load call site
+        // (`loadScalarServingBackend` → `ScalarServingModelLoadConfiguration.chatTemplateOverrideURL`).
+        // Neither continuous-batch route nor the exact Qwen3.5 MTP composition constructs its
+        // tokenizer through that seam, so silently accepting the flag there would drop an
+        // operator's explicit override request on the floor — fail closed, mirroring
+        // --ngram-offload-plan's identical continuous/exact-MTP rationale immediately above.
+        // Unlike --ngram-offload-plan, no --quant-candidates refusal is needed: a template
+        // override is orthogonal to which candidate directory wins the auto-pick, and the
+        // resolved winner still loads through the same scalar-load seam this flag targets.
+        if chatTemplateURL != nil, continuousModeSelected {
+            throw FastMLXServeArgumentError.chatTemplateWithContinuousBatch
+        }
+        if chatTemplateURL != nil, exactQwen35MTP {
+            throw FastMLXServeArgumentError.chatTemplateWithExactQwen35MTP
+        }
+        // --quant-pick-only returns early below WITHOUT threading this field, the same silent-drop
+        // trap --ngram-offload-plan's own guard above documents.
+        if chatTemplateURL != nil, quantPickOnly {
+            throw FastMLXServeArgumentError.chatTemplateWithQuantPickOnly
         }
 
         // --qwen4exp-mtp requires --ngram-offload-plan (the marker-family admission gate only
@@ -1051,6 +1138,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         if scripted, ngramOffloadPlanURL != nil {
             throw FastMLXServeArgumentError.ngramOffloadPlanWithScripted
         }
+        // --chat-template is consumed only at the scalar-load seam (see the doc comment on
+        // .chatTemplateWithContinuousBatch above); the transport-only scripted backend loads no
+        // model, so the flag would be silently dropped.
+        if scripted, chatTemplateURL != nil {
+            throw FastMLXServeArgumentError.chatTemplateWithScripted
+        }
         if continuousDynamicPLD, allowHybridQwen35 {
             throw FastMLXServeArgumentError.dynamicPLDWithHybridQwen35
         }
@@ -1174,7 +1267,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             mtpDrafterDirectory: mtpDrafterDirectory,
             ngramOffloadPlanURL: ngramOffloadPlanURL,
             inCheckpointMTPSelection: qwen4ExpMTP ? .converted4Bit : nil,
-            memoryLimitBytes: memoryLimitBytes)
+            memoryLimitBytes: memoryLimitBytes,
+            chatTemplateURL: chatTemplateURL)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -1215,6 +1309,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--mtp-drafter-path",
         "--ngram-offload-plan",
         "--qwen4exp-mtp",
+        "--chat-template",
     ]
 
     private static func value(

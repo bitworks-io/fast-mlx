@@ -7,6 +7,7 @@ import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import HarnessCore
+import Hub
 import HuggingFace
 import ServingCore
 import SpikeCore
@@ -218,6 +219,20 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// before any weight load. Carries the observed `model_type` (`nil` when `config.json` is
     /// unreadable/absent).
     case ngramOffloadPlanUnsupportedFamily(String?)
+    /// `ScalarServingModelLoadConfiguration.chatTemplateOverrideURL` was supplied but is not an
+    /// absolute file URL — mirrors `ngramOffloadPlanMustBeAbsolute`'s guard exactly.
+    case chatTemplateOverrideMustBeAbsolute
+    /// `ScalarServingModelLoadConfiguration.chatTemplateOverrideURL` was supplied but the file is
+    /// missing, unreadable, or not valid UTF-8 — checked in `validateScalarServingModelLoadConfiguration`,
+    /// BEFORE `Memory.memoryLimit`/`Memory.cacheLimit` are mutated or any weight is loaded, exactly
+    /// like `ngramOffloadPlanUnavailable`'s existence guard. This is the ONE new fail-closed
+    /// condition `--chat-template` introduces at the scalar-load seam: this layer must never
+    /// silently fall back to the checkpoint's own resolved template on a bad override path — that
+    /// silent fallback is precisely the deployment failure mode (cycle 96: a live serve shipped on
+    /// a checkpoint whose template was never re-patched, undetected) this whole flag exists to
+    /// eliminate. Carries the offending path so the operator-facing announce line
+    /// (`scalarServingModelLoadRefusalAnnounceLine`'s generic `detail=\(error)` branch) names it.
+    case chatTemplateOverrideUnavailable(String)
     /// `ScalarServingModelLoadConfiguration.inCheckpointMTPSelection` was supplied, but the checkpoint
     /// at `modelDirectory` is not the qwen4_exp family the in-checkpoint MTP drafter is loaded
     /// from -- the drafter's tensors live inside the TARGET checkpoint's own shard set, so a
@@ -365,6 +380,17 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// need to be reachable from outside the actor to be used), but it is no longer released after
     /// the startup gate the way this comment used to claim.
     public let inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection?
+    /// When supplied, overrides the checkpoint's own resolved chat template (`chat_template.jinja`
+    /// / `chat_template.json` / `tokenizer_config.json`'s `chat_template` field) for BOTH the
+    /// tokenizer this load builds AND the boot attestation probe
+    /// (`chatTemplateRefusesNonLeadingSystemMessage`/the new provenance fields on
+    /// `ScalarServingModelStartupReport`) — the SAME resolved text feeds both, so the attestation
+    /// can never describe a template different from the one actually rendered from. Absent (`nil`,
+    /// the default) preserves today's resolution unchanged, byte-for-byte. Validated in
+    /// `validateScalarServingModelLoadConfiguration` BEFORE any weight load — see
+    /// `ScalarServingModelLoadError.chatTemplateOverrideUnavailable`'s doc comment for why a
+    /// missing/unreadable override must refuse rather than silently fall back.
+    public let chatTemplateOverrideURL: URL?
 
     public init(
         launchedModel: String,
@@ -375,7 +401,8 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages,
         kvQuantTier: KVQuantTier = .fp16,
         ngramOffloadPlanURL: URL? = nil,
-        inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil
+        inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
+        chatTemplateOverrideURL: URL? = nil
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -386,6 +413,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         self.kvQuantTier = kvQuantTier
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
+        self.chatTemplateOverrideURL = chatTemplateOverrideURL
     }
 }
 
@@ -507,6 +535,29 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     }
 }
 
+/// How `scalarServingResolveChatTemplate` resolved the template text actually rendered from,
+/// reported on the boot attestation line (`ScalarServingModelStartupReport.chatTemplateSource`) so
+/// an operator can see WHICH source won, not merely whether an override was requested. Raw values
+/// are the exact snake_case tokens the startup line prints.
+public enum ScalarServingChatTemplateSourceKind: String, Equatable, Sendable {
+    /// `ScalarServingModelLoadConfiguration.chatTemplateOverrideURL`'s own text — checked first,
+    /// ahead of every on-disk source.
+    case override
+    /// The model directory's own `chat_template.jinja` file.
+    case modelDirJinja = "model_dir_jinja"
+    /// The model directory's own `chat_template.json` file's `chat_template` field.
+    case modelDirChatTemplateJSON = "model_dir_chat_template_json"
+    /// `tokenizer_config.json`'s `chat_template` field — the last-resort fallback.
+    case tokenizerConfig = "tokenizer_config"
+}
+
+/// One resolved chat template: its text, and which source it came from. See
+/// `scalarServingResolveChatTemplate`'s doc comment for the resolution order.
+struct ScalarServingResolvedChatTemplate: Equatable {
+    let text: String
+    let source: ScalarServingChatTemplateSourceKind
+}
+
 public struct ScalarServingModelStartupReport: Equatable, Sendable {
     public let launchedModel: String
     public let route: ServingExecutionRoute
@@ -543,6 +594,18 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     /// probe's own fail-closed value (see its doc comment) so a fixture that doesn't pass this
     /// explicitly reports the conservative "still refuses" state rather than a silently-safe one.
     public let chatTemplateRefusesNonLeadingSystemMessage: Bool
+    /// The resolved template's own sha256 (lowercase hex), byte count, and source kind — sampled
+    /// from the SAME `ScalarServingResolvedChatTemplate` `chatTemplateRefusesNonLeadingSystemMessage`
+    /// was computed from, so these three fields and that boolean can never describe different
+    /// template text. `nil` in all three when no template resolved at all (mirrors that boolean's
+    /// own fail-closed direction: an unresolvable template is evidence of nothing, reported here as
+    /// "unresolved" on the startup line rather than a fabricated digest). Deliberately reports the
+    /// template's DIGEST and byte count, never its raw text or (for the override source) its local
+    /// file path — the startup line reaches published logs, and an absolute override path would
+    /// leak host directory layout.
+    public let chatTemplateSHA256: String?
+    public let chatTemplateByteCount: Int?
+    public let chatTemplateSource: ScalarServingChatTemplateSourceKind?
 
     public init(
         launchedModel: String,
@@ -559,7 +622,10 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         mlxCacheBytes: Int = 0,
         mlxPeakBytes: Int = 0,
         inCheckpointMTPStartupVerdict: ScalarServingInCheckpointMTPStartupVerdict? = nil,
-        chatTemplateRefusesNonLeadingSystemMessage: Bool = true
+        chatTemplateRefusesNonLeadingSystemMessage: Bool = true,
+        chatTemplateSHA256: String? = nil,
+        chatTemplateByteCount: Int? = nil,
+        chatTemplateSource: ScalarServingChatTemplateSourceKind? = nil
     ) {
         self.launchedModel = launchedModel
         self.route = route
@@ -576,6 +642,9 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         self.mlxPeakBytes = mlxPeakBytes
         self.inCheckpointMTPStartupVerdict = inCheckpointMTPStartupVerdict
         self.chatTemplateRefusesNonLeadingSystemMessage = chatTemplateRefusesNonLeadingSystemMessage
+        self.chatTemplateSHA256 = chatTemplateSHA256
+        self.chatTemplateByteCount = chatTemplateByteCount
+        self.chatTemplateSource = chatTemplateSource
     }
 
     /// Machine-readable startup-line fragment for the sampled MLX allocator bytes,
@@ -598,6 +667,18 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     public var chatTemplateRefusesNonLeadingSystemMessageFragment: String {
         "chat_template_refuses_non_leading_system_message="
             + "\(chatTemplateRefusesNonLeadingSystemMessage)"
+    }
+
+    /// Machine-readable startup-line fragment naming the resolved template's digest, byte count,
+    /// and source kind — see `chatTemplateSHA256`'s doc comment for why a digest, never the raw
+    /// text or (for the override source) the operator's local file path. `"unresolved"` for all
+    /// three when no template resolved at all, mirroring
+    /// `chatTemplateRefusesNonLeadingSystemMessageFragment`'s companion boolean staying `true` in
+    /// that same case.
+    public var chatTemplateProvenanceFragment: String {
+        "chat_template_sha256=\(chatTemplateSHA256 ?? "unresolved") "
+            + "chat_template_bytes=\(chatTemplateByteCount.map(String.init) ?? "unresolved") "
+            + "chat_template_source=\(chatTemplateSource?.rawValue ?? "unresolved")"
     }
 }
 
@@ -661,6 +742,20 @@ public func validateScalarServingModelLoadConfiguration(
             !planIsDirectory.boolValue
         else {
             throw ScalarServingModelLoadError.ngramOffloadPlanUnavailable
+        }
+    }
+    // `--chat-template`'s ONE new fail-closed condition (see `chatTemplateOverrideUnavailable`'s
+    // doc comment): checked here, BEFORE any weight load, so a typo'd/missing/unreadable override
+    // path fails in milliseconds rather than after a full (potentially many-GB) checkpoint load.
+    if let chatTemplateOverrideURL = configuration.chatTemplateOverrideURL {
+        guard chatTemplateOverrideURL.isFileURL,
+            chatTemplateOverrideURL.path.hasPrefix("/")
+        else {
+            throw ScalarServingModelLoadError.chatTemplateOverrideMustBeAbsolute
+        }
+        guard scalarServingChatTemplateOverrideText(url: chatTemplateOverrideURL) != nil else {
+            throw ScalarServingModelLoadError.chatTemplateOverrideUnavailable(
+                chatTemplateOverrideURL.path)
         }
     }
     return configuration
@@ -735,7 +830,33 @@ public func loadScalarServingModel(
     }
     try validateScalarServingMemoryLimits(configuration)
 
-    let tokenizer = context.tokenizer
+    // `--chat-template`: when an override was supplied, build a REPLACEMENT tokenizer whose only
+    // difference from the checkpoint's own is the resolved `chat_template` field, and use it for
+    // EVERYTHING downstream (codec construction, stop-token resolution, the startup parity
+    // render) — never only for rendering. `scalarServingTokenizerWithChatTemplateOverride` copies
+    // every other tokenizer_config.json field and the full tokenizer.json vocabulary unchanged, so
+    // encode/decode/eosTokenId/etc. stay identical to `context.tokenizer`'s; only chat-template
+    // resolution differs. Re-reads and re-validates the override file HERE (rather than trusting
+    // `validateScalarServingModelLoadConfiguration`'s earlier read) so a file that vanished or
+    // became unreadable between validation and this point still refuses instead of silently
+    // falling back to `context.tokenizer`'s own (un-overridden) template — the exact failure mode
+    // this flag exists to eliminate.
+    let tokenizer: any MLXLMCommon.Tokenizer
+    let chatTemplateOverrideText: String?
+    if let chatTemplateOverrideURL = configuration.chatTemplateOverrideURL {
+        guard let overrideText = scalarServingChatTemplateOverrideText(url: chatTemplateOverrideURL)
+        else {
+            throw ScalarServingModelLoadError.chatTemplateOverrideUnavailable(
+                chatTemplateOverrideURL.path)
+        }
+        chatTemplateOverrideText = overrideText
+        tokenizer = try await scalarServingTokenizerWithChatTemplateOverride(
+            modelDirectory: configuration.modelDirectory,
+            overrideTemplateText: overrideText)
+    } else {
+        chatTemplateOverrideText = nil
+        tokenizer = context.tokenizer
+    }
     let modelConfiguration = context.configuration
     // Read this BEFORE `context.model` is `sending`-consumed into the `InferenceActor` below (both
     // decoder-strategy branches send it into the actor). A subsequent read of the same non-Sendable
@@ -938,7 +1059,8 @@ public func loadScalarServingModel(
     // #1817) and stays passthrough (non-separating) until it is live-captured.
     let observedFamilyModelType = scalarServingModelType(modelDirectory: configuration.modelDirectory)
     let templateAttestsThinkMarkers = scalarServingChatTemplateAttestsThinkMarkers(
-        modelDirectory: configuration.modelDirectory)
+        modelDirectory: configuration.modelDirectory,
+        overrideText: chatTemplateOverrideText)
     backendConfiguration.disableThinkingWhenToolsActive = servingDisablesThinkingWhenToolsActive(
         route: decoderRoute,
         modelType: observedFamilyModelType,
@@ -948,13 +1070,26 @@ public func loadScalarServingModel(
         modelType: observedFamilyModelType,
         templateAttestsThinkMarkers: templateAttestsThinkMarkers)
     // Boot-time visibility for the deployment runbook's manual "drop a patched chat_template.jinja
-    // into the model directory" step: sampled from the SAME resolved template
+    // into the model directory" step: sampled from the SAME resolved template (now including the
+    // `--chat-template` override, when supplied — see `chatTemplateOverrideText`'s capture above)
     // `templateAttestsThinkMarkers` above reads, so a live serve on a checkpoint whose template was
-    // never (re-)patched shows it on the startup line instead of shipping silently — see
-    // `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc comment.
+    // never (re-)patched, and never overridden, shows it on the startup line instead of shipping
+    // silently — see `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s doc comment.
     let chatTemplateRefusesNonLeadingSystemMessage =
         scalarServingChatTemplateRefusesNonLeadingSystemMessage(
-            modelDirectory: configuration.modelDirectory)
+            modelDirectory: configuration.modelDirectory,
+            overrideText: chatTemplateOverrideText)
+    // Provenance triple for the startup line: sampled from the SAME resolved template the two
+    // probes immediately above read, via the same resolver, so the digest/byte-count/source fields
+    // can never describe different text than `chatTemplateRefusesNonLeadingSystemMessage` did.
+    let resolvedChatTemplateForReport = scalarServingResolveChatTemplate(
+        modelDirectory: configuration.modelDirectory,
+        overrideText: chatTemplateOverrideText)
+    let chatTemplateSHA256 = resolvedChatTemplateForReport.map {
+        scalarServingChatTemplateSHA256Hex($0.text)
+    }
+    let chatTemplateByteCount = resolvedChatTemplateForReport.map { Data($0.text.utf8).count }
+    let chatTemplateSource = resolvedChatTemplateForReport?.source
     // Some model families `preconditionFailure` inside their forward path on specific input token
     // IDs (media sentinels the model never expects as free-standing prompt tokens); on the scalar
     // route that precondition failure aborts the server process. Generated tokens are already
@@ -985,7 +1120,10 @@ public func loadScalarServingModel(
         mlxCacheBytes: memory.cacheMemory,
         mlxPeakBytes: memory.peakMemory,
         inCheckpointMTPStartupVerdict: inCheckpointMTPStartupVerdict,
-        chatTemplateRefusesNonLeadingSystemMessage: chatTemplateRefusesNonLeadingSystemMessage)
+        chatTemplateRefusesNonLeadingSystemMessage: chatTemplateRefusesNonLeadingSystemMessage,
+        chatTemplateSHA256: chatTemplateSHA256,
+        chatTemplateByteCount: chatTemplateByteCount,
+        chatTemplateSource: chatTemplateSource)
     return LoadedScalarServingModel(
         backend: backend,
         startupReport: report)
@@ -1034,13 +1172,10 @@ private let scalarServingThinkMarkerAttestationStrings = ["<think>", "</think>"]
 /// Artifact-derived attestation probe: does the LOADED checkpoint's own chat template contain the
 /// `<think>`/`</think>` markers the streaming reasoning splitter hardcodes?
 ///
-/// Resolves the same template Hugging Face tokenizers actually render from. swift-transformers'
-/// `Hub.swift` ("Check for chat template and merge if available") prefers a sibling
-/// `chat_template.jinja` file when present and OVERWRITES `tokenizer_config.json`'s `chat_template`
-/// field with its contents; this probe mirrors that precedence exactly, falling back to
-/// `tokenizer_config.json`'s `chat_template` string field only when `chat_template.jinja` is
-/// missing or unreadable. Returns `false`
-/// (fail-closed) when neither source resolves to a template, or when the resolved template text does
+/// Resolves the same template Hugging Face tokenizers actually render from — see
+/// `scalarServingResolveChatTemplate`'s doc comment for the resolution order, including the
+/// `overrideText` parameter (`--chat-template`, when supplied). Returns `false`
+/// (fail-closed) when no source resolves to a template, or when the resolved template text does
 /// not contain BOTH markers: an unreadable or non-attesting template must degrade
 /// `servingThinksByDefault` to today's byte-identical passthrough, never promote it to separation,
 /// because promoting content to `reasoning_content` on an unproven template is exactly the
@@ -1055,11 +1190,16 @@ private let scalarServingThinkMarkerAttestationStrings = ["<think>", "</think>"]
 /// Mirrors `scalarServingModelType`'s config-directory read pattern above; used to key
 /// `servingThinksByDefault`/`servingDisablesThinkingWhenToolsActive` (`StreamingReasoningPolicy.swift`)
 /// to the loaded artifact rather than a compile-time assumption about the family.
-func scalarServingChatTemplateAttestsThinkMarkers(modelDirectory: URL) -> Bool {
-    guard let template = scalarServingResolvedChatTemplateText(modelDirectory: modelDirectory) else {
+func scalarServingChatTemplateAttestsThinkMarkers(
+    modelDirectory: URL, overrideText: String? = nil
+) -> Bool {
+    guard
+        let resolved = scalarServingResolveChatTemplate(
+            modelDirectory: modelDirectory, overrideText: overrideText)
+    else {
         return false
     }
-    return scalarServingThinkMarkerAttestationStrings.allSatisfy(template.contains)
+    return scalarServingThinkMarkerAttestationStrings.allSatisfy(resolved.text.contains)
 }
 
 /// The literal `raise_exception(...)` argument the stock (un-patched) template anchor uses to
@@ -1074,14 +1214,17 @@ private let scalarServingNonLeadingSystemMessageRefusalAnchor =
 /// Artifact-derived attestation probe: does the LOADED checkpoint's own chat template still contain
 /// the stock refusal anchor that rejects any `system` message which is not first in the list?
 ///
-/// Uses the SAME `scalarServingResolvedChatTemplateText` resolution `scalarServingChatTemplateAttestsThinkMarkers`
-/// uses above (`chat_template.jinja` preferred, `tokenizer_config.json` fallback) — this probe exists
-/// specifically to catch the case where the deployment runbook's "drop a patched `chat_template.jinja`
-/// into the model directory" step was never (re-)applied: a live production-candidate serve shipped
-/// on exactly that stale checkpoint once, undetected, because nothing attested the resolved template
-/// at boot (`docs/task-inbox/` cycle-96 finding). Reading from a different (wrong-precedence) source
-/// than the tokenizer actually renders from would silently defeat this probe's whole purpose, which
-/// is why it shares the resolver this file already fixed to match `Hub.swift`.
+/// Uses the SAME `scalarServingResolveChatTemplate` resolution `scalarServingChatTemplateAttestsThinkMarkers`
+/// uses above — this probe exists specifically to catch the case where the deployment runbook's
+/// "drop a patched `chat_template.jinja` into the model directory" step was never (re-)applied (or,
+/// with `--chat-template` available, was never overridden): a live production-candidate serve
+/// shipped on exactly that stale checkpoint once, undetected, because nothing attested the resolved
+/// template at boot (`docs/task-inbox/` cycle-96 finding). Reading from a different
+/// (wrong-precedence) source than the tokenizer actually renders from would silently defeat this
+/// probe's whole purpose, which is why it shares the resolver this file already fixed to match
+/// `Hub.swift`, and why `overrideText` (when supplied) is the SAME value the render path's
+/// replacement tokenizer was actually built from — see `loadScalarServingModel`'s
+/// `chatTemplateOverrideText` capture.
 ///
 /// Fail-closed shape: returns `true` (i.e. "still refuses", the unsafe/alerting state) when NO
 /// template resolves at all. An unresolvable template is NOT evidence that an operator successfully
@@ -1092,37 +1235,55 @@ private let scalarServingNonLeadingSystemMessageRefusalAnchor =
 /// evidence, to avoid over-promoting streamed reasoning separation); here `false` is the claim
 /// requiring positive evidence — "the template was read AND does not contain the stock anchor" — so
 /// the unresolvable case must land on `true`, the conservative "assume still broken, keep warning"
-/// outcome, not the silent-success outcome that let cycle 96 ship undetected.
+/// outcome, not the silent-success outcome that let cycle 96 ship undetected. This probe
+/// deliberately does NOT gate admission on its own result — a template that refuses non-leading
+/// system messages (override or not) is a legitimate operator choice, only ever reported here.
 ///
 /// This probe checks for the stock `system`-only anchor text; it says nothing directly about
 /// `developer` messages. But `MLXScalarTextCodec.render` maps `developer` onto `system`
 /// (`scalarServingTemplateRoleName(for:)`) before any request reaches the template, so a
 /// non-leading `developer` message is refused (or accepted) by the exact same anchor this probe
 /// attests — this function governs both roles even though its name only says `system`.
-func scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: URL) -> Bool {
-    guard let template = scalarServingResolvedChatTemplateText(modelDirectory: modelDirectory) else {
+func scalarServingChatTemplateRefusesNonLeadingSystemMessage(
+    modelDirectory: URL, overrideText: String? = nil
+) -> Bool {
+    guard
+        let resolved = scalarServingResolveChatTemplate(
+            modelDirectory: modelDirectory, overrideText: overrideText)
+    else {
         return true
     }
-    return template.contains(scalarServingNonLeadingSystemMessageRefusalAnchor)
+    return resolved.text.contains(scalarServingNonLeadingSystemMessageRefusalAnchor)
 }
 
-/// Resolve the chat template text the tokenizer actually renders from, preferring a sibling
-/// `chat_template.jinja` file and falling back to `tokenizer_config.json`'s `chat_template` field
-/// only when `chat_template.jinja` is missing or unreadable.
-///
-/// This mirrors swift-transformers' own precedence, not the reverse: `Hub.swift`
-/// ("Check for chat template and merge if available") prefers `chat_template.jinja` when it exists
-/// and OVERWRITES `tokenizer_config.json`'s `chat_template` field with its contents before handing
-/// the merged config to the tokenizer. Reading `tokenizer_config.json` first would attest whatever
-/// checkpoint template shipped originally even after an operator drops a patched
-/// `chat_template.jinja` alongside it — the tokenizer would render the patched file while this
-/// probe kept reading the stale one.
-private func scalarServingResolvedChatTemplateText(modelDirectory: URL) -> String? {
+/// Resolve the chat template text the tokenizer actually renders from, and which source it came
+/// from, in the SAME four-tier precedence order swift-transformers' own `Hub.swift` ("Check for
+/// chat template and merge if available") resolves: an `overrideText` argument (`--chat-template`,
+/// when supplied) wins outright, ahead of every on-disk source; failing that, a sibling
+/// `chat_template.jinja` file; failing that, `chat_template.json`'s `chat_template` field; failing
+/// that, `tokenizer_config.json`'s `chat_template` field. `Hub.swift` overwrites
+/// `tokenizer_config.json`'s in-memory `chat_template` value with whichever on-disk file source
+/// resolves before handing the merged config to the tokenizer — reading `tokenizer_config.json`
+/// first, or skipping the `.json` tier, would attest a template different from the one the
+/// tokenizer actually renders from.
+func scalarServingResolveChatTemplate(
+    modelDirectory: URL, overrideText: String? = nil
+) -> ScalarServingResolvedChatTemplate? {
+    if let overrideText {
+        return ScalarServingResolvedChatTemplate(text: overrideText, source: .override)
+    }
     let jinjaURL = modelDirectory.appendingPathComponent("chat_template.jinja")
     if let data = try? Data(contentsOf: jinjaURL),
         let text = String(data: data, encoding: .utf8)
     {
-        return text
+        return ScalarServingResolvedChatTemplate(text: text, source: .modelDirJinja)
+    }
+    let chatTemplateJSONURL = modelDirectory.appendingPathComponent("chat_template.json")
+    if let data = try? Data(contentsOf: chatTemplateJSONURL),
+        let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+        let template = root["chat_template"] as? String
+    {
+        return ScalarServingResolvedChatTemplate(text: template, source: .modelDirChatTemplateJSON)
     }
     let tokenizerConfigURL = modelDirectory.appendingPathComponent("tokenizer_config.json")
     guard let data = try? Data(contentsOf: tokenizerConfigURL),
@@ -1131,7 +1292,70 @@ private func scalarServingResolvedChatTemplateText(modelDirectory: URL) -> Strin
     else {
         return nil
     }
-    return template
+    return ScalarServingResolvedChatTemplate(text: template, source: .tokenizerConfig)
+}
+
+/// Reads `url` and returns its UTF-8 text, or `nil` when the file is missing, unreadable, or not
+/// valid UTF-8. Shared by `validateScalarServingModelLoadConfiguration`'s pre-weight-load refusal
+/// check and `loadScalarServingModel`'s later re-read, so both use the IDENTICAL definition of
+/// "readable" — see `ScalarServingModelLoadError.chatTemplateOverrideUnavailable`'s doc comment.
+func scalarServingChatTemplateOverrideText(url: URL) -> String? {
+    guard let data = try? Data(contentsOf: url),
+        let text = String(data: data, encoding: .utf8)
+    else {
+        return nil
+    }
+    return text
+}
+
+/// SHA-256 fold of a chat template's text, for the boot attestation line's provenance fragment.
+/// Mirrors `inCheckpointMTPTokenSequenceFingerprint`'s exact hex-encoding style below.
+func scalarServingChatTemplateSHA256Hex(_ text: String) -> String {
+    let digest = SHA256.hash(data: Data(text.utf8))
+    return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+/// Builds a tokenizer identical to the checkpoint's own, except with its resolved `chat_template`
+/// field replaced by `overrideTemplateText`. Re-reads `tokenizer_config.json`/`tokenizer.json`
+/// directly from `modelDirectory` via `Hub.LanguageModelConfigurationFromHub` (the SAME async
+/// config-loading type `Tokenizers.AutoTokenizer.from(modelFolder:)` uses internally) rather than
+/// reusing the already-loaded `context.tokenizer`, because `MLXLMCommon.Tokenizer` (the narrower,
+/// project-local bridge protocol `context.tokenizer` is typed as — declared in vendored
+/// `MLXLMCommon/Tokenizer.swift`, never edited by this change) exposes no `chatTemplate:`-taking
+/// `applyChatTemplate` overload and no way to reach the `Tokenizers.Tokenizer` instance the
+/// adapter macro (`#adaptHuggingFaceTokenizer`) wraps — that instance is a private stored property
+/// of a macro-local struct with no public accessor. Constructing a fresh `PreTrainedTokenizer` from
+/// the on-disk config files, with only `chat_template` swapped, is the only override mechanism
+/// reachable from outside that boundary.
+///
+/// Uses `PreTrainedTokenizer(tokenizerConfig:tokenizerData:)` DIRECTLY — never
+/// `Tokenizers.AutoTokenizer.from(tokenizerConfig:tokenizerData:)`, whose `tokenizerClass(for:)`
+/// dispatch could select a different tokenizer subclass (e.g. `LlamaPreTrainedTokenizer`) than the
+/// checkpoint's own load already resolved, a silent behavior difference present only on the
+/// override path. `AutoTokenizer.from(modelFolder:)` — the exact function
+/// `#huggingFaceTokenizerLoader()` calls for every ordinary load — hardcodes `PreTrainedTokenizer`
+/// this same way (`swift-transformers/Sources/Tokenizers/Tokenizer.swift`), so this mirrors the
+/// production load path exactly, with one field swapped.
+///
+/// `LanguageModelConfigurationFromHub.tokenizerConfig` throws `TokenizerError.missingConfig` when
+/// no `tokenizer_config.json` resolves at all, matching `AutoTokenizer.from(modelFolder:)`'s own
+/// behavior in that case exactly (rather than silently constructing a bare `["chat_template": ...]`
+/// config the checkpoint's own load path would never have accepted).
+func scalarServingTokenizerWithChatTemplateOverride(
+    modelDirectory: URL,
+    overrideTemplateText: String
+) async throws -> any MLXLMCommon.Tokenizer {
+    let configuration = LanguageModelConfigurationFromHub(modelFolder: modelDirectory)
+    guard let baseTokenizerConfig = try await configuration.tokenizerConfig else {
+        throw Tokenizers.TokenizerError.missingConfig
+    }
+    let tokenizerData = try await configuration.tokenizerData
+    var dictionary = baseTokenizerConfig.dictionary() ?? [:]
+    dictionary["chat_template"] = .init(overrideTemplateText)
+    let overriddenTokenizerConfig = Config(dictionary)
+    let upstream = try PreTrainedTokenizer(
+        tokenizerConfig: overriddenTokenizerConfig, tokenizerData: tokenizerData)
+    return #adaptHuggingFaceTokenizer(upstream)
 }
 
 /// How one cache's serving kind was determined by `classifyScalarServingNativeCacheEntry`.

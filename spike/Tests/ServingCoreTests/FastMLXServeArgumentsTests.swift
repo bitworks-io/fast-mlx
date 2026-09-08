@@ -1894,4 +1894,171 @@ final class FastMLXServeArgumentsTests: XCTestCase {
                 .ngramOffloadPlanWithContinuousBatch)
         }
     }
+
+    // MARK: - --chat-template: an absolute local path to a chat-template file that overrides the
+    // served checkpoint's own resolved template for BOTH rendering and the boot attestation
+    // probe. Default nil preserves today's resolution unchanged.
+
+    func testChatTemplateParsesAsAbsolutePathOnScalarServe() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--chat-template", "/abs/path/chat_template.jinja",
+        ])
+
+        XCTAssertEqual(
+            arguments.chatTemplateURL,
+            URL(fileURLWithPath: "/abs/path/chat_template.jinja"))
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--chat-template PATH"))
+    }
+
+    func testChatTemplateRejectsRelativePath() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--chat-template", "relative/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateMustBeAbsolute)
+        }
+    }
+
+    func testChatTemplateRequiresAValue() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--chat-template",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .missingValue("--chat-template"))
+        }
+    }
+
+    func testChatTemplateDefaultsNilAndDoesNotChangeOtherwiseValidParse() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ])
+        XCTAssertNil(arguments.chatTemplateURL)
+        XCTAssertEqual(
+            arguments.backend,
+            .scalar(
+                modelDirectory: URL(fileURLWithPath: "/models/fixture", isDirectory: true),
+                memoryLimitBytes: 68_719_476_736,
+                cacheLimitBytes: 8_589_934_592))
+    }
+
+    func testChatTemplateRejectedWithScripted() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--chat-template", "/abs/path/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateWithScripted)
+        }
+    }
+
+    func testChatTemplateRejectedWithContinuousBatchNoSpec() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-batch-no-spec",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "103079215104",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--chat-template", "/abs/path/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateWithContinuousBatch)
+        }
+    }
+
+    func testChatTemplateRejectedWithContinuousDynamicPLD() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-dynamic-pld",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "103079215104",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--chat-template", "/abs/path/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateWithContinuousBatch)
+        }
+    }
+
+    func testChatTemplateRejectedWithExactQwen35MTP() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/qwen35-target",
+                "--model", "qwen35-exact",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--exact-qwen35-mtp",
+                "--mtp-drafter-path", "/models/qwen35-drafter",
+                "--chat-template", "/abs/path/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateWithExactQwen35MTP)
+        }
+    }
+
+    func testChatTemplateRejectedWithQuantPickOnly() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--quant-pick-only",
+                "--chat-template", "/abs/path/chat_template.jinja",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .chatTemplateWithQuantPickOnly)
+        }
+    }
+
+    /// Non-regression: unlike --ngram-offload-plan, --chat-template is NOT refused when combined
+    /// with the loaded (non-pick-only) --quant-candidates auto-pick route — the resolved winning
+    /// directory still loads through the same scalar-load seam this flag targets.
+    func testChatTemplateAcceptedWithLoadedQuantCandidates() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--quant-candidates", "/models/a,/models/b",
+            "--model", "qwen3",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--chat-template", "/abs/path/chat_template.jinja",
+        ])
+
+        XCTAssertEqual(
+            arguments.chatTemplateURL,
+            URL(fileURLWithPath: "/abs/path/chat_template.jinja"))
+        XCTAssertEqual(arguments.quantCandidateDirectories.count, 2)
+    }
 }

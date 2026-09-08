@@ -25,7 +25,8 @@ import XCTest
 final class FlashNextChatTemplateAttestationTests: XCTestCase {
     private func writeModelDirectory(
         tokenizerConfigJSON: String? = nil,
-        chatTemplateJinja: String? = nil
+        chatTemplateJinja: String? = nil,
+        chatTemplateJSON: String? = nil
     ) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("flashnext-template-probe-\(UUID().uuidString)", isDirectory: true)
@@ -37,6 +38,10 @@ final class FlashNextChatTemplateAttestationTests: XCTestCase {
         if let chatTemplateJinja {
             try Data(chatTemplateJinja.utf8).write(
                 to: directory.appendingPathComponent("chat_template.jinja"))
+        }
+        if let chatTemplateJSON {
+            try Data(chatTemplateJSON.utf8).write(
+                to: directory.appendingPathComponent("chat_template.json"))
         }
         return directory
     }
@@ -226,5 +231,130 @@ final class FlashNextChatTemplateAttestationTests: XCTestCase {
 
         XCTAssertFalse(
             scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+    }
+
+    // MARK: - scalarServingResolveChatTemplate: source-kind reporting (`--chat-template` override
+    // ahead of `chat_template.jinja`, ahead of `chat_template.json`, ahead of
+    // `tokenizer_config.json`'s `chat_template` field; `nil` when nothing resolves).
+
+    /// Tier 1: an override text, when supplied, wins outright, ahead of EVERY on-disk source —
+    /// even when all three on-disk sources are present too.
+    func testResolveChatTemplateOverrideWinsOverEveryOnDiskSource() throws {
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: #"{"chat_template": "\#(nonAttestingTemplateText)"}"#,
+            chatTemplateJinja: nonAttestingTemplateText,
+            chatTemplateJSON: #"{"chat_template": "\#(nonAttestingTemplateText)"}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let resolved = scalarServingResolveChatTemplate(
+            modelDirectory: directory, overrideText: attestingTemplateText)
+
+        XCTAssertEqual(resolved?.text, attestingTemplateText)
+        XCTAssertEqual(resolved?.source, .override)
+    }
+
+    /// Tier 2: absent an override, `chat_template.jinja` resolves and reports `.modelDirJinja`.
+    func testResolveChatTemplateReportsModelDirJinjaSource() throws {
+        let directory = try writeModelDirectory(chatTemplateJinja: attestingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let resolved = scalarServingResolveChatTemplate(modelDirectory: directory)
+
+        XCTAssertEqual(resolved?.text, attestingTemplateText)
+        XCTAssertEqual(resolved?.source, .modelDirJinja)
+    }
+
+    /// Tier 3 (the fixed gap): absent an override AND `chat_template.jinja`, `chat_template.json`'s
+    /// `chat_template` field resolves and reports `.modelDirChatTemplateJSON`. Before this fix the
+    /// resolver skipped straight from `.jinja` to `tokenizer_config.json`, silently attesting a
+    /// STALE `tokenizer_config.json` template even though `chat_template.json` — which
+    /// swift-transformers' `Hub.swift` prefers over `tokenizer_config.json` — was present.
+    func testResolveChatTemplateReportsModelDirChatTemplateJSONSource() throws {
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: #"{"chat_template": "\#(nonAttestingTemplateText)"}"#,
+            chatTemplateJSON: #"{"chat_template": "\#(attestingTemplateText)"}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let resolved = scalarServingResolveChatTemplate(modelDirectory: directory)
+
+        XCTAssertEqual(resolved?.text, attestingTemplateText)
+        XCTAssertEqual(resolved?.source, .modelDirChatTemplateJSON)
+    }
+
+    /// `chat_template.jinja` still wins over `chat_template.json` when both are present — the
+    /// SAME precedence `Hub.swift` uses ("Prefer .jinja template over .json template").
+    func testResolveChatTemplateJinjaWinsOverChatTemplateJSON() throws {
+        let directory = try writeModelDirectory(
+            chatTemplateJinja: attestingTemplateText,
+            chatTemplateJSON: #"{"chat_template": "\#(nonAttestingTemplateText)"}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let resolved = scalarServingResolveChatTemplate(modelDirectory: directory)
+
+        XCTAssertEqual(resolved?.text, attestingTemplateText)
+        XCTAssertEqual(resolved?.source, .modelDirJinja)
+    }
+
+    /// Tier 4 (last resort): absent an override and both on-disk template files,
+    /// `tokenizer_config.json`'s `chat_template` field resolves and reports `.tokenizerConfig`.
+    func testResolveChatTemplateReportsTokenizerConfigSource() throws {
+        let directory = try writeModelDirectory(
+            tokenizerConfigJSON: #"{"chat_template": "\#(attestingTemplateText)"}"#)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let resolved = scalarServingResolveChatTemplate(modelDirectory: directory)
+
+        XCTAssertEqual(resolved?.text, attestingTemplateText)
+        XCTAssertEqual(resolved?.source, .tokenizerConfig)
+    }
+
+    /// Fail-closed: nothing resolves at all (no override, no on-disk source) — `nil`, matching
+    /// `scalarServingChatTemplateRefusesNonLeadingSystemMessage`'s own fail-closed `true` in this
+    /// same case.
+    func testResolveChatTemplateReturnsNilWhenNothingResolves() throws {
+        let directory = try writeModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertNil(scalarServingResolveChatTemplate(modelDirectory: directory))
+    }
+
+    // MARK: - overrideText threading on the two attestation probes: proves the probes consult the
+    // override ahead of every on-disk source, and that the on-disk file itself is left untouched.
+
+    /// The refusal probe reports `true` (still refuses) from the on-disk stock template with no
+    /// override, and `false` (patched) once an override supplies a non-refusing template — while
+    /// the SAME on-disk file, read again with no override, still reports `true`. This is the
+    /// decisive proof that the override changes what gets ATTESTED without mutating the checkpoint
+    /// artifact on disk (the write-protected `chat_template.jinja` this flag exists to avoid
+    /// touching).
+    func testRefusesNonLeadingSystemMessageOverrideDoesNotMutateOnDiskTemplate() throws {
+        let directory = try writeModelDirectory(chatTemplateJinja: refusingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+        XCTAssertFalse(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(
+                modelDirectory: directory, overrideText: nonRefusingTemplateText))
+        // Re-read with no override: the on-disk file is untouched.
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+        XCTAssertEqual(
+            try String(contentsOf: directory.appendingPathComponent("chat_template.jinja"), encoding: .utf8),
+            refusingTemplateText)
+    }
+
+    /// The converse: an override can also make a PERMISSIVE on-disk template report `true` (an
+    /// operator override to a MORE conservative template is an equally legitimate choice this
+    /// probe must not silently ignore).
+    func testRefusesNonLeadingSystemMessageOverrideCanMakeAPermissiveTemplateRefuse() throws {
+        let directory = try writeModelDirectory(chatTemplateJinja: nonRefusingTemplateText)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertFalse(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(
+                modelDirectory: directory, overrideText: refusingTemplateText))
     }
 }
