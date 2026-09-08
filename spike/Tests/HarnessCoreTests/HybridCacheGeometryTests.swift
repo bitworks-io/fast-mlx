@@ -400,6 +400,42 @@ final class HybridCacheGeometryTests: XCTestCase {
             "indexer_kv_heads absent must fail closed, never silently default to 1")
     }
 
+    /// Mirrors `ModelConfigDecoderTests` T6: `selected_kv_execution_mode: "compact"` must refuse at
+    /// this second qwen4_exp-scoped resolution site too — see `decode`'s `isSparseIndexerHybrid` block
+    /// for the full rationale (compact's measured ~52 GB/model prefill allocation this decoder cannot
+    /// see).
+    func testFlashNext_selectedKVExecutionModeCompact_failsClosed() {
+        var geom = qwen4ExpGeom()
+        geom["selected_kv_execution_mode"] = "compact"
+        geom["model_type"] = "qwen4_exp"
+        let data = try! JSONSerialization.data(withJSONObject: geom)
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.qwen4ExpHybridGeometry(configJSON: data),
+            "selected_kv_execution_mode=compact must refuse rather than under-count the compact allocation"
+        ) { error in
+            guard case ModelConfigDecodeError.invalidField(let f) = error else {
+                return XCTFail("expected invalidField(selected_kv_execution_mode), got \(error)")
+            }
+            XCTAssertEqual(f, "selected_kv_execution_mode")
+        }
+    }
+
+    /// Explicit `"dense"` must derive a geometry EQUAL to the key-absent fixture's geometry.
+    func testFlashNext_selectedKVExecutionModeDenseEqualsAbsent() throws {
+        var withMode = qwen4ExpGeom()
+        withMode["selected_kv_execution_mode"] = "dense"
+        withMode["model_type"] = "qwen4_exp"
+        let withModeData = try! JSONSerialization.data(withJSONObject: withMode)
+
+        var absent = qwen4ExpGeom()
+        absent["model_type"] = "qwen4_exp"
+        let absentData = try! JSONSerialization.data(withJSONObject: absent)
+
+        let denseGeometry = try ModelConfigDecoder.qwen4ExpHybridGeometry(configJSON: withModeData)
+        let absentGeometry = try ModelConfigDecoder.qwen4ExpHybridGeometry(configJSON: absentData)
+        XCTAssertEqual(denseGeometry, absentGeometry, "explicit dense must not perturb the geometry vs. absent")
+    }
+
     func testFlashNext_wrongFamily_failsClosed() {
         var geom = qwen4ExpGeom()
         geom["model_type"] = "qwen3_5"

@@ -2052,6 +2052,194 @@ final class ModelConfigDecoderTests: XCTestCase {
         XCTAssertEqual(total, 15_360)
     }
 
+    /// T6: fail-closed — `selected_kv_execution_mode: "compact"` THROWS. This key switches
+    /// this family's runtime attention route from dense to the QSA compact-gather path (the key is a
+    /// decoded `text_config` field, honoured by the family's attention layer at construction, which
+    /// falls back to `dense` only when the key is absent). Compact's per-full-attention-layer
+    /// allocation at the production prefill chunk is measured (not estimated) in the family's
+    /// selected-KV attention test suite at 4,364,271,736 B versus dense's 0 — roughly 52 GB across
+    /// the 12 full-attention layers this fixture models, none of which the fit-check sizer expresses.
+    /// Modelling it honestly would require the runtime cache class AND the prefill chunk size, neither
+    /// of which reaches this decoder, so refuse rather than silently under-count.
+    func testSparseIndexerHybrid_selectedKVExecutionModeCompact_failsClosed() {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1,
+          "selected_kv_execution_mode": "compact"
+        }
+        """
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x"),
+            "qwen4_exp with selected_kv_execution_mode=compact must refuse rather than under-count the ~52 GB compact allocation"
+        ) { error in
+            guard case ModelConfigDecodeError.invalidField(let f) = error else {
+                return XCTFail("expected invalidField(selected_kv_execution_mode), got \(error)")
+            }
+            XCTAssertEqual(f, "selected_kv_execution_mode")
+        }
+    }
+
+    /// T6b: explicit `selected_kv_execution_mode: "dense"` decodes exactly as if the key were absent.
+    func testSparseIndexerHybrid_selectedKVExecutionModeExplicitDense_decodes() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1,
+          "selected_kv_execution_mode": "dense"
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-mode-dense")
+        XCTAssertEqual(parsed.profile.auxPerLayerKeyDim, 128)
+        XCTAssertEqual(CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16), 27_648)
+    }
+
+    /// T6c: absent `selected_kv_execution_mode` decodes exactly as before this field was read at all.
+    func testSparseIndexerHybrid_selectedKVExecutionModeAbsent_decodes() throws {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen4-exp-mode-absent")
+        XCTAssertEqual(parsed.profile.auxPerLayerKeyDim, 128)
+        XCTAssertEqual(CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16), 27_648)
+    }
+
+    /// T6d: explicit `"dense"` and absent must agree with EACH OTHER and with the existing T2/T4c
+    /// pinned figure (27,648 B/tok for this exact fixture, under `.fp16`) — a future refactor that
+    /// starts reading the mode in a way that perturbs the unaffected path must fail this assertion.
+    func testSparseIndexerHybrid_selectedKVExecutionModeDenseEqualsAbsent() throws {
+        func kvBytesPerToken(mode: String?) throws -> Double {
+            let modeField = mode.map { ",\n  \"selected_kv_execution_mode\": \"\($0)\"" } ?? ""
+            let json = """
+            {
+              "model_type": "qwen4_exp",
+              "num_hidden_layers": 48,
+              "num_attention_heads": 16,
+              "num_key_value_heads": 2,
+              "head_dim": 256,
+              "hidden_size": 4096,
+              "max_position_embeddings": 262144,
+              "full_attention_interval": 4,
+              "layer_types": \(qwen4ExpLayerTypesJSON()),
+              "linear_num_key_heads": 16,
+              "linear_num_value_heads": 48,
+              "linear_key_head_dim": 128,
+              "linear_value_head_dim": 128,
+              "linear_conv_kernel_dim": 4,
+              "indexer_head_dim": 128,
+              "indexer_kv_heads": 1\(modeField)
+            }
+            """
+            let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x")
+            return CapacityModel.kvBytesPerToken(parsed.profile, kvQuant: .fp16)
+        }
+        let denseBytes = try kvBytesPerToken(mode: "dense")
+        let absentBytes = try kvBytesPerToken(mode: nil)
+        XCTAssertEqual(denseBytes, absentBytes, "explicit dense must not perturb the decode vs. absent")
+        XCTAssertEqual(denseBytes, 27_648, "must match the existing T2/T4c pinned per-token figure for this fixture")
+    }
+
+    /// T6e: non-`qwen4_exp` families never read/validate `selected_kv_execution_mode` — mirrors T4e.
+    /// A stray (invalid-for-qwen4_exp) `"compact"` value on an unrelated dense family must decode
+    /// exactly as though the field weren't there, proving the guard is gated on `isSparseIndexerHybrid`.
+    func testNonSparseIndexerHybrid_ignoresSelectedKVExecutionModeField() throws {
+        let json = """
+        {
+          "model_type": "qwen3",
+          "num_hidden_layers": 64,
+          "num_attention_heads": 64,
+          "num_key_value_heads": 8,
+          "head_dim": 128,
+          "hidden_size": 5120,
+          "max_position_embeddings": 40960,
+          "selected_kv_execution_mode": "compact"
+        }
+        """
+        let parsed = try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "test-qwen3-stray-mode-field")
+        XCTAssertEqual(parsed.profile.modelType, .uniformGQA)
+        XCTAssertNil(parsed.profile.auxPerLayerKeyDim, "non-qwen4_exp families must never populate the aux term")
+    }
+
+    /// T6f: fail-closed — a non-string JSON value (e.g. a number) for `selected_kv_execution_mode`
+    /// must refuse, not be silently ignored or coerced.
+    func testSparseIndexerHybrid_selectedKVExecutionModeNonString_failsClosed() {
+        let json = """
+        {
+          "model_type": "qwen4_exp",
+          "num_hidden_layers": 48,
+          "num_attention_heads": 16,
+          "num_key_value_heads": 2,
+          "head_dim": 256,
+          "hidden_size": 4096,
+          "max_position_embeddings": 262144,
+          "full_attention_interval": 4,
+          "layer_types": \(qwen4ExpLayerTypesJSON()),
+          "linear_num_key_heads": 16,
+          "linear_num_value_heads": 48,
+          "linear_key_head_dim": 128,
+          "linear_value_head_dim": 128,
+          "linear_conv_kernel_dim": 4,
+          "indexer_head_dim": 128,
+          "indexer_kv_heads": 1,
+          "selected_kv_execution_mode": 3
+        }
+        """
+        XCTAssertThrowsError(
+            try ModelConfigDecoder.decode(configJSON: data(json), safetensorsBytes: 1, id: "x"),
+            "a non-string selected_kv_execution_mode must refuse, not be silently ignored or coerced"
+        ) { error in
+            guard case ModelConfigDecodeError.invalidField(let f) = error else {
+                return XCTFail("expected invalidField(selected_kv_execution_mode), got \(error)")
+            }
+            XCTAssertEqual(f, "selected_kv_execution_mode")
+        }
+    }
+
     /// Families that need a NEW `ArchClass` formula (not an allow-list add) must fail closed. openelm
     /// carries a PER-LAYER-VARYING `num_key_value_heads` array (not the scalar every audited class
     /// reads), so uniformGQA's `nKVHeads × head_dim × nAttnLayers` would use the wrong head count on

@@ -646,6 +646,25 @@ public enum ModelConfigDecoder {
             guard indexerKVHeads == 1 else {
                 throw ModelConfigDecodeError.invalidField("indexer_kv_heads")
             }
+            // `selected_kv_execution_mode` is a real, decoded `text_config` key of this family, and
+            // the family's attention layer honours it at RUNTIME (defaulting to `dense` only when the
+            // key is absent), switching every full-attention layer from dense attention to the QSA
+            // "compact" gather route — a decode-time config toggle, not a serve-time flag this sizer
+            // already sees. Measured directly against the family's selected-KV attention test fixture,
+            // not estimated: at L=512 (the production prefill chunk) with keyLength=4096, compact allocates
+            // 4,364,271,736 B for a SINGLE full-attention layer versus dense's 0 — roughly 52 GB summed
+            // over the 12 full-attention layers this profile models, none of which the growing-KV
+            // formula above or the indexer aux term just above expresses. Modelling it honestly would
+            // need the runtime cache class AND the prefill chunk size, neither of which reaches this
+            // decoder, so refuse rather than silently reintroduce the exact phantom-GREEN-then-abort
+            // hole the indexer aux term above exists to close. Absent and explicit `"dense"` are
+            // unchanged from before this key was read at all; anything else (an unknown string, or a
+            // non-string JSON value) also refuses rather than being silently ignored or coerced.
+            if let rawMode = geom("selected_kv_execution_mode") {
+                guard let mode = rawMode as? String, mode == "dense" else {
+                    throw ModelConfigDecodeError.invalidField("selected_kv_execution_mode")
+                }
+            }
         } else {
             auxPerLayerKeyDim = nil
         }
@@ -1313,6 +1332,16 @@ public extension ModelConfigDecoder {
         }
         guard indexerKVHeads == 1 else {
             throw ModelConfigDecodeError.invalidField("indexer_kv_heads")
+        }
+
+        // `selected_kv_execution_mode` refusal, mirroring `decode`'s `isSparseIndexerHybrid` block
+        // exactly (same runtime effect, same measured ~52 GB compact-vs-dense figure, same fail-closed
+        // rationale — see that comment for the full explanation). Absent/`"dense"` unchanged; anything
+        // else refuses.
+        if let rawMode = geom("selected_kv_execution_mode") {
+            guard let mode = rawMode as? String, mode == "dense" else {
+                throw ModelConfigDecodeError.invalidField("selected_kv_execution_mode")
+            }
         }
 
         let dense = DenseKVGeometry(
