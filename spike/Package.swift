@@ -104,12 +104,19 @@ let package = Package(
         ),
         .testTarget(
             name: "SpikeServingAdaptersTests",
+            // `fastmlx-serve` is a TEST-ONLY dependency (mirrors ProofControlTests' dependency on
+            // `fastmlx-proof-runner` above): one black-box CLI test spawns the real built binary to
+            // prove FastMLXServe.main()'s `catch let error as ScalarServingModelLoadError` arm exits
+            // 2 with the machine-readable refusal line on stderr, instead of the raw Swift
+            // top-level fatalError trap (exit 133) a regression there would silently reintroduce.
+            // The production `SpikeServingAdapters` target itself gains no new dependency.
             dependencies: [
                 "HarnessCore",
                 "ServingCore",
                 "ServingNIO",
                 "SpikeCore",
                 "SpikeServingAdapters",
+                "fastmlx-serve",
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),

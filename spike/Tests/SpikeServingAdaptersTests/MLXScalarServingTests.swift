@@ -1231,6 +1231,104 @@ final class MLXScalarServingTests: XCTestCase {
             XCTAssertEqual(retainedDrafter != nil, drafterRetentionDecision)
         }
     }
+
+    // MARK: - Black-box CLI coverage: `FastMLXServe.main()`'s
+    // `catch let error as ScalarServingModelLoadError` arm
+
+    /// Same shape as `Qwen38ScorecardProofRunnerCLITests`'s `productsDirectory`/binary-invocation
+    /// idiom, applied to the built `fastmlx-serve` binary (a TEST-ONLY dependency of this target —
+    /// see `Package.swift`'s `SpikeServingAdaptersTests` comment).
+    private static var productsDirectory: URL {
+        Bundle(for: MLXScalarServingTests.self).bundleURL.deletingLastPathComponent()
+    }
+
+    private static var serveURL: URL {
+        productsDirectory.appendingPathComponent("fastmlx-serve")
+    }
+
+    private struct ServeCLIResult {
+        let exitStatus: Int32
+        let stdout: String
+        let stderr: String
+    }
+
+    private func runServe(arguments: [String]) throws -> ServeCLIResult {
+        let binary = Self.serveURL
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: binary.path),
+            "fastmlx-serve binary missing at \(binary.path); "
+                + "SpikeServingAdaptersTests must depend on the executable target")
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = arguments
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return ServeCLIResult(
+            exitStatus: process.terminationStatus,
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self))
+    }
+
+    /// Synthetic qwen3_5 checkpoint directory: a full config.json (every field
+    /// `ModelConfigDecoder.decode` requires for the hybrid-linear arch class, so the CLI's pre-load
+    /// fit-check decodes and proceeds) with `linear_key_head_dim` set to 33 — not a multiple of 32,
+    /// so the scalar route's post-fit-check gated-delta kernel viability guard
+    /// (`scalarServingQwen35RecurrentKeyHeadDim`/`ScalarServingModelLoadError
+    /// .hybridKernelKeyHeadDimUnaligned`) refuses it — plus a `model.safetensors.index.json`
+    /// declaring a small total size so the fit-check sizes the checkpoint honestly (`weightsAreDeclared
+    /// = true`) without any real weight shards on disk. Mirrors `qwen35UnalignedDkConfigJSON` above,
+    /// which exercises the same guard directly (not through the CLI/full fit-check pipeline).
+    private func writeUnalignedQwen35CheckpointDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "scalar-serving-cli-unaligned-dk-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let configJSON = #"""
+            {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+             "text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,
+               "vocab_size":248320,"num_hidden_layers":48,"full_attention_interval":4,
+               "num_key_value_heads":8,"head_dim":128,"torch_dtype":"bfloat16",
+               "linear_num_key_heads":16,"linear_num_value_heads":32,
+               "linear_key_head_dim":33,"linear_value_head_dim":128,"linear_conv_kernel_dim":4}}
+            """#
+        try Data(configJSON.utf8).write(to: directory.appendingPathComponent("config.json"))
+        let indexJSON = #"{"metadata":{"total_size":50000000}}"#
+        try Data(indexJSON.utf8).write(
+            to: directory.appendingPathComponent("model.safetensors.index.json"))
+        return directory
+    }
+
+    /// Acceptance: the CLI's `catch let error as ScalarServingModelLoadError` arm renders the
+    /// machine-readable refusal line and exits 2 (rather than a raw Swift top-level fatalError trap,
+    /// exit 133) when a real invocation's pre-load kernel viability guard refuses a checkpoint.
+    func testServeCLIRefusesUnalignedQwen35KeyHeadDimWithExitTwo() throws {
+        let directory = try writeUnalignedQwen35CheckpointDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let result = try runServe(arguments: [
+            "--model", "qwen3_5-cli-fixture",
+            "--model-path", directory.path,
+            "--host", "127.0.0.1",
+            "--port", "58732",
+        ])
+
+        XCTAssertEqual(result.exitStatus, 2)
+        XCTAssertTrue(
+            result.stderr.contains("configuration=refused"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("reason=scalar_serving_model_load_error"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("hybridKernelKeyHeadDimUnaligned(33)"),
+            "unexpected stderr: \(result.stderr)")
+    }
 }
 
 private enum FixtureTokenizerError: Error {
