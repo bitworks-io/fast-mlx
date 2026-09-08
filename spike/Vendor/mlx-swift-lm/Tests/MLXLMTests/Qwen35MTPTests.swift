@@ -771,6 +771,51 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35VLMCommitDrafterStateFlagsDesyncOnShortTrim() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self,
+            from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXVLM.Qwen35(cfg)
+        let drafter = MLXVLM.Qwen35VLMNextNDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+
+        // Prime the drafter with a single-token prompt so its own cache offset
+        // (1) is strictly smaller than the trim `commitDrafterState` will
+        // request below (3) -- the short-trim precondition
+        // `trimDrafterCacheTrackingShortTrim` exists to detect.
+        var state = drafter.makeState(parameters: nil)
+        let promptTokens = MLXArray([Int32(1)]).reshaped([1, 1])
+        let prepareHidden = MLXArray.zeros([1, 1, cfg.textConfiguration.hiddenSize])
+        let bonus = MLXArray([Int32(4)])
+        drafter.prepareDrafterState(
+            target: target, promptTokens: promptTokens, targetHidden: prepareHidden,
+            firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+        #expect(state.cache.allSatisfy { $0.offset == 1 })
+        #expect(state.nextPosition == 1)
+
+        // Force a trim request larger than the cache can actually supply --
+        // the drafter's cache cannot shed every rejected entry.
+        state.proposalAppended = 3
+
+        let targetHidden = MLXArray.zeros([1, 1, cfg.textConfiguration.hiddenSize])
+        let draftTokens = MLXArray([Int32(1), Int32(2), Int32(3)]).reshaped([1, 3])
+        let finalToken = MLXArray([Int32(5)])
+        drafter.commitDrafterState(
+            target: target, targetHidden: targetHidden, draftTokens: draftTokens,
+            acceptedCount: 0, finalToken: finalToken, positionDeltas: nil,
+            state: &state, sampler: sampler)
+        eval(state.seedToken!, state.seedHidden!)
+
+        // `trim(3)` on a cache with offset 1 can only shed 1 entry, then the
+        // commit's own forward pass re-appends exactly 1 (the final token),
+        // so a correctly tracked cache and position both land back on 1.
+        #expect(state.cache.allSatisfy { $0.offset == 1 })
+        #expect(state.nextPosition == 1)
+        #expect(state.drafterCacheDesynchronized == true)
+    }
+
+    @Test
     func testQwen35GDNCheckpointMatchesPrefixWithoutReplayingProjections() throws {
         MLXRandom.seed(42)
         let cfg = try JSONDecoder().decode(

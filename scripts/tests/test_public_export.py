@@ -55,7 +55,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift",
-        "sha256": "95110581a01bf827cbaa74b3ea2fdd45b4ac0bd7fe74e489f907a9f45f443741",
+        "sha256": "3996179002b61ec022fe1f208aece97bb4cbc6ab28cee155b9d2c5bcf3b3521d",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen3MoELazyModelTests.swift",
