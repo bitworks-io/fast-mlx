@@ -463,4 +463,154 @@ final class Qwen3TemplateRenderTests: XCTestCase {
             rendered.contains(Self.toolPolicyMarkerContent),
             "expected the tool policy content to survive rendering, in:\n\(rendered)")
     }
+
+    // MARK: - Hermetic proof: NO environment variable required (project lesson: a suite gated
+    // entirely on `FASTMLX_QWEN3_TOKENIZER_DIR` stays green under `swift test` in CI, which never
+    // sets that variable, even if a refactor deletes the override mechanism entirely). These two
+    // arms build a minimal synthetic tokenizer from string/dictionary literals in a temp directory,
+    // so they execute unconditionally, driving the SAME production seam as the arms above
+    // (`scalarServingTokenizerWithChatTemplateOverride` -> `MLXScalarTextCodec.render` -> a genuine
+    // Jinja render, then a genuine encode/decode round trip) without re-implementing any of it.
+
+    /// Builds a `stockShapedTemplateText`-based fixture directory like
+    /// `writeStockShapedModelDirectory()` above, except `tokenizer.json`/`tokenizer_config.json` are
+    /// constructed from literals here instead of copied from `FASTMLX_QWEN3_TOKENIZER_DIR`.
+    /// `PreTrainedTokenizer` (vendored `swift-transformers`) requires a `tokenizer_class` registered
+    /// in `TokenizerModel.knownTokenizers` — `Qwen2Tokenizer` resolves to its `BPETokenizer` model —
+    /// and that model requires a `model.vocab` plus a `model.merges` array (empty is valid: with no
+    /// merge ranks, `BPETokenizer.bpe(token:)` performs no merges at all, so the codec's rendered
+    /// text tokenizes one Unicode scalar at a time). With no `preTokenizer`/`normalizer`/`decoder`
+    /// configured (all three become `nil` when their config key is absent — see
+    /// `PreTokenizerFactory`/`NormalizerFactory`/`DecoderFactory`.`fromConfig`), pre-tokenization,
+    /// normalization, and decoding are all the identity function, so a vocab covering every
+    /// printable ASCII character plus `\n`, alongside `<|im_start|>`/`<|im_end|>` as `special` added
+    /// tokens (matched whole, ahead of the character-level fallback, by `PreTrainedTokenizer`'s own
+    /// `addedTokensRegex`), is sufficient to round-trip any of this suite's fixture message text
+    /// losslessly through `encode` then `decode`.
+    private func writeHermeticStockShapedModelDirectory(
+        chatTemplateText: String = Qwen3TemplateRenderTests.stockShapedTemplateText
+    ) throws -> URL {
+        var vocab: [String: Int] = [:]
+        var nextID = 2
+        for scalarValue in UInt32(0x20)...UInt32(0x7E) {
+            vocab[String(UnicodeScalar(scalarValue)!)] = nextID
+            nextID += 1
+        }
+        vocab["\n"] = nextID
+
+        let tokenizerData: [String: Any] = [
+            "added_tokens": [
+                [
+                    "id": 0, "content": "<|im_start|>", "special": true, "lstrip": false,
+                    "rstrip": false,
+                ],
+                [
+                    "id": 1, "content": "<|im_end|>", "special": true, "lstrip": false,
+                    "rstrip": false,
+                ],
+            ],
+            "model": [
+                "type": "BPE",
+                "vocab": vocab,
+                "merges": [String](),
+            ],
+        ]
+        let tokenizerConfig: [String: Any] = [
+            "tokenizer_class": "Qwen2Tokenizer",
+            "eos_token": "<|im_end|>",
+            "clean_up_tokenization_spaces": false,
+        ]
+
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent(
+                "chat-template-hermetic-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: tokenizerData)
+            .write(to: directory.appendingPathComponent("tokenizer.json"))
+        try JSONSerialization.data(withJSONObject: tokenizerConfig)
+            .write(to: directory.appendingPathComponent("tokenizer_config.json"))
+        try Data(chatTemplateText.utf8).write(
+            to: directory.appendingPathComponent("chat_template.jinja"))
+        return directory
+    }
+
+    /// (hermetic-a) No override: mirrors `testNoOverrideStockTemplateRaisesOnNonLeadingSystemMessage`
+    /// above exactly, against the synthetic fixture instead of a real checkpoint, so it runs with no
+    /// environment variable set.
+    func testHermeticNoOverrideStockTemplateRaisesOnNonLeadingSystemMessage() async throws {
+        let directory = try writeHermeticStockShapedModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
+        let tokenizer = #adaptHuggingFaceTokenizer(upstream)
+        let codec = MLXScalarTextCodec(tokenizer: tokenizer)
+
+        var caught: (any Error)?
+        do {
+            _ = try codec.render(
+                messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
+                reasoningEffort: nil)
+            XCTFail("expected the stock template's non-leading system guard to raise")
+        } catch {
+            caught = error
+        }
+
+        let servingError = try XCTUnwrap(caught as? OpenAIServingError)
+        XCTAssertEqual(servingError.openAIError.code, "chat_template_rejected")
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory))
+    }
+
+    /// (hermetic-b) With `--chat-template` override: mirrors
+    /// `testOverrideRendersNonLeadingSystemMessageInPlace` above exactly, against the synthetic
+    /// fixture, so it runs with no environment variable set. This is the decisive regression guard
+    /// for the production mitigation: deleting
+    /// `dictionary["chat_template"] = .init(overrideTemplateText)` in `MLXScalarServing.swift` makes
+    /// this test fail (see the mutation check accompanying this change), whereas every
+    /// env-var-gated test above it in this file would silently skip instead of catching that.
+    func testHermeticOverrideRendersNonLeadingSystemMessageInPlace() async throws {
+        let directory = try writeHermeticStockShapedModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let overriddenTokenizer = try await scalarServingTokenizerWithChatTemplateOverride(
+            modelDirectory: directory, overrideTemplateText: Self.patchedShapedTemplateText)
+        let codec = MLXScalarTextCodec(tokenizer: overriddenTokenizer)
+
+        let tokens = try codec.render(
+            messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
+            reasoningEffort: nil)
+        let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+
+        XCTAssertEqual(
+            occurrenceCount(of: "<|im_start|>system", in: rendered), 1,
+            "expected exactly one system turn, in:\n\(rendered)")
+        let systemRange = try XCTUnwrap(rendered.range(of: "<|im_start|>system"))
+        let closeRange = try XCTUnwrap(
+            rendered.range(of: "<|im_end|>", range: systemRange.upperBound..<rendered.endIndex))
+        let systemBlock = rendered[systemRange.upperBound..<closeRange.lowerBound]
+        XCTAssertTrue(
+            systemBlock.contains(Self.systemTurnMarkerContent),
+            "expected the system message's own content strictly inside the system block, in:\n\(rendered)"
+        )
+
+        // The system turn must render IN PLACE, not hoisted to the front. Both renderings produce
+        // exactly one system block containing the marker, so the occurrence count above cannot tell
+        // them apart -- only position can. This matters beyond tidiness: the in-place form keeps the
+        // prompt prefix stable for KV-cache reuse, which is why the patch merges only the LEADING
+        // system block and emits later system turns where they occur.
+        let openingRange = try XCTUnwrap(rendered.range(of: "opening user turn"))
+        let closingRange = try XCTUnwrap(rendered.range(of: "closing user turn"))
+        XCTAssertLessThan(
+            openingRange.upperBound, systemRange.lowerBound,
+            "the first user turn must precede the system turn, in:\n\(rendered)")
+        XCTAssertLessThan(
+            closeRange.upperBound, closingRange.lowerBound,
+            "the system turn must precede the closing user turn, in:\n\(rendered)")
+
+        XCTAssertFalse(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(
+                modelDirectory: directory, overrideText: Self.patchedShapedTemplateText))
+        XCTAssertTrue(
+            scalarServingChatTemplateRefusesNonLeadingSystemMessage(modelDirectory: directory),
+            "the on-disk chat_template.jinja must be unaffected by the override")
+    }
 }
