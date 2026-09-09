@@ -423,4 +423,107 @@ final class SampledMTPDegenerateTopPCharacterizationTests: XCTestCase {
         XCTAssertEqual(nanCount, vocabularySize)
         XCTAssertTrue(sum.isNaN)
     }
+
+    // MARK: - T5: exact boundary tie -- `.>` (exclusive) vs `.>=` (inclusive)
+
+    /// `testTopPFilterFixIsInertAcrossNonDegenerateRange` above was MEASURED
+    /// green (`Executed 6 tests, with 0 failures`) on 2026-09-09 under a
+    /// TEMPORARY mutation of `applyTopPFilter`'s `keepMask` line in
+    /// `Evaluate.swift` from `cumulativeProbs .> (1 - topP)` to
+    /// `cumulativeProbs .>= (1 - topP)`. That gate's `decayingLogitsRow`
+    /// fixture is smooth (`logit[i] = -Float(i) * decayStep`), so no
+    /// cumulative value it ever produces lands EXACTLY on `1 - topP` in
+    /// float32 -- `.>` and `.>=` are indistinguishable on every point that
+    /// gate sweeps. The comparison operator's boundary/tie semantics were
+    /// therefore completely unpinned anywhere in this file. This test is
+    /// what pins them.
+    ///
+    /// Fixture: a width-4 vocabulary of exactly-representable float32
+    /// probabilities, ascending `[0.125, 0.125, 0.25, 0.5]` (powers of two,
+    /// so they and their partial sums are exact in float32). Their ascending
+    /// cumulative array is exactly `[0.125, 0.25, 0.5, 1.0]`. `topP = 0.75`
+    /// makes `1 - topP == 0.25` exactly, which coincides exactly with
+    /// cumulative sorted position 1. Logits are built as `log` of those
+    /// probabilities so `logSoftmax` reproduces them (a shared additive
+    /// normalizing constant does not change the resulting probabilities).
+    func testExactTieAtThresholdIsExcludedNotIncluded() {
+        let targetProbabilities: [Float] = [0.125, 0.125, 0.25, 0.5]
+        let topP: Float = 0.75
+        // Sorted (ascending) position whose cumulative probability is
+        // expected to land exactly on `1 - topP`. Cumulative-array index,
+        // not necessarily an original vocabulary index (see the anti-vacuity
+        // precondition below, which measures this independently rather than
+        // assuming it).
+        let tiedSortedPosition = 1
+
+        let logits = MLX.log(MLXArray(targetProbabilities)).reshaped([1, targetProbabilities.count])
+
+        // --- 1. ANTI-VACUITY PRECONDITION -----------------------------------
+        // Independently recompute the ascending cumulative probability array
+        // using the same op sequence `applyTopPFilter` uses internally
+        // (`logSoftmax` -> `argSort` -> `takeAlong` -> `exp` -> `cumsum`), and
+        // require EXACT equality (never a tolerance) to `1 - topP` at the
+        // tied sorted position. If this does not hold, the fixture no longer
+        // produces an exact tie and the rest of this test is meaningless --
+        // fail loudly here rather than silently proceeding or falling back
+        // to `allClose`.
+        let logprobs = logSoftmax(logits)
+        let sortedIndices = argSort(logprobs, axis: -1)
+        let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
+        let sortedProbs = exp(sortedLogprobs)
+        let cumulativeProbs = cumsum(sortedProbs, axis: -1).flattened()
+        eval(cumulativeProbs)
+        let cumulativeValues = cumulativeProbs.asArray(Float.self)
+        let expectedThreshold = Float(1) - topP
+        print(
+            "[exact-tie] cumulativeProbs=\(cumulativeValues) expectedThreshold=\(expectedThreshold) "
+                + "tiedSortedPosition=\(tiedSortedPosition)")
+
+        XCTAssertEqual(
+            cumulativeValues[tiedSortedPosition], expectedThreshold,
+            "ANTI-VACUITY FAILURE: fixture no longer produces an exact tie at sorted position "
+                + "\(tiedSortedPosition). Measured cumulative array = \(cumulativeValues), expected "
+                + "an EXACT match to 1 - topP = \(expectedThreshold) at that position. Without this "
+                + "exact tie, testExactTieAtThresholdIsExcludedNotIncluded pins nothing -- pick a "
+                + "different fixture rather than loosening this to a tolerance."
+        )
+
+        // --- 2. THE BEHAVIORAL PIN ------------------------------------------
+        // With the tie established, `applyTopPFilter`'s `cumulativeProbs .>
+        // (1 - topP)` (exclusive) must EXCLUDE both tokens at or below the
+        // tied cumulative value (probability exactly 0 in the output), while
+        // the tokens strictly above the threshold are retained with non-zero
+        // probability. Original indices 0 and 1 both carry probability
+        // 0.125, i.e. cumulative mass <= 0.25 in EITHER tie-break ordering of
+        // the sort -- asserting both are excluded is therefore robust to
+        // `argSort`'s tie-break behavior between two exactly-equal keys,
+        // without needing to assume which original index lands at which
+        // sorted position.
+        let probabilities = truncatedSamplingProbabilities(
+            logits: logits, temperature: 1, topP: topP, topK: 0, minP: 0
+        ).flattened()
+        eval(probabilities)
+        let outputValues = probabilities.asArray(Float.self)
+        print("[exact-tie] outputProbabilities=\(outputValues)")
+
+        XCTAssertEqual(outputValues.count, targetProbabilities.count)
+        XCTAssertEqual(
+            outputValues[0], 0,
+            "original index 0 (probability 0.125, cumulative mass <= the exact tie) must be "
+                + "EXCLUDED; got \(outputValues[0])")
+        XCTAssertEqual(
+            outputValues[1], 0,
+            "original index 1 (probability 0.125, cumulative mass <= the exact tie) must be "
+                + "EXCLUDED -- this is the assertion the `.>` -> `.>=` mutation flips; got "
+                + "\(outputValues[1])")
+        XCTAssertGreaterThan(
+            outputValues[2], 0,
+            "original index 2 (probability 0.25, cumulative mass strictly above the tie) must be "
+                + "RETAINED; got \(outputValues[2])")
+        XCTAssertGreaterThan(
+            outputValues[3], 0,
+            "original index 3 (probability 0.5, the row's argmax) must be RETAINED via both the "
+                + "cumulative-mass test and the keep-last-sorted-position floor; got "
+                + "\(outputValues[3])")
+    }
 }
