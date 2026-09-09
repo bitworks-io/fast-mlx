@@ -1548,6 +1548,20 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 help: "Cumulative MTP speculative-decoding verify rounds.",
                 value: counters.verifyRounds,
                 to: &lines)
+            appendCounterMetric(
+                "fastmlx_mtp_speculative_requests_total",
+                help: "Cumulative count of completed requests that genuinely speculated. Does "
+                    + "NOT latch, unlike fastmlx_mtp_passthrough_active — compare against "
+                    + "fastmlx_mtp_passthrough_requests_total for a current passthrough rate.",
+                value: counters.speculativeRequestCount,
+                to: &lines)
+            appendCounterMetric(
+                "fastmlx_mtp_passthrough_requests_total",
+                help: "Cumulative count of completed requests that passed through. Does NOT "
+                    + "latch, unlike fastmlx_mtp_passthrough_active — compare against "
+                    + "fastmlx_mtp_speculative_requests_total for a current passthrough rate.",
+                value: counters.passthroughRequestCount,
+                to: &lines)
             // A gauge, not a counter: this is a 0/1 state (sticky passthrough in effect as of this
             // scrape), not a monotonic total, so it goes through `appendMetric` directly.
             appendMetric(
@@ -1557,8 +1571,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 // the HELP line itself contain the substring `<name> 1` and silently satisfy any
                 // `contains("fastmlx_mtp_passthrough_active 1")` assertion regardless of the real
                 // value. The tests assert on exact lines for the same reason.
-                help: "Set to 1 when MTP speculative decoding has entered sticky passthrough and "
-                    + "is no longer proposing draft tokens; 0 otherwise.",
+                //
+                // This gauge LATCHES: set to 1 once passthrough has occurred at ANY point during
+                // this serve and never cleared afterward, even though the decoder can — and does —
+                // resume speculating on a later request. It does not mean the decoder is not
+                // currently proposing draft tokens. For the CURRENT passthrough rate, read
+                // fastmlx_mtp_speculative_requests_total and fastmlx_mtp_passthrough_requests_total
+                // instead, both of which are plain per-request running totals that never latch.
+                help: "Sticky/latching: set to 1 once MTP speculative decoding has entered "
+                    + "passthrough at any point in this serve and never cleared afterward "
+                    + "(the decoder may still be speculating on later requests); 0 if passthrough "
+                    + "has never occurred this serve. See fastmlx_mtp_speculative_requests_total "
+                    + "and fastmlx_mtp_passthrough_requests_total for the current per-request rate.",
                 value: counters.passthroughActive ? 1 : 0,
                 to: &lines)
         }

@@ -64,6 +64,20 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 }
 
 
+# DELIBERATELY HARDCODED, not recomputed: this is the tripwire that forces a conscious
+# decision whenever the public path set changes. Recomputing it here would make it agree
+# with any projection, including one that leaked a file. It is defined exactly ONCE, as a
+# module-level constant, because keeping the same literal in two places inside
+# test_public_projection_uses_sanitized_vendor_overrides -- the publicIndex assertion and
+# the reexport_count assertion -- and updating them out of step has turned HEAD red three
+# times (see the comment above the publicIndex assertion for the full history). Both call
+# sites below read this constant; there is no longer a second literal to drift.
+SEALED_PUBLIC_INDEX = {
+    "pathCount": 907,
+    "pathModeSha256": "3204158166a11d7101523a547ffbec3354ce8c278c2a72abc27611c4273f352e",
+}
+
+
 def public_index_seal(entries: dict[str, str]) -> dict[str, object]:
     digest = hashlib.sha256()
     for path in sorted(entries):
@@ -315,18 +329,21 @@ class PublicExportTests(unittest.TestCase):
             if has_development_manifest
             else development_manifest
         )
-        # DELIBERATELY HARDCODED, not recomputed: this literal is the tripwire that forces a
-        # conscious decision whenever the public path set changes. Recomputing it here would make
-        # it agree with any projection, including one that leaked a file. When it fails, do NOT
-        # just paste the actual value -- first confirm the added/removed path belongs in public,
-        # then update ALL THREE places that encode the path count together:
-        #   1. this literal,
-        #   2. public/public-repository-public.json's stored seal,
-        #   3. the `reexport_count` assertion in
-        #      test_public_projection_uses_sanitized_vendor_overrides (below), which has moved in
-        #      lockstep with this value through every reseal in this file's history.
-        # Updating only some of them leaves the suite red at HEAD: 4a15e78 missed (1) and (3), and
-        # the repair that fixed (1) still missed (3).
+        # DELIBERATELY HARDCODED, not recomputed: the SEALED_PUBLIC_INDEX constant above this
+        # class is the tripwire that forces a conscious decision whenever the public path set
+        # changes. Recomputing it here would make it agree with any projection, including one
+        # that leaked a file. When it fails, do NOT just paste the actual value -- first confirm
+        # the added/removed path belongs in public, then update the TWO places that still encode
+        # the path count separately:
+        #   1. SEALED_PUBLIC_INDEX (above this class),
+        #   2. public/public-repository-public.json's stored seal.
+        # The former third place -- the `reexport_count` assertion in
+        # test_public_projection_uses_sanitized_vendor_overrides (below) -- now derives from
+        # SEALED_PUBLIC_INDEX["pathCount"] instead of carrying its own literal, so it can no
+        # longer drift out of step on its own.
+        # Historically, updating these out of step left the suite red at HEAD: 4a15e78 missed (1)
+        # and the (then-separate) reexport_count literal, and the repair that fixed (1) still
+        # missed reexport_count.
         #
         # 871 -> 872 (4a15e78) added spike/Tests/SpikeCoreTests/MLXDecoderEvaluateThrowingPropagationTests.swift.
         # That commit resealed the manifest but missed this literal, so the full suite failed while
@@ -518,6 +535,28 @@ class PublicExportTests(unittest.TestCase):
         # file in place (byte-only, no reseal of its own): Harness.swift gained the subcommand
         # dispatch and its usage text. All three places moved together.
         #
+        # 906 -> 907 added, in one increment:
+        # spike/Tests/SpikeServingAdaptersTests/OffloadPlanCheckOnlyServeWiringStructuralTests.swift
+        # -- a source-text structural pin asserting that every `ScalarServingModelLoadConfiguration(`
+        # construction site in the serve driver forwards `offloadPlanCheckOnly:`, plus a
+        # whole-surface companion gate asserting every parsed `public let` argument field is read
+        # somewhere by that driver. It exists because the serve driver is an executable target with
+        # no test target, so no behavioral Swift test can reach its call sites: the parsed and
+        # cross-validated `--offload-plan-check-only` flag was dropped at the one bridge into the
+        # load path, silently downgrading an advertised dry run into a full server bound to the
+        # operator's configured port, and nothing anywhere turned red. Confirmed to belong in public
+        # before reseal: it is ordinary XCTest coverage of already-projected trees, it reads
+        # repository source text through a `#filePath` ancestor search rather than any checkpoint or
+        # deployment asset, it carries no checkpoint text, no infrastructure detail and no
+        # machine-local path, and its identifiers are deliberately family-neutral (the
+        # `offload`/`plan`/`ngram` vocabulary, never the internal implementation-family CamelCase
+        # name) because the projected-marker gate fails closed on such a marker in a projected path
+        # or its bytes. The same increment edited two already-projected files in place (byte-only,
+        # no reseal of their own): the serve driver gained the one-line forwarding argument, and
+        # spike/Tests/ServingCoreTests/FastMLXServeArgumentsTests.swift gained three parse-level
+        # rows pinning that the flag is refused on the continuous routes and parses on the scalar
+        # route. All three places moved together.
+        #
         # 904 -> 906 added, across two commits in one cycle:
         # spike/Tests/SpikeCoreTests/SampledMTPDegenerateTopPCharacterizationTests.swift
         # (904 -> 905) and
@@ -558,10 +597,7 @@ class PublicExportTests(unittest.TestCase):
         # that was already resolved transitively. All three places moved together.
         self.assertEqual(
             public_manifest.get("publicIndex"),
-            {
-                "pathCount": 906,
-                "pathModeSha256": "4efebd0020a9bef0b03c588d87f082d6a7cd2afb55ba3ed180fc4899a73982ad",
-            },
+            SEALED_PUBLIC_INDEX,
         )
 
         if has_development_manifest:
@@ -647,14 +683,16 @@ class PublicExportTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=output, check=True)
             subprocess.run(["git", "add", "."], cwd=output, check=True)
             reexport_count = export_public_repository.export(output, reexport)
-            # Same hardcoded-tripwire rule as the `pathCount` literal in
-            # test_public_export_matches_sealed_public_manifest -- see that comment for the
-            # three-places update obligation. This assertion is the third place, and it is the one
-            # that gets missed: 4a15e78 moved the projection 871 -> 872 and updated neither, and the
-            # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
-            # a second time. Re-exporting the already-projected tree must reproduce the same path
-            # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 906)
+            # Same hardcoded-tripwire rule as SEALED_PUBLIC_INDEX (see the comment above that
+            # constant and the comment above the publicIndex assertion in
+            # test_public_projection_uses_sanitized_vendor_overrides for the update obligation and
+            # history). This used to carry its own separate literal, which was the one that kept
+            # getting missed: 4a15e78 moved the projection 871 -> 872 and updated neither literal,
+            # and the follow-up repair updated the other one but not this one, leaving the suite
+            # red at HEAD a second time. Re-exporting the already-projected tree must reproduce the
+            # same path count -- that idempotence is what this asserts -- so this now reads
+            # SEALED_PUBLIC_INDEX["pathCount"] directly and can no longer drift out of step.
+            self.assertEqual(reexport_count, SEALED_PUBLIC_INDEX["pathCount"])
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

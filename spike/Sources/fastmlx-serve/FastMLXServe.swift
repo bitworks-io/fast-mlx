@@ -831,7 +831,16 @@ private func loadScalarServingBackend(
             ngramOffloadPlanURL: arguments.ngramOffloadPlanURL,
             inCheckpointMTPSelection: arguments.inCheckpointMTPSelection,
             sampledMTPBlockDecisionsEnabled: arguments.sampledMTPBlockDecisionsEnabled,
-            chatTemplateOverrideURL: arguments.chatTemplateURL))
+            chatTemplateOverrideURL: arguments.chatTemplateURL,
+            // THE only bridge from the parsed `--offload-plan-check-only` flag to the load path:
+            // `loadScalarServingModel` reads this field to stop BEFORE any weight load and throw
+            // the `OffloadPlanCheckCompleted` success sentinel instead. Omitting this argument
+            // silently keeps the configuration's `false` default, so the parsed flag is dropped on
+            // the floor and the advertised dry run becomes a full server bind on the operator's
+            // configured port -- exactly the defect this line exists to close. If a second
+            // `ScalarServingModelLoadConfiguration(` construction site is ever added (for example a
+            // new serving route in this file), it must forward this field too.
+            offloadPlanCheckOnly: arguments.offloadPlanCheckOnly))
     return PreparedServingBackend(
         backend: loaded.backend,
         evidenceSnapshot: {
@@ -858,9 +867,15 @@ private func loadScalarServingBackend(
                     verifyRounds: telemetry.verifyRoundCount,
                     // `passthroughReason` only ever moves from `nil` to non-nil and then stays
                     // there (sticky) — see `InferenceActor.SpeculativeTelemetrySnapshot`'s doc
-                    // comment — so `true` here means passthrough was in effect as of this scrape
-                    // and will remain so for the rest of this serve.
-                    passthroughActive: telemetry.passthroughReason != nil)
+                    // comment — so `true` here means passthrough occurred at some point at or
+                    // before this scrape, and will read `true` for the rest of this serve. It does
+                    // NOT mean passthrough is in effect right now, and it does NOT mean the decoder
+                    // has stopped speculating: a later request on this same decoder can, and does,
+                    // speculate again — `speculativeRequestCount`/`passthroughRequestCount` below
+                    // are the per-request counters that report that without latching.
+                    passthroughActive: telemetry.passthroughReason != nil,
+                    speculativeRequestCount: telemetry.speculativeRequestCount,
+                    passthroughRequestCount: telemetry.passthroughRequestCount)
             }
             return try ServingEvidence.ResourceSnapshot(
                 activeRequests: snapshot.activeRequests,

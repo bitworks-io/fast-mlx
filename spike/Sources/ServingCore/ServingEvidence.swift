@@ -717,23 +717,45 @@ extension ServingEvidence {
         /// state living INSIDE a present block — distinct from the no-drafter-bound vs
         /// drafter-bound-but-present distinction that already lives one level up, at the
         /// enclosing `ResourceSnapshot.speculativeDecoding` optional (see that property's doc
-        /// comment). A present block with `passthroughActive == true` means: drafter bound,
-        /// speculation attempted at some point, but no longer proposing draft tokens.
+        /// comment). A present block with `passthroughActive == true` means: passthrough occurred
+        /// AT SOME POINT during this serve. It does NOT mean the decoder is not currently
+        /// proposing draft tokens — once set this flag latches for the rest of the serve, even
+        /// though a later request on the same decoder can, and does, speculate again. Use
+        /// `speculativeRequestCount`/`passthroughRequestCount` below for a genuine per-request
+        /// tally: both are serve-cumulative, so a rate over any window is the delta between two
+        /// reads of them, which this latching flag cannot express at all.
         public let passthroughActive: Bool
+        /// Cumulative count of completed requests that genuinely speculated this serve.
+        /// Absent-on-decode (an older on-disk payload predating this field) reads as `0`, matching
+        /// the existing precedent for every other field on this type. Unlike `passthroughActive`,
+        /// this keeps incrementing after `passthroughActive` goes `true` — it is the field that
+        /// lets an operator compute an actual passthrough RATE instead of relying on a latch.
+        public let speculativeRequestCount: Int
+        /// Cumulative count of completed requests that passed through this serve. Sibling of
+        /// `speculativeRequestCount`; same absent-on-decode ⇒ `0` precedent.
+        public let passthroughRequestCount: Int
 
         public init(
             proposedDraftTokens: Int,
             acceptedDraftTokens: Int,
             verifyRounds: Int,
-            passthroughActive: Bool = false
+            passthroughActive: Bool = false,
+            speculativeRequestCount: Int = 0,
+            passthroughRequestCount: Int = 0
         ) throws {
             try ServingEvidence.validateNonNegative(proposedDraftTokens, field: "proposedDraftTokens")
             try ServingEvidence.validateNonNegative(acceptedDraftTokens, field: "acceptedDraftTokens")
             try ServingEvidence.validateNonNegative(verifyRounds, field: "verifyRounds")
+            try ServingEvidence.validateNonNegative(
+                speculativeRequestCount, field: "speculativeRequestCount")
+            try ServingEvidence.validateNonNegative(
+                passthroughRequestCount, field: "passthroughRequestCount")
             self.proposedDraftTokens = proposedDraftTokens
             self.acceptedDraftTokens = acceptedDraftTokens
             self.verifyRounds = verifyRounds
             self.passthroughActive = passthroughActive
+            self.speculativeRequestCount = speculativeRequestCount
+            self.passthroughRequestCount = passthroughRequestCount
         }
 
         private enum CodingKeys: String, CodingKey, CaseIterable {
@@ -741,6 +763,8 @@ extension ServingEvidence {
             case acceptedDraftTokens = "accepted_draft_tokens"
             case verifyRounds = "verify_rounds"
             case passthroughActive = "passthrough_active"
+            case speculativeRequestCount = "speculative_request_count"
+            case passthroughRequestCount = "passthrough_request_count"
         }
 
         public init(from decoder: Decoder) throws {
@@ -753,7 +777,11 @@ extension ServingEvidence {
                 acceptedDraftTokens: container.decode(Int.self, forKey: .acceptedDraftTokens),
                 verifyRounds: container.decode(Int.self, forKey: .verifyRounds),
                 passthroughActive: container.decodeIfPresent(
-                    Bool.self, forKey: .passthroughActive) ?? false)
+                    Bool.self, forKey: .passthroughActive) ?? false,
+                speculativeRequestCount: container.decodeIfPresent(
+                    Int.self, forKey: .speculativeRequestCount) ?? 0,
+                passthroughRequestCount: container.decodeIfPresent(
+                    Int.self, forKey: .passthroughRequestCount) ?? 0)
         }
     }
 

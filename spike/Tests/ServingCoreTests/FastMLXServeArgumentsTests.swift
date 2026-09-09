@@ -2413,6 +2413,88 @@ final class FastMLXServeArgumentsTests: XCTestCase {
             "the flag itself must differ, or this test proves nothing")
     }
 
+    // MARK: - --offload-plan-check-only + continuous mode: the SAME silent-downgrade hazard as a
+    // dropped `offloadPlanCheckOnly:` at the scalar-load seam, just on the other backend. If this
+    // flag reached a continuous route unconsulted, a "safe dry run" would silently start a full
+    // continuous-batch server bound to the operator's configured port -- on a production host,
+    // beside a live incumbent, exactly like the scalar-route defect this change closes. These
+    // rows exist to PIN that the combination is refused today, not to introduce a new refusal:
+    // `testOffloadPlanCheckOnlyConflictsAreCoveredTransitivelyByTheNgramPlanGuards` above already
+    // proves the plan-PRESENT case refuses via `.ngramOffloadPlanWithContinuousBatch` (fires before
+    // `--offload-plan-check-only` is ever consulted). These two rows close the one combination that
+    // test does not cover -- plan ABSENT + continuous mode -- which instead refuses via
+    // `.offloadPlanCheckOnlyRequiresNGramOffloadPlan` (the flag is meaningless without a plan to
+    // check, regardless of backend route). Together the three rows show every reachable state of
+    // (offloadPlanCheckOnly, ngramOffloadPlanURL, continuousModeSelected) already refuses -- a
+    // matching new `FastMLXServeArgumentError` case for this exact intersection would be
+    // unreachable dead code layered on top of an already-fail-closed gate, not a missing guard.
+
+    /// `--offload-plan-check-only` without `--ngram-offload-plan`, combined with
+    /// `--continuous-batch-no-spec`: refuses via the existing plan-required case, which does not
+    /// special-case backend route -- the continuous flag never gets a chance to matter.
+    func testOffloadPlanCheckOnlyRequiresNgramOffloadPlanWithContinuousBatchNoSpec() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-batch-no-spec",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--offload-plan-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .offloadPlanCheckOnlyRequiresNGramOffloadPlan)
+        }
+    }
+
+    /// Same as above for `--continuous-dynamic-pld`, the other continuous route.
+    func testOffloadPlanCheckOnlyRequiresNgramOffloadPlanWithContinuousDynamicPLD() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--continuous-dynamic-pld",
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--max-reserved-kv-bytes", "17179869184",
+                "--offload-plan-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .offloadPlanCheckOnlyRequiresNGramOffloadPlan)
+        }
+    }
+
+    /// Mandatory anti-vacuity control for the two refusal tests immediately above and for
+    /// `testOffloadPlanCheckOnlyConflictsAreCoveredTransitivelyByTheNgramPlanGuards`'s continuous
+    /// rows: on the DEFAULT (scalar) route, with `--ngram-offload-plan` present, the byte-identical
+    /// flag set (minus the continuous flag) must PARSE and yield `offloadPlanCheckOnly == true`.
+    /// Without this control, a refusal test for the continuous combination would pass just as well
+    /// if `--offload-plan-check-only` were refused UNCONDITIONALLY (a bug that would itself brick
+    /// the scalar dry run this whole change exists to make trustworthy) -- this row proves the
+    /// refusal is specific to the continuous combination, not a blanket rejection of the flag.
+    func testOffloadPlanCheckOnlyHappyPathOnScalarRouteWithPlanParses() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+            "--offload-plan-check-only",
+        ])
+        XCTAssertTrue(arguments.offloadPlanCheckOnly)
+        if case .scalar = arguments.backend {
+            // Default (no continuous/scripted/exact-MTP flag) route resolved to scalar, as expected.
+        } else {
+            XCTFail("expected the default route to resolve to .scalar, got \(String(describing: arguments.backend))")
+        }
+    }
+
     // MARK: - fastMLXServeArgumentRefusalAnnounceLine: the machine-readable refusal line
     // `FastMLXServe.main`'s top-level `catch let error as FastMLXServeArgumentError` arm renders.
     // Without that arm, EVERY one of these 94 cases — thrown from the very first statement of

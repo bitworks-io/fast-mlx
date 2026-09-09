@@ -585,6 +585,61 @@ final class ServingEvidenceTests: XCTestCase {
         XCTAssertFalse(decodedOld.passthroughActive)
     }
 
+    /// `speculativeRequestCount`/`passthroughRequestCount` are the per-request, NON-latching
+    /// counterpart to `passthroughActive`: unlike the sticky flag above, these keep incrementing
+    /// for every completed request regardless of what earlier requests reported, which is what
+    /// lets an operator compute an actual passthrough rate. Must round-trip, and must default to
+    /// `0` (not throw) when an older on-disk payload omits both keys entirely — the same
+    /// absent-on-decode precedent `passthroughActive` already established above.
+    func testSpeculativeDecodingCountersPerRequestCountsRoundTripAndDefaultToZeroWhenOmitted() throws {
+        let withRequestCounts = try ServingEvidence.SpeculativeDecodingCounters(
+            proposedDraftTokens: 30,
+            acceptedDraftTokens: 21,
+            verifyRounds: 9,
+            passthroughActive: true,
+            speculativeRequestCount: 4,
+            passthroughRequestCount: 1)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(
+            String(data: encoder.encode(withRequestCounts), encoding: .utf8))
+        XCTAssertTrue(json.contains(#""speculative_request_count":4"#), json)
+        XCTAssertTrue(json.contains(#""passthrough_request_count":1"#), json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                ServingEvidence.SpeculativeDecodingCounters.self, from: Data(json.utf8)),
+            withRequestCounts)
+
+        // A payload predating these two fields (no `speculative_request_count`/
+        // `passthrough_request_count` keys at all) must still decode, with both counters
+        // resolving to `0` rather than failing closed.
+        let oldPayload = Data(
+            #"""
+            {"proposed_draft_tokens":30,"accepted_draft_tokens":21,"verify_rounds":9,\#
+            "passthrough_active":true}
+            """#.utf8)
+        let decodedOld = try JSONDecoder().decode(
+            ServingEvidence.SpeculativeDecodingCounters.self, from: oldPayload)
+        XCTAssertEqual(decodedOld.speculativeRequestCount, 0)
+        XCTAssertEqual(decodedOld.passthroughRequestCount, 0)
+        // The already-established field must be unaffected by these two new ones.
+        XCTAssertTrue(decodedOld.passthroughActive)
+    }
+
+    /// Negative values must be rejected the same way every other counter on this type already is
+    /// (`ServingEvidence.validateNonNegative`) — these two are not exempt just because they are new.
+    func testSpeculativeDecodingCountersRejectsNegativePerRequestCounts() {
+        XCTAssertThrowsError(
+            try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0, acceptedDraftTokens: 0, verifyRounds: 0,
+                speculativeRequestCount: -1))
+        XCTAssertThrowsError(
+            try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0, acceptedDraftTokens: 0, verifyRounds: 0,
+                passthroughRequestCount: -1))
+    }
+
     func testFitDriftFieldsSurviveTheProductionCanonicalEvidencePath() throws {
         // The acceptance for differentiator #2: the drift fields must survive the SERIALIZER production
         // actually uses — ServingEvidence.canonicalJSONData() (the JSONL sink) and decodeCanonicalJSONData

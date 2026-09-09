@@ -78,6 +78,17 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     /// `stickyPassthroughReason`-style "unknown".
     private var accumulatedVerifyRoundCount = 0
     private var stickyPassthroughReason: String?
+    /// Per-request count of completed bounded generations that genuinely speculated (i.e. their
+    /// iterator's `passthroughReason` was `nil` when `reset()` snapshotted it). Unlike
+    /// `stickyPassthroughReason`, this NEVER latches or stops moving — it is a plain running total,
+    /// incremented by exactly 1 per completed request, so `accumulatedSpeculativeRequestCount /
+    /// (accumulatedSpeculativeRequestCount + accumulatedPassthroughRequestCount)` gives an operator
+    /// a genuine passthrough RATE across the serve, which the sticky `passthroughReason` gauge
+    /// cannot: that gauge only ever moves from "off" to permanently "on".
+    private var accumulatedSpeculativeRequestCount = 0
+    /// Sibling of `accumulatedSpeculativeRequestCount` for the passthrough case. See that
+    /// property's doc comment.
+    private var accumulatedPassthroughRequestCount = 0
 
     public var speculativeTelemetrySnapshot: SpeculativeTelemetrySnapshot {
         SpeculativeTelemetrySnapshot(
@@ -85,7 +96,9 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
             acceptedCount: accumulatedAcceptedCount + (iterator?.acceptedDraftTokens ?? 0),
             verifyRoundCount: accumulatedVerifyRoundCount
                 + (iterator?.speculativeDecodingTelemetry?.roundCount ?? 0),
-            passthroughReason: iterator?.passthroughReason ?? stickyPassthroughReason)
+            passthroughReason: iterator?.passthroughReason ?? stickyPassthroughReason,
+            speculativeRequestCount: accumulatedSpeculativeRequestCount,
+            passthroughRequestCount: accumulatedPassthroughRequestCount)
     }
 
     /// The CURRENT iterator's own passthrough reason — deliberately WITHOUT the `??
@@ -258,6 +271,9 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
             accumulatedVerifyRoundCount += iterator.speculativeDecodingTelemetry?.roundCount ?? 0
             if let reason = iterator.passthroughReason {
                 stickyPassthroughReason = reason
+                accumulatedPassthroughRequestCount += 1
+            } else {
+                accumulatedSpeculativeRequestCount += 1
             }
         }
         iterator = nil

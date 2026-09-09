@@ -1325,6 +1325,121 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    /// `fastmlx_mtp_speculative_requests_total`/`fastmlx_mtp_passthrough_requests_total` are the
+    /// per-request, non-latching counterpart to the sticky `fastmlx_mtp_passthrough_active` gauge
+    /// above — an operator computes a genuine passthrough RATE from these two, which the gauge
+    /// alone cannot provide once it has latched to `1`. Exact-line assertions, same discipline as
+    /// the gauge tests: a `contains` check on the metric name alone would also match its own HELP
+    /// line.
+    func testMetricsEndpointRendersPerRequestSpeculativeAndPassthroughCountersAsExactCounterLines()
+        async throws
+    {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0,
+                acceptedDraftTokens: 0,
+                verifyRounds: 0,
+                passthroughActive: true,
+                speculativeRequestCount: 4,
+                passthroughRequestCount: 1))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let lines = response.body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        XCTAssertTrue(
+            lines.contains("fastmlx_mtp_speculative_requests_total 4"),
+            "expected an exact `fastmlx_mtp_speculative_requests_total 4` line; body was:\n\(response.body)")
+        XCTAssertTrue(
+            lines.contains("fastmlx_mtp_passthrough_requests_total 1"),
+            "expected an exact `fastmlx_mtp_passthrough_requests_total 1` line; body was:\n\(response.body)")
+        XCTAssertTrue(lines.contains("# TYPE fastmlx_mtp_speculative_requests_total counter"))
+        XCTAssertTrue(lines.contains("# TYPE fastmlx_mtp_passthrough_requests_total counter"))
+        XCTAssertFalse(lines.contains("# TYPE fastmlx_mtp_speculative_requests_total gauge"))
+        XCTAssertFalse(lines.contains("# TYPE fastmlx_mtp_passthrough_requests_total gauge"))
+        // The gauge above is latched (`passthroughActive: true`) even though this fixture reports
+        // 4 requests that genuinely speculated — proving the two rendered metric families are
+        // independent, exactly the point of this increment.
+        XCTAssertTrue(lines.contains("fastmlx_mtp_passthrough_active 1"))
+        _ = try await channel.finish()
+    }
+
+    /// The `fastmlx_mtp_passthrough_active` HELP text previously asserted a FALSE invariant — that
+    /// the gauge going to `1` meant the decoder was "no longer proposing draft tokens". It is
+    /// sticky/latching, not a live state: a later request on the same decoder can, and does,
+    /// speculate again. This test pins the corrected HELP line's absence of that false phrasing so
+    /// a future edit cannot silently reintroduce it, without weakening any existing exact-line
+    /// gauge-VALUE assertion above (those assert on `fastmlx_mtp_passthrough_active <n>`, not on
+    /// the HELP text, and are left untouched).
+    func testMetricsEndpointPassthroughActiveHelpTextDoesNotClaimSpeculationHasStopped() async throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 0,
+            mlxActiveBytes: 0,
+            mlxCacheBytes: 0,
+            mlxPeakBytes: 0,
+            speculativeDecoding: try ServingEvidence.SpeculativeDecodingCounters(
+                proposedDraftTokens: 0,
+                acceptedDraftTokens: 0,
+                verifyRounds: 0,
+                passthroughActive: true))
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let helpLine = try XCTUnwrap(
+            response.body.split(separator: "\n", omittingEmptySubsequences: false)
+                .map(String.init)
+                .first { $0.hasPrefix("# HELP fastmlx_mtp_passthrough_active ") },
+            "expected a HELP line for fastmlx_mtp_passthrough_active; body was:\n\(response.body)")
+        XCTAssertFalse(
+            helpLine.contains("no longer proposing"),
+            "HELP text must not claim the decoder has stopped proposing draft tokens — it is a "
+                + "sticky latch, not a live state; line was: \(helpLine)")
+        XCTAssertTrue(
+            helpLine.contains("fastmlx_mtp_speculative_requests_total")
+                || helpLine.contains("fastmlx_mtp_passthrough_requests_total"),
+            "HELP text should point an operator at the per-request counters for a current rate; "
+                + "line was: \(helpLine)")
+        _ = try await channel.finish()
+    }
+
     func testMetricsEndpointRejectsWrongMethodAndRequestBodyBeforeBackendWork()
         async throws
     {

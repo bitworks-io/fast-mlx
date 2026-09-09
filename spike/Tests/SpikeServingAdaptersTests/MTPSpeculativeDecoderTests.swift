@@ -1045,6 +1045,21 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
             secondDelta.passthroughReason,
             "a later, genuinely speculating request must not inherit an earlier request's sticky "
                 + "passthrough reason")
+
+        // Per-request counters (the passthrough gauge is a one-way latch; see
+        // docs/task-inbox/2026-09-09-mtp-passthrough-rate-telemetry.md):
+        // request 1 passed through, request 2 genuinely speculated (proven above by
+        // `secondDelta.acceptedDraftTokens > 0`, the anti-vacuity control this assertion pair
+        // depends on — without it, a decoder that never speculated at all could still produce a
+        // `(1, 1)` reading here). These must read as a real per-request tally, not a sticky latch.
+        let telemetryAfterBothRequests = await actor.speculativeTelemetry()
+        let finalTelemetry = try XCTUnwrap(telemetryAfterBothRequests)
+        XCTAssertEqual(
+            finalTelemetry.passthroughRequestCount, 1,
+            "exactly one of the two requests passed through")
+        XCTAssertEqual(
+            finalTelemetry.speculativeRequestCount, 1,
+            "exactly one of the two requests genuinely speculated")
     }
 
     /// The trap this fix must avoid (see the task-inbox doc's "fix is not a plain string delta"

@@ -86,14 +86,30 @@ public struct SpeculativeTelemetrySnapshot: Equatable, Sendable {
     /// snapshot to absent.
     public let verifyRoundCount: Int
     public let passthroughReason: String?
+    /// Per-request count of completed requests that genuinely speculated this serve. In contrast
+    /// to `passthroughReason` (which only ever moves from `nil` to a value and then LATCHES
+    /// forever, per `MTPSpeculativeDecoder.reset()`'s doc comment), this is a plain running total
+    /// that keeps incrementing for every request that speculates, including ones after
+    /// `passthroughReason` has already gone non-nil on an earlier request. Defaulted to `0` so
+    /// existing call sites/conformers predating this field keep compiling unchanged.
+    public let speculativeRequestCount: Int
+    /// Per-request count of completed requests that passed through this serve. Sibling of
+    /// `speculativeRequestCount`; the pair gives a caller a passthrough RATE
+    /// (`passthroughRequestCount / (speculativeRequestCount + passthroughRequestCount)`), which the
+    /// sticky `passthroughReason`/gauge alone cannot express. Defaulted to `0` for the same
+    /// compile-compatibility reason as `speculativeRequestCount`.
+    public let passthroughRequestCount: Int
 
     public init(
-        proposedCount: Int, acceptedCount: Int, verifyRoundCount: Int, passthroughReason: String?
+        proposedCount: Int, acceptedCount: Int, verifyRoundCount: Int, passthroughReason: String?,
+        speculativeRequestCount: Int = 0, passthroughRequestCount: Int = 0
     ) {
         self.proposedCount = proposedCount
         self.acceptedCount = acceptedCount
         self.verifyRoundCount = verifyRoundCount
         self.passthroughReason = passthroughReason
+        self.speculativeRequestCount = speculativeRequestCount
+        self.passthroughRequestCount = passthroughRequestCount
     }
 }
 
