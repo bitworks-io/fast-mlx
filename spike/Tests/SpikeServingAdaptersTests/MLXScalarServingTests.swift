@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import XCTest
@@ -1063,6 +1064,370 @@ final class MLXScalarServingTests: XCTestCase {
             }
             XCTAssertTrue(detail.contains("eligibilityDenied"), "detail: \(detail)")
             XCTAssertFalse(detail.contains("fingerprintMismatch"), "detail: \(detail)")
+        }
+    }
+
+    // NOTE ON NAMING (applies to everything below this line): this file is part of the public
+    // projection, whose validator fails closed on the internal implementation-family marker. Refer
+    // to the offload/row-store types DESCRIPTIVELY ("the row store", "the offload policy source")
+    // rather than by their CamelCase family-prefixed symbol names -- spelling one out fails the
+    // projection gate and blocks publication. Do not "helpfully" restore the exact symbol names.
+    //
+    // MARK: - offloadPlanCheckOnly (`--offload-plan-check-only`) happy path: proving
+    // `checkOffloadedNGramPlanOnly` (LLMModelFactory.swift:877-924) actually resolves and verifies
+    // a plan on a HOST that agrees with it, driven through the real `loadScalarServingModel` call
+    // site, not called directly. Everything above this MARK (`writeNGramOffloadPlanFixture` and its
+    // two tests) only ever exercises FAILURE arms; neither one reaches `checkOffloadedNGramPlanOnly`
+    // far enough to construct a real offloaded n-gram row store (Arm A fails at the plan's own
+    // fingerprint cross-check, Arm B at eligibility resolution, both well before the row store is
+    // ever opened). This fixture is a SEPARATE builder, deliberately not a parameterization of
+    // `writeNGramOffloadPlanFixture` above -- see that function's doc comment: `inodeOffset: 1` and
+    // `omitEligibilityFile: true` must keep failing for exactly their current reasons, untouched.
+
+    /// The 128-byte rows file byte pattern (`byte i = (i*7+13) % 256`) the frozen chunk seal below
+    /// was sealed against by an INDEPENDENT Python tool -- NOT by any canonicalizer in this Swift
+    /// codebase. `writeSealedNGramOffloadPlanFixture` self-checks this pattern's sha256 against the
+    /// independently-recorded value below before ever using it, so a future edit to this byte
+    /// pattern fails loudly here rather than silently invalidating every chunk digest below.
+    private func sealedNGramRowsBytes() -> Data {
+        Data((0 ..< 128).map { UInt8(($0 * 7 + 13) % 256) })
+    }
+
+    /// The frozen chunk seal, written to disk as EXACT literal bytes -- never round-tripped through
+    /// `JSONSerialization.data(withJSONObject:)` -- re-serializing can
+    /// reorder keys, and this codebase's own canonicalizer must never be the thing that both
+    /// produces and checks this fixture's root digest). `%GATE%` and `%ROOT_DIGEST%` are the ONLY
+    /// substitution points. By default `rootDigest` reproduces the frozen literal byte-for-byte, so
+    /// substituting a different `gate` value alone changes the object this seal's root digest was
+    /// computed over WITHOUT changing the recorded `root_digest`, deliberately breaking root-digest
+    /// verification (see `testOffloadPlanCheckOnlyRefusesSealWhoseGovernanceGateWasChangedViaRootDigestMismatch`'s
+    /// doc comment). Passing a `rootDigest` that was independently, correctly recomputed for the
+    /// edited document lets a caller instead exercise the governance-gate check itself (see
+    /// `testOffloadPlanCheckOnlyRefusesCorrectlyResealedSealWhoseGovernanceGateIsRuntimeEligible`).
+    private func literalSealedChunkSealJSON(gate: String, rootDigest: String) -> String {
+        #"""
+        {
+          "seal_format": "qwen38-flash-next-ngram-chunk-seal-v1",
+          "root_digest": "%ROOT_DIGEST%",
+          "status": {"gate": "%GATE%", "runtimeCompatibility": "unverified"},
+          "chunk_geometry": {"row_count": 16, "bytes_per_row": 8, "chunk_row_count": 4, "chunk_byte_length": 32},
+          "source_identity": {"model_id": "test-model", "resolved_revision": "abc123", "file_name": "ngram_rows.bin"},
+          "chunks": [
+            {"chunk_id": 0, "row_start": 0,  "row_count": 4, "byte_start": 0,  "byte_length": 32, "sha256": "297a7bb3358fcd2aa607d3358113aa3b792240536b26fa9d67e62f2b396b8fc0"},
+            {"chunk_id": 1, "row_start": 4,  "row_count": 4, "byte_start": 32, "byte_length": 32, "sha256": "16fc642d18fbf32ebdd7ae8e02f9381c6719e14a0668d965fcae718d1c4371cf"},
+            {"chunk_id": 2, "row_start": 8,  "row_count": 4, "byte_start": 64, "byte_length": 32, "sha256": "bbe7244f725991722c1c20c07614e299242631a58fb62f61808e48a006c1185a"},
+            {"chunk_id": 3, "row_start": 12, "row_count": 4, "byte_start": 96, "byte_length": 32, "sha256": "a4e91560b41512029db2bc8f20b4b182b31fbea26559bf0b3f7f9fdec3313333"}
+          ]
+        }
+        """#
+            .replacingOccurrences(of: "%GATE%", with: gate)
+            .replacingOccurrences(of: "%ROOT_DIGEST%", with: rootDigest)
+    }
+
+    /// Builds every on-disk input `checkOffloadedNGramPlanOnly` needs to reach a genuine SUCCESS: a
+    /// qwen4_exp `config.json` directory with NO safetensors shard at all (load-bearing -- if the
+    /// check ever fell through to a real weight load, there is nothing there to load, so a
+    /// regression that starts reaching `loadModel` fails loudly instead of silently passing on a
+    /// stub checkpoint), a 128-byte rows file, its frozen chunk seal, an acceptance record whose
+    /// `fingerprint` is stamped from a REAL `fstat` of that rows file with NO inode offset (so this
+    /// fixture, unlike `writeNGramOffloadPlanFixture`'s Arm A, is designed to actually resolve), and
+    /// an eligibility file placed OUTSIDE both the model directory and the rows file's own
+    /// directory -- the offload eligibility resolver refuses a configuration file located
+    /// inside either artifact boundary (the offload policy source, :119-126), a check neither
+    /// arm of `writeNGramOffloadPlanFixture` above ever reaches (both fail earlier), so that helper
+    /// never had to route around it, and correctly does not.
+    ///
+    /// There is deliberately NO knob to write a shard: the absent shard is load-bearing (see
+    /// above), and an unused parameter that silently ignores `true` would be worse than no
+    /// parameter at all -- a later cycle would pass it, get no shard anyway, and conclude the
+    /// check tolerates a real checkpoint.
+    private func writeSealedNGramOffloadPlanFixture(
+        chunkVerification: String?,
+        sealGate: String = "source-preflight-only",
+        sealRootDigest: String? = nil
+    ) throws -> (modelDirectory: URL, planURL: URL, rowsFileURL: URL) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scalar-serving-ngram-offload-sealed-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let modelDirectory = root.appendingPathComponent("model", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data(#"{"model_type":"qwen4_exp","num_hidden_layers":4}"#.utf8)
+            .write(to: modelDirectory.appendingPathComponent("config.json"))
+
+        let planDirectory = root.appendingPathComponent("plan", isDirectory: true)
+        try FileManager.default.createDirectory(at: planDirectory, withIntermediateDirectories: true)
+
+        let rowsFileURL = planDirectory.appendingPathComponent("ngram_rows.bin")
+        let rowsBytes = sealedNGramRowsBytes()
+        try rowsBytes.write(to: rowsFileURL)
+
+        // Self-check against the INDEPENDENTLY-recorded sha256: if this
+        // ever fails, the byte pattern above drifted from what the frozen seal's chunk digests
+        // (and root digest) were actually computed against, and every check below would silently
+        // be comparing the wrong file.
+        let observedRowsSHA256 = SHA256.hash(data: rowsBytes).map { String(format: "%02x", $0) }.joined()
+        precondition(
+            observedRowsSHA256 == "8b94fd8b7db8b1ef29c089c16389697a057310b7c739c1ad844e9be970f5cfd6",
+            "rows fixture byte pattern drifted from the frozen seal's independently-recorded sha256")
+
+        try Data(
+            literalSealedChunkSealJSON(
+                gate: sealGate,
+                rootDigest: sealRootDigest
+                    ?? "6098bfaecab82ea6279df75c5e2fc6c276e11cd3cd0845296ffde8f79a321411"
+            ).utf8
+        ).write(to: planDirectory.appendingPathComponent("seal.json"))
+
+        // Deliberately OUTSIDE `planDirectory` (the rows file's own directory) and outside
+        // `modelDirectory` -- see this function's doc comment.
+        try Data(#"{"host":"test-host","operatorReference":"test-ref"}"#.utf8)
+            .write(to: root.appendingPathComponent("eligibility.json"))
+
+        // `fstat` on an opened descriptor -- the one fingerprint call this codebase treats as
+        // trustworthy (mirrors `writeNGramOffloadPlanFixture` above and the resolver itself).
+        let fd = Darwin.open(rowsFileURL.path, O_RDONLY)
+        guard fd >= 0 else {
+            struct FixtureOpenFailed: Error {}
+            throw FixtureOpenFailed()
+        }
+        defer { Darwin.close(fd) }
+        var fileStat = stat()
+        guard Darwin.fstat(fd, &fileStat) == 0 else {
+            struct FixtureStatFailed: Error {}
+            throw FixtureStatFailed()
+        }
+
+        let acceptanceRecord: [String: Any] = [
+            "source": [
+                "kind": "bf16Base",
+                "modelID": "test-model",
+                // Must be a 40-hex-digit immutable SHA -- the row store's
+                // `validateDescriptor` fails closed on anything shorter (unlike
+                // `writeNGramOffloadPlanFixture`'s "abc123", which never reaches this store
+                // constructor because both its arms fail earlier).
+                "resolvedRevision": String(repeating: "a", count: 40),
+                "fileName": "ngram_rows.bin",
+                "byteCount": 128,
+                "sha256": String(repeating: "0", count: 64),
+            ],
+            "descriptor": [
+                "rowCount": 16,
+                "rowByteCount": 8,
+            ],
+            "fingerprint": [
+                "device": Int(fileStat.st_dev),
+                "inode": Int(fileStat.st_ino),
+                "byteCount": 128,
+                "modifiedSeconds": Int(fileStat.st_mtimespec.tv_sec),
+                "modifiedNanoseconds": Int(fileStat.st_mtimespec.tv_nsec),
+                "changedSeconds": Int(fileStat.st_ctimespec.tv_sec),
+                "changedNanoseconds": Int(fileStat.st_ctimespec.tv_nsec),
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: acceptanceRecord)
+            .write(to: planDirectory.appendingPathComponent("acceptance.json"))
+
+        var plan: [String: Any] = [
+            "rowsFile": "ngram_rows.bin",
+            "chunkSeal": "seal.json",
+            "acceptanceRecord": "acceptance.json",
+            "eligibility": "../eligibility.json",
+            "limits": [
+                "maxResidentRows": 1_024,
+                "maxResidentBytes": 1_048_576,
+                "maxRequestRows": 256,
+                "maxInFlightBytes": 65_536,
+            ],
+        ]
+        if let chunkVerification {
+            plan["chunkVerification"] = chunkVerification
+        }
+        let planURL = planDirectory.appendingPathComponent("plan.json")
+        try JSONSerialization.data(withJSONObject: plan).write(to: planURL)
+
+        return (modelDirectory: modelDirectory, planURL: planURL, rowsFileURL: rowsFileURL)
+    }
+
+    /// THE HAPPY PATH, never previously executed by any test: a plan that actually resolves and
+    /// verifies on this host must escape `loadScalarServingModel` as `OffloadPlanCheckCompleted`
+    /// (exit 0 at the CLI), never as a `ScalarServingModelLoadError` (exit 2) -- the two refusal and
+    /// success arms differ ONLY by which type escapes (see `OffloadPlanCheckCompleted`'s doc
+    /// comment), so asserting merely "did not throw `ScalarServingModelLoadError`" would be
+    /// insufficient; this asserts the POSITIVE type. Every report field is then checked against an
+    /// INDEPENDENT value the test computes itself -- a `stat` it performs directly on the returned
+    /// rows URL for the file-identity fields (never the acceptance record, never the report's own
+    /// other fields), and the fixture's own chosen geometry/policy for the rest.
+    func testOffloadPlanCheckOnlyCompletesAndAttestsIndependentlyObservedFacts() async throws {
+        let fixture = try writeSealedNGramOffloadPlanFixture(chunkVerification: "boundaryChunks")
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        var independentStat = stat()
+        guard stat(fixture.rowsFileURL.path, &independentStat) == 0 else {
+            XCTFail("test's own independent stat of the rows file failed")
+            return
+        }
+        let independentModifiedNanoseconds =
+            Int(independentStat.st_mtimespec.tv_sec) * 1_000_000_000
+            + Int(independentStat.st_mtimespec.tv_nsec)
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-offload-plan-check-only",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL,
+                    offloadPlanCheckOnly: true))
+            XCTFail("a resolving, verifying plan must escape via OffloadPlanCheckCompleted, not return")
+        } catch let completion as OffloadPlanCheckCompleted {
+            XCTAssertEqual(completion.rowsDevice, Int(independentStat.st_dev))
+            XCTAssertEqual(completion.rowsInode, Int(independentStat.st_ino))
+            XCTAssertEqual(completion.rowsByteCount, Int(independentStat.st_size))
+            XCTAssertEqual(completion.rowsByteCount, 128)
+            XCTAssertEqual(completion.rowsModifiedNanoseconds, independentModifiedNanoseconds)
+
+            XCTAssertEqual(completion.chunkCount, 4)
+            XCTAssertEqual(completion.chunksVerified, 2)
+            XCTAssertEqual(completion.chunkVerification, "boundaryChunks")
+
+            XCTAssertEqual(completion.eligibilityHost, "test-host")
+            XCTAssertTrue(
+                completion.eligibilityResolvedFrom.hasSuffix("eligibility.json"),
+                completion.eligibilityResolvedFrom)
+        } catch {
+            XCTFail("expected OffloadPlanCheckCompleted, got \(error)")
+        }
+    }
+
+    /// Same fixture, `chunkVerification: "full"`: `chunksVerified` must now cover every chunk (4),
+    /// not just the 2 boundary chunks T1 above verified. T1 and T2 TOGETHER are what make
+    /// `chunksVerified` a discriminating assertion -- with only one policy tested, `chunksVerified`
+    /// would be indistinguishable from a hardcoded `chunkCount` echo.
+    func testOffloadPlanCheckOnlyFullPolicyVerifiesEveryChunk() async throws {
+        let fixture = try writeSealedNGramOffloadPlanFixture(chunkVerification: "full")
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-offload-plan-check-only",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL,
+                    offloadPlanCheckOnly: true))
+            XCTFail("a resolving, verifying plan must escape via OffloadPlanCheckCompleted, not return")
+        } catch let completion as OffloadPlanCheckCompleted {
+            XCTAssertEqual(completion.chunkCount, 4)
+            XCTAssertEqual(completion.chunksVerified, 4)
+            XCTAssertEqual(completion.chunkVerification, "full")
+        } catch {
+            XCTFail("expected OffloadPlanCheckCompleted, got \(error)")
+        }
+    }
+
+    /// THE PERMANENT ANTI-VACUITY CONTROL for T1/T2 above: this is the SAME fixture, with only the
+    /// seal's `status.gate` field edited to `"runtime-eligible"` while the recorded `root_digest`
+    /// stays the FROZEN literal unchanged. Editing a field inside the canonically-hashed document
+    /// without recomputing its digest necessarily breaks root-digest verification -- this test
+    /// proves that the seal's bytes are digest-verified (tamper detection): an edited, unresealed
+    /// document is rejected before its contents are trusted for anything, including governance.
+    /// It does NOT by itself prove the governance-gate string check is enforced -- a digest-mismatch
+    /// refusal alone cannot distinguish "governance enforced" from "governance never consulted".
+    /// That is proven separately, and decisively, by
+    /// `testOffloadPlanCheckOnlyRefusesCorrectlyResealedSealWhoseGovernanceGateIsRuntimeEligible`
+    /// below, which uses a correctly-resealed digest so root-digest verification passes and the
+    /// refusal can only come from the governance check itself. What this test DOES establish on its
+    /// own, unconditionally: if T1/T2 above were silently passing WITHOUT reaching
+    /// `qwen4ExpVerifyPLEOffloadBeforeLoad` (e.g. a future edit that made `offloadPlanCheckOnly`
+    /// short-circuit before ever parsing the seal), this test would also start passing for the
+    /// wrong reason -- so its own failure mode is the decisive one: run it against a version of the
+    /// code that skips seal parsing, and it stops failing when it must.
+    func testOffloadPlanCheckOnlyRefusesSealWhoseGovernanceGateWasChangedViaRootDigestMismatch() async throws {
+        let fixture = try writeSealedNGramOffloadPlanFixture(
+            chunkVerification: "boundaryChunks", sealGate: "runtime-eligible")
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-offload-plan-check-only",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL,
+                    offloadPlanCheckOnly: true))
+            XCTFail("an edited-gate seal with a stale root_digest must fail closed, not complete")
+        } catch let error as ScalarServingModelLoadError {
+            guard case .offloadedNGramPlanLoadFailed(let detail) = error else {
+                XCTFail("expected .offloadedNGramPlanLoadFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("chunkSealRootDigestMismatch"), "detail: \(detail)")
+        } catch let completion as OffloadPlanCheckCompleted {
+            XCTFail("must not complete on a seal whose root digest no longer matches: \(completion)")
+        }
+    }
+
+    /// THE DECISIVE PROOF that T1/T2 genuinely reach `qwen4ExpVerifyPLEOffloadBeforeLoad` and are
+    /// subject to the seal's governance rules, rather than passing at an earlier short-circuit: the
+    /// SAME fixture as the anti-vacuity control above, with `status.gate` edited to
+    /// `"runtime-eligible"`, but this time paired with `root_digest` recomputed by an INDEPENDENT
+    /// Python tool (`json.dumps(sort_keys=True, separators=(",",":"), ensure_ascii=True)` + sha256)
+    /// over the EDITED document -- never by any canonicalizer in this Swift codebase. Root-digest
+    /// verification therefore PASSES, so any refusal can only come from the governance check in
+    /// the row store's seal parser (`chunkSealGovernanceMismatch`), not from tamper detection.
+    /// A digest-mismatch refusal alone cannot distinguish "governance enforced" from "governance
+    /// never consulted" -- this test is what makes that distinction, by removing the digest
+    /// mismatch as a possible cause of the refusal.
+    func testOffloadPlanCheckOnlyRefusesCorrectlyResealedSealWhoseGovernanceGateIsRuntimeEligible() async throws {
+        let fixture = try writeSealedNGramOffloadPlanFixture(
+            chunkVerification: "boundaryChunks",
+            sealGate: "runtime-eligible",
+            sealRootDigest: "fd94975b131505f6b50116c436801d41ce33809d2be9aecc8d95f888f1640dab")
+        defer {
+            try? FileManager.default.removeItem(
+                at: fixture.modelDirectory.deletingLastPathComponent())
+        }
+
+        do {
+            _ = try await loadScalarServingModel(
+                configuration: ScalarServingModelLoadConfiguration(
+                    launchedModel: "qwen4-exp-offload-plan-check-only",
+                    modelDirectory: fixture.modelDirectory,
+                    memoryLimitBytes: 8_192,
+                    cacheLimitBytes: 1_024,
+                    backendConfiguration: fixtureBackendConfiguration(),
+                    ngramOffloadPlanURL: fixture.planURL,
+                    offloadPlanCheckOnly: true))
+            XCTFail("a correctly-resealed but governance-gate-mismatched seal must fail closed, not complete")
+        } catch let error as ScalarServingModelLoadError {
+            guard case .offloadedNGramPlanLoadFailed(let detail) = error else {
+                XCTFail("expected .offloadedNGramPlanLoadFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("chunkSealGovernanceMismatch"), "detail: \(detail)")
+            XCTAssertFalse(
+                detail.contains("chunkSealRootDigestMismatch"),
+                "root digest was correctly recomputed for the edited document -- a digest-mismatch "
+                    + "message here would mean this test is not actually exercising governance: "
+                    + "detail: \(detail)")
+        } catch let completion as OffloadPlanCheckCompleted {
+            XCTFail("must not complete on a seal whose governance gate is runtime-eligible: \(completion)")
         }
     }
 
