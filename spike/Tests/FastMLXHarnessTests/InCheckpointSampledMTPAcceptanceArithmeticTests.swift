@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 import XCTest
@@ -64,6 +65,146 @@ final class InCheckpointSampledMTPAcceptanceArithmeticTests: XCTestCase {
         XCTAssertEqual(probabilities.count, 2)
         XCTAssertEqual(probabilities[0], 0.5)
         XCTAssertEqual(probabilities[1], 0.5)
+    }
+
+    // MARK: - independentTruncatedProbabilities (top_p branch)
+    //
+    // `independentTruncatedProbabilities`'s top_p branch (`0 < topP < 1`, ~lines 470-480 of
+    // `InCheckpointSampledMTPAcceptanceCLI.swift`) is otherwise UNEXERCISED by any test:
+    // `inCheckpointSampledMTPAssertIndependentTruncationControls`'s identity control runs at
+    // `topP=1` (the branch guard `topP < 1` is false there) and its anti-vacuity control runs at
+    // `topP=1, topK=3` (same reason) -- both skip the top_p branch entirely, so its first-ever
+    // execution would otherwise be on real 151,936-wide logits on a heavy host. These tests
+    // exercise it directly, against small fixtures whose expected kept sets are hand-derived in the
+    // comments beside them -- never by calling the function under test to produce its own
+    // expectation, and never by re-deriving it through any other truncation helper.
+
+    func testTruncatedProbabilitiesTopPAloneKeepsHandComputedNucleus() throws {
+        // Fixture probabilities chosen directly (softmax is invariant to an additive shift, so
+        // setting `logit_i = ln(p_i)` for a set of `p_i` already summing to 1 makes this function
+        // reproduce exactly those `p_i` whenever nothing is truncated -- the same trick the identity
+        // control above relies on): ten DISTINCT values (no ties for the ascending sort to break),
+        // at a shuffled (non-monotonic) index assignment so the test cannot pass by accident from
+        // indices already happening to be in cumulative order.
+        //
+        //   index: 0     1     2     3     4     5     6     7     8     9
+        //   prob:  0.08  0.01  0.24  0.03  0.40  0.02  0.05  0.07  0.06  0.04
+        //   (sum = 0.08+0.01+0.24+0.03+0.40+0.02+0.05+0.07+0.06+0.04 = 1.00)
+        let probabilities: [Double] = [0.08, 0.01, 0.24, 0.03, 0.40, 0.02, 0.05, 0.07, 0.06, 0.04]
+        let logits = probabilities.map { Foundation.log($0) }
+
+        // Hand-derived nucleus at topP=0.6 (keepThreshold = 1 - topP = 0.4), reproducing the
+        // vendored ASCENDING-cumulative algorithm exactly (see the doc comment on
+        // `independentTruncatedProbabilities` above its declaration): sort ascending by probability,
+        // accumulate, mask every entry whose running cumulative is `<= 0.4`; the entry that first
+        // pushes cumulative strictly above 0.4, and everything after it in ascending order, survive.
+        //
+        // ascending order (smallest probability first): idx1(0.01), idx5(0.02), idx3(0.03),
+        // idx9(0.04), idx6(0.05), idx8(0.06), idx7(0.07), idx0(0.08), idx2(0.24), idx4(0.40)
+        //
+        // running cumulative (masked iff cumulative <= 0.4 at that step):
+        //   idx1: cum=0.01 <=0.4 -> masked
+        //   idx5: cum=0.03 <=0.4 -> masked
+        //   idx3: cum=0.06 <=0.4 -> masked
+        //   idx9: cum=0.10 <=0.4 -> masked
+        //   idx6: cum=0.15 <=0.4 -> masked
+        //   idx8: cum=0.21 <=0.4 -> masked
+        //   idx7: cum=0.28 <=0.4 -> masked
+        //   idx0: cum=0.36 <=0.4 -> masked
+        //   idx2: cum=0.60  >0.4 -> KEPT (first entry to survive)
+        //   idx4: cum=1.00  >0.4 -> KEPT
+        //
+        // Kept set = {2, 4}. Renormalized (minP=0 and topK=0 are both no-ops here, so the softmax in
+        // step 5 just renormalizes the two survivors' own probabilities against each other):
+        //   idx2 = 0.24 / (0.24 + 0.40) = 0.24 / 0.64 = 0.375
+        //   idx4 = 0.40 / (0.24 + 0.40) = 0.40 / 0.64 = 0.625
+        let expectedKeptIndices: Set<Int> = [2, 4]
+
+        // Anti-vacuity: the nucleus must be a PROPER, NON-EMPTY subset of the fixture -- a nucleus
+        // that kept everything (the top_p branch effectively a no-op) or kept only a single element
+        // (indistinguishable from an always-argmax bug) would make the assertions below inert.
+        XCTAssertGreaterThan(expectedKeptIndices.count, 0)
+        XCTAssertLessThan(expectedKeptIndices.count, probabilities.count)
+
+        let result = try independentTruncatedProbabilities(
+            logits: logits, temperature: 1, topP: 0.6, topK: 0, minP: 0)
+
+        XCTAssertEqual(result.count, 10)
+        for index in result.indices where !expectedKeptIndices.contains(index) {
+            XCTAssertEqual(
+                result[index], 0.0,
+                "index \(index) is outside the hand-derived nucleus {2, 4} and must be masked to "
+                    + "exactly 0.0 (observed \(result[index]))")
+        }
+        XCTAssertEqual(result[2], 0.375, accuracy: 1e-9)
+        XCTAssertEqual(result[4], 0.625, accuracy: 1e-9)
+        XCTAssertEqual(result.reduce(0, +), 1.0, accuracy: 1e-9)
+    }
+
+    func testTruncatedProbabilitiesComposesTopPThenTopKInVendoredOrderAtDeployedShapedRegime() throws {
+        // Fixture: 30 DISTINCT integer "weights" 1...30 (distinct so the ascending-cumulative sort
+        // has no ties to break), assigned to indices via a fixed permutation
+        // `index = (weight - 1 + 13) % 30` (a bijection over 0...29, so the fixture is not trivially
+        // monotonic in index order). `probability_i = weight_i / 465` (465 = 1+2+...+30).
+        // `logit_i = ln(probability_i)` (same additive-shift-invariance trick as the test above).
+        let totalWeight = 465.0  // 30*31/2
+        var weightByIndex = [Double](repeating: 0, count: 30)
+        for weight in 1...30 {
+            let index = (weight - 1 + 13) % 30
+            weightByIndex[index] = Double(weight)
+        }
+        let logits = weightByIndex.map { Foundation.log($0 / totalWeight) }
+
+        // Hand-derived top_p nucleus at topP=0.95 (keepThreshold = 1 - 0.95 = 0.05; in weight terms
+        // `0.05 * 465 = 23.25`): ascending order is simply weight 1, 2, ..., 30 (by construction of
+        // the fixture). Cumulative weight after w=1..k is `k(k+1)/2`: k=6 -> cumulative=21 <=23.25
+        // (masked); k=7 -> cumulative=28 >23.25 (survives, and everything above it). So weights 1-6
+        // are masked by top_p, weights 7-30 (24 entries) survive -- NUCLEUS SUPPORT = 24, already
+        // greater than topK=20 below, so top_k is guaranteed to bind on this fixture (this is the
+        // "top-k binds INSIDE the nucleus" shape the deployed topP=0.95/topK=20 preset produces
+        // whenever the nucleus holds more than 20 tokens).
+        //
+        // Hand-derived top_k=20 over those 24 survivors (weights 7-30): keeps the 20 highest, i.e.
+        // weights 11-30 (dropping the four smallest survivors: weights 7, 8, 9, 10).
+        //
+        // FINAL support = weights 11-30 (20 entries). Via the index permutation above, weights 11-30
+        // map to indices 23,24,...,29 (weights 11-17) and 0,1,...,12 (weights 18-30) -- i.e. the
+        // kept index set is `{0...12} union {23...29}`.
+        //
+        // THIS IS THE ORDER-DISCRIMINATING CASE (proves top_p -> top_k, not the reverse, matching
+        // vendored `Evaluate.swift`'s top_p -> min_p -> top_k -> softmax pipeline): if top_k ran
+        // BEFORE top_p, top_k would first keep weights 11-30 (the top 20 of the full 30 by weight),
+        // and top_p's ascending-cumulative walk over those surviving 20 (weights 11-30) would then
+        // mask weight=11 (cumulative = 11/465 = 0.02366 <=0.05) AND weight=12
+        // (cumulative = (11+12)/465 = 0.04946, STILL <=0.05) before finally crossing the threshold
+        // at weight=13 (cumulative = (11+12+13)/465 = 0.07742 >0.05) -- producing FINAL support 18
+        // (weights 13-30), not 20. The `== 20`/exact-set assertions below are exactly what a
+        // top_k-before-top_p regression would flip to 18 and a different index set.
+        var expectedKeptIndices: Set<Int> = []
+        for index in 0...12 { expectedKeptIndices.insert(index) }
+        for index in 23...29 { expectedKeptIndices.insert(index) }
+        XCTAssertEqual(expectedKeptIndices.count, 20)
+        // Anti-vacuity: a proper, non-empty subset of the 30-wide fixture.
+        XCTAssertGreaterThan(expectedKeptIndices.count, 0)
+        XCTAssertLessThan(expectedKeptIndices.count, weightByIndex.count)
+
+        let result = try independentTruncatedProbabilities(
+            logits: logits, temperature: 1, topP: 0.95, topK: 20, minP: 0)
+
+        XCTAssertEqual(result.count, 30)
+        var observedKeptIndices: Set<Int> = []
+        for index in result.indices where result[index] > 0.0 {
+            observedKeptIndices.insert(index)
+        }
+        XCTAssertEqual(
+            observedKeptIndices, expectedKeptIndices,
+            "kept index set mismatch -- see the hand-derived order-discriminating arithmetic above "
+                + "this test (observed count=\(observedKeptIndices.count), expected count="
+                + "\(expectedKeptIndices.count))")
+        for index in result.indices where !expectedKeptIndices.contains(index) {
+            XCTAssertEqual(result[index], 0.0)
+        }
+        XCTAssertEqual(result.reduce(0, +), 1.0, accuracy: 1e-9)
     }
 
     // MARK: - inCheckpointSampledMTPSigmaMinPQ

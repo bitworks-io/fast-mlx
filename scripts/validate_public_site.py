@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "5a5aa5416debd3c813e7a27f0b0659c5d7818d6a9b73583c3f0b5d3e3cd07179"
+    "7c99d3f0254c9886d91819e6e91dc711a7ce05beb924baba9517cf88a8442a67"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "c68e2375fc18892aaf00948ea788ae2062a7d11c835f14c5cfe93fbc4eeab11d"
+    "39dd1a74b76aaec2cbd4d4e8a16dc520def11d65afd79a224c25be908df31600"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "28 published research notes",
+    "29 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -484,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/a-ratio-is-not-a-result/",
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/",
     "research/every-tool-call-took-the-path-we-never-tested/",
     "research/the-fit-check-refused-a-model-that-fit/",
@@ -514,6 +515,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/a-ratio-is-not-a-result/": ("2026-09-09", "2026-09-09"),
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/": ("2026-09-08", "2026-09-08"),
     "research/every-tool-call-took-the-path-we-never-tested/": ("2026-09-08", "2026-09-08"),
     "research/the-fit-check-refused-a-model-that-fit/": ("2026-09-06", "2026-09-06"),
@@ -809,6 +811,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/a-ratio-is-not-a-result/": (
+        "A ratio is not a result — fast-mlx",
+        "We had a measured speedup for speculative decoding: 1.31x, honestly obtained, with controls that passed. It was also, for our purposes, close to useless — because it was measured with sampling switched off in a way…",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/": (
         "You had to load the model to learn it wouldn't load — fast-mlx",

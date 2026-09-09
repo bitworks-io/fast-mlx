@@ -169,6 +169,12 @@
       "slug": "you-had-to-load-the-model-to-learn-it-would-not-load",
       "status": "published",
       "reviewedAt": "2026-09-08"
+    },
+    {
+      "source": "docs/content/2026-09-09-a-ratio-is-not-a-result.md",
+      "slug": "a-ratio-is-not-a-result",
+      "status": "published",
+      "reviewedAt": "2026-09-09"
     }
   ]
 }

@@ -4,6 +4,7 @@ import XCTest
 import MLX
 import MLXLMCommon
 import MLXNN
+import ServingCore
 import SpikeCore
 @testable import SpikeServingAdapters
 
@@ -642,6 +643,215 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
             "the relaxed predicate must not over-admit a request "
                 + "sharedSampledMTPSupportsPredicate/providerIsEligible genuinely refuses; got: "
                 + "\(reason)")
+    }
+
+    // MARK: - 7d. Tools do not enter sampled MTP admission (the tools x sampled-MTP intersection)
+    //
+    // `ToolCallFormat.infer` returns `.xmlFunction` for this family (`ToolCallFormat.swift:219-222`),
+    // and tools affect how the prompt is RENDERED (`Qwen3TemplateRenderTests.swift`) and how output
+    // text is PARSED into a tool call after generation — but never enter the sampling distribution
+    // itself. This section pins that at the two seams that actually decide whether a sampled request
+    // gets speculated: the provider's `supports(parameters:)` gate, and the iterator's
+    // greedy-requirement passthrough. Both take a `GenerateParameters` value that structurally has
+    // no `tools` field at all (`Evaluate.swift:54-135`), so a tool-bearing request's OWN sampling
+    // knobs are exactly what reaches these gates. To make the "tool-bearing" framing more than a
+    // comment, these tests derive those sampling knobs from a genuine, JSON-decoded
+    // `OpenAIChatCompletionRequest` that carries a real `tools` array, through
+    // `ServingSamplingPolicy.resolve(from:)` — the same production seam every serving backend
+    // (`ContinuousServingBackend`/`ExactQwen35MTPServingBackend`) uses to turn a request into a
+    // sampling decision — rather than writing `.sampled(temperature: 1.0, ...)` by hand.
+
+    private static let toolBearingThinkingPresetRequestJSON = """
+        {"model":"qwen3","messages":[
+          {"role":"user","content":"do you have the RTX 6000 Ada in stock?"}
+        ],"tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0,"presence_penalty":0,"seed":42,"max_tokens":384}
+        """
+
+    private static let toolFreeThinkingPresetRequestJSON = """
+        {"model":"qwen3","messages":[
+          {"role":"user","content":"do you have the RTX 6000 Ada in stock?"}
+        ],"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0,"presence_penalty":0,"seed":42,"max_tokens":384}
+        """
+
+    /// Tools present, but the INSTRUCT preset (temperature 0.7, outside
+    /// `sharedSampledMTPSupportsPredicate`'s `temperature == 1` requirement) — the anti-vacuity
+    /// companion: a request that SHOULD be refused must still be refused with tools present.
+    private static let toolBearingInstructPresetRequestJSON = """
+        {"model":"qwen3","messages":[
+          {"role":"user","content":"do you have the RTX 6000 Ada in stock?"}
+        ],"tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"temperature":0.7,"top_p":1.0,"max_tokens":384}
+        """
+
+    private func requireSampledPolicy(
+        _ policy: ServingSamplingPolicy, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> (temperature: Double, topP: Double, topK: Int?, minP: Double?, seed: Int64?) {
+        guard case let .sampled(temperature, topP, topK, minP, seed) = policy else {
+            XCTFail("expected a .sampled policy, got \(policy)", file: file, line: line)
+            throw XCTSkip("unreachable")
+        }
+        return (temperature, topP, topK, minP, seed)
+    }
+
+    /// Item 1: admission (`supports(parameters:)`) is unaffected by tools. Resolving the
+    /// tool-bearing and tool-free requests through `ServingSamplingPolicy.resolve(from:)` first —
+    /// and asserting the two resolved policies are EQUAL — is the real, non-vacuous proof: that
+    /// function's own signature reads only `temperature`/`topP`/`topK`/`minP`/`seed` off the
+    /// request, never `tools`, so if a future change threaded `tools` into resolution this
+    /// assertion would catch the divergence directly, rather than merely restating "these two
+    /// hand-built `GenerateParameters` values happen to match."
+    func testSampledProviderSupportsVerdictIsUnaffectedByToolsPresenceAtTheDeployedThinkingPreset()
+        throws
+    {
+        let toolBearingRequest = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(Self.toolBearingThinkingPresetRequestJSON.utf8))
+        let toolFreeRequest = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(Self.toolFreeThinkingPresetRequestJSON.utf8))
+        XCTAssertFalse(
+            toolBearingRequest.tools.isEmpty, "fixture sanity: this request must actually carry a tool")
+        XCTAssertTrue(toolFreeRequest.tools.isEmpty, "fixture sanity: this request must carry none")
+
+        let toolBearingPolicy = try ServingSamplingPolicy.resolve(from: toolBearingRequest)
+        let toolFreePolicy = try ServingSamplingPolicy.resolve(from: toolFreeRequest)
+        XCTAssertEqual(
+            toolBearingPolicy, toolFreePolicy,
+            "tools must not change what a request resolves to at the real serving boundary")
+
+        let resolved = try requireSampledPolicy(toolBearingPolicy)
+        let parameters = GenerateParameters(
+            temperature: Float(resolved.temperature),
+            topP: Float(resolved.topP),
+            topK: resolved.topK ?? 0,
+            minP: Float(resolved.minP ?? 0),
+            presencePenalty: Float(toolBearingRequest.presencePenalty ?? 0))
+        let provider = SeededSampledMTPBlockRuntimeProvider(
+            seed: 1,
+            truncation: SampledMTPSamplingTruncation(parameters: parameters))
+
+        // Both requests resolve to the identical policy (asserted above), so both produce the
+        // identical `GenerateParameters` and therefore the identical verdict — evaluated twice
+        // below under the two labels the intersection actually cares about.
+        XCTAssertTrue(
+            provider.supports(parameters: parameters),
+            "the deployed thinking preset, tools present, must be admitted")
+        XCTAssertTrue(
+            provider.supports(parameters: parameters),
+            "the deployed thinking preset, tools absent (identical resolved parameters), must be "
+                + "admitted identically")
+
+        // Anti-vacuity companion: tools present, but a preset that SHOULD be refused. Without this
+        // arm, a `supports()` that returned `true` unconditionally would have passed both
+        // assertions above too.
+        let instructPresetRequest = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(Self.toolBearingInstructPresetRequestJSON.utf8))
+        XCTAssertFalse(instructPresetRequest.tools.isEmpty)
+        let instructResolved = try requireSampledPolicy(
+            try ServingSamplingPolicy.resolve(from: instructPresetRequest))
+        let instructParameters = GenerateParameters(
+            temperature: Float(instructResolved.temperature),
+            topP: Float(instructResolved.topP),
+            topK: instructResolved.topK ?? 0,
+            minP: Float(instructResolved.minP ?? 0),
+            presencePenalty: Float(instructPresetRequest.presencePenalty ?? 0))
+        XCTAssertFalse(
+            provider.supports(parameters: instructParameters),
+            "an unsupported (non-temperature-1) preset must still be refused, tools notwithstanding")
+    }
+
+    /// Item 2 (eligible arm): the SAME tool-bearing thinking-preset request, run all the way
+    /// through a real `MTPSpeculativeDecoder` against a requires-greedy drafter with
+    /// `sampledBlockDecisionsEnabled: true`. `providerIsEligible` becomes true, so the
+    /// greedy-requirement passthrough's `!providerIsEligible` conjunct is false and that gate never
+    /// fires — speculation engages (`initialPassthroughReason == nil` at
+    /// `MTPSpeculativeTokenIterator.swift:169-183`). This file's own mocks never call the
+    /// `sampler` argument `draftBlock` receives (see the file header, caveat 3), so the provider's
+    /// `decide()` still degrades to a DIFFERENT, provider-only sticky passthrough — reaching that
+    /// exact reason is itself the proof `providerIsEligible` really flipped true, mirroring
+    /// `testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndDeployedPresetEscapesGreedyPassthrough`
+    /// above, but with the sampling knobs pulled from a genuine tool-bearing request instead of
+    /// written by hand.
+    func testToolBearingSampledRequestWithEligibleProviderEscapesGreedyPassthrough() async throws {
+        let request = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(Self.toolBearingThinkingPresetRequestJSON.utf8))
+        XCTAssertFalse(request.tools.isEmpty, "fixture sanity: this request must actually carry a tool")
+        let resolved = try requireSampledPolicy(try ServingSamplingPolicy.resolve(from: request))
+
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(
+                temperature: resolved.temperature, topP: resolved.topP, topK: resolved.topK,
+                minP: resolved.minP, seed: resolved.seed)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "a tool-bearing, truncation-matched sampled request against a requires-greedy drafter "
+                + "with sampledBlockDecisionsEnabled must reach the provider seam, not silently stay "
+                + "on the ordinary sampler path")
+        XCTAssertFalse(
+            reason.contains("requires temperature == 0"),
+            "the greedy-requirement passthrough -- the ONE gate this test exists to prove a "
+                + "tool-bearing request does not trip differently -- must not fire once "
+                + "providerIsEligible is true; got: \(reason)")
+        XCTAssertTrue(
+            reason.contains("sampled MTP block decision failed"),
+            "expected the provider-specific degradation reason, got: \(reason)")
+    }
+
+    /// Item 2 (ineligible arm, the decisive control): the identical tool-bearing request, with
+    /// exactly ONE variable changed from the test above -- `sampledBlockDecisionsEnabled` left at
+    /// its default `false` -- so `providerIsEligible` is unconditionally false and the real
+    /// production drafter's greedy-requirement passthrough fires, with its EXACT reason string.
+    func testToolBearingSampledRequestWithIneligibleProviderStillTakesGreedyPassthrough() async throws
+    {
+        let request = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(Self.toolBearingThinkingPresetRequestJSON.utf8))
+        XCTAssertFalse(request.tools.isEmpty, "fixture sanity: this request must actually carry a tool")
+        let resolved = try requireSampledPolicy(try ServingSamplingPolicy.resolve(from: request))
+
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        // Deliberately NOT passing `sampledBlockDecisionsEnabled:` -- the default every
+        // pre-existing call site uses, and the production default this control protects.
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(
+                temperature: resolved.temperature, topP: resolved.topP, topK: resolved.topK,
+                minP: resolved.minP, seed: resolved.seed)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "against a requires-greedy drafter with the flag off, this tool-bearing sampled "
+                + "request must still take today's unmodified greedy-requirement passthrough")
+        XCTAssertEqual(
+            reason,
+            "Qwen MTP currently requires temperature == 0; generating without speculation",
+            "expected the EXACT greedy-requirement passthrough reason string, got: \(reason)")
     }
 
     // MARK: - 8. Per-request telemetry delta (observability)

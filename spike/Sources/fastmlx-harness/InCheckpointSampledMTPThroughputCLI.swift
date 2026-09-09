@@ -38,23 +38,61 @@ import Tokenizers
 let inCheckpointSampledMTPThroughputRequiredPromptCount = 8
 let inCheckpointSampledMTPThroughputRequiredMaxTokens = 256
 
-/// C2's target interval center: the acceptance measurement's pooled-over-proposed implied
-/// acceptance rate on record (`docs/task-inbox/2026-09-09-sampled-mtp-acceptance-MEASURED.md`).
-/// Named so the +/-0.05 absolute tolerance below is legible independent of this literal.
-let inCheckpointSampledMTPThroughputExpectedImpliedAcceptance = 0.6879
+/// C2's target interval center: the TRUNCATED acceptance run's pooled-over-proposed implied
+/// acceptance rate, harness `d555bb74` (release, heavy host, 8 clean streams, 0 excluded, all
+/// sigma agreement checks AGREE), measured at the deployed thinking preset (`top_p=0.95,
+/// top_k=20`) -- see
+/// `docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-PREDECLARATION.md`, "Part A3 --
+/// control re-centering" and "Part B". `0.6706` is the midpoint of the two providers' truncated
+/// measured values (seeded `0.6632`, nondeterministic `0.6780`) -- the SAME midpoint convention by
+/// which the prior (untruncated) `0.6879` was the midpoint of the two providers' untruncated
+/// measured values (`0.6810`, `0.6947`). Named so the +/-0.05 absolute tolerance below is legible
+/// independent of this literal.
+let inCheckpointSampledMTPThroughputExpectedImpliedAcceptance = 0.6706
 let inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute = 0.05
 
-/// C3's target: the reciprocal of the independently measured `T = 0.0381` s/token from the
-/// acceptance run on the same host/artifact (predeclaration, control 3).
-let inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond = 26.24
-let inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction = 0.15
+/// C3's target: the mean of `1/T` across the two TRUNCATED acceptance run arms, harness
+/// `d555bb74` (release, heavy host, 8 clean streams, 0 excluded, all sigma agreement checks
+/// AGREE), measured at the deployed thinking preset (`top_p=0.95, top_k=20`) -- see
+/// `docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-PREDECLARATION.md`, "Part A3 --
+/// control re-centering" and "Part B". `25.828` is the mean of `1/0.038799 = 25.774` (seeded) and
+/// `1/0.038637 = 25.882` (nondeterministic).
+let inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond = 25.828
+/// Tightened from the untruncated regime's `+/- 15%`: the two instruments (this CLI's scalar arm
+/// and the acceptance CLI's `T`) were shown to agree on the untruncated baseline to 0.4%, so a 15%
+/// window was ~37x looser than demonstrated reproducibility and could only catch gross
+/// misconfiguration, not a real regression. Also: `1/T` is structurally an UPPER bound on this
+/// arm's rate under truncation -- the scalar arm additionally pays the sampler, which under
+/// truncation is a full-vocabulary sort chain (`TopPSampler`) per emitted token rather than one
+/// `categorical` call -- so a measured value below `25.828` is expected, and a value at or above
+/// it would itself be a finding, not a cleaner pass.
+let inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction = 0.05
 
-/// The predeclared band boundaries (predeclaration, "Predeclared bands"). Both the REJECT
-/// median ceiling and the ACCEPT per-prompt floor share this same numeric value (1.10) by the
-/// predeclaration's own text; one named constant for both keeps that coincidence visible instead
-/// of duplicating the literal.
-let inCheckpointSampledMTPThroughputBandLowThreshold = 1.10
-let inCheckpointSampledMTPThroughputBandHighThreshold = 1.30
+/// The predeclared band boundaries
+/// (`docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-PREDECLARATION.md`, "Part A --
+/// product decision band"). This band decides an OPERATIONAL switch on an already-built opt-in
+/// (`--qwen4exp-sampled-mtp`), not whether to build it -- that decision, and its 1.10/1.30
+/// thresholds, was made and spent under the untruncated regime. Both the REJECT median ceiling
+/// and the ACCEPT per-prompt floor share this same numeric value (1.05) by the predeclaration's
+/// own text; one named constant for both keeps that coincidence visible instead of duplicating
+/// the literal.
+let inCheckpointSampledMTPThroughputBandLowThreshold = 1.05
+let inCheckpointSampledMTPThroughputBandHighThreshold = 1.20
+
+// MARK: - Truncated acceptance run predeclared vectors (seeded replay control)
+//
+// The seeded per-prompt `(proposedCount, acceptedCount)` vectors from the SAME truncated
+// acceptance run cited above, in prompt order -- predeclared in
+// `docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-PREDECLARATION.md`, "Part B", for
+// the exact-equality seeded replay control (see
+// `inCheckpointSampledMTPThroughputSeededReplayComparison` below). Applies to `--provider seeded`
+// only; `nondeterministic` has no predeclared per-prompt vector to replay against.
+let inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededProposedCounts: [Int] = [
+    220, 210, 247, 221, 199, 214, 225, 213,
+]
+let inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededAcceptedCounts: [Int] = [
+    144, 150, 131, 143, 155, 148, 141, 148,
+]
 
 // MARK: - CLI arguments
 //
@@ -212,7 +250,8 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
             return "ABORT: scalar-arm mean tok/s \(String(format: "%.4f", observed)) is outside "
                 + "\(String(format: "%.4f", expected)) +/- \(String(format: "%.0f", toleranceFraction * 100))% "
                 + "-- this run is measuring something other than what the independently measured "
-                + "T = 0.0381 s/token measured; the comparison is void"
+                + "T = 0.038799s/token (seeded) / 0.038637s/token (nondeterministic) truncated "
+                + "acceptance run measured; the comparison is void"
         }
     }
 }
@@ -352,15 +391,18 @@ enum InCheckpointSampledMTPThroughputBand: String, Codable, Equatable, Sendable 
 }
 
 /// The predeclaration's INFORMATIONAL band classification (never enforced by this CLI as an exit
-/// code) -- see "Predeclared bands":
-///   - REJECT: `median <= 1.10`.
-///   - ACCEPT: `median >= 1.30` AND `minPerPromptRatio >= 1.10`.
-///   - GATED: everything else -- including the case where the median clears 1.30 but at least one
-///     per-prompt ratio is below 1.10. That case is deliberately GATED, not ACCEPT: "a median
+/// code) -- see
+/// `docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-PREDECLARATION.md`, "Part A --
+/// product decision band". This band decides an OPERATIONAL switch on an already-built opt-in, not
+/// whether to build it:
+///   - REJECT: `median <= 1.05`.
+///   - ACCEPT: `median >= 1.20` AND `minPerPromptRatio >= 1.05`.
+///   - GATED: everything else -- including the case where the median clears 1.20 but at least one
+///     per-prompt ratio is below 1.05. That case is deliberately GATED, not ACCEPT: "a median
 ///     carried by two prompts while others regress is not a speedup a user experiences"
 ///     (predeclaration).
-/// REJECT is checked first so the two boundaries (both literally `1.10`) cannot both match and
-/// leave the outcome to case-order ambiguity: a median at or below 1.10 is REJECT regardless of
+/// REJECT is checked first so the two boundaries (both literally `1.05`) cannot both match and
+/// leave the outcome to case-order ambiguity: a median at or below 1.05 is REJECT regardless of
 /// what any single per-prompt ratio is.
 func inCheckpointSampledMTPThroughputBand(
     medianRatio: Double, minPerPromptRatio: Double
@@ -401,6 +443,61 @@ func inCheckpointSampledMTPThroughputImpliedAcceptanceControlPasses(
     toleranceAbsolute: Double = inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute
 ) -> Bool {
     abs(observed - expected) <= toleranceAbsolute
+}
+
+struct InCheckpointSampledMTPThroughputSeededReplayComparison: Codable, Equatable, Sendable {
+    /// `false` only for `provider != .seeded` -- `nondeterministic` has no predeclared per-prompt
+    /// vector to replay against (predeclaration, Part A3: "`+/- 0.05` remains the band for
+    /// `nondeterministic`").
+    let applicable: Bool
+    /// `false` when the observed and expected vectors are not even the same shape -- in that case
+    /// there is nothing to compare per-prompt and `perPromptMatches` is empty.
+    let lengthMatched: Bool
+    let perPromptMatches: [Bool]
+    let allMatched: Bool
+}
+
+/// C2's decisive form for `--provider seeded` ONLY (predeclaration, Part A3, "C2 gains a decisive
+/// form for seeded"): compares this run's own per-prompt `(proposedCount, acceptedCount)` vectors
+/// against the truncated acceptance run's predeclared vectors
+/// (`inCheckpointSampledMTPThroughputTruncatedAcceptanceSeeded{Proposed,Accepted}Counts`, harness
+/// `d555bb74`). The untruncated run showed the seeded arm replays bit-identically across the two
+/// instruments -- the tee sampler forwards `inner.sample(logits:)` unchanged and the measuring
+/// provider delegates `decide` unchanged -- so exact equality is structurally expected here too; a
+/// mismatch is a real finding about differing-graph kernel-selection nondeterminism, not a reason
+/// to void the measurement.
+///
+/// INFORMATIONAL ONLY, by construction: this function has no throwing path and returns a plain
+/// value describing the comparison, never a verdict the caller is expected to gate on. "If exact
+/// equality fails the run is not void -- the band still governs and the miss is reported as a
+/// finding" (predeclaration). Returns `applicable: false` for any provider other than `.seeded`,
+/// without comparing anything.
+func inCheckpointSampledMTPThroughputSeededReplayComparison(
+    provider: InCheckpointSampledMTPAcceptanceProviderKind,
+    observedProposedCounts: [Int],
+    observedAcceptedCounts: [Int],
+    expectedProposedCounts: [Int] = inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededProposedCounts,
+    expectedAcceptedCounts: [Int] = inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededAcceptedCounts
+) -> InCheckpointSampledMTPThroughputSeededReplayComparison {
+    guard provider == .seeded else {
+        return InCheckpointSampledMTPThroughputSeededReplayComparison(
+            applicable: false, lengthMatched: false, perPromptMatches: [], allMatched: false)
+    }
+    guard
+        observedProposedCounts.count == observedAcceptedCounts.count,
+        observedProposedCounts.count == expectedProposedCounts.count,
+        expectedProposedCounts.count == expectedAcceptedCounts.count
+    else {
+        return InCheckpointSampledMTPThroughputSeededReplayComparison(
+            applicable: true, lengthMatched: false, perPromptMatches: [], allMatched: false)
+    }
+    let perPromptMatches = (0..<observedProposedCounts.count).map { index in
+        observedProposedCounts[index] == expectedProposedCounts[index]
+            && observedAcceptedCounts[index] == expectedAcceptedCounts[index]
+    }
+    return InCheckpointSampledMTPThroughputSeededReplayComparison(
+        applicable: true, lengthMatched: true, perPromptMatches: perPromptMatches,
+        allMatched: perPromptMatches.allSatisfy { $0 })
 }
 
 /// C3, pooled: scalar-arm mean tok/s must be within `+/- toleranceFraction` (relative) of
@@ -617,6 +714,11 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
     var scalarRates: [Double] = []
     var speculativeRates: [Double] = []
     var ratios: [Double] = []
+    // Per-prompt vectors feeding the seeded replay control (informational only -- see
+    // `inCheckpointSampledMTPThroughputSeededReplayComparison`), populated for every provider even
+    // though the comparison itself only applies to `.seeded`.
+    var perPromptProposedCounts: [Int] = []
+    var perPromptAcceptedCounts: [Int] = []
 
     for (promptIndex, prompt) in prompts.enumerated() {
         let promptTokens = context.tokenizer.encode(text: prompt)
@@ -770,6 +872,8 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
         scalarRates.append(scalarTokensPerSecond)
         speculativeRates.append(speculativeResult.tokensPerSecond)
         ratios.append(ratio)
+        perPromptProposedCounts.append(speculativeResult.proposedCount)
+        perPromptAcceptedCounts.append(speculativeResult.acceptedCount)
     }
 
     guard let medianRatio = inCheckpointSampledMTPThroughputMedianRatio(ratios),
@@ -816,6 +920,46 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
             + "\(String(format: "%.4f", inCheckpointSampledMTPThroughputExpectedImpliedAcceptance)) "
             + "+/- \(inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute)): "
             + (impliedAcceptancePassed ? "PASS" : "FAIL"))
+
+    // C2's decisive form for seeded (predeclaration, Part A3) -- INFORMATIONAL ONLY, printed
+    // unconditionally (even if C2's band check above is about to abort the run) and NEVER thrown
+    // on: "If exact equality fails the run is not void -- the band still governs and the miss is
+    // reported as a finding." This block has no `throw` and no `guard ... else { throw }` -- it
+    // only ever calls `print`.
+    let seededReplayComparison = inCheckpointSampledMTPThroughputSeededReplayComparison(
+        provider: parsed.provider,
+        observedProposedCounts: perPromptProposedCounts,
+        observedAcceptedCounts: perPromptAcceptedCounts)
+    if !seededReplayComparison.applicable {
+        print(
+            "seeded replay check (informational, cannot abort the run): does not apply to "
+                + "provider=\(parsed.provider.rawValue) -- only --provider seeded has a predeclared "
+                + "per-prompt vector to replay against")
+    } else if !seededReplayComparison.lengthMatched {
+        print(
+            "seeded replay check (informational, cannot abort the run): length mismatch -- "
+                + "observed \(perPromptProposedCounts.count) prompt(s), predeclared "
+                + "\(inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededProposedCounts.count) "
+                + "-- not comparable per-prompt; this is a finding, not a run-voiding condition")
+    } else {
+        for (index, matched) in seededReplayComparison.perPromptMatches.enumerated() {
+            print(
+                "seeded replay check (informational, cannot abort the run) prompt[\(index)]: "
+                    + "observed=(proposed=\(perPromptProposedCounts[index]), "
+                    + "accepted=\(perPromptAcceptedCounts[index])) predeclared=(proposed="
+                    + "\(inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededProposedCounts[index]), "
+                    + "accepted="
+                    + "\(inCheckpointSampledMTPThroughputTruncatedAcceptanceSeededAcceptedCounts[index])) "
+                    + "-- \(matched ? "MATCH" : "MISMATCH")")
+        }
+        print(
+            "seeded replay check (informational, cannot abort the run) verdict: "
+                + (seededReplayComparison.allMatched
+                    ? "ALL MATCH (exact equality, as structurally expected)"
+                    : "AT LEAST ONE MISMATCH -- a finding to explain, not a reason to void this "
+                        + "run; the band below still governs"))
+    }
+
     guard let impliedAcceptance, impliedAcceptancePassed else {
         throw InCheckpointSampledMTPThroughputCLIError.impliedAcceptanceOutOfBand(
             observed: impliedAcceptance ?? .nan, proposedCount: pooledProposedCount,

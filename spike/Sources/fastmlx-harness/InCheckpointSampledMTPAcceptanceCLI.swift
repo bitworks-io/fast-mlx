@@ -448,7 +448,13 @@ func inCheckpointSampledMTPIndependentSoftmax(_ logits: [Double]) throws -> [Dou
 ///   4. top_k (applied only when `topK > 0 && topK < vocabularySize`): keep the `topK` highest
 ///      remaining log-probabilities, mask the rest.
 ///   5. `softmax(masked / temperature)`, with masked entries mapping to exactly `0.0`.
-private func independentTruncatedProbabilities(
+///
+/// `internal` (not `private`), matching every sibling pure function above in this file
+/// (`inCheckpointSampledMTPIndependentSoftmax` etc.) that `@testable import fastmlx_harness` calls
+/// directly from `InCheckpointSampledMTPAcceptanceArithmeticTests.swift` -- this affects only Swift
+/// access control, not the independence contract above: the body still never calls
+/// `truncatedSamplingProbabilities` or any other `MLXLMCommon` helper.
+func independentTruncatedProbabilities(
     logits: [Double], temperature: Double, topP: Double, topK: Int, minP: Double
 ) throws -> [Double] {
     guard !logits.isEmpty else {
@@ -572,6 +578,101 @@ func inCheckpointSampledMTPAssertIndependentTruncationControls() {
             + "more than 0.05 on at least one entry (observed max|delta|=\(maxAbsoluteDelta)) -- "
             + "otherwise the identity control above cannot distinguish a correct implementation "
             + "from one where truncation is silently a no-op")
+}
+
+// MARK: - Truncation binding instrumentation
+//
+// At the deployed preset (`top_p=0.95, top_k=20`) the two filters run in series and, per drafted
+// position, one is almost always inert: if the 0.95 nucleus alone holds more than 20 tokens, top_k
+// binds (trims the nucleus down to exactly `topK`) and top_p was the effective filter; if the
+// nucleus holds fewer than 20, top_k never removes anything and top_p was the effective filter.
+// Nothing about "measured at the deployed preset" is evidence of which filter actually bound
+// without recording this per position -- these types/functions make that observable in the output
+// instead of merely asserted.
+
+/// Which truncation filter was the one that actually bound at one drafted position, derived from
+/// `supportSize` (the count of strictly-nonzero entries in `independentTruncatedProbabilities`'s
+/// returned target distribution `p`) and the run's own `topK`. Scoped to the `topK > 0` regime this
+/// run measures (`top_p=0.95, top_k=20`-shaped): `topK <= 0` (top_k disabled) always classifies as
+/// `.untruncated` here even if `topP` alone is truncating, because that combination is not the
+/// regime this instrument exists to characterize.
+enum InCheckpointSampledMTPTruncationBindingClass: String, Codable, Equatable, Sendable {
+    /// `supportSize == topK`: top_k is the filter that removed the last entries -- the nucleus held
+    /// at least `topK` tokens before top_k ran.
+    case topKBinding
+    /// `supportSize < topK`: top_k found fewer than `topK` surviving candidates and was a no-op --
+    /// top_p (or min_p) is what actually shaped the final support.
+    case topPBinding
+    /// `topK <= 0`: top_k is disabled outright for this run.
+    case untruncated
+}
+
+/// Classifies one drafted position's truncation outcome. `supportSize` must already be the count of
+/// strictly-nonzero entries in the SAME `p` this run measured (see the call site in
+/// `InCheckpointMeasuringSampledMTPBlockRuntimeProvider.measuredDecide`) -- never recomputed from a
+/// second, independently invented distribution.
+func inCheckpointSampledMTPClassifyTruncationBinding(
+    supportSize: Int, topK: Int
+) -> InCheckpointSampledMTPTruncationBindingClass {
+    guard topK > 0 else { return .untruncated }
+    return supportSize == topK ? .topKBinding : .topPBinding
+}
+
+/// Pooled `min`/`median`/`max`/`count` over a set of per-position `supportSize` values. A dedicated
+/// `Int`-keyed summary (not a reuse of `InCheckpointSampledMTPDoubleSummary`, which has no `median`
+/// field and is shared by unrelated `Double` timing summaries elsewhere in this file) so adding
+/// `median` here cannot ripple into those call sites.
+struct InCheckpointSampledMTPTruncationSupportSummary: Codable, Equatable, Sendable {
+    let min: Int
+    let median: Double
+    let max: Int
+    let count: Int
+}
+
+/// `median` here is the textbook even/odd-count average-of-middle-two-or-take-middle definition,
+/// computed on a SORTED COPY of `values` (never mutates the caller's array).
+func inCheckpointSampledMTPSummarizeTruncationSupport(
+    _ values: [Int]
+) -> InCheckpointSampledMTPTruncationSupportSummary? {
+    guard !values.isEmpty else { return nil }
+    let sorted = values.sorted()
+    let mid = sorted.count / 2
+    let median: Double =
+        sorted.count % 2 == 0
+        ? Double(sorted[mid - 1] + sorted[mid]) / 2.0
+        : Double(sorted[mid])
+    return InCheckpointSampledMTPTruncationSupportSummary(
+        min: sorted.first!, median: median, max: sorted.last!, count: sorted.count)
+}
+
+/// Classification counts plus the support-size summary for one pool of `supportSize` samples --
+/// factored out so the per-stream, per-step-pooled, and run-pooled call sites (all three classify
+/// the SAME way against the SAME `topK`) cannot drift into three separate implementations.
+struct InCheckpointSampledMTPTruncationBindingCounts: Equatable, Sendable {
+    let topKBindingCount: Int
+    let topPBindingCount: Int
+    let untruncatedCount: Int
+    let supportSizeSummary: InCheckpointSampledMTPTruncationSupportSummary?
+}
+
+func inCheckpointSampledMTPClassifyTruncationBindings(
+    supportSizes: [Int], topK: Int
+) -> InCheckpointSampledMTPTruncationBindingCounts {
+    var topKBindingCount = 0
+    var topPBindingCount = 0
+    var untruncatedCount = 0
+    for supportSize in supportSizes {
+        switch inCheckpointSampledMTPClassifyTruncationBinding(supportSize: supportSize, topK: topK) {
+        case .topKBinding: topKBindingCount += 1
+        case .topPBinding: topPBindingCount += 1
+        case .untruncated: untruncatedCount += 1
+        }
+    }
+    return InCheckpointSampledMTPTruncationBindingCounts(
+        topKBindingCount: topKBindingCount,
+        topPBindingCount: topPBindingCount,
+        untruncatedCount: untruncatedCount,
+        supportSizeSummary: inCheckpointSampledMTPSummarizeTruncationSupport(supportSizes))
 }
 
 /// `Sigma_x min(p(x), q(x))` -- the exact per-step sampled-MTP acceptance probability under the
@@ -941,6 +1042,12 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
     /// drafted position in one parallel call, so every step's target/draft row pair exists whether
     /// or not that step was ultimately reached by the sequential walk.
     private(set) var sigmaMinPQByStep: [Int: [InCheckpointSampledMTPStepSigmaSample]] = [:]
+    /// `truncationSupportSizeByStep[i]` collects, per block, the count of strictly-nonzero entries
+    /// in that block's OWN `p` at drafted position `i` -- i.e. how many vocabulary entries survived
+    /// truncation. Recorded alongside `sigmaMinPQByStep` above (same loop, same already-computed
+    /// `p`, no second MLX evaluation) so a reader can later classify which filter bound (see
+    /// `inCheckpointSampledMTPClassifyTruncationBinding`) instead of only asserting it did.
+    private(set) var truncationSupportSizeByStep: [Int: [Int]] = [:]
 
     init(
         inner: any SampledMTPBlockRuntimeDeciding,
@@ -1071,6 +1178,11 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
                 let sigma = inCheckpointSampledMTPSigmaMinPQ(target: p, draft: q)
                 sigmaMinPQByStep[index, default: []].append(
                     (sigma: sigma, acceptedDraftCount: decision.acceptedDraftCount))
+                // One pass over `p` (already allocated above, no second MLX evaluation): count of
+                // strictly-nonzero entries is exactly how many vocabulary entries this position's
+                // truncation left standing -- see `InCheckpointSampledMTPTruncationBindingClass`.
+                let supportSize = p.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+                truncationSupportSizeByStep[index, default: []].append(supportSize)
             }
         }
         decideDurationsSeconds.append(elapsed)
@@ -1125,6 +1237,16 @@ struct InCheckpointSampledMTPAcceptanceStepReport: Codable, Equatable, Sendable 
     /// 0` -- never fabricated as `0.0`.
     let sigmaMinPQMeanConditionedOnReached: Double?
     let sigmaMinPQConditionedBlockCount: Int
+    /// Per-position truncation-binding classification counts at this step, over the SAME blocks
+    /// `sigmaMinPQBlockCount` above pools (unconditional, every block regardless of reached) -- see
+    /// `InCheckpointSampledMTPTruncationBindingClass`. The three counts always sum to
+    /// `sigmaMinPQBlockCount`.
+    let topKBindingCount: Int
+    let topPBindingCount: Int
+    let untruncatedCount: Int
+    /// `nil` only when this step has zero blocks (mirrors `inCheckpointSampledMTPSummarize`'s own
+    /// `nil`-on-empty convention elsewhere in this file).
+    let truncationSupportSize: InCheckpointSampledMTPTruncationSupportSummary?
 }
 
 struct InCheckpointSampledMTPAcceptanceStreamReport: Codable, Equatable, Sendable {
@@ -1305,6 +1427,7 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     var cleanDraftBlockSeconds = 0.0
     var cleanDraftBlockCount = 0
     var cleanSigmaByStep: [Int: [InCheckpointSampledMTPStepSigmaSample]] = [:]
+    var cleanTruncationSupportSizeByStep: [Int: [Int]] = [:]
 
     for (promptIndex, prompt) in prompts.enumerated() {
         let promptTokens = context.tokenizer.encode(text: prompt)
@@ -1383,6 +1506,9 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         let streamStepReports = perStep.map { step -> InCheckpointSampledMTPAcceptanceStepReport in
             let sigmaSamples = measuring.sigmaMinPQByStep[step.stepIndex] ?? []
             let sigmaSummary = inCheckpointSampledMTPSummarizeStepSigma(sigmaSamples, stepIndex: step.stepIndex)
+            let supportSizes = measuring.truncationSupportSizeByStep[step.stepIndex] ?? []
+            let bindingCounts = inCheckpointSampledMTPClassifyTruncationBindings(
+                supportSizes: supportSizes, topK: samplingReport.topK)
             return InCheckpointSampledMTPAcceptanceStepReport(
                 stepIndex1Based: step.stepIndex + 1,
                 reachedCount: step.reachedCount,
@@ -1391,7 +1517,11 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
                 sigmaMinPQMean: sigmaSummary.unconditionalMean,
                 sigmaMinPQBlockCount: sigmaSummary.unconditionalCount,
                 sigmaMinPQMeanConditionedOnReached: sigmaSummary.conditionedMean,
-                sigmaMinPQConditionedBlockCount: sigmaSummary.conditionedCount)
+                sigmaMinPQConditionedBlockCount: sigmaSummary.conditionedCount,
+                topKBindingCount: bindingCounts.topKBindingCount,
+                topPBindingCount: bindingCounts.topPBindingCount,
+                untruncatedCount: bindingCounts.untruncatedCount,
+                truncationSupportSize: bindingCounts.supportSizeSummary)
         }
         let streamAcceptance = inCheckpointSampledMTPPooledAcceptance(measuring.blockOutcomes)
 
@@ -1424,6 +1554,9 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         for (step, samples) in measuring.sigmaMinPQByStep {
             cleanSigmaByStep[step, default: []].append(contentsOf: samples)
         }
+        for (step, supportSizes) in measuring.truncationSupportSizeByStep {
+            cleanTruncationSupportSizeByStep[step, default: []].append(contentsOf: supportSizes)
+        }
         let phases = mtpIterator.speculativeDecodingPhaseTelemetry
         cleanDraftBlockSeconds += phases.draftBlockSeconds
         cleanDraftBlockCount += phases.draftBlockCount
@@ -1454,6 +1587,9 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     let pooledStepReports = pooledPerStep.map { step -> InCheckpointSampledMTPAcceptanceStepReport in
         let sigmaSamples = cleanSigmaByStep[step.stepIndex] ?? []
         let sigmaSummary = inCheckpointSampledMTPSummarizeStepSigma(sigmaSamples, stepIndex: step.stepIndex)
+        let supportSizes = cleanTruncationSupportSizeByStep[step.stepIndex] ?? []
+        let bindingCounts = inCheckpointSampledMTPClassifyTruncationBindings(
+            supportSizes: supportSizes, topK: samplingReport.topK)
         return InCheckpointSampledMTPAcceptanceStepReport(
             stepIndex1Based: step.stepIndex + 1,
             reachedCount: step.reachedCount,
@@ -1462,7 +1598,11 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
             sigmaMinPQMean: sigmaSummary.unconditionalMean,
             sigmaMinPQBlockCount: sigmaSummary.unconditionalCount,
             sigmaMinPQMeanConditionedOnReached: sigmaSummary.conditionedMean,
-            sigmaMinPQConditionedBlockCount: sigmaSummary.conditionedCount)
+            sigmaMinPQConditionedBlockCount: sigmaSummary.conditionedCount,
+            topKBindingCount: bindingCounts.topKBindingCount,
+            topPBindingCount: bindingCounts.topPBindingCount,
+            untruncatedCount: bindingCounts.untruncatedCount,
+            truncationSupportSize: bindingCounts.supportSizeSummary)
     }
     let pooledAcceptance = inCheckpointSampledMTPPooledAcceptance(cleanOutcomes)
     let decideSummary = inCheckpointSampledMTPSummarize(cleanDecideSeconds)
@@ -1520,6 +1660,29 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
                 + " | unconditional mean="
                 + (step.sigmaMinPQMean.map { String(format: "%.4f", $0) } ?? "n/a")
                 + " n=\(step.sigmaMinPQBlockCount)")
+    }
+    // Pooled ACROSS ALL STEPS (not per-step, unlike the loop above) -- makes "measured at
+    // topP=\(samplingReport.topP) topK=\(samplingReport.topK)" evidence rather than an assertion:
+    // which filter actually bound at each drafted position, and how wide the surviving support was.
+    let allTruncationSupportSizes = cleanTruncationSupportSizeByStep.values.flatMap { $0 }
+    let pooledBindingCounts = inCheckpointSampledMTPClassifyTruncationBindings(
+        supportSizes: allTruncationSupportSizes, topK: samplingReport.topK)
+    let pooledPositionCount = allTruncationSupportSizes.count
+    if pooledPositionCount > 0 {
+        func fraction(_ count: Int) -> String {
+            String(format: "%.4f", Double(count) / Double(pooledPositionCount))
+        }
+        print(
+            "truncation binding (pooled across all steps, n=\(pooledPositionCount)): "
+                + "topKBinding=\(pooledBindingCounts.topKBindingCount) (\(fraction(pooledBindingCounts.topKBindingCount))) "
+                + "topPBinding=\(pooledBindingCounts.topPBindingCount) (\(fraction(pooledBindingCounts.topPBindingCount))) "
+                + "untruncated=\(pooledBindingCounts.untruncatedCount) (\(fraction(pooledBindingCounts.untruncatedCount)))")
+        if let supportSummary = pooledBindingCounts.supportSizeSummary {
+            print(
+                "truncation support size (pooled): min=\(supportSummary.min) "
+                    + "median=\(String(format: "%.1f", supportSummary.median)) max=\(supportSummary.max) "
+                    + "n=\(supportSummary.count)")
+        }
     }
     if let decideSummary {
         print(

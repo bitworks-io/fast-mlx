@@ -152,13 +152,13 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             manifest["articles"][-1],
             {
-                "source": "docs/content/2026-09-08-you-had-to-load-the-model-to-learn-it-would-not-load.md",
-                "slug": "you-had-to-load-the-model-to-learn-it-would-not-load",
+                "source": "docs/content/2026-09-09-a-ratio-is-not-a-result.md",
+                "slug": "a-ratio-is-not-a-result",
                 "status": "published",
-                "reviewedAt": "2026-09-08",
+                "reviewedAt": "2026-09-09",
             },
         )
-        self.assertEqual(article_count, 28)
+        self.assertEqual(article_count, 29)
 
     def test_capability_manifest_is_explicit_and_evidence_backed(self) -> None:
         articles = build_public_site.load_articles(REPOSITORY_ROOT)

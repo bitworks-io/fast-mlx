@@ -68,56 +68,58 @@ final class InCheckpointSampledMTPThroughputArithmeticTests: XCTestCase {
 
     // MARK: - inCheckpointSampledMTPThroughputBand
     //
-    // Predeclared bands (docs/task-inbox/2026-09-09-sampled-mtp-direct-throughput-
-    // PREDECLARATION.md, "Predeclared bands"):
-    //   REJECT: median <= 1.10
-    //   ACCEPT: median >= 1.30 AND every per-prompt ratio >= 1.10
+    // Predeclared bands (docs/task-inbox/2026-09-09-sampled-mtp-truncated-throughput-
+    // PREDECLARATION.md, "Part A -- product decision band"), re-centered from the untruncated
+    // contract's 1.10/1.30 to this contract's 1.05/1.20 -- this band governs an OPERATIONAL switch
+    // on an already-built opt-in, not whether to build it:
+    //   REJECT: median <= 1.05
+    //   ACCEPT: median >= 1.20 AND every per-prompt ratio >= 1.05
     //   GATED:  everything else
 
     func testBandAcceptsExactlyAtBothBoundaries() {
-        // median == 1.30 (the ACCEPT floor, inclusive) AND minPerPromptRatio == 1.10 (the
+        // median == 1.20 (the ACCEPT floor, inclusive) AND minPerPromptRatio == 1.05 (the
         // per-prompt floor, inclusive) -- both boundaries hit exactly.
-        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.30, minPerPromptRatio: 1.10)
+        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.20, minPerPromptRatio: 1.05)
 
         XCTAssertEqual(band, .accept)
     }
 
     func testBandIsGatedJustBelowTheAcceptMedianFloor() {
-        // median = 1.2999999... (just under 1.30) with a healthy min ratio -- must NOT accept.
+        // median = 1.1999999... (just under 1.20) with a healthy min ratio -- must NOT accept.
         let band = inCheckpointSampledMTPThroughputBand(
-            medianRatio: 1.2999999999, minPerPromptRatio: 1.20)
+            medianRatio: 1.1999999999, minPerPromptRatio: 1.10)
 
         XCTAssertEqual(band, .gated)
     }
 
     func testBandRejectsExactlyAtTheRejectCeiling() {
-        // median == 1.10 exactly -- REJECT (<=), regardless of what the min ratio is.
-        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.10, minPerPromptRatio: 1.10)
+        // median == 1.05 exactly -- REJECT (<=), regardless of what the min ratio is.
+        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.05, minPerPromptRatio: 1.05)
 
         XCTAssertEqual(band, .reject)
     }
 
     func testBandRejectsJustBelowTheRejectCeiling() {
         let band = inCheckpointSampledMTPThroughputBand(
-            medianRatio: 1.0999999999, minPerPromptRatio: 1.05)
+            medianRatio: 1.0499999999, minPerPromptRatio: 1.00)
 
         XCTAssertEqual(band, .reject)
     }
 
     func testBandIsGatedNotAcceptWhenMedianClearsFloorButAnyPerPromptRatioIsBelowTheFloor() {
-        // THE DISCRIMINATING CASE the per-prompt floor exists for: median comfortably clears 1.30
-        // (a strong pooled result), but at least one individual prompt regressed below 1.10 --
+        // THE DISCRIMINATING CASE the per-prompt floor exists for: median comfortably clears 1.20
+        // (a strong pooled result), but at least one individual prompt regressed below 1.05 --
         // "a median carried by two prompts while others regress is not a speedup a user
         // experiences" (predeclaration). This must be GATED, never ACCEPT.
-        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.50, minPerPromptRatio: 1.05)
+        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.50, minPerPromptRatio: 1.00)
 
         XCTAssertEqual(band, .gated)
     }
 
     func testBandIsGatedInTheOpenIntervalBetweenBoundaries() {
-        // median strictly between 1.10 and 1.30, min ratio irrelevant to this case (healthy) --
+        // median strictly between 1.05 and 1.20, min ratio irrelevant to this case (healthy) --
         // the direction stays open but is not licensed.
-        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.20, minPerPromptRatio: 1.20)
+        let band = inCheckpointSampledMTPThroughputBand(medianRatio: 1.10, minPerPromptRatio: 1.10)
 
         XCTAssertEqual(band, .gated)
     }
@@ -151,23 +153,24 @@ final class InCheckpointSampledMTPThroughputArithmeticTests: XCTestCase {
     }
 
     func testImpliedAcceptanceHandComputed() throws {
-        // accepted=6879, proposed=10000 -> 0.6879 exactly.
+        // accepted=6706, proposed=10000 -> 0.6706 exactly.
         let observed = try XCTUnwrap(
             inCheckpointSampledMTPThroughputImpliedAcceptance(
-                proposedCount: 10_000, acceptedCount: 6_879))
+                proposedCount: 10_000, acceptedCount: 6_706))
 
-        XCTAssertEqual(observed, 0.6879, accuracy: 1e-12)
+        XCTAssertEqual(observed, 0.6706, accuracy: 1e-12)
     }
 
     // Boundary tests below use `expected`/`toleranceAbsolute` values that are EXACTLY
     // representable in binary floating point (halves and quarters), and derive `observed` from
-    // them by addition/subtraction -- NOT the real predeclared constants (`0.6879`/`0.05`, hand-
-    // computed against in `testImpliedAcceptanceHandComputed` above). Decimal fractions like
-    // `0.6879 + 0.05` do not round-trip back to a double bit-identical to the literal `0.05`
-    // (floating-point addition/subtraction is not exactly invertible for non-representable
-    // fractions), which would make an "exactly at the boundary" test flaky on the specific
-    // constant rather than on the `<=` inclusivity this test actually targets. Representable
-    // values isolate that.
+    // them by addition/subtraction -- NOT the real predeclared constants (`0.6706`/`0.05`, hand-
+    // computed against in `testImpliedAcceptanceHandComputed` above; re-centered from the
+    // untruncated contract's `0.6879` on the truncated acceptance run, harness `d555bb74`). Decimal
+    // fractions like `0.6706 + 0.05` do not round-trip back to a double bit-identical to the
+    // literal `0.05` (floating-point addition/subtraction is not exactly invertible for non-
+    // representable fractions), which would make an "exactly at the boundary" test flaky on the
+    // specific constant rather than on the `<=` inclusivity this test actually targets.
+    // Representable values isolate that.
     func testImpliedAcceptanceControlPassesExactlyAtPlusTolerance() {
         let expected = 0.5
         let toleranceAbsolute = 0.25
@@ -292,5 +295,76 @@ final class InCheckpointSampledMTPThroughputArithmeticTests: XCTestCase {
         XCTAssertEqual(summary.min, 20.0)
         XCTAssertEqual(summary.max, 32.0)
         XCTAssertEqual(summary.count, 4)
+    }
+
+    // MARK: - inCheckpointSampledMTPThroughputSeededReplayComparison
+    //
+    // C2's decisive form for `--provider seeded` (predeclaration, Part A3): a NEVER-THROWING,
+    // purely informational comparison against the truncated acceptance run's predeclared
+    // per-prompt vectors -- "If exact equality fails the run is not void". None of these tests use
+    // `try`/`XCTAssertThrowsError`, because the function under test has no throwing signature at
+    // all: `func inCheckpointSampledMTPThroughputSeededReplayComparison(...) ->
+    // InCheckpointSampledMTPThroughputSeededReplayComparison` -- there is no error path to catch,
+    // by construction. That absence is itself the guarantee this test file pins.
+
+    func testSeededReplayComparisonNotApplicableForNondeterministicProvider() {
+        // `nondeterministic` has no predeclared per-prompt vector to replay against -- the
+        // function must report `applicable: false` without attempting any comparison, and must not
+        // crash on mismatched vector shapes it never even looks at.
+        let comparison = inCheckpointSampledMTPThroughputSeededReplayComparison(
+            provider: .nondeterministic,
+            observedProposedCounts: [1, 2, 3],
+            observedAcceptedCounts: [1])
+
+        XCTAssertFalse(comparison.applicable)
+        XCTAssertFalse(comparison.lengthMatched)
+        XCTAssertEqual(comparison.perPromptMatches, [])
+        XCTAssertFalse(comparison.allMatched)
+    }
+
+    func testSeededReplayComparisonExactMatch() {
+        // The truncated acceptance run's own predeclared vectors, fed back in as the "observed"
+        // vectors -- the structurally-expected exact-equality case.
+        let comparison = inCheckpointSampledMTPThroughputSeededReplayComparison(
+            provider: .seeded,
+            observedProposedCounts: [220, 210, 247, 221, 199, 214, 225, 213],
+            observedAcceptedCounts: [144, 150, 131, 143, 155, 148, 141, 148])
+
+        XCTAssertTrue(comparison.applicable)
+        XCTAssertTrue(comparison.lengthMatched)
+        XCTAssertEqual(comparison.perPromptMatches, Array(repeating: true, count: 8))
+        XCTAssertTrue(comparison.allMatched)
+    }
+
+    func testSeededReplayComparisonSingleElementMismatch() {
+        // Identical to the predeclared vectors except prompt[3]'s acceptedCount is off by one
+        // (143 -> 144) -- must report exactly one MISMATCH, at index 3, and `allMatched: false`,
+        // without throwing or aborting anything.
+        let comparison = inCheckpointSampledMTPThroughputSeededReplayComparison(
+            provider: .seeded,
+            observedProposedCounts: [220, 210, 247, 221, 199, 214, 225, 213],
+            observedAcceptedCounts: [144, 150, 131, 144, 155, 148, 141, 148])
+
+        XCTAssertTrue(comparison.applicable)
+        XCTAssertTrue(comparison.lengthMatched)
+        XCTAssertEqual(
+            comparison.perPromptMatches,
+            [true, true, true, false, true, true, true, true])
+        XCTAssertFalse(comparison.allMatched)
+    }
+
+    func testSeededReplayComparisonLengthMismatchReportsNotComparableRatherThanCrashing() {
+        // Observed only 3 prompts against the predeclared 8 -- the function must recognize the
+        // shape mismatch and report `lengthMatched: false` with an EMPTY `perPromptMatches` (never
+        // force-index out of bounds), rather than throwing or trapping.
+        let comparison = inCheckpointSampledMTPThroughputSeededReplayComparison(
+            provider: .seeded,
+            observedProposedCounts: [220, 210, 247],
+            observedAcceptedCounts: [144, 150, 131])
+
+        XCTAssertTrue(comparison.applicable)
+        XCTAssertFalse(comparison.lengthMatched)
+        XCTAssertEqual(comparison.perPromptMatches, [])
+        XCTAssertFalse(comparison.allMatched)
     }
 }

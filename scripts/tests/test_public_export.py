@@ -455,6 +455,16 @@ class PublicExportTests(unittest.TestCase):
         # the intersection its two neighbouring tests each covered only one axis of. All three
         # places moved together.
         #
+        # 903 -> 904 added, in one increment (one path, mode 100644):
+        # docs/content/2026-09-09-a-ratio-is-not-a-result.md -- a new article registered as
+        # published in site/publications.json, which article_pairs() requires before an article's
+        # source is added to the projected path set. It is ordinary already-reviewed content in
+        # the docs/content/ tree every sibling article already publishes from, and it
+        # carries no checkpoint text, no infrastructure detail, no machine-local path, and no
+        # internal implementation-family CamelCase name. The same increment edited one
+        # already-projected file in place (byte-only, no reseal of its own): site/publications.json
+        # gained the entry. All three places moved together.
+        #
         # 901 -> 903 added, in one increment (two paths, mode 100644):
         # spike/Tests/ServingCoreTests/SampledMTPServeArgumentTests.swift and
         # spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/TruncatedSamplingProbabilitiesTests.swift --
@@ -533,8 +543,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 903,
-                "pathModeSha256": "c661299a86cb3ec98ebcc0d94a4fd08a0425e79cdb526349a86e4ebf03b59724",
+                "pathCount": 904,
+                "pathModeSha256": "a982c53f50e90f59230c35a853c785bafcdf72cd34d872decc3ad22c4a2e7028",
             },
         )
 
@@ -628,7 +638,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 903)
+            self.assertEqual(reexport_count, 904)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
