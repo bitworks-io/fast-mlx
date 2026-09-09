@@ -518,6 +518,22 @@ class PublicExportTests(unittest.TestCase):
         # file in place (byte-only, no reseal of its own): Harness.swift gained the subcommand
         # dispatch and its usage text. All three places moved together.
         #
+        # 904 -> 906 added, across two commits in one cycle:
+        # spike/Tests/SpikeCoreTests/SampledMTPDegenerateTopPCharacterizationTests.swift
+        # (904 -> 905) and
+        # spike/Tests/SpikeCoreTests/ScalarTopPSamplerDegenerateTopPCharacterizationTests.swift
+        # (905 -> 906). Both characterize how a degenerate `top_p` behaves: the first on the
+        # speculative sampled-MTP truncation bridge, the second on the scalar `TopPSampler` arm,
+        # where a permuted-peak discriminator shows the scalar arm emits a WRONG token rather than
+        # failing closed. Confirmed to belong in public before reseal: both are ordinary XCTest
+        # coverage of already-projected SpikeCore contracts, they drive synthetic in-test logit
+        # fixtures rather than any real checkpoint, and each was marker-scanned to carry no
+        # internal family marker, infrastructure detail, or machine-local path. The stored seal had
+        # already moved to 906 while THIS literal and the `reexport_count` assertion below were
+        # both left at 904 -- the exact split-update failure this comment warns about, and it
+        # turned the public `public-boundary` CI job red at `bd28880a`. All three places move
+        # together here.
+        #
         # 891 -> 892 added, in one increment:
         # spike/Tests/SpikeServingAdaptersTests/ServingDeveloperRoleMappingTests.swift -- end-to-end
         # coverage for the render boundary's wire-role mapping: OpenAI's `developer` role is now
@@ -543,8 +559,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 904,
-                "pathModeSha256": "a982c53f50e90f59230c35a853c785bafcdf72cd34d872decc3ad22c4a2e7028",
+                "pathCount": 906,
+                "pathModeSha256": "4efebd0020a9bef0b03c588d87f082d6a7cd2afb55ba3ed180fc4899a73982ad",
             },
         )
 
@@ -638,7 +654,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 904)
+            self.assertEqual(reexport_count, 906)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
