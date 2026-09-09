@@ -71,6 +71,14 @@ struct InCheckpointSampledMTPThroughputArguments: Equatable, Sendable {
     let seed: UInt64
     let provider: InCheckpointSampledMTPAcceptanceProviderKind
     let outputJSONPath: String
+    /// `--top-p`/`--top-k`, optional, defaulting to `1`/`0` -- the untruncated identity, i.e. every
+    /// existing invocation that omits these two flags behaves EXACTLY as before this option was
+    /// added. `temperature` and `minP` are NOT exposed as flags: `supports()`
+    /// (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
+    /// `temperature == 1` and `minP == 0`, so a flag that could set either to anything else would
+    /// only ever produce a run where the provider refuses and speculation never engages.
+    let topP: Double
+    let topK: Int
 }
 
 enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -83,6 +91,12 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
     case invalidMaxTokens(String)
     case invalidSeed(String)
     case invalidProvider(String)
+    /// `supports()` requires `topP > 0 && topP <= 1` (`SampledMTPBlockRuntimeBridge.swift`'s
+    /// `sharedSampledMTPSupportsPredicate`). Refused at parse time -- before any model load -- so a
+    /// value outside that range never gets as far as silently producing a no-speculation run.
+    case invalidTopP(String)
+    /// `supports()` requires `topK >= 0`. Same parse-time refusal rationale as `invalidTopP`.
+    case invalidTopK(String)
     case modelPathMustBeAbsolute
     case ngramOffloadPlanMustBeAbsolute
     case promptsFileMustBeAbsolute
@@ -104,6 +118,17 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
     /// `docs/task-inbox/` truncated-sample record).
     case armEndedEarly(
         arm: String, promptIndex: Int, emittedTokenCount: Int, requestedMaxTokens: Int)
+    /// Fires ONLY for `promptIndex == 0`'s speculative arm, immediately after that prompt's
+    /// `MTPSpeculativeTokenIterator` is constructed and BEFORE a single token is generated:
+    /// `passthroughReason` was already non-nil at construction time, meaning `providerIsEligible`
+    /// was false at `init` (`MTPSpeculativeTokenIterator.swift:171-186`) -- e.g. the provider's
+    /// stored `SampledMTPSamplingTruncation` did not match this run's own `parameters`, so
+    /// `supports()` refused it. `passthroughReason` is nil at this exact point in EVERY legitimate
+    /// engaged run (set unconditionally, and only, when `providerIsEligible` is false), so this
+    /// cannot spuriously fire on a healthy stream, and it catches a provider/truncation wiring
+    /// defect before spending the cost of a full `--max-tokens` decode on both arms, rather than
+    /// only after C1 below has already run the whole prompt.
+    case providerWiringNotEngaged(passthroughReason: String)
     /// C1: the speculative arm never proposed a draft token, or went sticky passthrough, for this
     /// prompt. This is the predeclaration's single most important control -- a silently
     /// non-speculating arm degenerates to the scalar arm and produces a ratio of ~1.00, which
@@ -137,6 +162,11 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
         case .invalidSeed(let raw): return "--seed requires a non-negative UInt64; actual=\(raw)"
         case .invalidProvider(let raw):
             return "--provider requires seeded|nondeterministic; actual=\(raw)"
+        case .invalidTopP(let raw):
+            return "--top-p requires a Double with 0 < topP <= 1 (what supports() accepts); "
+                + "actual=\(raw)"
+        case .invalidTopK(let raw):
+            return "--top-k requires a non-negative Int (what supports() accepts); actual=\(raw)"
         case .modelPathMustBeAbsolute: return "--model-path must be an absolute path"
         case .ngramOffloadPlanMustBeAbsolute: return "--ngram-offload-plan must be an absolute path"
         case .promptsFileMustBeAbsolute: return "--prompts-file must be an absolute path"
@@ -158,6 +188,13 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
                 + "\(emittedTokenCount)/\(requestedMaxTokens) requested tokens before its "
                 + "iterator ended -- a truncated arm's tok/s is not comparable to a full one; "
                 + "refusing to pool it into the ratio"
+        case .providerWiringNotEngaged(let passthroughReason):
+            return "ABORT: prompt[0]'s speculative arm iterator was already in passthrough "
+                + "(passthroughReason=\(passthroughReason)) IMMEDIATELY after construction, before "
+                + "any token was generated -- the sampled MTP provider's truncation does not match "
+                + "this run's own sampling parameters (or another construction-time ineligibility), "
+                + "so supports() refused it; refusing rather than silently measuring a ratio built "
+                + "on a speculative arm that never actually speculated"
         case .speculationNotEngaged(let promptIndex, let proposedCount, let passthroughReason):
             return "ABORT: prompt[\(promptIndex)] speculative arm proposedCount=\(proposedCount) "
                 + "passthroughReason=\(passthroughReason ?? "nil") -- speculation did not engage "
@@ -183,10 +220,16 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
 func parseInCheckpointSampledMTPThroughputArguments(
     _ arguments: [String]
 ) throws -> InCheckpointSampledMTPThroughputArguments {
-    let allowed: Set<String> = [
+    let requiredFlags: Set<String> = [
         "--model-path", "--ngram-offload-plan", "--prompts-file", "--max-tokens", "--seed",
         "--provider", "--output-json",
     ]
+    // `--top-p`/`--top-k` are OPTIONAL (see the doc comment on
+    // `InCheckpointSampledMTPThroughputArguments.topP`/`.topK`) -- present in `allowed` (so they are
+    // accepted at all) but deliberately absent from `requiredFlags`, so every existing invocation
+    // that omits them keeps working unchanged.
+    let optionalFlags: Set<String> = ["--top-p", "--top-k"]
+    let allowed = requiredFlags.union(optionalFlags)
     var values: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -206,7 +249,7 @@ func parseInCheckpointSampledMTPThroughputArguments(
         values[flag] = arguments[index + 1]
         index += 2
     }
-    for flag in allowed where values[flag] == nil {
+    for flag in requiredFlags where values[flag] == nil {
         throw InCheckpointSampledMTPThroughputCLIError.missingFlag(flag)
     }
 
@@ -240,6 +283,19 @@ func parseInCheckpointSampledMTPThroughputArguments(
         throw InCheckpointSampledMTPThroughputCLIError.invalidProvider(rawProvider)
     }
 
+    // Defaults are the untruncated identity (`topP = 1`, `topK = 0`) -- an invocation that omits
+    // both flags measures EXACTLY what this CLI measured before they existed. Validated against
+    // precisely what `supports()` (`sharedSampledMTPSupportsPredicate`) accepts, at parse time,
+    // BEFORE any model load or measurement is spent.
+    let rawTopP = values["--top-p"] ?? "1"
+    guard let topP = Double(rawTopP), topP > 0, topP <= 1 else {
+        throw InCheckpointSampledMTPThroughputCLIError.invalidTopP(rawTopP)
+    }
+    let rawTopK = values["--top-k"] ?? "0"
+    guard let topK = Int(rawTopK), topK >= 0 else {
+        throw InCheckpointSampledMTPThroughputCLIError.invalidTopK(rawTopK)
+    }
+
     return InCheckpointSampledMTPThroughputArguments(
         modelPath: modelPath,
         ngramOffloadPlanPath: ngramOffloadPlanPath,
@@ -247,7 +303,9 @@ func parseInCheckpointSampledMTPThroughputArguments(
         maxTokens: maxTokens,
         seed: seed,
         provider: provider,
-        outputJSONPath: outputJSONPath)
+        outputJSONPath: outputJSONPath,
+        topP: topP,
+        topK: topK)
 }
 
 func inCheckpointSampledMTPThroughputExternalDiagnostic(_ error: Error) -> String {
@@ -516,15 +574,24 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
         expectedSourceKeyCount: inCheckpointSampledMTPArtifactSelection.expectedSourceKeyCount,
         revision: inCheckpointSampledMTPArtifactSelection.revision)
 
-    // Forced sampling policy -- identical to the acceptance CLI, and not a choice: `supports()`
-    // accepts nothing else.
+    // `temperature` and `minP` are PINNED, not a choice -- identical rationale to the acceptance
+    // CLI: `supports()` (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`)
+    // requires exactly `temperature == 1` and `minP == 0`, and there is no flag for either. `topP`/
+    // `topK` ARE settable, via `--top-p`/`--top-k`, and default to the untruncated identity (`1`/
+    // `0`); `parseInCheckpointSampledMTPThroughputArguments` already rejects any value `supports()`
+    // would refuse.
     let parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
         temperature: 1,
-        topP: 1,
-        topK: 0,
+        topP: Float(parsed.topP),
+        topK: parsed.topK,
         minP: 0,
         seed: parsed.seed)
+    // Built from the SAME `parameters` value handed to `MTPSpeculativeTokenIterator` inside
+    // `runSpeculativeArm` below (not a second, independently invented truncation) -- this is what
+    // makes it structurally impossible for the provider's stored truncation and this run's own
+    // request truncation to disagree.
+    let truncation = SampledMTPSamplingTruncation(parameters: parameters)
     let samplingReport = InCheckpointSampledMTPThroughputSamplingReport(
         temperature: Double(parameters.temperature),
         topP: Double(parameters.topP),
@@ -539,7 +606,10 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
             + "seed=\(parsed.seed) sampling: temperature=\(samplingReport.temperature) "
             + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) minP=\(samplingReport.minP) "
             + "repetitionPenalty=nil presencePenalty=nil frequencyPenalty=nil "
-            + "(forced -- these are the only parameters supports() accepts)")
+            + "(temperature=1 and minP=0 are PINNED -- supports() requires exactly those; topP/topK "
+            + "are settable via --top-p/--top-k, default to the untruncated identity (1/0), and the "
+            + "ACTUAL values this run measured are topP=\(samplingReport.topP) "
+            + "topK=\(samplingReport.topK), printed above)")
 
     var promptReports: [InCheckpointSampledMTPThroughputPromptReport] = []
     var pooledProposedCount = 0
@@ -568,7 +638,16 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
                 blockSize: inCheckpointSampledMTPBlockSize,
                 collectPhaseTelemetry: false,
                 sampledBlockDecisionProvider: inCheckpointSampledMTPMakeProvider(
-                    parsed.provider, seed: parsed.seed))
+                    parsed.provider, seed: parsed.seed, truncation: truncation))
+            // Fail fast on prompt[0]'s speculative arm, BEFORE spending this prompt's full
+            // `--max-tokens` decode on both arms: see the doc comment on `providerWiringNotEngaged`
+            // for why `passthroughReason` at this exact point (immediately after construction,
+            // before `nextThrowing()` is ever called) genuinely discriminates a provider/truncation
+            // wiring defect from a healthy run.
+            if promptIndex == 0, let constructionPassthroughReason = mtpIterator.passthroughReason {
+                throw InCheckpointSampledMTPThroughputCLIError.providerWiringNotEngaged(
+                    passthroughReason: constructionPassthroughReason)
+            }
             guard try mtpIterator.nextThrowing() != nil else {
                 throw InCheckpointSampledMTPThroughputCLIError.armEndedEarly(
                     arm: "speculative", promptIndex: promptIndex, emittedTokenCount: 0,

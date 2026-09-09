@@ -496,7 +496,14 @@ final class InCheckpointSampledMTPAcceptanceArithmeticTests: XCTestCase {
     // DEBUG test target via `@testable import fastmlx_harness`.
     func testTwoBlockRealCallSequenceSucceedsWithCorrectlyPairedSigma() throws {
         let inner = StubSampledMTPBlockRuntimeProvider(acceptedDraftCountsToReturn: [1, 2])
-        let provider = InCheckpointMeasuringSampledMTPBlockRuntimeProvider(inner: inner)
+        // Identity sampling parameters: this test's expected sigma values are
+        // hand-computed from the PLAIN softmax, so the measuring provider must
+        // predict the untruncated overlap. These are stated explicitly rather
+        // than defaulted, so a future truncating configuration cannot silently
+        // inherit an expectation that is only valid at identity.
+        let provider = InCheckpointMeasuringSampledMTPBlockRuntimeProvider(
+            inner: inner,
+            targetTemperature: 1, targetTopP: 1, targetTopK: 0, targetMinP: 0)
 
         // Hand-computed logits/softmax/sigma -- see the assertions below for the arithmetic.
         let flatZero = MLXArray([Float(0), Float(0)])  // softmax [0.5, 0.5]

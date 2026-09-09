@@ -206,6 +206,19 @@ public enum FastMLXServeArgumentError:
     /// `--ngram-offload-plan` is present, so a separate `--offload-plan-check-only`-specific
     /// refusal for any of them would be unreachable dead code.
     case offloadPlanCheckOnlyRequiresNGramOffloadPlan
+    /// `--qwen4exp-sampled-mtp` without `--qwen4exp-mtp`: the sampled block-decision provider this
+    /// flag constructs plugs into the in-checkpoint MTP drafter's own iterator
+    /// (`MTPSpeculativeDecoder`'s `sampledBlockDecisionsEnabled`), which only `--qwen4exp-mtp`
+    /// loads. Without that drafter there is no iterator to hand the provider to, so the flag would
+    /// be silently meaningless rather than merely unused. Refuse at parse time instead, mirroring
+    /// `mtpDrafterRequiresExactQwen35MTP`'s identical "valued flag requires the feature it
+    /// modifies" shape. `--qwen4exp-mtp` itself already requires `--ngram-offload-plan` (see
+    /// `qwen4ExpMTPRequiresNGramOffloadPlan`'s doc comment), so this requirement gives
+    /// `--qwen4exp-sampled-mtp` the SAME transitive coverage against continuous batching,
+    /// `--exact-qwen35-mtp`, `--quant-pick-only`, `--quant-candidates`, and `--scripted` that
+    /// `--qwen4exp-mtp` already gets — a separate `--qwen4exp-sampled-mtp`-specific refusal for any
+    /// of those would be unreachable dead code.
+    case sampledMTPRequiresInCheckpointMTP
 
     public var description: String {
         switch self {
@@ -327,6 +340,8 @@ public enum FastMLXServeArgumentError:
                 + "verdict the dry run exists to learn"
         case .offloadPlanCheckOnlyRequiresNGramOffloadPlan:
             "--offload-plan-check-only requires --ngram-offload-plan"
+        case .sampledMTPRequiresInCheckpointMTP:
+            "--qwen4exp-sampled-mtp requires --qwen4exp-mtp"
         }
     }
 }
@@ -488,6 +503,20 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       artifact would add a valued
                                       --qwen4exp-mtp-selection flag mirroring
                                       --exact-qwen35-mtp / --exact-mtp-selection.
+          --qwen4exp-sampled-mtp      Opt-in: let the in-checkpoint Qwen4-Exp MTP
+                                      drafter propose SAMPLED (temperature != 0)
+                                      block decisions instead of only accelerating
+                                      greedy requests. Requires --qwen4exp-mtp.
+                                      Default off. Turning this on changes the
+                                      sampling distribution machinery for every
+                                      eligible request; the measured 1.31-1.40x
+                                      speedup was obtained at topP=1, topK=0 and
+                                      does NOT transfer to a truncated
+                                      configuration (under truncation the draft and
+                                      target top-k sets can differ, and where they
+                                      are disjoint per-block acceptance is exactly
+                                      zero and speculation is pure overhead) --
+                                      default-on would ship an unmeasured change.
           --chat-template PATH        Absolute local path to a chat-template file that overrides
                                       the served checkpoint's own resolved template for BOTH
                                       rendering and the boot attestation probe (the same resolved
@@ -642,6 +671,25 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// is covered TRANSITIVELY through the `--ngram-offload-plan` requirement, which already
     /// refuses all four combinations itself.
     public let inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection?
+    /// `--qwen4exp-sampled-mtp`: opt-in to let the in-checkpoint Qwen4-Exp MTP drafter propose
+    /// SAMPLED (temperature != 0) block decisions through a `SampledMTPBlockRuntimeDeciding`
+    /// provider, instead of accelerating only greedy requests (today's behavior). Default `false`
+    /// preserves today's behavior byte-for-byte: `MTPSpeculativeDecoder.prefill` passes `nil` for
+    /// `sampledBlockDecisionProvider`, so `MTPSpeculativeTokenIterator`'s `providerIsEligible` stays
+    /// unconditionally false and no sampled request is ever routed through the provider machinery.
+    /// Requires `inCheckpointMTPSelection` to be non-nil (see
+    /// `FastMLXServeArgumentError.sampledMTPRequiresInCheckpointMTP`) -- there is no drafter
+    /// iterator to hand the provider to otherwise.
+    ///
+    /// THIS IS AN UNMEASURED-DISTRIBUTION-CHANGE FLAG, not a free accelerator: turning it on swaps
+    /// the drafter's sampler and every acceptance/residual/bonus uniform for the provider's own
+    /// (`MTPSpeculativeTokenIterator.swift:211-212`) for every eligible request. The measured
+    /// 1.31-1.40x sampled-MTP speedup was obtained at `topP=1, topK=0` (untruncated) and does NOT
+    /// transfer to a truncated configuration: under truncation the draft and target top-k sets can
+    /// differ, and where they are disjoint per-block acceptance is exactly zero and speculation is
+    /// pure overhead. Shipping this default-on would ship that unmeasured regime as the default,
+    /// which is why it stays opt-in.
+    public let sampledMTPBlockDecisionsEnabled: Bool
     /// The operator's raw `--memory-limit-bytes` payload, threaded independently of `backend` so it
     /// reaches every consumer that plans against the host envelope — including `--quant-pick-only`,
     /// whose early-return carries no `backend` case at all (`backend == nil`) and would otherwise
@@ -720,6 +768,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         mtpDrafterDirectory: URL? = nil,
         ngramOffloadPlanURL: URL? = nil,
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
+        sampledMTPBlockDecisionsEnabled: Bool = false,
         memoryLimitBytes: Int? = nil,
         chatTemplateURL: URL? = nil,
         fitCheckOnly: Bool = false,
@@ -757,6 +806,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.mtpDrafterDirectory = mtpDrafterDirectory
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
+        self.sampledMTPBlockDecisionsEnabled = sampledMTPBlockDecisionsEnabled
         self.memoryLimitBytes = memoryLimitBytes
         self.chatTemplateURL = chatTemplateURL
         self.fitCheckOnly = fitCheckOnly
@@ -807,6 +857,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var mtpDrafterDirectory: URL?
         var ngramOffloadPlanURL: URL?
         var qwen4ExpMTP = false
+        var qwen4ExpSampledMTP = false
         var evidencePath: URL?
         var chatTemplateURL: URL?
         var fitCheckOnly = false
@@ -982,6 +1033,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 exactQwen35MTP = true
             case "--qwen4exp-mtp":
                 qwen4ExpMTP = true
+            case "--qwen4exp-sampled-mtp":
+                qwen4ExpSampledMTP = true
             case "--fit-check-only":
                 fitCheckOnly = true
             case "--offload-plan-check-only":
@@ -1164,6 +1217,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // --mtp-drafter-path comment describing the same transitive-coverage trap.
         if qwen4ExpMTP, ngramOffloadPlanURL == nil {
             throw FastMLXServeArgumentError.qwen4ExpMTPRequiresNGramOffloadPlan
+        }
+
+        // --qwen4exp-sampled-mtp plugs a sampled block-decision provider into the in-checkpoint MTP
+        // drafter's own iterator, which only --qwen4exp-mtp loads -- see
+        // sampledMTPRequiresInCheckpointMTP's doc comment for the transitive coverage this
+        // requirement buys against every other conflicting mode (the same shape as the
+        // --qwen4exp-mtp / --ngram-offload-plan requirement immediately above).
+        if qwen4ExpSampledMTP, !qwen4ExpMTP {
+            throw FastMLXServeArgumentError.sampledMTPRequiresInCheckpointMTP
         }
 
         // --offload-plan-check-only verifies the offloaded n-gram plan the SAME way the real load
@@ -1453,6 +1515,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             mtpDrafterDirectory: mtpDrafterDirectory,
             ngramOffloadPlanURL: ngramOffloadPlanURL,
             inCheckpointMTPSelection: qwen4ExpMTP ? .converted4Bit : nil,
+            sampledMTPBlockDecisionsEnabled: qwen4ExpSampledMTP,
             memoryLimitBytes: memoryLimitBytes,
             chatTemplateURL: chatTemplateURL,
             fitCheckOnly: fitCheckOnly,
@@ -1497,6 +1560,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--mtp-drafter-path",
         "--ngram-offload-plan",
         "--qwen4exp-mtp",
+        "--qwen4exp-sampled-mtp",
         "--chat-template",
         "--fit-check-only",
         "--offload-plan-check-only",

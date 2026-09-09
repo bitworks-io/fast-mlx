@@ -409,6 +409,16 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// need to be reachable from outside the actor to be used), but it is no longer released after
     /// the startup gate the way this comment used to claim.
     public let inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection?
+    /// Threaded from `FastMLXServeArguments.sampledMTPBlockDecisionsEnabled` -- opt-in to let the
+    /// in-checkpoint MTP drafter's `MTPSpeculativeDecoder` propose SAMPLED (temperature != 0) block
+    /// decisions through a provider, instead of accelerating only greedy requests. Default `false`
+    /// preserves today's behavior byte-for-byte (see `MTPSpeculativeDecoder.prefill`'s doc comment).
+    /// Meaningless when `inCheckpointMTPSelection` is `nil` -- there is no drafter iterator to hand
+    /// the provider to -- but that combination is already refused at the argument parser
+    /// (`FastMLXServeArgumentError.sampledMTPRequiresInCheckpointMTP`), so this type does not
+    /// re-refuse it defensively the way some other paired fields do; every call site into this
+    /// struct today comes from that already-validated parser.
+    public let sampledMTPBlockDecisionsEnabled: Bool
     /// When supplied, overrides the checkpoint's own resolved chat template (`chat_template.jinja`
     /// / `chat_template.json` / `tokenizer_config.json`'s `chat_template` field) for BOTH the
     /// tokenizer this load builds AND the boot attestation probe
@@ -439,6 +449,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         kvQuantTier: KVQuantTier = .fp16,
         ngramOffloadPlanURL: URL? = nil,
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
+        sampledMTPBlockDecisionsEnabled: Bool = false,
         chatTemplateOverrideURL: URL? = nil,
         offloadPlanCheckOnly: Bool = false
     ) {
@@ -451,6 +462,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         self.kvQuantTier = kvQuantTier
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
+        self.sampledMTPBlockDecisionsEnabled = sampledMTPBlockDecisionsEnabled
         self.chatTemplateOverrideURL = chatTemplateOverrideURL
         self.offloadPlanCheckOnly = offloadPlanCheckOnly
     }
@@ -520,6 +532,13 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     /// it.
     public let drafterActiveBytesDelta: Int
     public let drafterCacheBytesDelta: Int
+    /// Mirrors `ScalarServingModelLoadConfiguration.sampledMTPBlockDecisionsEnabled` for THIS load,
+    /// so an operator reading the startup line can tell which path serves a request without cross
+    /// referencing the process's launch arguments. `false` (the default) means the sampled
+    /// block-decision provider seam is never constructed, regardless of any other field on this
+    /// verdict — see `machineReadableFields()`'s doc comment for why this must always be printed,
+    /// never omitted.
+    public let sampledBlockDecisionsEnabled: Bool
 
     public init(
         namespace: FastMLXInCheckpointMTPNamespace,
@@ -531,7 +550,8 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
         acceptedDraftTokens: Int,
         drafterServing: Bool,
         drafterActiveBytesDelta: Int,
-        drafterCacheBytesDelta: Int
+        drafterCacheBytesDelta: Int,
+        sampledBlockDecisionsEnabled: Bool = false
     ) {
         self.namespace = namespace
         self.revision = revision
@@ -543,6 +563,7 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
         self.drafterServing = drafterServing
         self.drafterActiveBytesDelta = drafterActiveBytesDelta
         self.drafterCacheBytesDelta = drafterCacheBytesDelta
+        self.sampledBlockDecisionsEnabled = sampledBlockDecisionsEnabled
     }
 
     /// Machine-readable startup-line fragment proving the qwen4_exp in-checkpoint MTP gate
@@ -557,6 +578,12 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
     /// "MTP was never requested" (that case never reaches this function at all: the whole
     /// `in_checkpoint_mtp*` fragment is empty, per `FastMLXServe.swift`'s
     /// `report.inCheckpointMTPStartupVerdict?.machineReadableFields() ?? ""`).
+    /// `in_checkpoint_mtp_sampled_block_decisions` is what lets an operator tell which decode path
+    /// actually serves a request -- the sampled block-decision provider seam
+    /// (`MTPSpeculativeDecoder.prefill`) or the unmodified greedy-only drafter path -- without
+    /// cross-referencing the process's own launch arguments; always present (`true` or `false`)
+    /// whenever this fragment is emitted at all, per this method's own "all fields always present"
+    /// rule above.
     public func machineReadableFields() -> String {
         [
             "in_checkpoint_mtp=true",
@@ -570,6 +597,7 @@ public struct ScalarServingInCheckpointMTPStartupVerdict: Equatable, Sendable {
             "in_checkpoint_mtp_drafter_serving=\(drafterServing)",
             "in_checkpoint_mtp_drafter_active_bytes_delta=\(drafterActiveBytesDelta)",
             "in_checkpoint_mtp_drafter_cache_bytes_delta=\(drafterCacheBytesDelta)",
+            "in_checkpoint_mtp_sampled_block_decisions=\(sampledBlockDecisionsEnabled)",
         ].joined(separator: " ")
     }
 }
@@ -1110,7 +1138,8 @@ public func loadScalarServingModel(
             acceptedDraftTokens: readiness.acceptedDraftTokens,
             drafterServing: drafterRetentionDecision,
             drafterActiveBytesDelta: postDrafterMemory.activeMemory - preDrafterMemory.activeMemory,
-            drafterCacheBytesDelta: postDrafterMemory.cacheMemory - preDrafterMemory.cacheMemory)
+            drafterCacheBytesDelta: postDrafterMemory.cacheMemory - preDrafterMemory.cacheMemory,
+            sampledBlockDecisionsEnabled: configuration.sampledMTPBlockDecisionsEnabled)
         // Retained across this block's closing brace — see the comment above this `if let` for
         // why. `Memory.clearCache()` below only reclaims the readiness gate's own transient
         // scratch buffers (its reference + speculative decode passes); it does not and must not
@@ -1152,7 +1181,8 @@ public func loadScalarServingModel(
                 decoder: try MTPSpeculativeDecoder(
                     target: model,
                     drafter: drafter,
-                    cacheFactory: cacheFactory))
+                    cacheFactory: cacheFactory,
+                    sampledBlockDecisionsEnabled: configuration.sampledMTPBlockDecisionsEnabled))
         } else {
             inference = InferenceActor(
                 decoder: MLXDecoder(

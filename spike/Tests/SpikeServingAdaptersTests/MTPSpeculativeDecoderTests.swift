@@ -5,6 +5,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 import SpikeCore
+@testable import SpikeServingAdapters
 
 /// Drives `MTPSpeculativeDecoder` through a REAL `InferenceActor.generateBounded` run, using the
 /// weight-free target/drafter fixtures extracted (unmodified, access-level-only) into
@@ -22,6 +23,20 @@ import SpikeCore
 ///      needs a `SpeculativeCacheRewindModel`-conforming mock or a fleet run.
 ///   2. The mock target is not a `SpeculativeCacheRewindModel`, so `maximumNativeTargetCacheRewind`
 ///      is never consulted here either.
+///   3. (Section 7b, sampled block decisions) None of this file's `MTPDrafterModel` mocks
+///      (`InCheckpointMTPMockDrafter` et al.) ever call the `sampler: any LogitSampler` argument
+///      `draftBlock` receives — they return a fixed proposal regardless. A real drafter calls it
+///      once per proposed position, which is what feeds a sampled block-decision provider's
+///      recorder its captured proposals. Against these fixtures a provider's `decide()` therefore
+///      always sees zero captured proposals against `blockSize - 1` requested tokens and throws
+///      `proposalCountMismatch` on every round — caught by
+///      `MTPSpeculativeTokenIterator.speculateRound()` (never propagated) and degraded to sticky
+///      passthrough with reason `"sampled MTP block decision failed: ..."`. Section 7b's tests
+///      exploit this deliberately: reaching that specific, provider-only passthrough reason is
+///      itself the proof that `sampledBlockDecisionsEnabled` really did construct a provider and
+///      hand it to the iterator, not merely that the flag compiles. It does NOT prove a provider
+///      ever ACCEPTS a proposal end to end — that needs a drafter mock that calls `sampler.sample`,
+///      which is out of this increment's scope.
 final class MTPSpeculativeDecoderTests: XCTestCase {
 
     // MARK: - Shared fixture builders
@@ -356,6 +371,279 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         XCTAssertNotNil(telemetry.passthroughReason)
     }
 
+    // MARK: - 7b. Sampled block decisions (opt-in provider wiring)
+    //
+    // See this file's header comment, caveat 3, for why these tests key on the specific
+    // "sampled MTP block decision failed" passthrough reason rather than a genuine acceptance —
+    // that reason string can ONLY appear if `sampledBlockDecisionsEnabled` actually constructed a
+    // provider, the iterator's `providerIsEligible` gate actually admitted it (temperature/topP/
+    // topK/minP/penalties all matched `sharedSampledMTPSupportsPredicate` and the stored
+    // `SampledMTPSamplingTruncation`), and `decide()` was actually invoked. A decoder that
+    // silently dropped the new parameter, or built the wrong provider variant, could not produce
+    // this exact reason.
+
+    /// Opt-in + a SEEDED sampled request (matches `SampledMTPSamplingTruncation.untruncated`:
+    /// temperature 1, topP 1, topK 0, minP 0, no penalties) reaches
+    /// `SeededSampledMTPBlockRuntimeProvider.decide()` and degrades gracefully (never throws to the
+    /// caller) when it fails against this file's sampler-bypassing mocks — see caveat 3.
+    func testSampledBlockDecisionsEnabledWithSeedReachesProviderDecideAndDegradesGracefully()
+        async throws
+    {
+        let plannedTokens = Self.acceptAllPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 1.0, topP: 1.0, topK: nil, minP: nil, seed: 7)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "a seeded, truncation-matched sampled request with sampledBlockDecisionsEnabled must "
+                + "reach the provider seam, not silently stay on the ordinary sampler path")
+        XCTAssertTrue(
+            reason.contains("sampled MTP block decision failed"),
+            "expected the provider-specific passthrough reason, got: \(reason)")
+    }
+
+    /// Same as above, but UNSEEDED — reaches
+    /// `NondeterministicSampledMTPBlockRuntimeProvider.decide()` instead (the seed-vs-no-seed
+    /// branch in `MTPSpeculativeDecoder.prefill`), and degrades identically.
+    func testSampledBlockDecisionsEnabledWithoutSeedReachesProviderDecideAndDegradesGracefully()
+        async throws
+    {
+        let plannedTokens = Self.acceptAllPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 1.0, topP: 1.0, topK: nil, minP: nil, seed: nil)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "an unseeded, truncation-matched sampled request with sampledBlockDecisionsEnabled "
+                + "must reach the provider seam, not silently stay on the ordinary sampler path")
+        XCTAssertTrue(
+            reason.contains("sampled MTP block decision failed"),
+            "expected the provider-specific passthrough reason, got: \(reason)")
+    }
+
+    /// Control: the SAME truncation-matched sampled request, but with `sampledBlockDecisionsEnabled`
+    /// left at its default (`false`) — the decoder default this whole flag must preserve. No
+    /// provider is ever constructed (`MTPSpeculativeDecoder.prefill` passes `nil`), so
+    /// `providerIsEligible` is unconditionally false regardless of how well the request's
+    /// truncation matches, and the run takes today's unmodified genuinely-speculating path: no
+    /// provider-specific passthrough (in fact no passthrough at all, since this drafter's fixed
+    /// proposal matches every planned tail token).
+    func testSampledBlockDecisionsDisabledByDefaultLeavesMatchedTruncationRequestGenuinelySpeculating()
+        async throws
+    {
+        let plannedTokens = Self.acceptAllPlannedTokens()
+        let target = MTPSpeculativeDecoderCountingTargetModel(plannedTokens: plannedTokens)
+        let drafter = MTPSpeculativeDecoderCountingDrafter(draftedTokenValue: 6)
+        // Extracted BEFORE the decoder/actor are built, for the same reason as test 1 above: the
+        // mocks are not `Sendable`, so touching `drafter` after it has been sent into the actor is
+        // a Swift 6 data-race error. A direct reference to the counter box sidesteps that.
+        let draftBlockCallCounter = drafter.draftBlockCallCounter
+        // Deliberately NOT passing `sampledBlockDecisionsEnabled:` — this is the default-parameter
+        // construction path every pre-existing call site (all ~15 of them) already uses.
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 1.0, topP: 1.0, topK: nil, minP: nil, seed: 7)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        XCTAssertNil(
+            telemetry.passthroughReason,
+            "sampledBlockDecisionsEnabled defaulting to false must not change this request's "
+                + "already-genuinely-speculating outcome")
+        XCTAssertGreaterThan(draftBlockCallCounter.value, 0)
+    }
+
+    // MARK: - 7c. Sampled block decisions against a REQUIRES-GREEDY drafter (the flag's actual
+    // reason to exist)
+    //
+    // Every test in section 7b above uses `MTPSpeculativeDecoderCountingDrafter`, which inherits
+    // `MTPDrafterModel`'s protocol-default `requiresGreedySampling == false`
+    // (`MTPDrafterModel.swift:101`). Against that mock, `MTPSpeculativeTokenIterator`'s greedy
+    // passthrough gate (`drafter.requiresGreedySampling, parameters.temperature != 0,
+    // !providerIsEligible`) never even reaches its third term, since the FIRST term is already
+    // false — so section 7b's tests cannot show the flag doing the one thing it exists to do:
+    // release a `requiresGreedySampling == true` drafter (the real in-checkpoint MTP drafter's
+    // actual constraint, per section 7's own `MTPSpeculativeDecoderGreedyOnlyDrafter`) from that
+    // gate for a truncation-matched sampled request. These three tests use
+    // `MTPSpeculativeDecoderGreedyOnlyDrafter` instead, exactly as section 7 already does.
+
+    /// Flag ON + a `requiresGreedySampling == true` drafter + the deployed thinking preset
+    /// (temperature 1, topP 0.95, topK 20, minP 0 — `sharedSampledMTPSupportsPredicate` accepts
+    /// this truncated range, not only the untruncated `topP == 1, topK == 0` shape) must NOT take
+    /// the greedy passthrough: `providerIsEligible` becomes true (temperature != 0, no processor,
+    /// and the provider's `supports(parameters:)` matches both the shared predicate and its own
+    /// stored truncation — see `MTPSpeculativeDecoder.prefill`, which derives that stored
+    /// truncation from this SAME request), so the gate's `!providerIsEligible` term is false and
+    /// the whole conjunction never fires, regardless of `requiresGreedySampling`.
+    ///
+    /// This file's own header comment (caveat 3) already establishes that none of its
+    /// `MTPDrafterModel` mocks call the `sampler` argument `draftBlock` receives, so a provider
+    /// constructed against these fixtures always sees zero captured proposals against
+    /// `blockSize - 1` requested tokens and throws `proposalCountMismatch` — caught by
+    /// `speculateRound()` and degraded to sticky passthrough with reason "sampled MTP block
+    /// decision failed: ...". Reaching THAT specific, provider-only reason (never the greedy-
+    /// requirement one) is exactly the proof this test needs: it can only appear if
+    /// `providerIsEligible` really did flip true and the iterator really did hand control to the
+    /// provider, not merely that the flag compiles.
+    func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndDeployedPresetEscapesGreedyPassthrough()
+        async throws
+    {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: 42)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "a truncation-matched sampled request against a requires-greedy drafter with "
+                + "sampledBlockDecisionsEnabled must reach the provider seam, not silently stay "
+                + "on the ordinary sampler path")
+        XCTAssertFalse(
+            reason.contains("requires temperature == 0"),
+            "the greedy-requirement passthrough must not fire once providerIsEligible is true; "
+                + "got: \(reason)")
+        XCTAssertTrue(
+            reason.contains("sampled MTP block decision failed"),
+            "expected the provider-specific degradation reason (proof providerIsEligible really "
+                + "flipped true and the iterator handed control to the provider), got: \(reason)")
+    }
+
+    /// The discriminating control for the test above, and the honest "production default" check
+    /// section 7b's own control (`testSampledBlockDecisionsDisabledByDefaultLeavesMatchedTruncationRequestGenuinelySpeculating`)
+    /// does not actually provide: THE SAME preset, THE SAME requires-greedy drafter, but with
+    /// `sampledBlockDecisionsEnabled` left at its default `false`. No provider is ever constructed
+    /// (`MTPSpeculativeDecoder.prefill` passes `nil`), so `providerIsEligible` is unconditionally
+    /// false regardless of how well the request's truncation matches, and the real production
+    /// drafter's greedy-requirement passthrough still fires.
+    func testSampledBlockDecisionsDisabledWithGreedyOnlyDrafterAndDeployedPresetStillTakesGreedyPassthrough()
+        async throws
+    {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        // Deliberately NOT passing `sampledBlockDecisionsEnabled:` — the default every pre-existing
+        // call site uses, and the production default this control protects.
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) })
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: 42)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "against a requires-greedy drafter with the flag off, this sampled request must still "
+                + "take today's unmodified greedy-requirement passthrough")
+        XCTAssertTrue(
+            reason.contains("requires temperature == 0"),
+            "expected the greedy-requirement passthrough reason (the production default this "
+                + "flag must preserve when off), got: \(reason)")
+    }
+
+    /// Flag ON + the requires-greedy drafter, but an INSTRUCT-style request that does not match
+    /// `sharedSampledMTPSupportsPredicate` at all (`temperature == 1` is required; this request
+    /// uses 0.7) and additionally carries a nonzero presence penalty, which makes
+    /// `parameters.processor()` non-nil — the OTHER independent way `providerIsEligible` is false
+    /// (`parameters.processor() == nil` is its own separate conjunct). Either failure alone would
+    /// be enough; both are present here. Proves the relaxed predicate did not over-admit: turning
+    /// the flag on for a genuinely-unsupported request must still land on the greedy-requirement
+    /// passthrough, not silently attempt (and mis-degrade) the provider seam.
+    func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetStillTakesGreedyPassthrough()
+        async throws
+    {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 0.7, topP: 1.0, topK: nil, minP: nil, seed: 42),
+            penalties: DecoderPenalties(presencePenalty: 1.5)
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "an unsupported (non-temperature-1, penalized) sampled request against a "
+                + "requires-greedy drafter must still take the greedy-requirement passthrough "
+                + "even with the flag on")
+        XCTAssertTrue(
+            reason.contains("requires temperature == 0"),
+            "the relaxed predicate must not over-admit a request "
+                + "sharedSampledMTPSupportsPredicate/providerIsEligible genuinely refuses; got: "
+                + "\(reason)")
+    }
+
     // MARK: - 8. Per-request telemetry delta (observability)
 
     /// Independently-derived expected value, NOT the observed output pinned after the fact (see
@@ -602,6 +890,79 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
 
         XCTAssertEqual(summary.finishReason, .endOfSequence)
         XCTAssertNil(summary.speculativeDelta)
+    }
+
+    // MARK: - 9. Boot attestation: ScalarServingInCheckpointMTPStartupVerdict.machineReadableFields()
+    //
+    // Mirrors `InCheckpointMTPStartupGateEndToEndTests.swift`'s own
+    // `testMachineReadableFieldsRendersEveryFieldWithDistinctValues` shape exactly (construct the
+    // verdict directly with every OTHER field pinned, vary only the field under test, assert on
+    // individual `contains("key=value")` scalars) -- that file is not in this increment's write
+    // set, so these two directional assertions live here instead.
+
+    /// `in_checkpoint_mtp_sampled_block_decisions=true` when the load enabled sampled block
+    /// decisions.
+    func testMachineReadableFieldsRendersSampledBlockDecisionsTrueWhenEnabled() {
+        let verdict = ScalarServingInCheckpointMTPStartupVerdict(
+            namespace: .converted,
+            revision: "abc123",
+            sourceKeyCount: 11,
+            promptTokenCount: 22,
+            generatedTokenCount: 33,
+            proposedDraftTokens: 44,
+            acceptedDraftTokens: 55,
+            drafterServing: true,
+            drafterActiveBytesDelta: 66,
+            drafterCacheBytesDelta: 77,
+            sampledBlockDecisionsEnabled: true)
+
+        let fields = verdict.machineReadableFields()
+
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp_sampled_block_decisions=true"))
+    }
+
+    /// `in_checkpoint_mtp_sampled_block_decisions=false` when the load did NOT enable sampled block
+    /// decisions -- both directions asserted, per this increment's own instructions, rather than
+    /// only the positive case.
+    func testMachineReadableFieldsRendersSampledBlockDecisionsFalseWhenDisabled() {
+        let verdict = ScalarServingInCheckpointMTPStartupVerdict(
+            namespace: .converted,
+            revision: "abc123",
+            sourceKeyCount: 11,
+            promptTokenCount: 22,
+            generatedTokenCount: 33,
+            proposedDraftTokens: 44,
+            acceptedDraftTokens: 55,
+            drafterServing: true,
+            drafterActiveBytesDelta: 66,
+            drafterCacheBytesDelta: 77,
+            sampledBlockDecisionsEnabled: false)
+
+        let fields = verdict.machineReadableFields()
+
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp_sampled_block_decisions=false"))
+    }
+
+    /// The default-parameter construction path (no explicit `sampledBlockDecisionsEnabled:`) also
+    /// renders `false` -- every existing call site into this initializer that predates this field
+    /// (e.g. `InCheckpointMTPStartupGateEndToEndTests.swift`'s own verdict constructions) keeps
+    /// reporting the conservative, unaffected value rather than an unset/garbage one.
+    func testMachineReadableFieldsRendersSampledBlockDecisionsFalseByDefault() {
+        let verdict = ScalarServingInCheckpointMTPStartupVerdict(
+            namespace: .converted,
+            revision: "abc123",
+            sourceKeyCount: 11,
+            promptTokenCount: 22,
+            generatedTokenCount: 33,
+            proposedDraftTokens: 44,
+            acceptedDraftTokens: 55,
+            drafterServing: true,
+            drafterActiveBytesDelta: 66,
+            drafterCacheBytesDelta: 77)
+
+        let fields = verdict.machineReadableFields()
+
+        XCTAssertTrue(fields.contains("in_checkpoint_mtp_sampled_block_decisions=false"))
     }
 }
 

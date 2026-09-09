@@ -45,6 +45,16 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     /// model's default cache, so a reset cannot silently change KV storage format.
     private let cacheFactory: () -> [KVCache]
     private let blockSize: Int
+    /// Opt-in: when `true` AND the request is `.sampled` (see `prefill`), a fresh sampled
+    /// block-decision provider is built and passed to `MTPSpeculativeTokenIterator` as
+    /// `sampledBlockDecisionProvider:`. Default `false` preserves every existing construction
+    /// site's behavior byte-for-byte — `prefill` passes `nil` for the provider exactly as it did
+    /// before this field existed, so `providerIsEligible` stays unconditionally false and the
+    /// `supports()` predicate this whole seam depends on is never evaluated. See
+    /// `FastMLXServeArguments.sampledMTPBlockDecisionsEnabled`'s doc comment for why this is
+    /// opt-in rather than default-on: the measured 1.31-1.40x sampled-MTP speedup does not
+    /// transfer to a truncated sampling configuration.
+    private let sampledBlockDecisionsEnabled: Bool
 
     private var iterator: MTPSpeculativeTokenIterator?
     private var lastReturnedToken: Int?
@@ -95,11 +105,16 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     ///   - cacheFactory: Builds a fresh target KV cache family for every `prefill`/`reset`.
     ///   - blockSize: MUST equal `servingBlockSize` (3) or this throws — see that constant's doc
     ///     comment. Defaulted so ordinary call sites don't need to name it.
+    ///   - sampledBlockDecisionsEnabled: Opt-in to the sampled block-decision provider seam for
+    ///     `.sampled` requests — see the stored property's doc comment. Defaulted `false` so every
+    ///     existing call site (all ~15 test construction sites plus the production one) keeps
+    ///     today's behavior unchanged without naming this parameter.
     public init(
         target: any LanguageModel,
         drafter: any MTPDrafterModel,
         cacheFactory: @escaping () -> [KVCache],
-        blockSize: Int = MTPSpeculativeDecoder.servingBlockSize
+        blockSize: Int = MTPSpeculativeDecoder.servingBlockSize,
+        sampledBlockDecisionsEnabled: Bool = false
     ) throws {
         guard blockSize == MTPSpeculativeDecoder.servingBlockSize else {
             throw MTPSpeculativeDecoderError.unsupportedBlockSize(blockSize)
@@ -108,6 +123,7 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
         self.drafter = drafter
         self.cacheFactory = cacheFactory
         self.blockSize = blockSize
+        self.sampledBlockDecisionsEnabled = sampledBlockDecisionsEnabled
     }
 
     /// Build the `GenerateParameters` the iterator is constructed with, from whatever `setSampling`
@@ -152,13 +168,47 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     public mutating func prefill(_ promptTokens: [Int]) throws -> Int {
         let parameters = buildParameters()
         let input = LMInput(tokens: MLXArray(promptTokens.map { Int32($0) }))
+        // Fresh provider per `prefill` call, deliberately: these providers carry per-block state
+        // (block index, uniform sources), so a stashed/reused instance across requests would leak
+        // one request's draw sequence into the next. `nil` (both conditions false) reproduces
+        // today's behavior byte-for-byte — see `sampledBlockDecisionsEnabled`'s doc comment.
+        let sampledBlockDecisionProvider: (any SampledMTPBlockRuntimeDeciding)?
+        if sampledBlockDecisionsEnabled, case .sampled = sampling {
+            // Derived from the SAME `parameters` value handed to the iterator below, so the
+            // provider's stored truncation and the request's actual truncation can never disagree
+            // (`supports(parameters:)` cross-checks the two and refuses on mismatch, degrading to
+            // "no speculation" rather than a wrong distribution — see
+            // `SampledMTPSamplingTruncation`'s doc comment).
+            let truncation = SampledMTPSamplingTruncation(parameters: parameters)
+            if let seed = parameters.seed {
+                // A seeded request MUST route to the seeded provider, never the nondeterministic
+                // one. `buildParameters()` threads a request's seed into `GenerateParameters.seed`
+                // specifically so a fixed seed makes a request reproducible (the runbook advertises
+                // this guarantee). Once a provider is eligible, `MTPSpeculativeTokenIterator`
+                // REPLACES the drafter's sampler with the provider's own
+                // (`MTPSpeculativeTokenIterator.swift:211-212`), so the acceptance/residual/bonus
+                // uniforms come from the provider's entropy from that point on —
+                // `NondeterministicSampledMTPBlockRuntimeProvider`'s default entropy is
+                // `Double.random`, which is NOT reproducible across runs. Routing a seeded request
+                // to that provider would silently break the seed's documented reproducibility
+                // guarantee. Reproducibility is not traded for speed.
+                sampledBlockDecisionProvider = SeededSampledMTPBlockRuntimeProvider(
+                    seed: seed, truncation: truncation)
+            } else {
+                sampledBlockDecisionProvider = NondeterministicSampledMTPBlockRuntimeProvider(
+                    truncation: truncation)
+            }
+        } else {
+            sampledBlockDecisionProvider = nil
+        }
         var newIterator = try MTPSpeculativeTokenIterator(
             input: input,
             mainModel: target,
             drafter: drafter,
             mainCache: cacheFactory(),
             parameters: parameters,
-            blockSize: blockSize)
+            blockSize: blockSize,
+            sampledBlockDecisionProvider: sampledBlockDecisionProvider)
         guard let token = try newIterator.nextThrowing() else {
             throw MTPSpeculativeDecoderError.iteratorExhausted
         }

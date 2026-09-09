@@ -780,3 +780,336 @@ private final class RecordingRuntimeEntropy: @unchecked Sendable {
         return value
     }
 }
+
+/// Cheap pins for the `supports(parameters:)` truncation cross-check added
+/// alongside `SampledMTPSamplingTruncation`.
+final class SampledMTPSamplingTruncationSupportsTests: XCTestCase {
+    /// This is the test that would have caught the `Optional(0.0)` refusal:
+    /// the deployed runbook instructs clients to send `presence_penalty: 0`
+    /// explicitly, which arrives as `Optional(0.0)`, not `nil`. A provider
+    /// carrying the matching truncation must accept it; a provider that
+    /// still carries `.untruncated` (i.e. was never wired up for the
+    /// deployed thinking preset) must refuse, which is exactly the
+    /// cross-check from item 3 of this increment.
+    func testSupportsAcceptsDeployedThinkingPresetAndRejectsTruncationMismatch() {
+        let deployedTruncation = SampledMTPSamplingTruncation(
+            temperature: 1, topP: 0.95, topK: 20, minP: 0)
+        let deployedParameters = GenerateParameters(
+            temperature: 1,
+            topP: 0.95,
+            topK: 20,
+            minP: 0,
+            presencePenalty: 0.0)
+
+        let matchingProvider = SeededSampledMTPBlockRuntimeProvider(
+            seed: 1, truncation: deployedTruncation)
+        XCTAssertTrue(matchingProvider.supports(parameters: deployedParameters))
+
+        // Same request, but the provider was constructed with a DIFFERENT
+        // truncation (the untruncated default) -- the cross-check must
+        // refuse rather than silently serve the wrong target distribution.
+        let mismatchedProvider = SeededSampledMTPBlockRuntimeProvider(seed: 1)
+        XCTAssertFalse(mismatchedProvider.supports(parameters: deployedParameters))
+    }
+}
+
+/// Direct coverage for the `categoricalSample` rounding-fallthrough fix.
+/// `categoricalSample` is `internal` (not `private`) specifically so this
+/// hand-built scenario is reachable: see the access-level comment on its
+/// declaration.
+final class SampledMTPCategoricalSampleFallbackTests: XCTestCase {
+    func testRoundingFallthroughReturnsLastPositiveMassIndexNotLastIndex() throws {
+        // Deliberately sums to 0.9, short of 1, with two trailing exact
+        // zeros -- the shape a truncated distribution produces. `uniform`
+        // is chosen so the running cumulative sum never exceeds it, which
+        // forces every iteration of the loop to fall through to the final
+        // fallback line.
+        let probabilities = [0.3, 0.3, 0.3, 0.0, 0.0]
+        let uniform = 0.95
+
+        let result = try XCTUnwrap(categoricalSample(probabilities, uniform: uniform))
+
+        XCTAssertEqual(result, 2)
+        XCTAssertGreaterThan(probabilities[result], 0)
+        // The bug this replaces returned `probabilities.indices.last` (4),
+        // whose probability is exactly zero -- pin that index would have
+        // been the wrong, zero-mass answer.
+        XCTAssertEqual(probabilities[probabilities.count - 1], 0)
+    }
+}
+
+/// The decisive test for this increment: drives `SeededSampledMTPBlockRuntimeProvider`
+/// over many single-draft-token blocks with a truncating `SampledMTPSamplingTruncation`,
+/// on a fixture whose draft (`q`) and target (`p`) top-2 sets are deliberately
+/// disjoint, and checks the emitted-token histogram against an independently
+/// computed truncated target distribution `p'` -- computed with this file's
+/// own `[Double]` softmax/top-k arithmetic, never by calling
+/// `truncatedSamplingProbabilities`.
+///
+/// Every emitted token (per-step accepted/corrected token, AND bonus token
+/// on a fully-accepted block) is, by the standard unbiasedness property of
+/// residual-corrected speculative sampling, marginally distributed as the
+/// *target* distribution used for that slot -- regardless of what `q` is.
+/// Using the SAME logits row for both the per-step target and the bonus
+/// target here means the whole pool of emitted tokens across all blocks has
+/// one shared theoretical marginal, `p'`, which is what makes a single
+/// pooled histogram comparison meaningful.
+final class SampledMTPTruncatedTargetDistributionTests: XCTestCase {
+    private static let targetLogits: [Double] = [2.0, 1.0, 0.5, 0.0, -0.5, -1.0]
+    // Chosen so the draft's own top-2 ({3, 4}) is disjoint from the
+    // target's top-2 ({0, 1}), while still placing enough mass on tokens 0
+    // and 1 that a meaningful fraction of blocks accept (residual
+    // correction's acceptance probability is min(1, p'(x)/q(x)), which is
+    // 1 whenever the drafted token is 0 or 1 here).
+    private static let proposalLogits: [Double] = [2.0, 1.9, -3.0, 2.05, 2.02, -3.0]
+    private static let topK = 2
+    private static let blockCount = 3000
+
+    func testEmittedHistogramMatchesIndependentlyComputedTruncatedTargetAndRejectsBothMisimplementations() throws {
+        let fullTargetProbabilities = Self.referenceSoftmax(Self.targetLogits)
+        let truncatedTargetProbabilities = Self.referenceTopKTruncated(
+            fullTargetProbabilities, topK: Self.topK)
+        // Structural precondition for the fixture itself, not the
+        // production code: confirms the two top-2 sets really are disjoint,
+        // so this test is actually exercising truncation and not an
+        // accidentally-overlapping corner case.
+        let targetTopTwo = Set(Self.topIndices(fullTargetProbabilities, count: 2))
+        let proposalTopTwo = Set(Self.topIndices(Self.referenceSoftmax(Self.proposalLogits), count: 2))
+        XCTAssertTrue(targetTopTwo.isDisjoint(with: proposalTopTwo))
+
+        // Mass an UNTRUNCATED p would place outside the top-2 support --
+        // the wrong-model yardstick controls (a) and (b) below compare
+        // against, and the fraction the executed discrimination control
+        // further down independently reproduces by actually running an
+        // untruncated provider over this same fixture.
+        let untruncatedLeakedMass = (Self.topK ..< fullTargetProbabilities.count)
+            .reduce(0.0) { $0 + fullTargetProbabilities[$1] }
+
+        let truncation = SampledMTPSamplingTruncation(
+            temperature: 1, topP: 1, topK: Self.topK, minP: 0)
+        let provider = SeededSampledMTPBlockRuntimeProvider(seed: 0xC0FF_EE01, truncation: truncation)
+        let targetLogitsArray = MLXArray(Self.targetLogits.map(Float.init))
+        let proposalLogitsArray = MLXArray(Self.proposalLogits.map(Float.init))
+
+        let (histogram, acceptedBlocks) = try Self.runBlocks(
+            provider: provider,
+            proposalLogitsArray: proposalLogitsArray,
+            targetLogitsArray: targetLogitsArray,
+            blockCount: Self.blockCount)
+        let totalTokens = histogram.reduce(0, +)
+
+        // Anti-vacuity: both the residual-correction path (rejects) and the
+        // bonus path (fully-accepted blocks) must actually have fired many
+        // times, or this test would not cover the bonus-row truncation
+        // site at all -- exactly the gap item 4 calls out.
+        XCTAssertGreaterThan(acceptedBlocks, Self.blockCount / 5)
+        XCTAssertLessThan(acceptedBlocks, Self.blockCount * 4 / 5)
+
+        // --- Main assertion: matches the independently computed p' ---
+        // p' has exactly zero mass outside the top-2 indices, and that
+        // truncation is enforced by an exact `-infinity` masked logit
+        // feeding an exact `0.0` softmax output, not by a small tolerance
+        // -- so no correctly-truncated run can ever emit an out-of-set
+        // token, and this is checked unconditionally rather than
+        // statistically.
+        let leakedOutsideTopK = (Self.topK ..< histogram.count).reduce(0) { $0 + histogram[$1] }
+        XCTAssertEqual(leakedOutsideTopK, 0)
+
+        // Within the top-2 support, check the token-0 fraction against p'(0)
+        // with a 6-sigma normal-approximation bound on the observed
+        // proportion (n = totalTokens, p = p'(0)): this is generous enough
+        // to make a false failure astronomically unlikely while still
+        // being far tighter than either control's expected gap below.
+        let expectedToken0Fraction = truncatedTargetProbabilities[0]
+        let observedToken0Fraction = Double(histogram[0]) / Double(totalTokens)
+        let sixSigmaBound = 6 * (expectedToken0Fraction * (1 - expectedToken0Fraction)
+            / Double(totalTokens)).squareRoot()
+        XCTAssertLessThan(
+            abs(observedToken0Fraction - expectedToken0Fraction), sixSigmaBound)
+
+        // --- Control (a): analytic magnitude check against the untruncated-p model ---
+        // `leakedOutsideTopK == 0` is an exact COUNT, not a proportion, so
+        // comparing `untruncatedLeakedMass` (a MASS/fraction) against
+        // `sixSigmaBound` (a bound on a PROPORTION estimate) compares two
+        // different kinds of quantity and is not decisive at this sample
+        // size: at `blockCount = 3000` (so at most 6000 emitted tokens)
+        // `10 * sixSigmaBound` never drops below the fixed
+        // `untruncatedLeakedMass` of this fixture, so that comparison can
+        // never pass. Expressing the control as an expected leaked COUNT
+        // under the wrong (untruncated) model fixes this: with this
+        // fixture's numbers, an untruncated p would be expected to leak on
+        // the order of a thousand tokens over a run this size, which is far
+        // past `decisiveLeakCountThreshold` -- large enough that observing
+        // exactly 0 leaked tokens (the real assertion above) is
+        // astronomically unlikely to have happened by chance under this
+        // wrong model. This and control (b) are analytic magnitude checks:
+        // they establish that the exact-zero observation is decisive
+        // evidence against the wrong models, not that either wrong model
+        // was actually run -- see the executed discrimination control
+        // below for that.
+        let decisiveLeakCountThreshold = 30.0
+        let untruncatedModelExpectedLeakedCount = untruncatedLeakedMass * Double(totalTokens)
+        XCTAssertGreaterThan(untruncatedModelExpectedLeakedCount, decisiveLeakCountThreshold)
+
+        // --- Control (b): analytic magnitude check against a bonus-untruncated model ---
+        // If only the per-step sites were truncated and the bonus row were
+        // left untruncated, every fully-accepted block would still emit its
+        // bonus token from the FULL softmax, leaking `untruncatedLeakedMass`
+        // outside the top-2 set on each of the `acceptedBlocks` accepted
+        // blocks this run actually observed (using the run's own accept
+        // count, so this is not a hypothetical count). Same fix as control
+        // (a): express it as an expected COUNT compared against the same
+        // decisive threshold, not a fraction compared against a proportion
+        // bound. Like control (a), this is an analytic magnitude check, not
+        // an executed mutation -- see the executed control below.
+        let bonusUntruncatedModelExpectedLeakedCount =
+            Double(acceptedBlocks) * untruncatedLeakedMass
+        XCTAssertGreaterThan(bonusUntruncatedModelExpectedLeakedCount, decisiveLeakCountThreshold)
+
+        // --- Executed discrimination control: an actually-untruncated provider ---
+        // Controls (a) and (b) above never run a misconfigured provider --
+        // they are pure arithmetic and would not change if, say, the bonus
+        // site's `truncation:` argument were deleted from the production
+        // code. This block closes that gap by actually constructing a
+        // second `SeededSampledMTPBlockRuntimeProvider` with
+        // `truncation: .untruncated` and driving it over the exact same
+        // fixture via `decide` called directly. `decide` does not consult
+        // `supports(parameters:)` at all -- confirmed by reading its body
+        // above, the truncation cross-check lives only inside `supports` --
+        // so calling `decide` directly bypasses that gate and lets a
+        // genuinely mismatched provider run to completion instead of being
+        // refused. Observing `leakedOutsideTopK > 0` here, at a fraction
+        // close to the independently-computed `untruncatedLeakedMass`, is
+        // what converts "would have leaked" into "did leak": it proves the
+        // `leakedOutsideTopK == 0` assertion on the correctly-truncated
+        // provider above is an actually discriminating measurement, not
+        // trivially satisfied because nothing in this fixture could ever
+        // produce a nonzero leak.
+        let untruncatedProvider = SeededSampledMTPBlockRuntimeProvider(
+            seed: 0xC0FF_EE02, truncation: .untruncated)
+        let (untruncatedHistogram, _) = try Self.runBlocks(
+            provider: untruncatedProvider,
+            proposalLogitsArray: proposalLogitsArray,
+            targetLogitsArray: targetLogitsArray,
+            blockCount: Self.blockCount)
+        let untruncatedTotalTokens = untruncatedHistogram.reduce(0, +)
+        let untruncatedLeakedOutsideTopK = (Self.topK ..< untruncatedHistogram.count)
+            .reduce(0) { $0 + untruncatedHistogram[$1] }
+        XCTAssertGreaterThan(untruncatedLeakedOutsideTopK, 0)
+        let untruncatedObservedLeakedFraction =
+            Double(untruncatedLeakedOutsideTopK) / Double(untruncatedTotalTokens)
+        XCTAssertEqual(untruncatedObservedLeakedFraction, untruncatedLeakedMass, accuracy: 0.05)
+    }
+
+    /// Shared driver for both the correctly-truncated provider and the
+    /// executed-discrimination-control's deliberately untruncated provider:
+    /// samples a proposal, calls `decide` for a single-draft-token block,
+    /// and accumulates the emitted-token histogram and accept count.
+    private static func runBlocks(
+        provider: SeededSampledMTPBlockRuntimeProvider,
+        proposalLogitsArray: MLXArray,
+        targetLogitsArray: MLXArray,
+        blockCount: Int
+    ) throws -> (histogram: [Int], acceptedBlocks: Int) {
+        var histogram = [Int](repeating: 0, count: Self.targetLogits.count)
+        var acceptedBlocks = 0
+        for _ in 0 ..< blockCount {
+            let proposedToken = provider.proposalSampler.sample(logits: proposalLogitsArray)
+                .item(Int.self)
+            let decision = try provider.decide(
+                proposedTokens: [proposedToken],
+                targetLogits: [targetLogitsArray],
+                bonusTargetLogits: targetLogitsArray)
+            if decision.acceptedDraftCount == 1 {
+                acceptedBlocks += 1
+            }
+            for token in decision.outputTokens {
+                histogram[token] += 1
+            }
+        }
+        return (histogram, acceptedBlocks)
+    }
+
+    private static func referenceSoftmax(_ logits: [Double]) -> [Double] {
+        let maxLogit = logits.max() ?? 0
+        let expValues = logits.map { exp($0 - maxLogit) }
+        let sum = expValues.reduce(0, +)
+        return expValues.map { $0 / sum }
+    }
+
+    /// Keeps only the `topK` highest-probability entries (ties broken by
+    /// index), zeroes the rest, and renormalizes -- independently
+    /// reimplementing (in `[Double]`, never by calling
+    /// `truncatedSamplingProbabilities`) what the top-p/top-k/temperature-1
+    /// filter chain reduces to when top-p and min-p are both no-ops.
+    private static func referenceTopKTruncated(_ probabilities: [Double], topK: Int) -> [Double] {
+        precondition(topK > 0 && topK < probabilities.count)
+        let keptIndices = Set(topIndices(probabilities, count: topK))
+        let masked = probabilities.enumerated().map { keptIndices.contains($0.offset) ? $0.element : 0 }
+        let sum = masked.reduce(0, +)
+        return masked.map { $0 / sum }
+    }
+
+    private static func topIndices(_ probabilities: [Double], count: Int) -> [Int] {
+        Array(probabilities.indices.sorted { probabilities[$0] > probabilities[$1] }.prefix(count))
+    }
+}
+
+/// Regression coverage for the production OOM risk: before the trim fix,
+/// `SeededSampledMTPProposalSampler.commit` (and the equivalent methods on
+/// `FixedUniformProposalSampler` and `NondeterministicSampledMTPProposalSampler`)
+/// only advanced `consumedCaptureCount` and never shrank `captures`, so every
+/// already-committed full-vocabulary probability row
+/// (`CapturedProposal.probabilities`, ~1.2 MB at this model's ~151,936-wide
+/// vocabulary) stayed retained in memory for the life of the sampler. This
+/// provider is now reachable on the serving path
+/// (`MTPSpeculativeDecoder.prefill` constructs one per request), so an
+/// unbounded-retention regression here is a per-request multi-gigabyte leak,
+/// not merely a harness inefficiency.
+final class SeededSampledMTPProposalCaptureRetentionTests: XCTestCase {
+    /// Drives `blockCount` two-draft-token blocks and asserts, after every
+    /// single one, that nothing from a completed block is still retained.
+    /// This is a concrete bound tied to the block shape (exactly 0
+    /// outstanding captures immediately after a successful `decide()`
+    /// commits and trims the whole block's captures), not merely "smaller
+    /// than the naive total". The unfixed `commit` (`consumedCaptureCount +=
+    /// count` with no `captures.removeFirst`) would instead have left
+    /// `retainedProposalCaptureCount` growing by `proposalDistributions.count`
+    /// (2) every block, reaching `blockCount * 2 == 1000` captures retained
+    /// by the end of this run -- so this assertion would FAIL against the
+    /// pre-fix code from the very first iteration onward.
+    func testRetainedProposalCapturesStayBoundedAcrossManyBlocks() throws {
+        let provider = SeededSampledMTPBlockRuntimeProvider(seed: 0xC0FF_EE03)
+        let proposalDistributions = [[0.6, 0.3, 0.1], [0.5, 0.3, 0.2]]
+        let bonusDistribution = [0.2, 0.3, 0.5]
+        let blockCount = 500
+
+        func logits(_ distribution: [Double]) -> MLXArray {
+            MLXArray(distribution.map { Float(log($0)) })
+        }
+
+        for _ in 0 ..< blockCount {
+            let proposals = proposalDistributions.map { distribution in
+                provider.proposalSampler.sample(logits: logits(distribution)).item(Int.self)
+            }
+            _ = try provider.decide(
+                proposedTokens: proposals,
+                targetLogits: proposalDistributions.map(logits),
+                bonusTargetLogits: logits(bonusDistribution))
+
+            // Immediately after each successful `decide()`, every capture
+            // made for that block has been committed and trimmed: nothing
+            // should carry over into the next block.
+            XCTAssertEqual(provider.retainedProposalCaptureCount, 0)
+        }
+
+        // Final check, stated independently of the per-iteration loop
+        // above: the pre-fix code would have accumulated
+        // `blockCount * proposalDistributions.count` == 1000 retained
+        // captures here; the fix keeps it at 0.
+        XCTAssertEqual(provider.retainedProposalCaptureCount, 0)
+        XCTAssertLessThan(
+            provider.retainedProposalCaptureCount,
+            blockCount * proposalDistributions.count)
+    }
+}

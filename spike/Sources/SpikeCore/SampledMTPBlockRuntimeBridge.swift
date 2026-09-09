@@ -92,6 +92,94 @@ public struct SeededSampledMTPBlockRuntimeDrawTrace: Sendable, Equatable {
     }
 }
 
+/// The four `GenerateParameters` fields that determine the *target*
+/// distribution `p` a truncated-sampling request actually draws from:
+/// temperature, top-p, top-k, and min-p.
+///
+/// Each sampled-MTP block runtime provider stores one of these at
+/// construction and cross-checks it against the incoming request's own
+/// truncation on every `supports(parameters:)` call (see
+/// `sharedSampledMTPSupportsPredicate` and each provider's `supports`
+/// below). A mismatch is refused outright, so a forgotten or wrong wiring
+/// degrades to "no speculation" (the caller falls back to ordinary
+/// sampling), never to "speculation that silently emits tokens drawn from
+/// the wrong distribution."
+///
+/// Where that cross-check can and cannot fire is worth stating precisely,
+/// because the two cases are not alike. On the serving path it CANNOT fire:
+/// `MTPSpeculativeDecoder.prefill` derives the truncation from the very same
+/// `GenerateParameters` value it hands the iterator, so the comparison is a
+/// tautology there and the guarantee comes from that shared derivation
+/// rather than from this check. It earns its keep for providers constructed
+/// somewhere OTHER than the request they will serve -- the measurement CLIs
+/// and tests -- where the two really can diverge, and where being refused is
+/// how such a provider avoids reporting a measurement of a distribution it
+/// was not actually sampling."
+public struct SampledMTPSamplingTruncation: Sendable, Equatable {
+    public let temperature: Float
+    public let topP: Float
+    public let topK: Int
+    public let minP: Float
+
+    public init(temperature: Float, topP: Float, topK: Int, minP: Float) {
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+    }
+
+    /// Reads the four truncation fields off the request's own parameters, so
+    /// a provider's stored truncation can be compared against whatever a
+    /// given request actually asked for.
+    public init(parameters: GenerateParameters) {
+        self.init(
+            temperature: parameters.temperature,
+            topP: parameters.topP,
+            topK: parameters.topK,
+            minP: parameters.minP)
+    }
+
+    /// The identity truncation: `truncatedSamplingProbabilities` at these
+    /// four values is exactly `softmax(logits, axis: -1)`, matching this
+    /// file's pre-truncation behavior. This is also every provider's
+    /// default, which keeps existing untruncated construction sites
+    /// compiling unchanged.
+    public static let untruncated = SampledMTPSamplingTruncation(
+        temperature: 1, topP: 1, topK: 0, minP: 0)
+}
+
+/// The sampling-shape predicate shared by every sampled-MTP block runtime
+/// provider's `supports(parameters:)`.
+///
+/// `topP`/`topK` accept the deployed thinking preset's truncated range
+/// (rather than requiring the untruncated `topP == 1, topK == 0`); `topP >
+/// 0` stays strict because the vendored `GenerateParameters.sampler()` maps
+/// `topP == 0` to "no filter", and accepting `topP >= 0` here while that
+/// helper treats `0` as no-filter would be a silent divergence between what
+/// this predicate admits and what the target sampler actually does.
+///
+/// The penalty checks accept `nil` OR exactly `0`, not only `nil`: the
+/// deployed runbook instructs clients to send e.g. `presence_penalty: 0`
+/// explicitly, which arrives here as `Optional(0.0)`, not `nil`. The
+/// vendored `GenerateParameters.processor()` already treats zero as absent,
+/// so `nil` and `0` genuinely mean the same thing -- requiring strict `==
+/// nil` silently refused that real, intentionally-zero production request.
+///
+/// This predicate alone does not decide whether a given provider supports a
+/// given request: every call site also cross-checks its own stored
+/// `SampledMTPSamplingTruncation` against
+/// `SampledMTPSamplingTruncation(parameters:)`. See the doc comment on
+/// `SampledMTPSamplingTruncation` for why that cross-check is required.
+private func sharedSampledMTPSupportsPredicate(_ parameters: GenerateParameters) -> Bool {
+    parameters.temperature == 1
+        && parameters.topP > 0 && parameters.topP <= 1
+        && parameters.topK >= 0
+        && parameters.minP == 0
+        && (parameters.repetitionPenalty ?? 0) == 0
+        && (parameters.presencePenalty ?? 0) == 0
+        && (parameters.frequencyPenalty ?? 0) == 0
+}
+
 /// Default-off production-shaped sampled MTP provider. It mirrors the seeded
 /// diagnostic provider's validation and commit-on-success behavior, but draws
 /// proposal, acceptance, residual, and bonus uniforms from caller-supplied
@@ -102,6 +190,7 @@ public final class NondeterministicSampledMTPBlockRuntimeProvider:
 {
     private let entropy: SampledMTPBlockRuntimeEntropy
     private let recorder: NondeterministicSampledMTPProposalSampler
+    private let truncation: SampledMTPSamplingTruncation
     private var blockIndex = 0
 
     public private(set) var drawTraces: [SeededSampledMTPBlockRuntimeDrawTrace] = []
@@ -110,20 +199,17 @@ public final class NondeterministicSampledMTPBlockRuntimeProvider:
     public init(
         entropy: @escaping SampledMTPBlockRuntimeEntropy = { _ in
             Double.random(in: 0 ..< 1)
-        }
+        },
+        truncation: SampledMTPSamplingTruncation = .untruncated
     ) {
         self.entropy = entropy
         self.recorder = NondeterministicSampledMTPProposalSampler(entropy: entropy)
+        self.truncation = truncation
     }
 
     public func supports(parameters: GenerateParameters) -> Bool {
-        parameters.temperature == 1
-            && parameters.topP == 1
-            && parameters.topK == 0
-            && parameters.minP == 0
-            && parameters.repetitionPenalty == nil
-            && parameters.presencePenalty == nil
-            && parameters.frequencyPenalty == nil
+        sharedSampledMTPSupportsPredicate(parameters)
+            && truncation == SampledMTPSamplingTruncation(parameters: parameters)
     }
 
     public func decide(
@@ -148,7 +234,8 @@ public final class NondeterministicSampledMTPBlockRuntimeProvider:
 
         let proposals = try recorder.peek(count: proposedTokens.count)
         let vocabularyCount = try validateRuntimeVocabularyWidth(proposals: proposals)
-        let bonusTargetDistribution = try runtimeNormalizedProbabilities(bonusTargetLogits)
+        let bonusTargetDistribution = try runtimeNormalizedProbabilities(
+            bonusTargetLogits, truncation: truncation)
         try validateRuntimeWidth(bonusTargetDistribution.count, expected: vocabularyCount)
 
         var steps = [SampledMTPBlockStep]()
@@ -164,7 +251,8 @@ public final class NondeterministicSampledMTPBlockRuntimeProvider:
                     actual: proposedToken)
             }
 
-            let targetDistribution = try runtimeNormalizedProbabilities(targetLogits[index])
+            let targetDistribution = try runtimeNormalizedProbabilities(
+                targetLogits[index], truncation: truncation)
             try validateRuntimeWidth(targetDistribution.count, expected: vocabularyCount)
             steps.append(SampledMTPBlockStep(
                 targetDistribution: targetDistribution,
@@ -231,12 +319,25 @@ public final class SeededSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeD
     private var acceptanceUniforms: SeededSampledMTPUniformSource
     private var residualUniforms: SeededSampledMTPUniformSource
     private var bonusUniforms: SeededSampledMTPUniformSource
+    private let truncation: SampledMTPSamplingTruncation
     private var blockIndex = 0
 
     public private(set) var drawTraces: [SeededSampledMTPBlockRuntimeDrawTrace] = []
     public var proposalSampler: any LogitSampler { recorder }
 
-    public init(seed: UInt64) {
+    /// Test-only visibility into the proposal sampler's retained
+    /// full-vocabulary capture count. Deliberately not `private`, for the
+    /// same reason as `categoricalSample` below: it is the only honest seam
+    /// for the regression test covering `SeededSampledMTPProposalSampler
+    /// .commit`'s capture-trimming fix to observe that retained memory
+    /// actually stays bounded. `pendingCaptureCount` cannot serve this role
+    /// -- it is a DIFFERENCE (`captures.count - consumedCaptureCount`), so
+    /// it reads small even if the underlying `captures` array itself grows
+    /// without bound. `internal` access keeps this out of the public API
+    /// while staying reachable from `@testable import SpikeCore`.
+    var retainedProposalCaptureCount: Int { recorder.retainedCaptureCount }
+
+    public init(seed: UInt64, truncation: SampledMTPSamplingTruncation = .untruncated) {
         self.recorder = SeededSampledMTPProposalSampler(seed: seed)
         self.acceptanceUniforms = SeededSampledMTPUniformSource(
             seed: seed,
@@ -247,16 +348,12 @@ public final class SeededSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeD
         self.bonusUniforms = SeededSampledMTPUniformSource(
             seed: seed,
             domain: .bonus)
+        self.truncation = truncation
     }
 
     public func supports(parameters: GenerateParameters) -> Bool {
-        parameters.temperature == 1
-            && parameters.topP == 1
-            && parameters.topK == 0
-            && parameters.minP == 0
-            && parameters.repetitionPenalty == nil
-            && parameters.presencePenalty == nil
-            && parameters.frequencyPenalty == nil
+        sharedSampledMTPSupportsPredicate(parameters)
+            && truncation == SampledMTPSamplingTruncation(parameters: parameters)
     }
 
     public func decide(
@@ -281,7 +378,8 @@ public final class SeededSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeD
 
         let proposals = try recorder.peek(count: proposedTokens.count)
         let vocabularyCount = try validateVocabularyWidth(proposals: proposals)
-        let bonusTargetDistribution = try validatingNormalizedProbabilities(bonusTargetLogits)
+        let bonusTargetDistribution = try validatingNormalizedProbabilities(
+            bonusTargetLogits, truncation: truncation)
         try validateWidth(bonusTargetDistribution.count, expected: vocabularyCount)
 
         var steps = [SampledMTPBlockStep]()
@@ -297,7 +395,8 @@ public final class SeededSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeD
                     actual: proposedToken)
             }
 
-            let targetDistribution = try validatingNormalizedProbabilities(targetLogits[index])
+            let targetDistribution = try validatingNormalizedProbabilities(
+                targetLogits[index], truncation: truncation)
             try validateWidth(targetDistribution.count, expected: vocabularyCount)
             steps.append(SampledMTPBlockStep(
                 targetDistribution: targetDistribution,
@@ -358,25 +457,25 @@ public final class SeededSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeD
 public final class SampledMTPBlockRuntimeBridge: SampledMTPBlockRuntimeDeciding {
     private let plans: [SampledMTPBlockRuntimeDrawPlan]
     private let recorder: FixedUniformProposalSampler
+    private let truncation: SampledMTPSamplingTruncation
     private var planIndex = 0
 
     public var proposalSampler: any LogitSampler { recorder }
 
-    public init(plans: [SampledMTPBlockRuntimeDrawPlan]) {
+    public init(
+        plans: [SampledMTPBlockRuntimeDrawPlan],
+        truncation: SampledMTPSamplingTruncation = .untruncated
+    ) {
         self.plans = plans
         self.recorder = FixedUniformProposalSampler(
             uniforms: plans.flatMap(\.proposalUniforms))
+        self.truncation = truncation
     }
 
     public func supports(parameters: GenerateParameters) -> Bool {
         !plans.isEmpty
-            && parameters.temperature == 1
-            && parameters.topP == 1
-            && parameters.topK == 0
-            && parameters.minP == 0
-            && parameters.repetitionPenalty == nil
-            && parameters.presencePenalty == nil
-            && parameters.frequencyPenalty == nil
+            && sharedSampledMTPSupportsPredicate(parameters)
+            && truncation == SampledMTPSamplingTruncation(parameters: parameters)
     }
 
     public func decide(
@@ -403,7 +502,8 @@ public final class SampledMTPBlockRuntimeBridge: SampledMTPBlockRuntimeDeciding 
             indexed, proposal in
             let (index, token) = indexed
             return SampledMTPBlockStep(
-                targetDistribution: normalizedProbabilities(targetLogits[index]),
+                targetDistribution: normalizedProbabilities(
+                    targetLogits[index], truncation: truncation),
                 draftDistribution: proposal.probabilities,
                 proposedToken: token,
             )
@@ -412,7 +512,8 @@ public final class SampledMTPBlockRuntimeBridge: SampledMTPBlockRuntimeDeciding 
             steps: steps,
             acceptanceUniforms: plan.acceptanceUniforms,
             terminalDraws: [plan.terminalDraw],
-            bonusTargetDistribution: normalizedProbabilities(bonusTargetLogits))
+            bonusTargetDistribution: normalizedProbabilities(
+                bonusTargetLogits, truncation: truncation))
         planIndex += 1
         return SampledMTPBlockRuntimeDecision(
             outputTokens: decision.tokens,
@@ -466,6 +567,20 @@ private final class FixedUniformProposalSampler: LogitSampler {
         }
         let result = Array(captures[consumedCaptureCount ..< consumedCaptureCount + count])
         consumedCaptureCount += count
+        // `CapturedProposal.probabilities` is a full-vocabulary `[Double]`
+        // row (~1.2 MB at this model's ~151,936-wide vocabulary). Without
+        // this trim, every consumed capture would sit in `captures` for the
+        // life of this sampler, which is now reachable on the serving path
+        // (`MTPSpeculativeDecoder.prefill` constructs one per request) --
+        // a multi-thousand-block completion would otherwise retain gigabytes
+        // of already-consumed rows for no reason. Drop the consumed prefix
+        // immediately and reset the index rather than merely advancing it.
+        // Do NOT "simplify" this back to a plain `consumedCaptureCount +=
+        // count` index bump.
+        if consumedCaptureCount > 0 {
+            captures.removeFirst(consumedCaptureCount)
+            consumedCaptureCount = 0
+        }
         return result
     }
 }
@@ -479,6 +594,12 @@ private final class SeededSampledMTPProposalSampler: LogitSampler {
     var pendingCaptureCount: Int {
         captures.count - consumedCaptureCount
     }
+
+    /// The raw retained array length, as opposed to `pendingCaptureCount`'s
+    /// difference -- see the doc comment on
+    /// `SeededSampledMTPBlockRuntimeProvider.retainedProposalCaptureCount`
+    /// for why the distinction matters for testing the trim fix.
+    var retainedCaptureCount: Int { captures.count }
 
     init(seed: UInt64) {
         self.proposalUniforms = SeededSampledMTPUniformSource(seed: seed, domain: .proposal)
@@ -514,6 +635,20 @@ private final class SeededSampledMTPProposalSampler: LogitSampler {
 
     func commit(count: Int) {
         consumedCaptureCount += count
+        // `CapturedProposal.probabilities` is a full-vocabulary `[Double]`
+        // row (~1.2 MB at this model's ~151,936-wide vocabulary). Without
+        // this trim, every committed capture would sit in `captures` for
+        // the life of this sampler, which is now reachable on the serving
+        // path (`MTPSpeculativeDecoder.prefill` constructs one per
+        // request) -- a multi-thousand-block completion would otherwise
+        // retain gigabytes of already-committed rows for no reason. Drop
+        // the committed prefix immediately and reset the index rather than
+        // merely advancing it. Do NOT "simplify" this back to a plain
+        // `consumedCaptureCount += count` index bump.
+        if consumedCaptureCount > 0 {
+            captures.removeFirst(consumedCaptureCount)
+            consumedCaptureCount = 0
+        }
     }
 }
 
@@ -563,6 +698,20 @@ private final class NondeterministicSampledMTPProposalSampler: LogitSampler {
 
     func commit(count: Int) {
         consumedCaptureCount += count
+        // `CapturedProposal.probabilities` is a full-vocabulary `[Double]`
+        // row (~1.2 MB at this model's ~151,936-wide vocabulary). Without
+        // this trim, every committed capture would sit in `captures` for
+        // the life of this sampler, which is now reachable on the serving
+        // path (`MTPSpeculativeDecoder.prefill` constructs one per
+        // request) -- a multi-thousand-block completion would otherwise
+        // retain gigabytes of already-committed rows for no reason. Drop
+        // the committed prefix immediately and reset the index rather than
+        // merely advancing it. Do NOT "simplify" this back to a plain
+        // `consumedCaptureCount += count` index bump.
+        if consumedCaptureCount > 0 {
+            captures.removeFirst(consumedCaptureCount)
+            consumedCaptureCount = 0
+        }
     }
 }
 
@@ -613,8 +762,43 @@ private struct SeededSampledMTPUniformSource {
     }
 }
 
-private func normalizedProbabilities(_ logits: MLXArray) -> [Double] {
-    let probabilities = softmax(logits.asType(.float32), axis: -1).flattened()
+private func normalizedProbabilities(
+    _ logits: MLXArray,
+    truncation: SampledMTPSamplingTruncation = .untruncated
+) -> [Double] {
+    // `truncatedSamplingProbabilities` requires `ndim >= 2` (it partitions
+    // the last two dimensions for its top-k filter); reshape to a 2D array
+    // first. Using `[-1, logits.dim(-1)]` rather than `[1, -1]` preserves
+    // the row boundary for a `[B, V]` or `[T, V]` input: `[1, -1]` would
+    // silently flatten such an input into ONE joint softmax over `B * V`
+    // instead of one softmax per row, and the result would still come back
+    // with the right total length, so the width validators elsewhere in
+    // this file could not catch the mismatch. Every call site today passes
+    // a single `[V]`-or-`[1, V]` row, so this is latent, not live -- kept
+    // here as free insurance against a future multi-row call site.
+    //
+    // At `.untruncated` (temperature 1, topP 1, topK 0, minP 0) this is
+    // mathematically identical to `softmax(logits, axis: -1)` (matching
+    // this function's pre-truncation behavior), though NOT necessarily
+    // bit-exact: `truncatedSamplingProbabilities` computes it as
+    // `softmax(logSoftmax(x))`, two rounding passes rather than one.
+    // An EMPTY logits row is a legitimate fail-closed input: callers feed one
+    // deliberately to prove this path refuses rather than fabricates a
+    // distribution, and the pre-truncation implementation returned `[]` for it
+    // (its `softmax(...).flattened()` produced an empty array, which the
+    // `sum > 0` guard below then rejected). `reshaped` cannot infer a dimension
+    // from an empty array and raises an MLX FATAL error rather than throwing,
+    // which kills the whole process instead of failing this one call closed.
+    // So the empty case must be answered before any reshape, not after it.
+    guard logits.size > 0 else { return [] }
+    let row = logits.asType(.float32).reshaped([-1, logits.dim(-1)])
+    let probabilities = truncatedSamplingProbabilities(
+        logits: row,
+        temperature: truncation.temperature,
+        topP: truncation.topP,
+        topK: truncation.topK,
+        minP: truncation.minP
+    ).flattened()
     eval(probabilities)
     let raw = probabilities.asArray(Float.self).map(Double.init)
     let sum = raw.reduce(0, +)
@@ -627,7 +811,10 @@ private func normalizedProbabilities(_ logits: MLXArray) -> [Double] {
     return normalized
 }
 
-private func validatingNormalizedProbabilities(_ logits: MLXArray) throws -> [Double] {
+private func validatingNormalizedProbabilities(
+    _ logits: MLXArray,
+    truncation: SampledMTPSamplingTruncation = .untruncated
+) throws -> [Double] {
     let rawLogits = logits.flattened()
     eval(rawLogits)
     // A raw `-infinity` logit is legitimate: it is how a model expresses a
@@ -650,7 +837,7 @@ private func validatingNormalizedProbabilities(_ logits: MLXArray) throws -> [Do
     guard rawLogits.asArray(Float.self).allSatisfy({ !$0.isNaN && $0 != Float.infinity }) else {
         throw SeededSampledMTPBlockRuntimeProviderError.invalidLogits
     }
-    let distribution = normalizedProbabilities(logits)
+    let distribution = normalizedProbabilities(logits, truncation: truncation)
     guard !distribution.isEmpty else {
         throw SeededSampledMTPBlockRuntimeProviderError.invalidLogits
     }
@@ -691,9 +878,12 @@ private func validateProposalToken(_ token: Int, vocabularyCount: Int) throws {
     }
 }
 
-private func runtimeNormalizedProbabilities(_ logits: MLXArray) throws -> [Double] {
+private func runtimeNormalizedProbabilities(
+    _ logits: MLXArray,
+    truncation: SampledMTPSamplingTruncation = .untruncated
+) throws -> [Double] {
     do {
-        return try validatingNormalizedProbabilities(logits)
+        return try validatingNormalizedProbabilities(logits, truncation: truncation)
     } catch {
         throw NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits
     }
@@ -724,14 +914,50 @@ private func validateRuntimeProposalToken(_ token: Int, vocabularyCount: Int) th
     }
 }
 
-private func categoricalSample(_ probabilities: [Double], uniform: Double) -> Int? {
+// Deliberately not `private`: the rounding-fallthrough branch below is
+// unreachable through this file's public surface once a distribution has
+// passed through `normalizedProbabilities`'s largest-bin correction (its
+// cumulative sum comes back bit-exact `1.0` in practice), so the only
+// honest way to cover the branch this file's fix actually changed is a
+// direct call with a hand-built distribution and uniform. `internal` access
+// keeps it out of the public API while staying reachable from
+// `@testable import SpikeCore`.
+func categoricalSample(_ probabilities: [Double], uniform: Double) -> Int? {
     guard !probabilities.isEmpty else { return nil }
     var cumulative = 0.0
+    var lastSupportedToken: Int?
     for (index, probability) in probabilities.enumerated() {
+        if probability > 0 {
+            lastSupportedToken = index
+        }
         cumulative += probability
         if uniform < cumulative { return index }
     }
-    return probabilities.indices.last
+    // Rounding fallthrough: floating-point summation left the cumulative
+    // sum just short of `uniform` even though probabilities are normalized
+    // to (approximately) 1. This fix aligns `categoricalSample` with
+    // `SampledMTPResidualCorrection.sample(distribution:uniform:)`, which
+    // already returns the last index with POSITIVE probability rather than
+    // `probabilities.indices.last` for exactly this reason.
+    //
+    // All three call sites in this file sample the DRAFT distribution,
+    // which is deliberately left `.untruncated`, so today this function is
+    // never actually invoked on a truncated distribution with exact-zero
+    // trailing entries. The scenario in which the distinction currently
+    // matters is a model whose logits carry `-infinity` at masked indices
+    // (this repo has a recorded fact that this model's logits do exactly
+    // that at media-sentinel indices on every forward): those indices are
+    // exact `0.0` after softmax, so the same rounding fallthrough could
+    // still hand back a zero-mass token from an otherwise-untruncated
+    // distribution. That token would fall outside `supp(q')`,
+    // `acceptanceProbability` would throw `zeroDraftMass`, and the caller
+    // would degrade to sticky passthrough for the rest of the stream: a
+    // one-in-a-billion rounding artifact silently converted into a
+    // permanent throughput cliff. Returning the last index with POSITIVE
+    // probability instead keeps the fallback inside the support of the
+    // distribution actually being sampled from.
+    // Do not revert this to `probabilities.indices.last`.
+    return lastSupportedToken
 }
 
 private extension Data {

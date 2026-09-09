@@ -103,6 +103,14 @@ struct InCheckpointSampledMTPAcceptanceArguments: Equatable, Sendable {
     let seed: UInt64
     let provider: InCheckpointSampledMTPAcceptanceProviderKind
     let outputJSONPath: String
+    /// `--top-p`/`--top-k`, optional, defaulting to `1`/`0` -- the untruncated identity, i.e. every
+    /// existing invocation that omits these two flags behaves EXACTLY as before this option was
+    /// added. `temperature` and `minP` are NOT exposed as flags: `supports()`
+    /// (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
+    /// `temperature == 1` and `minP == 0`, so a flag that could set either to anything else would
+    /// only ever produce a run where the provider refuses and speculation never engages.
+    let topP: Double
+    let topK: Int
 }
 
 enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -115,6 +123,12 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
     case invalidMaxTokens(String)
     case invalidSeed(String)
     case invalidProvider(String)
+    /// `supports()` requires `topP > 0 && topP <= 1` (`SampledMTPBlockRuntimeBridge.swift`'s
+    /// `sharedSampledMTPSupportsPredicate`). Refused at parse time -- before any model load -- so a
+    /// value outside that range never gets as far as silently producing a no-speculation run.
+    case invalidTopP(String)
+    /// `supports()` requires `topK >= 0`. Same parse-time refusal rationale as `invalidTopP`.
+    case invalidTopK(String)
     case modelPathMustBeAbsolute
     case ngramOffloadPlanMustBeAbsolute
     case promptsFileMustBeAbsolute
@@ -129,6 +143,17 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
     /// is the predeclaration's single most important control -- a zero-block run must not read
     /// like a clean one -- so it aborts the whole CLI invocation rather than reporting 0/0 for one
     /// prompt among several.
+    /// Fires ONLY for `promptIndex == 0`, immediately after that prompt's `MTPSpeculativeTokenIterator`
+    /// is constructed and BEFORE a single token is generated: `passthroughReason` was already
+    /// non-nil at construction time, meaning `providerIsEligible` was false at `init`
+    /// (`MTPSpeculativeTokenIterator.swift:171-186`) -- e.g. the provider's stored
+    /// `SampledMTPSamplingTruncation` did not match this run's own `parameters`, so `supports()`
+    /// refused it. `passthroughReason` is nil at this exact point in EVERY legitimate engaged run
+    /// (it is set unconditionally, and only, when `providerIsEligible` is false) -- so this check
+    /// cannot spuriously fire on a healthy stream, and it catches a provider/truncation wiring
+    /// defect before the cost of a full decode loop is spent, rather than only after prompt[0]'s
+    /// entire stream has already run to completion.
+    case providerWiringNotEngaged(passthroughReason: String)
     case zeroProposedDraftTokens(promptIndex: Int, passthroughReason: String?)
     /// Fires when a stream proposed tokens (so the earlier `zeroProposedDraftTokens` control did
     /// NOT catch it) but `decide()` never once succeeded -- e.g. every `decide()` call threw
@@ -184,6 +209,11 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
         case .invalidSeed(let raw): return "--seed requires a non-negative UInt64; actual=\(raw)"
         case .invalidProvider(let raw):
             return "--provider requires seeded|nondeterministic; actual=\(raw)"
+        case .invalidTopP(let raw):
+            return "--top-p requires a Double with 0 < topP <= 1 (what supports() accepts); "
+                + "actual=\(raw)"
+        case .invalidTopK(let raw):
+            return "--top-k requires a non-negative Int (what supports() accepts); actual=\(raw)"
         case .modelPathMustBeAbsolute: return "--model-path must be an absolute path"
         case .ngramOffloadPlanMustBeAbsolute: return "--ngram-offload-plan must be an absolute path"
         case .promptsFileMustBeAbsolute: return "--prompts-file must be an absolute path"
@@ -192,6 +222,13 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
         case .outputJSONMustBeAbsolute: return "--output-json must be an absolute path"
         case .outputJSONMustBeNew: return "--output-json must name a new file"
         case .outputJSONWriteFailed: return "failed to write --output-json"
+        case .providerWiringNotEngaged(let passthroughReason):
+            return "ABORT: prompt[0]'s speculative iterator was already in passthrough "
+                + "(passthroughReason=\(passthroughReason)) IMMEDIATELY after construction, before "
+                + "any token was generated -- the sampled MTP provider's truncation does not match "
+                + "this run's own sampling parameters (or another construction-time ineligibility), "
+                + "so supports() refused it; refusing rather than silently measuring a run with no "
+                + "speculation at all"
         case .zeroProposedDraftTokens(let promptIndex, let passthroughReason):
             return "ABORT: prompt[\(promptIndex)] proposed ZERO draft tokens "
                 + "(passthroughReason=\(passthroughReason ?? "nil")) -- the sampled MTP provider "
@@ -252,10 +289,16 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
 func parseInCheckpointSampledMTPAcceptanceArguments(
     _ arguments: [String]
 ) throws -> InCheckpointSampledMTPAcceptanceArguments {
-    let allowed: Set<String> = [
+    let requiredFlags: Set<String> = [
         "--model-path", "--ngram-offload-plan", "--prompts-file", "--max-tokens", "--seed",
         "--provider", "--output-json",
     ]
+    // `--top-p`/`--top-k` are OPTIONAL (see the doc comment on
+    // `InCheckpointSampledMTPAcceptanceArguments.topP`/`.topK`) -- present in `allowed` (so they are
+    // accepted at all) but deliberately absent from `requiredFlags`, so every existing invocation
+    // that omits them keeps working unchanged.
+    let optionalFlags: Set<String> = ["--top-p", "--top-k"]
+    let allowed = requiredFlags.union(optionalFlags)
     var values: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -275,7 +318,7 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         values[flag] = arguments[index + 1]
         index += 2
     }
-    for flag in allowed where values[flag] == nil {
+    for flag in requiredFlags where values[flag] == nil {
         throw InCheckpointSampledMTPAcceptanceCLIError.missingFlag(flag)
     }
 
@@ -309,6 +352,21 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         throw InCheckpointSampledMTPAcceptanceCLIError.invalidProvider(rawProvider)
     }
 
+    // Defaults are the untruncated identity (`topP = 1`, `topK = 0`) -- an invocation that omits
+    // both flags measures EXACTLY what this CLI measured before they existed. Validated against
+    // precisely what `supports()` (`sharedSampledMTPSupportsPredicate`) accepts, at parse time,
+    // BEFORE any model load or measurement is spent: refusing here means a bad value never gets far
+    // enough to construct a provider whose truncation cannot possibly match, which would otherwise
+    // degrade to a silent no-speculation run (see `providerWiringNotEngaged`).
+    let rawTopP = values["--top-p"] ?? "1"
+    guard let topP = Double(rawTopP), topP > 0, topP <= 1 else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidTopP(rawTopP)
+    }
+    let rawTopK = values["--top-k"] ?? "0"
+    guard let topK = Int(rawTopK), topK >= 0 else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidTopK(rawTopK)
+    }
+
     return InCheckpointSampledMTPAcceptanceArguments(
         modelPath: modelPath,
         ngramOffloadPlanPath: ngramOffloadPlanPath,
@@ -316,7 +374,9 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         maxTokens: maxTokens,
         seed: seed,
         provider: provider,
-        outputJSONPath: outputJSONPath)
+        outputJSONPath: outputJSONPath,
+        topP: topP,
+        topK: topK)
 }
 
 func inCheckpointSampledMTPAcceptanceExternalDiagnostic(_ error: Error) -> String {
@@ -354,6 +414,164 @@ func inCheckpointSampledMTPIndependentSoftmax(_ logits: [Double]) throws -> [Dou
         throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits("non-finite or zero softmax sum")
     }
     return exponentials.map { $0 / sum }
+}
+
+/// Independently re-derives, in this file's own plain `[Double]` arithmetic, the exact truncated
+/// sampling distribution `MLXLMCommon.truncatedSamplingProbabilities` computes from raw logits:
+/// `logSoftmax -> top_p -> min_p -> top_k -> softmax(./temperature)`, in that order.
+///
+/// DELIBERATELY DUPLICATED, NOT SHARED WITH THE RUNTIME'S HELPER. This file's entire reason to
+/// exist is an INDEPENDENT cross-check of the runtime's `Sigma_x min(p(x), q(x))` acceptance-rate
+/// prediction. If this function called `truncatedSamplingProbabilities` (or imported the runtime's
+/// own truncation code from `SampledMTPBlockRuntimeBridge` / `MLXLMCommon`), the cross-check would
+/// become tautological: it would AGREE with the runtime even if the runtime's own truncation were
+/// wrong, because both sides would be running the identical bug. A later "deduplication" pass MUST
+/// NOT replace this body with a call to the shared MLX helper -- doing so would silently delete the
+/// only independent check this instrument has.
+///
+/// Semantics reproduced from `truncatedSamplingProbabilities` / `applyTopPFilter` /
+/// `applyMinPFilter` / `applyTopKFilter` (read for reference only, at
+/// `spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/Evaluate.swift` -- never imported here):
+///   1. `logprobs[i] = logits[i] - logSumExp(logits)`, max-shifted for numerical stability. A raw
+///      `-infinity` logit is legitimate (a masked/unsupported vocabulary position, same as
+///      `inCheckpointSampledMTPIndependentSoftmax` above) and maps to exactly `0.0` probability.
+///   2. top_p (nucleus, applied only when `0 < topP < 1`): sort ascending by log-probability, take
+///      the cumulative sum of `exp(sortedLogprob)` in that ascending order, and mask to
+///      `-infinity` every entry whose cumulative probability is `<= 1 - topP` (keep the rest,
+///      cumulative STRICTLY greater than `1 - topP`). This ascending-cumulative form -- not a
+///      descending "keep the top mass first" variant -- is what the vendored `applyTopPFilter`
+///      computes; the two disagree at ties/boundaries, so it is reproduced exactly, not
+///      approximated.
+///   3. min_p (applied only when `minP > 0`): thresholded against the CURRENT (post-top_p-masked)
+///      maximum, mirroring `applyMinPFilter` being chained onto the already-top_p-filtered array in
+///      the vendored code -- keep entries with `logprob >= currentMax + log(minP)`, mask the rest.
+///   4. top_k (applied only when `topK > 0 && topK < vocabularySize`): keep the `topK` highest
+///      remaining log-probabilities, mask the rest.
+///   5. `softmax(masked / temperature)`, with masked entries mapping to exactly `0.0`.
+private func independentTruncatedProbabilities(
+    logits: [Double], temperature: Double, topP: Double, topK: Int, minP: Double
+) throws -> [Double] {
+    guard !logits.isEmpty else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits("empty vocabulary")
+    }
+    guard logits.allSatisfy({ !$0.isNaN && $0 != Double.infinity }) else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits("NaN or +infinity logit")
+    }
+    guard let maxLogit = logits.max(), maxLogit.isFinite else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits("every logit is -infinity")
+    }
+
+    // Step 1: max-shifted log-sum-exp -> log-probabilities.
+    let sumExp = logits.reduce(0.0) { $0 + Foundation.exp($1 - maxLogit) }
+    let logSumExp = maxLogit + Foundation.log(sumExp)
+    var masked = logits.map { $0 - logSumExp }
+
+    // Step 2: top_p (nucleus), ascending-cumulative form -- matches `applyTopPFilter` exactly.
+    if topP > 0, topP < 1 {
+        let ascendingOrder = masked.indices.sorted { masked[$0] < masked[$1] }
+        let keepThreshold = 1 - topP
+        var cumulative = 0.0
+        for index in ascendingOrder {
+            cumulative += Foundation.exp(masked[index])
+            if cumulative <= keepThreshold {
+                masked[index] = -Double.infinity
+            }
+        }
+    }
+
+    // Step 3: min_p, thresholded against the CURRENT (post-top_p) max -- matches `applyMinPFilter`
+    // being chained onto the already-top_p-filtered array in the vendored code.
+    if minP > 0 {
+        guard let currentMax = masked.max(), currentMax.isFinite else {
+            // Every entry was already masked by top_p -- nothing left for min_p to keep.
+            return Array(repeating: 0.0, count: logits.count)
+        }
+        let threshold = currentMax + Foundation.log(minP)
+        for index in masked.indices where masked[index] < threshold {
+            masked[index] = -Double.infinity
+        }
+    }
+
+    // Step 4: top_k -- keep the topK highest remaining log-probabilities.
+    if topK > 0, topK < logits.count {
+        let descendingOrder = masked.indices.sorted { masked[$0] > masked[$1] }
+        for index in descendingOrder.dropFirst(topK) {
+            masked[index] = -Double.infinity
+        }
+    }
+
+    // Step 5: softmax(masked / temperature). `Foundation.exp` of a `-infinity` argument is exactly
+    // `0.0` in Swift, so masked entries need no special-casing here.
+    let scaled = masked.map { $0 / temperature }
+    guard let scaledMax = scaled.max(), scaledMax.isFinite else {
+        // Every entry masked (degenerate distribution) -- the caller's DISAGREE cross-check would
+        // catch this against the runtime long before this branch would ever legitimately execute.
+        return Array(repeating: 0.0, count: logits.count)
+    }
+    let exponentials = scaled.map { Foundation.exp($0 - scaledMax) }
+    let total = exponentials.reduce(0, +)
+    guard total.isFinite, total > 0 else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits(
+            "non-finite or zero truncated softmax sum")
+    }
+    return exponentials.map { $0 / total }
+}
+
+/// Control (mirrors `inCheckpointSampledMTPAssertDrafterForwardsPerBlockRelationship` above): an
+/// ordinary function, not a top-level statement or an unreferenced global initializer (either of
+/// which could silently never run), called explicitly from `runInCheckpointSampledMTPAcceptance`
+/// before `independentTruncatedProbabilities` is ever used to predict a live run's sigmaMinPQ.
+///
+/// Identity check: at temperature=1, topP=1, topK=0, minP=0 (the CLI's own untruncated
+/// configuration, and the only one this file measured before truncated sampling existed), no
+/// filter applies, so the function must reduce to the plain softmax within 1e-12.
+///
+/// Anti-vacuity companion: at a genuinely truncating configuration, the result must differ from
+/// the plain softmax by more than a stated threshold on at least one vocabulary entry. Without
+/// this, a bug that made truncation silently a no-op (e.g. an inverted `topK > 0` guard) would
+/// still pass the identity check above undetected.
+func inCheckpointSampledMTPAssertIndependentTruncationControls() {
+    let sampleLogits: [Double] = [2.0, 1.0, 0.5, 0.1, -0.3, -1.0, -2.5, -5.0, -Double.infinity, 3.0]
+
+    let plain: [Double]
+    let identity: [Double]
+    do {
+        plain = try inCheckpointSampledMTPIndependentSoftmax(sampleLogits)
+        identity = try independentTruncatedProbabilities(
+            logits: sampleLogits, temperature: 1, topP: 1, topK: 0, minP: 0)
+    } catch {
+        preconditionFailure(
+            "independentTruncatedProbabilities identity control setup threw unexpectedly: \(error)")
+    }
+    precondition(
+        plain.count == identity.count,
+        "independentTruncatedProbabilities identity control vocabulary width mismatch")
+    for index in plain.indices {
+        precondition(
+            abs(plain[index] - identity[index]) <= 1e-12,
+            "independentTruncatedProbabilities at temperature=1 topP=1 topK=0 minP=0 must match "
+                + "the plain softmax within 1e-12 (index \(index): plain=\(plain[index]) "
+                + "identity=\(identity[index])) -- a divergence here means the new truncation path "
+                + "changes behavior even when a run's own sampling parameters request no "
+                + "truncation at all")
+    }
+
+    let truncated: [Double]
+    do {
+        truncated = try independentTruncatedProbabilities(
+            logits: sampleLogits, temperature: 1, topP: 1, topK: 3, minP: 0)
+    } catch {
+        preconditionFailure(
+            "independentTruncatedProbabilities anti-vacuity control setup threw unexpectedly: "
+                + "\(error)")
+    }
+    let maxAbsoluteDelta = zip(plain, truncated).map { abs($0 - $1) }.max() ?? 0
+    precondition(
+        maxAbsoluteDelta > 0.05,
+        "independentTruncatedProbabilities at topK=3 must differ from the untruncated softmax by "
+            + "more than 0.05 on at least one entry (observed max|delta|=\(maxAbsoluteDelta)) -- "
+            + "otherwise the identity control above cannot distinguish a correct implementation "
+            + "from one where truncation is silently a no-op")
 }
 
 /// `Sigma_x min(p(x), q(x))` -- the exact per-step sampled-MTP acceptance probability under the
@@ -699,6 +917,18 @@ final class InCheckpointSampledMTPTeeingLogitSampler: LogitSampler {
 final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlockRuntimeDeciding {
     private let inner: any SampledMTPBlockRuntimeDeciding
     private let teeingSampler: InCheckpointSampledMTPTeeingLogitSampler
+    /// The run's ACTUAL target-side sampling parameters (same values reported in
+    /// `InCheckpointSampledMTPAcceptanceSamplingReport`/`GenerateParameters`, never a second,
+    /// independently invented set) -- drives whether and how `independentTruncatedProbabilities`
+    /// truncates the target distribution `p` below. When these are the identity configuration
+    /// (temperature=1, topP=1, topK=0, minP=0), `independentTruncatedProbabilities` reduces to the
+    /// plain softmax (see `inCheckpointSampledMTPAssertIndependentTruncationControls`), so this
+    /// class's prediction never hardcodes either the truncated or untruncated case -- it always
+    /// tracks whatever configuration is actually being measured.
+    private let targetTemperature: Double
+    private let targetTopP: Double
+    private let targetTopK: Int
+    private let targetMinP: Double
 
     private(set) var decideDurationsSeconds: [Double] = []
     private(set) var blockOutcomes: [InCheckpointSampledMTPBlockOutcome] = []
@@ -712,9 +942,16 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
     /// or not that step was ultimately reached by the sequential walk.
     private(set) var sigmaMinPQByStep: [Int: [InCheckpointSampledMTPStepSigmaSample]] = [:]
 
-    init(inner: any SampledMTPBlockRuntimeDeciding) {
+    init(
+        inner: any SampledMTPBlockRuntimeDeciding,
+        targetTemperature: Double, targetTopP: Double, targetTopK: Int, targetMinP: Double
+    ) {
         self.inner = inner
         self.teeingSampler = InCheckpointSampledMTPTeeingLogitSampler(inner: inner.proposalSampler)
+        self.targetTemperature = targetTemperature
+        self.targetTopP = targetTopP
+        self.targetTopK = targetTopK
+        self.targetMinP = targetMinP
     }
 
     var proposalSampler: any LogitSampler { teeingSampler }
@@ -817,7 +1054,19 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
                     throw InCheckpointSampledMTPAcceptanceCLIError.targetDraftVocabularyWidthMismatch(
                         expected: draftRow.count, actual: targetRow.count)
                 }
-                let p = try inCheckpointSampledMTPIndependentSoftmax(targetRow)
+                // Target side `p`: truncated at whatever configuration this run's OWN
+                // `GenerateParameters` actually requests (`targetTemperature`/`targetTopP`/
+                // `targetTopK`/`targetMinP`, set in `init` from the same `parameters` the run's
+                // scalar and speculative iterators are constructed with) -- never hardcoded to
+                // either the truncated or untruncated case. At the identity configuration
+                // (temperature=1, topP=1, topK=0, minP=0) this is exactly the plain softmax (see
+                // `inCheckpointSampledMTPAssertIndependentTruncationControls`).
+                let p = try independentTruncatedProbabilities(
+                    logits: targetRow, temperature: targetTemperature, topP: targetTopP,
+                    topK: targetTopK, minP: targetMinP)
+                // Draft side `q` stays UNTRUNCATED: the runtime's own drafter proposal distribution
+                // is not truncated, so re-deriving it with truncation here would predict a
+                // different quantity than the one `decide()` actually accepts/rejects against.
                 let q = try inCheckpointSampledMTPIndependentSoftmax(draftRow)
                 let sigma = inCheckpointSampledMTPSigmaMinPQ(target: p, draft: q)
                 sigmaMinPQByStep[index, default: []].append(
@@ -980,6 +1229,7 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     throw InCheckpointSampledMTPAcceptanceCLIError.releaseBuildRequired
     #else
     inCheckpointSampledMTPAssertDrafterForwardsPerBlockRelationship()
+    inCheckpointSampledMTPAssertIndependentTruncationControls()
     let parsed = try parseInCheckpointSampledMTPAcceptanceArguments(arguments)
 
     let outputURL = URL(fileURLWithPath: parsed.outputJSONPath)
@@ -1014,15 +1264,19 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         expectedSourceKeyCount: inCheckpointSampledMTPArtifactSelection.expectedSourceKeyCount,
         revision: inCheckpointSampledMTPArtifactSelection.revision)
 
-    // Forced sampling policy -- this is not a choice. `supports()`
-    // (`SampledMTPBlockRuntimeBridge.swift:119-127,252-260`) rejects anything else, and
-    // `providerIsEligible` additionally requires `parameters.processor() == nil`
-    // (`MTPSpeculativeTokenIterator.swift:171-173`).
+    // `temperature` and `minP` are PINNED, not a choice: `supports()`
+    // (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
+    // `temperature == 1` and `minP == 0`, and `providerIsEligible` additionally requires
+    // `parameters.processor() == nil` (`MTPSpeculativeTokenIterator.swift:171-173`) -- there is no
+    // flag for either. `topP`/`topK` ARE settable, via `--top-p`/`--top-k`, and default to the
+    // untruncated identity (`1`/`0`); `parseInCheckpointSampledMTPAcceptanceArguments` already
+    // rejects any value `supports()` would refuse, so `parsed.topP`/`parsed.topK` are always within
+    // the accepted range by the time they reach here.
     let parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
         temperature: 1,
-        topP: 1,
-        topK: 0,
+        topP: Float(parsed.topP),
+        topK: parsed.topK,
         minP: 0,
         seed: parsed.seed)
     let samplingReport = InCheckpointSampledMTPAcceptanceSamplingReport(
@@ -1039,7 +1293,10 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
             + "seed=\(parsed.seed) sampling: temperature=\(samplingReport.temperature) "
             + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) minP=\(samplingReport.minP) "
             + "repetitionPenalty=nil presencePenalty=nil frequencyPenalty=nil "
-            + "(forced -- these are the only parameters supports() accepts)")
+            + "(temperature=1 and minP=0 are PINNED -- supports() requires exactly those; topP/topK "
+            + "are settable via --top-p/--top-k, default to the untruncated identity (1/0), and the "
+            + "ACTUAL values this run measured are topP=\(samplingReport.topP) "
+            + "topK=\(samplingReport.topK), printed above)")
 
     var streamReports: [InCheckpointSampledMTPAcceptanceStreamReport] = []
     var cleanOutcomes: [InCheckpointSampledMTPBlockOutcome] = []
@@ -1054,8 +1311,22 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
 
         // --- sampled MTP run ---
         let mtpCache = context.model.newCache(parameters: parameters)
+        // Built from the SAME `parameters` value handed to `MTPSpeculativeTokenIterator` below (not
+        // a second, independently invented truncation) -- this is what makes it structurally
+        // impossible for the provider's stored truncation and this run's own request truncation to
+        // disagree. See `SampledMTPSamplingTruncation`'s doc comment for why that cross-check is the
+        // load-bearing safety property this depends on.
+        let truncation = SampledMTPSamplingTruncation(parameters: parameters)
         let measuring = InCheckpointMeasuringSampledMTPBlockRuntimeProvider(
-            inner: inCheckpointSampledMTPMakeProvider(parsed.provider, seed: parsed.seed))
+            inner: inCheckpointSampledMTPMakeProvider(
+                parsed.provider, seed: parsed.seed, truncation: truncation),
+            // Same `samplingReport` values already printed above and written into the JSON's
+            // `sampling` field -- this run's ACTUAL target-side sampling configuration, not a
+            // second, independently invented one. Never hardcodes either the truncated or
+            // untruncated case: it always tracks whatever `--top-p`/`--top-k` this run was invoked
+            // with.
+            targetTemperature: samplingReport.temperature, targetTopP: samplingReport.topP,
+            targetTopK: samplingReport.topK, targetMinP: samplingReport.minP)
         var mtpIterator = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: MLXArray(promptTokens)),
             mainModel: context.model,
@@ -1065,6 +1336,14 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
             blockSize: inCheckpointSampledMTPBlockSize,
             collectPhaseTelemetry: true,
             sampledBlockDecisionProvider: measuring)
+        // Fail fast on prompt[0], BEFORE spending this prompt's full decode loop: see the doc
+        // comment on `providerWiringNotEngaged` for why `passthroughReason` at this exact point
+        // (immediately after construction, before `nextThrowing()` is ever called) genuinely
+        // discriminates a provider/truncation wiring defect from a healthy run.
+        if promptIndex == 0, let constructionPassthroughReason = mtpIterator.passthroughReason {
+            throw InCheckpointSampledMTPAcceptanceCLIError.providerWiringNotEngaged(
+                passthroughReason: constructionPassthroughReason)
+        }
         var emitted = 0
         while emitted < parsed.maxTokens, let _ = try mtpIterator.nextThrowing() {
             emitted += 1
@@ -1344,8 +1623,14 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     }
     let disagreements = (perStepAgreement + [pooledAgreement]).filter { $0.verdict == .disagree }
     guard disagreements.isEmpty else {
+        // Names the EFFECTIVE truncation parameters `p` (the target side) was predicted under, so
+        // a future disagreement report states which configuration it was measuring -- e.g.
+        // distinguishing "the untruncated cross-check disagreed" from "the truncated cross-check
+        // disagreed at this topP/topK/minP", rather than leaving a reader to guess.
         let detail = disagreements.map(inCheckpointSampledMTPDescribeAgreementCheck)
             .joined(separator: "; ")
+            + " -- target `p` predicted under temperature=\(samplingReport.temperature) "
+            + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) minP=\(samplingReport.minP)"
         throw InCheckpointSampledMTPAcceptanceCLIError.sigmaMinPQDisagreement(detail)
     }
     let agreementReport = InCheckpointSampledMTPAcceptanceAgreementReport(
@@ -1395,12 +1680,19 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     #endif
 }
 
+/// `truncation` is REQUIRED (no default): every call site must build it from the SAME
+/// `GenerateParameters` value the caller hands to `MTPSpeculativeTokenIterator`
+/// (`SampledMTPSamplingTruncation(parameters:)`), so the constructed provider's stored truncation
+/// and the run's own request truncation cannot disagree. A default of `.untruncated` here would
+/// silently re-introduce exactly the wiring gap this function exists to close if a future call site
+/// forgot to pass one.
 func inCheckpointSampledMTPMakeProvider(
     _ kind: InCheckpointSampledMTPAcceptanceProviderKind,
-    seed: UInt64
+    seed: UInt64,
+    truncation: SampledMTPSamplingTruncation
 ) -> any SampledMTPBlockRuntimeDeciding {
     switch kind {
-    case .seeded: return SeededSampledMTPBlockRuntimeProvider(seed: seed)
-    case .nondeterministic: return NondeterministicSampledMTPBlockRuntimeProvider()
+    case .seeded: return SeededSampledMTPBlockRuntimeProvider(seed: seed, truncation: truncation)
+    case .nondeterministic: return NondeterministicSampledMTPBlockRuntimeProvider(truncation: truncation)
     }
 }

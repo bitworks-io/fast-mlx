@@ -455,6 +455,15 @@ class PublicExportTests(unittest.TestCase):
         # the intersection its two neighbouring tests each covered only one axis of. All three
         # places moved together.
         #
+        # 901 -> 903 added, in one increment (two paths, mode 100644):
+        # spike/Tests/ServingCoreTests/SampledMTPServeArgumentTests.swift and
+        # spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/TruncatedSamplingProbabilitiesTests.swift --
+        # the opt-in sampled-MTP serve flag's argument tests and the vendored truncation helper's
+        # tests, from the truncation-parity increment recorded in
+        # docs/task-inbox/2026-09-09-sampled-mtp-truncation-parity-IMPLEMENTED.md. The same
+        # increment edited several already-projected files in place (byte-only, no reseal of their
+        # own). All three places moved together.
+        #
         # 899 -> 901 added, in one increment (two paths, mode 100644):
         # spike/Sources/fastmlx-harness/InCheckpointSampledMTPThroughputCLI.swift and
         # spike/Tests/FastMLXHarnessTests/InCheckpointSampledMTPThroughputArithmeticTests.swift --
@@ -524,8 +533,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 901,
-                "pathModeSha256": "711db708e4c2e4f412e1741740efc14cf2afbc46429a9c41c6a76322294515bd",
+                "pathCount": 903,
+                "pathModeSha256": "c661299a86cb3ec98ebcc0d94a4fd08a0425e79cdb526349a86e4ebf03b59724",
             },
         )
 
@@ -619,7 +628,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 901)
+            self.assertEqual(reexport_count, 903)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

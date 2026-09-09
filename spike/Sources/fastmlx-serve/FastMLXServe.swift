@@ -830,6 +830,7 @@ private func loadScalarServingBackend(
             kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
             ngramOffloadPlanURL: arguments.ngramOffloadPlanURL,
             inCheckpointMTPSelection: arguments.inCheckpointMTPSelection,
+            sampledMTPBlockDecisionsEnabled: arguments.sampledMTPBlockDecisionsEnabled,
             chatTemplateOverrideURL: arguments.chatTemplateURL))
     return PreparedServingBackend(
         backend: loaded.backend,
