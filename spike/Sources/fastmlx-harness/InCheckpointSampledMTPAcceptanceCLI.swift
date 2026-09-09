@@ -438,10 +438,26 @@ func inCheckpointSampledMTPIndependentSoftmax(_ logits: [Double]) throws -> [Dou
 ///   2. top_p (nucleus, applied only when `0 < topP < 1`): sort ascending by log-probability, take
 ///      the cumulative sum of `exp(sortedLogprob)` in that ascending order, and mask to
 ///      `-infinity` every entry whose cumulative probability is `<= 1 - topP` (keep the rest,
-///      cumulative STRICTLY greater than `1 - topP`). This ascending-cumulative form -- not a
-///      descending "keep the top mass first" variant -- is what the vendored `applyTopPFilter`
-///      computes; the two disagree at ties/boundaries, so it is reproduced exactly, not
-///      approximated.
+///      cumulative STRICTLY greater than `1 - topP`) -- EXCEPT the single highest
+///      log-probability entry (the last position in ascending sort order, i.e. the row's argmax),
+///      which is ALWAYS kept regardless of whether its own cumulative probability clears the
+///      threshold. This ascending-cumulative form -- not a descending "keep the top mass first"
+///      variant -- is what the vendored `applyTopPFilter` computes; the two disagree at
+///      ties/boundaries, so it is reproduced exactly, not approximated. The keep-the-argmax
+///      exception mirrors `applyTopPFilter`'s `min_tokens_to_keep=1` fix (HF
+///      `TopPLogitsWarper`'s floor): without it, once `1 - topP` rounds to exactly `1.0f` in
+///      float32, the cumulative-probability test is false at every position -- including at the
+///      row's own maximum, since `cumulativeProbs` is float32-non-decreasing and its last sorted
+///      position always holds that maximum -- and the entire row would mask to `-infinity`.
+///      Because this oracle's arithmetic is `Double`, not `float32`, that saturation point is far
+///      more extreme here (`1 - topP` does not round to exactly `1.0` in `Double` until
+///      `topP` is on the order of `Double.ulpOfOne`, roughly `1e-16`, not `float32`'s `~1e-8`) --
+///      but the exception is reproduced anyway, both for semantic parity with the fixed vendored
+///      helper across their full domains and so the two never silently diverge at the extreme end
+///      of `Double`'s own range either (previously, at `topP` this small, this oracle fell through
+///      to the "every entry masked" branch below and returned an all-zero vector; with the
+///      exception applied, it now returns a one-hot vector on the argmax instead, matching what
+///      the fixed vendored helper does at its own, much larger, float32 saturation point).
 ///   3. min_p (applied only when `minP > 0`): thresholded against the CURRENT (post-top_p-masked)
 ///      maximum, mirroring `applyMinPFilter` being chained onto the already-top_p-filtered array in
 ///      the vendored code -- keep entries with `logprob >= currentMax + log(minP)`, mask the rest.
@@ -472,14 +488,19 @@ func independentTruncatedProbabilities(
     let logSumExp = maxLogit + Foundation.log(sumExp)
     var masked = logits.map { $0 - logSumExp }
 
-    // Step 2: top_p (nucleus), ascending-cumulative form -- matches `applyTopPFilter` exactly.
+    // Step 2: top_p (nucleus), ascending-cumulative form -- matches `applyTopPFilter` exactly,
+    // including its `min_tokens_to_keep=1` fix: the last sorted position (this row's argmax) is
+    // never masked, even if its own cumulative probability does not clear `keepThreshold`. See the
+    // doc comment above for why this oracle mirrors that exception despite its `Double` arithmetic
+    // saturating at a far more extreme `topP` than the vendored helper's `float32` arithmetic does.
     if topP > 0, topP < 1 {
         let ascendingOrder = masked.indices.sorted { masked[$0] < masked[$1] }
         let keepThreshold = 1 - topP
         var cumulative = 0.0
-        for index in ascendingOrder {
+        for (position, index) in ascendingOrder.enumerated() {
             cumulative += Foundation.exp(masked[index])
-            if cumulative <= keepThreshold {
+            let isLastSortedPosition = position == ascendingOrder.count - 1
+            if cumulative <= keepThreshold, !isLastSortedPosition {
                 masked[index] = -Double.infinity
             }
         }

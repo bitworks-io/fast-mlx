@@ -230,8 +230,8 @@ final class ScalarTopPSamplerDegenerateTopPCharacterizationTests: XCTestCase {
     /// crossover in behavior (if any) between the healthy and degenerate
     /// regimes is visible in the test log rather than just asserted.
     ///
-    /// Measured on 2026-09-09 (see the `[scalar-topp] sweep ...` lines this
-    /// test prints):
+    /// Measured on 2026-09-09, BEFORE the `applyTopPFilter` `min_tokens_to_keep=1`
+    /// fix (see the `[scalar-topp] sweep ...` lines this test prints):
     ///
     /// | topP                    | token id |
     /// |--------------------------|---------:|
@@ -256,10 +256,21 @@ final class ScalarTopPSamplerDegenerateTopPCharacterizationTests: XCTestCase {
     /// UNPERMUTED fixture's true peak simply also sits at index 0, so a
     /// correct narrow-nucleus draw and a Gumbel-max tie-break fallback are
     /// indistinguishable from the returned token id alone at THIS topP. The
-    /// scalar path's degeneracy crossover coincides with the shared helper's
-    /// NaN boundary (between `1e-7` and `1e-9`), not before it. Only `1e-9`
-    /// and `Float.leastNormalMagnitude` are confirmed-degenerate scalar-path
-    /// reads (see the permuted test's decisive case).
+    /// scalar path's degeneracy crossover coincided with the shared helper's
+    /// NaN boundary (between `1e-7` and `1e-9`), not before it. `1e-9` and
+    /// `Float.leastNormalMagnitude` were the confirmed-degenerate scalar-path
+    /// reads (see the permuted test's decisive case) BEFORE the fix below.
+    ///
+    /// POST-FIX (this suite's decisive pin is
+    /// `testPermutedFixtureDistinguishesTieBreakFromRealPeakTracking`, not
+    /// this table): `applyTopPFilter` now force-keeps the row's argmax
+    /// (HF `min_tokens_to_keep=1`), so the `1e-9` /
+    /// `Float.leastNormalMagnitude` rows no longer collapse to an
+    /// all-`-infinity` Gumbel-max tie-break. This unpermuted, index-0-peaked
+    /// fixture cannot distinguish "correctly kept the peak" from "still
+    /// tie-breaking to 0" on its own — this table is left as the historical
+    /// pre-fix measurement rather than re-asserted post-fix; the permuted
+    /// test below is the one pinned against the fix.
     func testProductionWidthTopPSweepReturnedTokenIds() {
         let vocabularySize = Self.productionVocabularySize
         let sweep: [Float] = [1.0, 0.95, 1e-7, 1e-9, Float.leastNormalMagnitude]
@@ -321,31 +332,31 @@ final class ScalarTopPSamplerDegenerateTopPCharacterizationTests: XCTestCase {
         XCTAssertTrue(narrow.inRange)
         XCTAssertEqual(narrow.tokenId, peakIndex)
 
-        // Case 3 — the decisive degenerate case (topP=1e-9). Two possible,
-        // mutually exclusive outcomes, both meaningful:
-        //   - returns 0 (not peakIndex): confirms the earlier token-0
-        //     reading was a Gumbel-max tie-break artifact of an
-        //     all-`-infinity` row — genuinely wrong output, independent of
-        //     where the true peak is. The fail-open severity claim stands.
-        //   - returns peakIndex: the row was NOT actually fully collapsed
-        //     (or the tie-break coincidentally still favors the true peak
-        //     for an unrelated reason), the earlier token-0 reading was an
-        //     artifact of the unpermuted fixture specifically, and the
-        //     severity claim must be retracted.
-        // Measured on 2026-09-09: token id 0, NOT peakIndex (see the
-        // "[scalar-topp] permuted degenerate ..." line this test prints).
-        // This CONFIRMS the first branch: at topP=1e-9, V=151936, the scalar
-        // sampler returns 0 regardless of where the fixture's true peak is
-        // placed, which rules out "coincidentally correct" and pins this as
-        // a genuine Gumbel-max-tie-break-over-an-all-`-infinity`-row defect,
-        // not signal survival. The earlier severity claim (scalar path
-        // silently returns a token from an undefined distribution instead
-        // of failing closed) stands, now on direct evidence rather than
-        // inference.
+        // Case 3 — the decisive case (topP=1e-9), and the PRIMARY ACCEPTANCE
+        // TEST for the `applyTopPFilter` `min_tokens_to_keep=1` fix.
+        //
+        // BEFORE the fix (measured 2026-09-09, root-cause characterization):
+        // token id 0, NOT peakIndex. That confirmed the earlier token-0
+        // reading was a Gumbel-max tie-break artifact of an all-`-infinity`
+        // row, independent of where the true peak sits — a genuinely wrong,
+        // silently-returned token. `applyTopPFilter` masked the ENTIRE row
+        // to `-infinity` at this `(topP, V)` because `1 - topP` rounds to
+        // exactly `1.0f` in float32 and the cumulative-probability test was
+        // false everywhere, including at the row's true argmax.
+        //
+        // AFTER the fix: `applyTopPFilter` force-keeps the row's argmax
+        // (HF `TopPLogitsWarper`'s `min_tokens_to_keep=1` floor) whenever the
+        // cumulative-mass test would otherwise mask every position. The
+        // permuted fixture's true peak sits at `peakIndex`, so the fixed
+        // sampler must now return `peakIndex`, not `0` — this is the exact
+        // discriminator that proved the defect, inverted to prove the
+        // repair: a sampler still tie-breaking to a fixed index-0 fallback
+        // would fail this assertion just as visibly as it failed before the
+        // fix confirmed the bug.
         let degenerate = sampledToken(logits: logits, vocabularySize: vocabularySize, topP: 1e-9)
         print("[scalar-topp] permuted degenerate peakIndex=\(peakIndex) topP=1e-9 token=\(degenerate.tokenId)")
         XCTAssertTrue(degenerate.inRange)
-        XCTAssertEqual(degenerate.tokenId, 0)
-        XCTAssertNotEqual(degenerate.tokenId, peakIndex)
+        XCTAssertEqual(degenerate.tokenId, peakIndex)
+        XCTAssertNotEqual(degenerate.tokenId, 0)
     }
 }

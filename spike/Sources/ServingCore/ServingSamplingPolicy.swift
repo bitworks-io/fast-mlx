@@ -48,14 +48,30 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
         }
         // Downstream (GenerateParameters/TopPSampler) computes its nucleus
         // threshold as `1 - topP` and only truncates when that value is
-        // strictly less than 1. In float32, `1 - topP` rounds to exactly 1.0
-        // once `topP` drops below roughly 3e-8 (measured: at production
-        // vocabulary width V=151936, topP <= 1e-9 masks every entry while
-        // 1e-7 is still usable). This guard is width-independent and
-        // deliberately conservative: it refuses slightly above the measured
-        // degeneracy onset, not at the exact onset, because the exact onset
-        // shifts with vocabulary width and a hardcoded "safe" constant would
-        // not be well-defined across models.
+        // strictly less than 1; below roughly `topP < 3e-8`, `1 - topP`
+        // rounds to exactly `1.0f` in float32 and every position in the
+        // cumulative-mass test reads as "does not clear the threshold."
+        //
+        // POLICY, not mechanism: `applyTopPFilter`
+        // (`spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/Evaluate.swift`)
+        // now force-keeps the row's single most-probable token whenever that
+        // happens (HF `TopPLogitsWarper`'s `min_tokens_to_keep=1` floor), so
+        // this band is no longer a fail-open defect at the vendored-helper
+        // level -- it yields a legitimate, correctly-computed single-token
+        // nucleus. This guard refuses it anyway, for a different reason: a
+        // forced single-token nucleus is operationally indistinguishable
+        // from greedy decoding, while still being requested and billed as
+        // sampled. Refusing it here, at the serving boundary, tells the
+        // caller to ask for `temperature: 0` (the real greedy path) instead
+        // of silently substituting one. This refusal is deliberately
+        // width-independent and conservative -- it refuses slightly above
+        // the float32 onset, not at the exact onset, because the exact
+        // onset shifts with vocabulary width and a hardcoded "safe" constant
+        // would not be well-defined across models -- and it keeps the
+        // serving boundary's correctness independent of the vendored
+        // helper's own float32 numerics: this guard would still be the
+        // right policy call even if a future vendor sync changed
+        // `applyTopPFilter`'s internals again.
         guard Float(1) - Float(resolvedTopP) < 1 else {
             throw ServingSamplingPolicyError.topPTooSmallToTruncate(resolvedTopP)
         }

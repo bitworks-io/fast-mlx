@@ -279,16 +279,59 @@ public struct TopPSampler: LogitSampler {
     }
 }
 
-/// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
-/// Matches `apply_top_p` from `mlx_lm/sample_utils.py`.
+/// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus
+/// sampling), OR the single most-probable token unconditionally (HF
+/// `TopPLogitsWarper`'s `min_tokens_to_keep=1` floor).
+///
+/// DELIBERATE DIVERGENCE from `apply_top_p` in `mlx_lm/sample_utils.py`:
+/// upstream has no `min_tokens_to_keep` floor, and this file matched that
+/// exactly until this fix. `sortedProbs = exp(sortedLogprobs)` is
+/// elementwise non-negative, and IEEE-754 round-to-nearest addition is
+/// monotonic in its non-negative operand, so `cumulativeProbs` is
+/// non-decreasing in float32 -- the LAST sorted position (the row's argmax)
+/// always holds the cumulative array's maximum. At a small enough `topP`,
+/// `1 - topP` rounds to exactly `1.0f`; when that happens `cumulativeProbs
+/// .> (1 - topP)` is false even at that maximum, so upstream's predicate
+/// (and this function's, before this fix) is false at EVERY position, the
+/// whole row masks to `-infinity`, and the caller's `categorical` Gumbel-max
+/// draw over an all-`-infinity` row returns whatever index its tie-break
+/// happens to land on -- measured on 2026-09-09 to be index 0 regardless of
+/// where the row's true peak sits (a fixture with the true peak permuted to
+/// index 12345 still returned 0 at `topP=1e-9`, V=151936). That is a
+/// silently wrong sampled token, not a refusal.
+///
+/// Because of the monotonicity argument above, OR-ing in "always keep the
+/// last sorted position" is a no-op everywhere the unmodified predicate
+/// already keeps ANY token at all (if any position clears the threshold,
+/// the last one -- the maximum -- already does too), so this changes
+/// nothing across the entire non-degenerate `topP` range, for any
+/// vocabulary width. It only changes the previously-fully-masked case, which
+/// now degrades to "return the single most-probable token" instead of
+/// "return an index from an undefined all-`-infinity` tie-break."
+///
+/// A future vendor sync against upstream `mlx_lm` MUST NOT silently drop
+/// this floor back to bare parity with `apply_top_p` -- upstream's own
+/// degenerate-band behavior (return token 0 once `1 - topP` saturates to
+/// `1.0f`) is the bug this fix exists to close, not a compatibility target.
 public func applyTopPFilter(_ logprobs: MLXArray, topP: MLXArray, negInf: MLXArray) -> MLXArray {
     let sortedIndices = argSort(logprobs, axis: -1)
     let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
     let sortedProbs = exp(sortedLogprobs)
     let cumulativeProbs = cumsum(sortedProbs, axis: -1)
 
+    // Force-keep the last sorted position (the row's argmax) regardless of
+    // the cumulative-mass test, per the `min_tokens_to_keep=1` floor
+    // documented above. Built rank-generically on axis -1 via broadcasting
+    // (a `[V]`-shaped boolean mask broadcasts against any `[..., V]`-shaped
+    // `cumulativeProbs`) -- this function has no rank precondition, unlike
+    // `applyTopKFilter` below, which does.
+    let vocabularySize = logprobs.dim(-1)
+    let sortedPositions = MLXArray.arange(vocabularySize)
+    let keepLastSortedPosition = sortedPositions .== (vocabularySize - 1)
+
     // Mask low-probability tail in sorted order, scatter back to original vocab order.
-    let filtered = MLX.where(cumulativeProbs .> (1 - topP), sortedLogprobs, negInf)
+    let keepMask = (cumulativeProbs .> (1 - topP)) .|| keepLastSortedPosition
+    let filtered = MLX.where(keepMask, sortedLogprobs, negInf)
     return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
 }
 

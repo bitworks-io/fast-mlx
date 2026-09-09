@@ -1510,7 +1510,15 @@ final class SampledMTPComposedTopPTopKTruncationTests: XCTestCase {
     /// `applyTopPFilter`'s ascending-sort/cumsum/threshold shape exactly,
     /// including its `topP > 0 && topP < 1` no-op guard (`applyTopPFilter`
     /// is only ever called from inside that guard in
-    /// `truncatedSamplingProbabilities`).
+    /// `truncatedSamplingProbabilities`) AND its `min_tokens_to_keep=1` fix:
+    /// the last sorted position (this row's highest-probability entry) is
+    /// always kept, even if its own cumulative mass does not clear
+    /// `1 - topP`. This yardstick's suites only ever exercise `topP` in
+    /// {0.5, 0.95} (see call sites below), which never comes close to the
+    /// float32 saturation band where that exception is observable, so
+    /// mirroring it here changes none of this file's existing assertions --
+    /// it keeps the reference's stated contract accurate should a future
+    /// suite extend the swept `topP` range down toward that band.
     private static func referenceNucleusSupport(
         _ probabilities: [Double], topP: Double
     ) -> Set<Int> {
@@ -1518,9 +1526,10 @@ final class SampledMTPComposedTopPTopKTruncationTests: XCTestCase {
         let ascending = probabilities.indices.sorted { probabilities[$0] < probabilities[$1] }
         var cumulative = 0.0
         var kept = Set<Int>()
-        for index in ascending {
+        for (position, index) in ascending.enumerated() {
             cumulative += probabilities[index]
-            if cumulative > 1 - topP {
+            let isLastSortedPosition = position == ascending.count - 1
+            if cumulative > 1 - topP || isLastSortedPosition {
                 kept.insert(index)
             }
         }
