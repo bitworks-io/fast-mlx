@@ -22,9 +22,17 @@ final class ContinuousServingProductionRouteEvidenceTests: XCTestCase {
         }
     }
 
+    // Gated: relies on the #if DEBUG-only
+    // `testingLoadedContinuousServingModelWithLoaderProvenance` backdoor
+    // constructor (MLXContinuousServing.swift), which does not exist in
+    // release builds. Skipped rather than vanished so the release suite
+    // still reports it. `testManualLoadedWrapperHasNoProductionRouteEvidenceAuthorization`
+    // in this file runs unconditionally in release and proves the suite
+    // is not silently empty.
     func testLoaderProvenanceAuthorizesPromptFreeBoundedOutputTokenTrace()
         async throws
     {
+#if DEBUG
         let recorder = EvidenceRuntimeRecorder()
         let coordinator = ContinuousBatchCoordinator(
             configuration: try ContinuousBatchConfiguration(
@@ -68,11 +76,21 @@ final class ContinuousServingProductionRouteEvidenceTests: XCTestCase {
         XCTAssertEqual(consumed, [])
         XCTAssertEqual(recorder.removedCount, 1)
         await backend.shutdown()
+#else
+        throw XCTSkip(
+            "testingLoadedContinuousServingModelWithLoaderProvenance is debug-only"
+        )
+#endif
     }
 
+    // Gated: same #if DEBUG-only backdoor constructor as
+    // testLoaderProvenanceAuthorizesPromptFreeBoundedOutputTokenTrace above.
+    // See that test's comment for why, and which test in this file remains
+    // unconditional.
     func testNormalStartDoesNotRecordTokenTraceByDefaultEvenWithProvenance()
         async throws
     {
+#if DEBUG
         let coordinator = ContinuousBatchCoordinator(
             configuration: try ContinuousBatchConfiguration(
                 maxActiveSlots: 1,
@@ -100,6 +118,11 @@ final class ContinuousServingProductionRouteEvidenceTests: XCTestCase {
             authorization: authorization)
         XCTAssertEqual(traces, [])
         await backend.shutdown()
+#else
+        throw XCTSkip(
+            "testingLoadedContinuousServingModelWithLoaderProvenance is debug-only"
+        )
+#endif
     }
 }
 

@@ -7,9 +7,17 @@ import ServingCore
 @testable import fastmlx_harness
 
 final class Qwen38ScorecardProductionRouteTests: XCTestCase {
+    // Gated: uses makeLoadedProductionRouteFixture, which relies on the
+    // #if DEBUG-only testingLoadedContinuousServingModelWithLoaderProvenance
+    // backdoor constructor (MLXContinuousServing.swift), absent in release
+    // builds. Skipped rather than vanished so the release suite still
+    // reports it. testDuplicateProductionTokenTraceFailsExplicitly in this
+    // file runs unconditionally in release and proves the suite is not
+    // silently empty.
     func testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch()
         async throws
     {
+#if DEBUG
         for concurrency in [2, 4] {
             let loaded = makeLoadedProductionRouteFixture(
                 concurrency: concurrency,
@@ -62,6 +70,12 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
             XCTAssertLessThan(latestAdmission, earliestCompletion)
             XCTAssertNoThrow(try result.validate())
         }
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     func testProductionRouteObservationDigestIsStableForSameTypedValues()
@@ -79,9 +93,14 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
             c4: c4))
     }
 
+    // Gated: same makeLoadedProductionRouteFixture / debug-only backdoor
+    // dependency as testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch
+    // above. See that test's comment for why, and which test in this file
+    // remains unconditional.
     func testRunLoadedClearsPriorPlanObservationsBeforeCurrentCohort()
         async throws
     {
+#if DEBUG
         for concurrency in [2, 4] {
             let loaded = makeLoadedProductionRouteFixture(
                 concurrency: concurrency,
@@ -118,11 +137,22 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
                         ? result
                         : makeValidProductionRouteResult(concurrency: 4)))
         }
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeLoadedProductionRouteFixture / debug-only backdoor
+    // dependency as testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch
+    // above. See that test's comment for why, and which test in this file
+    // remains unconditional.
     func testRunLoadedUsesCompletedTokenTracesWhenRequestsFinishBeforeAdmissionSnapshot()
         async throws
     {
+#if DEBUG
         let loaded = makeLoadedProductionRouteFixture(
             concurrency: 2,
             maxCompletionTokens: 4)
@@ -175,11 +205,22 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
             $0.usage.completionTokens == $0.outputTokenIDs.count
         })
         XCTAssertNoThrow(try result.validate())
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeLoadedProductionRouteFixture / debug-only backdoor
+    // dependency as testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch
+    // above. See that test's comment for why, and which test in this file
+    // remains unconditional.
     func testRunLoadedRejectsInsufficientPlanTraceCapacityBeforeRequests()
         async throws
     {
+#if DEBUG
         let loaded = makeLoadedProductionRouteFixture(
             concurrency: 2,
             maxCompletionTokens: 4,
@@ -204,11 +245,22 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
         XCTAssertEqual(snapshot.activeRequests, 0)
         XCTAssertEqual(snapshot.coordinatorSlots, 0)
         XCTAssertEqual(snapshot.reservedKVBytes, 0)
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeLoadedProductionRouteFixture / debug-only backdoor
+    // dependency as testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch
+    // above. See that test's comment for why, and which test in this file
+    // remains unconditional.
     func testRunLoadedCleansTracesAfterEvidenceFailureBeforeNextRun()
         async throws
     {
+#if DEBUG
         let loaded = makeLoadedProductionRouteFixture(
             concurrency: 2,
             maxCompletionTokens: 4)
@@ -243,11 +295,22 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
             result.coordinatorPlanObservations,
             allowedIDs: [3, 4])
         XCTAssertNoThrow(try result.validate())
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeLoadedProductionRouteFixture / debug-only backdoor
+    // dependency as testLoadedProductionRouteRunsC2AndC4ThroughSharedBackendBatch
+    // above. See that test's comment for why, and which test in this file
+    // remains unconditional.
     func testRunLoadedCancelsPartialAdmissionAfterSiblingStartFailure()
         async throws
     {
+#if DEBUG
         let loaded = makeLoadedProductionRouteFixture(
             concurrency: 2,
             maxCompletionTokens: 1_024,
@@ -331,6 +394,12 @@ final class Qwen38ScorecardProductionRouteTests: XCTestCase {
         XCTAssertEqual(snapshot.activeRequests, 0)
         XCTAssertEqual(snapshot.coordinatorSlots, 0)
         XCTAssertEqual(snapshot.reservedKVBytes, 0)
+#else
+        throw XCTSkip(
+            "makeLoadedProductionRouteFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     func testDuplicateProductionTokenTraceFailsExplicitly() throws {
@@ -654,6 +723,11 @@ private func makeProductionRouteFixtureBackend() -> ContinuousServingBackend {
             mailboxCapacity: .init(maxDeltas: 4, maxBytes: 4_096)))
 }
 
+// Gated: this helper's sole purpose is to invoke the #if DEBUG-only
+// testingLoadedContinuousServingModelWithLoaderProvenance backdoor
+// constructor (MLXContinuousServing.swift); every one of its callers is
+// itself #if DEBUG-gated (see comments on those test methods above).
+#if DEBUG
 private func makeLoadedProductionRouteFixture(
     concurrency: Int,
     maxCompletionTokens: Int,
@@ -696,6 +770,7 @@ private func makeLoadedProductionRouteFixture(
             backend: backend,
             startupReport: makeStartupReport(concurrency: concurrency))
 }
+#endif
 
 private func seedUnrelatedPlanActivity(
     _ loaded: LoadedContinuousServingModel

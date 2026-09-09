@@ -291,9 +291,18 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
     }
 
+    // Gated: uses makeRouteObservationLoadedFixture, which relies on
+    // the #if DEBUG-only testingLoadedContinuousServingModelWithLoaderProvenance
+    // backdoor constructor (MLXContinuousServing.swift), absent in
+    // release builds. Skipped rather than vanished so the release
+    // suite still reports it.
+    // testArgumentsFailClosedAndDiagnosticsDoNotEchoInputs in this file
+    // runs unconditionally in release and proves the suite is not
+    // silently empty.
     func testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let trace = CallTrace()
         let source = sourceLockFixture()
@@ -416,6 +425,12 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         XCTAssertFalse(raw.contains("Report a stable"))
         XCTAssertFalse(raw.contains("fixture-request"))
         XCTAssertFalse(raw.contains("prompt"))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     func testOutputExistsAndSymlinkFailBeforeSourcePreflight() async throws {
@@ -452,7 +467,13 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         }
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testInjectedWriteFailurePublishesNothing() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
 
         do {
@@ -471,6 +492,12 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     func testWriterUnlinksDestinationWhenDirectoryFsyncFailsAfterLink()
@@ -516,9 +543,15 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: sandbox.output), replacement)
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostLoadSourcePreflightDriftShutsDownClearAndEmitsNoArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -563,11 +596,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["source", "load", "source", "shutdown", "clear"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostObservationSourcePreflightDriftShutsDownClearAndEmitsNoArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -624,9 +669,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             "clear",
         ])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testUnsafePostRunFactsShutDownClearAndEmitNoArtifact() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -672,11 +729,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             "clear",
         ])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testTransientPostRunMetalResidualSettlesBeforeArtifactPublication()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -711,11 +780,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear", "settle", "clear"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunActiveAndCachedResidualWithinDocumentedTolerancePublishes()
         async throws
     {
+#if DEBUG
         // Reviewed exception 2026-08-31: mlx-swift 0.31.6 compiled-trace
         // teardown leaks kilobyte-scale constant-descriptor buffers per
         // load+serve cycle even with weights passed as compile state, so the
@@ -753,11 +834,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunCurrentAllocatedResidualWithinDocumentedTolerancePublishes()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -785,6 +878,12 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     func testResidualToleranceExceptionExpiresOnMLXSwiftUpgrade() throws {
@@ -819,9 +918,15 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             """)
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunReadbackRetriesCurrentAllocationWithoutDoubleCountingPlan()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -847,11 +952,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear", "settle", "clear"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPersistentCurrentAllocationEmitsBoundedAttemptTelemetryAndNoArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let hosts = HostSnapshotTrace([
@@ -905,11 +1022,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         XCTAssertEqual(observations.last?.attempt, 5)
         XCTAssertEqual(observations.last?.elapsedNanoseconds, 500)
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPersistentActiveAndCurrentResidualReportsActiveMemoryFirst()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let hosts = HostSnapshotTrace([
@@ -945,9 +1074,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testCleanupSettleCancellationSuppressesArtifact() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let metal = MetalTrace([
@@ -979,9 +1120,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunHostReadbackCancellationSuppressesArtifact() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let hosts = PostRunCancellingHostSnapshotTrace()
@@ -1003,9 +1156,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunWiredLimitDriftFailsWithoutCleanupRetry() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let hosts = HostSnapshotTrace([
@@ -1035,11 +1200,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunProcessMemoryReadbackFailureSuppressesArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let footprints = UInt64Trace([5, 0])
@@ -1070,9 +1247,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         XCTAssertEqual(observations.count, 1)
         XCTAssertFalse(observations[0].processMemoryReadbackValid)
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPersistentPostRunCachedMemoryFailsClosed() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let metal = MetalTrace([
@@ -1102,9 +1291,21 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
             XCTAssertEqual(error as? CLIError, .postRunCachedMemoryResidual)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testPostRunUnsafeThermalStateFailsWithoutCleanupRetry() async throws {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let thermal = StringTrace(["nominal", "serious"])
@@ -1131,11 +1332,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["clear"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testLoadedBackendAndRuntimeAreReleasedBeforeMLXCacheClear()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let backendLifetime =
             WeakRouteObservationObjectProbe<ContinuousServingBackend>()
@@ -1170,11 +1383,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
 
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["released"])
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testStartupConfigMismatchShutsDownClearAndEmitsNoArtifact()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -1227,11 +1452,23 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let startupMismatchEvents = await trace.snapshot()
         XCTAssertEqual(startupMismatchEvents, ["shutdown", "clear"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
+    // Gated: same makeRouteObservationLoadedFixture / debug-only
+    // backdoor dependency as
+    // testValidLoadedProvenanceFixtureReachesActualRunnerAndWritesArtifact
+    // above. See that test's comment for why, and which test in this
+    // file remains unconditional.
     func testObserverErrorShutsDownLoadedModelAndClearsCacheWithoutOutput()
         async throws
     {
+#if DEBUG
         let sandbox = try Sandbox()
         let loaded = try makeRouteObservationLoadedFixture()
         let trace = CallTrace()
@@ -1261,6 +1498,12 @@ final class Qwen38ScorecardProductionRouteObservationCLITests: XCTestCase {
         let events = await trace.snapshot()
         XCTAssertEqual(events, ["shutdown", "clear"])
         XCTAssertFalse(FileManager.default.fileExists(atPath: sandbox.output.path))
+#else
+        throw XCTSkip(
+            "makeRouteObservationLoadedFixture requires the debug-only "
+                + "testingLoadedContinuousServingModelWithLoaderProvenance"
+        )
+#endif
     }
 
     private func validArguments(
@@ -1470,6 +1713,11 @@ private func sourceLockFixture(
         maximumAcceptedDraftTokens: 2)
 }
 
+// Gated: this helper's sole purpose is to invoke the #if DEBUG-only
+// testingLoadedContinuousServingModelWithLoaderProvenance backdoor
+// constructor (MLXContinuousServing.swift); every one of its callers is
+// itself #if DEBUG-gated (see comments on those test methods above).
+#if DEBUG
 private func makeRouteObservationLoadedFixture(
     runtime: RouteObservationFixtureRuntime = RouteObservationFixtureRuntime()
 )
@@ -1531,6 +1779,7 @@ private func makeRouteObservationLoadedFixture(
                 soloPLDPolicy: nil,
                 modelProofVerified: true))
 }
+#endif
 
 private final class WeakRouteObservationObjectProbe<Object: AnyObject>:
     @unchecked Sendable

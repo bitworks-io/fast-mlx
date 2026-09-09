@@ -491,7 +491,17 @@ final class Qwen38PerformanceAttributionAuthorityTests: XCTestCase {
 #endif
     }
 
+    // Gated: uses Qwen38PerformanceAttributionControllerSignature
+    // .debugTrustedControllerRoot, which is declared inside
+    // #if DEBUG in Qwen38PerformanceAttributionControllerSignature.swift
+    // and does not exist in release builds. Skipped rather than
+    // vanished so the release suite still reports it.
+    // testControllerSignatureProductionRootFailsClosedWhenUnconfigured
+    // in this file runs unconditionally in release and exercises the
+    // production trusted-root path, so the suite cannot be silently
+    // empty of controller-signature coverage.
     func testControllerSignatureAdmitsLiveCollectionWithoutPromotionAuthority() throws {
+#if DEBUG
         let fixture = makeFixture()
         let files = try writeFixture(fixture)
         defer { try? FileManager.default.removeItem(at: files.directory) }
@@ -773,6 +783,11 @@ final class Qwen38PerformanceAttributionAuthorityTests: XCTestCase {
                 error as? Qwen38PerformanceAttributionControllerSignatureError,
                 .invalidPublicKeyEncoding)
         }
+#else
+        throw XCTSkip(
+            "debugTrustedControllerRoot is debug-only"
+        )
+#endif
     }
 
     func testControllerSignatureProductionRootFailsClosedWhenUnconfigured() throws {
