@@ -67,6 +67,32 @@ struct FastMLXServe {
                     + "cache_limit_bytes=\(completed.limits.cacheLimitBytes) "
                     + fit + offloadCaveat)
             exit(0)
+        } catch let completed as OffloadPlanCheckCompleted {
+            // `--offload-plan-check-only` reached the SAME pre-load fail-fast verification the
+            // real load runs (`qwen4ExpVerifyPLEOffloadBeforeLoad`) and stopped there -- this is
+            // success, not a refusal, so it exits 0 (contrast a dry-run FAILURE, which surfaces
+            // through the `ScalarServingModelLoadError` arm below and exits 2, printing no line
+            // here at all). Every field below is a QUANTITY the check actually measured, never a
+            // hardcoded boolean -- see docs/task-inbox/2026-09-08-offload-plan-check-only-DECISION.md.
+            // `ngram_exclusion_audited`/`mtp_drafter_loaded` are honestly `false`: this stop point
+            // is BEFORE `loadWeights`, the n-gram exclusion audit, and any MTP drafter load, so
+            // none of those ran. `chat_template_source=unproven` mirrors `--fit-check-only`'s
+            // `offload_path_resolvable=unproven` field: the resolved chat template is read only at
+            // the scalar-load seam this dry run stops before reaching.
+            print(
+                "fastmlx-serve offload_plan_check=complete weights_loaded=false "
+                    + "model_constructed=false "
+                    + "rows_device=\(completed.rowsDevice) rows_inode=\(completed.rowsInode) "
+                    + "rows_byte_count=\(completed.rowsByteCount) "
+                    + "rows_mtime_ns=\(completed.rowsModifiedNanoseconds) "
+                    + "chunk_verification=\(completed.chunkVerification) "
+                    + "chunk_count=\(completed.chunkCount) "
+                    + "chunks_verified=\(completed.chunksVerified) "
+                    + "eligibility_host=\(completed.eligibilityHost) "
+                    + "eligibility_resolved_from=\(completed.eligibilityResolvedFrom) "
+                    + "ngram_exclusion_audited=false mtp_drafter_loaded=false "
+                    + "chat_template_source=unproven")
+            exit(0)
         } catch is FitCheckRefusal {
             // The refusal summary was already written to stderr by emitFitCheck; fail closed with a
             // clean non-zero exit instead of a Swift top-level fatalError trap (exit 133, doubled

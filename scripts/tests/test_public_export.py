@@ -19,7 +19,7 @@ import validate_public_repository  # noqa: E402
 PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift",
-        "sha256": "68699882566bcec018cc9d3e8ef47b3fa9e07bec49ec2b86c8cd7eb0118129fa",
+        "sha256": "97010b716dc2e47b77046d7510db8bf3f3c672bc052029ce35c754f3e51cdf90",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",

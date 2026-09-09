@@ -2203,6 +2203,216 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertEqual(withFlag.fitCheckOnly, true)
     }
 
+    // MARK: - --offload-plan-check-only: the SECOND dry run, with a different stop point.
+    // --fit-check-only answers "does the declared budget arithmetic fit?" by reading the plan's
+    // declared limits.maxResidentBytes and the safetensors headers -- it never touches the offload
+    // artifacts, which is exactly why its attestation carries `offload_path_resolvable=unproven`.
+    // --offload-plan-check-only answers the different question "is THIS host provisioned?": it
+    // resolves the plan and runs the same pre-load verification the real load runs, then stops
+    // before any weight load. Arithmetic fits != host provisioned, so the two are refused together
+    // rather than given a silent precedence.
+
+    func testOffloadPlanCheckOnlyParsesTrueAndDefaultsFalse() throws {
+        let baseArguments: [String] = [
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+        ]
+
+        let withFlag = try FastMLXServeArguments.parse(
+            baseArguments + ["--offload-plan-check-only"])
+        XCTAssertTrue(withFlag.offloadPlanCheckOnly)
+        XCTAssertEqual(
+            withFlag.ngramOffloadPlanURL,
+            URL(fileURLWithPath: "/abs/path/plan.json"))
+        XCTAssertEqual(withFlag.inCheckpointMTPSelection, .converted4Bit)
+
+        // Unconditional control: the BYTE-IDENTICAL argv with only this flag removed parses and
+        // leaves the field false, so the assertion above is attributable to the flag itself and
+        // not to anything else on the line.
+        let withoutFlag = try FastMLXServeArguments.parse(baseArguments)
+        XCTAssertFalse(withoutFlag.offloadPlanCheckOnly)
+
+        // An operator plans a production change window from --help. A flag that parses but is
+        // undocumented is one the operator cannot discover at the moment it is needed.
+        XCTAssertTrue(
+            FastMLXServeArguments.usage.contains("--offload-plan-check-only"),
+            "--offload-plan-check-only must be documented in the usage text")
+    }
+
+    /// Refusal 1: composing the two dry runs throws the specific
+    /// .offloadPlanCheckOnlyWithFitCheckOnly case. They stop at different points and make
+    /// non-confusable claims; silently honouring one and dropping the other is the trap.
+    func testOffloadPlanCheckOnlyRejectedWithFitCheckOnly() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+                "--fit-check-only",
+                "--offload-plan-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .offloadPlanCheckOnlyWithFitCheckOnly)
+        }
+    }
+
+    /// Refusal 2: --force suppresses the very refusal this dry run exists to surface, so a host
+    /// with unresolvable offload artifacts could otherwise report "success". Mirrors
+    /// testFitCheckOnlyRejectedWithForce's identical rationale.
+    func testOffloadPlanCheckOnlyRejectedWithForce() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--ngram-offload-plan", "/abs/path/plan.json",
+                "--qwen4exp-mtp",
+                "--force",
+                "--offload-plan-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .offloadPlanCheckOnlyWithForce)
+        }
+    }
+
+    /// Refusal 3: without a plan there is nothing to resolve, so the flag is meaningless rather
+    /// than merely unused.
+    func testOffloadPlanCheckOnlyRequiresNgramOffloadPlan() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--offload-plan-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .offloadPlanCheckOnlyRequiresNGramOffloadPlan)
+        }
+    }
+
+    /// The TRANSITIVE-COVERAGE claim, proven rather than asserted in a comment.
+    ///
+    /// `offloadPlanCheckOnlyRequiresNGramOffloadPlan`'s doc comment justifies the ABSENCE of five
+    /// --offload-plan-check-only-specific refusals by arguing they would be unreachable dead code:
+    /// requiring --ngram-offload-plan means each conflicting mode is already refused by that
+    /// flag's own guard. That argument is only sound if each combination actually refuses, and
+    /// refuses for the REASON claimed -- a control asserting merely "it threw" would pass even if
+    /// the refusal came from somewhere unrelated, which is exactly how a wrong-reason refusal
+    /// slipped through this repository's live qualification once before. Each row below therefore
+    /// pins the specific case. If any of these ever parses successfully, the doc comment is wrong
+    /// and a real --offload-plan-check-only refusal is missing.
+    func testOffloadPlanCheckOnlyConflictsAreCoveredTransitivelyByTheNgramPlanGuards() {
+        let plan = ["--ngram-offload-plan", "/abs/path/plan.json"]
+        let modelBase: [String] = [
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ]
+        let flag = ["--offload-plan-check-only"]
+
+        let cases: [(name: String, argv: [String], expected: FastMLXServeArgumentError)] = [
+            (
+                "continuous batching",
+                ["--continuous-batch-no-spec"] + modelBase
+                    + ["--max-reserved-kv-bytes", "17179869184"] + plan + flag,
+                .ngramOffloadPlanWithContinuousBatch
+            ),
+            (
+                "dynamic-PLD continuous batching",
+                ["--continuous-dynamic-pld"] + modelBase
+                    + ["--max-reserved-kv-bytes", "17179869184"] + plan + flag,
+                .ngramOffloadPlanWithContinuousBatch
+            ),
+            (
+                "--exact-qwen35-mtp",
+                modelBase + ["--exact-qwen35-mtp"] + plan + flag,
+                .ngramOffloadPlanWithExactQwen35MTP
+            ),
+            (
+                "--quant-pick-only",
+                modelBase + ["--quant-pick-only"] + plan + flag,
+                .ngramOffloadPlanWithQuantPickOnly
+            ),
+            (
+                "--quant-candidates",
+                ["--quant-candidates", "/models/a,/models/b"] + modelBase + plan + flag,
+                .ngramOffloadPlanWithQuantCandidates
+            ),
+            (
+                "--scripted",
+                ["--scripted"] + plan + flag,
+                .ngramOffloadPlanWithScripted
+            ),
+        ]
+
+        for testCase in cases {
+            XCTAssertThrowsError(
+                try FastMLXServeArguments.parse(testCase.argv),
+                "\(testCase.name) with --offload-plan-check-only must refuse"
+            ) { error in
+                XCTAssertEqual(
+                    error as? FastMLXServeArgumentError,
+                    testCase.expected,
+                    "\(testCase.name) refused for the wrong reason")
+            }
+        }
+    }
+
+    /// --offload-plan-check-only must not perturb any other parsed field. Mirrors
+    /// testFitCheckOnlyDoesNotPerturbOtherParsedFields, including its Mirror-based sweep so a
+    /// future field addition is covered without editing this test.
+    func testOffloadPlanCheckOnlyDoesNotPerturbOtherParsedFields() throws {
+        let baseArguments: [String] = [
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+        ]
+        let withoutFlag = try FastMLXServeArguments.parse(baseArguments)
+        let withFlag = try FastMLXServeArguments.parse(
+            baseArguments + ["--offload-plan-check-only"])
+
+        func fields(_ arguments: FastMLXServeArguments) -> [String: String] {
+            Dictionary(
+                uniqueKeysWithValues: Mirror(reflecting: arguments).children.compactMap {
+                    child -> (String, String)? in
+                    guard let label = child.label else { return nil }
+                    return (label, String(describing: child.value))
+                })
+        }
+
+        let withoutFields = fields(withoutFlag)
+        let withFields = fields(withFlag)
+
+        XCTAssertFalse(withoutFields.isEmpty)
+        for (label, withoutValue) in withoutFields where label != "offloadPlanCheckOnly" {
+            XCTAssertEqual(
+                withFields[label], withoutValue,
+                "field \(label) changed when --offload-plan-check-only was added")
+        }
+        XCTAssertNotEqual(
+            withFields["offloadPlanCheckOnly"], withoutFields["offloadPlanCheckOnly"],
+            "the flag itself must differ, or this test proves nothing")
+    }
+
     // MARK: - fastMLXServeArgumentRefusalAnnounceLine: the machine-readable refusal line
     // `FastMLXServe.main`'s top-level `catch let error as FastMLXServeArgumentError` arm renders.
     // Without that arm, EVERY one of these 94 cases — thrown from the very first statement of

@@ -704,6 +704,57 @@ public func loadOffloadedNGramModelContext(
         "the offloaded n-gram table serving path is not part of the public projection")
 }
 
+/// Public-projection twin of the real `OffloadedNGramPlanCheckReport` (backing
+/// `--offload-plan-check-only`). Declared with the identical public members so the real
+/// `spike/Sources/**` call site that references this type keeps compiling in the public tree; the
+/// offloaded n-gram-table serving path this type describes is not part of the public projection,
+/// so nothing in this tree ever constructs one -- see `checkOffloadedNGramPlanOnly` below.
+public struct OffloadedNGramPlanCheckReport: Sendable {
+    public let rowsDevice: Int
+    public let rowsInode: Int
+    public let rowsByteCount: Int
+    public let rowsModifiedNanoseconds: Int
+    public let chunkVerification: String
+    public let chunkCount: Int
+    public let chunksVerified: Int
+    public let eligibilityHost: String
+    public let eligibilityResolvedFrom: String
+
+    public init(
+        rowsDevice: Int,
+        rowsInode: Int,
+        rowsByteCount: Int,
+        rowsModifiedNanoseconds: Int,
+        chunkVerification: String,
+        chunkCount: Int,
+        chunksVerified: Int,
+        eligibilityHost: String,
+        eligibilityResolvedFrom: String
+    ) {
+        self.rowsDevice = rowsDevice
+        self.rowsInode = rowsInode
+        self.rowsByteCount = rowsByteCount
+        self.rowsModifiedNanoseconds = rowsModifiedNanoseconds
+        self.chunkVerification = chunkVerification
+        self.chunkCount = chunkCount
+        self.chunksVerified = chunksVerified
+        self.eligibilityHost = eligibilityHost
+        self.eligibilityResolvedFrom = eligibilityResolvedFrom
+    }
+}
+
+/// Public-projection twin of the real `checkOffloadedNGramPlanOnly`. The offloaded n-gram-table
+/// serving path this signature fronts is not part of the public projection, so this always throws
+/// `ModelFactoryError.unsupportedModelType` rather than attempting any plan resolution or
+/// pre-load verification.
+public func checkOffloadedNGramPlanOnly(
+    modelDirectory: URL,
+    planFileURL: URL
+) throws -> OffloadedNGramPlanCheckReport {
+    throw ModelFactoryError.unsupportedModelType(
+        "the offloaded n-gram table serving path is not part of the public projection")
+}
+
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         LLMModelFactory.shared

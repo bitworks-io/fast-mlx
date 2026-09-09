@@ -293,6 +293,12 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// used to crash an operator's first `--qwen4exp-mtp` start with no stated remedy instead of
     /// reporting this case's line.
     case offloadedNGramPlanLoadFailed(detail: String)
+    /// `ScalarServingModelLoadConfiguration.offloadPlanCheckOnly` was set but
+    /// `ngramOffloadPlanURL` was `nil`. Unreachable from `fastmlx-serve` today --
+    /// `FastMLXServeArguments.parse` refuses `--offload-plan-check-only` without
+    /// `--ngram-offload-plan` before this seam is ever reached -- kept as a defensive boundary for
+    /// any other caller of this public configuration type.
+    case offloadPlanCheckOnlyRequiresNGramOffloadPlan
 }
 
 enum ScalarServingDecoderStrategy: Equatable {
@@ -414,6 +420,14 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// `ScalarServingModelLoadError.chatTemplateOverrideUnavailable`'s doc comment for why a
     /// missing/unreadable override must refuse rather than silently fall back.
     public let chatTemplateOverrideURL: URL?
+    /// `--offload-plan-check-only`: resolve and verify the offloaded n-gram plan's row store on
+    /// this host, then stop BEFORE any weight load or model construction -- see
+    /// `OffloadPlanCheckCompleted`'s doc comment. Default `false` preserves today's
+    /// behavior byte-for-byte. Requires `ngramOffloadPlanURL` to be non-nil -- see
+    /// `ScalarServingModelLoadError.offloadPlanCheckOnlyRequiresNGramOffloadPlan`'s doc comment
+    /// for the defensive guard at this seam (the CLI parser already refuses the combination
+    /// earlier, at argument parsing).
+    public let offloadPlanCheckOnly: Bool
 
     public init(
         launchedModel: String,
@@ -425,7 +439,8 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         kvQuantTier: KVQuantTier = .fp16,
         ngramOffloadPlanURL: URL? = nil,
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
-        chatTemplateOverrideURL: URL? = nil
+        chatTemplateOverrideURL: URL? = nil,
+        offloadPlanCheckOnly: Bool = false
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -437,6 +452,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         self.ngramOffloadPlanURL = ngramOffloadPlanURL
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
         self.chatTemplateOverrideURL = chatTemplateOverrideURL
+        self.offloadPlanCheckOnly = offloadPlanCheckOnly
     }
 }
 
@@ -718,6 +734,44 @@ public struct LoadedScalarServingModel: Sendable {
     }
 }
 
+/// Thrown by `loadScalarServingModel` when `ScalarServingModelLoadConfiguration
+/// .offloadPlanCheckOnly` stopped the load immediately after proving the offloaded n-gram plan
+/// resolves and verifies on this host -- see that flag's own doc comment. This is SUCCESS, not a
+/// refusal (mirrors `FitCheckOnlyCompleted`'s identical shape in `FastMLXServe.swift`):
+/// `FastMLXServe.main()` catches this sentinel explicitly and exits 0, printing the attestation
+/// these fields carry. Declared with plain `Int`/`String` fields (rather than embedding
+/// `MLXLLM.OffloadedNGramPlanCheckReport` directly) so `FastMLXServe.swift` -- which does not
+/// depend on the vendored `MLXLLM` module directly, only transitively through this one -- can
+/// catch this type and read its fields without needing that import.
+/// Deliberately family-NEUTRAL, like every other offload symbol in this projected file
+/// (`ngramOffloadPlanURL`, `offloadedNGramPlanLoadFailed`, `checkOffloadedNGramPlanOnly`): this
+/// file publishes to the public projection, which fails closed on the internal
+/// implementation-family marker. Nothing about these fields is model-specific. Do not rename this
+/// to carry a family prefix -- `validate_public_repository.py` will refuse the projection.
+public struct OffloadPlanCheckCompleted: Error, Sendable {
+    public let rowsDevice: Int
+    public let rowsInode: Int
+    public let rowsByteCount: Int
+    public let rowsModifiedNanoseconds: Int
+    public let chunkVerification: String
+    public let chunkCount: Int
+    public let chunksVerified: Int
+    public let eligibilityHost: String
+    public let eligibilityResolvedFrom: String
+
+    init(report: OffloadedNGramPlanCheckReport) {
+        self.rowsDevice = report.rowsDevice
+        self.rowsInode = report.rowsInode
+        self.rowsByteCount = report.rowsByteCount
+        self.rowsModifiedNanoseconds = report.rowsModifiedNanoseconds
+        self.chunkVerification = report.chunkVerification
+        self.chunkCount = report.chunkCount
+        self.chunksVerified = report.chunksVerified
+        self.eligibilityHost = report.eligibilityHost
+        self.eligibilityResolvedFrom = report.eligibilityResolvedFrom
+    }
+}
+
 @discardableResult
 public func validateScalarServingModelLoadConfiguration(
     _ configuration: ScalarServingModelLoadConfiguration
@@ -825,6 +879,40 @@ public func loadScalarServingModel(
         guard observedModelType == "qwen4_exp" else {
             throw ScalarServingModelLoadError.inCheckpointMTPUnsupportedFamily(observedModelType)
         }
+    }
+
+    // `--offload-plan-check-only`: resolve the offloaded n-gram plan and run the SAME pre-load
+    // fail-fast verification the real load runs below (`qwen4ExpVerifyPLEOffloadBeforeLoad`,
+    // reached here through `checkOffloadedNGramPlanOnly` -- see that facade's doc comment), then
+    // stop. Placed HERE -- after the family gates above, BEFORE the `Memory.memoryLimit`/
+    // `cacheLimit`/`clearCache()` mutations immediately below -- so this dry run performs NO MLX
+    // global mutation and NO Metal device work at all
+    // (docs/task-inbox/2026-09-08-offload-plan-check-only-DECISION.md).
+    //
+    // TWO ORDERING TRAPS this shape avoids: (1) the success sentinel
+    // `OffloadPlanCheckCompleted` is thrown AFTER (outside) the local `do`/`catch`
+    // immediately below, so it can never be caught and reinterpreted as a refusal -- a green run
+    // must never render as `configuration=refused`. It is also thrown well before the broad
+    // `catch` further down that wraps `loadOffloadedNGramModelContext` failures, so it cannot
+    // reach that arm either. (2) a genuine dry-run FAILURE is still funneled through the SAME
+    // conversion the real `ngramOffloadPlanURL` load branch below uses
+    // (`ScalarServingModelLoadError.offloadedNGramPlanLoadFailed(detail:)`), so the operator sees
+    // the byte-identical `reason=offloaded_ngram_plan_load_failed ... `
+    // `remedy=reseal_acceptance_record_on_this_host` line either way.
+    if configuration.offloadPlanCheckOnly {
+        guard let ngramOffloadPlanURL = configuration.ngramOffloadPlanURL else {
+            throw ScalarServingModelLoadError.offloadPlanCheckOnlyRequiresNGramOffloadPlan
+        }
+        let report: OffloadedNGramPlanCheckReport
+        do {
+            report = try checkOffloadedNGramPlanOnly(
+                modelDirectory: configuration.modelDirectory,
+                planFileURL: ngramOffloadPlanURL)
+        } catch {
+            throw ScalarServingModelLoadError.offloadedNGramPlanLoadFailed(
+                detail: String(describing: error))
+        }
+        throw OffloadPlanCheckCompleted(report: report)
     }
 
     Memory.memoryLimit = configuration.memoryLimitBytes

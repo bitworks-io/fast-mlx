@@ -188,6 +188,24 @@ public enum FastMLXServeArgumentError:
     /// the transport-only `--scripted` backend loads no model and has no model directory to check,
     /// so the flag would have nothing to report.
     case fitCheckOnlyWithScripted
+    /// `--offload-plan-check-only` and `--fit-check-only` are two different dry runs stopping at
+    /// two different, non-confusable points: "the declared budget arithmetic fits" versus "this
+    /// host's offload artifacts resolve and verify". Composing them is refused rather than given a
+    /// silent precedence, mirroring `fitCheckOnlyWithQuantPickOnly`'s identical rationale.
+    case offloadPlanCheckOnlyWithFitCheckOnly
+    /// `--force` exists to proceed past a refused verdict; `--offload-plan-check-only` exists to
+    /// LEARN that verdict. Combining them would let a host with unresolvable offload artifacts
+    /// report an `--offload-plan-check-only` "success" by suppressing the very refusal the dry run
+    /// exists to surface -- mirrors `fitCheckOnlyWithForce`'s identical rationale exactly.
+    case offloadPlanCheckOnlyWithForce
+    /// `--offload-plan-check-only` verifies the offloaded n-gram plan the SAME way the real load
+    /// resolves it (see `qwen4ExpMTPRequiresNGramOffloadPlan`'s identical shape), so it is
+    /// meaningless without a plan to check. This requirement also gives the flag TRANSITIVE
+    /// coverage against continuous batching, `--exact-qwen35-mtp`, `--quant-pick-only`,
+    /// `--quant-candidates`, and `--scripted`: each of those is already refused above whenever
+    /// `--ngram-offload-plan` is present, so a separate `--offload-plan-check-only`-specific
+    /// refusal for any of them would be unreachable dead code.
+    case offloadPlanCheckOnlyRequiresNGramOffloadPlan
 
     public var description: String {
         switch self {
@@ -301,6 +319,14 @@ public enum FastMLXServeArgumentError:
         case .fitCheckOnlyWithScripted:
             "--fit-check-only reports a loaded-model fit verdict and cannot be combined with "
                 + "--scripted"
+        case .offloadPlanCheckOnlyWithFitCheckOnly:
+            "--offload-plan-check-only and --fit-check-only are two different dry runs with "
+                + "different stop points; use one, not both"
+        case .offloadPlanCheckOnlyWithForce:
+            "--offload-plan-check-only cannot be combined with --force, which would suppress the "
+                + "verdict the dry run exists to learn"
+        case .offloadPlanCheckOnlyRequiresNGramOffloadPlan:
+            "--offload-plan-check-only requires --ngram-offload-plan"
         }
     }
 }
@@ -384,6 +410,20 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       --ngram-offload-plan + --qwen4exp-mtp to
                                       report the offloaded verdict -- the
                                       motivating production-cutover use case.
+          --offload-plan-check-only   Dry-run: resolve the --ngram-offload-plan on THIS
+                                      host and run the same pre-load verification the
+                                      real load runs (row-store geometry against the
+                                      chunk seal, plus the seal's chunk digests under
+                                      the plan's chunkVerification policy), print the
+                                      measured identity/count attestation, and exit
+                                      WITHOUT loading weights or constructing a model.
+                                      Answers "is this host provisioned?", which
+                                      --fit-check-only does NOT (it reads only the
+                                      plan's declared limits). Requires
+                                      --ngram-offload-plan; mutually exclusive with
+                                      --fit-check-only (a different stop point) and
+                                      --force (which would suppress the very refusal
+                                      this exists to surface).
           --quant-reliability PATH    With --quant-pick-only, overlay measured tool-call
                                       reliability (a quant-reliability/v1 artifact) onto
                                       the announce, joined by quant bits. Advisory: never
@@ -635,6 +675,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// second, parallel fit computation here could drift from what the real serve uses and make
     /// the flag misleading.
     public let fitCheckOnly: Bool
+    /// `--offload-plan-check-only`: resolve and verify the offloaded n-gram plan's row store on
+    /// this host at the scalar-load seam
+    /// (`ScalarServingModelLoadConfiguration.offloadPlanCheckOnly`), then stop BEFORE any weight
+    /// load or model construction, instead of skipping that computation. Default `false` preserves
+    /// today's behavior byte-for-byte. Requires `ngramOffloadPlanURL` to be non-nil (see
+    /// `offloadPlanCheckOnlyRequiresNGramOffloadPlan`) and is refused alongside `--fit-check-only`
+    /// or `--force` (see those cases' own doc comments) -- otherwise threaded exactly like
+    /// `fitCheckOnly`, on the FULL loaded-model construction path, never through
+    /// `--quant-pick-only`'s early return.
+    public let offloadPlanCheckOnly: Bool
 
     private init(
         backend: FastMLXServeBackend?,
@@ -672,7 +722,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
         memoryLimitBytes: Int? = nil,
         chatTemplateURL: URL? = nil,
-        fitCheckOnly: Bool = false
+        fitCheckOnly: Bool = false,
+        offloadPlanCheckOnly: Bool = false
     ) {
         self.backend = backend
         self.host = host
@@ -709,6 +760,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.memoryLimitBytes = memoryLimitBytes
         self.chatTemplateURL = chatTemplateURL
         self.fitCheckOnly = fitCheckOnly
+        self.offloadPlanCheckOnly = offloadPlanCheckOnly
     }
 
     public static func parse<S: Sequence>(
@@ -758,6 +810,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var evidencePath: URL?
         var chatTemplateURL: URL?
         var fitCheckOnly = false
+        var offloadPlanCheckOnly = false
 
         var index = 0
         while index < arguments.count {
@@ -931,6 +984,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 qwen4ExpMTP = true
             case "--fit-check-only":
                 fitCheckOnly = true
+            case "--offload-plan-check-only":
+                offloadPlanCheckOnly = true
             case "--exact-mtp-selection":
                 index += 1
                 let rawSelection = try value(at: index, in: arguments, for: argument)
@@ -1028,6 +1083,22 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             throw FastMLXServeArgumentError.fitCheckOnlyWithQuantPickOnly
         }
 
+        // --offload-plan-check-only's own refusals, grouped here mirroring --fit-check-only's
+        // block immediately above: (1) --fit-check-only is a DIFFERENT dry run with a different
+        // stop point -- composing them would silently pick one stop point over the other; (2)
+        // --force suppresses the very refusal --offload-plan-check-only exists to prove absent,
+        // exactly like --fit-check-only's identical refusal above. The "requires
+        // --ngram-offload-plan" refusal lives further below, grouped alongside its sibling
+        // --qwen4exp-mtp requirement -- see offloadPlanCheckOnlyRequiresNGramOffloadPlan's own
+        // doc comment for why that placement gives it transitive coverage instead of needing a
+        // third check here.
+        if offloadPlanCheckOnly, fitCheckOnly {
+            throw FastMLXServeArgumentError.offloadPlanCheckOnlyWithFitCheckOnly
+        }
+        if offloadPlanCheckOnly, forceServe {
+            throw FastMLXServeArgumentError.offloadPlanCheckOnlyWithForce
+        }
+
         if continuousBatchNoSpec, continuousDynamicPLD {
             throw FastMLXServeArgumentError.conflictingBackendModes
         }
@@ -1093,6 +1164,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         // --mtp-drafter-path comment describing the same transitive-coverage trap.
         if qwen4ExpMTP, ngramOffloadPlanURL == nil {
             throw FastMLXServeArgumentError.qwen4ExpMTPRequiresNGramOffloadPlan
+        }
+
+        // --offload-plan-check-only verifies the offloaded n-gram plan the SAME way the real load
+        // resolves it, so it is meaningless without a plan to check. Mirrors
+        // qwen4ExpMTPRequiresNGramOffloadPlan's identical placement/shape immediately above -- see
+        // offloadPlanCheckOnlyRequiresNGramOffloadPlan's own doc comment for the transitive
+        // coverage this requirement buys against every other conflicting mode.
+        if offloadPlanCheckOnly, ngramOffloadPlanURL == nil {
+            throw FastMLXServeArgumentError.offloadPlanCheckOnlyRequiresNGramOffloadPlan
         }
 
         // --auto-quant is an OFFLINE enumerate-only quant source (its network probe/download half is
@@ -1375,7 +1455,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             inCheckpointMTPSelection: qwen4ExpMTP ? .converted4Bit : nil,
             memoryLimitBytes: memoryLimitBytes,
             chatTemplateURL: chatTemplateURL,
-            fitCheckOnly: fitCheckOnly)
+            fitCheckOnly: fitCheckOnly,
+            offloadPlanCheckOnly: offloadPlanCheckOnly)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -1418,6 +1499,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--qwen4exp-mtp",
         "--chat-template",
         "--fit-check-only",
+        "--offload-plan-check-only",
     ]
 
     private static func value(
