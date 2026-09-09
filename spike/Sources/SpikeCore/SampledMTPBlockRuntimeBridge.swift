@@ -630,7 +630,24 @@ private func normalizedProbabilities(_ logits: MLXArray) -> [Double] {
 private func validatingNormalizedProbabilities(_ logits: MLXArray) throws -> [Double] {
     let rawLogits = logits.flattened()
     eval(rawLogits)
-    guard rawLogits.asArray(Float.self).allSatisfy(\.isFinite) else {
+    // A raw `-infinity` logit is legitimate: it is how a model expresses a
+    // masked/unsupported token. Some multimodal checkpoints mask their
+    // unsupported media-sentinel indices to `-Float.infinity` on every
+    // forward, so this is the ordinary shape of a real logits row, not a
+    // corrupt one, and `softmax` maps it to exactly `0.0`. A finiteness
+    // check therefore belongs on the OUTPUT of normalization, never on the
+    // raw logits going in.
+    //
+    // `NaN` and `+infinity` are NOT legitimate: both make `softmax` produce
+    // `NaN`. They are rejected here explicitly and fail-fast rather than by
+    // relying on `NaN` propagating through `softmax`'s sum. Note that the
+    // post-normalization checks below (the per-element `isFinite && >= 0`
+    // loop and the `abs(sum - 1) <= 1e-12` check) already catch them
+    // independently, and are what still catches a row that genuinely
+    // degenerates -- including an all-`-inf` row, whose softmax is `NaN`.
+    // This guard is therefore a documented early-out, not the enforcing
+    // gate: do NOT remove those checks on the belief that it covers them.
+    guard rawLogits.asArray(Float.self).allSatisfy({ !$0.isNaN && $0 != Float.infinity }) else {
         throw SeededSampledMTPBlockRuntimeProviderError.invalidLogits
     }
     let distribution = normalizedProbabilities(logits)

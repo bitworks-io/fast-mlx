@@ -1,6 +1,7 @@
 import HarnessCore
 import MLX
 import MLXLMCommon
+import MLXRandom
 @testable import SpikeCore
 import XCTest
 
@@ -477,6 +478,289 @@ final class SampledMTPBlockRuntimeBridgeTestsNondeterministicProvider: XCTestCas
 
     private func logits(_ distribution: [Double]) -> MLXArray {
         MLXArray(distribution.map { Float(log($0)) })
+    }
+}
+
+/// Regression coverage for a fail-closed defect: a multimodal checkpoint
+/// can mask its unsupported media-sentinel indices to `-Float.infinity` on
+/// every forward, and `MTPSpeculativeTokenIterator` hands those raw logits
+/// straight to `sampledBlockDecisionProvider.decide`.
+/// `validatingNormalizedProbabilities`'s raw guard used to reject any
+/// non-finite raw logit (including the model's own legitimate `-inf` mask),
+/// which made both production-shaped providers throw on block one, every
+/// time -- indistinguishably from a legitimate refusal, since the iterator
+/// reports only a generic sticky-passthrough reason.
+final class SampledMTPInfLogitsFailClosedTests: XCTestCase {
+    private static let productionVocabularyWidth = 151_936
+    /// Mimics such a checkpoint's four media-sentinel indices: spread across the
+    /// width (including the first and last positions) rather than
+    /// clustered, so the fixture does not accidentally depend on where the
+    /// mask sits.
+    private static let mediaSentinelMaskedIndices = [0, 50_000, 100_000, 151_935]
+    private static let numDraft = MTPSpeculativeDecoder.servingBlockSize - 1
+
+    // MARK: - A. Happy path, PRODUCTION WIDTH
+
+    /// This is the test that currently FAILS (before the fix): the bonus
+    /// row's raw `-inf` entries are rejected by the raw guard, so `decide`
+    /// throws `.invalidLogits` instead of returning a decision. Production
+    /// width matters here specifically because the `abs(sum - 1) <= 1e-12`
+    /// post-normalization tolerance is width-sensitive; a 3-element
+    /// fixture would not exercise it.
+    func testHappyPathAtProductionVocabularyWidthWithMaskedMediaTokenIndices() throws {
+        let width = Self.productionVocabularyWidth
+        let maskedIndices = Self.mediaSentinelMaskedIndices
+        let provider = SeededSampledMTPBlockRuntimeProvider(seed: 0xC118_0001)
+
+        var proposedTokens = [Int]()
+        var targetLogits = [MLXArray]()
+        for draftIndex in 0 ..< Self.numDraft {
+            let proposalLogits = Self.productionProposalLogits(
+                seed: UInt64(draftIndex + 1),
+                width: width)
+            let token = provider.proposalSampler.sample(logits: proposalLogits).item(Int.self)
+            proposedTokens.append(token)
+            targetLogits.append(Self.maskedProductionLogits(
+                seed: UInt64(1000 + draftIndex),
+                maskedIndices: maskedIndices,
+                width: width))
+        }
+        let bonusTargetLogits = Self.maskedProductionLogits(
+            seed: 9999,
+            maskedIndices: maskedIndices,
+            width: width)
+
+        let decision = try provider.decide(
+            proposedTokens: proposedTokens,
+            targetLogits: targetLogits,
+            bonusTargetLogits: bonusTargetLogits)
+
+        XCTAssertEqual(decision.outputTokens.count, decision.acceptedDraftCount + 1)
+        XCTAssertTrue((0 ... Self.numDraft).contains(decision.acceptedDraftCount))
+    }
+
+    // MARK: - B. Discriminating assertion
+
+    /// Two independent proofs that a masked index can never be produced:
+    /// (1) a direct probability assertion against MLX's own `softmax` on
+    /// the exact array handed to `decide` (this file's own
+    /// `normalizedProbabilities`/`validatingNormalizedProbabilities` are
+    /// `private` at file scope, so they are not reachable even via
+    /// `@testable` -- this is the closest honest seam); and (2) an
+    /// empirical corroboration across many seeded blocks that no masked
+    /// index ever appears in `outputTokens`.
+    func testMaskedIndicesCarryExactlyZeroProbabilityAndNeverAppearInOutput() throws {
+        let width = Self.productionVocabularyWidth
+        let maskedIndices = Self.mediaSentinelMaskedIndices
+
+        let bonusTargetLogits = Self.maskedProductionLogits(
+            seed: 42,
+            maskedIndices: maskedIndices,
+            width: width)
+        let probabilities = softmax(bonusTargetLogits.asType(.float32), axis: -1)
+        eval(probabilities)
+        let probabilityValues = probabilities.asArray(Float.self)
+        for index in maskedIndices {
+            XCTAssertEqual(probabilityValues[index], 0.0)
+        }
+
+        for seed in UInt64(1) ... 15 {
+            let provider = SeededSampledMTPBlockRuntimeProvider(seed: seed)
+            var proposedTokens = [Int]()
+            var targetLogits = [MLXArray]()
+            for draftIndex in 0 ..< Self.numDraft {
+                let proposalLogits = Self.productionProposalLogits(
+                    seed: seed &* 1000 &+ UInt64(draftIndex),
+                    width: width)
+                let token = provider.proposalSampler.sample(logits: proposalLogits).item(Int.self)
+                proposedTokens.append(token)
+                targetLogits.append(Self.maskedProductionLogits(
+                    seed: seed &* 1000 &+ UInt64(500 + draftIndex),
+                    maskedIndices: maskedIndices,
+                    width: width))
+            }
+            let seededBonus = Self.maskedProductionLogits(
+                seed: seed &* 1000 &+ 999,
+                maskedIndices: maskedIndices,
+                width: width)
+
+            let decision = try provider.decide(
+                proposedTokens: proposedTokens,
+                targetLogits: targetLogits,
+                bonusTargetLogits: seededBonus)
+
+            for token in decision.outputTokens {
+                XCTAssertFalse(maskedIndices.contains(token), "seed \(seed) produced a masked token")
+            }
+        }
+    }
+
+    // MARK: - C. Enumerated legitimate refusals
+
+    func testSeededProviderStillRejectsRawNaNLogit() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [Float.nan, 0, 0],
+            expected: SeededSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: SeededSampledMTPBlockRuntimeProvider(seed: 101))
+    }
+
+    func testNondeterministicProviderStillRejectsRawNaNLogit() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [Float.nan, 0, 0],
+            expected: NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: NondeterministicSampledMTPBlockRuntimeProvider(entropy: { _ in 0.1 }))
+    }
+
+    func testSeededProviderStillRejectsRawPositiveInfinityLogit() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [Float.infinity, 0, 0],
+            expected: SeededSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: SeededSampledMTPBlockRuntimeProvider(seed: 102))
+    }
+
+    func testNondeterministicProviderStillRejectsRawPositiveInfinityLogit() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [Float.infinity, 0, 0],
+            expected: NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: NondeterministicSampledMTPBlockRuntimeProvider(entropy: { _ in 0.1 }))
+    }
+
+    /// An all-`-inf` row is degenerate (every raw entry is individually
+    /// legitimate, but together they carry no information: `softmax` of an
+    /// all-`-inf` row divides `NaN` by `NaN`). This still refuses after the
+    /// fix, but via a DIFFERENT guard than C1/C2: the raw guard now admits
+    /// it, and it is `normalizedProbabilities`'s own internal
+    /// `sum.isFinite` check that collapses the result to `[]` (an all-NaN
+    /// softmax output sums to NaN), which `validatingNormalizedProbabilities`
+    /// then rejects via its `!distribution.isEmpty` guard -- not the
+    /// per-element or sum-normalization checks.
+    func testSeededProviderStillRejectsAllNegativeInfinityRow() throws {
+        // Confirms the "which guard" claim above directly, against MLX's
+        // own softmax, on the exact array shape used below: every entry of
+        // an all-`-inf` row's softmax is `NaN` (not e.g. a special-cased
+        // uniform distribution), which is what forces
+        // `normalizedProbabilities`'s `sum.isFinite` guard (not
+        // `validatingNormalizedProbabilities`'s per-element or
+        // sum-normalization checks) to produce the empty distribution that
+        // `!distribution.isEmpty` then rejects.
+        let allNegativeInfinity = MLXArray(
+            [-Float.infinity, -Float.infinity, -Float.infinity])
+        let softmaxOutput = softmax(allNegativeInfinity.asType(.float32), axis: -1)
+        eval(softmaxOutput)
+        XCTAssertTrue(softmaxOutput.asArray(Float.self).allSatisfy(\.isNaN))
+
+        try assertBonusLogitsStillRejected(
+            bonus: [-Float.infinity, -Float.infinity, -Float.infinity],
+            expected: SeededSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: SeededSampledMTPBlockRuntimeProvider(seed: 103))
+    }
+
+    func testNondeterministicProviderStillRejectsAllNegativeInfinityRow() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [-Float.infinity, -Float.infinity, -Float.infinity],
+            expected: NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: NondeterministicSampledMTPBlockRuntimeProvider(entropy: { _ in 0.1 }))
+    }
+
+    func testSeededProviderStillRejectsEmptyLogitsRow() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [],
+            expected: SeededSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: SeededSampledMTPBlockRuntimeProvider(seed: 104),
+            proposalAndTargetDistribution: [0.6, 0.4])
+    }
+
+    func testNondeterministicProviderStillRejectsEmptyLogitsRow() throws {
+        try assertBonusLogitsStillRejected(
+            bonus: [],
+            expected: NondeterministicSampledMTPBlockRuntimeProviderError.invalidLogits,
+            provider: NondeterministicSampledMTPBlockRuntimeProvider(entropy: { _ in 0.1 }),
+            proposalAndTargetDistribution: [0.6, 0.4])
+    }
+
+    /// A proposed token whose draft mass is exactly 0 (e.g. proposing a
+    /// masked index) still refuses, via the existing
+    /// `SampledMTPResidualCorrectionError.zeroDraftMass` path.
+    ///
+    /// This is deliberately NOT routed through either provider's own
+    /// `proposalSampler.sample()` -> `decide()` pipeline, because doing so
+    /// is structurally unreachable, not merely untried:
+    /// `categoricalSample` only ever returns an index whose own probability
+    /// is > 0, UNLESS its end-of-array fallback fires because the running
+    /// cumulative sum falls short of the drawn uniform. Measured directly
+    /// (mirroring Swift's `Double` IEEE-754 arithmetic bit-for-bit, using
+    /// this file's own largest-absorbs-the-remainder correction) at
+    /// production width with realistic random logits: the post-correction
+    /// cumulative sum came back bit-exact `1.0` across ten independent
+    /// trials, leaving no exploitable gap. So a real proposal draw can
+    /// never hand `decide()` a token with zero draft mass -- that is
+    /// exactly the invariant `testMaskedIndicesCarryExactlyZeroProbability...`
+    /// proves above. What CAN be, and is, tested here is the shared
+    /// acceptance layer both providers call into
+    /// (`SampledMTPBlockAcceptance.decide` ->
+    /// `SampledMTPResidualCorrection.acceptanceProbability`), which is not
+    /// rewrapped by either provider's `decide()` for this error, so the
+    /// thrown type is the shared `SampledMTPResidualCorrectionError`, not a
+    /// provider-specific one.
+    func testProposingAMaskedIndexStillRefusesViaTheSharedZeroDraftMassPath() {
+        XCTAssertThrowsError(try SampledMTPBlockAcceptance.decide(
+            steps: [SampledMTPBlockStep(
+                targetDistribution: [0.5, 0.5],
+                draftDistribution: [0.0, 1.0],
+                proposedToken: 0)],
+            acceptanceUniforms: [0.0],
+            terminalDraws: [.bonus(0.5)],
+            bonusTargetDistribution: [0.5, 0.5])) {
+                XCTAssertEqual(
+                    $0 as? SampledMTPResidualCorrectionError,
+                    .zeroDraftMass(token: 0))
+            }
+    }
+
+    // MARK: - Helpers
+
+    private static func maskedProductionLogits(
+        seed: UInt64,
+        maskedIndices: [Int],
+        width: Int
+    ) -> MLXArray {
+        let base = MLXRandom.normal([width], key: MLXRandom.key(seed))
+        eval(base)
+        var values = base.asArray(Float.self)
+        for index in maskedIndices {
+            values[index] = -Float.infinity
+        }
+        let masked = MLXArray(values)
+        eval(masked)
+        return masked
+    }
+
+    private static func productionProposalLogits(seed: UInt64, width: Int) -> MLXArray {
+        let logits = MLXRandom.normal([width], key: MLXRandom.key(seed))
+        eval(logits)
+        return logits
+    }
+
+    /// Drives a single-step block whose proposal and target distribution
+    /// are an ordinary finite two-element distribution, with the given raw
+    /// `bonus` array handed to `decide` unmodified, and asserts the given
+    /// error is thrown.
+    private func assertBonusLogitsStillRejected<E: Error & Equatable>(
+        bonus: [Float],
+        expected: E,
+        provider: some SampledMTPBlockRuntimeDeciding,
+        proposalAndTargetDistribution: [Double] = [0.6, 0.4]
+    ) throws {
+        let proposalLogits = MLXArray(
+            proposalAndTargetDistribution.map { Float(log($0)) })
+        let token = provider.proposalSampler.sample(logits: proposalLogits).item(Int.self)
+
+        XCTAssertThrowsError(try provider.decide(
+            proposedTokens: [token],
+            targetLogits: [proposalLogits],
+            bonusTargetLogits: MLXArray(bonus))) {
+                XCTAssertEqual($0 as? E, expected)
+            }
     }
 }
 
