@@ -171,6 +171,23 @@ public enum FastMLXServeArgumentError:
     /// `--quant-pick-only` returns early below without threading `chatTemplateURL` at all — no
     /// model is loaded on that dry-run path, so the flag would be silently dropped.
     case chatTemplateWithQuantPickOnly
+    /// `--fit-check-only` and `--quant-pick-only` are two different dry runs -- a single-model
+    /// fit-check vs. an auto-pick across several `--quant-candidates` directories -- so combining
+    /// them is ambiguous about which dry run the operator wants. Unlike `--chat-template` and the
+    /// other flags `--quant-pick-only`'s early return drops, `--fit-check-only` is NOT threaded
+    /// through that early-return construction at all (see the parser's own guard just above the
+    /// early return): it stays on the full loaded-model construction path so it reaches the real
+    /// `resolveServingLimits` call sites unchanged, so this is a genuine ambiguity refusal, not a
+    /// silent-drop guard.
+    case fitCheckOnlyWithQuantPickOnly
+    /// `--force` exists to proceed past a RED fit-check verdict; `--fit-check-only` exists to LEARN
+    /// that verdict. Combining them would let a red host report a `--fit-check-only` "success" by
+    /// suppressing the very signal the dry run exists to surface -- fail closed instead.
+    case fitCheckOnlyWithForce
+    /// `--fit-check-only` reports the verdict `resolveServingLimits` computes for a loaded model;
+    /// the transport-only `--scripted` backend loads no model and has no model directory to check,
+    /// so the flag would have nothing to report.
+    case fitCheckOnlyWithScripted
 
     public var description: String {
         switch self {
@@ -276,6 +293,14 @@ public enum FastMLXServeArgumentError:
             "--chat-template is not supported with --exact-qwen35-mtp"
         case .chatTemplateWithQuantPickOnly:
             "--chat-template is not supported with --quant-pick-only"
+        case .fitCheckOnlyWithQuantPickOnly:
+            "--fit-check-only and --quant-pick-only are alternative dry runs; use one, not both"
+        case .fitCheckOnlyWithForce:
+            "--fit-check-only cannot be combined with --force, which would suppress the verdict "
+                + "the dry run exists to learn"
+        case .fitCheckOnlyWithScripted:
+            "--fit-check-only reports a loaded-model fit verdict and cannot be combined with "
+                + "--scripted"
         }
     }
 }
@@ -346,6 +371,19 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       WITHOUT loading a model (exit 2 if none fits).
                                       Needs only --quant-candidates (+ optional
                                       --context); no runtime limits required.
+          --fit-check-only           Dry-run: resolve the fit-check verdict for a
+                                      single --model-path model directory via the
+                                      exact same resolveServingLimits call the real
+                                      serve makes (memory/cache limits, admitted max
+                                      context, verdict), print it, and exit WITHOUT
+                                      loading weights. Mutually exclusive with
+                                      --quant-pick-only and --force (which would
+                                      suppress the very verdict this exists to
+                                      learn); not supported with --scripted (no
+                                      model directory to check). Composes with
+                                      --ngram-offload-plan + --qwen4exp-mtp to
+                                      report the offloaded verdict -- the
+                                      motivating production-cutover use case.
           --quant-reliability PATH    With --quant-pick-only, overlay measured tool-call
                                       reliability (a quant-reliability/v1 artifact) onto
                                       the announce, joined by quant bits. Advisory: never
@@ -587,6 +625,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// deliberately NOT refused: the resolved winning directory still loads through the same
     /// scalar-load seam, so the override applies normally there.
     public let chatTemplateURL: URL?
+    /// `--fit-check-only`: report the `resolveServingLimits` verdict for the resolved model
+    /// directory and exit before the load that follows it, instead of skipping that computation.
+    /// Default `false` preserves today's behavior byte-for-byte. Deliberately NOT threaded through
+    /// `--quant-pick-only`'s early-return construction (see `fitCheckOnlyWithQuantPickOnly`'s doc
+    /// comment): this flag stays on the FULL loaded-model construction path all the way through
+    /// `--model-path`/`--model` resolution, so the seam at the real `resolveServingLimits` call
+    /// sites in `FastMLXServe.swift` is the ONLY place that computes the reported verdict -- a
+    /// second, parallel fit computation here could drift from what the real serve uses and make
+    /// the flag misleading.
+    public let fitCheckOnly: Bool
 
     private init(
         backend: FastMLXServeBackend?,
@@ -623,7 +671,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         ngramOffloadPlanURL: URL? = nil,
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
         memoryLimitBytes: Int? = nil,
-        chatTemplateURL: URL? = nil
+        chatTemplateURL: URL? = nil,
+        fitCheckOnly: Bool = false
     ) {
         self.backend = backend
         self.host = host
@@ -659,6 +708,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.inCheckpointMTPSelection = inCheckpointMTPSelection
         self.memoryLimitBytes = memoryLimitBytes
         self.chatTemplateURL = chatTemplateURL
+        self.fitCheckOnly = fitCheckOnly
     }
 
     public static func parse<S: Sequence>(
@@ -707,6 +757,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var qwen4ExpMTP = false
         var evidencePath: URL?
         var chatTemplateURL: URL?
+        var fitCheckOnly = false
 
         var index = 0
         while index < arguments.count {
@@ -878,6 +929,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 exactQwen35MTP = true
             case "--qwen4exp-mtp":
                 qwen4ExpMTP = true
+            case "--fit-check-only":
+                fitCheckOnly = true
             case "--exact-mtp-selection":
                 index += 1
                 let rawSelection = try value(at: index, in: arguments, for: argument)
@@ -955,6 +1008,24 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         }
         if exactMTPSelectionWasExplicit, !exactQwen35MTP {
             throw FastMLXServeArgumentError.exactMTPSelectionRequiresExactQwen35MTP
+        }
+
+        // --fit-check-only refusals that do not depend on ordering against anything else below:
+        // (1) --force suppresses the very verdict --fit-check-only exists to learn -- a red host
+        // would otherwise be able to report a --fit-check-only "success" merely because --force
+        // stopped the refusal that verdict would normally trigger; (2) --quant-pick-only is a
+        // DIFFERENT dry run (auto-pick across --quant-candidates directories rather than a
+        // single-model fit-check), so combining the two is ambiguous about which one the operator
+        // wants. The --scripted refusal lives further below, grouped alongside its sibling
+        // loaded-model-only flags (--qwen4exp-mtp, --ngram-offload-plan, --chat-template) that are
+        // each refused there by an explicit, unconditional check rather than through
+        // `hasLoadedModelOptions` -- see that check's own doc comment for why it is not folded in
+        // here as a third simple pair-check.
+        if fitCheckOnly, forceServe {
+            throw FastMLXServeArgumentError.fitCheckOnlyWithForce
+        }
+        if fitCheckOnly, quantPickOnly {
+            throw FastMLXServeArgumentError.fitCheckOnlyWithQuantPickOnly
         }
 
         if continuousBatchNoSpec, continuousDynamicPLD {
@@ -1170,6 +1241,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         if scripted, chatTemplateURL != nil {
             throw FastMLXServeArgumentError.chatTemplateWithScripted
         }
+        // --fit-check-only reports the `resolveServingLimits` verdict for a loaded model; the
+        // transport-only scripted backend loads no model and has no model directory to check, so the
+        // flag would have nothing to report. Not covered by `hasLoadedModelOptions` (this flag alone
+        // implies no model-path/memory/cache/reserved-KV/quant-candidates value), so an explicit
+        // refusal is required, mirroring `qwen4ExpMTPWithScripted`/`ngramOffloadPlanWithScripted`
+        // immediately above.
+        if scripted, fitCheckOnly {
+            throw FastMLXServeArgumentError.fitCheckOnlyWithScripted
+        }
         if continuousDynamicPLD, allowHybridQwen35 {
             throw FastMLXServeArgumentError.dynamicPLDWithHybridQwen35
         }
@@ -1294,7 +1374,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             ngramOffloadPlanURL: ngramOffloadPlanURL,
             inCheckpointMTPSelection: qwen4ExpMTP ? .converted4Bit : nil,
             memoryLimitBytes: memoryLimitBytes,
-            chatTemplateURL: chatTemplateURL)
+            chatTemplateURL: chatTemplateURL,
+            fitCheckOnly: fitCheckOnly)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -1336,6 +1417,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--ngram-offload-plan",
         "--qwen4exp-mtp",
         "--chat-template",
+        "--fit-check-only",
     ]
 
     private static func value(

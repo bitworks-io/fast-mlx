@@ -2062,6 +2062,147 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertEqual(arguments.quantCandidateDirectories.count, 2)
     }
 
+    // MARK: - --fit-check-only: a dry-run flag that reports the `resolveServingLimits` verdict for
+    // a single --model-path model directory (the SAME call the real serve makes, immediately before
+    // the load that follows it in FastMLXServe.swift) and exits without loading weights. Refused
+    // with --quant-pick-only (a different dry run), --force (which would suppress the verdict this
+    // flag exists to learn), and --scripted (no model directory to check). Deliberately NOT threaded
+    // through --quant-pick-only's early-return construction — it stays on the full loaded-model
+    // parse path so it reaches the real load-adjacent seam unchanged.
+
+    func testFitCheckOnlyParsesTrueAndDefaultsFalse() throws {
+        let withFlag = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--fit-check-only",
+        ])
+        XCTAssertTrue(withFlag.fitCheckOnly)
+
+        let withoutFlag = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+        ])
+        XCTAssertFalse(withoutFlag.fitCheckOnly)
+
+        XCTAssertTrue(FastMLXServeArguments.usage.contains("--fit-check-only"))
+    }
+
+    /// Refusal 1: --fit-check-only with --quant-pick-only throws the specific
+    /// .fitCheckOnlyWithQuantPickOnly case — asserting the REASON, not merely that parsing threw.
+    func testFitCheckOnlyRejectedWithQuantPickOnly() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--quant-candidates", "/models/a,/models/b",
+                "--quant-pick-only",
+                "--fit-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .fitCheckOnlyWithQuantPickOnly)
+        }
+    }
+
+    /// Refusal 2: --fit-check-only with --force throws the specific .fitCheckOnlyWithForce case.
+    /// --force exists to proceed past a red verdict; a dry run whose purpose is to LEARN the
+    /// verdict must not also carry the flag that suppresses it.
+    func testFitCheckOnlyRejectedWithForce() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--model-path", "/models/fixture",
+                "--model", "fixture",
+                "--memory-limit-bytes", "68719476736",
+                "--cache-limit-bytes", "8589934592",
+                "--force",
+                "--fit-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .fitCheckOnlyWithForce)
+        }
+    }
+
+    /// Refusal 3: --fit-check-only with --scripted throws the specific .fitCheckOnlyWithScripted
+    /// case. The transport-only scripted backend loads no model, so there is no fit to check.
+    func testFitCheckOnlyRejectedWithScripted() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted",
+                "--fit-check-only",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError,
+                .fitCheckOnlyWithScripted)
+        }
+    }
+
+    /// Acceptance (anti-inertness): --fit-check-only together with --ngram-offload-plan AND
+    /// --qwen4exp-mtp — the motivating cutover use case — parses successfully and preserves all
+    /// three settings. If a future guard folds --fit-check-only into the --ngram-offload-plan
+    /// refusal at :quantPickOnly's sibling check (see FastMLXServeArguments.swift's guard keyed on
+    /// `ngramOffloadPlanURL != nil, quantPickOnly`), this test fails.
+    func testFitCheckOnlyAcceptedWithNgramOffloadPlanAndInCheckpointMTP() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+            "--fit-check-only",
+        ])
+
+        XCTAssertTrue(arguments.fitCheckOnly)
+        XCTAssertEqual(
+            arguments.ngramOffloadPlanURL,
+            URL(fileURLWithPath: "/abs/path/plan.json"))
+        XCTAssertEqual(arguments.inCheckpointMTPSelection, .converted4Bit)
+    }
+
+    /// --fit-check-only must not perturb any other parsed field: compare every stored property
+    /// (via `Mirror`, so a future field addition is covered automatically) between the same argv
+    /// with and without the flag, excluding `fitCheckOnly` itself.
+    func testFitCheckOnlyDoesNotPerturbOtherParsedFields() throws {
+        let baseArguments: [String] = [
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--ngram-offload-plan", "/abs/path/plan.json",
+            "--qwen4exp-mtp",
+        ]
+        let withoutFlag = try FastMLXServeArguments.parse(baseArguments)
+        let withFlag = try FastMLXServeArguments.parse(baseArguments + ["--fit-check-only"])
+
+        let withoutFields = Dictionary(
+            uniqueKeysWithValues: Mirror(reflecting: withoutFlag).children.compactMap {
+                child -> (String, String)? in
+                guard let label = child.label else { return nil }
+                return (label, String(describing: child.value))
+            })
+        let withFields = Dictionary(
+            uniqueKeysWithValues: Mirror(reflecting: withFlag).children.compactMap {
+                child -> (String, String)? in
+                guard let label = child.label else { return nil }
+                return (label, String(describing: child.value))
+            })
+
+        XCTAssertFalse(withoutFields.isEmpty)
+        for (label, withoutValue) in withoutFields where label != "fitCheckOnly" {
+            XCTAssertEqual(
+                withFields[label], withoutValue,
+                "field \(label) changed when --fit-check-only was added")
+        }
+        XCTAssertEqual(withoutFlag.fitCheckOnly, false)
+        XCTAssertEqual(withFlag.fitCheckOnly, true)
+    }
+
     // MARK: - fastMLXServeArgumentRefusalAnnounceLine: the machine-readable refusal line
     // `FastMLXServe.main`'s top-level `catch let error as FastMLXServeArgumentError` arm renders.
     // Without that arm, EVERY one of these 94 cases — thrown from the very first statement of

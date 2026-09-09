@@ -46,6 +46,27 @@ struct FastMLXServe {
     static func main() async throws {
         do {
             try await run()
+        } catch let completed as FitCheckOnlyCompleted {
+            // `--fit-check-only` reached the load-immediately-following seam on purpose and stopped
+            // there -- this is success, not a refusal, so it exits 0 (contrast the `FitCheckRefusal`
+            // arm below, which exits 2). Reuses `ServingFitDecision.machineReadableFields()` (the
+            // same frozen `fit_check=` contract the real serve's own startup line splices in) for
+            // every verdict field rather than inventing a second format that could drift from it;
+            // this line adds only the dry-run-specific facts that contract does not carry: that no
+            // weights were loaded, the planned route, the model id, and the resolved limits/context
+            // the real load would have used.
+            let fit = completed.limits.fitDecision?.machineReadableFields() ?? "fit_check=skipped"
+            let offloadCaveat = completed.limits.offloadCompositionApplied
+                ? " offload_path_resolvable=unproven"
+                : ""
+            print(
+                "fastmlx-serve fit_check_only=complete weights_loaded=false "
+                    + "route=\(completed.route) model=\(completed.model) "
+                    + "max_context_tokens=\(completed.limits.maxContextTokens) "
+                    + "memory_limit_bytes=\(completed.limits.memoryLimitBytes) "
+                    + "cache_limit_bytes=\(completed.limits.cacheLimitBytes) "
+                    + fit + offloadCaveat)
+            exit(0)
         } catch is FitCheckRefusal {
             // The refusal summary was already written to stderr by emitFitCheck; fail closed with a
             // clean non-zero exit instead of a Swift top-level fatalError trap (exit 133, doubled
@@ -358,6 +379,33 @@ private struct ResolvedServingLimits {
     let fitDecision: ServingFitDecision?
     /// The one immutable request capability derived from the same fit decision.
     let modelCapabilities: ServingModelCapabilities
+    /// `true` only when `--ngram-offload-plan` was supplied AND `NGramOffloadFitComposition.make`
+    /// succeeded, so this verdict is conditioned on the offloaded (not full-resident) weights
+    /// figure. See `--fit-check-only`'s `offload_path_resolvable=unproven` attestation field: the
+    /// FIT path reads ONLY the plan's declared `limits.maxResidentBytes` (an operator-declared
+    /// budget, not a measurement) plus the target checkpoint's safetensors headers
+    /// (`NGramOffloadFitComposition.planMaxResidentBytes` /
+    /// `offloadedNGramTensorBytes`); it never consults the plan's acceptance record, chunk seal,
+    /// row-store file, or the operator-owned eligibility approval, all of which are resolved later
+    /// on the LOAD path (`loadOffloadedNGramModelContext`, `MLXScalarServing.swift`). A GREEN here
+    /// means only "the declared budget arithmetic fits" -- NOT "this host is proven able to serve
+    /// it" -- so a fit-check-only dry run must say so explicitly rather than let an operator read
+    /// GREEN and walk into a load-time refusal at the cutover window. `false` when the flag was
+    /// absent OR the composition failed (the fallback keeps the conservative full-resident figure,
+    /// which carries no such unproven-offload caveat).
+    let offloadCompositionApplied: Bool
+}
+
+/// `--fit-check-only`: `prepareBackend` reached the SAME `resolveServingLimits` call the real serve
+/// makes and computed a verdict, but the operator asked to stop before the load that immediately
+/// follows it. A dedicated typed sentinel `main()` catches explicitly and maps to exit 0, mirroring
+/// `FitCheckRefusal`'s shape (which maps a refused verdict to exit 2) -- `prepareBackend` returns a
+/// single typed value, so a thrown sentinel is how it signals "stop here, on purpose" without a
+/// second return shape threaded through every call site.
+private struct FitCheckOnlyCompleted: Error {
+    let route: String
+    let model: String
+    let limits: ResolvedServingLimits
 }
 
 private struct FitCheckRefusal: Error, CustomStringConvertible {
@@ -563,6 +611,13 @@ private func resolveServingLimits(
     // checkpoint shape, malformed plan) must NOT reduce the figure — keep the conservative
     // full-resident `parsed` and only note the miss, since an optimistic fit that loads and OOMs
     // is worse than the false RED this composition exists to fix.
+    // Tracks whether the composition below actually applied (not merely whether the flag was
+    // supplied) -- consumed by `--fit-check-only`'s `offload_path_resolvable=unproven` attestation
+    // field on `ResolvedServingLimits`. See that field's doc comment for why an applied offload
+    // composition needs a distinct honesty caveat: this FIT-time computation reads only the plan's
+    // declared `limits.maxResidentBytes` budget, never the plan's acceptance record or eligibility
+    // approval that the LOAD path resolves later.
+    var offloadCompositionApplied = false
     if let ngramOffloadPlanURL = arguments.ngramOffloadPlanURL {
         do {
             let composed = try NGramOffloadFitComposition.make(
@@ -579,6 +634,7 @@ private func resolveServingLimits(
                     + "= adjusted weights \(composed.profile.weightsBytes4bitEstimate) B",
             ])
             parsed = composed
+            offloadCompositionApplied = true
         } catch {
             emitFitCheck([
                 "ngram offload fit adjustment could not be computed (\(error)); "
@@ -671,7 +727,8 @@ private func resolveServingLimits(
     return ResolvedServingLimits(
         memoryLimitBytes: memory, cacheLimitBytes: cache,
         maxReservedKVBytes: providedReservedKV, maxContextTokens: contextCap,
-        fitDecision: decision, modelCapabilities: modelCapabilities)
+        fitDecision: decision, modelCapabilities: modelCapabilities,
+        offloadCompositionApplied: offloadCompositionApplied)
 }
 
 /// Resolve which directory the serve path actually loads. With `--quant-candidates` set, run the
@@ -876,6 +933,20 @@ private func prepareBackend(
             modelDirectory: served.directory, arguments: arguments, host: host,
             providedMemory: memoryLimitBytes, providedCache: cacheLimitBytes, providedReservedKV: nil,
             preParsed: fitParsed)
+        // `--fit-check-only`: the verdict above is the SAME one the real serve is about to load
+        // against -- stop here, immediately before the load, rather than computing a second
+        // parallel fit that could drift from it. `route` names the PLANNED route (what was
+        // configured), not a load outcome: an exact-Qwen3.5-MTP composition can still fall back to
+        // plain scalar at load time, but that fallback determination itself requires the load this
+        // dry run exists to skip.
+        if arguments.fitCheckOnly {
+            throw FitCheckOnlyCompleted(
+                route: (exactDrafterDirectory != nil
+                    ? ServingExecutionRoute.exactQwen35MTP
+                    : ServingExecutionRoute.scalarGreedy).rawValue,
+                model: arguments.model,
+                limits: limits)
+        }
         if let drafterDirectory = exactDrafterDirectory {
             let loaded = try await loadExactQwen35MTPServeComposition(
                 configuration: ExactQwen35MTPServeCompositionConfiguration(
@@ -1011,6 +1082,20 @@ private func prepareBackend(
             providedMemory: memoryLimitBytes, providedCache: cacheLimitBytes,
             providedReservedKV: maxReservedKVBytes, preParsed: served.parsed,
             advisorySlotCount: continuousMaxActiveSlots)
+        // `--fit-check-only`: same seam as the scalar/exact-MTP route above -- stop here,
+        // immediately before the load, reporting the SAME verdict just computed rather than a
+        // second parallel one. `route` names the PLANNED backend mode the operator selected
+        // (`--continuous-dynamic-pld` vs. `--continuous-batch-no-spec`), not a live per-request
+        // routing outcome: the startup report's own `route` field is fixed to
+        // `continuous-batch-no-spec` for both modes at construction time (the dynamic mode's
+        // solo-PLD/no-spec choice happens per request, after load), so reusing that field here
+        // would silently discard the one distinction --fit-check-only can actually report pre-load.
+        if arguments.fitCheckOnly {
+            throw FitCheckOnlyCompleted(
+                route: usesDynamicPLD ? "continuous-dynamic-pld" : "continuous-batch-no-spec",
+                model: arguments.model,
+                limits: limits)
+        }
         let loaded: LoadedContinuousServingModel
         do {
             loaded = try await loadContinuousServingModel(
