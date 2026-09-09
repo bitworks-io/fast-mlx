@@ -733,6 +733,23 @@ final class MLXScalarServingTests: XCTestCase {
             mailboxCapacity: .init(maxDeltas: 8, maxBytes: 4_096))
     }
 
+    /// The running host's name, obtained INDEPENDENTLY of the offload eligibility resolver's own
+    /// host accessor by spawning `/bin/hostname` -- so eligibility fixtures declaring a host that
+    /// must actually match this process (approvals are now host-bound, not merely
+    /// positionally-checked) resolve without this test happening to reimplement, and therefore
+    /// tautologically agree with, the production comparison.
+    private func liveHostNameForTests() throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/hostname")
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func writePlanFile() throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("scalar-serving-ngram-plan-\(UUID().uuidString)", isDirectory: true)
@@ -944,7 +961,8 @@ final class MLXScalarServingTests: XCTestCase {
         try Data("{}".utf8).write(to: planDirectory.appendingPathComponent("seal.json"))
 
         if !omitEligibilityFile {
-            try Data(#"{"host":"test-host","operatorReference":"test-ref"}"#.utf8)
+            let liveHost = try liveHostNameForTests()
+            try Data(#"{"host":"\#(liveHost)","operatorReference":"test-ref"}"#.utf8)
                 .write(to: planDirectory.appendingPathComponent("eligibility.json"))
         }
 
@@ -1181,7 +1199,8 @@ final class MLXScalarServingTests: XCTestCase {
 
         // Deliberately OUTSIDE `planDirectory` (the rows file's own directory) and outside
         // `modelDirectory` -- see this function's doc comment.
-        try Data(#"{"host":"test-host","operatorReference":"test-ref"}"#.utf8)
+        let liveHost = try liveHostNameForTests()
+        try Data(#"{"host":"\#(liveHost)","operatorReference":"test-ref"}"#.utf8)
             .write(to: root.appendingPathComponent("eligibility.json"))
 
         // `fstat` on an opened descriptor -- the one fingerprint call this codebase treats as
@@ -1296,7 +1315,7 @@ final class MLXScalarServingTests: XCTestCase {
             XCTAssertEqual(completion.chunksVerified, 2)
             XCTAssertEqual(completion.chunkVerification, "boundaryChunks")
 
-            XCTAssertEqual(completion.eligibilityHost, "test-host")
+            XCTAssertEqual(completion.eligibilityHost, try liveHostNameForTests())
             XCTAssertTrue(
                 completion.eligibilityResolvedFrom.hasSuffix("eligibility.json"),
                 completion.eligibilityResolvedFrom)
