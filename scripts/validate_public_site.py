@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "8004ce90020f59f8969dce783d13bc01fd19d235de7c80162b947f79559ac159"
+    "5a5aa5416debd3c813e7a27f0b0659c5d7818d6a9b73583c3f0b5d3e3cd07179"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "5c4d81a3b31cacc5de795d79b8118f5888676a810340e2ab804f31fc7174c8f9"
+    "c68e2375fc18892aaf00948ea788ae2062a7d11c835f14c5cfe93fbc4eeab11d"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "27 published research notes",
+    "28 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -484,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/you-had-to-load-the-model-to-learn-it-would-not-load/",
     "research/every-tool-call-took-the-path-we-never-tested/",
     "research/the-fit-check-refused-a-model-that-fit/",
     "research/a-family-name-is-not-evidence-about-a-checkpoint/",
@@ -513,6 +514,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/you-had-to-load-the-model-to-learn-it-would-not-load/": ("2026-09-08", "2026-09-08"),
     "research/every-tool-call-took-the-path-we-never-tested/": ("2026-09-08", "2026-09-08"),
     "research/the-fit-check-refused-a-model-that-fit/": ("2026-09-06", "2026-09-06"),
     "research/a-family-name-is-not-evidence-about-a-checkpoint/": ("2026-09-06", "2026-09-06"),
@@ -807,6 +809,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/you-had-to-load-the-model-to-learn-it-would-not-load/": (
+        "You had to load the model to learn it wouldn't load — fast-mlx",
+        "An earlier note — The fit-check refused a model that fit — was about the fit-check getting an answer wrong. This one is about not being able to ask it the question.",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/every-tool-call-took-the-path-we-never-tested/": (
         "Every tool call took the path we never tested — fast-mlx",
