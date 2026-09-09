@@ -1113,3 +1113,451 @@ final class SeededSampledMTPProposalCaptureRetentionTests: XCTestCase {
             blockCount * proposalDistributions.count)
     }
 }
+
+/// Closes a composed top-p AND top-k truncation gap that
+/// `SampledMTPTruncatedTargetDistributionTests` above does not cover: that
+/// class qualifies top-k ALONE (`topP: 1, topK: 2` -- top-p disabled). The
+/// deployed thinking preset (`top_p: 0.95, top_k: 20`) runs BOTH filters, in
+/// mlx-lm order top-p -> min-p -> top-k (`truncatedSamplingProbabilities`),
+/// and that composed path -- which runs on every production request -- had
+/// never been exercised.
+///
+/// `referenceComposedTruncation` and its helpers below are this class's own
+/// independent `[Double]` reimplementation of the top-p/top-k filter chain,
+/// derived from the semantics of `applyTopPFilter`/`applyTopKFilter`. They
+/// are never built by calling `truncatedSamplingProbabilities` or any
+/// vendored filter directly -- a defect in the vendored chain must not also
+/// be able to corrupt the yardstick meant to catch it.
+final class SampledMTPComposedTopPTopKTruncationTests: XCTestCase {
+    private static let targetLogits: [Double] = [2.0, 1.8, 1.6, 1.4, 1.2, 1.0, -3.0, -4.0]
+    private static let blockCount = 3000
+    private static let seed: UInt64 = 0xBA5E_D000
+
+    /// Draft distribution shared by both regimes below: half its mass sits
+    /// INSIDE the composed support `{0, 1, 2}` -- in exactly the
+    /// proportions of the independently computed `p'`, scaled down to a
+    /// total of 0.5, so `p'(x) / q(x) == 2` for every in-support `x` and
+    /// acceptance probability `min(1, 2)` is deterministically 1 -- and the
+    /// other half sits on token 3, OUTSIDE the composed support, where
+    /// `p'(3) == 0` makes acceptance probability exactly 0 (always
+    /// rejected, forcing the residual-correction path). That 50/50 split
+    /// lands `acceptedBlocks` near the middle of `(blockCount/5,
+    /// blockCount*4/5)`, so both the residual-correction path and the
+    /// fully-accepted bonus path fire many times on every run. Indices
+    /// `4...7` carry only a negligible `1e-6` each so the row stays a
+    /// valid, fully-supported distribution (no exact zero the proposal
+    /// sampler could ever be asked to draw and reject as unsupported).
+    private static let proposalLogits: [Double] = [
+        -1.605049, -1.805049, -2.005049, -0.693155,
+        -13.815511, -13.815511, -13.815511, -13.815511,
+    ]
+
+    /// Regime A: top-p (0.95) alone admits a six-token nucleus
+    /// `{0,1,2,3,4,5}`, but top-k (3) then binds INSIDE that nucleus and
+    /// cuts it down further to `{0,1,2}` -- `composedSupport !=
+    /// nucleusSupport`. Discriminates against a wiring that drops top-k
+    /// while keeping top-p.
+    func testRegimeATopKBindsInsideTopPNucleus() throws {
+        try runComposedTruncationRegime(
+            topP: 0.95,
+            topK: 3,
+            expectedNucleus: [0, 1, 2, 3, 4, 5],
+            expectedComposed: [0, 1, 2],
+            expectedTopKOnly: [0, 1, 2],
+            seedOffset: 1) { nucleusSupport, composedSupport, _ in
+                XCTAssertNotEqual(composedSupport, nucleusSupport)
+            }
+    }
+
+    /// Regime B, the production-shaped case: top-p (0.5) alone already
+    /// narrows to `{0,1,2}`, the same set top-k (6) composes down to --
+    /// `composedSupport == nucleusSupport` -- while top-k ALONE (ignoring
+    /// top-p) would keep six tokens `{0,1,2,3,4,5}`: `composedSupport !=
+    /// topKOnlySupport`. At the deployed preset the nucleus is usually
+    /// smaller than `top_k: 20`, so top-p does the real work here and
+    /// `applyTopKFilter` must be a no-op on an input that already carries
+    /// `-inf` entries from the top-p pass -- that composition had never
+    /// been tested before this method.
+    func testRegimeBTopPBindsBeforeTopK() throws {
+        try runComposedTruncationRegime(
+            topP: 0.5,
+            topK: 6,
+            expectedNucleus: [0, 1, 2],
+            expectedComposed: [0, 1, 2],
+            expectedTopKOnly: [0, 1, 2, 3, 4, 5],
+            seedOffset: 2) { _, composedSupport, topKOnlySupport in
+                XCTAssertNotEqual(composedSupport, topKOnlySupport)
+            }
+    }
+
+    // MARK: - Attribution fixture (30-token, real deployed topK: 20)
+
+    /// Weight `w` in `1...30` sits at `index = (w - 1 + 13) % 30`; that
+    /// token's logit is `ln(w / 465)` (465 == sum(1...30)), so `softmax` of
+    /// this row is exactly `w / 465` at every index -- no rounding-
+    /// sensitive normalization step to get wrong.
+    private static let attributionVocabularySize = 30
+    private static let attributionTopK = 20
+    private static let attributionTargetLogits: [Double] = [
+        -3.2516656477, -3.1975984264, -3.1463051320, -3.0975149679, -3.0509949522,
+        -3.0065431897, -2.9639835752, -2.9231615807, -2.8839408676, -2.8462005396,
+        -2.8098328954, -2.7747415756, -2.7408400239, -6.1420374056, -5.4488902250,
+        -5.0434251169, -4.7557430445, -4.5325994932, -4.3502779364, -4.1961272565,
+        -4.0625958639, -3.9448128283, -3.8394523126, -3.7441421328, -3.6571307558,
+        -3.5770880481, -3.5029800760, -3.4339872045, -3.3694486833, -3.3088240615,
+    ]
+
+    /// Draft distribution for the attribution fixture: half its mass
+    /// proportional to `p'` over `keptArmIndices` (weights `11...30`,
+    /// scaled to sum 0.5 -- same `ratio == 2, always-accept-when-inside`
+    /// construction as `proposalLogits` above), a quarter split uniformly
+    /// over `topPArmIndices` (weights `1...6`), and a quarter split
+    /// uniformly over `topKArmIndices` (weights `7...10`). The two arms
+    /// getting nonzero draft mass is what lets a defect that leaks either
+    /// arm actually surface in the histogram: a `q` with zero mass there
+    /// could never propose those tokens in the first place.
+    private static let attributionProposalLogits: [Double] = [
+        -3.8189325824, -3.7648653611, -3.7135720667, -3.6647819025, -3.6182618869,
+        -3.5738101243, -3.5312505099, -3.4904285154, -3.4512078022, -3.4134674743,
+        -3.3770998301, -3.3420085103, -3.3081069586, -3.1780538303, -3.1780538303,
+        -3.1780538303, -3.1780538303, -3.1780538303, -3.1780538303, -2.7725887222,
+        -2.7725887222, -2.7725887222, -2.7725887222, -4.3114090675, -4.2243976905,
+        -4.1443549828, -4.0702470106, -4.0012541392, -3.9367156180, -3.8760909962,
+    ]
+
+    /// Removed by top-p ALONE (weights `1...6`): still masked even with
+    /// `topK: 0` -- see the executed control below.
+    private static let topPArmIndices: Set<Int> = [13, 14, 15, 16, 17, 18]
+    /// Removed by top-k ALONE (weights `7...10`): pass top-p's nucleus but
+    /// do not survive the top-20 cut.
+    private static let topKArmIndices: Set<Int> = [19, 20, 21, 22]
+    /// Survive both filters (weights `11...30`).
+    private static let keptArmIndices: Set<Int> = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 23, 24, 25, 26, 27, 28, 29,
+    ]
+
+    /// The two indices a top-k-before-top-p filter-order swap removes that
+    /// the correct top-p-then-top-k order keeps. Weights 11 and 12
+    /// (indices 23 and 24) sit just inside the boundary top-p's `1 - topP`
+    /// threshold draws against the FULL, unnormalized `465`-weight row.
+    /// Swap the order -- run top-k (20) first -- and that boundary shifts:
+    /// top-k alone keeps weights `11...30`, an unnormalized surviving mass
+    /// of `410/465`, and the subsequent top-p pass then measures its
+    /// threshold against that smaller mass instead, which cuts deeper and
+    /// drops these two weights on top of the six the top-p arm (weights
+    /// `1...6`) already drops under either order. Under the CORRECT order
+    /// they instead survive both filters, carrying combined mass `23/410`
+    /// of the composed support; under the SWAPPED order they carry exactly
+    /// zero. These two indices exist specifically to catch that one
+    /// mutation -- swapping the `if topP > 0 && topP < 1` and `if topK >
+    /// 0` blocks in `truncatedSamplingProbabilities` -- which the
+    /// `leakedTopPArm`/`leakedTopKArm` assertions above do not catch: both
+    /// arms they check stay excluded under either filter order, so neither
+    /// one moves when only the order changes.
+    private static let orderDiscriminatorIndices: Set<Int> = [23, 24]
+
+    /// Both `SampledMTPTruncatedTargetDistributionTests` above and
+    /// `testRegimeATopKBindsInsideTopPNucleus`/`testRegimeBTopPBindsBeforeTopK`
+    /// converge on the SAME composed support (`{0,1,2}` for both regimes
+    /// above), so an out-of-support leak count there cannot say WHICH
+    /// filter misbehaved. This fixture separates the two arms at the real
+    /// deployed `topK: 20` over a 30-token vocabulary --
+    /// `applyTopKFilter` no-ops whenever `topK >= vocabularySize`
+    /// (Evaluate.swift:316), so anything narrower than 21 tokens would make
+    /// a `topK: 20` assertion pass by construction rather than by actually
+    /// exercising the filter, which is why this fixture is 30 wide.
+    func testAttributesLeakToTopPOrTopKArmSeparately() throws {
+        let vocabularySize = Self.attributionVocabularySize
+        let topK = Self.attributionTopK
+        let topP = 0.95
+
+        let fullProbabilities = Self.referenceSoftmax(Self.attributionTargetLogits)
+        let nucleusSupport = Self.referenceNucleusSupport(fullProbabilities, topP: topP)
+        let (composedSupport, composedProbabilities) = Self.referenceComposedTruncation(
+            fullProbabilities: fullProbabilities, topP: topP, topK: topK)
+
+        // Anti-vacuity computed IN-TEST, not asserted only in a comment: a
+        // later edit to this fixture (e.g. shrinking the vocabulary, or
+        // raising topK) must not be able to silently make the top-k arm
+        // inert without one of these four failing first.
+        XCTAssertEqual(nucleusSupport.count, 24)
+        XCTAssertEqual(topK, 20)
+        XCTAssertGreaterThan(nucleusSupport.count, topK)
+        XCTAssertLessThan(topK, vocabularySize)
+
+        // Pins the fixture against the independently-verified index
+        // mapping: if this fails, the fixture (or this reimplementation of
+        // it) is wrong, not the production code under test -- stop and
+        // report rather than pushing past it.
+        XCTAssertEqual(nucleusSupport, Self.keptArmIndices.union(Self.topKArmIndices))
+        XCTAssertEqual(composedSupport, Self.keptArmIndices)
+
+        let truncation = SampledMTPSamplingTruncation(
+            temperature: 1, topP: Float(topP), topK: topK, minP: 0)
+        let provider = SeededSampledMTPBlockRuntimeProvider(
+            seed: Self.seed &+ 3, truncation: truncation)
+        let targetLogitsArray = MLXArray(Self.attributionTargetLogits.map(Float.init))
+        let proposalLogitsArray = MLXArray(Self.attributionProposalLogits.map(Float.init))
+
+        let (histogram, acceptedBlocks) = try Self.runBlocks(
+            provider: provider,
+            proposalLogitsArray: proposalLogitsArray,
+            targetLogitsArray: targetLogitsArray,
+            vocabularySize: vocabularySize,
+            blockCount: Self.blockCount)
+        let totalTokens = histogram.reduce(0, +)
+
+        XCTAssertGreaterThan(acceptedBlocks, Self.blockCount / 5)
+        XCTAssertLessThan(acceptedBlocks, Self.blockCount * 4 / 5)
+
+        // The top-p arm: stays green even if top-k alone were dropped
+        // (M2), since top-p already excludes it independently.
+        let leakedTopPArm = Self.topPArmIndices.reduce(0) { $0 + histogram[$1] }
+        XCTAssertEqual(leakedTopPArm, 0)
+        // The top-k arm: THIS is the load-bearing assertion for
+        // attribution. It stays green under a pure top-p mutation (M3
+        // still excludes this arm independently, since top-p never touches
+        // it) and goes red specifically under a top-k mutation (M2) --
+        // that separation is the whole point of this fixture.
+        let leakedTopKArm = Self.topKArmIndices.reduce(0) { $0 + histogram[$1] }
+        XCTAssertEqual(leakedTopKArm, 0)
+
+        // --- Order discriminator: catches a top-k-before-top-p filter
+        // swap that the two arm checks above cannot. `leakedTopPArm` and
+        // `leakedTopKArm` both stay green under a pure order swap -- their
+        // arms are excluded by top-p and top-k respectively regardless of
+        // which filter runs first -- so a mutation that swaps the order of
+        // the `if topP > 0 && topP < 1` and `if topK > 0` blocks in
+        // `truncatedSamplingProbabilities` would otherwise pass this whole
+        // test undetected. `orderDiscriminatorIndices` (weights 11 and 12)
+        // sit exactly on that order-dependent boundary: kept under the
+        // correct order, dropped under the swap. See the field's doc
+        // comment for the derivation of `410/465` and `23/410`.
+        //
+        // Anti-vacuity, checked against the independently-derived
+        // reference support (`composedSupport`, never
+        // `truncatedSamplingProbabilities`): a future edit to this fixture
+        // that stopped keeping both discriminator indices in the composed
+        // support would otherwise silently disarm the two assertions
+        // below rather than failing loudly here first.
+        XCTAssertTrue(Self.orderDiscriminatorIndices.isSubset(of: composedSupport))
+
+        let orderDiscriminatorCount = Self.orderDiscriminatorIndices
+            .reduce(0) { $0 + histogram[$1] }
+        XCTAssertGreaterThan(orderDiscriminatorCount, 0)
+        let orderDiscriminatorFraction = Double(orderDiscriminatorCount) / Double(totalTokens)
+        XCTAssertEqual(orderDiscriminatorFraction, 23.0 / 410.0, accuracy: 0.02)
+
+        // 6-sigma proportion check on one in-support index against the
+        // independently computed p'.
+        let probeIndex = 12 // weight 30, the largest surviving mass
+        let expectedProbeFraction = composedProbabilities[probeIndex]
+        let observedProbeFraction = Double(histogram[probeIndex]) / Double(totalTokens)
+        let sixSigmaBound = 6 * (expectedProbeFraction * (1 - expectedProbeFraction)
+            / Double(totalTokens)).squareRoot()
+        XCTAssertLessThan(
+            abs(observedProbeFraction - expectedProbeFraction), sixSigmaBound)
+
+        // --- Executed control: topK: 0 on the SAME fixture and the SAME
+        // draft, driven through `decide` directly (bypassing `supports`,
+        // as the executed control in `SampledMTPTruncatedTargetDistributionTests`
+        // does). If this leaked NOTHING on the top-k arm either, the
+        // `leakedTopKArm == 0` assertion above would be trivially
+        // satisfied by a fixture that could never leak there regardless of
+        // truncation -- this proves it is actually reachable and that
+        // disabling top-k alone (not top-p too) is what opens it.
+        let controlTruncation = SampledMTPSamplingTruncation(
+            temperature: 1, topP: Float(topP), topK: 0, minP: 0)
+        let controlProvider = SeededSampledMTPBlockRuntimeProvider(
+            seed: Self.seed &+ 4, truncation: controlTruncation)
+        let (controlHistogram, _) = try Self.runBlocks(
+            provider: controlProvider,
+            proposalLogitsArray: proposalLogitsArray,
+            targetLogitsArray: targetLogitsArray,
+            vocabularySize: vocabularySize,
+            blockCount: Self.blockCount)
+        let controlTotalTokens = controlHistogram.reduce(0, +)
+
+        // The control still excludes the top-p arm: proves the control
+        // moved ONLY the top-k arm, not truncation as a whole.
+        let controlLeakedTopPArm = Self.topPArmIndices.reduce(0) { $0 + controlHistogram[$1] }
+        XCTAssertEqual(controlLeakedTopPArm, 0)
+
+        let controlLeakedTopKArm = Self.topKArmIndices.reduce(0) { $0 + controlHistogram[$1] }
+        XCTAssertGreaterThan(controlLeakedTopKArm, 0)
+        // Independently computed expected mass: weights 7+8+9+10 == 34,
+        // over the nucleus-only (topP: 0.95, topK: 0) total sum(7...30) ==
+        // 444. At ~6000 emitted tokens that is ~460 expected, so observing
+        // exactly 0 on the correctly-truncated provider above is decisive
+        // evidence rather than luck.
+        let controlObservedTopKArmFraction =
+            Double(controlLeakedTopKArm) / Double(controlTotalTokens)
+        XCTAssertEqual(controlObservedTopKArmFraction, 34.0 / 444.0, accuracy: 0.02)
+    }
+
+    // MARK: - Shared driver
+
+    private func runComposedTruncationRegime(
+        topP: Double,
+        topK: Int,
+        expectedNucleus: Set<Int>,
+        expectedComposed: Set<Int>,
+        expectedTopKOnly: Set<Int>,
+        seedOffset: UInt64,
+        additionalDiscrimination: (
+            _ nucleusSupport: Set<Int>,
+            _ composedSupport: Set<Int>,
+            _ topKOnlySupport: Set<Int>
+        ) -> Void
+    ) throws {
+        let fullProbabilities = Self.referenceSoftmax(Self.targetLogits)
+        let nucleusSupport = Self.referenceNucleusSupport(fullProbabilities, topP: topP)
+        let topKOnlySupport = Self.referenceTopKSupport(fullProbabilities, topK: topK)
+        let (composedSupport, composedProbabilities) = Self.referenceComposedTruncation(
+            fullProbabilities: fullProbabilities, topP: topP, topK: topK)
+
+        // Pins the fixture against the table this increment was scoped
+        // against: if either of these fails, the table (or this
+        // reimplementation of it) is wrong, not the production code under
+        // test -- stop and report rather than pushing past it.
+        XCTAssertEqual(nucleusSupport, expectedNucleus)
+        XCTAssertEqual(composedSupport, expectedComposed)
+        XCTAssertEqual(topKOnlySupport, expectedTopKOnly)
+        additionalDiscrimination(nucleusSupport, composedSupport, topKOnlySupport)
+
+        let truncation = SampledMTPSamplingTruncation(
+            temperature: 1, topP: Float(topP), topK: topK, minP: 0)
+        let provider = SeededSampledMTPBlockRuntimeProvider(
+            seed: Self.seed &+ seedOffset, truncation: truncation)
+        let targetLogitsArray = MLXArray(Self.targetLogits.map(Float.init))
+        let proposalLogitsArray = MLXArray(Self.proposalLogits.map(Float.init))
+
+        let (histogram, acceptedBlocks) = try Self.runBlocks(
+            provider: provider,
+            proposalLogitsArray: proposalLogitsArray,
+            targetLogitsArray: targetLogitsArray,
+            vocabularySize: Self.targetLogits.count,
+            blockCount: Self.blockCount)
+        let totalTokens = histogram.reduce(0, +)
+
+        // Anti-vacuity: both the residual-correction path (rejects) and the
+        // bonus path (fully-accepted blocks) must actually have fired many
+        // times.
+        XCTAssertGreaterThan(acceptedBlocks, Self.blockCount / 5)
+        XCTAssertLessThan(acceptedBlocks, Self.blockCount * 4 / 5)
+
+        // Truncation is enforced by an exact `-infinity` -> exact `0.0`
+        // softmax output, so any nonzero count outside the composed support
+        // is a real defect, checked exactly rather than statistically.
+        let leakedOutsideComposedSupport = histogram.indices
+            .filter { !composedSupport.contains($0) }
+            .reduce(0) { $0 + histogram[$1] }
+        XCTAssertEqual(leakedOutsideComposedSupport, 0)
+
+        // Within the composed support, check the token-0 fraction against
+        // the independently computed p'(0) with a 6-sigma normal-
+        // approximation bound on the observed proportion.
+        let expectedToken0Fraction = composedProbabilities[0]
+        let observedToken0Fraction = Double(histogram[0]) / Double(totalTokens)
+        let sixSigmaBound = 6 * (expectedToken0Fraction * (1 - expectedToken0Fraction)
+            / Double(totalTokens)).squareRoot()
+        XCTAssertLessThan(
+            abs(observedToken0Fraction - expectedToken0Fraction), sixSigmaBound)
+    }
+
+    /// Shared driver: samples a proposal, calls `decide` for a single-
+    /// draft-token block, and accumulates the emitted-token histogram and
+    /// accept count. Mirrors `SampledMTPTruncatedTargetDistributionTests
+    /// .runBlocks`, generalized with an explicit `vocabularySize` so it can
+    /// drive both this class's 8-token and 30-token fixtures.
+    private static func runBlocks(
+        provider: SeededSampledMTPBlockRuntimeProvider,
+        proposalLogitsArray: MLXArray,
+        targetLogitsArray: MLXArray,
+        vocabularySize: Int,
+        blockCount: Int
+    ) throws -> (histogram: [Int], acceptedBlocks: Int) {
+        var histogram = [Int](repeating: 0, count: vocabularySize)
+        var acceptedBlocks = 0
+        for _ in 0 ..< blockCount {
+            let proposedToken = provider.proposalSampler.sample(logits: proposalLogitsArray)
+                .item(Int.self)
+            let decision = try provider.decide(
+                proposedTokens: [proposedToken],
+                targetLogits: [targetLogitsArray],
+                bonusTargetLogits: targetLogitsArray)
+            if decision.acceptedDraftCount == 1 {
+                acceptedBlocks += 1
+            }
+            for token in decision.outputTokens {
+                histogram[token] += 1
+            }
+        }
+        return (histogram, acceptedBlocks)
+    }
+
+    // MARK: - Independent reference implementation
+
+    private static func referenceSoftmax(_ logits: [Double]) -> [Double] {
+        let maxLogit = logits.max() ?? 0
+        let expValues = logits.map { exp($0 - maxLogit) }
+        let sum = expValues.reduce(0, +)
+        return expValues.map { $0 / sum }
+    }
+
+    /// Nucleus-sampling support: sorts ascending, cumsums probabilities, and
+    /// keeps indices whose cumulative mass exceeds `1 - topP` -- mirroring
+    /// `applyTopPFilter`'s ascending-sort/cumsum/threshold shape exactly,
+    /// including its `topP > 0 && topP < 1` no-op guard (`applyTopPFilter`
+    /// is only ever called from inside that guard in
+    /// `truncatedSamplingProbabilities`).
+    private static func referenceNucleusSupport(
+        _ probabilities: [Double], topP: Double
+    ) -> Set<Int> {
+        guard topP > 0, topP < 1 else { return Set(probabilities.indices) }
+        let ascending = probabilities.indices.sorted { probabilities[$0] < probabilities[$1] }
+        var cumulative = 0.0
+        var kept = Set<Int>()
+        for index in ascending {
+            cumulative += probabilities[index]
+            if cumulative > 1 - topP {
+                kept.insert(index)
+            }
+        }
+        return kept
+    }
+
+    /// Top-k support: the `topK` largest-probability indices, ties broken by
+    /// index -- mirroring `applyTopKFilter`'s `guard topK < vocabularySize
+    /// else { return logprobs }` no-op (and the caller's `if topK > 0`
+    /// guard) exactly.
+    private static func referenceTopKSupport(
+        _ probabilities: [Double], topK: Int
+    ) -> Set<Int> {
+        guard topK > 0, topK < probabilities.count else { return Set(probabilities.indices) }
+        let descending = probabilities.indices.sorted { probabilities[$0] > probabilities[$1] }
+        return Set(descending.prefix(topK))
+    }
+
+    /// Composes top-p THEN top-k, in mlx-lm's order: masks everything
+    /// outside the top-p nucleus to zero first, then selects the `topK`
+    /// largest of what remains (which can only ever narrow the nucleus
+    /// further, never re-admit anything top-p already dropped -- masked
+    /// entries stay at exactly `0.0`, never renormalized back to life), and
+    /// renormalizes the survivors to sum to 1.
+    private static func referenceComposedTruncation(
+        fullProbabilities: [Double], topP: Double, topK: Int
+    ) -> (support: Set<Int>, probabilities: [Double]) {
+        let nucleusSupport = referenceNucleusSupport(fullProbabilities, topP: topP)
+        let afterTopP = fullProbabilities.enumerated().map {
+            nucleusSupport.contains($0.offset) ? $0.element : 0.0
+        }
+        let topKRaw = referenceTopKSupport(afterTopP, topK: topK)
+        let composedSupport = Set(topKRaw.filter { afterTopP[$0] > 0 })
+        let masked = afterTopP.enumerated().map {
+            composedSupport.contains($0.offset) ? $0.element : 0.0
+        }
+        let sum = masked.reduce(0, +)
+        return (composedSupport, masked.map { $0 / sum })
+    }
+}
