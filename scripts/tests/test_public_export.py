@@ -419,6 +419,17 @@ class PublicExportTests(unittest.TestCase):
         # consumers that still under-count. For the THIRD time the marker gate caught a real leak
         # first: a doc-comment citation reintroduced the CamelCase family marker into this very
         # file, and was rewritten to name the cache by role. All three places moved together.
+        # 894 -> 895 added, in one increment: the cycle's published engineering note on why a
+        # pure fit-check function whose only callers were the loads it gated could not be run
+        # without paying for the load, on refusing to combine a dry run with the --force flag
+        # that suppresses the very verdict it exists to learn, and on reporting
+        # offload_path_resolvable=unproven rather than letting an arithmetic-only green read as
+        # a serving guarantee. Articles are projected only when named in site/publications.json;
+        # this note reports fast-mlx's own work only and names no third party, no host and no
+        # machine-local path. The same increment edited one already-projected file in place
+        # byte-only, no reseal of its own: site/publications.json gained the entry. All three
+        # places moved together.
+        #
         # 893 -> 894 added, in one increment:
         # docs/content/2026-09-08-every-tool-call-took-the-path-we-never-tested.md -- the cycle's
         # published engineering note, registered in site/publications.json, on why a default that
@@ -469,8 +480,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 894,
-                "pathModeSha256": "bc0cdedadc5d6817b260843f931053984bd1b883591f0965758eb51febe4e063",
+                "pathCount": 895,
+                "pathModeSha256": "3ca6ab28fcaf3a6dc8cfca726ae923ffa5b1497aae79d9ff025b1758ad84f4df",
             },
         )
 
@@ -564,7 +575,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 894)
+            self.assertEqual(reexport_count, 895)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()

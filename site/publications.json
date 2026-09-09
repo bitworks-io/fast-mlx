@@ -163,6 +163,12 @@
       "slug": "every-tool-call-took-the-path-we-never-tested",
       "status": "published",
       "reviewedAt": "2026-09-08"
+    },
+    {
+      "source": "docs/content/2026-09-08-you-had-to-load-the-model-to-learn-it-would-not-load.md",
+      "slug": "you-had-to-load-the-model-to-learn-it-would-not-load",
+      "status": "published",
+      "reviewedAt": "2026-09-08"
     }
   ]
 }
