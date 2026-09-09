@@ -33,7 +33,7 @@ public struct AcceptanceCheck: Sendable {
 /// The equivalence bar an aggressive-quantization tier (e.g. a 2-bit KV cache) is actually held
 /// to. `exact` is today's identical-prefix gate — appropriate while KV stays at fp16/int8, where a
 /// short prefix signals a real bug. `lossy` accepts that a short prefix is EXPECTED at aggressive
-/// tiers and substitutes a different floor: did it crash, did it emit non-finite logits, and does
+/// tiers and substitutes a different floor: did it crash, did it emit corrupt logits, and does
 /// a fixed known-answer canary still land.
 public enum TriadMode: String, Sendable, Equatable, CaseIterable {
     case exact
@@ -64,17 +64,23 @@ public struct CoherenceCanary: Sendable {
     public static let capitalOfFrance = CoherenceCanary(prompt: "The capital of France is", mustContain: "Paris")
 }
 
-/// Lossy-tier equivalence: non-crash (produced at least `minPrefix` tokens), non-NaN (no
-/// non-finite value anywhere in the scored logits), and the coherence canary's answer still
-/// contains the expected substring. All three must hold — any one failing is a real regression,
-/// not expected quantization loss.
+/// Lossy-tier equivalence: non-crash (produced at least `minPrefix` tokens), non-corrupt (no
+/// `NaN` and no `+infinity` anywhere in the scored logits), and the coherence canary's answer
+/// still contains the expected substring.
+///
+/// `-infinity` is deliberately NOT a failure. A masked/unsupported token has probability exactly
+/// zero, so its logprob is legitimately `-infinity`, and at least one shipping checkpoint masks
+/// its unsupported media-sentinel vocabulary indices on every forward. Treating that as corruption
+/// made this gate fail closed on that model for a reason unrelated to quantization.
+///
+/// All three must hold — any one failing is a real regression, not expected quantization loss.
 public struct LossyEquivalenceCheck: Sendable {
     public let minPrefix: Int
     public init(minPrefix: Int = 1) { self.minPrefix = minPrefix }
-    public func evaluate(prefix: Int, allFinite: Bool, canaryPassed: Bool) -> (passed: Bool, reasons: [String]) {
+    public func evaluate(prefix: Int, noCorruptValues: Bool, canaryPassed: Bool) -> (passed: Bool, reasons: [String]) {
         var reasons: [String] = []
         if prefix < minPrefix { reasons.append("prefix \(prefix) < minPrefix \(minPrefix) (crashed or produced no tokens)") }
-        if !allFinite { reasons.append("non-finite (NaN/Inf) value in scored logits") }
+        if !noCorruptValues { reasons.append("corrupt (NaN or +Inf) value in scored logits") }
         if !canaryPassed { reasons.append("coherence canary failed (answer missing expected substring)") }
         return (reasons.isEmpty, reasons)
     }

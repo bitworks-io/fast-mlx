@@ -253,6 +253,19 @@ func referenceDriver(_ flags: Flags, modelPath: String, eos: Int) -> ReferenceDr
 
 func fmt(_ x: Double, _ digits: Int = 3) -> String { String(format: "%.\(digits)f", x) }
 
+/// A raw `-infinity` logprob is legitimate: it is how a masked/unsupported token is expressed
+/// (probability exactly `0`). At least one shipping checkpoint (`qwen4_exp` / Qwen3.8-Flash-Next)
+/// masks its unsupported media-sentinel vocabulary indices to `-Float.infinity` on EVERY forward,
+/// so an all-token-finite check fails closed on that model for a reason that has nothing to do
+/// with KV quantization. `NaN` and `+infinity` are NOT legitimate: a logprob above 0 is
+/// impossible, and both make downstream softmax/argmax arithmetic produce `NaN`. Reject only
+/// those two here. (Same rule already applied to the raw-logit guard in
+/// `SampledMTPBlockRuntimeBridge.swift`; see docs/task-inbox/2026-09-09-sampled-mtp-inf-logits-
+/// fail-closed-BLOCKER.md.)
+func rowsHaveNoCorruptValues(_ rows: [[Float]]) -> Bool {
+    rows.allSatisfy { row in row.allSatisfy { !$0.isNaN && $0 != Float.infinity } }
+}
+
 // MARK: - corpus (hermetic; no model)
 
 func runCorpus() {
@@ -395,10 +408,13 @@ func runVerify(_ flags: Flags) async {
             ).passed(before: 0, after: markerValue)
             engaged = engaged && cacheEngaged
             // non-crash: candidate already produced >=1 token (checked below via prefix).
-            // non-NaN: scan a full-vocab logprobs pass for any non-finite value — this ALSO
+            // non-corrupt: scan a full-vocab logprobs pass for NaN or +infinity — this ALSO
             // exercises the harness scoring forward with the quantized cache (Phase 3's path).
+            // `-infinity` is NOT rejected here: some models (e.g. qwen4_exp) legitimately mask
+            // unsupported vocabulary indices to `-inf` on every forward, so that is data, not
+            // corruption. See rowsHaveNoCorruptValues's doc comment for the full rule.
             let rows = try await driver.logprobs(prompt: promptTokens, config: config)
-            let allFinite = rows.allSatisfy { row in row.allSatisfy { $0.isFinite } }
+            let noCorruptValues = rowsHaveNoCorruptValues(rows)
             // Integration diagnostic (not a gate): the uncompiled scoring forward free-runs
             // its own greedy path at the SAME tier, so its argmax stream vs the compiled
             // decode's tokens separates compile-trace fidelity from codec loss. Near-tie
@@ -436,7 +452,7 @@ func runVerify(_ flags: Flags) async {
             let canaryText = tokenizer.decode(tokenIds: canaryRun.tokens)
             let canaryPassed = canary.passed(canaryText)
             let lossy = LossyEquivalenceCheck(minPrefix: 1)
-                .evaluate(prefix: candidate.tokens.count, allFinite: allFinite, canaryPassed: canaryPassed)
+                .evaluate(prefix: candidate.tokens.count, noCorruptValues: noCorruptValues, canaryPassed: canaryPassed)
             // Teacher-forced top-1 agreement vs the SAME engine at fp16 KV (adjudicated
             // re-spec): the earlier free-running identical-prefix gate was
             // chaotic — one flipped high-entropy token diverges everything after it, the same
@@ -522,7 +538,7 @@ func runVerify(_ flags: Flags) async {
                     .uncompiledCorrectness.rawValue
             }
             print("prompt: \(String(reflecting: prompt)) (\(promptTokens.count) tokens), n=\(n), temp=0")
-            print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), all-finite=\(allFinite), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
+            print("equivalence (lossy, kv_quant_tier=\(kvQuantTier ?? "fp16")): produced=\(candidate.tokens.count), no-corrupt-values=\(noCorruptValues), canary=\(canaryPassed ? "PASS" : "FAIL") -> \(lossy.passed ? "PASS" : "FAIL")")
             if !lossy.reasons.isEmpty { print("  reasons: \(lossy.reasons.joined(separator: "; "))") }
             verdict = TriadVerdict(equivalenceOK: lossy.passed, engaged: engaged, acceptanceOK: nil)
             if !verdict.passed { print("candidate: \(candidate.tokens)") }
@@ -2159,6 +2175,26 @@ struct Harness {
                         + qwenMTPSampledBlockTraceExternalDiagnostic(error))
                 exit(1)
             }
+        case "qwen4exp-sampled-mtp-acceptance":
+            do {
+                try await runInCheckpointSampledMTPAcceptance(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "qwen4exp-sampled-mtp-acceptance FAILED: "
+                        + inCheckpointSampledMTPAcceptanceExternalDiagnostic(error))
+                exit(1)
+            }
+        case "qwen4exp-sampled-mtp-throughput":
+            do {
+                try await runInCheckpointSampledMTPThroughput(
+                    arguments: Array(arguments.dropFirst(2)))
+            } catch {
+                print(
+                    "qwen4exp-sampled-mtp-throughput FAILED: "
+                        + inCheckpointSampledMTPThroughputExternalDiagnostic(error))
+                exit(1)
+            }
         case "exact-prefix-proof":
             do {
                 try await runExactPrefixProof(
@@ -2329,6 +2365,14 @@ struct Harness {
                                                opt-in hidden-first runtime-equivalence gate
           qwen-mtp-eval-combined --target <DIR> --drafter <DIR> --evidence <NEW-OR-EMPTY JSONL>
                                                long-retrieval cache-first vs joint-eval diagnostic
+          qwen4exp-sampled-mtp-acceptance     Release-only real sampled-MTP acceptance rate for
+                 --model-path <DIR> --ngram-offload-plan <FILE>   qwen4_exp (Qwen3.8-Flash-Next):
+                 --prompts-file <FILE> --max-tokens <N>            per-step/per-prompt/pooled `a`,
+                 --seed <UINT64> --provider seeded|nondeterministic decide()-time `D`, target-step
+                 --output-json <NEW-FILE>                          time `T`, drafter-cost `delta`,
+                                               and an independently re-derived sigmaMinPQ per step
+                                               (docs/task-inbox/2026-09-09-sampled-mtp-acceptance-
+                                               rate-PREDECLARATION.md)
           exact-prefix-proof                  fresh loaded exact request-start proof
                  --model <PATH> --model-id <ID> --source-revision <CHECKPOINT-SHA256>
                  --expected-harness-git-sha <SHA>

@@ -52,28 +52,28 @@ final class TriadTests: XCTestCase {
 
   func testLossyEquivalencePassesWhenAllThreeConditionsHold() {
     let check = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, reasons) = check.evaluate(prefix: 5, allFinite: true, canaryPassed: true)
+    let (passed, reasons) = check.evaluate(prefix: 5, noCorruptValues: true, canaryPassed: true)
     XCTAssertTrue(passed)
     XCTAssertTrue(reasons.isEmpty)
   }
 
   func testLossyEquivalenceFailsOnZeroPrefixCrashSignal() {
     let check = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, reasons) = check.evaluate(prefix: 0, allFinite: true, canaryPassed: true)
+    let (passed, reasons) = check.evaluate(prefix: 0, noCorruptValues: true, canaryPassed: true)
     XCTAssertFalse(passed)
     XCTAssertTrue(reasons.contains { $0.contains("crashed or produced no tokens") })
   }
 
   func testLossyEquivalenceFailsOnNonFiniteLogits() {
     let check = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, reasons) = check.evaluate(prefix: 5, allFinite: false, canaryPassed: true)
+    let (passed, reasons) = check.evaluate(prefix: 5, noCorruptValues: false, canaryPassed: true)
     XCTAssertFalse(passed)
-    XCTAssertTrue(reasons.contains { $0.contains("non-finite") })
+    XCTAssertTrue(reasons.contains { $0.contains("corrupt") })
   }
 
   func testLossyEquivalenceFailsOnCanaryMiss() {
     let check = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, reasons) = check.evaluate(prefix: 5, allFinite: true, canaryPassed: false)
+    let (passed, reasons) = check.evaluate(prefix: 5, noCorruptValues: true, canaryPassed: false)
     XCTAssertFalse(passed)
     XCTAssertTrue(reasons.contains { $0.contains("coherence canary failed") })
   }
@@ -82,7 +82,7 @@ final class TriadTests: XCTestCase {
     // At 2-bit today, a short prefix is EXPECTED (not the crash signal) — the point of the lossy
     // gate is that a short prefix alone must NOT fail the tier; only crash/NaN/canary do.
     let check = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, reasons) = check.evaluate(prefix: 3, allFinite: false, canaryPassed: false)
+    let (passed, reasons) = check.evaluate(prefix: 3, noCorruptValues: false, canaryPassed: false)
     XCTAssertFalse(passed)
     XCTAssertEqual(reasons.count, 2, "prefix=3 >= minPrefix=1 should NOT itself contribute a reason")
   }
@@ -94,7 +94,7 @@ final class TriadTests: XCTestCase {
     let exact = EquivalenceCheck(minPrefix: 30)
     XCTAssertFalse(exact.evaluate(candidate: [1, 2, 3, 99], reference: [1, 2, 3, 4]).passed)
     let lossy = LossyEquivalenceCheck(minPrefix: 1)
-    let (passed, _) = lossy.evaluate(prefix: 3, allFinite: true, canaryPassed: true)
+    let (passed, _) = lossy.evaluate(prefix: 3, noCorruptValues: true, canaryPassed: true)
     XCTAssertTrue(passed)
   }
 }

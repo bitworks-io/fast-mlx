@@ -455,6 +455,50 @@ class PublicExportTests(unittest.TestCase):
         # the intersection its two neighbouring tests each covered only one axis of. All three
         # places moved together.
         #
+        # 899 -> 901 added, in one increment (two paths, mode 100644):
+        # spike/Sources/fastmlx-harness/InCheckpointSampledMTPThroughputCLI.swift and
+        # spike/Tests/FastMLXHarnessTests/InCheckpointSampledMTPThroughputArithmeticTests.swift --
+        # the direct end-to-end speculative-vs-scalar throughput instrument predeclared in
+        # docs/task-inbox/2026-09-09-sampled-mtp-direct-throughput-PREDECLARATION.md, plus its 31
+        # pure-arithmetic tests. It exists because the sampled-MTP speedup on record is composed
+        # from separately timed parts rather than observed, and its denominator omits phase costs
+        # the acceptance instrument measures and discards. All three places moved together.
+        #
+        # 898 -> 899 added, in one increment (one path, mode 100644):
+        # spike/Tests/FastMLXHarnessTests/RowsHaveNoCorruptValuesTests.swift -- coverage for the
+        # harness verify path's logprob corruption predicate. That check previously rejected any
+        # non-finite value, which fails closed on a checkpoint that masks unsupported vocabulary
+        # indices to -infinity on every forward: a masked token's logprob is legitimately -infinity
+        # because its probability is exactly zero. The predicate now rejects only NaN and
+        # +infinity, and these tests pin both directions including the happy-path control, so the
+        # relaxation cannot silently widen into accepting real corruption.
+        # It is ordinary harness test source inside an already-projected tree: no checkpoint text,
+        # no infrastructure detail, no machine-local path, and every identifier is family-neutral
+        # because the projected-marker gate forbids the internal implementation-family CamelCase
+        # name in a projected path or its bytes. The same increment edited already-projected files
+        # in place (byte-only, no reseal of their own): Harness.swift swapped the predicate and its
+        # printed label, and the speculative iterator now carries the provider's own failure cause
+        # into its passthrough reason instead of a single hardcoded string. All three places moved
+        # together.
+        #
+        # 896 -> 898 added, in one increment (two paths, both mode 100644):
+        # spike/Sources/fastmlx-harness/InCheckpointSampledMTPAcceptanceCLI.swift -- the
+        # release-only instrument that measures the real sampled-MTP per-step acceptance rate `a`
+        # together with the decide() cost, the target step cost and an independently re-derived
+        # Sigma_x min(p(x), q(x)), all in one run so no quantity is inherited from a prior
+        # measurement.
+        # spike/Tests/FastMLXHarnessTests/InCheckpointSampledMTPAcceptanceArithmeticTests.swift --
+        # 28 hand-derived unit tests for that CLI's pure arithmetic: softmax (including the masked
+        # -infinity row this model really emits), the sigma overlap, the per-step reached/accepted
+        # split, the pooled ratio, the break-even solve checked by substitution, and the
+        # conditioned-vs-unconditional sigma distinction.
+        # Both are ordinary harness source/test inside already-projected trees: no checkpoint text,
+        # no infrastructure detail, no machine-local path, and every identifier is family-neutral
+        # because the projected-marker gate forbids the internal implementation-family CamelCase
+        # name in a projected path or its bytes. The same increment edited one already-projected
+        # file in place (byte-only, no reseal of its own): Harness.swift gained the subcommand
+        # dispatch and its usage text. All three places moved together.
+        #
         # 891 -> 892 added, in one increment:
         # spike/Tests/SpikeServingAdaptersTests/ServingDeveloperRoleMappingTests.swift -- end-to-end
         # coverage for the render boundary's wire-role mapping: OpenAI's `developer` role is now
@@ -480,8 +524,8 @@ class PublicExportTests(unittest.TestCase):
         self.assertEqual(
             public_manifest.get("publicIndex"),
             {
-                "pathCount": 896,
-                "pathModeSha256": "63a1bd6d9b920c758a584f06d0ae833845914c599a7418b1fc8bfb2f36df058f",
+                "pathCount": 901,
+                "pathModeSha256": "711db708e4c2e4f412e1741740efc14cf2afbc46429a9c41c6a76322294515bd",
             },
         )
 
@@ -575,7 +619,7 @@ class PublicExportTests(unittest.TestCase):
             # follow-up repair updated the other two but not this one, leaving the suite red at HEAD
             # a second time. Re-exporting the already-projected tree must reproduce the same path
             # count -- that idempotence is what this asserts, so this value tracks `pathCount`.
-            self.assertEqual(reexport_count, 896)
+            self.assertEqual(reexport_count, 901)
             for destination, metadata in PUBLIC_VENDOR_SOURCE_OVERRIDES.items():
                 output_bytes = (output / destination).read_bytes()
                 reexport_bytes = (reexport / destination).read_bytes()
