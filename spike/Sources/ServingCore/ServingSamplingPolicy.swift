@@ -43,8 +43,21 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
         guard resolvedTopP.isFinite else {
             throw ServingSamplingPolicyError.nonFiniteTopP
         }
-        guard resolvedTopP >= 0, resolvedTopP <= 1 else {
+        guard resolvedTopP > 0, resolvedTopP <= 1 else {
             throw ServingSamplingPolicyError.topPOutOfRange(resolvedTopP)
+        }
+        // Downstream (GenerateParameters/TopPSampler) computes its nucleus
+        // threshold as `1 - topP` and only truncates when that value is
+        // strictly less than 1. In float32, `1 - topP` rounds to exactly 1.0
+        // once `topP` drops below roughly 3e-8 (measured: at production
+        // vocabulary width V=151936, topP <= 1e-9 masks every entry while
+        // 1e-7 is still usable). This guard is width-independent and
+        // deliberately conservative: it refuses slightly above the measured
+        // degeneracy onset, not at the exact onset, because the exact onset
+        // shifts with vocabulary width and a hardcoded "safe" constant would
+        // not be well-defined across models.
+        guard Float(1) - Float(resolvedTopP) < 1 else {
+            throw ServingSamplingPolicyError.topPTooSmallToTruncate(resolvedTopP)
         }
 
         if let topK, topK <= 0 {
@@ -84,6 +97,7 @@ public enum ServingSamplingPolicyError: Error, Equatable, Sendable {
     case temperatureOutOfRange(Double)
     case nonFiniteTopP
     case topPOutOfRange(Double)
+    case topPTooSmallToTruncate(Double)
     case topKOutOfRange(Int)
     case nonFiniteMinP
     case minPOutOfRange(Double)

@@ -90,6 +90,66 @@ final class ServingSamplingPolicyTests: XCTestCase {
             .nonFiniteTopP)
     }
 
+    func testResolutionRejectsZeroTopPAtPositiveTemperature() {
+        // top_p == 0 must be refused, not silently widened: downstream
+        // (GenerateParameters/TopPSampler) disables top-p truncation entirely
+        // when topP == 0, which is the opposite of "narrowest possible nucleus"
+        // that a caller asking for top_p: 0 actually means.
+        assertThrows(
+            try ServingSamplingPolicy.resolve(temperature: 0.7, topP: 0, seed: nil),
+            .topPOutOfRange(0))
+    }
+
+    func testResolutionRejectsTopPTooSmallToTruncate() {
+        // 1e-9 is inside the measured-degenerate band at production vocabulary
+        // width: the nucleus threshold (1 - topP) saturates to exactly 1.0 in
+        // float32, so the top-p filter can never keep anything.
+        assertThrows(
+            try ServingSamplingPolicy.resolve(temperature: 0.7, topP: 1e-9, seed: nil),
+            .topPTooSmallToTruncate(1e-9))
+    }
+
+    func testResolutionAcceptsSmallestUsableTopPAndRejectsSaturatingBand() throws {
+        // 1e-7 is measured usable at production vocabulary width (V=151936)
+        // and must resolve, not be refused: it sits above the saturation
+        // boundary and still discriminates a real nucleus.
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(temperature: 0.7, topP: 1e-7, seed: nil),
+            .sampled(temperature: 0.7, topP: 1e-7, topK: nil, minP: nil, seed: nil))
+
+        // A value in the saturating band (1 - topP rounds to exactly 1.0 in
+        // float32) must be refused, proving the guard discriminates rather
+        // than refusing everything small.
+        assertThrows(
+            try ServingSamplingPolicy.resolve(temperature: 0.7, topP: 2e-8, seed: nil),
+            .topPTooSmallToTruncate(2e-8))
+    }
+
+    func testResolutionKeepsDeployedPresetUnchanged() throws {
+        // Regression that matters most: production traffic (temperature 1.0,
+        // topP 0.95, topK 20, minP 0) must resolve exactly as before.
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: 42),
+            .sampled(temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: 42))
+    }
+
+    func testResolutionZeroTopPOnGreedyBranchDoesNotThrow() throws {
+        // The greedy branch returns before any top_p validation runs.
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(temperature: nil, topP: 0, seed: nil),
+            .greedy)
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(temperature: 0, topP: 0, seed: nil),
+            .greedy)
+    }
+
+    func testResolutionTopPNilStillDefaultsToOne() throws {
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(temperature: 0.7, topP: nil, seed: nil),
+            .sampled(temperature: 0.7, topP: 1.0, topK: nil, minP: nil, seed: nil))
+    }
+
     func testResolveFromRequestReadsTemperature() throws {
         let sampledRequest = OpenAIChatCompletionRequest(
             model: "qwen3-32b",

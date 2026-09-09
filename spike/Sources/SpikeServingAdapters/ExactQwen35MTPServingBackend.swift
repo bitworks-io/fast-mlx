@@ -610,7 +610,11 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
         case .nonFiniteTemperature, .temperatureOutOfRange:
             return .invalidRequest("temperature must be finite and in (0, 2]", param: "temperature")
         case .nonFiniteTopP, .topPOutOfRange:
-            return .invalidRequest("top_p must be finite and in [0, 1]", param: "top_p")
+            return .invalidRequest("top_p must be finite and in (0, 1]", param: "top_p")
+        case .topPTooSmallToTruncate:
+            return .invalidRequest(
+                "top_p is too small to select any tokens; use temperature 0 for greedy decoding",
+                param: "top_p")
         case .topKOutOfRange:
             return .invalidRequest("top_k must be greater than zero", param: "top_k")
         case .nonFiniteMinP, .minPOutOfRange:
