@@ -2061,4 +2061,164 @@ final class FastMLXServeArgumentsTests: XCTestCase {
             URL(fileURLWithPath: "/abs/path/chat_template.jinja"))
         XCTAssertEqual(arguments.quantCandidateDirectories.count, 2)
     }
+
+    // MARK: - fastMLXServeArgumentRefusalAnnounceLine: the machine-readable refusal line
+    // `FastMLXServe.main`'s top-level `catch let error as FastMLXServeArgumentError` arm renders.
+    // Without that arm, EVERY one of these 94 cases — thrown from the very first statement of
+    // `run()` — survives to the top level unwrapped and traps via Swift's top-level fatalError
+    // (exit 133, doubled message, no `reason=` token, unclassifiable by automation) instead of
+    // exiting cleanly with exit(2). See `testFastMLXServeArgumentErrorCatchArmCallSitePinExists`
+    // below for the structural pin on the arm itself — a passing renderer test here proves nothing
+    // about whether the arm still calls it.
+
+    func testRefusalLineRendersUnknownArgument() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.unknownArgument("--bogus"))
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=Unknown argument: --bogus")
+        XCTAssertTrue(line.hasPrefix("fastmlx-serve configuration=refused reason=invalid_arguments"))
+    }
+
+    func testRefusalLineRendersDuplicateOption() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.duplicateOption("--port"))
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=--port may be specified only once")
+    }
+
+    func testRefusalLineRendersMissingValue() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.missingValue("--kv-quant"))
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=--kv-quant requires a value")
+    }
+
+    func testRefusalLineRendersInvalidPort() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.invalidPort)
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=--port must be an integer from 0 through 65535")
+    }
+
+    /// Multi-clause detail text (joined `"..." + "..."` in `description`), and the exact case that
+    /// produced this task's live-host defect's sibling refusal shape (a flag rejected under a
+    /// specific mode combination).
+    func testRefusalLineRendersNgramOffloadPlanWithQuantCandidates() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.ngramOffloadPlanWithQuantCandidates)
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=--ngram-offload-plan is sealed against one specific artifact and cannot "
+                + "be combined with --quant-candidates auto-pick across several candidate "
+                + "directories; pass the single sealed model directory explicitly via --model-path "
+                + "instead")
+        XCTAssertTrue(line.contains("detail=--ngram-offload-plan"))
+    }
+
+    /// The other multi-clause case, and the actual live defect this task fixes: this is the case
+    /// `--chat-template is not supported with continuous batching` belongs alongside (same "flag
+    /// rejected under a mode combination" family) — proving the renderer covers that family, not
+    /// just the single-value cases above.
+    func testRefusalLineRendersChatTemplateWithContinuousBatch() {
+        let line = fastMLXServeArgumentRefusalAnnounceLine(.chatTemplateWithContinuousBatch)
+
+        XCTAssertEqual(
+            line,
+            "fastmlx-serve configuration=refused reason=invalid_arguments "
+                + "detail=--chat-template is not supported with continuous batching")
+    }
+
+    /// Structural pin, precedent: `scripts/tests/test_serve_wrapper.py`'s
+    /// `test_ngram_offload_plan_conflict_rule_still_exists_in_the_binary`. A renderer unit test
+    /// above still passes if someone deletes the top-level `catch` arm in `FastMLXServe.swift` —
+    /// the renderer would simply never run in production, and an argument-validation refusal would
+    /// fall through to Swift's top-level fatalError trap (exit 133, doubled message) again. Read
+    /// the ACTUAL source text of the call site and assert the arm still exists and its body still
+    /// calls the renderer and `exit(2)`, rather than trusting the renderer alone.
+    ///
+    /// The path is resolved from `#filePath` (this test file's own compile-time absolute path),
+    /// walking up to the repo root, never a hardcoded absolute path. If that resolution fails —
+    /// read fails, arm text not found — this test FAILS with a named reason; it must never silently
+    /// skip (this repo has been bitten before by a conditional assertion that skips instead of
+    /// failing).
+    func testFastMLXServeArgumentErrorCatchArmCallSitePinExists() {
+        // Resolve the call site by SEARCHING ancestors for it, not by counting levels. The
+        // repository layout is not the only one this file compiles under: the fleet sync script
+        // deploys `spike/`'s CONTENTS as the package root on the fleet hosts, so the package sits
+        // one directory shallower there and a fixed four-level walk lands on a path that does not
+        // exist. `#filePath` is baked at compile time, so on the fleet that would be a spurious
+        // FAILURE, not a skip -- and a pin that cries wolf gets muted, which is how a real pin dies.
+        // Both layouts are accepted; neither found is still a hard failure.
+        let candidateSuffixes = [
+            ["spike", "Sources", "fastmlx-serve", "FastMLXServe.swift"],
+            ["Sources", "fastmlx-serve", "FastMLXServe.swift"],
+        ]
+        var searchDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var resolvedMainFile: URL?
+        for _ in 0..<8 {
+            for suffix in candidateSuffixes {
+                let candidate = suffix.reduce(searchDirectory) { $0.appendingPathComponent($1) }
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    resolvedMainFile = candidate
+                    break
+                }
+            }
+            if resolvedMainFile != nil { break }
+            searchDirectory.deleteLastPathComponent()
+        }
+
+        guard let mainFilePath = resolvedMainFile else {
+            XCTFail(
+                "could not locate FastMLXServe.swift by walking up from #filePath (\(#filePath)); "
+                    + "the repo/package layout moved relative to this test file. Fix the search "
+                    + "above rather than letting this pin go silent.")
+            return
+        }
+
+        let source: String
+        do {
+            source = try String(contentsOf: mainFilePath, encoding: .utf8)
+        } catch {
+            XCTFail(
+                "could not read FastMLXServe.swift from the #filePath-derived path "
+                    + "\(mainFilePath.path) — repo layout moved relative to this test file, or "
+                    + "#filePath resolution regressed; fix the path derivation above rather than "
+                    + "letting this pin go silent: \(error)")
+            return
+        }
+
+        let armMarker = "catch let error as FastMLXServeArgumentError"
+        guard let armRange = source.range(of: armMarker) else {
+            XCTFail(
+                "FastMLXServe.swift no longer has a `\(armMarker)` catch arm; an "
+                    + "argument-validation refusal thrown by FastMLXServeArguments.parse will fall "
+                    + "through to Swift's top-level fatalError trap (exit 133, doubled message) "
+                    + "instead of exiting cleanly with exit(2)")
+            return
+        }
+
+        // Inspect only the text immediately following the arm's `catch` clause, not the whole
+        // file, so this pin cannot be satisfied by an unrelated call to the renderer or to exit(2)
+        // elsewhere in the file. 800 characters comfortably covers this arm's body (~542 chars
+        // including its doc comment as of this writing) while staying well short of the next arm.
+        let armBody = source[armRange.upperBound...].prefix(800)
+
+        XCTAssertTrue(
+            armBody.contains("fastMLXServeArgumentRefusalAnnounceLine"),
+            "the FastMLXServeArgumentError catch arm no longer calls "
+                + "fastMLXServeArgumentRefusalAnnounceLine; the refusal would go unrendered")
+        XCTAssertTrue(
+            armBody.contains("exit(2)"),
+            "the FastMLXServeArgumentError catch arm no longer calls exit(2); the process would "
+                + "fall through instead of exiting cleanly")
+    }
 }

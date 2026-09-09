@@ -280,6 +280,32 @@ public enum FastMLXServeArgumentError:
     }
 }
 
+/// Operator-facing announce line for `FastMLXServe.main`'s top-level catch of
+/// `FastMLXServeArgumentError`. Without this, an argument-validation refusal thrown by
+/// `FastMLXServeArguments.parse` — the very FIRST statement in `run()`, so this is the earliest
+/// possible refusal in the whole process — survives to the top level unwrapped and traps via
+/// Swift's top-level fatalError (exit 133, doubled message) instead of exiting cleanly with
+/// exit(2); see the sibling `catch let error as ScalarServingModelLoadError` arm in
+/// `FastMLXServe.swift`, whose comment names this exact failure mode, and
+/// `scalarServingModelLoadRefusalAnnounceLine` in
+/// `SpikeServingAdapters/MLXScalarServing.swift`, whose conventions this mirrors.
+///
+/// Declared HERE, next to `FastMLXServeArgumentError` itself, rather than in `SpikeServingAdapters`
+/// alongside `scalarServingModelLoadRefusalAnnounceLine`: `FastMLXServeArgumentError` already lives
+/// in `ServingCore` and this function names no type outside it, so — unlike that sibling, whose
+/// error type lives in `SpikeServingAdapters` — nothing forces this one out of `ServingCore`.
+///
+/// Renders the WHOLE 94-case `FastMLXServeArgumentError` type with one honest generic line rather
+/// than per-case bespoke `reason=` tokens: every case's own `description` already names the
+/// offending flag and the concrete violation (e.g. "--chat-template is not supported with
+/// continuous batching"), so a fixed `reason=invalid_arguments` prefix plus that description in
+/// `detail=` is accurate and complete on its own — mirroring
+/// `scalarServingModelLoadRefusalAnnounceLine`'s `default` branch, which renders its own remaining
+/// ~28 cases the same way rather than inventing structure the description doesn't need.
+public func fastMLXServeArgumentRefusalAnnounceLine(_ error: FastMLXServeArgumentError) -> String {
+    "fastmlx-serve configuration=refused reason=invalid_arguments detail=\(error.description)"
+}
+
 public struct FastMLXServeArguments: Equatable, Sendable {
     public static let usage = """
         Usage:

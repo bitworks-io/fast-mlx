@@ -68,6 +68,14 @@ struct FastMLXServe {
             FileHandle.standardError.write(
                 Data((scalarServingModelLoadRefusalAnnounceLine(error) + "\n").utf8))
             exit(2)
+        } catch let error as FastMLXServeArgumentError {
+            // `FastMLXServeArguments.parse` is the very first statement in `run()`, so this is the
+            // earliest refusal reachable in the whole process. Same clean-exit rationale as the
+            // arms above: avoid a Swift top-level fatalError trap (exit 133, doubled message) for an
+            // error already meant for the operator (an unknown/conflicting/malformed flag).
+            FileHandle.standardError.write(
+                Data((fastMLXServeArgumentRefusalAnnounceLine(error) + "\n").utf8))
+            exit(2)
         }
     }
 
