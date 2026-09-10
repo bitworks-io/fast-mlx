@@ -190,6 +190,86 @@ final class ServingSamplingPolicyTests: XCTestCase {
         XCTAssertEqual(try ServingSamplingPolicy.resolve(from: greedyRequest), .greedy)
     }
 
+    func testDefaultsFillEveryOmittedFieldWhenTemperatureAbsent() throws {
+        // A param-less request plus artifact-sourced defaults resolves as
+        // sampled, carrying exactly the default values.
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil, defaults: defaults),
+            .sampled(temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: nil))
+    }
+
+    func testExplicitZeroTemperatureStaysGreedyEvenWithDefaults() throws {
+        // Explicit temperature: 0 is the client's escape hatch to the greedy
+        // speculative-decoding path; defaults must never override it.
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: 0, topP: nil, topK: nil, minP: nil, seed: nil, defaults: defaults),
+            .greedy)
+    }
+
+    func testNilDefaultsPreservesTodaysGreedyBehaviorOnParamlessRequest() throws {
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil, defaults: nil),
+            .greedy)
+    }
+
+    func testExplicitFieldsWinOverDefaultsWhileOmittedFieldsAreDefaulted() throws {
+        // Anti-vacuity control: defaults must not blindly overwrite fields the
+        // request actually supplied.
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: 0.5, topK: nil, minP: nil, seed: nil, defaults: defaults),
+            .sampled(temperature: 1.0, topP: 0.5, topK: 20, minP: 0, seed: nil))
+    }
+
+    func testExplicitNonzeroTemperatureWinsOverTheDefaultTemperature() throws {
+        // The topP override is covered above, but `temperature` is the one field
+        // with special nil-versus-explicit-0 handling, so its override path is
+        // pinned separately rather than assumed to follow from topP's.
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(
+                temperature: 0.7, topP: nil, topK: nil, minP: nil, seed: nil, defaults: defaults),
+            .sampled(temperature: 0.7, topP: 0.95, topK: 20, minP: 0, seed: nil))
+    }
+
+    func testDefaultedValuesAreValidatedExactlyLikeClientSuppliedOnes() throws {
+        // Defaults are artifact-sourced, so a malformed artifact must fail the
+        // same way a malformed request does -- there must be no path that
+        // reaches `.sampled` carrying an unvalidated value. Each case omits the
+        // field from the request so ONLY the default can be the value under
+        // test.
+        assertThrows(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil,
+                defaults: ServingSamplingDefaults(
+                    temperature: 2.5, topP: 0.95, topK: 20, minP: 0)),
+            .temperatureOutOfRange(2.5))
+        assertThrows(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil,
+                defaults: ServingSamplingDefaults(
+                    temperature: 1.0, topP: 1.5, topK: 20, minP: 0)),
+            .topPOutOfRange(1.5))
+        assertThrows(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil,
+                defaults: ServingSamplingDefaults(
+                    temperature: 1.0, topP: 0.95, topK: 0, minP: 0)),
+            .topKOutOfRange(0))
+        assertThrows(
+            try ServingSamplingPolicy.resolve(
+                temperature: nil, topP: nil, topK: nil, minP: nil, seed: nil,
+                defaults: ServingSamplingDefaults(
+                    temperature: 1.0, topP: 0.95, topK: 20, minP: 1.5)),
+            .minPOutOfRange(1.5))
+    }
+
     private func assertThrows(
         _ expression: @autoclosure () throws -> ServingSamplingPolicy,
         _ expected: ServingSamplingPolicyError,

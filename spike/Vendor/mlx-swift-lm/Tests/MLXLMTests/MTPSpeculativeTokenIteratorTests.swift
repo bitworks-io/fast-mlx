@@ -874,6 +874,68 @@ func testGreedyOnlyDrafterUsesExplicitSampledBlockDecisionProvider() throws {
     #expect(cache.offset == 4, "only the selected input is committed")
 }
 
+/// The actual production seam that broke: `MTPSpeculativeTokenIterator.init`'s
+/// `providerIsEligible` is the CONJUNCTION `temperature != 0 && parameters.processor() == nil
+/// && provider.supports(...)`. `parameters.processor()` is the REAL vendored
+/// `GenerateParameters.processor()` (not mocked) -- so this test exercises the actual fix in
+/// `Evaluate.swift`, not merely a unit-level `processor() == nil` check in isolation. Before that
+/// fix, `repetitionPenalty: 1.0` made `processor()` build a `RepetitionContext` (non-nil), so
+/// `providerIsEligible` was false and a `requiresGreedySampling` drafter (like this one) at
+/// `temperature: 1` fell back to sticky passthrough -- silently disabling speculation for every
+/// real request using the documented HF no-op penalty value.
+@Test
+func testGreedyOnlyDrafterRemainsEligibleWithNeutralRepetitionPenaltyViaSampledProvider() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8])
+    main.capturesPromptHiddenDuringPrepare = true
+    let drafter = MockStatefulGreedyDrafter()
+    let provider = ForcedSampledBlockDecisionProvider()
+    let cache = CountingKVCache()
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        mainCache: [cache],
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1, repetitionPenalty: 1.0),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(iterator.next() == 5, "prepare-time target bonus")
+    #expect(iterator.next() == 11, "provider-selected residual correction")
+    #expect(provider.proposedTokens == [[0]], "the drafter actually proposed a draft token")
+    #expect(iterator.proposedCount == 1)
+    #expect(drafter.draftCallCount == 1)
+    #expect(iterator.passthroughReason == nil)
+    #expect(cache.offset == 4, "only the selected input is committed")
+}
+
+/// Anti-vacuity companion to the test above: a REAL (non-neutral) repetition penalty on the
+/// otherwise-identical request must still take sticky passthrough. Without this, the test above
+/// could pass merely because passthrough never fires for this fixture regardless of the penalty.
+@Test
+func testGreedyOnlyDrafterFallsBackToPassthroughWithRealRepetitionPenaltyViaSampledProvider()
+    throws
+{
+    let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8])
+    let drafter = MockStatefulGreedyDrafter()
+    let provider = ForcedSampledBlockDecisionProvider()
+
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 4, temperature: 1, repetitionPenalty: 1.1),
+        blockSize: 2,
+        sampledBlockDecisionProvider: provider)
+
+    #expect(
+        iterator.passthroughReason
+            == "Qwen MTP currently requires temperature == 0; generating without speculation")
+    #expect(drafter.prepareCallCount == 0, "passthrough never reaches drafter prefill")
+    #expect(drafter.draftCallCount == 0)
+}
+
+
 @Test
 func testSampledBlockDecisionFailureRollsBackAndFallsBackToTarget() throws {
     let main = MockMainModel(nextLogitTokens: [0, 0, 5, 7, 8, 9])

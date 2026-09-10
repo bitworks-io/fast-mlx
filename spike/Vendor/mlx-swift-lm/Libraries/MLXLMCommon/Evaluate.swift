@@ -169,9 +169,22 @@ public struct GenerateParameters: Sendable {
         }
     }
 
+    /// Whether `repetitionPenalty` requests no penalty. `RepetitionContext.process` implements the
+    /// MULTIPLICATIVE law `x < 0 ? x * penalty : x / penalty` — that law's neutral element is `1`,
+    /// not `0` (unlike the additive presence/frequency penalties, whose neutral element genuinely is
+    /// `0`). `nil` and `0` are also accepted so existing untouched call sites keep meaning "no
+    /// penalty"; `0` itself is otherwise unreachable from a real HTTP request (the serving boundary
+    /// rejects `repetition_penalty <= 0`), but `1.0` is the documented HF-style no-op value and is
+    /// live in production presets.
+    public static func repetitionPenaltyIsNeutral(_ repetitionPenalty: Float?) -> Bool {
+        repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1
+    }
+
     public func processor() -> LogitProcessor? {
         let repetitionContext: RepetitionContext?
-        if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
+        if let repetitionPenalty, !GenerateParameters.repetitionPenaltyIsNeutral(repetitionPenalty),
+            repetitionContextSize > 0
+        {
             repetitionContext = RepetitionContext(
                 repetitionPenalty: repetitionPenalty,
                 repetitionContextSize: repetitionContextSize

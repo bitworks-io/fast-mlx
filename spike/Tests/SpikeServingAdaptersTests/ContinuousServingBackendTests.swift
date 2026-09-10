@@ -98,6 +98,52 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// `repetitionPenalty` is a MULTIPLICATIVE penalty (the vendored `RepetitionContext`:
+    /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`. Both
+    /// HF-recommended presets for the deployed model send `repetition_penalty: 1.0` on every
+    /// request -- if this route treated that as "a penalty is active" it would reject every real
+    /// production request outright (an HTTP 400 a client actually observes). `1.1` is a REAL
+    /// penalty and must still be rejected, so this test discriminates rather than merely proving
+    /// "nothing here ever rejects."
+    func testContinuousBatchRouteAdmitsNeutralRepetitionPenaltyButRejectsReal() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        var neutral = request(text: "solo", maxTokens: 2)
+        neutral.repetitionPenalty = 1.0
+        let handle = try await backend.start(neutral)
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        _ = await handle.lease.cancel(.clientDisconnected)
+
+        var real = request(text: "solo", maxTokens: 2)
+        real.repetitionPenalty = 1.1
+        do {
+            _ = try await backend.start(real)
+            XCTFail("continuous route must still reject a real (non-neutral) repetition penalty")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequest(_, let param) = error else {
+                XCTFail("expected invalidRequest, got \(error)")
+                await backend.shutdown()
+                return
+            }
+            XCTAssertEqual(param, "presence_penalty")
+        }
+        await backend.shutdown()
+    }
+
     func testDynamicAdmissionTwoHeldRequestsExpireAsAtomicBatchNoSpec()
         async throws
     {

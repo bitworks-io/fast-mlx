@@ -36,8 +36,20 @@ public struct DecoderPenalties: Equatable, Sendable {
 
     /// True when no penalty is requested — the decoder then uses no logit processor (byte-identical
     /// to the prior behavior). A zero penalty counts as "none" (matches the vendored `processor()`).
+    /// `repetitionPenalty` also treats `1` as "none": the vendored `RepetitionContext` is a
+    /// MULTIPLICATIVE penalty (`x < 0 ? x * penalty : x / penalty`), so `1` -- not `0` -- is its
+    /// neutral element, and both HF-recommended presets for the deployed model send
+    /// `repetition_penalty: 1.0`.
     public var isEmpty: Bool {
-        (presencePenalty ?? 0) == 0 && (frequencyPenalty ?? 0) == 0 && (repetitionPenalty ?? 0) == 0
+        (presencePenalty ?? 0) == 0 && (frequencyPenalty ?? 0) == 0
+            && DecoderPenalties.repetitionPenaltyIsNeutral(repetitionPenalty)
+    }
+
+    /// Duplicated (rather than shared) against `GenerateParameters.repetitionPenaltyIsNeutral`:
+    /// this type stores `Double` while the vendored parameters use `Float`, and this file doesn't
+    /// otherwise import `MLXLMCommon`. Same invariant, same neutral set: `{nil, 0, 1}`.
+    public static func repetitionPenaltyIsNeutral(_ repetitionPenalty: Double?) -> Bool {
+        repetitionPenalty == nil || repetitionPenalty == 0 || repetitionPenalty == 1
     }
 }
 

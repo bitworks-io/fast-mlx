@@ -51,7 +51,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift",
-        "sha256": "67a88575c2cf0a0834eb1822333b6b8b7151030884b31a3aa8e43fa9eb81591b",
+        "sha256": "a9ba4756c7add426bd8b4ca8892920d03fa8e25f68c82ed3ebc29f8e36956583",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift",
@@ -73,8 +73,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # times (see the comment above the publicIndex assertion for the full history). Both call
 # sites below read this constant; there is no longer a second literal to drift.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 908,
-    "pathModeSha256": "19cbed1e282d7dea4fa14da066dcf02fe90e2729f9fb34d7d67bf7754b135666",
+    "pathCount": 909,
+    "pathModeSha256": "1ce73fdef780c0b1a467ff1938f3d0f34ce8d753024d8f4908134e217f7ada80",
 }
 
 

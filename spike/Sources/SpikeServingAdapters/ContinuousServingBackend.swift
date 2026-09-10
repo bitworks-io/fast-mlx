@@ -181,8 +181,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                     + "send temperature 0 for greedy decoding",
                 param: "temperature")
         }
+        // `repetitionPenalty` is checked for non-neutrality via the shared `DecoderPenalties`
+        // helper, not `(x ?? 0) != 0` like the additive presence/frequency knobs: the vendored
+        // `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x * penalty : x / penalty`),
+        // so its neutral element is `1`, not `0`. Both HF-recommended presets for the deployed
+        // model send `repetition_penalty: 1.0`, which must stay admissible here.
         if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
-            || (request.repetitionPenalty ?? 0) != 0
+            || !DecoderPenalties.repetitionPenaltyIsNeutral(request.repetitionPenalty)
         {
             throw OpenAIServingError.invalidRequest(
                 "presence/frequency/repetition penalties are not supported on the continuous-batch "

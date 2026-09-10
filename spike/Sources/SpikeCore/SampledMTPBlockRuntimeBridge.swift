@@ -165,6 +165,13 @@ public struct SampledMTPSamplingTruncation: Sendable, Equatable {
 /// so `nil` and `0` genuinely mean the same thing -- requiring strict `==
 /// nil` silently refused that real, intentionally-zero production request.
 ///
+/// `repetitionPenalty` is checked via `GenerateParameters.repetitionPenaltyIsNeutral`
+/// rather than the same `?? 0) == 0` pattern used for the additive presence/frequency
+/// knobs: the vendored `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x *
+/// penalty : x / penalty`), so its neutral element is `1`, not `0`. Both HF-recommended
+/// presets for the deployed model send `repetition_penalty: 1.0`; treating that as "a
+/// penalty is active" would wrongly disable sampled MTP for every real request using them.
+///
 /// This predicate alone does not decide whether a given provider supports a
 /// given request: every call site also cross-checks its own stored
 /// `SampledMTPSamplingTruncation` against
@@ -175,7 +182,7 @@ private func sharedSampledMTPSupportsPredicate(_ parameters: GenerateParameters)
         && parameters.topP > 0 && parameters.topP <= 1
         && parameters.topK >= 0
         && parameters.minP == 0
-        && (parameters.repetitionPenalty ?? 0) == 0
+        && GenerateParameters.repetitionPenaltyIsNeutral(parameters.repetitionPenalty)
         && (parameters.presencePenalty ?? 0) == 0
         && (parameters.frequencyPenalty ?? 0) == 0
 }

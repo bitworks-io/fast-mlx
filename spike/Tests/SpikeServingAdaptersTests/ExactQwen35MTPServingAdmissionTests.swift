@@ -124,7 +124,13 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
             .scalarFallback(.sampledGeneration))
     }
 
-    func testEveryNonzeroPenaltyFallsBackFromLogitProcessorPath() {
+    /// Renamed from `testEveryNonzeroPenaltyFallsBackFromLogitProcessorPath`: that name asserted a
+    /// false invariant once `repetitionPenalty`'s neutral element was corrected to `1` (the
+    /// MULTIPLICATIVE identity), since `1.0` is nonzero yet eligible. `1.1` is a genuinely active
+    /// (non-neutral) penalty and must still fall back -- see
+    /// `testNeutralRepetitionPenaltyRemainsEligible` below for the `1.0` case this name used to
+    /// wrongly imply was covered.
+    func testEveryRealPenaltyFallsBackFromLogitProcessorPath() {
         for penalties in [
             DecoderPenalties(presencePenalty: 0.1),
             DecoderPenalties(frequencyPenalty: -0.1),
@@ -134,6 +140,17 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
                 decide(penalties: penalties),
                 .scalarFallback(.logitProcessor))
         }
+    }
+
+    /// `repetitionPenalty == 1` is the HF-style MULTIPLICATIVE no-op (both HF-recommended presets
+    /// for the deployed model send exactly this value on every request). Fixing
+    /// `DecoderPenalties.isEmpty`'s neutral element moves such a request from `.scalarFallback`
+    /// onto the exact-Qwen MTP `.eligible` route -- a real production route switch that this test
+    /// pins directly, rather than relying only on the unit-level `DecoderPenalties.isEmpty` test.
+    func testNeutralRepetitionPenaltyRemainsEligible() {
+        XCTAssertEqual(
+            decide(penalties: DecoderPenalties(repetitionPenalty: 1)),
+            decide())
     }
 
     func testExplicitZeroPenaltiesRemainEligible() {

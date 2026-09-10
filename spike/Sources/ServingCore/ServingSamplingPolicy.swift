@@ -21,13 +21,24 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
     /// are ignored on that branch. A positive temperature yields `.sampled`,
     /// defaulting `topP` to `1.0` when absent. Non-finite or out-of-range
     /// values throw.
+    ///
+    /// `defaults`, when non-`nil`, supplies values for sampling fields the
+    /// request omitted — sourced from the model artifact rather than the
+    /// client. A field the request DID supply always wins over `defaults`.
+    /// `defaults` only ever fills an *absent* (`nil`) temperature: an
+    /// explicit `temperature: 0` still resolves to `.greedy` regardless of
+    /// `defaults`, preserving that value as the client's escape hatch to the
+    /// greedy speculative-decoding path. Passing `defaults: nil` reproduces
+    /// today's behavior exactly.
     public static func resolve(
         temperature: Double?,
         topP: Double?,
         topK: Int? = nil,
         minP: Double? = nil,
-        seed: Int64?
+        seed: Int64?,
+        defaults: ServingSamplingDefaults? = nil
     ) throws -> ServingSamplingPolicy {
+        let temperature = temperature ?? defaults?.temperature
         guard let temperature, temperature != 0 else {
             return .greedy
         }
@@ -39,7 +50,7 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
             throw ServingSamplingPolicyError.temperatureOutOfRange(temperature)
         }
 
-        let resolvedTopP = topP ?? 1.0
+        let resolvedTopP = topP ?? defaults?.topP ?? 1.0
         guard resolvedTopP.isFinite else {
             throw ServingSamplingPolicyError.nonFiniteTopP
         }
@@ -76,20 +87,23 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
             throw ServingSamplingPolicyError.topPTooSmallToTruncate(resolvedTopP)
         }
 
-        if let topK, topK <= 0 {
-            throw ServingSamplingPolicyError.topKOutOfRange(topK)
+        let resolvedTopK = topK ?? defaults?.topK
+        if let resolvedTopK, resolvedTopK <= 0 {
+            throw ServingSamplingPolicyError.topKOutOfRange(resolvedTopK)
         }
 
-        if let minP {
-            guard minP.isFinite else {
+        let resolvedMinP = minP ?? defaults?.minP
+        if let resolvedMinP {
+            guard resolvedMinP.isFinite else {
                 throw ServingSamplingPolicyError.nonFiniteMinP
             }
-            guard minP >= 0, minP <= 1 else {
-                throw ServingSamplingPolicyError.minPOutOfRange(minP)
+            guard resolvedMinP >= 0, resolvedMinP <= 1 else {
+                throw ServingSamplingPolicyError.minPOutOfRange(resolvedMinP)
             }
         }
 
-        return .sampled(temperature: temperature, topP: resolvedTopP, topK: topK, minP: minP, seed: seed)
+        return .sampled(
+            temperature: temperature, topP: resolvedTopP, topK: resolvedTopK, minP: resolvedMinP, seed: seed)
     }
 
     /// Convenience resolution from a decoded request, carrying `top_p`, `top_k`,
@@ -117,4 +131,24 @@ public enum ServingSamplingPolicyError: Error, Equatable, Sendable {
     case topKOutOfRange(Int)
     case nonFiniteMinP
     case minPOutOfRange(Double)
+}
+
+/// Fallback sampling values applied by `ServingSamplingPolicy.resolve` when a
+/// request omits the corresponding field. Sourced from the model artifact
+/// (deferred with live decode), not from the client. A field the request
+/// explicitly supplies always overrides the matching default; `temperature`
+/// only fills an *absent* value and never overrides an explicit `0`, which
+/// stays the client's escape hatch to the greedy speculative-decoding path.
+public struct ServingSamplingDefaults: Equatable, Sendable {
+    public var temperature: Double
+    public var topP: Double
+    public var topK: Int
+    public var minP: Double
+
+    public init(temperature: Double, topP: Double, topK: Int, minP: Double) {
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+    }
 }
