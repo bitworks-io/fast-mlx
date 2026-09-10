@@ -73,8 +73,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # times (see the comment above the publicIndex assertion for the full history). Both call
 # sites below read this constant; there is no longer a second literal to drift.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 912,
-    "pathModeSha256": "82d9b5d7856271dc57a00fca1b2cd8ff947bb6911f73fb73c9b7243cd016b978",
+    "pathCount": 913,
+    "pathModeSha256": "824564108cb3b6749503b733969edc862c117ed78ca276bcf7d04f1cf5b4aa12",
 }
 
 

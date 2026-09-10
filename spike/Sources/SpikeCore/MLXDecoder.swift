@@ -46,6 +46,16 @@ public struct MLXDecoder: Decoder {
     /// multi-chunk prefill without multi-thousand-token fixtures.
     private let prefillChunkSize: Int
 
+    /// `setSampling` genuinely swaps in a `TopPSampler` honoring the requested distribution (see
+    /// its doc comment) — this is a real opt-in, not a stub. See `Decoder.supportsSampling`'s doc
+    /// comment for why the default must stay `false` and only conformers that verify this may
+    /// override it.
+    public var supportsSampling: Bool { true }
+    /// `setPenalties` genuinely builds the vendored `PenaltyProcessor` via
+    /// `GenerateParameters.processor()` and applies it before token selection (see its doc
+    /// comment) — a real opt-in, not a stub.
+    public var supportsPenalties: Bool { true }
+
     public init(
         model: any LanguageModel, cache: [KVCache],
         prefillChunkSize: Int = MLXDecoder.defaultPrefillChunkSize

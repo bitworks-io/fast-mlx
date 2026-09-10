@@ -66,6 +66,19 @@ public struct MTPSpeculativeDecoder: Decoder, SpeculativeTelemetryProviding {
     private var sampling: DecoderSampling = .greedy
     private var penalties: DecoderPenalties = .none
 
+    /// `setSampling` is stashed and consumed by `buildParameters()` (below), which feeds the
+    /// iterator's `GenerateParameters` and — when `sampledBlockDecisionsEnabled` — the block-
+    /// decision provider gate at `prefill`. A `.sampled` request here is genuinely honored (per
+    /// the header doc comment's sampler-divergence note: "merely unaccelerated, not incorrect" —
+    /// that still counts as supported, per `Decoder.supportsSampling`'s doc comment). Real
+    /// opt-in, not a stub.
+    public var supportsSampling: Bool { true }
+    /// `setPenalties` is stashed and consumed by `buildParameters()`, which threads
+    /// repetition/presence/frequency penalties into the iterator's `GenerateParameters` exactly
+    /// like `MLXDecoder.setPenalties` threads them into `GenerateParameters.processor()`. Real
+    /// opt-in, not a stub.
+    public var supportsPenalties: Bool { true }
+
     /// Cumulative telemetry across every iterator this decoder has owned (i.e. survives `reset()`
     /// — see its doc comment). `passthroughReason` only ever moves from `nil` to a value; it is
     /// never cleared once observed, mirroring the iterator's own "sticky" semantics.

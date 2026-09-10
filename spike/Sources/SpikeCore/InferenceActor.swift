@@ -68,19 +68,41 @@ public protocol Decoder {
     mutating func reset()
     /// Configure token selection for the NEXT generation. The default is a no-op, so a
     /// decoder that only supports greedy decode (e.g. the compiled path) stays greedy and
-    /// existing conformers need no change. A decoder that ignores a `.sampled` request must
-    /// never be reached by one — the serving layer rejects sampling on unsupported routes
-    /// rather than silently downgrading to greedy.
+    /// existing conformers need no change. `InferenceActor.generateBounded` is the guard that
+    /// actually enforces this: it refuses a `.sampled` request outright (throwing
+    /// `InferenceActorError.samplingUnsupportedByDecoder`) when `supportsSampling` is `false`,
+    /// rather than calling this no-op and silently downgrading to greedy.
     mutating func setSampling(_ sampling: DecoderSampling)
     /// Configure logit penalties for the NEXT generation (applied before token selection). Default
-    /// no-op, so decoders that don't support penalties are unchanged; the serving layer only routes
-    /// penalized requests to a decoder that honors them.
+    /// no-op, so decoders that don't support penalties are unchanged. `InferenceActor.generateBounded`
+    /// is the guard that enforces this: it refuses a request carrying non-empty `DecoderPenalties`
+    /// (throwing `InferenceActorError.penaltiesUnsupportedByDecoder`) when `supportsPenalties` is
+    /// `false`, rather than calling this no-op and silently ignoring the penalty.
     mutating func setPenalties(_ penalties: DecoderPenalties)
+    /// Whether `setSampling` on this decoder actually changes token selection — i.e. a `.sampled`
+    /// request honors the REQUESTED DISTRIBUTION (temperature/top-p/top-k/min-p), not merely that
+    /// the route is fast. A decoder may support sampling while being "merely unaccelerated, not
+    /// incorrect" for it (see `MTPSpeculativeDecoder`'s header doc comment on its sampler
+    /// divergence) and still report `true` here — this is a correctness capability, not a
+    /// performance one. Defaults to `false`: an unlisted conformer is assumed NOT to honor
+    /// sampling, so a `.sampled` request against it is refused rather than silently downgraded to
+    /// greedy (the defect `InferenceActor.generateBounded`'s guard exists to close).
+    var supportsSampling: Bool { get }
+    /// Whether `setPenalties` on this decoder actually applies the configured logit penalties
+    /// before token selection. Defaults to `false` for the same reason as `supportsSampling`: an
+    /// unlisted conformer is assumed NOT to honor penalties, so a request carrying non-empty
+    /// `DecoderPenalties` against it is refused rather than silently ignored.
+    var supportsPenalties: Bool { get }
 }
 
 extension Decoder {
     public mutating func setSampling(_ sampling: DecoderSampling) {}
     public mutating func setPenalties(_ penalties: DecoderPenalties) {}
+    // Permissive-default trap: do NOT flip these to `true`. `true` here would silently readmit
+    // the exact fail-open defect this capability pair exists to close — see the protocol's doc
+    // comments and `InferenceActor.generateBounded`'s refusal guard.
+    public var supportsSampling: Bool { false }
+    public var supportsPenalties: Bool { false }
 }
 
 /// Point-in-time speculative-decoding counters. `Sendable`/`Equatable` so a snapshot can cross
@@ -167,6 +189,14 @@ public enum InferenceActorError: Error, Equatable, Sendable {
     case invalidEndOfSequence
     case invalidMaximumTokens
     case invalidTokenID(Int)
+    /// A `.sampled` request was routed to a decoder whose `supportsSampling` is `false`. Refused
+    /// here — before any state mutation — rather than silently decoding greedy while reporting
+    /// sampled (the defect this guard closes).
+    case samplingUnsupportedByDecoder
+    /// A request carrying non-empty `DecoderPenalties` (per `DecoderPenalties.isEmpty`) was routed
+    /// to a decoder whose `supportsPenalties` is `false`. Refused here — before any state
+    /// mutation — rather than silently ignoring the penalty.
+    case penaltiesUnsupportedByDecoder
 }
 
 public enum InferenceTokenDisposition: Equatable, Sendable {
@@ -317,6 +347,20 @@ public actor InferenceActor {
         }
         guard !boundedGenerationActive else {
             throw InferenceActorError.generationAlreadyActive
+        }
+        // Both refusal guards live here — BEFORE `boundedGenerationActive = true` and before any
+        // other decoder-state mutation below. `ScalarServingBackend` holds one `InferenceActor` for
+        // the process lifetime, so throwing after that flag flips (or after `decoder.reset()` /
+        // `setSampling` / `setPenalties`, whose `defer` clearing `boundedGenerationActive` is
+        // registered AFTER them, not before) would leave the flag stuck `true` forever and brick
+        // every subsequent request on this actor with `.generationAlreadyActive` — strictly worse
+        // than the silent-downgrade defect this guard exists to close. See
+        // `docs/task-inbox/2026-09-10-compiled-fp16-route-silently-downgrades-sampled-to-greedy-DEFECT.md`.
+        if case .sampled = sampling, !decoder.supportsSampling {
+            throw InferenceActorError.samplingUnsupportedByDecoder
+        }
+        guard penalties.isEmpty || decoder.supportsPenalties else {
+            throw InferenceActorError.penaltiesUnsupportedByDecoder
         }
 
         boundedGenerationActive = true
