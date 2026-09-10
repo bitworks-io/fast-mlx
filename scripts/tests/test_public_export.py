@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -89,6 +90,148 @@ def public_index_seal(entries: dict[str, str]) -> dict[str, object]:
         "pathCount": len(entries),
         "pathModeSha256": digest.hexdigest(),
     }
+
+
+
+
+# --- Projected-reference symbol-leak gate -----------------------------------------------------
+#
+# Wave 1 (MTPSpeculativeTokenIterator.swift) and Wave 2 (MLXScalarServing.swift and both
+# fastmlx-harness CLIs) shipped a public projection that did not compile, in two different
+# shapes with the same root cause: projected code referenced a symbol that the projected tree
+# does not declare -- once because a sanitized override dropped a method the development twin
+# had, once because a wholly-excluded development file declared the symbol at all. The only
+# gate that would have caught either is the ~9-minute full `swift build` of the exported tree
+# (scripts/check_public_projection_builds.py). This is the cheap, seconds-scale substitute that
+# runs on every push in the public-boundary CI job: it never invokes the Swift toolchain, only
+# text scanning over the same export this module already exercises elsewhere.
+
+SWIFT_DECLARATION_MODIFIER = (
+    r"(?:final|mutating|static|class|override|required|convenience|nonisolated|"
+    r"dynamic|indirect|unowned|lazy|weak|distributed)"
+)
+
+# public/open declarations only, optionally preceded by same-line attributes and followed by
+# any number of secondary modifiers (final, mutating, static, ...) before the declaration
+# keyword. var/let/extension are deliberately excluded -- the task spec calls them "too noisy
+# for a heuristic gate" and neither historical wave involved one.
+SWIFT_PUBLIC_DECLARATION_PATTERN = re.compile(
+    r"(?m)^[ \t]*(?:@\w+(?:\([^)]*\))?[ \t]+)*"
+    r"(?:public|open)\b[ \t]+"
+    rf"(?:{SWIFT_DECLARATION_MODIFIER}\b[ \t]+)*"
+    r"(class|struct|enum|protocol|actor|func|typealias)\b[ \t]+"
+    r"([A-Za-z_][A-Za-zA-Z0-9_]*)"
+)
+
+SWIFT_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-zA-Z0-9_]*")
+
+
+def strip_swift_comments_and_strings(text: str) -> str:
+    """Blank out // and /* */ comments (including /// doc comments) and string literal
+    content, replacing every removed character with a space so line and column positions in
+    the surviving text are unchanged. Block comments nest (Swift allows this). String
+    interpolation (\\( ... )) is treated as live code, since it is: whatever identifiers it
+    references are compiled, not quoted.
+
+    This exists because Wave 2's doc comments named the missing symbols at
+    MLXScalarServing.swift:558 and :580 without breaking compilation -- a reference-detection
+    pass that did not strip comments first would have flagged those lines and been wrong for
+    the reason the whole gate exists to get right.
+    """
+    out: list = []
+    i = 0
+    n = len(text)
+    block_depth = 0
+    # Stack of [kind, interpolation_paren_depth]; kind is "single" or "triple". A positive
+    # interpolation depth means we are inside \(...) and characters are live code again.
+    string_stack: list = []
+    while i < n:
+        two = text[i : i + 2]
+        three = text[i : i + 3]
+
+        if block_depth > 0:
+            if two == "/*":
+                block_depth += 1
+                out.append("  ")
+                i += 2
+                continue
+            if two == "*/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
+                continue
+            ch = text[i]
+            out.append(ch if ch == "\n" else " ")
+            i += 1
+            continue
+
+        if string_stack:
+            kind, interp_depth = string_stack[-1]
+            if interp_depth > 0:
+                ch = text[i]
+                if ch == "(":
+                    string_stack[-1][1] = interp_depth + 1
+                elif ch == ")":
+                    string_stack[-1][1] = interp_depth - 1
+                out.append(ch)
+                i += 1
+                continue
+            if kind == "triple" and three == '"""':
+                string_stack.pop()
+                out.append("   ")
+                i += 3
+                continue
+            if kind == "single" and text[i] == '"':
+                string_stack.pop()
+                out.append(" ")
+                i += 1
+                continue
+            if text[i] == "\\" and i + 1 < n:
+                if text[i + 1] == "(":
+                    string_stack[-1][1] = 1
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("  ")
+                i += 2
+                continue
+            ch = text[i]
+            out.append(ch if ch == "\n" else " ")
+            i += 1
+            continue
+
+        # Live code.
+        if two == "//":
+            newline = text.find("\n", i)
+            if newline == -1:
+                out.append(" " * (n - i))
+                i = n
+            else:
+                out.append(" " * (newline - i))
+                i = newline
+            continue
+        if two == "/*":
+            block_depth = 1
+            out.append("  ")
+            i += 2
+            continue
+        if three == '"""':
+            string_stack.append(["triple", 0])
+            out.append("   ")
+            i += 3
+            continue
+        if text[i] == '"':
+            string_stack.append(["single", 0])
+            out.append(" ")
+            i += 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def swift_public_top_level_declaration_names(stripped_text: str) -> set:
+    return {match.group(2) for match in SWIFT_PUBLIC_DECLARATION_PATTERN.finditer(stripped_text)}
 
 
 class PublicExportTests(unittest.TestCase):
@@ -757,6 +900,81 @@ class PublicExportTests(unittest.TestCase):
                     metadata["sha256"],
                 )
             self.assertFalse((reexport / "public/sanitized-projection").exists())
+
+    def test_projected_code_does_not_reference_development_only_declarations(self) -> None:
+        """Fail fast, in seconds, on the shape both Wave 1 and Wave 2 shared: projected Swift
+        source referencing a public top-level symbol the projected tree does not itself declare.
+
+        This does not run the Swift toolchain -- it is the cheap substitute for the ~9-minute
+        full build (scripts/check_public_projection_builds.py) that public-boundary CI cannot
+        afford on every push. See the module-level comment above
+        strip_swift_comments_and_strings for why comments and strings are stripped first, and
+        the anti-vacuity mutation coverage recorded in docs/task-inbox/ for proof this gate
+        actually goes red on both historical waves.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "public"
+            output.mkdir()
+            export_public_repository.export(
+                REPOSITORY_ROOT,
+                output,
+                allow_development_manifest=(
+                    REPOSITORY_ROOT / "public/public-repository-public.json"
+                ).is_file(),
+            )
+
+            exported_swift_files = sorted(output.rglob("*.swift"))
+            self.assertTrue(
+                exported_swift_files,
+                "export produced no .swift files -- this gate would pass vacuously",
+            )
+
+            exported_stripped_by_path: dict[Path, str] = {}
+            declared_in_projection: set[str] = set()
+            for path in exported_swift_files:
+                stripped = strip_swift_comments_and_strings(
+                    path.read_text(encoding="utf-8", errors="replace")
+                )
+                exported_stripped_by_path[path] = stripped
+                declared_in_projection |= swift_public_top_level_declaration_names(stripped)
+
+            tracked = export_public_repository.tracked_entries(REPOSITORY_ROOT)
+            development_swift_paths = sorted(
+                REPOSITORY_ROOT / relative
+                for relative in tracked
+                if relative.startswith("spike/") and relative.endswith(".swift")
+            )
+            self.assertTrue(
+                development_swift_paths,
+                "no tracked spike/ .swift files found -- this gate would pass vacuously",
+            )
+
+            declared_in_development_only: set[str] = set()
+            for path in development_swift_paths:
+                stripped = strip_swift_comments_and_strings(
+                    path.read_text(encoding="utf-8", errors="replace")
+                )
+                declared_in_development_only |= (
+                    swift_public_top_level_declaration_names(stripped) - declared_in_projection
+                )
+
+            offenses: list[str] = []
+            for path, stripped in exported_stripped_by_path.items():
+                relative = path.relative_to(output)
+                for lineno, line in enumerate(stripped.splitlines(), start=1):
+                    for match in SWIFT_IDENTIFIER_PATTERN.finditer(line):
+                        name = match.group(0)
+                        if name in declared_in_development_only:
+                            offenses.append(f"{name} referenced at {relative}:{lineno}")
+
+            self.assertEqual(
+                offenses,
+                [],
+                "projected code references a symbol the projected tree does not declare "
+                "(development-only declaration leaking through a sanitized override or a "
+                "wholly-excluded development file); repair the projected reference or the "
+                "sanitized twin, do not silence this gate:\n" + "\n".join(sorted(offenses)),
+            )
 
     def test_mtp_processor_pin_does_not_reintroduce_the_fictional_copy(self) -> None:
         """The MTP logit-processor pin must not describe a copy that does not exist.
