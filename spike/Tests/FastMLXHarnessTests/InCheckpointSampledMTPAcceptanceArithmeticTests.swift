@@ -714,6 +714,221 @@ final class InCheckpointSampledMTPAcceptanceArithmeticTests: XCTestCase {
         // `decide()` call -- count only (a scalar), never the timing values themselves.
         XCTAssertEqual(provider.decideDurationsSeconds.count, 2)
     }
+
+    // MARK: - inCheckpointSampledMTPCounterfactualTempering (temperature counterfactual replay)
+    //
+    // Contract: docs/task-inbox/2026-09-09-sampled-mtp-temperature-counterfactual-PREDECLARATION.md.
+    // These drive the pure helper directly against small hand-derived fixtures -- no model weights,
+    // no MLXArray, no network.
+
+    func testTemperingAtSingleTokenSupportIsExactlyTemperatureInvariant() throws {
+        // Reuses the exact top_p nucleus fixture from
+        // `testTruncatedProbabilitiesTopPAloneKeepsHandComputedNucleus` above, but tightened to
+        // `topP=0.01` (keepThreshold = 1 - 0.01 = 0.99): every ascending-cumulative entry before the
+        // fixture's own argmax (index 4, probability 0.40) has cumulative <= 0.99 (the largest
+        // pre-argmax cumulative is idx2's 0.60), so only index 4 -- the row's own argmax, kept
+        // unconditionally by the `min_tokens_to_keep=1` exception documented on
+        // `independentTruncatedProbabilities` -- survives. SUPPORT SIZE = 1.
+        //
+        // Control C1 (predeclaration): temperature is applied AFTER the filter chain, so at a
+        // single-token surviving support the law is a point mass at every temperature -- `sigma_T`
+        // must equal `sigma_1` EXACTLY (`==`, never a tolerance) for all four pinned temperatures.
+        let probabilities: [Double] = [0.08, 0.01, 0.24, 0.03, 0.40, 0.02, 0.05, 0.07, 0.06, 0.04]
+        let logits = probabilities.map { Foundation.log($0) }
+        // Arbitrary drafter proposal (sums to 1, no special relationship to the target row) --
+        // C1 must hold regardless of what `q` is, since it is a property of `p` alone collapsing to
+        // a point mass.
+        let draft: [Double] = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+
+        // Guard against the fixture silently drifting to a different support size later: assert the
+        // support size in-test, not just in the comment above.
+        let p1 = try independentTruncatedProbabilities(
+            logits: logits, temperature: 1, topP: 0.01, topK: 0, minP: 0)
+        let supportSize = p1.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        XCTAssertEqual(supportSize, 1, "fixture must have single-token support for C1 to be tested")
+
+        let sample = try inCheckpointSampledMTPCounterfactualTempering(
+            targetRow: logits, draft: draft, targetTopP: 0.01, targetTopK: 0, targetMinP: 0)
+
+        XCTAssertEqual(
+            sample.sigmaByTemperature.count, inCheckpointSampledMTPCounterfactualTemperatures.count)
+        let sigma1 = sample.sigmaByTemperature[0]
+        for (index, temperature) in inCheckpointSampledMTPCounterfactualTemperatures.enumerated() {
+            XCTAssertEqual(
+                sample.sigmaByTemperature[index], sigma1,
+                "T=\(temperature): sigma_T must equal sigma_1 EXACTLY at single-token support "
+                    + "(observed sigma_T=\(sample.sigmaByTemperature[index]) sigma_1=\(sigma1))")
+        }
+        // Anti-vacuity: the point mass is on index 4 (probability 0.40), and `draft[4] = 0.1`, so
+        // sigma_1 = min(1.0, 0.1) = 0.1 exactly -- not a degenerate 0.0 or 1.0 that could hide a
+        // bug returning an all-zero or all-one vector.
+        XCTAssertEqual(sigma1, 0.1, accuracy: 1e-9)
+    }
+
+    func testTemperingAtMultiTokenSupportSharpensTowardArgmaxAsTemperatureFalls() throws {
+        // Two-token vocabulary, NO truncation (topP=1, topK=0, minP=0) -- support size is trivially
+        // the full vocabulary width (2), asserted below so a later edit cannot silently collapse it
+        // to 1 and make this test inert.
+        //
+        // logit_i = ln(p_i) (softmax-invariant-to-shift trick used throughout this file's other
+        // tests): p_1 = softmax(logits) = [0.6, 0.4] exactly at T=1.
+        //
+        // Drafter q = [0.9, 0.1] already favors the target's argmax (index 0) more strongly than the
+        // target itself does at T=1: min(0.6,0.9)=0.6 (bounded by p), min(0.4,0.1)=0.1 (bounded by
+        // q) -> sigma_1 = 0.6 + 0.1 = 0.7 exactly.
+        //
+        // At T=0.7, tempering raises each probability to the power 1/0.7 ~= 1.4285714 before
+        // renormalizing (temperature enters AFTER the filter chain, at the plain softmax step) --
+        // this SHARPENS the law toward its own argmax (index 0): hand-computed (natural logs,
+        // ln(0.6)=-0.5108256, ln(0.4)=-0.9162907; scaled by 1/0.7 -> exponents -0.7297509 and
+        // -1.3089868; exp(...) ~= 0.482029 and 0.270094; renormalized) p_0.7 ~= [0.6409, 0.3591].
+        // Because p_0.7[0]=0.6409 is STILL below q[0]=0.9, the overlap at index 0 is still bounded
+        // by p and INCREASES from 0.6 to ~0.6409 (the argmax gained mass); p_0.7[1]=0.3591 is still
+        // above q[1]=0.1, so the overlap at index 1 stays bounded by q at exactly 0.1, unchanged.
+        // Net: sigma_0.7 ~= 0.6409 + 0.1 = 0.7409, STRICTLY GREATER than sigma_1 = 0.7 -- sharpening
+        // toward an argmax the drafter already favors more strongly can only raise or hold the
+        // overlap, never lower it, and here it strictly raises it. This is the discriminating
+        // direction the predeclaration's "for T < 1 the target sharpens toward its argmax" describes.
+        let probabilities: [Double] = [0.6, 0.4]
+        let logits = probabilities.map { Foundation.log($0) }
+        let draft: [Double] = [0.9, 0.1]
+
+        let p1 = try independentTruncatedProbabilities(
+            logits: logits, temperature: 1, topP: 1, topK: 0, minP: 0)
+        let supportSize = p1.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        XCTAssertEqual(supportSize, 2, "fixture must have multi-token support for this test to be meaningful")
+
+        let sample = try inCheckpointSampledMTPCounterfactualTempering(
+            targetRow: logits, draft: draft, targetTopP: 1, targetTopK: 0, targetMinP: 0)
+
+        let sigma1 = sample.sigmaByTemperature[0]
+        let sigma07 = sample.sigmaByTemperature[3]
+        XCTAssertEqual(sigma1, 0.7, accuracy: 1e-9)
+        XCTAssertEqual(sigma07, 0.7409, accuracy: 2e-3)  // hand-derived above; transcendental, not exact
+        XCTAssertNotEqual(sigma07, sigma1)
+        XCTAssertGreaterThan(
+            sigma07, sigma1,
+            "sharpening toward an argmax the drafter already favors more strongly must RAISE the "
+                + "overlap, not lower it -- see the hand-derived direction argument above")
+    }
+
+    func testTemperingSigmaArgmaxPlusSigmaRestReconstructsSigmaOne() throws {
+        // `sigmaRest` is DEFINED as `sigma_1 - sigmaArgmax` by the implementation, so
+        // `sigmaArgmax + sigmaRest` reconstructs `sigma_1` up to floating-point rounding in the
+        // subtract-then-add round trip -- NOT bit-exact in general (Sterbenz's lemma, which would
+        // guarantee an exact subtraction, does not apply here since sigmaArgmax and sigma_1 are not
+        // guaranteed to be within a factor of 2 of each other), but the residual error is bounded by
+        // machine epsilon relative to O(1)-magnitude values, so `accuracy: 1e-12` is the tolerance
+        // (vastly tighter than any of this file's other floating-point comparisons, which use 1e-6
+        // to 1e-9 for genuinely lossy Float32/transcendental paths).
+        let probabilities: [Double] = [0.6, 0.4]
+        let logits = probabilities.map { Foundation.log($0) }
+        let draft: [Double] = [0.9, 0.1]
+
+        let sample = try inCheckpointSampledMTPCounterfactualTempering(
+            targetRow: logits, draft: draft, targetTopP: 1, targetTopK: 0, targetMinP: 0)
+
+        XCTAssertEqual(sample.sigmaArgmax + sample.sigmaRest, sample.sigmaByTemperature[0], accuracy: 1e-12)
+    }
+
+    func testTemperingOrderSwapIsDetectedWhenItChangesTheSurvivingSupport() throws {
+        // Control C1's proof obligation (see the CRITICAL note above
+        // `inCheckpointSampledMTPCounterfactualTempering`) is that `independentTruncatedProbabilities`
+        // filters BEFORE it tempers -- filtering (steps 2-4) reads `masked = logits - logSumExp`, the
+        // UNTEMPERED log-probabilities, so the surviving support set never depends on `temperature` at
+        // all. `testTemperingAtSingleTokenSupportIsExactlyTemperatureInvariant` above cannot detect a
+        // filter/temper ORDER swap: at a single-token support a point mass is a point mass under
+        // either ordering, and the existing multi-token fixture
+        // (`testTruncatedProbabilitiesTopPAloneKeepsHandComputedNucleus`'s support) happens to survive
+        // identically either way -- a mutation that tempers BEFORE filtering was verified by hand to
+        // leave every existing assertion in this file green (`swift test` reported
+        // `Executed 41 tests, with 0 failures` with that mutation applied, before this test existed).
+        // This fixture is chosen specifically so tempering CHANGES the surviving nucleus under the
+        // swapped order, which is the only way an ordering bug becomes observable.
+        //
+        // Fixture: target probabilities at T=1 `p = [0.6, 0.25, 0.1, 0.05]` (already summing to 1, so
+        // `logit_i = ln(p_i)` reproduces exactly these `p_i` via the softmax-shift-invariance trick
+        // used throughout this file), `topP = 0.9` (`keepThreshold = 1 - topP = 0.1`), `topK = 0`,
+        // `minP = 0`. Drafter `q = [0.25, 0.25, 0.25, 0.25]` (uniform; C1's shape does not depend on
+        // what `q` is, only on the target's own support).
+        //
+        // Hand-derived T=1 nucleus (ascending-cumulative walk, same algorithm as the top_p tests
+        // above): ascending order is idx3(0.05), idx2(0.1), idx1(0.25), idx0(0.6).
+        //   idx3: cumulative=0.05          <=0.1 -> masked
+        //   idx2: cumulative=0.05+0.10=0.15 >0.1 -> KEPT (first entry to survive)
+        //   idx1: cumulative=0.15+0.25=0.40 >0.1 -> KEPT
+        //   idx0: cumulative=0.40+0.60=1.00 >0.1 -> KEPT
+        // Kept set = {0, 1, 2}, SUPPORT SIZE = 3 -- index 3 alone is masked.
+        //
+        // The T=0.7 correct-order support and the T=0.7 sigma values below were computed
+        // INDEPENDENTLY with a standalone Python script that reimplements
+        // `independentTruncatedProbabilities`'s five steps line-for-line from its doc comment (both
+        // the CORRECT filter-then-temper order and the swapped temper-then-filter mutation), never by
+        // calling the function under test to produce its own expectation:
+        //   - correct order (filter on untempered log-probs, temper only the final softmax): the
+        //     ascending-cumulative walk above is IDENTICAL at every temperature (it never reads
+        //     `temperature`), so the T=0.7 support is the SAME {0, 1, 2}, size 3. Tempering only
+        //     reweights those three survivors: p_0.7 ~= [0.73332906, 0.20996165, 0.05670930, 0], and
+        //     sigma_0.7 = sum_i min(p_0.7[i], q[i]) = 0.25 + 0.20996165 + 0.05670930
+        //     = 0.5166709445750258 (q=0.25 caps index 0's contribution; the other two survivors are
+        //     each below 0.25 so they are each capped by p_0.7 instead).
+        //   - swapped order (temper the log-probs BEFORE the ascending-cumulative walk): tempering
+        //     first SHARPENS the row toward its own argmax, so the walk now accumulates
+        //     `exp(log(p_i)/T)` (no longer a proper probability distribution) against the SAME
+        //     `keepThreshold = 0.1`; index 2's reweighted mass now falls below that threshold, so the
+        //     nucleus SHRINKS to {0, 1}, size 2 -- support is NOT temperature-invariant under the
+        //     swapped order. Renormalizing over just {0, 1} gives
+        //     p_0.7_swapped ~= [0.77741575, 0.22258425, 0, 0], and
+        //     sigma_0.7_swapped = 0.25 + 0.22258424509272245 = 0.47258424509272245.
+        let probabilities: [Double] = [0.6, 0.25, 0.1, 0.05]
+        let logits = probabilities.map { Foundation.log($0) }
+        let draft: [Double] = [0.25, 0.25, 0.25, 0.25]
+
+        // Anti-vacuity precondition (predeclaration requirement 1): the T=1 support must be exactly
+        // the hand-derived 3 tokens above. If this fails, the FIXTURE has drifted (e.g. the
+        // probabilities or topP changed) -- fix the fixture and its hand-derived comment above, do
+        // NOT loosen this assertion; a fixture whose T=1 support size is not exactly 3 no longer has
+        // any known relationship to the T=0.7 numbers hand-derived (and independently verified) above,
+        // and the rest of this test would silently stop testing anything.
+        let p1 = try independentTruncatedProbabilities(
+            logits: logits, temperature: 1, topP: 0.9, topK: 0, minP: 0)
+        let support1 = p1.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        XCTAssertEqual(
+            support1, 3,
+            "fixture's T=1 nucleus must be exactly the hand-derived {0,1,2} (support size 3) -- fix "
+                + "the fixture (and its hand-derived comment above) rather than loosening this "
+                + "assertion; the T=0.7 expected numbers below are only valid for THIS support "
+                + "(observed support size \(support1))")
+
+        // Predeclaration requirement 3: support is temperature-invariant under the CORRECT order --
+        // computed directly (not through `inCheckpointSampledMTPCounterfactualTempering`, whose
+        // `sigmaByTemperature` does not expose support size) so this assertion is about
+        // `independentTruncatedProbabilities` itself, the function C1 is a check on.
+        let p07 = try independentTruncatedProbabilities(
+            logits: logits, temperature: 0.7, topP: 0.9, topK: 0, minP: 0)
+        let support07 = p07.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
+        XCTAssertEqual(
+            support07, 3,
+            "support size must stay exactly {0,1,2} (size 3) at T=0.7 under the correct filter-"
+                + "before-temper order -- a mismatch here (e.g. 2) means temperature is leaking into "
+                + "the top_p filter (observed support size \(support07))")
+
+        let sample = try inCheckpointSampledMTPCounterfactualTempering(
+            targetRow: logits, draft: draft, targetTopP: 0.9, targetTopK: 0, targetMinP: 0)
+        let sigma07 = sample.sigmaByTemperature[3]  // index 3 == T=0.7, see the ordered temperature list
+
+        // Predeclaration requirement 2: THE discriminating assertion. Under the correct order this is
+        // 0.5166709445750258; under the swapped order it collapses to 0.47258424509272245 (see the
+        // hand-derived/independently-verified arithmetic above) -- a mismatch landing near the latter
+        // means the filter/temper ORDER inside `independentTruncatedProbabilities` has been swapped.
+        XCTAssertEqual(
+            sigma07, 0.5166709445750258, accuracy: 1e-9,
+            "sigma_0.7 must equal the correct-order value 0.5166709445750258 -- a value near "
+                + "0.47258424509272245 instead means the filter/temper ORDER inside "
+                + "independentTruncatedProbabilities has been swapped (temperature applied before the "
+                + "top_p filter instead of after; see the CRITICAL note above "
+                + "inCheckpointSampledMTPCounterfactualTempering) (observed \(sigma07))")
+    }
 }
 
 // MARK: - Fix 6 test doubles

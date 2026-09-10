@@ -706,6 +706,82 @@ func inCheckpointSampledMTPSigmaMinPQ(target p: [Double], draft q: [Double]) -> 
     return total
 }
 
+// MARK: - Temperature counterfactual replay
+//
+// Contract: `docs/task-inbox/2026-09-09-sampled-mtp-temperature-counterfactual-PREDECLARATION.md`.
+// A REPLAY over already-computed logits -- zero incremental GPU work, no gate change, no new model
+// run. `supports()` only ever admits `temperature == 1` (`SampledMTPBlockRuntimeBridge.swift:174`),
+// so every live run this file drives is itself always at `targetTemperature == 1`; the temperatures
+// below are a fixed, pinned counterfactual list, entirely independent of that run parameter.
+
+/// Ordered, pinned temperature list this counterfactual replay measures. Order matters:
+/// `InCheckpointSampledMTPStepTemperingSample.sigmaByTemperature[i]` corresponds to
+/// `inCheckpointSampledMTPCounterfactualTemperatures[i]` -- index `0` is always `T=1.0`, and every
+/// call site below (e.g. `sigmaByTemperature[0]` for `sigma_1`, `sigmaByTemperature[3]` for
+/// `sigma_0.7`) relies on this exact ordering rather than searching for the value.
+let inCheckpointSampledMTPCounterfactualTemperatures: [Double] = [1.0, 0.9, 0.8, 0.7]
+
+/// One drafted position's counterfactual sigma_T reading across every temperature in
+/// `inCheckpointSampledMTPCounterfactualTemperatures`, plus the analytic
+/// `sigma_argmax`/`sigma_rest` decomposition at `T=1` the predeclaration also requires.
+struct InCheckpointSampledMTPStepTemperingSample: Equatable, Sendable {
+    /// `sigmaByTemperature[i]` is `sigma_T` at `inCheckpointSampledMTPCounterfactualTemperatures[i]`.
+    let sigmaByTemperature: [Double]
+    /// `min(p_1(x*), q(x*))` where `x* = argmax p_1` -- the single largest contributor to `sigma_1`.
+    let sigmaArgmax: Double
+    /// `sigma_1 - sigmaArgmax` -- everything `sigma_1` accumulates outside the target's own argmax.
+    let sigmaRest: Double
+}
+
+/// Computes the counterfactual `sigma_T = Sigma_x min(p_T(x), q(x))` for every temperature in
+/// `inCheckpointSampledMTPCounterfactualTemperatures`, from the SAME `targetRow` logits and
+/// UNTRUNCATED, UNTEMPERED drafter proposal `q` the caller already derived for its own `sigma`
+/// (`q` is not re-derived per `T` -- see the predeclaration's "the quantity" section for why: it is
+/// not the law `decide()` re-derives per temperature either, since `decide()` never runs at
+/// `T != 1` in the first place).
+///
+/// CRITICAL (do not "optimize" this): the surviving support set IS temperature-invariant --
+/// `independentTruncatedProbabilities` applies every filter (top_p/min_p/top_k) BEFORE temperature
+/// ever enters, at its step 5 (`softmax(masked / temperature)`). That invariance is tempting to
+/// exploit by filtering once and re-scaling only the final softmax per temperature. **Do not.**
+/// Control C1 (see the call site in `runInCheckpointSampledMTPAcceptance`) asserts that
+/// `supportSize == 1` positions show EXACT temperature-invariant `sigma_T` as a genuine check on
+/// `independentTruncatedProbabilities`'s own filter-then-temper ordering. Sharing a single filtered
+/// array across temperatures would make that assertion true by construction regardless of whether
+/// the ordering is actually implemented correctly, and the control would measure nothing. This
+/// function therefore calls `independentTruncatedProbabilities` independently, IN FULL (all five
+/// steps, including the top_p/min_p/top_k re-filter), once per temperature -- four full passes over
+/// the vocabulary instead of one. That CPU cost is accepted deliberately, for C1's sake.
+func inCheckpointSampledMTPCounterfactualTempering(
+    targetRow: [Double], draft q: [Double],
+    targetTopP: Double, targetTopK: Int, targetMinP: Double
+) throws -> InCheckpointSampledMTPStepTemperingSample {
+    var sigmaByTemperature: [Double] = []
+    sigmaByTemperature.reserveCapacity(inCheckpointSampledMTPCounterfactualTemperatures.count)
+    var pAtT1: [Double] = []
+    for temperature in inCheckpointSampledMTPCounterfactualTemperatures {
+        // Independent, full call -- see the CRITICAL note above. Never a shared/cached masked array.
+        let pT = try independentTruncatedProbabilities(
+            logits: targetRow, temperature: temperature, topP: targetTopP, topK: targetTopK,
+            minP: targetMinP)
+        if pAtT1.isEmpty, temperature == inCheckpointSampledMTPCounterfactualTemperatures[0] {
+            pAtT1 = pT
+        }
+        sigmaByTemperature.append(inCheckpointSampledMTPSigmaMinPQ(target: pT, draft: q))
+    }
+    guard
+        let xStar = pAtT1.enumerated().max(by: { $0.element < $1.element })?.offset
+    else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidLogits(
+            "counterfactual tempering: empty T=1 target distribution")
+    }
+    let sigmaArgmax = Swift.min(pAtT1[xStar], q[xStar])
+    let sigma1 = sigmaByTemperature[0]
+    let sigmaRest = sigma1 - sigmaArgmax
+    return InCheckpointSampledMTPStepTemperingSample(
+        sigmaByTemperature: sigmaByTemperature, sigmaArgmax: sigmaArgmax, sigmaRest: sigmaRest)
+}
+
 /// One block's raw outcome: how many draft tokens this block proposed, and how many the block
 /// accepted before falling to a residual correction or the terminal bonus token.
 struct InCheckpointSampledMTPBlockOutcome: Equatable, Sendable {
@@ -1069,6 +1145,12 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
     /// `p`, no second MLX evaluation) so a reader can later classify which filter bound (see
     /// `inCheckpointSampledMTPClassifyTruncationBinding`) instead of only asserting it did.
     private(set) var truncationSupportSizeByStep: [Int: [Int]] = [:]
+    /// `temperingByStep[i]` collects, per block, one `InCheckpointSampledMTPStepTemperingSample` for
+    /// drafted position `i` -- the counterfactual `sigma_T` replay over the SAME already-computed
+    /// `targetRow`/`q` pair `sigmaMinPQByStep`/`truncationSupportSizeByStep` above are recorded from
+    /// (same loop iteration, appended in lockstep -- a later reader zips these three by index).
+    /// See `docs/task-inbox/2026-09-09-sampled-mtp-temperature-counterfactual-PREDECLARATION.md`.
+    private(set) var temperingByStep: [Int: [InCheckpointSampledMTPStepTemperingSample]] = [:]
 
     init(
         inner: any SampledMTPBlockRuntimeDeciding,
@@ -1204,6 +1286,31 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
                 // truncation left standing -- see `InCheckpointSampledMTPTruncationBindingClass`.
                 let supportSize = p.reduce(0) { $0 + ($1 > 0 ? 1 : 0) }
                 truncationSupportSizeByStep[index, default: []].append(supportSize)
+                // Counterfactual temperature replay -- same `targetRow`/`q` this position's `sigma`
+                // above was already computed from, independently re-filtered per temperature (see
+                // `inCheckpointSampledMTPCounterfactualTempering`'s CRITICAL note on why the filter
+                // chain is never shared across temperatures despite the surviving support set being
+                // temperature-invariant).
+                let tempering = try inCheckpointSampledMTPCounterfactualTempering(
+                    targetRow: targetRow, draft: q, targetTopP: targetTopP, targetTopK: targetTopK,
+                    targetMinP: targetMinP)
+                // `sigma_T` at `T=1.0` is the SAME quantity as `sigma` above only when
+                // `targetTemperature == 1` -- true of every live run this file drives (`supports()`
+                // pins it), but asserted here rather than assumed: `tempering` was computed from an
+                // entirely independent call to `independentTruncatedProbabilities`, and a divergence
+                // would invalidate every pooled `sigma_T` comparison downstream.
+                if targetTemperature == 1 {
+                    precondition(
+                        tempering.sigmaByTemperature[0] == sigma,
+                        "sigma_T at T=1.0 (independently recomputed by "
+                            + "inCheckpointSampledMTPCounterfactualTempering) must equal the sigma "
+                            + "already computed above at targetTemperature=1 EXACTLY -- observed "
+                            + "sigma_T[T=1.0]=\(tempering.sigmaByTemperature[0]) sigma=\(sigma). A "
+                            + "divergence here means the two independently-computed calls to "
+                            + "independentTruncatedProbabilities do not agree on identical inputs, "
+                            + "which would invalidate every pooled sigma_T comparison below.")
+                }
+                temperingByStep[index, default: []].append(tempering)
             }
         }
         decideDurationsSeconds.append(elapsed)
@@ -1449,6 +1556,7 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     var cleanDraftBlockCount = 0
     var cleanSigmaByStep: [Int: [InCheckpointSampledMTPStepSigmaSample]] = [:]
     var cleanTruncationSupportSizeByStep: [Int: [Int]] = [:]
+    var cleanTemperingByStep: [Int: [InCheckpointSampledMTPStepTemperingSample]] = [:]
 
     for (promptIndex, prompt) in prompts.enumerated() {
         let promptTokens = context.tokenizer.encode(text: prompt)
@@ -1578,6 +1686,9 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         for (step, supportSizes) in measuring.truncationSupportSizeByStep {
             cleanTruncationSupportSizeByStep[step, default: []].append(contentsOf: supportSizes)
         }
+        for (step, temperingSamples) in measuring.temperingByStep {
+            cleanTemperingByStep[step, default: []].append(contentsOf: temperingSamples)
+        }
         let phases = mtpIterator.speculativeDecodingPhaseTelemetry
         cleanDraftBlockSeconds += phases.draftBlockSeconds
         cleanDraftBlockCount += phases.draftBlockCount
@@ -1705,6 +1816,100 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
                     + "n=\(supportSummary.count)")
         }
     }
+
+    // Temperature counterfactual replay -- see
+    // docs/task-inbox/2026-09-09-sampled-mtp-temperature-counterfactual-PREDECLARATION.md. Console-
+    // only, mirroring the pooled-across-all-steps truncation-binding block above: an ADDITIONAL view
+    // over the SAME per-step storage (`cleanTemperingByStep`/`cleanTruncationSupportSizeByStep`),
+    // not a new JSON field.
+    let allTempering = cleanTemperingByStep.values.flatMap { $0 }
+    if !allTempering.isEmpty {
+        let temperingPositionCount = allTempering.count
+        let sigmaTMeans = inCheckpointSampledMTPCounterfactualTemperatures.indices.map { index in
+            allTempering.reduce(0.0) { $0 + $1.sigmaByTemperature[index] }
+                / Double(temperingPositionCount)
+        }
+        print(
+            "sigma_T (pooled across all steps, n=\(temperingPositionCount)): "
+                + zip(inCheckpointSampledMTPCounterfactualTemperatures, sigmaTMeans)
+                    .map { temperature, mean in "T=\(temperature)=\(String(format: "%.4f", mean))" }
+                    .joined(separator: " "))
+
+        let sigma1Mean = sigmaTMeans[0]
+        let sigma07Mean = sigmaTMeans[3]
+        let delta: Double? = sigma1Mean > 0 ? (sigma1Mean - sigma07Mean) / sigma1Mean : nil
+        print(
+            "Delta = (sigma_1 - sigma_0.7) / sigma_1 (pooled across all steps) = "
+                + (delta.map { String(format: "%.4f", $0) } ?? "n/a"))
+
+        let sigmaArgmaxMean =
+            allTempering.reduce(0.0) { $0 + $1.sigmaArgmax } / Double(temperingPositionCount)
+        let sigmaRestMean =
+            allTempering.reduce(0.0) { $0 + $1.sigmaRest } / Double(temperingPositionCount)
+        print(
+            "sigma_argmax (pooled) = \(String(format: "%.4f", sigmaArgmaxMean)) "
+                + "sigma_rest (pooled) = \(String(format: "%.4f", sigmaRestMean)) "
+                + "n=\(temperingPositionCount)")
+
+        // C1 (exact, non-statistical): at any position with a single-token surviving support, the
+        // law is a point mass at every temperature, so `sigma_T` must equal `sigma_1` EXACTLY --
+        // compared with `!=` on `Double`, never a tolerance. A non-zero count here means the
+        // instrument is wrong and the run is void; see the predeclaration's C1 control.
+        var c1ViolationCount = 0
+        var c1FirstOffender: (supportSize: Int, temperature: Double, sigmaT: Double, sigma1: Double)?
+        // C2 (discriminating): a non-zero count here is what distinguishes a genuine measurement
+        // from an instrument that silently returns `sigma_T == sigma_1` everywhere.
+        var c2Count = 0
+        for step in cleanTemperingByStep.keys.sorted() {
+            let supportSizes = cleanTruncationSupportSizeByStep[step] ?? []
+            let temperingSamples = cleanTemperingByStep[step] ?? []
+            precondition(
+                supportSizes.count == temperingSamples.count,
+                "C1/C2 require supportSize and tempering samples recorded in lockstep per step "
+                    + "(step=\(step): supportSizes.count=\(supportSizes.count) "
+                    + "temperingSamples.count=\(temperingSamples.count)) -- both are appended in "
+                    + "the same loop iteration in measuredDecide, so a mismatch here means that "
+                    + "invariant broke")
+            for (supportSize, sample) in zip(supportSizes, temperingSamples) {
+                let sigma1 = sample.sigmaByTemperature[0]
+                if supportSize == 1 {
+                    var violation: (temperature: Double, sigmaT: Double)?
+                    for (index, temperature) in inCheckpointSampledMTPCounterfactualTemperatures
+                        .enumerated()
+                    {
+                        let sigmaT = sample.sigmaByTemperature[index]
+                        if sigmaT != sigma1 {
+                            violation = (temperature, sigmaT)
+                            break
+                        }
+                    }
+                    if let violation {
+                        c1ViolationCount += 1
+                        if c1FirstOffender == nil {
+                            c1FirstOffender = (
+                                supportSize: supportSize, temperature: violation.temperature,
+                                sigmaT: violation.sigmaT, sigma1: sigma1)
+                        }
+                    }
+                } else if supportSize > 1 {
+                    let sigma07 = sample.sigmaByTemperature[3]
+                    if sigma07 != sigma1 {
+                        c2Count += 1
+                    }
+                }
+            }
+        }
+        print(
+            "C1 (supportSize==1 temperature-invariance, exact `!=`): violations=\(c1ViolationCount)")
+        if let c1FirstOffender {
+            print(
+                "C1 FIRST OFFENDER: supportSize=\(c1FirstOffender.supportSize) "
+                    + "T=\(c1FirstOffender.temperature) sigma_T=\(c1FirstOffender.sigmaT) "
+                    + "sigma_1=\(c1FirstOffender.sigma1)")
+        }
+        print("C2 (supportSize>1 AND sigma_0.7 != sigma_1, discriminating): count=\(c2Count)")
+    }
+
     if let decideSummary {
         print(
             "D (decide wall time/block, decide()-CPU-only -- EXCLUDES the target forward, see "
