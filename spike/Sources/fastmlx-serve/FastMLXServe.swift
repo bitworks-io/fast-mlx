@@ -840,7 +840,12 @@ private func loadScalarServingBackend(
             // configured port -- exactly the defect this line exists to close. If a second
             // `ScalarServingModelLoadConfiguration(` construction site is ever added (for example a
             // new serving route in this file), it must forward this field too.
-            offloadPlanCheckOnly: arguments.offloadPlanCheckOnly))
+            offloadPlanCheckOnly: arguments.offloadPlanCheckOnly,
+            // `--default-sampling`: forwarded unconditionally. This is the ONE construction site
+            // that forwards it -- `ExactQwen35MTPServeComposition.scalarConfiguration` deliberately
+            // does NOT, which is what keeps that route's scalar fallback at `defaults: nil`. See
+            // `ScalarServingModelLoadConfiguration.defaultSampling`'s doc comment.
+            defaultSampling: arguments.defaultSampling))
     return PreparedServingBackend(
         backend: loaded.backend,
         evidenceSnapshot: {

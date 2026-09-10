@@ -91,6 +91,14 @@ public struct ScalarServingBackendConfiguration: Sendable {
     /// input tokens. Defaults to `[]`, meaning the model rejects none — today's behavior, unchanged,
     /// for every family that does not report any.
     public var rejectedPromptTokenIDs: Set<Int>
+    /// Artifact-sourced sampling fallback (`--default-sampling generation-config`) applied at
+    /// admission (`resolveDecoderSampling`) to a request that omits a sampling field. Set by the
+    /// scalar loader ONLY when `ScalarServingModelLoadConfiguration.defaultSampling ==
+    /// .generationConfig` resolved successfully -- see `loadScalarServingModel`'s doc comment at the
+    /// assignment site for why this is confined to `ScalarServingBackend` admission rather than the
+    /// decoder/`InferenceActor` layer. Defaults `nil`, preserving today's `defaults: nil` behavior
+    /// (and every other serving route's construction, which never sets this field) byte-for-byte.
+    public var samplingDefaults: ServingSamplingDefaults?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -101,7 +109,8 @@ public struct ScalarServingBackendConfiguration: Sendable {
         disableThinkingWhenToolsActive: Bool = false,
         thinksByDefault: Bool = false,
         modelCapabilities: ServingModelCapabilities? = nil,
-        rejectedPromptTokenIDs: Set<Int> = []
+        rejectedPromptTokenIDs: Set<Int> = [],
+        samplingDefaults: ServingSamplingDefaults? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -121,6 +130,7 @@ public struct ScalarServingBackendConfiguration: Sendable {
         self.thinksByDefault = thinksByDefault
         self.modelCapabilities = modelCapabilities
         self.rejectedPromptTokenIDs = rejectedPromptTokenIDs
+        self.samplingDefaults = samplingDefaults
     }
 }
 
@@ -323,7 +333,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         try Self.screenRejectedPromptTokens(renderedPromptTokens, configuration: configuration)
         // Resolve + validate sampling at admission so an out-of-range temperature/top_p rejects
         // with a clean 400 here rather than failing mid-generation in the detached task.
-        let sampling = try Self.resolveDecoderSampling(request)
+        let sampling = try resolveDecoderSampling(request)
         let penalties = Self.decoderPenalties(request)
 
         let id = ServingRequestID("scalar-\(UUID().uuidString)")
@@ -437,9 +447,6 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             code: "unsupported_prompt_token")
     }
 
-    /// Resolve the request's sampling policy (ServingCore) into the decoder-runtime policy
-    /// (SpikeCore), mapping a policy validation failure to a 400-class serving error so an
-    /// out-of-range temperature/top_p/etc. is rejected at admission with an honest param.
     /// Bridge the request's OpenAI penalty fields to the decoder-runtime penalties (SpikeCore).
     private static func decoderPenalties(
         _ request: OpenAIChatCompletionRequest
@@ -450,14 +457,22 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             repetitionPenalty: request.repetitionPenalty)
     }
 
-    private static func resolveDecoderSampling(
+    /// Resolve the request's sampling policy (ServingCore) into the decoder-runtime policy
+    /// (SpikeCore), mapping a policy validation failure to a 400-class serving error so an
+    /// out-of-range temperature/top_p/etc. is rejected at admission with an honest param.
+    ///
+    /// An INSTANCE method (not `static`, unlike its sibling `decoderPenalties` above) specifically
+    /// so it can read `configuration.samplingDefaults` -- the `--default-sampling generation-config`
+    /// artifact-sourced fallback the scalar loader sets, `nil` for every other route/configuration
+    /// (today's behavior, unchanged). Has exactly one caller, `start(_:preservedResolution:)` above.
+    private func resolveDecoderSampling(
         _ request: OpenAIChatCompletionRequest
     ) throws -> DecoderSampling {
         let policy: ServingSamplingPolicy
         do {
-            policy = try ServingSamplingPolicy.resolve(from: request)
+            policy = try ServingSamplingPolicy.resolve(from: request, defaults: configuration.samplingDefaults)
         } catch let error as ServingSamplingPolicyError {
-            throw openAIError(for: error)
+            throw Self.openAIError(for: error)
         }
         switch policy {
         case .greedy:

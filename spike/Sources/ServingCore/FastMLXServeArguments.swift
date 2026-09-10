@@ -31,10 +31,13 @@ public enum FastMLXServeHostUse: String, Equatable, Sendable {
 /// `--default-sampling`: whether a request that omits sampling parameters (notably `temperature`)
 /// decodes greedy argmax (`off`, today's behavior, and the default) or is resolved against the
 /// served checkpoint's own `generation_config.json` sampling subset
-/// (`GenerationConfigSamplingDefaults.load(contentsOf:)`, `generation-config`). This enum is
-/// parse-time only in this increment: nothing yet calls `load` or threads the resolved defaults
-/// into a serve route -- see the refusals below, which exist because turning this on converts
-/// param-less traffic into SAMPLED traffic, which several routes cannot honor.
+/// (`GenerationConfigSamplingDefaults.load(contentsOf:)`, `generation-config`). `generation-config`
+/// is wired into the SCALAR serve route only (`loadScalarServingModel`,
+/// `spike/Sources/SpikeServingAdapters/MLXScalarServing.swift`), fail-closed at load -- a
+/// missing/unparseable/non-sampling artifact, or a resolved `.compiledFP16` decoder strategy,
+/// refuses to start rather than silently falling back to greedy. See the refusals below, which
+/// exist because turning this on converts param-less traffic into SAMPLED traffic, which every
+/// OTHER route either cannot honor or has not proven safe for.
 public enum FastMLXServeDefaultSampling: String, Equatable, Sendable {
     case off
     case generationConfig = "generation-config"
@@ -592,8 +595,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
           --default-sampling MODE     Whether a request omitting sampling params (default:
                                       off) decodes greedy argmax (off) or resolves the
                                       served checkpoint's own generation_config.json
-                                      sampling subset (generation-config). Parse-time
-                                      only today: not yet wired into any serve route.
+                                      sampling subset (generation-config). Wired into
+                                      the scalar serve route only; fail-closed at load
+                                      (a missing/invalid generation_config.json, or a
+                                      compiled-fp16 decoder strategy, refuses to
+                                      start rather than falling back to greedy).
                                       Not supported with --scripted, --quant-pick-only,
                                       continuous batching, or --exact-qwen35-mtp; with
                                       --qwen4exp-mtp also requires
@@ -808,9 +814,18 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// `--default-sampling`: `off` (the default) preserves today's behavior byte-for-byte -- a
     /// request omitting sampling parameters decodes greedy argmax. `generationConfig` opts into
     /// resolving the served checkpoint's own `generation_config.json` sampling subset for such a
-    /// request instead. PARSE-TIME ONLY in this increment: nothing yet calls
-    /// `GenerationConfigSamplingDefaults.load(contentsOf:)` or threads its result into a serve
-    /// route -- that wiring is a later increment. Fail-closed here against every route that would
+    /// request instead, for the SCALAR serve route only
+    /// (`ScalarServingModelLoadConfiguration.defaultSampling`,
+    /// `spike/Sources/SpikeServingAdapters/MLXScalarServing.swift`). Fail-closed at LOAD, not
+    /// per-request: `GenerationConfigSamplingDefaults.load(contentsOf:)` runs against
+    /// `generation_config.json` inside the model directory before any weight load, and a
+    /// missing/unparseable file, `do_sample: false`, absent/zero `temperature`, or an out-of-range
+    /// sampling field refuses to start rather than silently falling back to greedy. Also refused at
+    /// load when the resolved scalar decoder strategy is `.compiledFP16`
+    /// (`scalarServingDefaultSamplingDecoderStrategyError`) -- that decoder does not opt into
+    /// `Decoder.supportsSampling`, so admitting the combination would boot healthy on the greedy
+    /// startup probe and then fail every real sampled request mid-stream with an opaque backend
+    /// error instead. Refused here at PARSE TIME (this type) against every OTHER route that would
     /// otherwise silently ignore this flag or regress accepted behavior when it converts
     /// param-less traffic into sampled traffic: `--scripted` and `--quant-pick-only` never serve a
     /// request at all (`defaultSamplingWithScripted` / `defaultSamplingWithQuantPickOnly`);

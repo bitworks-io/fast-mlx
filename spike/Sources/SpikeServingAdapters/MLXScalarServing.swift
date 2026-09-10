@@ -299,6 +299,30 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// `--ngram-offload-plan` before this seam is ever reached -- kept as a defensive boundary for
     /// any other caller of this public configuration type.
     case offloadPlanCheckOnlyRequiresNGramOffloadPlan
+    /// `configuration.defaultSampling == .generationConfig` but
+    /// `GenerationConfigSamplingDefaults.load(contentsOf:)` threw against the model directory's
+    /// `generation_config.json` -- missing file, unparseable JSON, `do_sample` absent/`false`, no
+    /// usable (non-`nil`, non-zero) `temperature`, or an out-of-range sampling field. Per
+    /// `docs/task-inbox/2026-09-09-default-sampling-params-DECISION.md`'s "fail closed at startup"
+    /// rule: falling back to greedy here would silently reproduce the exact defect this flag exists
+    /// to fix. Carries the underlying typed failure so the operator-facing line can distinguish "file
+    /// missing" from "do_sample: false" rather than collapsing every cause into one message.
+    case defaultSamplingGenerationConfigUnavailable(GenerationConfigSamplingDefaultsError)
+    /// `configuration.defaultSampling == .generationConfig` but the RESOLVED scalar decoder strategy
+    /// is `.compiledFP16`. Unlike `inCheckpointMTPIncompatibleWithCompiledDecoderStrategy`'s pairing
+    /// (provably unreachable for qwen4_exp today), this combination is NOT a rare edge case: the
+    /// model family is unconstrained for `--default-sampling`, and `.compiledFP16` is the DOMINANT
+    /// resolution for any all-dense-attention checkpoint --
+    /// `classifyScalarServingDecoderRoute` (`ScalarServingCacheLayoutPolicy.swift:~145`) returns
+    /// `.compiled` whenever no layer classifies `.recurrentState`, and `.compiled` + the default
+    /// `.fp16` KV tier resolves to `.compiledFP16` (`scalarServingDecoderStrategy`). Refused at load
+    /// because `CompiledMLXDecoder` does not opt into `Decoder.supportsSampling` (it takes the
+    /// protocol-extension default of `false`): with the flag on, the GREEDY startup probe
+    /// (`verifyScalarServingResetParity`) would still pass and the server would boot healthy, and
+    /// then every real param-less request -- now resolved to `.sampled` by this very flag -- would
+    /// hit `InferenceActor.generateBounded`'s per-request capability guard and surface an opaque
+    /// mid-stream `samplingUnsupportedByDecoder` backend error instead of a clean refusal to start.
+    case defaultSamplingIncompatibleWithCompiledDecoderStrategy
 }
 
 enum ScalarServingDecoderStrategy: Equatable {
@@ -334,6 +358,25 @@ func scalarServingInCheckpointMTPDecoderStrategyError(
         return nil
     }
     return .inCheckpointMTPIncompatibleWithCompiledDecoderStrategy
+}
+
+/// Fail-closed compatibility guard between `configuration.defaultSampling` and the RESOLVED
+/// `ScalarServingDecoderStrategy`. Mirrors `scalarServingInCheckpointMTPDecoderStrategyError`'s
+/// shape (a pure function returning the error to throw, or `nil` to admit) but NOT its
+/// unreachability claim -- read `ScalarServingModelLoadError.defaultSamplingIncompatibleWithCompiledDecoderStrategy`'s
+/// own doc comment for why `.compiledFP16` is the DOMINANT resolution here, not a rare edge case,
+/// and why refusing at load (rather than letting the per-request capability guard in
+/// `InferenceActor.generateBounded` catch it) is required: the greedy startup probe would still
+/// pass, so the server would boot healthy and then fail every real sampled request mid-stream with
+/// an opaque backend error instead of a clean refusal to start.
+func scalarServingDefaultSamplingDecoderStrategyError(
+    defaultSampling: FastMLXServeDefaultSampling,
+    decoderStrategy: ScalarServingDecoderStrategy
+) -> ScalarServingModelLoadError? {
+    guard defaultSampling == .generationConfig, decoderStrategy == .compiledFP16 else {
+        return nil
+    }
+    return .defaultSamplingIncompatibleWithCompiledDecoderStrategy
 }
 
 func scalarServingDecoderStrategy(
@@ -438,6 +481,22 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// for the defensive guard at this seam (the CLI parser already refuses the combination
     /// earlier, at argument parsing).
     public let offloadPlanCheckOnly: Bool
+    /// `--default-sampling`: `.off` (the default) preserves today's behavior byte-for-byte -- a
+    /// request omitting sampling parameters decodes greedy argmax. `.generationConfig` opts into
+    /// resolving the served checkpoint's `generation_config.json` sampling subset for the SCALAR
+    /// serve route ONLY, fail-closed at load (see `loadScalarServingModel`'s generation-config load
+    /// and `scalarServingDefaultSamplingDecoderStrategyError`).
+    ///
+    /// There are TWO construction sites for this type. `spike/Sources/fastmlx-serve/FastMLXServe.swift`
+    /// (`loadScalarServingBackend`, ~:815) forwards `FastMLXServeArguments.defaultSampling` here.
+    /// `spike/Sources/SpikeServingAdapters/ExactQwen35MTPServeComposition.swift`
+    /// (`scalarConfiguration`, ~:45) deliberately does NOT forward it -- that omission is the
+    /// mechanism that keeps the exact-qwen35 route's scalar fallback at `defaults: nil`, matching
+    /// `docs/task-inbox/2026-09-09-default-sampling-params-DECISION.md`'s "scope the default by
+    /// route" rule; `FastMLXServeArgumentError.defaultSamplingWithExactQwen35MTP` also refuses this
+    /// flag at parse time for that route, so this omission is redundant-but-intentional, not the
+    /// only guard.
+    public let defaultSampling: FastMLXServeDefaultSampling
 
     public init(
         launchedModel: String,
@@ -451,7 +510,8 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         inCheckpointMTPSelection: FastMLXInCheckpointMTPSelection? = nil,
         sampledMTPBlockDecisionsEnabled: Bool = false,
         chatTemplateOverrideURL: URL? = nil,
-        offloadPlanCheckOnly: Bool = false
+        offloadPlanCheckOnly: Bool = false,
+        defaultSampling: FastMLXServeDefaultSampling = .off
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -465,6 +525,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
         self.sampledMTPBlockDecisionsEnabled = sampledMTPBlockDecisionsEnabled
         self.chatTemplateOverrideURL = chatTemplateOverrideURL
         self.offloadPlanCheckOnly = offloadPlanCheckOnly
+        self.defaultSampling = defaultSampling
     }
 }
 
@@ -943,6 +1004,27 @@ public func loadScalarServingModel(
         throw OffloadPlanCheckCompleted(report: report)
     }
 
+    // `--default-sampling generation-config`: resolve the artifact's sampling defaults HERE --
+    // AFTER the `--offload-plan-check-only` sentinel above (so that dry run's behavior stays
+    // byte-identical -- this load never runs on that path) and BEFORE any `Memory.*` process-global
+    // mutation or weight load below, so a missing/unparseable/`do_sample:false`/out-of-range
+    // `generation_config.json` fails in milliseconds instead of after a multi-GB checkpoint load.
+    // `GenerationConfigSamplingDefaults.load` itself fails closed on every error path (see its own
+    // doc comment) -- there is no silent-greedy fallback here either.
+    let defaultSamplingDefaults: ServingSamplingDefaults?
+    if configuration.defaultSampling == .generationConfig {
+        let generationConfigURL = configuration.modelDirectory.appendingPathComponent(
+            "generation_config.json")
+        do {
+            defaultSamplingDefaults = try GenerationConfigSamplingDefaults.load(
+                contentsOf: generationConfigURL)
+        } catch let error as GenerationConfigSamplingDefaultsError {
+            throw ScalarServingModelLoadError.defaultSamplingGenerationConfigUnavailable(error)
+        }
+    } else {
+        defaultSamplingDefaults = nil
+    }
+
     Memory.memoryLimit = configuration.memoryLimitBytes
     Memory.cacheLimit = configuration.cacheLimitBytes
     Memory.clearCache()
@@ -1047,6 +1129,14 @@ public func loadScalarServingModel(
     if let decoderStrategyError = scalarServingInCheckpointMTPDecoderStrategyError(
         selection: configuration.inCheckpointMTPSelection, decoderStrategy: decoderStrategy) {
         throw decoderStrategyError
+    }
+    // Fail-closed BEFORE any drafter weight load, same seam as the MTP guard immediately above: see
+    // `scalarServingDefaultSamplingDecoderStrategyError`'s doc comment -- unlike the MTP guard, this
+    // combination is NOT provably unreachable in production; it is the dominant resolution for any
+    // all-dense-attention checkpoint.
+    if let defaultSamplingDecoderStrategyError = scalarServingDefaultSamplingDecoderStrategyError(
+        defaultSampling: configuration.defaultSampling, decoderStrategy: decoderStrategy) {
+        throw defaultSamplingDecoderStrategyError
     }
     let codec = MLXScalarTextCodec(tokenizer: tokenizer)
     let stopTokenIDs = try resolveScalarServingStopTokenIDs(
@@ -1253,6 +1343,16 @@ public func loadScalarServingModel(
     // `rejectedPromptTokenIDs` was captured earlier, before `context.model` was sent into the
     // decoder actor — see the comment at its capture site.
     backendConfiguration.rejectedPromptTokenIDs = rejectedPromptTokenIDs
+    // `--default-sampling generation-config`: applied ONLY at scalar-backend ADMISSION
+    // (`ScalarServingBackend.resolveDecoderSampling`, via `ServingSamplingPolicy.resolve(from:defaults:)`),
+    // deliberately NOT at the decoder/`InferenceActor` layer. `runScalarServingStartupProbe`
+    // (`verifyScalarServingResetParity`) asserts `first.tokens == second.tokens` reset parity across
+    // two runs of the SAME greedy startup prompt, and `ServingSamplingPolicy.resolve` never defaults
+    // a `seed` -- applying `defaultSamplingDefaults` any deeper (e.g. inside the startup probe or the
+    // decoder itself) would make that boot-parity check nondeterministic, since a sampled probe with
+    // no pinned seed can legitimately draw two different tokens. `defaultSamplingDefaults` is `nil`
+    // unless `configuration.defaultSampling == .generationConfig` resolved successfully above.
+    backendConfiguration.samplingDefaults = defaultSamplingDefaults
     let backend = ScalarServingBackend(
         launchedModel: configuration.launchedModel,
         inference: inference,
@@ -1679,6 +1779,18 @@ public func scalarServingModelLoadRefusalAnnounceLine(
         // itself rather than assume the remedy token covers it.
         return "fastmlx-serve configuration=refused reason=offloaded_ngram_plan_load_failed "
             + "detail=\(detail) remedy=reseal_acceptance_record_on_this_host"
+    case .defaultSamplingGenerationConfigUnavailable(let underlying):
+        // `detail=` carries the UNDERLYING `GenerationConfigSamplingDefaultsError` (not this case's
+        // own name) so an operator can tell "file missing" (`unreadable`) from "do_sample: false"
+        // (`samplingNotEnabled`) from an out-of-range artifact value (`invalidValue(...)`) — see
+        // that error case's own doc comment for the full enumeration.
+        return "fastmlx-serve configuration=refused "
+            + "reason=default_sampling_generation_config_unavailable "
+            + "detail=\(underlying) remedy=--default-sampling_off"
+    case .defaultSamplingIncompatibleWithCompiledDecoderStrategy:
+        return "fastmlx-serve configuration=refused "
+            + "reason=default_sampling_incompatible_with_compiled_decoder_strategy "
+            + "remedy=--default-sampling_off"
     default:
         return "fastmlx-serve configuration=refused reason=scalar_serving_model_load_error "
             + "detail=\(error)"
