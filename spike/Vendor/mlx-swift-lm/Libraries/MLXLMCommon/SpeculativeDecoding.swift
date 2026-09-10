@@ -95,6 +95,13 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
     /// Number of tokens emitted from speculative rounds, including correction and bonus tokens.
     public private(set) var emittedTokenCount: Int
 
+    /// Number of rounds that completed a full verify pass but then discarded
+    /// their accepted draft tokens and committed none, via
+    /// `recordDegradedRound(discardedAcceptedDraftTokens:)`. Before this
+    /// counter existed, how often that degrade path is actually taken was
+    /// unanswerable from telemetry alone.
+    public private(set) var degradedRoundCount: Int
+
     /// Logical phase timings for measurement and optimization attribution.
     public private(set) var phases: SpeculativeDecodingPhaseTelemetry
 
@@ -106,6 +113,7 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         draftModelCallCount: Int = 0,
         targetVerifiedTokenCount: Int = 0,
         emittedTokenCount: Int = 0,
+        degradedRoundCount: Int = 0,
         phases: SpeculativeDecodingPhaseTelemetry = .init()
     ) {
         self.roundCount = roundCount
@@ -115,6 +123,7 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         self.draftModelCallCount = draftModelCallCount
         self.targetVerifiedTokenCount = targetVerifiedTokenCount
         self.emittedTokenCount = emittedTokenCount
+        self.degradedRoundCount = degradedRoundCount
         self.phases = phases
     }
 
@@ -153,6 +162,30 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         targetModelCallCount += 1
         draftModelCallCount += draftModelCalls ?? drafted
         targetVerifiedTokenCount += targetVerified
+    }
+
+    /// Records a round that completed a full draft-and-verify pass but then
+    /// discarded its accepted draft tokens and committed none to the emitted
+    /// stream — the degrade taken when a speculative rewind checkpoint cannot
+    /// be installed for replay, which falls back to an exact single-token
+    /// step. `discardedAcceptedDraftTokens` is subtracted from
+    /// `acceptedDraftTokenCount`, clamped so the counter never goes negative,
+    /// so this degraded round is not credited with acceptances it did not
+    /// actually deliver — keeping this counter in agreement with
+    /// `MTPSpeculativeTokenIterator.acceptedCount`, which retracts the same
+    /// amount at the same degrade site.
+    ///
+    /// `roundCount`, `draftTokenCount`, and `targetVerifiedTokenCount` are
+    /// deliberately NOT retracted: the round genuinely ran a full draft and
+    /// verify pass before its result was discarded, so that work happened
+    /// and should still be counted.
+    ///
+    /// `degradedRoundCount` answers a question that was previously
+    /// unanswerable from this telemetry alone: how often that degrade path
+    /// is actually taken.
+    package mutating func recordDegradedRound(discardedAcceptedDraftTokens: Int) {
+        acceptedDraftTokenCount = max(0, acceptedDraftTokenCount - discardedAcceptedDraftTokens)
+        degradedRoundCount += 1
     }
 
     package mutating func recordGeneratedToken() {
