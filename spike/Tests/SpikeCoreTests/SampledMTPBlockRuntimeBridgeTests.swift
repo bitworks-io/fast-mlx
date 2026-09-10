@@ -74,7 +74,39 @@ final class SampledMTPBlockRuntimeBridgeTests: XCTestCase {
                 terminalDraw: .bonus(0.5))
         ])
         XCTAssertFalse(bridge.supports(parameters: GenerateParameters(temperature: 0)))
+        // `bridge` stores the default `.untruncated` truncation (1,1,0,0), which
+        // mismatches a temperature-0.7 request's own (0.7,1,0,0). So the refusal
+        // on the next line comes entirely from `supports`'s stored-truncation
+        // cross-check, NOT from `sharedSampledMTPSupportsPredicate`: that
+        // predicate admits any finite temperature > 0, including 0.7, since its
+        // relaxation off `temperature == 1`. The companion below constructs a
+        // bridge whose stored truncation actually matches a temperature-0.7
+        // request, which is what isolates and proves the predicate's own
+        // admission.
         XCTAssertFalse(bridge.supports(parameters: GenerateParameters(temperature: 0.7)))
+        let matchingTemperatureBridge = SampledMTPBlockRuntimeBridge(
+            plans: [
+                SampledMTPBlockRuntimeDrawPlan(
+                    proposalUniforms: [0.25],
+                    acceptanceUniforms: [0],
+                    terminalDraw: .bonus(0.5))
+            ],
+            truncation: SampledMTPSamplingTruncation(temperature: 0.7, topP: 1, topK: 0, minP: 0))
+        XCTAssertTrue(
+            matchingTemperatureBridge.supports(parameters: GenerateParameters(temperature: 0.7)))
+        // With the stored truncation matched to the request too, the
+        // cross-check can no longer be what refuses temperature 0: this
+        // isolates and pins the predicate's own `> 0` lower bound.
+        let matchingZeroTemperatureBridge = SampledMTPBlockRuntimeBridge(
+            plans: [
+                SampledMTPBlockRuntimeDrawPlan(
+                    proposalUniforms: [0.25],
+                    acceptanceUniforms: [0],
+                    terminalDraw: .bonus(0.5))
+            ],
+            truncation: SampledMTPSamplingTruncation(temperature: 0, topP: 1, topK: 0, minP: 0))
+        XCTAssertFalse(
+            matchingZeroTemperatureBridge.supports(parameters: GenerateParameters(temperature: 0)))
         XCTAssertFalse(bridge.supports(parameters: GenerateParameters(temperature: 1, topP: 0.9)))
         XCTAssertTrue(bridge.supports(parameters: GenerateParameters(temperature: 1)))
     }
@@ -121,7 +153,21 @@ final class SeededSampledMTPBlockRuntimeProviderTests: XCTestCase {
 
         XCTAssertTrue(first.supports(parameters: GenerateParameters(temperature: 1, seed: 99)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 0)))
+        // `first` stores the default `.untruncated` truncation (1,1,0,0), which
+        // mismatches a temperature-0.7 request's own (0.7,1,0,0). So the refusal
+        // on the next line comes entirely from `supports`'s stored-truncation
+        // cross-check, NOT from `sharedSampledMTPSupportsPredicate`: that
+        // predicate admits any finite temperature > 0, including 0.7, since its
+        // relaxation off `temperature == 1`. The companion below constructs a
+        // provider whose stored truncation actually matches a temperature-0.7
+        // request, which is what isolates and proves the predicate's own
+        // admission.
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 0.7)))
+        let matchingTemperatureProvider = SeededSampledMTPBlockRuntimeProvider(
+            seed: 0x0123_4567_89ab_cdef,
+            truncation: SampledMTPSamplingTruncation(temperature: 0.7, topP: 1, topK: 0, minP: 0))
+        XCTAssertTrue(
+            matchingTemperatureProvider.supports(parameters: GenerateParameters(temperature: 0.7)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, topP: 0.95)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, topK: 4)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, minP: 0.05)))
@@ -452,7 +498,20 @@ final class SampledMTPBlockRuntimeBridgeTestsNondeterministicProvider: XCTestCas
 
         XCTAssertTrue(provider.supports(parameters: GenerateParameters(temperature: 1, seed: 7)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 0)))
+        // `provider` stores the default `.untruncated` truncation (1,1,0,0),
+        // which mismatches a temperature-0.7 request's own (0.7,1,0,0). So the
+        // refusal on the next line comes entirely from `supports`'s
+        // stored-truncation cross-check, NOT from
+        // `sharedSampledMTPSupportsPredicate`: that predicate admits any finite
+        // temperature > 0, including 0.7, since its relaxation off
+        // `temperature == 1`. The companion below constructs a provider whose
+        // stored truncation actually matches a temperature-0.7 request, which
+        // is what isolates and proves the predicate's own admission.
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 0.7)))
+        let matchingTemperatureProvider = NondeterministicSampledMTPBlockRuntimeProvider(
+            truncation: SampledMTPSamplingTruncation(temperature: 0.7, topP: 1, topK: 0, minP: 0))
+        XCTAssertTrue(
+            matchingTemperatureProvider.supports(parameters: GenerateParameters(temperature: 0.7)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topP: 0.95)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topK: 4)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, minP: 0.05)))

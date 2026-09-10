@@ -151,6 +151,49 @@ public struct SampledMTPSamplingTruncation: Sendable, Equatable {
 /// The sampling-shape predicate shared by every sampled-MTP block runtime
 /// provider's `supports(parameters:)`.
 ///
+/// `temperature > 0 && temperature.isFinite` admits any finite positive
+/// temperature, not only `temperature == 1`, because the exactness this
+/// predicate exists to protect does not depend on temperature at all.
+/// `truncatedSamplingProbabilities` (`Evaluate.swift:407-441`, vendored)
+/// applies the top-p/min-p/top-k filter chain to `logSoftmax(logits)` FIRST
+/// and only afterward computes `softmax(logprobs * (1 / temperature))`.
+/// `GenerateParameters.sampler()` (`Evaluate.swift:157-170`) picks between
+/// two branches, and BOTH land on that identical order:
+///   - untruncated (`topP == 1 && topK == 0 && minP == 0`): `sampler()`
+///     returns `CategoricalSampler(temperature:)`, which draws
+///     `categorical(logits * (1 / temperature))` -- i.e. `softmax(logits *
+///     (1 / temperature))`. At that same truncation,
+///     `truncatedSamplingProbabilities` skips every filter and returns
+///     `softmax(logSoftmax(logits) * (1 / temperature))`. These are the same
+///     law: `logSoftmax` only subtracts a per-row constant (`log-sum-exp`),
+///     and softmax is invariant to a constant additive shift of its input.
+///     (Not bit-exact -- two rounding passes versus one; this file already
+///     documents that same distinction at `normalizedProbabilities`.)
+///   - truncated (`usesTopP || usesTopK || usesMinP`): `sampler()` returns
+///     `TopPSampler(temperature:topP:topK:minP:)`, whose `sample(logits:)`
+///     applies the identical top-p -> min-p -> top-k filter chain to
+///     `logSoftmax(logits)` and then draws `categorical(logprobs * (1 /
+///     temperature))` -- line-for-line the same order and the same final
+///     `softmax(logprobs * (1 / temperature))` `truncatedSamplingProbabilities`
+///     computes.
+/// So for every temperature this predicate admits, the target law `p` this
+/// file computes tracks `parameters.sampler()`'s actual draw law exactly,
+/// not only at `temperature == 1`.
+///
+/// `temperature > 0` is what does the excluding, not a separate `!= 0`
+/// check: it is false for `temperature == 0` (correctly -- `sampler()`
+/// returns `ArgMaxSampler` there, and `truncatedSamplingProbabilities` would
+/// divide by zero, i.e. `softmax(logprobs * (1 / 0))`) AND false for
+/// `temperature == .nan` (`NaN > 0` is `false` under IEEE-754, so `NaN` is
+/// refused by construction with no separate `.isNaN` check needed). Negative
+/// temperatures are refused by the same `> 0` term. `.isFinite` excludes
+/// `+infinity` (and would exclude `-infinity`, already excluded by `> 0`):
+/// `1 / .infinity` is `0`, which would silently flatten `p` to a uniform
+/// distribution over the filtered support rather than refusing a request
+/// whose target law this predicate cannot state as "the request's actual
+/// sampler," so admitting it would be exactly the kind of silent-wrong-law
+/// case this predicate exists to prevent.
+///
 /// `topP`/`topK` accept the deployed thinking preset's truncated range
 /// (rather than requiring the untruncated `topP == 1, topK == 0`); `topP >
 /// 0` stays strict because the vendored `GenerateParameters.sampler()` maps
@@ -178,7 +221,7 @@ public struct SampledMTPSamplingTruncation: Sendable, Equatable {
 /// `SampledMTPSamplingTruncation(parameters:)`. See the doc comment on
 /// `SampledMTPSamplingTruncation` for why that cross-check is required.
 private func sharedSampledMTPSupportsPredicate(_ parameters: GenerateParameters) -> Bool {
-    parameters.temperature == 1
+    parameters.temperature > 0 && parameters.temperature.isFinite
         && parameters.topP > 0 && parameters.topP <= 1
         && parameters.topK >= 0
         && parameters.minP == 0
@@ -545,6 +588,18 @@ private final class FixedUniformProposalSampler: LogitSampler {
         self.uniforms = uniforms
     }
 
+    // DO NOT thread `truncation`/temperature into this `normalizedProbabilities(logits)` call.
+    // This is the DRAFT distribution `q` -- the law the drafter itself actually sampled the
+    // proposed token from -- and it must stay `.untruncated` (temperature 1, no filters)
+    // regardless of what temperature the REQUEST asks for. `SampledMTPResidualCorrection`'s
+    // accept/reject test and its residual correction (`(target - min(target, ratio*draft)) /
+    // (1 - sum(min))`) are only valid when `q` is the distribution actually used to draw the
+    // proposed token; if this call instead used the request's temperature, `q` would no longer
+    // match the token that was actually drawn, silently breaking the distribution-preservation
+    // guarantee that makes the accept/reject/residual scheme produce exactly `p` in expectation.
+    // Only the TARGET distribution (`targetLogits`/`bonusTargetLogits`, below) truncates at the
+    // request's temperature -- see `sharedSampledMTPSupportsPredicate`'s doc comment for why that
+    // one tracks the request's `parameters.sampler()` law exactly at every admitted temperature.
     func sample(logits: MLXArray) -> MLXArray {
         guard uniforms.indices.contains(uniformIndex) else {
             failed = true
@@ -612,6 +667,9 @@ private final class SeededSampledMTPProposalSampler: LogitSampler {
         self.proposalUniforms = SeededSampledMTPUniformSource(seed: seed, domain: .proposal)
     }
 
+    // DO NOT thread `truncation`/temperature into this call -- this is the draft distribution
+    // `q`; see the pin comment on `FixedUniformProposalSampler.sample` above for why it must
+    // stay `.untruncated` regardless of the request's temperature.
     func sample(logits: MLXArray) -> MLXArray {
         do {
             let probabilities = try validatingNormalizedProbabilities(logits)
@@ -673,6 +731,9 @@ private final class NondeterministicSampledMTPProposalSampler: LogitSampler {
         self.entropy = entropy
     }
 
+    // DO NOT thread `truncation`/temperature into this call -- this is the draft distribution
+    // `q`; see the pin comment on `FixedUniformProposalSampler.sample` above for why it must
+    // stay `.untruncated` regardless of the request's temperature.
     func sample(logits: MLXArray) -> MLXArray {
         do {
             let probabilities = try runtimeNormalizedProbabilities(logits)

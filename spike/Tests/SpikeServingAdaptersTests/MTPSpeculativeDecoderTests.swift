@@ -602,14 +602,20 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
                 + "flag must preserve when off), got: \(reason)")
     }
 
-    /// Flag ON + the requires-greedy drafter, but an INSTRUCT-style request that does not match
-    /// `sharedSampledMTPSupportsPredicate` at all (`temperature == 1` is required; this request
-    /// uses 0.7) and additionally carries a nonzero presence penalty, which makes
-    /// `parameters.processor()` non-nil — the OTHER independent way `providerIsEligible` is false
-    /// (`parameters.processor() == nil` is its own separate conjunct). Either failure alone would
-    /// be enough; both are present here. Proves the relaxed predicate did not over-admit: turning
-    /// the flag on for a genuinely-unsupported request must still land on the greedy-requirement
-    /// passthrough, not silently attempt (and mis-degrade) the provider seam.
+    /// Flag ON + the requires-greedy drafter, an INSTRUCT-style request (temperature 0.7, topP
+    /// 1.0), and a nonzero presence penalty, which makes `parameters.processor()` non-nil.
+    ///
+    /// Before the step-(i) relaxation of `sharedSampledMTPSupportsPredicate` (temperature `== 1`
+    /// -> `> 0 && .isFinite`), this request was refused on TWO independent grounds: temperature
+    /// 0.7 failed the predicate's old `temperature == 1` clause, AND the presence penalty made
+    /// `parameters.processor()` non-nil (the OTHER, independent way `providerIsEligible` is
+    /// false). After that relaxation, temperature 0.7 is a finite positive temperature the
+    /// predicate now ADMITS, so only the penalty ground survives here — the temperature ground
+    /// was deliberately removed by the relaxation, not accidentally lost. This test alone can no
+    /// longer distinguish "refused for the penalty" from "refused for anything at all"; see
+    /// `testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetWithoutPenaltyEscapesGreedyPassthrough`
+    /// immediately below for the companion that supplies that missing discrimination, by removing
+    /// the penalty and asserting the SAME temperature/topP shape is now admitted.
     func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetStillTakesGreedyPassthrough()
         async throws
     {
@@ -635,14 +641,63 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         let telemetry = try XCTUnwrap(telemetrySnapshot)
         let reason = try XCTUnwrap(
             telemetry.passthroughReason,
-            "an unsupported (non-temperature-1, penalized) sampled request against a "
-                + "requires-greedy drafter must still take the greedy-requirement passthrough "
-                + "even with the flag on")
+            "a penalized sampled request against a requires-greedy drafter must still take the "
+                + "greedy-requirement passthrough even with the flag on")
         XCTAssertTrue(
             reason.contains("requires temperature == 0"),
-            "the relaxed predicate must not over-admit a request "
-                + "sharedSampledMTPSupportsPredicate/providerIsEligible genuinely refuses; got: "
-                + "\(reason)")
+            "the relaxed predicate must not over-admit a penalized request "
+                + "sharedSampledMTPSupportsPredicate/providerIsEligible genuinely refuses on the "
+                + "surviving (penalty) ground; got: \(reason)")
+    }
+
+    /// The discriminating companion to the test above: the IDENTICAL request shape (temperature
+    /// 0.7, topP 1.0, requires-greedy drafter, flag on) with the ONE variable that test's own
+    /// refusal now hinges on -- the presence penalty -- removed. Without this test, the assertion
+    /// above cannot tell "refused for the penalty" apart from "refused for anything at all"; a
+    /// regression that silently reintroduced a `temperature == 1` requirement would leave that
+    /// test just as green. This test requires the opposite outcome: temperature 0.7 alone, once
+    /// the step-(i) relaxation lands, must be enough to escape the greedy-requirement passthrough
+    /// -- `providerIsEligible` must flip true on this shape exactly as it already does for
+    /// temperature 1 (`testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndDeployedPresetEscapesGreedyPassthrough`
+    /// above), landing on the SAME provider-specific degradation reason for the same documented
+    /// cause (this file's mocks never call the `sampler` argument `draftBlock` receives).
+    func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetWithoutPenaltyEscapesGreedyPassthrough()
+        async throws
+    {
+        let target = MTPSpeculativeDecoderCountingTargetModel(
+            plannedTokens: Self.acceptAllPlannedTokens())
+        let drafter = MTPSpeculativeDecoderGreedyOnlyDrafter(draftedTokenValue: 6)
+        let decoder = try MTPSpeculativeDecoder(
+            target: target, drafter: drafter,
+            cacheFactory: { target.newCache(parameters: nil) },
+            sampledBlockDecisionsEnabled: true)
+        let actor = InferenceActor(decoder: decoder)
+
+        let maxTokens = 5
+        let summary = try await actor.generateBounded(
+            promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
+            sampling: .sampled(temperature: 0.7, topP: 1.0, topK: nil, minP: nil, seed: 42)
+            // Deliberately no `penalties:` argument -- the ONE variable changed from the test
+            // above, isolating the temperature ground this companion exists to re-check.
+        ) { _ in .continueGeneration }
+
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, maxTokens)
+        let telemetrySnapshot = await actor.speculativeTelemetry()
+        let telemetry = try XCTUnwrap(telemetrySnapshot)
+        let reason = try XCTUnwrap(
+            telemetry.passthroughReason,
+            "a truncation-matched, unpenalized temperature-0.7 sampled request against a "
+                + "requires-greedy drafter with sampledBlockDecisionsEnabled must reach the "
+                + "provider seam, not silently stay on the ordinary sampler path")
+        XCTAssertFalse(
+            reason.contains("requires temperature == 0"),
+            "the greedy-requirement passthrough must not fire once the step-(i) relaxation makes "
+                + "providerIsEligible true at temperature 0.7; got: \(reason)")
+        XCTAssertTrue(
+            reason.contains("sampled MTP block decision failed"),
+            "expected the provider-specific degradation reason (proof providerIsEligible really "
+                + "flipped true at a non-1 finite temperature), got: \(reason)")
     }
 
     // MARK: - 7d. Tools do not enter sampled MTP admission (the tools x sampled-MTP intersection)
@@ -673,13 +728,19 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         ],"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0,"presence_penalty":0,"seed":42,"max_tokens":384}
         """
 
-    /// Tools present, but the INSTRUCT preset (temperature 0.7, outside
-    /// `sharedSampledMTPSupportsPredicate`'s `temperature == 1` requirement) — the anti-vacuity
+    /// Tools present, but a preset outside `sharedSampledMTPSupportsPredicate` — the anti-vacuity
     /// companion: a request that SHOULD be refused must still be refused with tools present.
+    ///
+    /// The refusal ground here is `min_p: 0.05` (the predicate requires `minP == 0`), NOT
+    /// temperature: after the step-(i) relaxation of `sharedSampledMTPSupportsPredicate`
+    /// (temperature `== 1` -> `> 0 && .isFinite`), this fixture's `temperature: 0.7` is itself
+    /// admitted by the predicate, so it can no longer carry this test's refusal on its own. Keep
+    /// `min_p` as the ground genuinely unrelated to tools — do not revert to relying on
+    /// temperature here.
     private static let toolBearingInstructPresetRequestJSON = """
         {"model":"qwen3","messages":[
           {"role":"user","content":"do you have the RTX 6000 Ada in stock?"}
-        ],"tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"temperature":0.7,"top_p":1.0,"max_tokens":384}
+        ],"tools":[{"type":"function","function":{"name":"get_product","description":"Look up a product","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"temperature":0.7,"top_p":1.0,"min_p":0.05,"max_tokens":384}
         """
 
     private func requireSampledPolicy(
@@ -754,7 +815,7 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
             presencePenalty: Float(instructPresetRequest.presencePenalty ?? 0))
         XCTAssertFalse(
             provider.supports(parameters: instructParameters),
-            "an unsupported (non-temperature-1) preset must still be refused, tools notwithstanding")
+            "an unsupported (min_p != 0) preset must still be refused, tools notwithstanding")
     }
 
     /// Item 2 (eligible arm): the SAME tool-bearing thinking-preset request, run all the way

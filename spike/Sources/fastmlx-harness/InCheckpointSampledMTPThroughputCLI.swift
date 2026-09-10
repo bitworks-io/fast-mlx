@@ -79,6 +79,28 @@ let inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction = 0.0
 let inCheckpointSampledMTPThroughputBandLowThreshold = 1.05
 let inCheckpointSampledMTPThroughputBandHighThreshold = 1.20
 
+// CAVEAT for `--temperature != 1.0` runs (this flag did not exist when C2/C3 above were
+// calibrated): `inCheckpointSampledMTPThroughputExpectedImpliedAcceptance`/
+// `inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond` were both measured at
+// `temperature=1` (the acceptance run cited above never ran otherwise). C2/C3 therefore do NOT
+// evaluate against those bands when `parsed.temperature != 1`: each control is recorded as
+// `applicable: false` (with a `notApplicableReason` and the observed value still printed to
+// stdout and still written to `--output-json` -- never silently dropped) rather than either
+// passing vacuously or throwing on a band that was never calibrated for that run. This CLI does
+// not (yet) recompute or invent a band for any other temperature -- guessing one would be a
+// separate, independently measured decision, and would be worse than declaring the control
+// inapplicable.
+//
+// The "inapplicable" scope is legitimate, not merely convenient, because instrument identity for
+// a `T != 1` run does not come from these two bands at all: it comes from running the `T = 1.0`
+// control FIRST, in the SAME build, with C2/C3 ARMED and PASSING -- that run is what proves this
+// build/host/session decodes the way the truncated acceptance measurement did. A `T != 1` run in
+// that same build inherits that already-proven identity; it is exercising a different decoding
+// law (`temperature != 1`), not asserting a new, unverified instrument-identity claim that C2/C3
+// would need to police. `--output-json`'s `sampling.temperature` field always records the run's
+// actual temperature (see `InCheckpointSampledMTPThroughputSamplingReport`), so which regime a
+// given C2/C3 verdict (or non-verdict) belongs to is legible after the fact either way.
+
 // MARK: - Truncated acceptance run predeclared vectors (seeded replay control)
 //
 // The seeded per-prompt `(proposedCount, acceptedCount)` vectors from the SAME truncated
@@ -111,12 +133,17 @@ struct InCheckpointSampledMTPThroughputArguments: Equatable, Sendable {
     let outputJSONPath: String
     /// `--top-p`/`--top-k`, optional, defaulting to `1`/`0` -- the untruncated identity, i.e. every
     /// existing invocation that omits these two flags behaves EXACTLY as before this option was
-    /// added. `temperature` and `minP` are NOT exposed as flags: `supports()`
+    /// added. `minP` is NOT exposed as a flag: `supports()`
     /// (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
-    /// `temperature == 1` and `minP == 0`, so a flag that could set either to anything else would
-    /// only ever produce a run where the provider refuses and speculation never engages.
+    /// `minP == 0`, so a flag that could set it to anything else would only ever produce a run where
+    /// the provider refuses and speculation never engages.
     let topP: Double
     let topK: Int
+    /// `--temperature`, optional, defaulting to `1.0` -- see the doc comment on that flag's parsing
+    /// (`parseInCheckpointSampledMTPThroughputArguments`) for what it validates. Unlike the
+    /// acceptance CLI, this CLI carries no temperature counterfactual instrument, so the FULL range
+    /// `supports()` accepts (any finite `temperature > 0`) is exposed here, not pinned to `1.0`.
+    let temperature: Double
 }
 
 enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -135,6 +162,12 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
     case invalidTopP(String)
     /// `supports()` requires `topK >= 0`. Same parse-time refusal rationale as `invalidTopP`.
     case invalidTopK(String)
+    /// `supports()` (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`)
+    /// requires a FINITE temperature `> 0` (`temperature == 0` selects `ArgMaxSampler` -- the greedy
+    /// path, which has its own separate route and is refused here rather than silently measured as
+    /// a degenerate sampled-MTP run; `NaN`/`+-infinity` are never legitimate). Refused at parse time
+    /// -- before any model load -- for the same reason as `invalidTopP`/`invalidTopK`.
+    case invalidTemperature(String)
     case modelPathMustBeAbsolute
     case ngramOffloadPlanMustBeAbsolute
     case promptsFileMustBeAbsolute
@@ -205,6 +238,10 @@ enum InCheckpointSampledMTPThroughputCLIError: Error, Equatable, CustomStringCon
                 + "actual=\(raw)"
         case .invalidTopK(let raw):
             return "--top-k requires a non-negative Int (what supports() accepts); actual=\(raw)"
+        case .invalidTemperature(let raw):
+            return "--temperature requires a finite Double > 0 (temperature == 0 selects the greedy "
+                + "ArgMaxSampler path, and NaN/+-infinity are never legitimate; what supports() "
+                + "accepts); actual=\(raw)"
         case .modelPathMustBeAbsolute: return "--model-path must be an absolute path"
         case .ngramOffloadPlanMustBeAbsolute: return "--ngram-offload-plan must be an absolute path"
         case .promptsFileMustBeAbsolute: return "--prompts-file must be an absolute path"
@@ -263,11 +300,11 @@ func parseInCheckpointSampledMTPThroughputArguments(
         "--model-path", "--ngram-offload-plan", "--prompts-file", "--max-tokens", "--seed",
         "--provider", "--output-json",
     ]
-    // `--top-p`/`--top-k` are OPTIONAL (see the doc comment on
-    // `InCheckpointSampledMTPThroughputArguments.topP`/`.topK`) -- present in `allowed` (so they are
-    // accepted at all) but deliberately absent from `requiredFlags`, so every existing invocation
-    // that omits them keeps working unchanged.
-    let optionalFlags: Set<String> = ["--top-p", "--top-k"]
+    // `--top-p`/`--top-k`/`--temperature` are OPTIONAL (see the doc comments on
+    // `InCheckpointSampledMTPThroughputArguments.topP`/`.topK`/`.temperature`) -- present in
+    // `allowed` (so they are accepted at all) but deliberately absent from `requiredFlags`, so every
+    // existing invocation that omits them keeps working unchanged.
+    let optionalFlags: Set<String> = ["--top-p", "--top-k", "--temperature"]
     let allowed = requiredFlags.union(optionalFlags)
     var values: [String: String] = [:]
     var index = 0
@@ -335,6 +372,18 @@ func parseInCheckpointSampledMTPThroughputArguments(
         throw InCheckpointSampledMTPThroughputCLIError.invalidTopK(rawTopK)
     }
 
+    // Default `"1"` is DELIBERATE, not arbitrary: every measurement run recorded before this flag
+    // existed used the hardcoded `temperature: 1` this default now reproduces exactly, so an
+    // invocation that omits `--temperature` remains byte-for-byte reproducible with its original
+    // command line. Validated against precisely what `supports()` (`sharedSampledMTPSupportsPredicate`,
+    // now any finite `temperature > 0`, not only `1.0`) accepts, at parse time, BEFORE any model
+    // load or measurement is spent -- this is what lets the new `T != 1` acceptance regime actually
+    // be measured by this CLI at all, rather than only ever producing a silent no-speculation run.
+    let rawTemperature = values["--temperature"] ?? "1"
+    guard let temperature = Double(rawTemperature), temperature > 0, temperature.isFinite else {
+        throw InCheckpointSampledMTPThroughputCLIError.invalidTemperature(rawTemperature)
+    }
+
     return InCheckpointSampledMTPThroughputArguments(
         modelPath: modelPath,
         ngramOffloadPlanPath: ngramOffloadPlanPath,
@@ -344,7 +393,8 @@ func parseInCheckpointSampledMTPThroughputArguments(
         provider: provider,
         outputJSONPath: outputJSONPath,
         topP: topP,
-        topK: topK)
+        topK: topK,
+        temperature: temperature)
 }
 
 func inCheckpointSampledMTPThroughputExternalDiagnostic(_ error: Error) -> String {
@@ -577,10 +627,22 @@ struct InCheckpointSampledMTPThroughputControlReport: Codable, Equatable, Sendab
     let impliedAcceptanceExpected: Double
     let impliedAcceptanceToleranceAbsolute: Double
     let impliedAcceptancePassed: Bool
+    /// `false` only when `sampling.temperature != 1` (the band this control checks against was
+    /// calibrated at `temperature=1` -- see the CAVEAT comment near this file's top). `true` for
+    /// every invocation that predates `--temperature`, byte-identical to their original reports.
+    let impliedAcceptanceApplicable: Bool
+    /// `nil` exactly when `impliedAcceptanceApplicable` is `true`. Non-nil names the reason AND
+    /// the run's actual temperature, so a reader of this JSON alone (without the stdout log) can
+    /// still tell a skipped control apart from a passed one.
+    let impliedAcceptanceNotApplicableReason: String?
     let scalarTokensPerSecondObserved: Double
     let scalarTokensPerSecondExpected: Double
     let scalarTokensPerSecondToleranceFraction: Double
     let scalarTokensPerSecondPassed: Bool
+    /// Same rule as `impliedAcceptanceApplicable`, for C3.
+    let scalarTokensPerSecondApplicable: Bool
+    /// Same rule as `impliedAcceptanceNotApplicableReason`, for C3.
+    let scalarTokensPerSecondNotApplicableReason: String?
     let promptCount: Int
     let requiredPromptCount: Int
     let maxTokens: Int
@@ -671,15 +733,17 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
         expectedSourceKeyCount: inCheckpointSampledMTPArtifactSelection.expectedSourceKeyCount,
         revision: inCheckpointSampledMTPArtifactSelection.revision)
 
-    // `temperature` and `minP` are PINNED, not a choice -- identical rationale to the acceptance
-    // CLI: `supports()` (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`)
-    // requires exactly `temperature == 1` and `minP == 0`, and there is no flag for either. `topP`/
-    // `topK` ARE settable, via `--top-p`/`--top-k`, and default to the untruncated identity (`1`/
-    // `0`); `parseInCheckpointSampledMTPThroughputArguments` already rejects any value `supports()`
-    // would refuse.
+    // `minP` is PINNED, not a choice: `supports()`
+    // (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
+    // `minP == 0`, and there is no flag for it. `topP`/`topK`/`temperature` ARE settable, via
+    // `--top-p`/`--top-k`/`--temperature`. `topP`/`topK` default to the untruncated identity (`1`/
+    // `0`); `temperature` defaults to `1.0`, matching every measurement run recorded before this
+    // flag existed. `parseInCheckpointSampledMTPThroughputArguments` already rejects any value
+    // `supports()` would refuse, so `parsed.topP`/`parsed.topK`/`parsed.temperature` are always
+    // within the accepted range by the time they reach here.
     let parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
-        temperature: 1,
+        temperature: Float(parsed.temperature),
         topP: Float(parsed.topP),
         topK: parsed.topK,
         minP: 0,
@@ -687,7 +751,10 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
     // Built from the SAME `parameters` value handed to `MTPSpeculativeTokenIterator` inside
     // `runSpeculativeArm` below (not a second, independently invented truncation) -- this is what
     // makes it structurally impossible for the provider's stored truncation and this run's own
-    // request truncation to disagree.
+    // request truncation to disagree. This holds for `temperature` exactly as it already held for
+    // `topP`/`topK`: `SampledMTPSamplingTruncation(parameters:)` reads `parameters.temperature`
+    // directly, so a `--temperature` other than the default flows into the provider's stored
+    // truncation automatically, with nothing to keep in sync by hand.
     let truncation = SampledMTPSamplingTruncation(parameters: parameters)
     let samplingReport = InCheckpointSampledMTPThroughputSamplingReport(
         temperature: Double(parameters.temperature),
@@ -703,10 +770,10 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
             + "seed=\(parsed.seed) sampling: temperature=\(samplingReport.temperature) "
             + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) minP=\(samplingReport.minP) "
             + "repetitionPenalty=nil presencePenalty=nil frequencyPenalty=nil "
-            + "(temperature=1 and minP=0 are PINNED -- supports() requires exactly those; topP/topK "
-            + "are settable via --top-p/--top-k, default to the untruncated identity (1/0), and the "
-            + "ACTUAL values this run measured are topP=\(samplingReport.topP) "
-            + "topK=\(samplingReport.topK), printed above)")
+            + "(minP=0 is PINNED -- supports() requires exactly that; topP/topK/temperature are "
+            + "settable via --top-p/--top-k/--temperature, default to the untruncated identity "
+            + "(1/0/1.0), and the ACTUAL values this run measured are topP=\(samplingReport.topP) "
+            + "topK=\(samplingReport.topK) temperature=\(samplingReport.temperature), printed above)")
 
     var promptReports: [InCheckpointSampledMTPThroughputPromptReport] = []
     var pooledProposedCount = 0
@@ -915,11 +982,26 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
     let impliedAcceptancePassed = impliedAcceptance.map {
         inCheckpointSampledMTPThroughputImpliedAcceptanceControlPasses(observed: $0)
     } ?? false
+    // NOT APPLICABLE (rather than a throw or a vacuous PASS) when `temperature != 1`: the band
+    // above was calibrated at `temperature=1` only -- see the CAVEAT comment near this file's top.
+    let impliedAcceptanceApplicable = parsed.temperature == 1
+    let impliedAcceptanceNotApplicableReason: String? =
+        impliedAcceptanceApplicable
+        ? nil
+        : "band calibrated at temperature 1, this run is at temperature \(parsed.temperature)"
+    let impliedAcceptanceVerdict: String
+    if let impliedAcceptanceNotApplicableReason {
+        impliedAcceptanceVerdict =
+            "NOT APPLICABLE -- \(impliedAcceptanceNotApplicableReason) (observed "
+            + (impliedAcceptance.map { String(format: "%.4f", $0) } ?? "n/a") + ")"
+    } else {
+        impliedAcceptanceVerdict = impliedAcceptancePassed ? "PASS" : "FAIL"
+    }
     print(
         "control C2 (implied acceptance vs "
             + "\(String(format: "%.4f", inCheckpointSampledMTPThroughputExpectedImpliedAcceptance)) "
             + "+/- \(inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute)): "
-            + (impliedAcceptancePassed ? "PASS" : "FAIL"))
+            + impliedAcceptanceVerdict)
 
     // C2's decisive form for seeded (predeclaration, Part A3) -- INFORMATIONAL ONLY, printed
     // unconditionally (even if C2's band check above is about to abort the run) and NEVER thrown
@@ -960,27 +1042,52 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
                         + "run; the band below still governs"))
     }
 
-    guard let impliedAcceptance, impliedAcceptancePassed else {
-        throw InCheckpointSampledMTPThroughputCLIError.impliedAcceptanceOutOfBand(
-            observed: impliedAcceptance ?? .nan, proposedCount: pooledProposedCount,
-            acceptedCount: pooledAcceptedCount,
-            expected: inCheckpointSampledMTPThroughputExpectedImpliedAcceptance,
-            toleranceAbsolute: inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute)
+    // At `temperature == 1` this must still throw exactly as before this flag existed --
+    // ARMED, not softened. At `temperature != 1` the band above does not describe this run
+    // (`impliedAcceptanceApplicable == false`, already recorded above and in `--output-json`), so
+    // there is nothing here to enforce; execution continues instead of aborting before the
+    // results file is written.
+    if impliedAcceptanceApplicable {
+        guard let impliedAcceptance, impliedAcceptancePassed else {
+            throw InCheckpointSampledMTPThroughputCLIError.impliedAcceptanceOutOfBand(
+                observed: impliedAcceptance ?? .nan, proposedCount: pooledProposedCount,
+                acceptedCount: pooledAcceptedCount,
+                expected: inCheckpointSampledMTPThroughputExpectedImpliedAcceptance,
+                toleranceAbsolute: inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute)
+        }
     }
 
     // C3
     let scalarControlPassed = inCheckpointSampledMTPThroughputScalarControlPasses(
         observedMeanTokensPerSecond: scalarSummary.mean)
+    // Same NOT APPLICABLE treatment as C2, and for the same reason: this band was calibrated at
+    // `temperature=1` only.
+    let scalarControlApplicable = parsed.temperature == 1
+    let scalarControlNotApplicableReason: String? =
+        scalarControlApplicable
+        ? nil
+        : "band calibrated at temperature 1, this run is at temperature \(parsed.temperature)"
+    let scalarControlVerdict: String
+    if let scalarControlNotApplicableReason {
+        scalarControlVerdict =
+            "NOT APPLICABLE -- \(scalarControlNotApplicableReason) (observed "
+            + String(format: "%.4f", scalarSummary.mean) + ")"
+    } else {
+        scalarControlVerdict = scalarControlPassed ? "PASS" : "FAIL"
+    }
     print(
         "control C3 (scalar tok/s vs "
             + "\(String(format: "%.2f", inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond)) "
             + "+/- \(String(format: "%.0f", inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction * 100))%): "
-            + (scalarControlPassed ? "PASS" : "FAIL"))
-    guard scalarControlPassed else {
-        throw InCheckpointSampledMTPThroughputCLIError.scalarThroughputOutOfBand(
-            observed: scalarSummary.mean,
-            expected: inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond,
-            toleranceFraction: inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction)
+            + scalarControlVerdict)
+    // Same ARMED-at-T=1 / not-applicable-otherwise rule as C2's guard above.
+    if scalarControlApplicable {
+        guard scalarControlPassed else {
+            throw InCheckpointSampledMTPThroughputCLIError.scalarThroughputOutOfBand(
+                observed: scalarSummary.mean,
+                expected: inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond,
+                toleranceFraction: inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction)
+        }
     }
 
     let band = inCheckpointSampledMTPThroughputBand(
@@ -994,10 +1101,14 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
         impliedAcceptanceExpected: inCheckpointSampledMTPThroughputExpectedImpliedAcceptance,
         impliedAcceptanceToleranceAbsolute: inCheckpointSampledMTPThroughputImpliedAcceptanceToleranceAbsolute,
         impliedAcceptancePassed: impliedAcceptancePassed,
+        impliedAcceptanceApplicable: impliedAcceptanceApplicable,
+        impliedAcceptanceNotApplicableReason: impliedAcceptanceNotApplicableReason,
         scalarTokensPerSecondObserved: scalarSummary.mean,
         scalarTokensPerSecondExpected: inCheckpointSampledMTPThroughputExpectedScalarTokensPerSecond,
         scalarTokensPerSecondToleranceFraction: inCheckpointSampledMTPThroughputScalarTokensPerSecondToleranceFraction,
         scalarTokensPerSecondPassed: scalarControlPassed,
+        scalarTokensPerSecondApplicable: scalarControlApplicable,
+        scalarTokensPerSecondNotApplicableReason: scalarControlNotApplicableReason,
         promptCount: prompts.count,
         requiredPromptCount: inCheckpointSampledMTPThroughputRequiredPromptCount,
         maxTokens: parsed.maxTokens,

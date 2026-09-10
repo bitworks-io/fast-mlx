@@ -105,12 +105,20 @@ struct InCheckpointSampledMTPAcceptanceArguments: Equatable, Sendable {
     let outputJSONPath: String
     /// `--top-p`/`--top-k`, optional, defaulting to `1`/`0` -- the untruncated identity, i.e. every
     /// existing invocation that omits these two flags behaves EXACTLY as before this option was
-    /// added. `temperature` and `minP` are NOT exposed as flags: `supports()`
+    /// added. `minP` is NOT exposed as a flag: `supports()`
     /// (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
-    /// `temperature == 1` and `minP == 0`, so a flag that could set either to anything else would
-    /// only ever produce a run where the provider refuses and speculation never engages.
+    /// `minP == 0`, so a flag that could set it to anything else would only ever produce a run where
+    /// the provider refuses and speculation never engages.
     let topP: Double
     let topK: Int
+    /// `--temperature`, optional, defaulting to `1.0` -- see the doc comment on that flag's parsing
+    /// (`parseInCheckpointSampledMTPAcceptanceArguments`) for why THIS CLI, unlike the throughput
+    /// CLI, refuses any value other than `1.0` even though `supports()` itself now admits a wider
+    /// range: the temperature counterfactual replay (`inCheckpointSampledMTPCounterfactualTempering`
+    /// and its `sigma_1`/`Delta` reporting below) treats its `T=1.0` column as THIS RUN'S OWN LAW,
+    /// not merely one point in a fixed counterfactual list -- that is only true when the run itself
+    /// actually decoded at `T=1`.
+    let temperature: Double
 }
 
 enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringConvertible, Sendable {
@@ -129,6 +137,20 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
     case invalidTopP(String)
     /// `supports()` requires `topK >= 0`. Same parse-time refusal rationale as `invalidTopP`.
     case invalidTopK(String)
+    /// `supports()` (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`)
+    /// requires a FINITE temperature `> 0` (`temperature == 0` selects `ArgMaxSampler` -- the greedy
+    /// path, which has its own separate route and is refused here rather than silently measured as
+    /// a degenerate sampled-MTP run; `NaN`/`+-infinity` are never legitimate). Refused at parse time
+    /// -- before any model load -- for the same reason as `invalidTopP`/`invalidTopK`.
+    case invalidTemperature(String)
+    /// `supports()` itself now admits any finite `temperature > 0`, not only `1.0` -- but THIS CLI's
+    /// temperature counterfactual replay (`inCheckpointSampledMTPCounterfactualTempering`) treats its
+    /// `T=1.0` column as the run's OWN law (see the doc comment on
+    /// `InCheckpointSampledMTPAcceptanceArguments.temperature`), so a run that actually decoded at a
+    /// different temperature would silently report a `sigma_1`/`Delta` pair computed against a
+    /// counterfactual rather than against itself. Refused at parse time rather than left as a latent
+    /// mislabeling. The throughput CLI carries no such instrument and has no equivalent refusal.
+    case temperaturePinnedForTemperingCounterfactual(Double)
     case modelPathMustBeAbsolute
     case ngramOffloadPlanMustBeAbsolute
     case promptsFileMustBeAbsolute
@@ -214,6 +236,16 @@ enum InCheckpointSampledMTPAcceptanceCLIError: Error, Equatable, CustomStringCon
                 + "actual=\(raw)"
         case .invalidTopK(let raw):
             return "--top-k requires a non-negative Int (what supports() accepts); actual=\(raw)"
+        case .invalidTemperature(let raw):
+            return "--temperature requires a finite Double > 0 (temperature == 0 selects the greedy "
+                + "ArgMaxSampler path, and NaN/+-infinity are never legitimate; what supports() "
+                + "accepts); actual=\(raw)"
+        case .temperaturePinnedForTemperingCounterfactual(let value):
+            return "--temperature=\(value) refused: qwen4exp-sampled-mtp-acceptance's temperature "
+                + "counterfactual replay treats its T=1.0 column as this run's OWN decoding law, not "
+                + "merely one entry in a fixed counterfactual list -- that is only true when this run "
+                + "itself actually decodes at temperature=1.0. This CLI accepts --temperature=1.0 "
+                + "only; use qwen4exp-sampled-mtp-throughput to measure other temperatures"
         case .modelPathMustBeAbsolute: return "--model-path must be an absolute path"
         case .ngramOffloadPlanMustBeAbsolute: return "--ngram-offload-plan must be an absolute path"
         case .promptsFileMustBeAbsolute: return "--prompts-file must be an absolute path"
@@ -293,11 +325,11 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         "--model-path", "--ngram-offload-plan", "--prompts-file", "--max-tokens", "--seed",
         "--provider", "--output-json",
     ]
-    // `--top-p`/`--top-k` are OPTIONAL (see the doc comment on
-    // `InCheckpointSampledMTPAcceptanceArguments.topP`/`.topK`) -- present in `allowed` (so they are
-    // accepted at all) but deliberately absent from `requiredFlags`, so every existing invocation
-    // that omits them keeps working unchanged.
-    let optionalFlags: Set<String> = ["--top-p", "--top-k"]
+    // `--top-p`/`--top-k`/`--temperature` are OPTIONAL (see the doc comments on
+    // `InCheckpointSampledMTPAcceptanceArguments.topP`/`.topK`/`.temperature`) -- present in
+    // `allowed` (so they are accepted at all) but deliberately absent from `requiredFlags`, so every
+    // existing invocation that omits them keeps working unchanged.
+    let optionalFlags: Set<String> = ["--top-p", "--top-k", "--temperature"]
     let allowed = requiredFlags.union(optionalFlags)
     var values: [String: String] = [:]
     var index = 0
@@ -367,6 +399,25 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         throw InCheckpointSampledMTPAcceptanceCLIError.invalidTopK(rawTopK)
     }
 
+    // Default `"1"` is DELIBERATE, not arbitrary: every measurement run recorded before this flag
+    // existed used the hardcoded `temperature: 1` this default now reproduces exactly, so an
+    // invocation that omits `--temperature` remains byte-for-byte reproducible with its original
+    // command line. `supports()` (`sharedSampledMTPSupportsPredicate`) now admits any finite
+    // `temperature > 0`, not only `1.0` -- validated first, generally, below. THIS CLI additionally
+    // refuses anything other than `1.0` (see `temperaturePinnedForTemperingCounterfactual`'s doc
+    // comment and `InCheckpointSampledMTPAcceptanceArguments.temperature`): its temperature
+    // counterfactual replay's `T=1.0` column is only a faithful reading of the run's own law when
+    // the run itself actually decoded at `T=1`. The throughput CLI carries no such instrument and
+    // exposes the full range `supports()` accepts.
+    let rawTemperature = values["--temperature"] ?? "1"
+    guard let temperature = Double(rawTemperature), temperature > 0, temperature.isFinite else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.invalidTemperature(rawTemperature)
+    }
+    guard temperature == 1 else {
+        throw InCheckpointSampledMTPAcceptanceCLIError.temperaturePinnedForTemperingCounterfactual(
+            temperature)
+    }
+
     return InCheckpointSampledMTPAcceptanceArguments(
         modelPath: modelPath,
         ngramOffloadPlanPath: ngramOffloadPlanPath,
@@ -376,7 +427,8 @@ func parseInCheckpointSampledMTPAcceptanceArguments(
         provider: provider,
         outputJSONPath: outputJSONPath,
         topP: topP,
-        topK: topK)
+        topK: topK,
+        temperature: temperature)
 }
 
 func inCheckpointSampledMTPAcceptanceExternalDiagnostic(_ error: Error) -> String {
@@ -710,9 +762,16 @@ func inCheckpointSampledMTPSigmaMinPQ(target p: [Double], draft q: [Double]) -> 
 //
 // Contract: `docs/task-inbox/2026-09-09-sampled-mtp-temperature-counterfactual-PREDECLARATION.md`.
 // A REPLAY over already-computed logits -- zero incremental GPU work, no gate change, no new model
-// run. `supports()` only ever admits `temperature == 1` (`SampledMTPBlockRuntimeBridge.swift:174`),
-// so every live run this file drives is itself always at `targetTemperature == 1`; the temperatures
-// below are a fixed, pinned counterfactual list, entirely independent of that run parameter.
+// run. `supports()` (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) now
+// admits any finite `temperature > 0`, not only `1.0` -- but THIS CLI's own `--temperature` parsing
+// (`parseInCheckpointSampledMTPAcceptanceArguments`) refuses anything other than `1.0`
+// (`temperaturePinnedForTemperingCounterfactual`), so every live run this file drives is STILL
+// always at `targetTemperature == 1`, by this file's own parse-time refusal rather than by
+// `supports()`'s admission rule. That refusal exists BECAUSE of this section: the temperatures below
+// are a fixed, pinned counterfactual list whose `T=1.0` entry is read downstream as the run's OWN
+// law (see the `sigma_1`/`Delta` reporting later in this file) -- a run that actually decoded at a
+// different temperature would make that reading silently wrong. `qwen4exp-sampled-mtp-throughput`
+// carries no equivalent instrument and exposes the full `supports()`-accepted temperature range.
 
 /// Ordered, pinned temperature list this counterfactual replay measures. Order matters:
 /// `InCheckpointSampledMTPStepTemperingSample.sigmaByTemperature[i]` corresponds to
@@ -1295,10 +1354,11 @@ final class InCheckpointMeasuringSampledMTPBlockRuntimeProvider: SampledMTPBlock
                     targetRow: targetRow, draft: q, targetTopP: targetTopP, targetTopK: targetTopK,
                     targetMinP: targetMinP)
                 // `sigma_T` at `T=1.0` is the SAME quantity as `sigma` above only when
-                // `targetTemperature == 1` -- true of every live run this file drives (`supports()`
-                // pins it), but asserted here rather than assumed: `tempering` was computed from an
-                // entirely independent call to `independentTruncatedProbabilities`, and a divergence
-                // would invalidate every pooled `sigma_T` comparison downstream.
+                // `targetTemperature == 1` -- true of every live run this file drives (this CLI's own
+                // `--temperature` parsing refuses anything else; see the MARK header above), but
+                // asserted here rather than assumed: `tempering` was computed from an entirely
+                // independent call to `independentTruncatedProbabilities`, and a divergence would
+                // invalidate every pooled `sigma_T` comparison downstream.
                 if targetTemperature == 1 {
                     precondition(
                         tempering.sigmaByTemperature[0] == sigma,
@@ -1514,17 +1574,20 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         expectedSourceKeyCount: inCheckpointSampledMTPArtifactSelection.expectedSourceKeyCount,
         revision: inCheckpointSampledMTPArtifactSelection.revision)
 
-    // `temperature` and `minP` are PINNED, not a choice: `supports()`
+    // `minP` is PINNED, not a choice: `supports()`
     // (`SampledMTPBlockRuntimeBridge.swift`'s `sharedSampledMTPSupportsPredicate`) requires exactly
-    // `temperature == 1` and `minP == 0`, and `providerIsEligible` additionally requires
-    // `parameters.processor() == nil` (`MTPSpeculativeTokenIterator.swift:171-173`) -- there is no
-    // flag for either. `topP`/`topK` ARE settable, via `--top-p`/`--top-k`, and default to the
-    // untruncated identity (`1`/`0`); `parseInCheckpointSampledMTPAcceptanceArguments` already
-    // rejects any value `supports()` would refuse, so `parsed.topP`/`parsed.topK` are always within
-    // the accepted range by the time they reach here.
+    // `minP == 0`, and `providerIsEligible` additionally requires `parameters.processor() == nil`
+    // (`MTPSpeculativeTokenIterator.swift:171-173`) -- there is no flag for it. `topP`/`topK`/
+    // `temperature` ARE settable, via `--top-p`/`--top-k`/`--temperature`. `topP`/`topK` default to
+    // the untruncated identity (`1`/`0`); `temperature` defaults to `1.0`, matching every measurement
+    // run recorded before this flag existed. `parseInCheckpointSampledMTPAcceptanceArguments` already
+    // rejects any value `supports()` would refuse, AND (temperature only, this CLI specifically)
+    // any value other than `1.0` -- see `temperaturePinnedForTemperingCounterfactual`'s doc comment
+    // -- so `parsed.topP`/`parsed.topK`/`parsed.temperature` are always within the accepted range
+    // (and `parsed.temperature == 1` exactly) by the time they reach here.
     let parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
-        temperature: 1,
+        temperature: Float(parsed.temperature),
         topP: Float(parsed.topP),
         topK: parsed.topK,
         minP: 0,
@@ -1543,10 +1606,12 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
             + "seed=\(parsed.seed) sampling: temperature=\(samplingReport.temperature) "
             + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) minP=\(samplingReport.minP) "
             + "repetitionPenalty=nil presencePenalty=nil frequencyPenalty=nil "
-            + "(temperature=1 and minP=0 are PINNED -- supports() requires exactly those; topP/topK "
-            + "are settable via --top-p/--top-k, default to the untruncated identity (1/0), and the "
-            + "ACTUAL values this run measured are topP=\(samplingReport.topP) "
-            + "topK=\(samplingReport.topK), printed above)")
+            + "(minP=0 is PINNED -- supports() requires exactly that; topP/topK/temperature are "
+            + "settable via --top-p/--top-k/--temperature, default to the untruncated identity "
+            + "(1/0/1.0), and this CLI additionally refuses --temperature != 1.0 -- see "
+            + "temperaturePinnedForTemperingCounterfactual; the ACTUAL values this run measured are "
+            + "topP=\(samplingReport.topP) topK=\(samplingReport.topK) "
+            + "temperature=\(samplingReport.temperature), printed above)")
 
     var streamReports: [InCheckpointSampledMTPAcceptanceStreamReport] = []
     var cleanOutcomes: [InCheckpointSampledMTPBlockOutcome] = []
