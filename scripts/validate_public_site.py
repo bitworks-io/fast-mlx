@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "7c99d3f0254c9886d91819e6e91dc711a7ce05beb924baba9517cf88a8442a67"
+    "f86a21e5b6728be702ff31f964d9ad6d2c2bdebd80b3538cb7b94dd2e98eb81b"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "39dd1a74b76aaec2cbd4d4e8a16dc520def11d65afd79a224c25be908df31600"
+    "e4a58d90cb64a1743f2c6100d3fe8ceab538ef53404f20720606bdc98e9985f3"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "29 published research notes",
+    "30 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -484,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/the-default-nobody-chose/",
     "research/a-ratio-is-not-a-result/",
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/",
     "research/every-tool-call-took-the-path-we-never-tested/",
@@ -515,6 +516,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/the-default-nobody-chose/": ("2026-09-10", "2026-09-10"),
     "research/a-ratio-is-not-a-result/": ("2026-09-09", "2026-09-09"),
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/": ("2026-09-08", "2026-09-08"),
     "research/every-tool-call-took-the-path-we-never-tested/": ("2026-09-08", "2026-09-08"),
@@ -811,6 +813,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/the-default-nobody-chose/": (
+        "The default nobody chose — fast-mlx",
+        "A client that sends no temperature gets greedy argmax. That sounds like a reasonable default until you notice two things: the model's authors shipped a recommended sampler inside the checkpoint, and greedy is the…",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/a-ratio-is-not-a-result/": (
         "A ratio is not a result — fast-mlx",
