@@ -73,8 +73,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # times (see the comment above the publicIndex assertion for the full history). Both call
 # sites below read this constant; there is no longer a second literal to drift.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 909,
-    "pathModeSha256": "1ce73fdef780c0b1a467ff1938f3d0f34ce8d753024d8f4908134e217f7ada80",
+    "pathCount": 912,
+    "pathModeSha256": "82d9b5d7856271dc57a00fca1b2cd8ff947bb6911f73fb73c9b7243cd016b978",
 }
 
 
@@ -224,7 +224,23 @@ class PublicExportTests(unittest.TestCase):
 
             failures = validate_public_repository.validate(output)
 
+            # The seal is checked HERE, in the narrow regression, and not only in
+            # test_public_projection_uses_sanitized_vendor_overrides below, because this is the
+            # only export check the commit process mandates on every increment. Four times now a
+            # reseal has moved public/public-repository-public.json while leaving
+            # SEALED_PUBLIC_INDEX stale; each time this test passed at HEAD -- it called the
+            # validator and never read the seal -- and the miss surfaced only as a red public CI
+            # run, the last time AFTER the projection had already been pushed. Reading the seal
+            # from the tree this test already exports costs nothing and makes the mandated gate
+            # structurally capable of catching it. This is still a tripwire, not a recomputation:
+            # it compares against the hardcoded constant, so it fails for an unintended path just
+            # as loudly as for an intended one.
+            exported_index = json.loads(
+                (output / "public/public-repository.json").read_text(encoding="utf-8")
+            ).get("publicIndex")
+
         self.assertEqual(failures, [])
+        self.assertEqual(exported_index, SEALED_PUBLIC_INDEX)
 
     def test_sampled_generation_foundation_is_exported_byte_for_byte(self) -> None:
         development_manifest = json.loads(
@@ -612,6 +628,28 @@ class PublicExportTests(unittest.TestCase):
         # same increment edited two already-projected files in place (byte-only, no reseal of their
         # own): the codec gained the translation seam and Package.swift declared the Jinja product
         # that was already resolved transitively. All three places moved together.
+        #
+        # 909 -> 912 added, in one increment:
+        # spike/Sources/ServingCore/GenerationConfigSamplingDefaults.swift and its
+        # spike/Tests/ServingCoreTests/GenerationConfigSamplingDefaultsTests.swift coverage, plus
+        # spike/Tests/ServingCoreTests/DefaultSamplingServeArgumentTests.swift -- the artifact-
+        # sourced default sampler and the `--default-sampling <off|generation-config>` flag whose
+        # refusals gate it. Confirmed to belong in public before reseal: ordinary source/XCTest
+        # coverage of already-projected serving contracts (ServingSamplingPolicy and
+        # FastMLXServeArguments are both projected), driven by hand-written generation_config
+        # fixtures written to a temporary path rather than any real checkpoint, carrying no
+        # checkpoint text, no infrastructure detail and no machine-local path.
+        #
+        # The two places did NOT move together this time, and that is the fourth recurrence of the
+        # failure this constant exists to prevent. The reseal updated
+        # public/public-repository-public.json to 912 and left SEALED_PUBLIC_INDEX at 909, so the
+        # narrow projection regression -- the only export check the commit process mandates --
+        # passed at HEAD, the projection was pushed to origin/main, and the miss surfaced only as a
+        # red public CI run AFTER publication. Recording the mechanism, not just the value: the
+        # narrow regression calls the validator and never reads the seal, so it is structurally
+        # incapable of catching a stale literal here. See the seal assertion now carried by
+        # test_current_development_projection_passes_public_validator, added in the same increment
+        # as this entry, which closes that hole.
         self.assertEqual(
             public_manifest.get("publicIndex"),
             SEALED_PUBLIC_INDEX,
