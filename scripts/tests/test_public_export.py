@@ -73,8 +73,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # times (see the comment above the publicIndex assertion for the full history). Both call
 # sites below read this constant; there is no longer a second literal to drift.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 907,
-    "pathModeSha256": "3204158166a11d7101523a547ffbec3354ce8c278c2a72abc27611c4273f352e",
+    "pathCount": 908,
+    "pathModeSha256": "19cbed1e282d7dea4fa14da066dcf02fe90e2729f9fb34d7d67bf7754b135666",
 }
 
 
@@ -534,6 +534,23 @@ class PublicExportTests(unittest.TestCase):
         # name in a projected path or its bytes. The same increment edited one already-projected
         # file in place (byte-only, no reseal of its own): Harness.swift gained the subcommand
         # dispatch and its usage text. All three places moved together.
+        #
+        # 907 -> 908 added, in one increment:
+        # spike/Tests/SpikeCoreTests/TopPFilterRankGenericityTests.swift -- direct coverage of
+        # `applyTopPFilter`, which is a public function whose doc comment asserts a rank contract
+        # ("no rank precondition", unlike `applyTopKFilter`) that no test had ever exercised: both
+        # live call sites pass rank 2, and the existing suites reach the function only through
+        # them. It pins rank-1/rank-2 exact agreement, and pins that the `min_tokens_to_keep`
+        # floor is the sole survivor mechanism in a regime an unconditional anti-vacuity
+        # precondition MEASURES rather than assumes -- an earlier draft claimed that regime at a
+        # narrower width where float32 `cumsum` rounding overshot the threshold, so deleting the
+        # floor term left the suite green and the test passed for the wrong reason. Confirmed to
+        # belong in public before reseal: ordinary XCTest coverage of an already-projected tree,
+        # driving synthetic in-test logit fixtures rather than any checkpoint, with no
+        # infrastructure detail, no machine-local path, and deliberately family-neutral
+        # identifiers, since the projected-marker gate fails closed on the internal
+        # implementation-family CamelCase name in a projected path or its bytes. No other
+        # projected file moved in this increment.
         #
         # 906 -> 907 added, in one increment:
         # spike/Tests/SpikeServingAdaptersTests/OffloadPlanCheckOnlyServeWiringStructuralTests.swift
