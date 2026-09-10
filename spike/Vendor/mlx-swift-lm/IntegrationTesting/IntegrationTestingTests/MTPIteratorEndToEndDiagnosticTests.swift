@@ -34,10 +34,9 @@ private struct LoadedPair {
 }
 
 /// Recording `LogitProcessor` for the emit-only invariant test
-/// `testMTPLogitProcessorReceivesOnlyEmittedTokens`. Struct so that
-/// `var verifyProcessorCopy = processor` in `speculateRound` forks the
-/// `recordedTokens` array via Swift copy-on-write — mutations to the
-/// verify-loop copy do not propagate to the canonical processor.
+/// `testMTPLogitProcessorReceivesOnlyEmittedTokens`. Records
+/// `didSample(token:)` calls so the test can verify which tokens the
+/// canonical processor actually observed.
 private struct EmissionLog: LogitProcessor {
     var recordedTokens: [Int] = []
     mutating func prompt(_ prompt: MLXArray) {}
@@ -745,9 +744,10 @@ struct MTPIteratorEndToEndDiagnosticTests {
     /// Locks in the behavior that `MTPSpeculativeTokenIterator.processor`
     /// (the canonical processor) receives `didSample(token:)` calls ONLY
     /// for emitted tokens (accepted drafts + correction per round, plus
-    /// passthrough tokens if engaged). The verify loop's sampling, which
-    /// runs on a struct value-copy (`verifyProcessorCopy` inside
-    /// `speculateRound`), must NOT pollute the canonical processor.
+    /// passthrough tokens if engaged). `speculateRound`'s sequential verify
+    /// loop breaks at the first draft mismatch, so verify positions after a
+    /// mismatch are never sampled and therefore never observed by any
+    /// processor — there is no copy for extra samples to leak from.
     ///
     /// Uses the test-only `_setProcessorForTesting` / `_processorForTesting`
     /// accessors (guarded by `@_spi(Testing)`) to install a recording
@@ -819,17 +819,18 @@ struct MTPIteratorEndToEndDiagnosticTests {
         // checked at next() boundaries, so the last round's tail can
         // exceed the emit budget).
         //
-        // Under a regression where verify-loop didSample leaks from the
-        // local copy into the canonical processor, log size inflates
-        // by ~(numDraft + 1) / (accepted + 1) — roughly 2× at the
-        // ~50% acceptance rate of this configuration. The tight upper
-        // bound below catches that case.
+        // Under a regression where the verify loop's didSample fires for a
+        // verify position beyond what was actually emitted (i.e. a
+        // rejected/never-sampled position leaking into the canonical
+        // processor), log size inflates by ~(numDraft + 1) / (accepted + 1)
+        // — roughly 2× at the ~50% acceptance rate of this configuration.
+        // The tight upper bound below catches that case.
         let blockSize = 4
         let upperBound = emitted.count + blockSize
         let lowerBound = emitted.count - 2
         #expect(
             log.recordedTokens.count <= upperBound,
-            "log size \(log.recordedTokens.count) > emitted+overhang \(upperBound) — verify-loop didSample is leaking from `verifyProcessorCopy` into `self.processor`. The struct value-semantics scoping has regressed."
+            "log size \(log.recordedTokens.count) > emitted+overhang \(upperBound) — verify-loop didSample is firing for a verify position beyond what the round actually emitted."
         )
         #expect(
             log.recordedTokens.count >= lowerBound,
@@ -838,16 +839,17 @@ struct MTPIteratorEndToEndDiagnosticTests {
         #expect(
             iter.passthroughReason == nil,
             "passthrough engaged unexpectedly: \(iter.passthroughReason ?? "")")
-        #expect(
-            log.recordedTokens.count >= 1,
+        let firstRecorded = try #require(
+            log.recordedTokens.first,
             "no speculation-round didSamples — speculation did not run on the canonical processor")
 
         // Content sanity: log should overlap with emitted's speculation
-        // suffix. Detect the prepare-bonus offset by matching log[0]
-        // against the first 3 emitted positions (Gemma 4 yields 1 or 2
-        // prepare bonuses), then verify the overlapping prefix matches.
+        // suffix. Detect the prepare-bonus offset by matching the first
+        // recorded token against the first 3 emitted positions (Gemma 4
+        // yields 1 or 2 prepare bonuses), then verify the overlapping
+        // prefix matches.
         if let offset = (0 ..< Swift.min(3, emitted.count))
-            .first(where: { emitted[$0] == log.recordedTokens[0] })
+            .first(where: { emitted[$0] == firstRecorded })
         {
             let commonCount = Swift.min(
                 log.recordedTokens.count, emitted.count - offset)
@@ -855,11 +857,11 @@ struct MTPIteratorEndToEndDiagnosticTests {
             let emittedSlice = Array(emitted[offset ..< offset + commonCount])
             #expect(
                 logPrefix == emittedSlice,
-                "recorded didSample sequence diverged from emitted-stream at offset \(offset). Recorded prefix: \(logPrefix). Emitted slice: \(emittedSlice). Verify-loop didSample is leaking from the local copy into the canonical processor."
+                "recorded didSample sequence diverged from emitted-stream at offset \(offset). Recorded prefix: \(logPrefix). Emitted slice: \(emittedSlice). Verify-loop didSample is observing a token that was never actually emitted."
             )
         } else {
             Issue.record(
-                "log[0]=\(log.recordedTokens[0]) not found in emitted[0..<3]=\(Array(emitted.prefix(3))) — content overlap broken"
+                "log[0]=\(firstRecorded) not found in emitted[0..<3]=\(Array(emitted.prefix(3))) — content overlap broken"
             )
         }
     }

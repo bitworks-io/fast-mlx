@@ -51,7 +51,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/MTPSpeculativeTokenIteratorTests.swift",
-        "sha256": "8c85863172a0b83fbd0b43403441fcd19ec2a687aa750f8f0907597eedc9a826",
+        "sha256": "67a88575c2cf0a0834eb1822333b6b8b7151030884b31a3aa8e43fa9eb81591b",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/Qwen35MTPTests.swift",
@@ -719,6 +719,69 @@ class PublicExportTests(unittest.TestCase):
                     metadata["sha256"],
                 )
             self.assertFalse((reexport / "public/sanitized-projection").exists())
+
+    def test_mtp_processor_pin_does_not_reintroduce_the_fictional_copy(self) -> None:
+        """The MTP logit-processor pin must not describe a copy that does not exist.
+
+        Until 2026-09-09 the emit-only pin -- in BOTH the vendored test and its published
+        sanitized projection -- explained itself in terms of ``var verifyProcessorCopy =
+        processor`` inside ``speculateRound``. That line has never existed in the vendored
+        production source; the sequential verify loop breaks at the first draft mismatch, so
+        positions after it are never sampled and there is nothing to leak. The assertion held
+        for the right value and the wrong stated reason, and the false explanation shipped
+        publicly.
+
+        The identifier is still real in ``spike/.build/checkouts/mlx-swift-lm/``, a stale
+        leftover from when ``mlx-swift-lm`` was a URL dependency -- a DIFFERENT revision that a
+        grep without ``--exclude-dir=.build`` will happily surface. So this pins the three files
+        that actually matter by exact path rather than by search.
+
+        This is the only gate that reads the vendored source and its published projection
+        together: the sha256 pin above hashes the projection alone, so a vendored edit whose
+        hand-port was forgotten leaves every other test green.
+        """
+        fictional = "verifyProcessorCopy"
+        # (path, token that MUST be present) -- the second element is the anti-vacuity control.
+        # Without it, a repointed or truncated path would satisfy the absence check by reading
+        # a file with no relevant content at all, which is an INERT pass rather than a passing
+        # one. Note this deliberately does not scan scripts/ -- this very file names the
+        # identifier, and a gate that swept its own reminder text would count itself.
+        subjects = (
+            (
+                "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/"
+                "MTPSpeculativeTokenIterator.swift",
+                "func speculateRound",
+            ),
+            (
+                "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/"
+                "MTPSpeculativeTokenIteratorTests.swift",
+                "private struct EmissionLog",
+            ),
+            (
+                "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/"
+                "MTPSpeculativeTokenIteratorTests.swift",
+                "private struct EmissionLog",
+            ),
+        )
+        # assertTrue/assertFalse on an explicit `in`, NOT assertIn/assertNotIn: the latter
+        # interpolate the whole haystack into the failure message, which for these files is a
+        # ~77 KB single-line dump that buries the actual message.
+        for relative, required in subjects:
+            path = REPOSITORY_ROOT / relative
+            self.assertTrue(path.is_file(), f"{relative} is missing")
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(
+                required in text,
+                f"{relative} does not contain {required!r} -- this gate is reading the "
+                "wrong file, so its absence check below proves nothing",
+            )
+            self.assertFalse(
+                fictional in text,
+                f"{relative} names {fictional!r}, an identifier that does not exist in the "
+                "vendored production source. The emit-only invariant holds because the "
+                "verify loop breaks at the first draft mismatch, not because of a struct "
+                "value-copy.",
+            )
 
     def test_export_copies_only_indexed_allowlist_and_published_articles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

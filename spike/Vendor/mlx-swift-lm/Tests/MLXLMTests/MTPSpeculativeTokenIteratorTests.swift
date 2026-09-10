@@ -1234,9 +1234,7 @@ func testMTPIteratorUsesSingleStepWhenOnlyOneTokenRemains() throws {
 // MARK: - LogitProcessor emit-only invariant
 
 /// Records `didSample(token:)` calls so a test can verify which tokens the
-/// processor actually observed. Pure value semantics — Swift struct value
-/// copies (e.g., `var verifyProcessorCopy = processor` in `speculateRound`)
-/// produce a separate `recordedTokens` backing via array copy-on-write.
+/// canonical processor actually observed during a speculation round.
 private struct EmissionLog: LogitProcessor {
     var recordedTokens: [Int] = []
 
@@ -1249,23 +1247,36 @@ private struct EmissionLog: LogitProcessor {
     }
 }
 
-/// Locks in the value-semantics invariant of `speculateRound`'s verify
-/// loop: `var verifyProcessorCopy = processor` makes a Swift struct copy,
-/// so `verifyProcessorCopy.didSample(...)` calls mutate the local copy
-/// and do NOT propagate back to `self.processor`. The canonical processor
-/// state at `self.processor` is updated only by the accept loop, which
-/// runs over the actually-emitted tokens (accepted drafts + correction).
+/// Pins the sequential verify loop's `didSample` scope. `speculateRound`'s
+/// `else` branch (taken whenever a non-nil `LogitProcessor` is installed and
+/// no sampled-block decision provider is configured) samples one verify
+/// position at a time in `for i in 0..<numDraft`, calling
+/// `processor?.didSample(token:)` immediately after each sample and BEFORE
+/// checking whether that position matches the draft. The loop then does
+/// `guard targetTokenValue == draftTokensList[i] else { finalToken =
+/// targetToken; break }` — so it stops at the FIRST mismatch. Verify
+/// positions after the mismatch are never sampled at all, so the processor
+/// never observes them: there is no copy or separate scope for state to
+/// leak from, because those positions' target tokens are never
+/// materialized. When every draft matches (the loop never breaks), a
+/// separate bonus block below the loop samples one more row and also calls
+/// `processor?.didSample(token:)`.
+///
+/// This test locks in that the processor observes EXACTLY the tokens the
+/// round actually emits (`pendingTokens`) — no more, no fewer — by deriving
+/// the expectation from the iterator's own `next()` output rather than a
+/// hardcoded literal, paired with an explicit anti-vacuity control proving
+/// a rejected (never-sampled) verify position really existed for this
+/// scenario, so the equality check isn't trivially satisfied by a round
+/// that happens to accept everything.
 ///
 /// Test scenario: bs=4 (numDraft=3), drafter proposes [5, 5, 5], main
 /// verifies and samples [5, 9, 1, 2] — only position 0 matches the draft.
-/// accepted=1, correction=9, emitted=[bonus=5, draft=5, correction=9].
-/// Verify loop's `didSample` fires four times (on the copy) for [5, 9, 1, 2].
-/// Self.processor's `didSample` should fire exactly twice (for emitted [5, 9])
-/// — NOT four times. The probe processor is installed AFTER init so the
-/// prepare-time bonus is not recorded; the test asserts on speculation-
-/// round emissions only.
+/// accepted=1, correction=9, emitted=[bonus=5, draft=5, correction=9]. The
+/// probe processor is installed AFTER init so the prepare-time bonus is not
+/// recorded; the test asserts on speculation-round emissions only.
 @Test
-func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
+func testMTPVerifyLoopFeedsProcessorExactlyTheEmittedTokensOnPartialAcceptance() throws {
     let mainLogitTokens: [Int32] = [
         0, 0, 5,  // prefill follow-up picks bonus 5 (positions 0/1 unused, < vocab=20)
         5, 9, 1, 2,  // verify positions: only position 0 matches draft
@@ -1277,8 +1288,9 @@ func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
     // maxTokens larger than the test's emit budget so `speculateRound`'s
     // `numDraft = min(remaining, blockSize - 1)` doesn't get capped — we
     // need the full numDraft=3 verify pass to exercise the invariant
-    // (4 verify-position samples vs only 2 emitted tokens). Control the
-    // round count by manual `next()` calls instead of draining.
+    // (3 verify-position samples, only 2 of which are ever reached, vs 2
+    // emitted tokens). Control the round count by manual `next()` calls
+    // instead of draining.
     var iter = try MTPSpeculativeTokenIterator(
         input: input, mainModel: main, drafter: drafter, mainCache: nil,
         parameters: GenerateParameters(maxTokens: 8), blockSize: 4
@@ -1305,18 +1317,142 @@ func testMTPVerifyLoopDidSampleStaysScopedToLocalCopy() throws {
     #expect(
         iter._verifierTokenReadbackCountForTesting == 2,
         "a non-nil processor must retain sequential target-token selection")
+    // Anti-vacuity control: readback count (2) must be strictly less than
+    // `proposedCount` (3). That gap is what proves an un-sampled drafted
+    // position actually EXISTED in this round — verify position 2, whose
+    // target value 1 is never materialized because the loop broke at
+    // position 1. Without it, the equality below would be satisfied just as
+    // well by an all-accepted round, where there is nothing for a leaking
+    // implementation to leak and so nothing to detect.
+    let antiVacuityMessage = """
+        anti-vacuity control: there must exist at least one drafted verify \
+        position (here, position 2) that the break-at-first-mismatch loop \
+        never reached and therefore never sampled — a leaking \
+        implementation would have had that unreached position to leak \
+        from. If readback count ever equals proposedCount for this \
+        scenario, the recordedTokens equality below would no longer be a \
+        meaningful regression signal.
+        """
+    #expect(
+        iter._verifierTokenReadbackCountForTesting < iter.proposedCount,
+        "\(antiVacuityMessage)")
 
     let log = iter._processorForTesting as? EmissionLog
     #expect(log != nil, "probe processor lost between install and drain")
 
-    // self.processor's didSample fired exactly twice — for the accepted
-    // draft and the correction — NOT for the three other verify-position
-    // samples (9, 1, 2) which happened on the local copy. If a regression
-    // ever removes the local-copy idiom, log.recordedTokens would gain
-    // entries [9, 1, 2] from the rejected verify positions.
+    // The tokens actually emitted by `next()` after the probe was installed
+    // — i.e. everything the round returned to the caller, in order.
+    let emittedAfterProbe = [t1, t2].compactMap { $0 }
+    let recordedTokens = log?.recordedTokens ?? []
+
+    // self.processor's didSample fired exactly for the emitted stream (the
+    // accepted draft and the correction). The drafter proposes 5 at every
+    // position; the main model's verify row is [5, 9, 1, 2]. Position 0
+    // matches, position 1 samples 9 and mismatches, so the loop breaks —
+    // the target values 1 and 2 at positions 2 and 3 are never sampled and
+    // so can never reach the processor.
+    let recordedTokensMessage = """
+        self.processor.recordedTokens=\(recordedTokens) — expected \
+        \(emittedAfterProbe) (exactly the tokens `next()` emitted after the \
+        probe was installed). A regression here means the processor is \
+        observing a verify-position sample that was never part of the \
+        emitted stream, or is missing one that was.
+        """
     #expect(
-        log?.recordedTokens == [5, 9],
-        "self.processor.recordedTokens=\(log?.recordedTokens ?? []) — expected [5, 9] (1 accepted draft + 1 correction). Verify-loop didSample is leaking from the copy into the canonical processor."
+        recordedTokens == emittedAfterProbe,
+        "\(recordedTokensMessage)"
+    )
+}
+
+/// Companion to the partial-acceptance test above, covering the ONLY other
+/// path through the sequential verify loop: every draft position matches,
+/// the `for` loop runs to completion without breaking, and control falls
+/// into the `if finalToken == nil` bonus block below it, which samples one
+/// more row and calls `processor?.didSample(token:)` for the bonus. Before
+/// this test, no test in this file exercised `EmissionLog`/`recordedTokens`
+/// on the all-accepted path at all, so a missing `didSample` call in the
+/// bonus block specifically would have gone undetected.
+///
+/// Test scenario: bs=4 (numDraft=3), drafter proposes [7, 7, 7], main
+/// verifies and samples [7, 7, 7] for the three draft positions (all
+/// accepted) then a distinguishable bonus value (11) for the bonus row.
+@Test
+func testMTPVerifyLoopFeedsProcessorExactlyTheEmittedTokensWhenEveryDraftAccepted() throws {
+    let mainLogitTokens: [Int32] = [
+        0, 0, 5,  // prefill follow-up picks bonus 5 (positions 0/1 unused, < vocab=20)
+        7, 7, 7, 11,  // verify positions: all three drafts match, then a distinct bonus
+    ]
+    let main = MockMainModel(nextLogitTokens: mainLogitTokens)
+    let drafter = MockDrafter(draftedTokenValue: 7)
+    let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
+
+    var iter = try MTPSpeculativeTokenIterator(
+        input: input, mainModel: main, drafter: drafter, mainCache: nil,
+        parameters: GenerateParameters(maxTokens: 8), blockSize: 4
+    )
+
+    // Drain the prepare-time bonus BEFORE installing the probe, same
+    // rationale as the partial-acceptance test above: that sample is not
+    // part of `speculateRound` and must not be attributed to the probe.
+    let t0 = iter.next()
+    #expect(t0 == 5, "prepare bonus")
+
+    iter._setProcessorForTesting(EmissionLog())
+
+    // Manual drain of exactly the round's 4 emitted tokens: 3 accepted
+    // drafts plus the bonus sampled after the loop completes without
+    // breaking.
+    let t1 = iter.next()
+    let t2 = iter.next()
+    let t3 = iter.next()
+    let t4 = iter.next()
+    #expect(t1 == 7, "first accepted draft")
+    #expect(t2 == 7, "second accepted draft")
+    #expect(t3 == 7, "third accepted draft")
+    #expect(t4 == 11, "bonus row, distinguishable from the drafts")
+    #expect(iter.proposedCount == 3, "numDraft=3 verify samples expected")
+    // Anti-vacuity control: this really is the all-accepted/bonus path, not
+    // some other route that happens to emit the same 4 values. Without
+    // pinning `acceptedCount == 3` a regression that stopped taking the
+    // bonus block (e.g. by rejecting the last draft and returning its
+    // correction instead) could still coincidentally satisfy the
+    // recordedTokens equality below.
+    let acceptedCountMessage = """
+        anti-vacuity control: every draft position must have matched for \
+        this scenario to actually reach the bonus block below the verify \
+        loop.
+        """
+    #expect(iter.acceptedCount == 3, "\(acceptedCountMessage)")
+    // Anti-vacuity control: proves the bonus block's `didSample` call site
+    // was actually reached and executed — 3 verify-loop samples plus 1
+    // bonus-block sample. A test that stayed on the reject path (as the
+    // partial-acceptance test above does) cannot exercise this call site at
+    // all, so this count is what makes the bonus block's own `didSample`
+    // observable.
+    let readbackCountMessage = """
+        anti-vacuity control: expected 3 verify-loop samples + 1 \
+        bonus-block sample; a readback count of 3 would mean the bonus row \
+        was never sampled at all.
+        """
+    #expect(
+        iter._verifierTokenReadbackCountForTesting == 4, "\(readbackCountMessage)")
+
+    let log = iter._processorForTesting as? EmissionLog
+    #expect(log != nil, "probe processor lost between install and drain")
+
+    let emittedAfterProbe = [t1, t2, t3, t4].compactMap { $0 }
+    let recordedTokens = log?.recordedTokens ?? []
+
+    let recordedTokensMessage = """
+        self.processor.recordedTokens=\(recordedTokens) — expected \
+        \(emittedAfterProbe) (exactly the tokens `next()` emitted after the \
+        probe was installed: 3 accepted drafts + 1 bonus). A regression \
+        here means the bonus block's `didSample` call was skipped, or some \
+        verify-loop sample leaked in beyond what was emitted.
+        """
+    #expect(
+        recordedTokens == emittedAfterProbe,
+        "\(recordedTokensMessage)"
     )
 }
 
