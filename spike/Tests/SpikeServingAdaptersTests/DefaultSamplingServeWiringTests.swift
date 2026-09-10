@@ -138,6 +138,129 @@ final class DefaultSamplingServeWiringTests: XCTestCase {
 
         XCTAssertEqual(backend.recordingState.receivedSamplings.first, .greedy)
     }
+
+    // MARK: - Call-site tests for guard (A), `loadScalarServingModel`'s
+    // `generation_config.json` load
+    //
+    // Unlike guard (B) (`scalarServingDefaultSamplingDecoderStrategyError`, covered above as a pure
+    // function only -- reaching its call site needs a real fleet checkpoint), guard (A) runs BEFORE
+    // any weight load or `Memory.*` mutation (see `loadScalarServingModel`'s comment immediately
+    // above its call, ~MLXScalarServing.swift:1007), so its call site IS reachable from a unit test
+    // against an EMPTY temp directory. These four tests close that half of the gap: two refusals
+    // (1, 2) and two controls (3, 4) that prove the refusals are actually discriminating on guard
+    // (A) itself, not merely on "the loader failed for some unrelated reason".
+
+    /// Refusal 1: an empty model directory has no `generation_config.json` at all --
+    /// `GenerationConfigSamplingDefaults.load` throws `.unreadable`, which guard (A) must convert to
+    /// exactly `.defaultSamplingGenerationConfigUnavailable(.unreadable)`.
+    func testLoadScalarServingModelRefusesMissingGenerationConfigArtifact() async throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+
+        let configuration = makeDefaultSamplingLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadScalarServingModel(configuration: configuration)
+            XCTFail("expected loadScalarServingModel to refuse a missing generation_config.json")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .defaultSamplingGenerationConfigUnavailable(.unreadable))
+        }
+    }
+
+    /// Refusal 2: a `generation_config.json` present but with `do_sample: false` -- proves the
+    /// refusal discriminates WHY the artifact is unusable, not merely THAT it is. Must throw exactly
+    /// `.defaultSamplingGenerationConfigUnavailable(.samplingNotEnabled)`, a DIFFERENT associated
+    /// value than refusal 1's.
+    func testLoadScalarServingModelRefusesGenerationConfigWithSamplingDisabled() async throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        try """
+            {"do_sample": false, "temperature": 1.0}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+
+        let configuration = makeDefaultSamplingLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadScalarServingModel(configuration: configuration)
+            XCTFail("expected loadScalarServingModel to refuse do_sample: false")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .defaultSamplingGenerationConfigUnavailable(.samplingNotEnabled))
+        }
+    }
+
+    /// CONTROL for refusals 1-2: same empty temp directory as refusal 1, but `defaultSampling: .off`
+    /// skips guard (A) entirely (the `if configuration.defaultSampling == .generationConfig` branch
+    /// never runs), so this reaches PAST it into the real model load (`loadModel(from:using:)`),
+    /// which fails on its OWN account since the directory has no `config.json`/weights. Without this
+    /// control, refusals 1-2 cannot be distinguished from "the loader fails on this directory no
+    /// matter what" -- this proves guard (A) itself is what fired above, by proving it does NOT fire
+    /// here.
+    ///
+    /// HAZARD: reaching past guard (A) executes `Memory.memoryLimit = configuration.memoryLimitBytes`
+    /// / `Memory.cacheLimit = configuration.cacheLimitBytes` / `Memory.clearCache()` --
+    /// PROCESS-GLOBAL MLX allocator state shared by every other test in this bundle, and MLX
+    /// peak-memory readings are order-dependent. This test deliberately uses realistic,
+    /// non-constraining limits (8 GiB / 1 GiB, see `makeDefaultSamplingLoadConfiguration`) rather
+    /// than tiny ones, so it does not throttle whatever test happens to run later in the same
+    /// process.
+    func testLoadScalarServingModelWithDefaultSamplingOffDoesNotHitGenerationConfigGuard()
+        async throws
+    {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+
+        let configuration = makeDefaultSamplingLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .off)
+
+        do {
+            _ = try await loadScalarServingModel(configuration: configuration)
+            XCTFail("expected loadScalarServingModel to fail on the empty directory's real load")
+        } catch let error as ScalarServingModelLoadError {
+            if case .defaultSamplingGenerationConfigUnavailable = error {
+                XCTFail("guard (A) must not fire when defaultSampling == .off; got \(error)")
+            }
+            // Any OTHER ScalarServingModelLoadError case is the expected outcome here -- this
+            // control only proves guard (A) itself did not fire.
+        } catch {
+            // A non-ScalarServingModelLoadError thrown straight from `loadModel` is also an
+            // acceptable pass for this control.
+        }
+    }
+
+    /// CONTROL for refusal 2, in the other direction: a VALID `generation_config.json`
+    /// (`do_sample: true` with a usable temperature and in-range `top_p`/`top_k`) paired with
+    /// `defaultSampling: .generationConfig` must ALSO proceed PAST guard (A) -- proving the guard
+    /// does not refuse every artifact indiscriminately, only the ones refusal 1-2 target. Shares the
+    /// same process-global `Memory.*` mutation hazard documented on the control immediately above,
+    /// for the same reason (guard (A) passes, so execution reaches the `Memory.*` lines).
+    func testLoadScalarServingModelWithValidGenerationConfigProceedsPastTheGuard() async throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        try """
+            {"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 20}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+
+        let configuration = makeDefaultSamplingLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadScalarServingModel(configuration: configuration)
+            XCTFail("expected loadScalarServingModel to fail on the empty directory's real load")
+        } catch let error as ScalarServingModelLoadError {
+            if case .defaultSamplingGenerationConfigUnavailable = error {
+                XCTFail("a VALID generation_config.json must pass guard (A); got \(error)")
+            }
+        } catch {
+            // A non-ScalarServingModelLoadError thrown straight from `loadModel` is also an
+            // acceptable pass for this control.
+        }
+    }
 }
 
 // MARK: - Fixtures
@@ -175,6 +298,36 @@ private func makeDefaultSamplingBackend(
             mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024),
             samplingDefaults: samplingDefaults))
     return DefaultSamplingBackendFixture(backend: backend, recordingState: state)
+}
+
+/// A fresh, empty per-test directory under `FileManager.default.temporaryDirectory`, for the guard
+/// (A) call-site tests. The caller is responsible for removing it (each test does so via `defer`).
+private func makeEmptyDefaultSamplingModelDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("default-sampling-guard-a-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+}
+
+/// Builds a `ScalarServingModelLoadConfiguration` for the guard (A) call-site tests. Memory/cache
+/// limits are realistic (8 GiB / 1 GiB), not tiny, so the process-global `Memory.*` mutation the two
+/// control tests trigger by design (see their doc comments) does not throttle unrelated tests that
+/// share this MLX allocator state.
+private func makeDefaultSamplingLoadConfiguration(
+    modelDirectory: URL,
+    defaultSampling: FastMLXServeDefaultSampling
+) -> ScalarServingModelLoadConfiguration {
+    ScalarServingModelLoadConfiguration(
+        launchedModel: "fixture-model",
+        modelDirectory: modelDirectory,
+        memoryLimitBytes: 8 * 1024 * 1024 * 1024,
+        cacheLimitBytes: 1 * 1024 * 1024 * 1024,
+        backendConfiguration: ScalarServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 8,
+            maximumQueuedRequests: 1,
+            queueRetryAfterSeconds: 1,
+            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024)),
+        defaultSampling: defaultSampling)
 }
 
 private func paramLessRequest(temperature: Double? = nil) -> OpenAIChatCompletionRequest {
