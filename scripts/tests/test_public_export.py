@@ -741,12 +741,22 @@ class PublicExportTests(unittest.TestCase):
         hand-port was forgotten leaves every other test green.
         """
         fictional = "verifyProcessorCopy"
+        sanitized = (
+            "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/"
+            "MTPSpeculativeTokenIteratorTests.swift"
+        )
         # (path, token that MUST be present) -- the second element is the anti-vacuity control.
         # Without it, a repointed or truncated path would satisfy the absence check by reading
         # a file with no relevant content at all, which is an INERT pass rather than a passing
         # one. Note this deliberately does not scan scripts/ -- this very file names the
         # identifier, and a gate that swept its own reminder text would count itself.
-        subjects = (
+        #
+        # These two exist in BOTH the development checkout and the public projection. The
+        # sanitized source does NOT: the exporter strips `public/sanitized-projection/` from
+        # the candidate by design, which is asserted a few tests above. Checking it
+        # unconditionally is what turned this gate red in the public-boundary job on its first
+        # publication; it is now handled explicitly below rather than assumed.
+        always_present = (
             (
                 "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/"
                 "MTPSpeculativeTokenIterator.swift",
@@ -757,16 +767,12 @@ class PublicExportTests(unittest.TestCase):
                 "MTPSpeculativeTokenIteratorTests.swift",
                 "private struct EmissionLog",
             ),
-            (
-                "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/"
-                "MTPSpeculativeTokenIteratorTests.swift",
-                "private struct EmissionLog",
-            ),
         )
+
         # assertTrue/assertFalse on an explicit `in`, NOT assertIn/assertNotIn: the latter
         # interpolate the whole haystack into the failure message, which for these files is a
         # ~77 KB single-line dump that buries the actual message.
-        for relative, required in subjects:
+        def check(relative: str, required: str) -> None:
             path = REPOSITORY_ROOT / relative
             self.assertTrue(path.is_file(), f"{relative} is missing")
             text = path.read_text(encoding="utf-8")
@@ -781,6 +787,25 @@ class PublicExportTests(unittest.TestCase):
                 "vendored production source. The emit-only invariant holds because the "
                 "verify loop breaks at the first draft mismatch, not because of a struct "
                 "value-copy.",
+            )
+
+        for relative, required in always_present:
+            check(relative, required)
+
+        if (REPOSITORY_ROOT / sanitized).is_file():
+            # Development checkout: the hand-ported copy is the one that actually publishes,
+            # and the sha256 pin above hashes it in isolation -- so a vendored edit whose
+            # hand-port was forgotten leaves every other test green. This is the only gate
+            # that reads both copies together.
+            check(sanitized, "private struct EmissionLog")
+        else:
+            # Public checkout. NOT a silent skip: assert the whole sanitized tree is absent,
+            # so a mistyped path in the branch above fails loudly here instead of quietly
+            # taking the "must be the public checkout" route and asserting nothing.
+            self.assertFalse(
+                (REPOSITORY_ROOT / "public/sanitized-projection").exists(),
+                f"{sanitized} is missing even though public/sanitized-projection/ exists -- "
+                "this is a development checkout with a broken path, not a public one",
             )
 
     def test_export_copies_only_indexed_allowlist_and_published_articles(self) -> None:
