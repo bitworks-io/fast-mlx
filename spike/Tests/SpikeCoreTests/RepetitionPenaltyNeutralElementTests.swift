@@ -51,13 +51,33 @@ struct RepetitionPenaltyNeutralElementTests {
         #expect(parameters.processor() != nil)
     }
 
-    // MARK: - 3. Sampled-MTP provider `supports(parameters:)` for the deployed HF Thinking preset.
+    // MARK: - 3. Sampled-MTP provider `supports(parameters:)` no longer distinguishes neutral
+    // from non-neutral repetition penalty.
 
-    /// Deployed Qwen3.8-Flash-Next "Thinking" preset: temperature 1.0, topP 0.95, topK 20,
-    /// minP 0, presencePenalty 0, repetitionPenalty 1.0. The provider's stored truncation must
-    /// match the request's (see `SampledMTPSamplingTruncation`'s cross-check doc comment), so the
-    /// provider under test is constructed with the matching truncation.
-    @Test func supportsAcceptsDeployedThinkingPresetWithRepetitionPenaltyOne() {
+    /// `sharedSampledMTPSupportsPredicate` used to refuse any non-neutral `repetitionPenalty`;
+    /// that clause was removed because penalties are now applied upstream, by
+    /// `MTPSpeculativeTokenIterator` penalizing the target verify rows from a scratch copy of
+    /// the request's `LogitProcessor` before handing them to this provider -- so the target law
+    /// `p` this provider computes is already the penalized law, and `supports()` no longer needs
+    /// (or gets) a say in whether the penalty is neutral.
+    ///
+    /// So `supports(parameters:)` is NOT the mechanism that still distinguishes
+    /// `repetitionPenalty == 1` (neutral -- a documented HF no-op both deployed presets send)
+    /// from a real penalty. What still is:
+    ///   - `GenerateParameters.processor()` (vendored `Evaluate.swift`, via
+    ///     `GenerateParameters.repetitionPenaltyIsNeutral`) -- this is exactly what
+    ///     `MTPSpeculativeTokenIterator.init` calls (`let requestProcessor =
+    ///     parameters.processor()`) to build the scratch `LogitProcessor` referenced above; it
+    ///     decides whether a `RepetitionContext` is constructed at all, i.e. whether the target
+    ///     rows get penalized, for the sampled-MTP path.
+    ///   - `DecoderPenalties.isEmpty` / `DecoderPenalties.repetitionPenaltyIsNeutral`
+    ///     (`InferenceActor.swift`) -- gates whether the compiled/greedy decode path installs a
+    ///     logit processor at all.
+    ///   - `ContinuousServingBackend.rejectUnsupportedDecodeControls`, via the same
+    ///     `DecoderPenalties.repetitionPenaltyIsNeutral` -- the continuous-batch route has no
+    ///     logit processor at all, so it still refuses any non-neutral repetition penalty
+    ///     outright, independent of the sampled-MTP predicate.
+    @Test func supportsNoLongerDistinguishesNeutralFromRealRepetitionPenalty() {
         let truncation = SampledMTPSamplingTruncation(
             temperature: 1, topP: 0.95, topK: 20, minP: 0)
         let provider = SeededSampledMTPBlockRuntimeProvider(seed: 1, truncation: truncation)
@@ -72,8 +92,8 @@ struct RepetitionPenaltyNeutralElementTests {
             frequencyPenalty: 0)
         #expect(provider.supports(parameters: thinkingPreset))
 
-        // Anti-vacuity: a real repetition penalty on the same otherwise-eligible request must
-        // still be refused.
+        // A real repetition penalty on the same otherwise-eligible request is now ADMITTED too,
+        // not refused -- see this test's doc comment for why.
         let realPenalty = GenerateParameters(
             temperature: 1,
             topP: 0.95,
@@ -82,7 +102,22 @@ struct RepetitionPenaltyNeutralElementTests {
             repetitionPenalty: 1.1,
             presencePenalty: 0,
             frequencyPenalty: 0)
-        #expect(!provider.supports(parameters: realPenalty))
+        #expect(provider.supports(parameters: realPenalty))
+
+        // Anti-vacuity: pairing the now-admitted penalty with a truncation shape that is STILL
+        // genuinely refused (`minP != 0`, unaffected by the penalty relaxation, and orthogonal
+        // to what this test otherwise varies) proves `supports` is still discriminating on
+        // something here, not merely returning `true` unconditionally now that repetition
+        // penalty no longer excludes a request.
+        let realPenaltyWithRefusedMinP = GenerateParameters(
+            temperature: 1,
+            topP: 0.95,
+            topK: 20,
+            minP: 0.05,
+            repetitionPenalty: 1.1,
+            presencePenalty: 0,
+            frequencyPenalty: 0)
+        #expect(!provider.supports(parameters: realPenaltyWithRefusedMinP))
     }
 
     // MARK: - 4. `DecoderPenalties.isEmpty`.

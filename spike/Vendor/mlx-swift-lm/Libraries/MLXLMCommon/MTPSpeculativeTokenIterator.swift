@@ -282,7 +282,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             y = tokens
             // Final prompt position not yet evaluated -- run one forward to
             // produce the bonus token AND prime drafter state.
-            let result = mainModel(y[text: .newAxis], cache: mainCache, state: prefillState)
+            let result = try mainModel.evaluateThrowing(
+                y[text: .newAxis], cache: mainCache, state: prefillState)
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
@@ -334,7 +335,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     // this one-token re-prime into MTP state emission.
                     var reprimeState = mainState ?? LMOutput.State()
                     reprimeState[mtpEmitFlagKey] = true
-                    let primed = mainModel(
+                    let primed = try mainModel.evaluateThrowing(
                         y[text: .newAxis], cache: mainCache, state: reprimeState)
                     mainState = primed.state
                     committedReprimeToken = token
@@ -389,8 +390,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     && hidden.dim(1) == normalizedPromptTokens.dim(1)
                     ? hidden : nil
             }
-            let baseTargetHidden = reusablePromptHidden
-                ?? mainModel(normalizedPrompt, cache: nil, state: prefillState)
+            let baseTargetHidden = try reusablePromptHidden
+                ?? mainModel.evaluateThrowing(normalizedPrompt, cache: nil, state: prefillState)
                     .state?[mtpLastHiddenStatesKey]
             if let baseTargetHidden,
                 committedReprimeToken == nil || committedReprimeHidden != nil
@@ -480,7 +481,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     /// Single round: draft `blockSize - 1` tokens, verify with main, accept
     /// the longest matching prefix, emit the bonus correction.
-    mutating func speculateRound() {
+    mutating func speculateRound() throws {
         guard !passthrough else { return }
         // A prior all-accepted round may keep one recurrent checkpoint until
         // its pending output is drained so early finalization can rewind it.
@@ -496,7 +497,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
             let draftBudget = Swift.min(remaining - 1, blockSize - 1)
             guard draftBudget > 0 else {
-                if let token = passthroughStep() {
+                if let token = try passthroughStep() {
                     pendingTokens.append(token)
                 }
                 return
@@ -618,7 +619,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             && mainCache.contains { $0 is MambaCache }
             && mainCache.allSatisfy { $0.isTrimmable || $0 is MambaCache }
         verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
-        let mainResult = mainModel(
+        let mainResult = try mainModel.evaluateThrowing(
             verifyInput[text: .newAxis], cache: mainCache, state: verifyState)
         let mainLogits = mainResult.logits
         var finalizedMainState = mainResult.state
@@ -779,7 +780,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     "Target advertised native speculative rewind, but cache rewind failed")
                 if accepted > 0 {
                     let acceptedPrefix = draftTokensList.prefix(accepted)
-                    let replayedState = replayAcceptedPrefixAfterHybridRewind(
+                    let replayedState = try replayAcceptedPrefixAfterHybridRewind(
                         acceptedPrefix,
                         baseState: mainResult.state ?? state,
                         emitDrafterState: true)
@@ -847,11 +848,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     /// One single-token forward step against the main model, used in
     /// passthrough mode. The drafter is not invoked.
-    private mutating func passthroughStep() -> Int? {
+    private mutating func passthroughStep() throws -> Int? {
         if let maxTokens, tokenCount >= maxTokens { return nil }
 
         let targetTailStart = phaseClock()
-        let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
+        let result = try mainModel.evaluateThrowing(
+            y[text: .newAxis], cache: mainCache, state: mainState)
         mainState = result.state
         var logits = result.logits[0..., -1, 0...]
         logits = processor?.process(logits: logits) ?? logits
@@ -874,7 +876,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         _ tokenValues: ArraySlice<Int>,
         baseState: LMOutput.State,
         emitDrafterState: Bool
-    ) -> LMOutput.State? {
+    ) throws -> LMOutput.State? {
         guard !tokenValues.isEmpty else { return baseState }
         guard checkpointSpeculativePromptCacheBeforeAppend(
             mainCache, tokenCount: tokenValues.count
@@ -893,7 +895,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         replayState[mtpEmitFlagKey] = emitDrafterState
         replayState[mtpCacheCheckpointIndexKey] = nil
         let replayInput = LMInput.Text(tokens: MLXArray(replayTokens))
-        let replayResult = mainModel(
+        let replayResult = try mainModel.evaluateThrowing(
             replayInput[text: .newAxis], cache: mainCache, state: replayState)
         if emitDrafterState, replayResult.state == nil {
             return nil
@@ -901,7 +903,13 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         return replayResult.state ?? baseState
     }
 
-    public mutating func next() -> Int? {
+    /// Throwing counterpart to ``next()``, propagating a target validation
+    /// failure surfaced through `evaluateThrowing` on any forward call this
+    /// step performs, instead of letting it reach a non-throwing entry point
+    /// that would have no choice but to abort. Callers that can act on a
+    /// caught error (for example an ordinary-request serving loop) should
+    /// prefer this over ``next()``.
+    public mutating func nextThrowing() throws -> Int? {
         // Calling `next` again acknowledges the prior token. Once every
         // cache-committed pending token has been retained, its rollback
         // checkpoint is no longer needed. `discardGeneratedToken()` clears
@@ -936,7 +944,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         if passthrough {
-            if let token = passthroughStep() {
+            if let token = try passthroughStep() {
                 telemetry.recordGeneratedToken()
                 return token
             }
@@ -948,12 +956,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         pendingIndex = 0
         committedPendingTokenCount = 0
         emittedCommittedPendingTokenCount = 0
-        speculateRound()
+        try speculateRound()
 
         if pendingTokens.isEmpty {
             // speculateRound chose passthrough -- fall through.
             if passthrough {
-                if let token = passthroughStep() {
+                if let token = try passthroughStep() {
                     telemetry.recordGeneratedToken()
                     return token
                 }
@@ -972,10 +980,29 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         telemetry.recordGeneratedToken()
         return token
     }
+
+    /// `TokenIteratorProtocol.next()` refines `IteratorProtocol`, whose
+    /// `next()` cannot throw, so this entry point cannot change shape to
+    /// surface a caught error without breaking every `for token in
+    /// iterator` call site. `try!` preserves the pre-existing outcome for a
+    /// target whose non-throwing `callAsFunction` already aborts on a
+    /// validation failure, which is what the production target does. It is
+    /// NOT equivalent for every conceivable target: one that returns
+    /// normally from `callAsFunction` while throwing from `evaluateThrowing`
+    /// would trap here where it previously succeeded, and must be driven
+    /// through ``nextThrowing()`` -- which any caller able to act on the
+    /// error should prefer regardless.
+    public mutating func next() -> Int? {
+        try! nextThrowing()
+    }
 }
 
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
-    public mutating func finalizeGeneration() {
+    /// Throwing counterpart to ``finalizeGeneration()``, propagating a
+    /// target validation failure surfaced through `evaluateThrowing` on the
+    /// terminal-commit forward below instead of aborting. Callers that can
+    /// act on a caught error should prefer this over ``finalizeGeneration()``.
+    public mutating func finalizeGenerationThrowing() throws {
         let finalizationStart = phaseClock()
         var nestedHybridRewindSeconds = 0.0
         defer {
@@ -999,7 +1026,7 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
                     rewound == committedPendingTokenCount,
                     "Hybrid speculative finalization requires an exact recurrent checkpoint")
                 if emitted > 0 {
-                    let replayedState = replayAcceptedPrefixAfterHybridRewind(
+                    let replayedState = try replayAcceptedPrefixAfterHybridRewind(
                         pendingTokens.prefix(emitted),
                         baseState: mainState ?? LMOutput.State(),
                         emitDrafterState: false)
@@ -1032,12 +1059,27 @@ extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
         var finalState = mainState ?? LMOutput.State()
         finalState[mtpEmitFlagKey] = false
         finalState[mtpCacheCheckpointIndexKey] = nil
-        let result = mainModel(y[text: .newAxis], cache: mainCache, state: finalState)
+        let result = try mainModel.evaluateThrowing(
+            y[text: .newAxis], cache: mainCache, state: finalState)
         mainState = result.state
         quantizeKVCache(&mainCache)
         eval(result.logits)
         synchronizeTargetPhaseBoundary(state: mainState)
         lastReturnedTokenNeedsFinalCommit = false
+    }
+
+    /// `GenerationFinalizingTokenIterator.finalizeGeneration()` is a
+    /// non-throwing protocol requirement (mirroring
+    /// `TokenIteratorProtocol.next()`), so this entry point cannot change
+    /// shape without breaking conformance. As with ``next()``, `try!`
+    /// preserves the pre-existing outcome only for a target whose
+    /// non-throwing `callAsFunction` already aborts on a validation failure;
+    /// a target that throws from `evaluateThrowing` while returning normally
+    /// from `callAsFunction` would trap here instead, and must be driven
+    /// through ``finalizeGenerationThrowing()``, which any caller able to act
+    /// on the error should prefer regardless.
+    public mutating func finalizeGeneration() {
+        try! finalizeGenerationThrowing()
     }
 }
 

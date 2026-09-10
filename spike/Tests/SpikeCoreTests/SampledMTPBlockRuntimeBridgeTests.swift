@@ -171,15 +171,30 @@ final class SeededSampledMTPBlockRuntimeProviderTests: XCTestCase {
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, topP: 0.95)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, topK: 4)))
         XCTAssertFalse(first.supports(parameters: GenerateParameters(temperature: 1, minP: 0.05)))
-        XCTAssertFalse(first.supports(parameters: GenerateParameters(
+        // `sharedSampledMTPSupportsPredicate` no longer excludes
+        // `repetitionPenalty`/`presencePenalty`/`frequencyPenalty`: penalties are now
+        // applied upstream, by `MTPSpeculativeTokenIterator` penalizing the target
+        // verify rows from a scratch copy of the request's `LogitProcessor` before
+        // handing them to this provider, so the target law `p` this provider computes
+        // is already the penalized law. A nonzero penalty is therefore admitted here.
+        // See `sharedSampledMTPSupportsPredicate`'s doc comment.
+        XCTAssertTrue(first.supports(parameters: GenerateParameters(
             temperature: 1,
             repetitionPenalty: 1.1)))
-        XCTAssertFalse(first.supports(parameters: GenerateParameters(
+        XCTAssertTrue(first.supports(parameters: GenerateParameters(
             temperature: 1,
             presencePenalty: 0.1)))
-        XCTAssertFalse(first.supports(parameters: GenerateParameters(
+        XCTAssertTrue(first.supports(parameters: GenerateParameters(
             temperature: 1,
             frequencyPenalty: 0.1)))
+        // Anti-vacuity: pairing a now-admitted penalty with a truncation shape that is
+        // STILL genuinely refused (`minP != 0`, unaffected by the penalty relaxation)
+        // proves `supports` is still discriminating on something, not merely returning
+        // `true` unconditionally now that penalties no longer exclude a request.
+        XCTAssertFalse(first.supports(parameters: GenerateParameters(
+            temperature: 1,
+            minP: 0.05,
+            repetitionPenalty: 1.1)))
 
         let proposalDistributions = [[0.2, 0.3, 0.5], [0.4, 0.35, 0.25]]
         let targetDistributions = proposalDistributions
@@ -493,7 +508,7 @@ final class SampledMTPBlockRuntimeBridgeTestsNondeterministicProvider: XCTestCas
         XCTAssertEqual(provider.drawTraces, fresh.drawTraces)
     }
 
-    func testUnsupportedSamplingParametersFailClosed() {
+    func testUnsupportedTruncationFailsClosedWhilePenaltiesNowAdmit() {
         let provider = NondeterministicSampledMTPBlockRuntimeProvider()
 
         XCTAssertTrue(provider.supports(parameters: GenerateParameters(temperature: 1, seed: 7)))
@@ -515,15 +530,30 @@ final class SampledMTPBlockRuntimeBridgeTestsNondeterministicProvider: XCTestCas
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topP: 0.95)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, topK: 4)))
         XCTAssertFalse(provider.supports(parameters: GenerateParameters(temperature: 1, minP: 0.05)))
-        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+        // `sharedSampledMTPSupportsPredicate` no longer excludes
+        // `repetitionPenalty`/`presencePenalty`/`frequencyPenalty`: penalties are now
+        // applied upstream, by `MTPSpeculativeTokenIterator` penalizing the target
+        // verify rows from a scratch copy of the request's `LogitProcessor` before
+        // handing them to this provider, so the target law `p` this provider computes
+        // is already the penalized law. A nonzero penalty is therefore admitted here.
+        // See `sharedSampledMTPSupportsPredicate`'s doc comment.
+        XCTAssertTrue(provider.supports(parameters: GenerateParameters(
             temperature: 1,
             repetitionPenalty: 1.1)))
-        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+        XCTAssertTrue(provider.supports(parameters: GenerateParameters(
             temperature: 1,
             presencePenalty: 0.1)))
-        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+        XCTAssertTrue(provider.supports(parameters: GenerateParameters(
             temperature: 1,
             frequencyPenalty: 0.1)))
+        // Anti-vacuity: pairing a now-admitted penalty with a truncation shape that is
+        // STILL genuinely refused (`minP != 0`, unaffected by the penalty relaxation)
+        // proves `supports` is still discriminating on something, not merely returning
+        // `true` unconditionally now that penalties no longer exclude a request.
+        XCTAssertFalse(provider.supports(parameters: GenerateParameters(
+            temperature: 1,
+            minP: 0.05,
+            repetitionPenalty: 1.1)))
     }
 
     private func sampleProposals(

@@ -19,7 +19,7 @@ import validate_public_repository  # noqa: E402
 PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/LLMModelFactory.swift",
-        "sha256": "97010b716dc2e47b77046d7510db8bf3f3c672bc052029ce35c754f3e51cdf90",
+        "sha256": "69ad4297a08fc46994278a03f7fc33e6fc8b2116598222ab051921819cb58765",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
@@ -39,7 +39,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift",
-        "sha256": "8f104d0955510b979d994d29fda922fe4ab9a2158f029ca136749df02078aaa2",
+        "sha256": "7b19b2391cc09c0ee7f09f56bb26b9786e78eae4346c82e3588620355ceed014",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift",

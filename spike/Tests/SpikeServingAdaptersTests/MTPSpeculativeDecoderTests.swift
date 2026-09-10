@@ -603,20 +603,31 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
     }
 
     /// Flag ON + the requires-greedy drafter, an INSTRUCT-style request (temperature 0.7, topP
-    /// 1.0), and a nonzero presence penalty, which makes `parameters.processor()` non-nil.
+    /// 1.0) with a nonzero MIN-P, which is what refuses this request post step-(ii).
     ///
-    /// Before the step-(i) relaxation of `sharedSampledMTPSupportsPredicate` (temperature `== 1`
-    /// -> `> 0 && .isFinite`), this request was refused on TWO independent grounds: temperature
-    /// 0.7 failed the predicate's old `temperature == 1` clause, AND the presence penalty made
-    /// `parameters.processor()` non-nil (the OTHER, independent way `providerIsEligible` is
-    /// false). After that relaxation, temperature 0.7 is a finite positive temperature the
-    /// predicate now ADMITS, so only the penalty ground survives here — the temperature ground
-    /// was deliberately removed by the relaxation, not accidentally lost. This test alone can no
-    /// longer distinguish "refused for the penalty" from "refused for anything at all"; see
-    /// `testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetWithoutPenaltyEscapesGreedyPassthrough`
-    /// immediately below for the companion that supplies that missing discrimination, by removing
-    /// the penalty and asserting the SAME temperature/topP shape is now admitted.
-    func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndInstructPresetStillTakesGreedyPassthrough()
+    /// History of this test's refusal ground, since it has moved twice:
+    ///   - Pre step-(i): temperature 0.7 alone failed the predicate's old `temperature == 1`
+    ///     clause.
+    ///   - Post step-(i), pre step-(ii): temperature 0.7 was admitted, but a nonzero presence
+    ///     penalty made `parameters.processor()` non-nil, which `providerIsEligible` refused
+    ///     directly (`&& parameters.processor() == nil`) before `supports()` was ever consulted.
+    ///   - Post step-(ii) (current): penalties no longer make `providerIsEligible` false at all
+    ///     -- `MTPSpeculativeTokenIterator` now penalizes the target verify/bonus rows from a
+    ///     scratch copy of the processor and hands the provider the already-penalized law, so a
+    ///     presence penalty alone no longer refuses. This fixture is re-anchored on `minP: 0.05`
+    ///     instead: `sharedSampledMTPSupportsPredicate` keeps `parameters.minP == 0` unconditionally
+    ///     (`SampledMTPBlockRuntimeBridge.swift`), so `providerIsEligible` is refused via
+    ///     `supports(parameters:)` returning false, not via the old `processor() == nil` term.
+    ///     The presence penalty is DELIBERATELY still present in this fixture (proving it is no
+    ///     longer sufficient to explain the refusal on its own); see
+    ///     `testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndRealInstructPresetEscapesGreedyPassthrough`
+    ///     in `PenalizedSampledMTPProvenanceTests` for the companion that removes minP (the one
+    ///     surviving refusal ground) and shows the SAME penalized shape is now admitted. It lives
+    ///     in that file rather than here because THIS file projects to the public repository while
+    ///     the iterator publishes from a lagging sanitized override; an "escapes passthrough"
+    ///     assertion would fail there. This test asserts a REFUSAL, which the older iterator also
+    ///     produces (on the penalty rather than on minP), so it is safe to project.
+    func testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndMinPPresetStillTakesGreedyPassthrough()
         async throws
     {
         let target = MTPSpeculativeDecoderCountingTargetModel(
@@ -631,7 +642,7 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         let maxTokens = 5
         let summary = try await actor.generateBounded(
             promptTokens: [1, 2, 3], maxTokens: maxTokens, eos: 99,
-            sampling: .sampled(temperature: 0.7, topP: 1.0, topK: nil, minP: nil, seed: 42),
+            sampling: .sampled(temperature: 0.7, topP: 1.0, topK: nil, minP: 0.05, seed: 42),
             penalties: DecoderPenalties(presencePenalty: 1.5)
         ) { _ in .continueGeneration }
 
@@ -641,23 +652,23 @@ final class MTPSpeculativeDecoderTests: XCTestCase {
         let telemetry = try XCTUnwrap(telemetrySnapshot)
         let reason = try XCTUnwrap(
             telemetry.passthroughReason,
-            "a penalized sampled request against a requires-greedy drafter must still take the "
-                + "greedy-requirement passthrough even with the flag on")
+            "a min_p-truncated, penalized sampled request against a requires-greedy drafter must "
+                + "still take the greedy-requirement passthrough even with the flag on")
         XCTAssertTrue(
             reason.contains("requires temperature == 0"),
-            "the relaxed predicate must not over-admit a penalized request "
-                + "sharedSampledMTPSupportsPredicate/providerIsEligible genuinely refuses on the "
-                + "surviving (penalty) ground; got: \(reason)")
+            "sharedSampledMTPSupportsPredicate/providerIsEligible must genuinely refuse this "
+                + "request on the min_p ground (penalties are no longer a refusal ground at all "
+                + "post step-(ii)); got: \(reason)")
     }
 
     /// The discriminating companion to the test above: the IDENTICAL request shape (temperature
     /// 0.7, topP 1.0, requires-greedy drafter, flag on) with the ONE variable that test's own
-    /// refusal now hinges on -- the presence penalty -- removed. Without this test, the assertion
-    /// above cannot tell "refused for the penalty" apart from "refused for anything at all"; a
-    /// regression that silently reintroduced a `temperature == 1` requirement would leave that
-    /// test just as green. This test requires the opposite outcome: temperature 0.7 alone, once
-    /// the step-(i) relaxation lands, must be enough to escape the greedy-requirement passthrough
-    /// -- `providerIsEligible` must flip true on this shape exactly as it already does for
+    /// refusal now hinges on -- `minP` -- removed. Without this test, the assertion above cannot
+    /// tell "refused for min_p" apart from "refused for anything at all"; a regression that
+    /// silently reintroduced a `temperature == 1` requirement would leave that test just as green.
+    /// This test requires the opposite outcome: temperature 0.7 alone, once the step-(i)
+    /// relaxation lands, must be enough to escape the greedy-requirement passthrough --
+    /// `providerIsEligible` must flip true on this shape exactly as it already does for
     /// temperature 1 (`testSampledBlockDecisionsEnabledWithGreedyOnlyDrafterAndDeployedPresetEscapesGreedyPassthrough`
     /// above), landing on the SAME provider-specific degradation reason for the same documented
     /// cause (this file's mocks never call the `sampler` argument `draftBlock` receives).

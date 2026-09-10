@@ -201,19 +201,27 @@ public struct SampledMTPSamplingTruncation: Sendable, Equatable {
 /// helper treats `0` as no-filter would be a silent divergence between what
 /// this predicate admits and what the target sampler actually does.
 ///
-/// The penalty checks accept `nil` OR exactly `0`, not only `nil`: the
-/// deployed runbook instructs clients to send e.g. `presence_penalty: 0`
-/// explicitly, which arrives here as `Optional(0.0)`, not `nil`. The
-/// vendored `GenerateParameters.processor()` already treats zero as absent,
-/// so `nil` and `0` genuinely mean the same thing -- requiring strict `==
-/// nil` silently refused that real, intentionally-zero production request.
+/// This predicate no longer excludes `presencePenalty`/`frequencyPenalty`/
+/// non-neutral `repetitionPenalty`. Penalties are handled OUTSIDE this
+/// provider now: `MTPSpeculativeTokenIterator` penalizes the target verify
+/// rows and the bonus row from a scratch copy of the request's canonical
+/// `LogitProcessor` -- advanced by the drafted tokens -- before handing them
+/// to `decide(proposedTokens:targetLogits:bonusTargetLogits:)`. Those rows
+/// have already been through `LogitProcessor.process`, so the target law `p`
+/// this provider computes from them is exactly the penalized law
+/// `parameters.sampler()` would draw from after `processor.process` on the
+/// live decode path -- the same exactness argument this predicate already
+/// relies on for temperature and truncation, just applied one layer
+/// upstream of this file.
 ///
-/// `repetitionPenalty` is checked via `GenerateParameters.repetitionPenaltyIsNeutral`
-/// rather than the same `?? 0) == 0` pattern used for the additive presence/frequency
-/// knobs: the vendored `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x *
-/// penalty : x / penalty`), so its neutral element is `1`, not `0`. Both HF-recommended
-/// presets for the deployed model send `repetition_penalty: 1.0`; treating that as "a
-/// penalty is active" would wrongly disable sampled MTP for every real request using them.
+/// The draft law `q` this provider records is deliberately NOT penalized,
+/// and must stay that way: speculative sampling is distribution-preserving
+/// for ANY proposal law `q`, provided `q` is the law the drafter actually
+/// sampled from and the residual `max(p - q, 0)` covers the gap. Penalizing
+/// the draft is an acceptance-rate optimization, never an exactness
+/// requirement -- the drafter has no seam to apply a penalty consistently
+/// across a block boundary anyway (see the block-N-proposed-at-end-of-block-
+/// (N-1) note on `MTPSpeculativeTokenIterator`'s `commitDrafterState` call).
 ///
 /// This predicate alone does not decide whether a given provider supports a
 /// given request: every call site also cross-checks its own stored
@@ -225,9 +233,6 @@ private func sharedSampledMTPSupportsPredicate(_ parameters: GenerateParameters)
         && parameters.topP > 0 && parameters.topP <= 1
         && parameters.topK >= 0
         && parameters.minP == 0
-        && GenerateParameters.repetitionPenaltyIsNeutral(parameters.repetitionPenalty)
-        && (parameters.presencePenalty ?? 0) == 0
-        && (parameters.frequencyPenalty ?? 0) == 0
 }
 
 /// Default-off production-shaped sampled MTP provider. It mirrors the seeded

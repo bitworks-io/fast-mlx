@@ -755,6 +755,60 @@ public func checkOffloadedNGramPlanOnly(
         "the offloaded n-gram table serving path is not part of the public projection")
 }
 
+// MARK: - In-checkpoint MTP drafter facade
+//
+// The real (non-projected) in-checkpoint MTP drafter facade adds
+// `InCheckpointMTPNamespaceSelection`, `LoadedInCheckpointMTPDrafter`, and
+// `loadInCheckpointMTPDrafter` as the public facade onto an in-checkpoint
+// MTP drafter load path that is internal to `MLXLLM` -- see that facade's
+// own doc comments for the full design. That path, and every type its real
+// implementation touches, is excluded from the public projection, so these
+// twins keep the identical public surface but fail closed (or omit
+// unpublished surface) instead of duplicating any of it.
+
+/// Public-projection twin of the real `InCheckpointMTPNamespaceSelection`, which names the two
+/// known checkpoint layouts the in-checkpoint MTP drafter load path can resolve. That load path
+/// is not part of the public projection.
+///
+/// The real declaration also has a computed property mapping each case to an internal namespace
+/// type used only by the excluded load path; that property is OMITTED here because its return
+/// type is itself declared in a file excluded from the public projection, and nothing in this
+/// tree reads it.
+public enum InCheckpointMTPNamespaceSelection: String, Sendable, CaseIterable, Equatable {
+    case official
+    case converted
+}
+
+/// Public-projection twin of the real `LoadedInCheckpointMTPDrafter`, the result type
+/// `loadInCheckpointMTPDrafter` below would return on success. Declared with the identical
+/// public members so the real `spike/Sources/**` call site that references this type keeps
+/// compiling in the public tree; the in-checkpoint MTP drafter load path this type describes is
+/// not part of the public projection, so nothing in this tree ever constructs one -- see
+/// `loadInCheckpointMTPDrafter` below.
+///
+/// Deliberately no `public init`: nothing in this tree constructs a value of this type, so a
+/// public memberwise init would publish surface with no caller.
+public struct LoadedInCheckpointMTPDrafter {
+    public let namespace: InCheckpointMTPNamespaceSelection
+    public let revision: String
+    public let sourceKeyCount: Int
+    public var drafter: any StatefulMTPDrafterModel
+}
+
+/// Public-projection twin of the real `loadInCheckpointMTPDrafter`. The in-checkpoint MTP
+/// drafter load path this signature fronts is not part of the public projection, so this always
+/// throws `ModelFactoryError.unsupportedModelType` rather than attempting any of the real
+/// function's configuration decoding or drafter loading.
+public func loadInCheckpointMTPDrafter(
+    modelDirectory: URL,
+    expectedNamespace: InCheckpointMTPNamespaceSelection,
+    expectedSourceKeyCount: Int,
+    revision: String
+) throws -> LoadedInCheckpointMTPDrafter {
+    throw ModelFactoryError.unsupportedModelType(
+        "the in-checkpoint MTP drafter path is not part of the public projection")
+}
+
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
     public static func modelFactory() -> (any MLXLMCommon.ModelFactory)? {
         LLMModelFactory.shared
