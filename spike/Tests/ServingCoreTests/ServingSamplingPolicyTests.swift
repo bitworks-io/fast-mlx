@@ -270,6 +270,48 @@ final class ServingSamplingPolicyTests: XCTestCase {
             .minPOutOfRange(1.5))
     }
 
+    func testResolveFromRequestWithDefaultsFillsParamlessRequest() throws {
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        let request = OpenAIChatCompletionRequest(
+            model: "qwen3-32b",
+            messages: [.init(role: .user, text: "Hi")],
+            maxCompletionTokens: nil,
+            temperature: nil,
+            choiceCount: 1,
+            stream: false,
+            stop: [])
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(from: request, defaults: defaults),
+            .sampled(temperature: 1.0, topP: 0.95, topK: 20, minP: 0, seed: nil))
+    }
+
+    func testResolveFromRequestWithDefaultsKeepsExplicitZeroTemperatureGreedy() throws {
+        let defaults = ServingSamplingDefaults(temperature: 1.0, topP: 0.95, topK: 20, minP: 0)
+        let request = OpenAIChatCompletionRequest(
+            model: "qwen3-32b",
+            messages: [.init(role: .user, text: "Hi")],
+            maxCompletionTokens: nil,
+            temperature: 0,
+            choiceCount: 1,
+            stream: false,
+            stop: [])
+        XCTAssertEqual(
+            try ServingSamplingPolicy.resolve(from: request, defaults: defaults),
+            .greedy)
+    }
+
+    func testResolveFromRequestWithoutDefaultsArgumentIsUnchanged() throws {
+        let request = OpenAIChatCompletionRequest(
+            model: "qwen3-32b",
+            messages: [.init(role: .user, text: "Hi")],
+            maxCompletionTokens: nil,
+            temperature: nil,
+            choiceCount: 1,
+            stream: false,
+            stop: [])
+        XCTAssertEqual(try ServingSamplingPolicy.resolve(from: request), .greedy)
+    }
+
     private func assertThrows(
         _ expression: @autoclosure () throws -> ServingSamplingPolicy,
         _ expected: ServingSamplingPolicyError,

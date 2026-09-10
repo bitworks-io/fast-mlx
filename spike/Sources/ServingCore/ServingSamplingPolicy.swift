@@ -108,15 +108,29 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
 
     /// Convenience resolution from a decoded request, carrying `top_p`, `top_k`,
     /// `min_p`, and `seed` through from the request.
+    ///
+    /// Equivalent to `resolve(from: request, defaults: nil)`.
     public static func resolve(
         from request: OpenAIChatCompletionRequest
+    ) throws -> ServingSamplingPolicy {
+        try resolve(from: request, defaults: nil)
+    }
+
+    /// Convenience resolution from a decoded request, additionally consulting
+    /// artifact-sourced `defaults` for fields the request omitted. See
+    /// `resolve(temperature:topP:topK:minP:seed:defaults:)` for the precedence
+    /// rules between the request and `defaults`.
+    public static func resolve(
+        from request: OpenAIChatCompletionRequest,
+        defaults: ServingSamplingDefaults?
     ) throws -> ServingSamplingPolicy {
         try resolve(
             temperature: request.temperature,
             topP: request.topP,
             topK: request.topK,
             minP: request.minP,
-            seed: request.seed)
+            seed: request.seed,
+            defaults: defaults)
     }
 }
 
@@ -139,13 +153,19 @@ public enum ServingSamplingPolicyError: Error, Equatable, Sendable {
 /// explicitly supplies always overrides the matching default; `temperature`
 /// only fills an *absent* value and never overrides an explicit `0`, which
 /// stays the client's escape hatch to the greedy speculative-decoding path.
+///
+/// `topP`, `topK`, and `minP` are optional so a loader can represent "the
+/// artifact did not constrain this field" (`nil`) distinctly from an
+/// explicit, validated value -- notably HF's `top_k: 0` convention ("top-k
+/// disabled"), which must map to `nil` here rather than to the literal `0`
+/// that `resolve` would refuse as out of range.
 public struct ServingSamplingDefaults: Equatable, Sendable {
     public var temperature: Double
-    public var topP: Double
-    public var topK: Int
-    public var minP: Double
+    public var topP: Double?
+    public var topK: Int?
+    public var minP: Double?
 
-    public init(temperature: Double, topP: Double, topK: Int, minP: Double) {
+    public init(temperature: Double, topP: Double? = nil, topK: Int? = nil, minP: Double? = nil) {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK

@@ -28,6 +28,18 @@ public enum FastMLXServeHostUse: String, Equatable, Sendable {
     case dedicatedServing = "dedicated-serving"
 }
 
+/// `--default-sampling`: whether a request that omits sampling parameters (notably `temperature`)
+/// decodes greedy argmax (`off`, today's behavior, and the default) or is resolved against the
+/// served checkpoint's own `generation_config.json` sampling subset
+/// (`GenerationConfigSamplingDefaults.load(contentsOf:)`, `generation-config`). This enum is
+/// parse-time only in this increment: nothing yet calls `load` or threads the resolved defaults
+/// into a serve route -- see the refusals below, which exist because turning this on converts
+/// param-less traffic into SAMPLED traffic, which several routes cannot honor.
+public enum FastMLXServeDefaultSampling: String, Equatable, Sendable {
+    case off
+    case generationConfig = "generation-config"
+}
+
 public enum FastMLXExactMTPSelection: String, Equatable, Sendable {
     case qwen35_9BDepth1 = "qwen35-9b-depth1"
     case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
@@ -219,6 +231,34 @@ public enum FastMLXServeArgumentError:
     /// `--qwen4exp-mtp` already gets — a separate `--qwen4exp-sampled-mtp`-specific refusal for any
     /// of those would be unreachable dead code.
     case sampledMTPRequiresInCheckpointMTP
+    case invalidDefaultSampling
+    /// `--default-sampling generation-config` resolves artifact-sourced sampling defaults for a
+    /// param-less request; `--scripted` is a transport-only dry run that never constructs a
+    /// sampling request at all, so the flag would be silently inert rather than merely unused.
+    case defaultSamplingWithScripted
+    /// `--default-sampling generation-config` would apply to a served request; `--quant-pick-only`
+    /// is a dry-run return path that resolves a pick and exits without ever serving a request, so
+    /// the flag would be silently inert there too.
+    case defaultSamplingWithQuantPickOnly
+    /// `ContinuousServingBackend` rejects `.sampled` with HTTP 400 (see its own admission check),
+    /// so turning param-less traffic into sampled traffic on a continuous route would convert
+    /// every affected request into a hard failure rather than silently ignoring the flag -- refuse
+    /// at parse time instead, mirroring `chatTemplateWithContinuousBatch` /
+    /// `ngramOffloadPlanWithContinuousBatch`'s identical "the flag would be silently
+    /// dropped/ignored" shape.
+    case defaultSamplingWithContinuousBatch
+    /// The exact Qwen3.5 MTP route falls back to scalar decoding on any non-greedy sampling
+    /// (`ExactQwen35MTPServingAdmission` -> `.scalarFallback(.sampledGeneration)`), so enabling
+    /// artifact-sourced defaults there would silently drop every param-less request off the MTP
+    /// path onto the scalar fallback instead of accelerating it.
+    case defaultSamplingWithExactQwen35MTP
+    /// `--qwen4exp-mtp` without `--qwen4exp-sampled-mtp`: the in-checkpoint MTP drafter only
+    /// accelerates GREEDY requests without the sampled block-decision provider
+    /// (`--qwen4exp-sampled-mtp`). Turning on artifact-sourced defaults would move every
+    /// param-less request from accelerated greedy MTP to unaccelerated scalar decode -- a
+    /// throughput cliff, not a silent drop -- so this combination is refused unless
+    /// `--qwen4exp-sampled-mtp` is also present.
+    case defaultSamplingWithInCheckpointMTPRequiresSampledMTP
 
     public var description: String {
         switch self {
@@ -342,6 +382,27 @@ public enum FastMLXServeArgumentError:
             "--offload-plan-check-only requires --ngram-offload-plan"
         case .sampledMTPRequiresInCheckpointMTP:
             "--qwen4exp-sampled-mtp requires --qwen4exp-mtp"
+        case .invalidDefaultSampling:
+            "--default-sampling must be off or generation-config"
+        case .defaultSamplingWithScripted:
+            "--default-sampling generation-config resolves artifact-sourced sampling defaults for "
+                + "a served request and cannot be combined with --scripted, which loads no model "
+                + "and serves nothing"
+        case .defaultSamplingWithQuantPickOnly:
+            "--default-sampling generation-config resolves artifact-sourced sampling defaults for "
+                + "a served request and cannot be combined with --quant-pick-only, whose dry-run "
+                + "return path exits without ever serving one"
+        case .defaultSamplingWithContinuousBatch:
+            "--default-sampling generation-config is not supported with continuous batching: "
+                + "ContinuousServingBackend rejects a sampled request with HTTP 400"
+        case .defaultSamplingWithExactQwen35MTP:
+            "--default-sampling generation-config is not supported with --exact-qwen35-mtp: that "
+                + "route falls back to scalar decoding on any non-greedy sampling, so every "
+                + "param-less request would silently drop off the MTP path"
+        case .defaultSamplingWithInCheckpointMTPRequiresSampledMTP:
+            "--default-sampling generation-config requires --qwen4exp-sampled-mtp when "
+                + "--qwen4exp-mtp is enabled: without it every param-less request would move from "
+                + "accelerated greedy MTP to unaccelerated scalar decode"
         }
     }
 }
@@ -528,6 +589,17 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       Applies only to the loaded scalar-serve route; not supported
                                       with --scripted, continuous batching, --exact-qwen35-mtp, or
                                       --quant-pick-only.
+          --default-sampling MODE     Whether a request omitting sampling params (default:
+                                      off) decodes greedy argmax (off) or resolves the
+                                      served checkpoint's own generation_config.json
+                                      sampling subset (generation-config). Parse-time
+                                      only today: not yet wired into any serve route.
+                                      Not supported with --scripted, --quant-pick-only,
+                                      continuous batching, or --exact-qwen35-mtp; with
+                                      --qwen4exp-mtp also requires
+                                      --qwen4exp-sampled-mtp (otherwise every
+                                      param-less request would move from accelerated
+                                      greedy MTP to unaccelerated scalar decode).
           --host HOST                 Bind host (default: 127.0.0.1).
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
@@ -733,6 +805,21 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// `fitCheckOnly`, on the FULL loaded-model construction path, never through
     /// `--quant-pick-only`'s early return.
     public let offloadPlanCheckOnly: Bool
+    /// `--default-sampling`: `off` (the default) preserves today's behavior byte-for-byte -- a
+    /// request omitting sampling parameters decodes greedy argmax. `generationConfig` opts into
+    /// resolving the served checkpoint's own `generation_config.json` sampling subset for such a
+    /// request instead. PARSE-TIME ONLY in this increment: nothing yet calls
+    /// `GenerationConfigSamplingDefaults.load(contentsOf:)` or threads its result into a serve
+    /// route -- that wiring is a later increment. Fail-closed here against every route that would
+    /// otherwise silently ignore this flag or regress accepted behavior when it converts
+    /// param-less traffic into sampled traffic: `--scripted` and `--quant-pick-only` never serve a
+    /// request at all (`defaultSamplingWithScripted` / `defaultSamplingWithQuantPickOnly`);
+    /// continuous batching's `ContinuousServingBackend` rejects `.sampled` with HTTP 400
+    /// (`defaultSamplingWithContinuousBatch`); `--exact-qwen35-mtp` falls back to scalar decoding
+    /// on any non-greedy sampling (`defaultSamplingWithExactQwen35MTP`); and `--qwen4exp-mtp`
+    /// without `--qwen4exp-sampled-mtp` would move every param-less request from accelerated
+    /// greedy MTP to unaccelerated scalar decode (`defaultSamplingWithInCheckpointMTPRequiresSampledMTP`).
+    public let defaultSampling: FastMLXServeDefaultSampling
 
     private init(
         backend: FastMLXServeBackend?,
@@ -772,7 +859,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         memoryLimitBytes: Int? = nil,
         chatTemplateURL: URL? = nil,
         fitCheckOnly: Bool = false,
-        offloadPlanCheckOnly: Bool = false
+        offloadPlanCheckOnly: Bool = false,
+        defaultSampling: FastMLXServeDefaultSampling = .off
     ) {
         self.backend = backend
         self.host = host
@@ -811,6 +899,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.chatTemplateURL = chatTemplateURL
         self.fitCheckOnly = fitCheckOnly
         self.offloadPlanCheckOnly = offloadPlanCheckOnly
+        self.defaultSampling = defaultSampling
     }
 
     public static func parse<S: Sequence>(
@@ -862,6 +951,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var chatTemplateURL: URL?
         var fitCheckOnly = false
         var offloadPlanCheckOnly = false
+        var defaultSampling = FastMLXServeDefaultSampling.off
 
         var index = 0
         while index < arguments.count {
@@ -1068,6 +1158,16 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.chatTemplateMustBeAbsolute
                 }
                 chatTemplateURL = URL(fileURLWithPath: path)
+            case "--default-sampling":
+                index += 1
+                let rawDefaultSampling = try value(at: index, in: arguments, for: argument)
+                guard
+                    let parsedDefaultSampling = FastMLXServeDefaultSampling(
+                        rawValue: rawDefaultSampling)
+                else {
+                    throw FastMLXServeArgumentError.invalidDefaultSampling
+                }
+                defaultSampling = parsedDefaultSampling
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -1265,6 +1365,43 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             }
             guard mtpDrafterDirectory != nil else {
                 throw FastMLXServeArgumentError.missingRequiredOption("--mtp-drafter-path")
+            }
+        }
+
+        // --default-sampling generation-config converts param-less traffic (temperature omitted)
+        // from greedy argmax into artifact-sourced SAMPLED decoding. Refuse every route/mode
+        // combination where that conversion would be silently inert or actively regress accepted
+        // behavior, mirroring this file's other "flag would be silently dropped/ignored"
+        // refusals. Placed here -- after `continuousModeSelected` and the full `exactQwen35MTP`
+        // validation block above, but BEFORE the `--quant-pick-only` early return below -- so
+        // every boolean this block reads is already resolved and no early return can skip it.
+        // `--default-sampling off` (the default) never enters this block.
+        if defaultSampling == .generationConfig {
+            // --scripted never constructs or serves a request at all.
+            if scripted {
+                throw FastMLXServeArgumentError.defaultSamplingWithScripted
+            }
+            // --quant-pick-only's dry-run return path resolves a pick and exits without ever
+            // serving a request.
+            if quantPickOnly {
+                throw FastMLXServeArgumentError.defaultSamplingWithQuantPickOnly
+            }
+            // ContinuousServingBackend rejects `.sampled` with HTTP 400 (see
+            // defaultSamplingWithContinuousBatch's own doc comment).
+            if continuousModeSelected {
+                throw FastMLXServeArgumentError.defaultSamplingWithContinuousBatch
+            }
+            // The exact Qwen3.5 MTP route falls back to scalar decoding on any non-greedy
+            // sampling (see defaultSamplingWithExactQwen35MTP's own doc comment).
+            if exactQwen35MTP {
+                throw FastMLXServeArgumentError.defaultSamplingWithExactQwen35MTP
+            }
+            // Without --qwen4exp-sampled-mtp, every param-less request under --qwen4exp-mtp would
+            // move from accelerated GREEDY MTP to UNACCELERATED scalar decode -- a throughput
+            // cliff, not a silent drop (see defaultSamplingWithInCheckpointMTPRequiresSampledMTP's own
+            // doc comment).
+            if qwen4ExpMTP, !qwen4ExpSampledMTP {
+                throw FastMLXServeArgumentError.defaultSamplingWithInCheckpointMTPRequiresSampledMTP
             }
         }
 
@@ -1519,7 +1656,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             memoryLimitBytes: memoryLimitBytes,
             chatTemplateURL: chatTemplateURL,
             fitCheckOnly: fitCheckOnly,
-            offloadPlanCheckOnly: offloadPlanCheckOnly)
+            offloadPlanCheckOnly: offloadPlanCheckOnly,
+            defaultSampling: defaultSampling)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -1564,6 +1702,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--chat-template",
         "--fit-check-only",
         "--offload-plan-check-only",
+        "--default-sampling",
     ]
 
     private static func value(
