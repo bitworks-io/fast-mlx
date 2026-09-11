@@ -705,6 +705,17 @@ private func resolveServingLimits(
     let ceilingProvenanceNotes = ModelSizer.provenanceNotes(box: host, kvQuant: .fp16)
     if !ceilingProvenanceNotes.isEmpty { emitFitCheck(ceilingProvenanceNotes) }
 
+    // Advisory-only external-ceiling-drift check (`WiredCeilingOvercommitGuard`): wired into this
+    // shared `resolveServingLimits` seam, not one route, so every real backend gets it — this
+    // function is the one place the scalar route (`.scalar`, including the exact-Qwen3.5-MTP
+    // composite) and both continuous-batch routes (`.continuousBatchNoSpec` /
+    // `.continuousDynamicPLD`) all call before load. `host` here is the SAME `SystemProfile`
+    // (operator memory budget already applied) that `decision` above was computed against, so this
+    // reports on the exact ceiling the fit verdict used. Never throws, never refuses, never
+    // mutates any budget/ceiling/allocation — it only emits one machine-readable
+    // `wired_ceiling_state=...` line per the advisory contract in `WiredCeilingOvercommitGuard`.
+    emitFitCheck(WiredCeilingOvercommitGuard.advisoryLines(for: WiredCeilingOvercommitGuard.assess(profile: host)))
+
     // Sizing-only advisory for a requested non-fp16 KV-cache tier. Emitted BEFORE the refusal guard
     // so an operator whose fp16 verdict is red still sees the mitigation ("int8 would fit at ceiling
     // X"). The what-if decision is HarnessCore's; every line is labeled runtime_not_wired. The
