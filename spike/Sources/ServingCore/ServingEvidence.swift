@@ -569,6 +569,16 @@ extension ServingEvidence {
         // trivially-conservative startup verdict.
         public let fitModeledPeakBytes: Int?
         public let fitMeasuredPeakBytes: Int?
+        /// `measuredPeakBytes + measuredCacheBytes` — the quantity `fitDriftVerdict`/`fitDriftFraction`
+        /// are actually classified against (see `FitCheckMeasuredReport.measuredFootprintBytes`'s doc
+        /// comment: MLX's own `peakMemory` excludes cache/pool bytes, so `drift`/`deltaFraction` are
+        /// computed against the footprint, not `measuredPeakBytes` alone). Kept ADDITIVE alongside
+        /// `fitMeasuredPeakBytes` (continuity — that field keeps meaning "measured peak" exactly as
+        /// before) so a reader can reconcile `fit_drift`/`fit_drift_frac` against the value they were
+        /// actually computed from, instead of against `fit_measured_peak_bytes` and getting a delta
+        /// that does not match. Optional and canonically OMITTED under the same no-prediction rule as
+        /// the sibling `fit_*` fields, so old snapshots stay byte-identical.
+        public let fitMeasuredFootprintBytes: Int?
         public let fitDriftVerdict: String?
         /// Signed `(measured − modeled) / modeled`. Negative = conservative (safe); may be negative.
         public let fitDriftFraction: Double?
@@ -587,6 +597,7 @@ extension ServingEvidence {
             mlxPeakBytes: Int,
             fitModeledPeakBytes: Int? = nil,
             fitMeasuredPeakBytes: Int? = nil,
+            fitMeasuredFootprintBytes: Int? = nil,
             fitDriftVerdict: String? = nil,
             fitDriftFraction: Double? = nil,
             fitModeledWeightsBytes: Int? = nil,
@@ -611,6 +622,7 @@ extension ServingEvidence {
             let optionalByteValues: [(String, Int?)] = [
                 ("fitModeledPeakBytes", fitModeledPeakBytes),
                 ("fitMeasuredPeakBytes", fitMeasuredPeakBytes),
+                ("fitMeasuredFootprintBytes", fitMeasuredFootprintBytes),
                 ("fitModeledWeightsBytes", fitModeledWeightsBytes),
                 ("fitModeledKVBytes", fitModeledKVBytes),
                 ("fitModeledTransientBytes", fitModeledTransientBytes),
@@ -633,6 +645,7 @@ extension ServingEvidence {
             self.mlxPeakBytes = mlxPeakBytes
             self.fitModeledPeakBytes = fitModeledPeakBytes
             self.fitMeasuredPeakBytes = fitMeasuredPeakBytes
+            self.fitMeasuredFootprintBytes = fitMeasuredFootprintBytes
             self.fitDriftVerdict = fitDriftVerdict
             self.fitDriftFraction = fitDriftFraction
             self.fitModeledWeightsBytes = fitModeledWeightsBytes
@@ -652,6 +665,7 @@ extension ServingEvidence {
             case mlxPeakBytes = "mlx_peak_bytes"
             case fitModeledPeakBytes = "fit_modeled_peak_bytes"
             case fitMeasuredPeakBytes = "fit_measured_peak_bytes"
+            case fitMeasuredFootprintBytes = "fit_measured_footprint_bytes"
             case fitDriftVerdict = "fit_drift"
             case fitDriftFraction = "fit_drift_frac"
             case fitModeledWeightsBytes = "fit_modeled_weights_bytes"
@@ -680,6 +694,9 @@ extension ServingEvidence {
                 fitMeasuredPeakBytes: ServingEvidence.decodeCanonicalOptional(
                     Int.self, from: container, forKey: .fitMeasuredPeakBytes,
                     field: "fit_measured_peak_bytes"),
+                fitMeasuredFootprintBytes: ServingEvidence.decodeCanonicalOptional(
+                    Int.self, from: container, forKey: .fitMeasuredFootprintBytes,
+                    field: "fit_measured_footprint_bytes"),
                 fitDriftVerdict: ServingEvidence.decodeCanonicalOptional(
                     String.self, from: container, forKey: .fitDriftVerdict,
                     field: "fit_drift"),

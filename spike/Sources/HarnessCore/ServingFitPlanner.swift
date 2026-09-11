@@ -71,6 +71,21 @@ public struct ServingFitDecision: Sendable {
     /// allocator), for surfacing measured-vs-modeled totals.
     public let prediction: CapacityPrediction
 
+    /// Compares `prediction.allocatorHeadroomBytes` (the byte term the SIZER prices the allocator
+    /// at — currently `CapacityModel.predictPeakBytes`'s hardcoded default, never overridden by any
+    /// call site) against `cacheLimitBytes` (`CapacityModel.recommendedCacheLimitBytes`, the byte
+    /// cap the RUNTIME is actually entitled to let `MLX.Memory.cacheLimit` hold). These are two
+    /// independently-computed numbers from the SAME `decide()` call; nothing enforces
+    /// `allocatorHeadroomBytes >= cacheLimitBytes`, so the model can price the allocator below what
+    /// the runtime may legitimately cache — and cache bytes are exactly what MLX's own `peakMemory`
+    /// excludes (`FitCheckMeasuredReport`'s `measuredFootprintBytes` is the other half of this
+    /// increment, for the same reason).
+    ///
+    /// ADVISORY ONLY. This state is never read by `classify`/`shouldProceed`/`color` and must never
+    /// be allowed to change them — substituting the real cache entitlement into the gating
+    /// prediction is a separate, operator-coordinated increment (arming), not this one.
+    public let allocatorHeadroomState: ServingFitPlanner.AllocatorHeadroomState
+
     private static func gib(_ b: Int) -> String { String(format: "%.2f GiB", Double(b) / 1_073_741_824.0) }
     private static func gib(_ b: Double) -> String { String(format: "%.2f GiB", b / 1_073_741_824.0) }
 
@@ -149,6 +164,53 @@ public struct ServingFitDecision: Sendable {
 /// `SystemProfile`). No filesystem, no MLX — the caller supplies a decoded `ModelArchProfile`
 /// (typically from `ModelConfigDecoder`) and a `SystemProfile` (typically `detectHost()`).
 public enum ServingFitPlanner {
+
+    /// Three-state result of comparing the sizer's modeled allocator-headroom term against the
+    /// runtime's actual cache-byte entitlement (`ServingFitDecision.allocatorHeadroomState`'s doc
+    /// comment explains what each side means and why the gap matters). Mirrors
+    /// `WiredCeilingAssessment`'s shape deliberately: distinguishing "checked and consistent" from
+    /// "never checked" matters here for the same reason it matters in
+    /// `WiredCeilingOvercommitGuard` — this project has been bitten by advisories that render
+    /// identically whether they ran and found nothing, or never ran at all.
+    public enum AllocatorHeadroomState: Equatable, Sendable {
+        /// `allocatorHeadroomBytes >= cacheLimitBytes` — the modeled allocator term already prices
+        /// at or above what the runtime may cache. No gap to report.
+        case consistent(headroomBytes: Int, cacheLimitBytes: Int)
+        /// `allocatorHeadroomBytes < cacheLimitBytes` — the model prices the allocator below the
+        /// runtime's own cache entitlement by `gapBytes`.
+        case underEntitled(headroomBytes: Int, cacheLimitBytes: Int, gapBytes: Int)
+    }
+
+    private static func gib(_ b: Int) -> String { String(format: "%.2f GiB", Double(b) / 1_073_741_824.0) }
+
+    /// Operator-facing advisory lines for the allocator-headroom-vs-cache-entitlement gap — same
+    /// `"NOTE:"`-prefixed, GiB-plus-raw-bytes style as `WiredCeilingOvercommitGuard.advisoryLines`
+    /// / `ModelSizer.provenanceNotes`. Emits exactly ONE stable machine-readable
+    /// `allocator_headroom_state=<value>` token per call (`under_entitled` / `consistent`) so a log
+    /// scraper need not parse prose, and emits a line in BOTH states — the `consistent` line proves
+    /// in the logs that this check actually ran, rather than leaving "checked and fine"
+    /// indistinguishable from "never checked". ADVISORY ONLY: never gates, never proceeds/refuses.
+    public static func allocatorHeadroomAdvisoryLines(for state: AllocatorHeadroomState) -> [String] {
+        switch state {
+        case .consistent(let headroom, let cacheLimit):
+            return [
+                "NOTE: allocator_headroom_state=consistent — modeled allocator headroom "
+                    + "\(headroom) B (\(gib(headroom))) is at or above the runtime's cache "
+                    + "entitlement \(cacheLimit) B (\(gib(cacheLimit))); advisory only.",
+            ]
+        case .underEntitled(let headroom, let cacheLimit, let gap):
+            return [
+                "NOTE: allocator_headroom_state=under_entitled — the sizer prices the allocator "
+                    + "below what the runtime is entitled to cache.",
+                "  modeled_allocator_headroom=\(headroom) B (\(gib(headroom)))",
+                "  runtime_cache_limit=\(cacheLimit) B (\(gib(cacheLimit)))",
+                "  gap=\(gap) B (\(gib(gap))) of cache the process may legitimately hold is priced "
+                    + "below the allocator headroom term AND excluded from MLX's own `peakMemory` "
+                    + "(see FitCheckMeasuredReport.measuredFootprintBytes); advisory only — this does "
+                    + "not change the verdict, and no verdict field consumes this state.",
+            ]
+        }
+    }
 
     /// Decide whether/how to serve `profile` on `host` at `requestedContext`.
     ///
@@ -245,6 +307,21 @@ public enum ServingFitPlanner {
                 profile, context: max(1, servedContext), kvQuant: kvQuant, concurrency: slots).rounded(.up))
         }
 
+        // Advisory only: name the gap between the modeled allocator-headroom term and the runtime's
+        // actual cache entitlement (see `ServingFitDecision.allocatorHeadroomState`'s doc comment).
+        // Deliberately computed from `prediction`/`cacheLimitBytes` alone, so it can never influence
+        // `verdict`/`shouldProceed` above (both are already assigned by this point).
+        let allocatorHeadroomBytes = Int(prediction.allocatorHeadroomBytes.rounded())
+        let allocatorHeadroomState: AllocatorHeadroomState
+        if allocatorHeadroomBytes < cacheLimitBytes {
+            allocatorHeadroomState = .underEntitled(
+                headroomBytes: allocatorHeadroomBytes, cacheLimitBytes: cacheLimitBytes,
+                gapBytes: cacheLimitBytes - allocatorHeadroomBytes)
+        } else {
+            allocatorHeadroomState = .consistent(
+                headroomBytes: allocatorHeadroomBytes, cacheLimitBytes: cacheLimitBytes)
+        }
+
         return ServingFitDecision(
             modelID: profile.id, color: verdict.color, bindingConstraint: verdict.bindingConstraint,
             mitigation: verdict.suggestedMitigation, quantBits: quantBits, requestedContext: resolvedRequest,
@@ -258,6 +335,6 @@ public enum ServingFitPlanner {
             wiredLimitIsMeasured: host.wiredLimitIsMeasured,
             effectiveMemoryCeilingSource: effectiveMemoryCeiling.source,
             effectiveMemoryCeilingIsMeasured: host.effectiveMemoryCeilingIsMeasured,
-            prediction: prediction)
+            prediction: prediction, allocatorHeadroomState: allocatorHeadroomState)
     }
 }

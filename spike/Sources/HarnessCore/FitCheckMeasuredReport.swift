@@ -9,7 +9,7 @@ import Foundation
 /// `Memory.snapshot().{peakMemory,activeMemory,cacheMemory}` — and passes them in), so it unit-tests
 /// off-box with no MLX dependency, mirroring `ServingFitDecision`.
 ///
-/// Drift semantics (measured peak vs modeled peak, the safety-relevant direction):
+/// Drift semantics (measured FOOTPRINT vs modeled peak, the safety-relevant direction):
 /// - `.conservative`  — measured came in BELOW the modeled peak by more than the tolerance band: the
 ///   sizer reserved more than the run used. Safe (the fit-check's intended bias) — never a surprise OOM.
 /// - `.underpredicted` — measured EXCEEDED the modeled peak by more than the tolerance: the run used
@@ -18,6 +18,12 @@ import Foundation
 /// - `.accurate`      — within ±tolerance: the model tracked reality.
 /// - `.indeterminate` — the modeled peak is not derivable (0), so no ratio can be formed (e.g. an
 ///   unsupported/novel arch the sizer refused to size). Report the measured bytes without a verdict.
+///
+/// `drift` (and `deltaBytes`/`deltaFraction`) are computed against `measuredFootprintBytes`
+/// (`measuredPeakBytes + measuredCacheBytes`), NOT `measuredPeakBytes` alone — see
+/// `measuredFootprintBytes`'s doc comment for why: MLX's `Memory.peakMemory` excludes cache/pool
+/// bytes, so comparing the modeled peak against `measuredPeakBytes` alone lets a real cache-driven
+/// overrun classify as `.conservative`/`.accurate` for free.
 public struct FitCheckMeasuredReport: Sendable {
     public enum Drift: String, Sendable {
         case accurate
@@ -39,7 +45,24 @@ public struct FitCheckMeasuredReport: Sendable {
     public let measuredActiveBytes: Int
     public let measuredCacheBytes: Int
 
-    /// `measuredPeakBytes − modeledPeakBytes` (signed): positive = the run used MORE than modeled.
+    /// `measuredPeakBytes + measuredCacheBytes` — the quantity `drift` is actually classified
+    /// against (see the type's top doc comment). MLX's own docs describe `activeMemory +
+    /// cacheMemory` as "the total memory allocated by MLX"; `peakMemory` is `max` over `activeMemory`
+    /// alone and structurally EXCLUDES cache/pool bytes the process may legitimately be holding.
+    ///
+    /// Honesty note (do not read this as more precise than it is): `measuredPeakBytes` is a
+    /// high-water mark accumulated over the whole run, while `measuredCacheBytes` is a single
+    /// INSTANTANEOUS sample taken at report time. Their sum is therefore an ESTIMATE of the run's
+    /// peak footprint, not a measurement of it — it is neither a guaranteed upper nor lower bound on
+    /// the true peak of `(active + cache)` over the run (the cache sample could have been smaller,
+    /// or larger, at the moment `activeMemory` actually peaked). It is strictly closer to the truth
+    /// than the peak-only figure it replaces for `drift`, and that narrower claim — not "the true
+    /// peak" or "the real footprint" — is the one this field is entitled to make.
+    public let measuredFootprintBytes: Int
+
+    /// `measuredFootprintBytes − modeledPeakBytes` (signed): positive = the run used MORE than
+    /// modeled. Computed against the footprint (peak + cache), not `measuredPeakBytes` alone — see
+    /// `measuredFootprintBytes`.
     public let deltaBytes: Int
     /// `deltaBytes / modeledPeakBytes` (0 when indeterminate). Positive = underpredicted direction.
     public let deltaFraction: Double
@@ -67,9 +90,11 @@ public struct FitCheckMeasuredReport: Sendable {
         self.measuredPeakBytes = measuredPeakBytes
         self.measuredActiveBytes = measuredActiveBytes
         self.measuredCacheBytes = measuredCacheBytes
+        let footprint = measuredPeakBytes + measuredCacheBytes
+        self.measuredFootprintBytes = footprint
         self.toleranceFraction = toleranceFraction
 
-        let delta = measuredPeakBytes - modeledPeak
+        let delta = footprint - modeledPeak
         self.deltaBytes = delta
         if modeledPeak <= 0 {
             self.deltaFraction = 0
@@ -93,11 +118,12 @@ public struct FitCheckMeasuredReport: Sendable {
     public func summaryLine() -> String {
         let pct = String(format: "%+.1f%%", deltaFraction * 100)
         let verdict = drift.rawValue.uppercased()
-        return "  measured-vs-modeled: peak measured=\(Self.gib(measuredPeakBytes)) "
+        return "  measured-vs-modeled: footprint(peak+cache) measured=\(Self.gib(measuredFootprintBytes)) "
             + "modeled=\(Self.gib(modeledPeakBytes)) (Δ \(pct), \(verdict)); "
             + "modeled terms: weights=\(Self.gib(modeledWeightsBytes)) kv=\(Self.gib(modeledKVBytes)) "
             + "transient=\(Self.gib(modeledTransientBytes)) headroom=\(Self.gib(modeledHeadroomBytes)); "
-            + "measured: active=\(Self.gib(measuredActiveBytes)) cache=\(Self.gib(measuredCacheBytes))"
+            + "measured: peak=\(Self.gib(measuredPeakBytes)) active=\(Self.gib(measuredActiveBytes)) "
+            + "cache=\(Self.gib(measuredCacheBytes))"
     }
 
     /// Machine-readable `fit_*` fields for the startup line (space-separated `key=value`, matching
@@ -107,6 +133,7 @@ public struct FitCheckMeasuredReport: Sendable {
         let frac = String(format: "%+.4f", deltaFraction)
         return "fit_modeled_peak_bytes=\(modeledPeakBytes) fit_measured_peak_bytes=\(measuredPeakBytes) "
             + "fit_measured_active_bytes=\(measuredActiveBytes) fit_measured_cache_bytes=\(measuredCacheBytes) "
+            + "fit_measured_footprint_bytes=\(measuredFootprintBytes) "
             + "fit_drift=\(drift.rawValue) fit_drift_frac=\(frac) "
             + "fit_modeled_weights_bytes=\(modeledWeightsBytes) fit_modeled_kv_bytes=\(modeledKVBytes) "
             + "fit_modeled_transient_bytes=\(modeledTransientBytes) fit_modeled_headroom_bytes=\(modeledHeadroomBytes)"

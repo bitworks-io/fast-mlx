@@ -708,6 +708,96 @@ final class ServingEvidenceTests: XCTestCase {
                 mlxPeakBytes: 0,
                 fitModeledPeakBytes: -1))
     }
+
+    // MARK: - fitMeasuredFootprintBytes (reconciles fit_drift/fit_drift_frac, computed against
+    // measuredPeakBytes + measuredCacheBytes, with the raw fit_measured_peak_bytes alongside it)
+
+    /// Acceptance 1: the new field round-trips through encode/decode, and the persisted JSON key
+    /// follows the file's existing flat snake_case `fit_*` convention.
+    func testResourceSnapshotFitMeasuredFootprintBytesRoundTripsWithSnakeCaseKey() throws {
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 1,
+            coordinatorSlots: 1,
+            reservedKVBytes: 2_048,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 6_144,
+            mlxCacheBytes: 1_024,
+            mlxPeakBytes: 9_000,
+            fitModeledPeakBytes: 10_000,
+            fitMeasuredPeakBytes: 9_000,
+            fitMeasuredFootprintBytes: 9_500,
+            fitDriftVerdict: "accurate",
+            fitDriftFraction: -0.05,
+            fitModeledWeightsBytes: 6_000,
+            fitModeledKVBytes: 2_000,
+            fitModeledTransientBytes: 1_500,
+            fitModeledHeadroomBytes: 500)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let json = try XCTUnwrap(String(data: encoder.encode(snapshot), encoding: .utf8))
+        XCTAssertTrue(json.contains(#""fit_measured_footprint_bytes":9500"#), json)
+        // The raw measured-peak field survives unchanged alongside the new footprint field
+        // (continuity — GAP 2 is additive, not a replacement).
+        XCTAssertTrue(json.contains(#""fit_measured_peak_bytes":9000"#), json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: Data(json.utf8)),
+            snapshot)
+        XCTAssertEqual(snapshot.fitMeasuredFootprintBytes, 9_500)
+    }
+
+    /// Acceptance 2: a persisted-evidence payload that PREDATES this field (no
+    /// `fit_measured_footprint_bytes` key at all — the exact shape of an on-disk evidence file
+    /// written before this change) must still decode, with the new field resolving to `nil` rather
+    /// than failing closed. This is the one that protects existing evidence files.
+    func testResourceSnapshotDecodesPersistedPayloadLackingFitMeasuredFootprintBytes() throws {
+        let oldPayload = Data(
+            #"""
+            {"active_requests":0,"coordinator_slots":0,"reserved_kv_bytes":0,\#
+            "max_reserved_kv_bytes":16384,"mlx_active_bytes":4096,"mlx_cache_bytes":1024,\#
+            "mlx_peak_bytes":9500,"fit_modeled_peak_bytes":10000,\#
+            "fit_measured_peak_bytes":9500,"fit_drift":"conservative","fit_drift_frac":-0.05}
+            """#.utf8)
+        let decoded = try JSONDecoder().decode(ServingEvidence.ResourceSnapshot.self, from: oldPayload)
+        XCTAssertNil(decoded.fitMeasuredFootprintBytes)
+        // Every pre-existing field on this legacy payload must decode unaffected.
+        XCTAssertEqual(decoded.fitMeasuredPeakBytes, 9_500)
+        XCTAssertEqual(decoded.fitDriftVerdict, "conservative")
+    }
+
+    /// Acceptance 3: a snapshot populated the way `FastMLXServe.swift` populates it from a
+    /// `FitCheckMeasuredReport` — `fitMeasuredFootprintBytes: drift?.measuredFootprintBytes` and
+    /// `fitMeasuredPeakBytes: drift?.measuredPeakBytes`, where `measuredFootprintBytes ==
+    /// measuredPeakBytes + measuredCacheBytes` (see `FitCheckMeasuredReport`'s doc comment) — carries
+    /// a footprint strictly greater than its peak whenever the report's cache bytes are non-zero.
+    /// ServingCoreTests has no HarnessCore dependency (ServingCore is deliberately HarnessCore-free —
+    /// see `ResourceSnapshot`'s drift-fields doc comment), so this simulates the report's own
+    /// `measuredPeakBytes + measuredCacheBytes` arithmetic with literal numbers rather than
+    /// constructing an actual `FitCheckMeasuredReport`; `FitCheckMeasuredReportTests` covers that
+    /// arithmetic directly at the source type.
+    func testResourceSnapshotFromReportWithCacheBytesHasFootprintStrictlyGreaterThanPeak() throws {
+        let measuredPeakBytes = 9_000
+        let measuredCacheBytes = 512
+        let measuredFootprintBytes = measuredPeakBytes + measuredCacheBytes
+
+        let snapshot = try ServingEvidence.ResourceSnapshot(
+            activeRequests: 0,
+            coordinatorSlots: 0,
+            reservedKVBytes: 0,
+            maxReservedKVBytes: 16_384,
+            mlxActiveBytes: 8_500,
+            mlxCacheBytes: measuredCacheBytes,
+            mlxPeakBytes: measuredPeakBytes,
+            fitModeledPeakBytes: 10_000,
+            fitMeasuredPeakBytes: measuredPeakBytes,
+            fitMeasuredFootprintBytes: measuredFootprintBytes,
+            fitDriftVerdict: "accurate",
+            fitDriftFraction: -0.045)
+
+        let footprint = try XCTUnwrap(snapshot.fitMeasuredFootprintBytes)
+        let peak = try XCTUnwrap(snapshot.fitMeasuredPeakBytes)
+        XCTAssertGreaterThan(footprint, peak)
+    }
 }
 
 private func makeMinimalEvidence() throws -> ServingEvidence {

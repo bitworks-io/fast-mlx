@@ -716,6 +716,18 @@ private func resolveServingLimits(
     // `wired_ceiling_state=...` line per the advisory contract in `WiredCeilingOvercommitGuard`.
     emitFitCheck(WiredCeilingOvercommitGuard.advisoryLines(for: WiredCeilingOvercommitGuard.assess(profile: host)))
 
+    // Advisory-only allocator-headroom-vs-cache-entitlement check (`ServingFitPlanner`): same seam as
+    // the wired-ceiling advisory just above, for the same reason — `resolveServingLimits` is the one
+    // place the scalar route (`.scalar`, including the exact-Qwen3.5-MTP composite) and both
+    // continuous-batch routes (`.continuousBatchNoSpec` / `.continuousDynamicPLD`) all pass through
+    // before load. Reads the state straight off `decision` (no second fit computation): `decision`
+    // above is the SAME `ServingFitDecision` this function already computed the verdict from, so the
+    // advisory reports on the exact prediction/ceiling pairing the fit verdict used. Never throws,
+    // never refuses, never mutates any budget/ceiling/allocation — it only emits one machine-readable
+    // `allocator_headroom_state=...` line per the advisory contract in
+    // `ServingFitPlanner.allocatorHeadroomAdvisoryLines`.
+    emitFitCheck(ServingFitPlanner.allocatorHeadroomAdvisoryLines(for: decision.allocatorHeadroomState))
+
     // Sizing-only advisory for a requested non-fp16 KV-cache tier. Emitted BEFORE the refusal guard
     // so an operator whose fp16 verdict is red still sees the mitigation ("int8 would fit at ceiling
     // X"). The what-if decision is HarnessCore's; every line is labeled runtime_not_wired. The
@@ -906,6 +918,7 @@ private func loadScalarServingBackend(
                 mlxPeakBytes: snapshot.mlxPeakBytes,
                 fitModeledPeakBytes: drift?.modeledPeakBytes,
                 fitMeasuredPeakBytes: drift?.measuredPeakBytes,
+                fitMeasuredFootprintBytes: drift?.measuredFootprintBytes,
                 fitDriftVerdict: drift?.drift.rawValue,
                 fitDriftFraction: drift?.deltaFraction,
                 fitModeledWeightsBytes: drift?.modeledWeightsBytes,
@@ -1068,6 +1081,7 @@ private func prepareBackend(
                         mlxPeakBytes: scalarSnapshot.mlxPeakBytes,
                         fitModeledPeakBytes: drift?.modeledPeakBytes,
                         fitMeasuredPeakBytes: drift?.measuredPeakBytes,
+                        fitMeasuredFootprintBytes: drift?.measuredFootprintBytes,
                         fitDriftVerdict: drift?.drift.rawValue,
                         fitDriftFraction: drift?.deltaFraction,
                         fitModeledWeightsBytes: drift?.modeledWeightsBytes,
@@ -1245,6 +1259,7 @@ private func prepareBackend(
                     mlxPeakBytes: snapshot.mlxPeakBytes,
                     fitModeledPeakBytes: drift?.modeledPeakBytes,
                     fitMeasuredPeakBytes: drift?.measuredPeakBytes,
+                    fitMeasuredFootprintBytes: drift?.measuredFootprintBytes,
                     fitDriftVerdict: drift?.drift.rawValue,
                     fitDriftFraction: drift?.deltaFraction,
                     fitModeledWeightsBytes: drift?.modeledWeightsBytes,
