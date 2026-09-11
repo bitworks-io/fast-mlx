@@ -50,10 +50,10 @@ path engages:
 
 | | share of the context-driven slope |
 |---|---|
-| ceiling — remove the whole pooling phase | **10.18%** |
-| the proposed cache | **9.89%** |
+| ceiling — remove the whole pooling phase | **10.53%** |
+| the proposed cache | **10.48%** |
 
-The second row is the one that closed it. **The cache captures 97.2% of the phase it targets.** It is
+The second row is the one that closed it. **The cache captures 99.5% of the phase it targets.** It is
 not a badly designed optimization that a better design could rescue. The phase is just small. There
 was no version of this worth the invalidation logic.
 
@@ -77,25 +77,35 @@ context, came in flat at 0.10% of the sparse layer's slope — so the rig was no
 memory pressure that rose with every arm. And the whole run reproduced an earlier measurement's ratio
 to within 0.77%, which is what makes it comparable to anything at all.
 
-We will also say plainly that the run was **formally void**. Four control arms breached the drift
-gate. All four run at about a quarter of a millisecond, where a 3% *relative* threshold is roughly
-seven microseconds — inside timer jitter. Every arm that mattered passed, the worst at 1.09%. The
-gate is the wrong shape for arms that small and we are fixing it. But the run is recorded as void,
-because a gate you explain away after seeing the result is not a gate.
+The first run of this was **formally void**, and we recorded it that way. Four control arms breached
+the drift gate. All four run at about a quarter of a millisecond, where a 3% *relative* threshold is
+roughly seven microseconds — inside timer jitter. Every arm that mattered passed, the worst at 1.09%.
+A gate you explain away after seeing the result is not a gate.
+
+So we fixed the gate rather than the interpretation: it now carries an absolute floor alongside the
+relative one, plus a check that fails the run if that floor ever becomes the binding threshold on an
+arm that feeds the result. The second run passes cleanly, with nothing failing, and reproduces the
+first to within 0.85% on the underlying slope. The numbers above are the clean run's.
+
+The two runs are worth reporting together, because of what they did to the threshold. The first came
+in at 9.89%. The second came in at 10.48%. Our predeclared bands put reject below 10% and no-verdict
+from 10% to 30%. **The measurement straddles that boundary.** Had we let the decision turn on which
+side of 10% a single run landed, it would have been settled by noise.
 
 ## The number we were not looking for
 
 The interesting result was in the 90% the pooling phase did not explain.
 
-The per-key slope works out to roughly **148 KB of implied memory traffic per key of cache**, measured
+The per-key slope works out to roughly **155 KB of implied memory traffic per key of cache**, measured
 against the same machine's own streaming bandwidth, probed in the same run. The path actually needs a
 few hundred bytes per key.
 
 The concrete version is starker. At a cache length of 32,768, the context-driven part of a single
-layer's decode step costs **7.91 ms**. Streaming the entire 8.39 MB key state once, end to end, costs
-**0.0134 ms**.
+layer's decode step costs **7.98 ms**. Streaming the entire 8.39 MB key state once, end to end, costs
+**0.0129 ms**.
 
-That is **591x**.
+That is **618x** — and the voided first run put it at 591x, so this is not a conclusion that depends
+on which run you read.
 
 **Long-context sparse-attention decode, on this path, is not a memory-bandwidth problem.** It is
 nowhere near the roofline. The cost is materialization — building a dense mask proportional to the
@@ -116,9 +126,11 @@ cheaper question, and this run is the reason we know to ask it.
 ## What we would keep from this
 
 Predeclare the number that would kill the idea, and write it down before the rig runs. Ours said
-below 10% reject, at or above 30% build. When the answer came back at 9.89% — one percent, relative,
-from a threshold — the honest reading was not a crisp verdict either way. It was that the ceiling sat
-three times under the bar, which is the same decision from a direction the boundary cannot wobble.
+below 10% reject, at or above 30% build. The answer came back at 9.89%, and then — same rig, same
+host, one corrected gate later — at 10.48%. A threshold your measurement can land on either side of
+is not telling you anything, and the honest reading was never a crisp verdict either way. It was that
+the ceiling sat three times under the bar, which is the same decision from a direction the boundary
+cannot wobble.
 
 And measure the ceiling before you cost the build. The most a change can possibly buy is almost always
 cheaper to find out than the change is to write.
