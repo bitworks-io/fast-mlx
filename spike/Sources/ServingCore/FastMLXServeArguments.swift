@@ -460,6 +460,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       model+context fits, derives the MLX memory/
                                       cache/reserved-KV limits from the sizer instead
                                       of the provided values.
+          --max-prefill-tokens N      Host prefill-memory safety bound: reject prompts
+                                      longer than N tokens at admission so a prompt this
+                                      host cannot prefill fails the request instead of
+                                      crashing the process. Independent of --context and
+                                      the model window; set per host (the safe value
+                                      scales with host memory). Unset disables it.
           --plan-concurrency N        Compute the fit-check verdict for N concurrent
                                       decode streams (per-stream KV scales ×N) instead
                                       of the single-stream default. Opt-in: the stricter
@@ -510,10 +516,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       overlay. Absolute local path.
           --kv-quant TIER             Requested KV-cache precision tier
                                       (fp16|int8|turbo4|tq2_5|tq3_5). ADVISORY ONLY:
-                                      the serving runtime stores KV in fp16; a
-                                      non-fp16 tier drives a sizing-only preview of
-                                      the context ceiling it would buy and is NOT
-                                      applied. An unknown tier fails closed.
+                                      the serving runtime stores KV in bf16 (the
+                                      model's mandated compute dtype); any tier only
+                                      drives a sizing-only preview (against a 2-byte
+                                      unquantized baseline) of the context ceiling it
+                                      would buy and is NOT applied. Unknown tier fails
+                                      closed.
           --tier TIER                 Serve dial (transparent|balanced|maxfit)
                                       for --quant-candidates auto-pick:
                                         transparent  fp16 KV only, never cap context
@@ -659,6 +667,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// Operator-requested served context (`--context N`); `nil` uses the sizer's effective default.
     /// Consumed by the pre-load fit-check, not by backend selection.
     public let requestedContext: Int?
+    /// Host prefill-memory safety bound (`--max-prefill-tokens N`); `nil` disables it (the default).
+    /// Rejects prompts longer than N tokens at admission so a prompt this host cannot prefill fails
+    /// the request instead of crashing the process. Independent of `--context`/the model window; an
+    /// interim stopgap the fit planner's transient sizer is expected to supersede. Set it per host —
+    /// the safe value scales with host memory. See the incident record for the prod derivation.
+    public let maxPrefillTokens: Int?
     /// `--force`: proceed past a red fit-check verdict instead of failing closed.
     public let forceServe: Bool
     /// `--quant-candidates`: several already-downloaded local checkpoint directories (different quants
@@ -680,8 +694,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// `--kv-quant TIER`: an operator-requested KV-cache precision tier (`fp16`/`int8`/`turbo4`/…).
     /// The RAW string is carried here deliberately: `ServingCore` stays free of a `HarnessCore`
     /// dependency, so tier validation and the sizing preview both happen in `HarnessCore`
-    /// (`KVQuantAdvisory`) at the serve call site. The serving runtime still stores KV in fp16 today
-    /// — a non-fp16 tier only drives a sizing-only advisory preview, never the enforced verdict.
+    /// (`KVQuantAdvisory`) at the serve call site. The serving runtime stores KV in **bf16** — the
+    /// compute dtype the model mandates (its configuration decoder rejects any non-bfloat16 checkpoint),
+    /// and the `KVCacheSimple` store allocates in the incoming K/V dtype with no fp16 cast. A tier only
+    /// drives a sizing-only advisory preview (against a 2-byte unquantized baseline), never the
+    /// enforced verdict; the runtime dtype is unaffected by the requested tier.
     public let kvQuantTier: String?
     /// `--tier TIER`: the operator-intent serve dial (`transparent`/`balanced`/`maxfit`). The RAW
     /// string is carried here for the same dependency-boundary reason as `kvQuantTier`: `ServingCore`
@@ -855,6 +872,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         maximumNonStreamingResponseBytes: Int = 16 * 1_048_576,
         completionLimitPolicy: ServingCompletionLimitPolicy = .reject,
         requestedContext: Int? = nil,
+        maxPrefillTokens: Int? = nil,
         forceServe: Bool = false,
         quantCandidateDirectories: [URL] = [],
         quantPickOnly: Bool = false,
@@ -894,6 +912,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.maximumNonStreamingResponseBytes = maximumNonStreamingResponseBytes
         self.completionLimitPolicy = completionLimitPolicy
         self.requestedContext = requestedContext
+        self.maxPrefillTokens = maxPrefillTokens
         self.forceServe = forceServe
         self.quantCandidateDirectories = quantCandidateDirectories
         self.quantPickOnly = quantPickOnly
@@ -945,6 +964,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var cacheLimitBytes: Int?
         var maxReservedKVBytes: Int?
         var requestedContext: Int?
+        var maxPrefillTokens: Int?
         var forceServe = false
         var quantCandidateDirs: [URL] = []
         var quantPickOnly = false
@@ -1080,6 +1100,11 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             case "--context":
                 index += 1
                 requestedContext = try positiveInteger(
+                    try value(at: index, in: arguments, for: argument),
+                    option: argument)
+            case "--max-prefill-tokens":
+                index += 1
+                maxPrefillTokens = try positiveInteger(
                     try value(at: index, in: arguments, for: argument),
                     option: argument)
             case "--plan-concurrency":
@@ -1655,6 +1680,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
             completionLimitPolicy: completionLimitPolicy,
             requestedContext: requestedContext,
+            maxPrefillTokens: maxPrefillTokens,
             forceServe: forceServe,
             quantCandidateDirectories: quantCandidateDirs,
             kvQuantTier: kvQuantTier,
@@ -1698,6 +1724,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--cache-limit-bytes",
         "--max-reserved-kv-bytes",
         "--context",
+        "--max-prefill-tokens",
         "--plan-concurrency",
         "--force",
         "--quant-candidates",

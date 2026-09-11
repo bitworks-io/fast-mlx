@@ -24,6 +24,7 @@ public enum ServingModelCapabilitiesError:
     case invalidMaximumNonStreamingCompletionTokens
     case invalidMaximumRequestBodyBytes
     case invalidMaximumNonStreamingResponseBytes
+    case invalidMaxPrefillTokens
 
     public var description: String {
         switch self {
@@ -47,6 +48,8 @@ public enum ServingModelCapabilitiesError:
             "the HTTP request-body byte ceiling must be positive"
         case .invalidMaximumNonStreamingResponseBytes:
             "the non-streaming response byte ceiling must be positive"
+        case .invalidMaxPrefillTokens:
+            "the host prefill-token safety bound must be positive"
         }
     }
 }
@@ -107,6 +110,15 @@ public struct ServingModelCapabilities: Sendable, Equatable {
     public let completionLimitPolicy: ServingCompletionLimitPolicy
     public let reasoningTokensCountTowardCompletion: Bool
 
+    /// Optional host-specific ceiling on the rendered PROMPT length, admitted independently of
+    /// `effectiveMaxContextTokens`. It exists only to reject prompts a host cannot prefill without
+    /// crashing (the model's prefill transient still grows with prompt length on the current build),
+    /// NOT to describe the model's context window. `nil` disables the check — the fleet default —
+    /// so it interferes with no host that is not explicitly protected. This is an interim safety
+    /// stopgap that the fit planner's context-aware transient sizer is expected to supersede once the
+    /// residual quadratic prefill term is chunked; see the incident record for the derivation.
+    public let maxPrefillTokens: Int?
+
     public init(
         model: String,
         nativeMaxContextTokens: Int,
@@ -117,7 +129,8 @@ public struct ServingModelCapabilities: Sendable, Equatable {
         maximumNonStreamingCompletionTokens: Int = 16_384,
         maximumRequestBodyBytes: Int? = nil,
         maximumNonStreamingResponseBytes: Int = 16 * 1_048_576,
-        completionLimitPolicy: ServingCompletionLimitPolicy = .reject
+        completionLimitPolicy: ServingCompletionLimitPolicy = .reject,
+        maxPrefillTokens: Int? = nil
     ) throws {
         guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ServingModelCapabilitiesError.emptyModel
@@ -142,6 +155,9 @@ public struct ServingModelCapabilities: Sendable, Equatable {
         }
         guard maximumNonStreamingResponseBytes > 0 else {
             throw ServingModelCapabilitiesError.invalidMaximumNonStreamingResponseBytes
+        }
+        if let maxPrefillTokens, maxPrefillTokens <= 0 {
+            throw ServingModelCapabilitiesError.invalidMaxPrefillTokens
         }
 
         let contextMaximum = effectiveMaxContextTokens - 1
@@ -178,6 +194,7 @@ public struct ServingModelCapabilities: Sendable, Equatable {
         self.maximumNonStreamingResponseBytes = maximumNonStreamingResponseBytes
         self.completionLimitPolicy = completionLimitPolicy
         self.reasoningTokensCountTowardCompletion = true
+        self.maxPrefillTokens = maxPrefillTokens
     }
 
     /// A bounded transport default, separate from token admission. Sixty-four bytes per admitted
@@ -221,6 +238,17 @@ public struct ServingModelCapabilities: Sendable, Equatable {
         guard renderedPromptTokens < effectiveMaxContextTokens else {
             throw OpenAIServingError.invalidRequestWithCode(
                 "The rendered prompt uses \(renderedPromptTokens) tokens and exceeds the effective context limit \(effectiveMaxContextTokens)",
+                param: "messages",
+                code: "context_length_exceeded")
+        }
+        // Host prefill-memory safety bound. Independent of the model's context window: on the current
+        // build the prefill transient still grows with prompt length, so a prompt this host cannot
+        // prefill would crash the process rather than fail the request. Reject it gracefully instead.
+        // Uses the standard context_length_exceeded code so clients auto-shorten, but the message says
+        // plainly this is a host limit, not the model's context, and is expected to lift.
+        if let maxPrefillTokens, renderedPromptTokens > maxPrefillTokens {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "The rendered prompt uses \(renderedPromptTokens) tokens, above this host's prefill-memory safety bound of \(maxPrefillTokens) tokens. This is a host memory limit on prompt length, not the model's context window; shorten the prompt. The bound is an interim protection and is expected to lift once prefill memory is bounded.",
                 param: "messages",
                 code: "context_length_exceeded")
         }

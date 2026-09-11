@@ -239,6 +239,88 @@ final class ServingModelCapabilitiesTests: XCTestCase {
             16_385)
     }
 
+    func testPrefillBoundUnsetAdmitsPromptThatWouldExceedIt() throws {
+        // Dormant default: with no bound, a prompt is limited only by the context window. The 5_000
+        // prompt used here is the SAME one the reject test below refuses under a 4_096 bound, so the
+        // pair proves the bound — not the prompt size — is what rejects.
+        let capabilities = try makeCapabilities(native: 16_384, effective: 8_192, maxPrefill: nil)
+
+        let resolution = try capabilities.resolveCompletionBudget(
+            requestedCompletionTokens: 1,
+            renderedPromptTokens: 5_000,
+            stream: true)
+
+        XCTAssertEqual(resolution.appliedCompletionTokens, 1)
+    }
+
+    func testPrefillBoundRejectsPromptAboveItWithinContext() throws {
+        // 5_000 sits well inside the 8_192 context window, so only the prefill bound can reject it.
+        let capabilities = try makeCapabilities(native: 16_384, effective: 8_192, maxPrefill: 4_096)
+
+        XCTAssertThrowsError(
+            try capabilities.resolveCompletionBudget(
+                requestedCompletionTokens: 1,
+                renderedPromptTokens: 5_000,
+                stream: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? OpenAIServingError,
+                .invalidRequestWithCode(
+                    "The rendered prompt uses 5000 tokens, above this host's prefill-memory safety bound of 4096 tokens. This is a host memory limit on prompt length, not the model's context window; shorten the prompt. The bound is an interim protection and is expected to lift once prefill memory is bounded.",
+                    param: "messages",
+                    code: "context_length_exceeded"))
+        }
+    }
+
+    func testPrefillBoundAdmitsPromptExactlyAtBoundAndRejectsOneAbove() throws {
+        let capabilities = try makeCapabilities(native: 16_384, effective: 8_192, maxPrefill: 4_096)
+
+        // Exactly at the bound is admitted (the bound is the maximum safe prompt length).
+        let atBound = try capabilities.resolveCompletionBudget(
+            requestedCompletionTokens: 1,
+            renderedPromptTokens: 4_096,
+            stream: true)
+        XCTAssertEqual(atBound.appliedCompletionTokens, 1)
+
+        // One token over is rejected.
+        XCTAssertThrowsError(
+            try capabilities.resolveCompletionBudget(
+                requestedCompletionTokens: 1,
+                renderedPromptTokens: 4_097,
+                stream: true))
+    }
+
+    func testContextWindowCheckPrecedesPrefillBoundSoMessagesStayDistinct() throws {
+        // A prompt that exceeds BOTH the context window and the prefill bound must report the context
+        // violation, not the host bound — the two rejections carry different, accurate messages.
+        let capabilities = try makeCapabilities(native: 8_192, effective: 4_096, maxPrefill: 2_048)
+
+        XCTAssertThrowsError(
+            try capabilities.resolveCompletionBudget(
+                requestedCompletionTokens: 1,
+                renderedPromptTokens: 5_000,
+                stream: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? OpenAIServingError,
+                .invalidRequestWithCode(
+                    "The rendered prompt uses 5000 tokens and exceeds the effective context limit 4096",
+                    param: "messages",
+                    code: "context_length_exceeded"))
+        }
+    }
+
+    func testNonPositivePrefillBoundFailsClosed() {
+        for invalidBound in [0, -1] {
+            XCTAssertThrowsError(
+                try makeCapabilities(native: 8_192, effective: 8_192, maxPrefill: invalidBound)
+            ) { error in
+                XCTAssertEqual(
+                    error as? ServingModelCapabilitiesError, .invalidMaxPrefillTokens)
+            }
+        }
+    }
+
     private func makeCapabilities(
         native: Int,
         effective: Int,
@@ -248,7 +330,8 @@ final class ServingModelCapabilitiesTests: XCTestCase {
         nonStreamingMaximum: Int = 16_384,
         requestBodyMaximum: Int? = nil,
         nonStreamingResponseMaximum: Int = 16 * 1_048_576,
-        policy: ServingCompletionLimitPolicy = .reject
+        policy: ServingCompletionLimitPolicy = .reject,
+        maxPrefill: Int? = nil
     ) throws -> ServingModelCapabilities {
         try ServingModelCapabilities(
             model: "qwen-test",
@@ -260,6 +343,7 @@ final class ServingModelCapabilitiesTests: XCTestCase {
             maximumNonStreamingCompletionTokens: nonStreamingMaximum,
             maximumRequestBodyBytes: requestBodyMaximum,
             maximumNonStreamingResponseBytes: nonStreamingResponseMaximum,
-            completionLimitPolicy: policy)
+            completionLimitPolicy: policy,
+            maxPrefillTokens: maxPrefill)
     }
 }

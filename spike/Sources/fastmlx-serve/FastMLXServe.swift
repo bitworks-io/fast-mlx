@@ -459,7 +459,8 @@ private func servingModelCapabilities(
         maximumNonStreamingCompletionTokens: arguments.maximumNonStreamingCompletionTokens,
         maximumRequestBodyBytes: arguments.maximumRequestBodyBytes,
         maximumNonStreamingResponseBytes: arguments.maximumNonStreamingResponseBytes,
-        completionLimitPolicy: arguments.completionLimitPolicy)
+        completionLimitPolicy: arguments.completionLimitPolicy,
+        maxPrefillTokens: arguments.maxPrefillTokens)
 }
 
 /// Scripted transport intentionally has no model/tokenizer. Give it an explicit synthetic fixture

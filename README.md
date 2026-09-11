@@ -102,7 +102,11 @@ context and the pre-load host-fit decision determine the ceiling. Use
 shape the policy. Long completions above the non-streaming ceiling remain available with
 `"stream":true`. The request-body ceiling scales with the admitted context (1–64 MiB by default),
 and `--max-request-body-bytes` plus `--max-non-streaming-response-bytes` provide explicit transport
-overrides. Authenticated clients can inspect every effective token and byte limit at
+overrides. Prompt length carries a separate, optional host bound: `--max-prefill-tokens N` rejects a
+prompt longer than N tokens at admission, so a prompt a given host cannot prefill fails that request
+instead of the process. It is independent of the model's context window, unset (disabled) by
+default, and set per host — an interim protection expected to lift once prefill memory is bounded.
+Authenticated clients can inspect every effective token and byte limit at
 `GET /v1/models` instead of guessing from a model name.
 
 ### Transport-only (no model)

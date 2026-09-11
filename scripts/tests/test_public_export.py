@@ -73,9 +73,16 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # the reexport_count assertion -- and updating them out of step has turned HEAD red three
 # times (see the comment above the publicIndex assertion for the full history). Both call
 # sites below read this constant; there is no longer a second literal to drift.
+# Cycle 60 (2026-09-11), 917 -> 918: adds
+# spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/SDPAHeadDim256PrefillTransientTests.swift,
+# a measurement instrument for the pinned mlx-core's SDPA dispatch at head_dim 256.
+# Conscious decision to publish: it is family-neutral (the tripwire above this one caught
+# an earlier draft that named the internal model family in comments), references no host,
+# credential, competitor or machine-local path, and reports only fast-mlx's own measured
+# evidence about a public dependency's documented behaviour.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 917,
-    "pathModeSha256": "797f7ea0500d1e48a0be0ccf2d976b2586dd6da1a627c1e78c77263a23d6ecc9",
+    "pathCount": 918,
+    "pathModeSha256": "621b80c8a3a4fdd9db0f78855a6880cdc039a539ae850bebe88e96f15d3336d6",
 }
 
 
