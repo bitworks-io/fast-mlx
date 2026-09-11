@@ -671,6 +671,10 @@ struct InCheckpointSampledMTPThroughputReport: Codable, Sendable {
     let buildConfiguration: String
     let blockSize: Int
     let numDraft: Int
+    /// Effective `GenerateParameters.prefillStepSize` this run measured under -- see
+    /// `HarnessMTPPrefillGeometry`. Records which prefill geometry produced this report, so a
+    /// future reader never has to assume it matches production's `MLXDecoder.defaultPrefillChunkSize`.
+    let prefillStepSize: Int
     let sampling: InCheckpointSampledMTPThroughputSamplingReport
     let prompts: [InCheckpointSampledMTPThroughputPromptReport]
     let pooled: InCheckpointSampledMTPThroughputPooledReport
@@ -741,13 +745,17 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
     // flag existed. `parseInCheckpointSampledMTPThroughputArguments` already rejects any value
     // `supports()` would refuse, so `parsed.topP`/`parsed.topK`/`parsed.temperature` are always
     // within the accepted range by the time they reach here.
-    let parameters = GenerateParameters(
+    var parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
         temperature: Float(parsed.temperature),
         topP: Float(parsed.topP),
         topK: parsed.topK,
         minP: 0,
         seed: parsed.seed)
+    // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+    // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+    // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+    parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
     // Built from the SAME `parameters` value handed to `MTPSpeculativeTokenIterator` inside
     // `runSpeculativeArm` below (not a second, independently invented truncation) -- this is what
     // makes it structurally impossible for the provider's stored truncation and this run's own
@@ -1137,6 +1145,7 @@ func runInCheckpointSampledMTPThroughput(arguments: [String]) async throws {
         buildConfiguration: "release",
         blockSize: inCheckpointSampledMTPBlockSize,
         numDraft: inCheckpointSampledMTPNumDraft,
+        prefillStepSize: parameters.prefillStepSize,
         sampling: samplingReport,
         prompts: promptReports,
         pooled: pooledReport,

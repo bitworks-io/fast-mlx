@@ -519,7 +519,11 @@ private final class Qwen38MTPScorecardLiveWorkerService: @unchecked Sendable {
             prompt: prompt,
             tokenizer: pair.target.tokenizer)
         let promptEnd = ProcessInfo.processInfo.systemUptime
-        let parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+        var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+        // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+        // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+        // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+        parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
         let cache = pair.target.model.newCache(parameters: parameters)
         var iterator = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: MLXArray(promptTokens.compactMap(Int32.init(exactly:)))),

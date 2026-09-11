@@ -181,6 +181,12 @@
       "slug": "the-default-nobody-chose",
       "status": "published",
       "reviewedAt": "2026-09-10"
+    },
+    {
+      "source": "docs/content/2026-09-11-the-lever-was-worth-ten-percent.md",
+      "slug": "the-lever-was-worth-ten-percent",
+      "status": "published",
+      "reviewedAt": "2026-09-11"
     }
   ]
 }

@@ -1525,6 +1525,10 @@ struct InCheckpointSampledMTPAcceptanceReport: Codable, Sendable {
     let buildConfiguration: String
     let blockSize: Int
     let numDraft: Int
+    /// Effective `GenerateParameters.prefillStepSize` this run measured under -- see
+    /// `HarnessMTPPrefillGeometry`. Records which prefill geometry produced this report, so a
+    /// future reader never has to assume it matches production's `MLXDecoder.defaultPrefillChunkSize`.
+    let prefillStepSize: Int
     let sampling: InCheckpointSampledMTPAcceptanceSamplingReport
     let streams: [InCheckpointSampledMTPAcceptanceStreamReport]
     let pooled: InCheckpointSampledMTPAcceptancePooledReport
@@ -1585,13 +1589,17 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
     // any value other than `1.0` -- see `temperaturePinnedForTemperingCounterfactual`'s doc comment
     // -- so `parsed.topP`/`parsed.topK`/`parsed.temperature` are always within the accepted range
     // (and `parsed.temperature == 1` exactly) by the time they reach here.
-    let parameters = GenerateParameters(
+    var parameters = GenerateParameters(
         maxTokens: parsed.maxTokens,
         temperature: Float(parsed.temperature),
         topP: Float(parsed.topP),
         topK: parsed.topK,
         minP: 0,
         seed: parsed.seed)
+    // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+    // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+    // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+    parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
     let samplingReport = InCheckpointSampledMTPAcceptanceSamplingReport(
         temperature: Double(parameters.temperature),
         topP: Double(parameters.topP),
@@ -2103,6 +2111,7 @@ func runInCheckpointSampledMTPAcceptance(arguments: [String]) async throws {
         buildConfiguration: "release",
         blockSize: inCheckpointSampledMTPBlockSize,
         numDraft: inCheckpointSampledMTPNumDraft,
+        prefillStepSize: parameters.prefillStepSize,
         sampling: samplingReport,
         streams: streamReports,
         pooled: pooledReport,

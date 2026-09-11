@@ -175,7 +175,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_392
 REVIEWED_HOME_PAGE_SHA256 = (
-    "f86a21e5b6728be702ff31f964d9ad6d2c2bdebd80b3538cb7b94dd2e98eb81b"
+    "771202d9711870dba4f4b04b61fcfbb06a458f85f5119cfdce224d6ede83919f"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -201,7 +201,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "e4a58d90cb64a1743f2c6100d3fe8ceab538ef53404f20720606bdc98e9985f3"
+    "6a7fc28553df022e3215fe1c1f4ece8469660ad147db85f23815bc3b46d2c950"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -389,7 +389,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "30 published research notes",
+    "31 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -484,6 +484,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/the-lever-was-worth-ten-percent/",
     "research/the-default-nobody-chose/",
     "research/a-ratio-is-not-a-result/",
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/",
@@ -516,6 +517,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/the-lever-was-worth-ten-percent/": ("2026-09-11", "2026-09-11"),
     "research/the-default-nobody-chose/": ("2026-09-10", "2026-09-10"),
     "research/a-ratio-is-not-a-result/": ("2026-09-09", "2026-09-09"),
     "research/you-had-to-load-the-model-to-learn-it-would-not-load/": ("2026-09-08", "2026-09-08"),
@@ -813,6 +815,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/the-lever-was-worth-ten-percent/": (
+        "The lever was worth ten percent — fast-mlx",
+        "The sparse-attention path in our long-context decode re-pools its key blocks on every single token. At a cache length of 32,768 that is thousands of blocks re-derived per layer per step, and twelve such layers per…",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/the-default-nobody-chose/": (
         "The default nobody chose — fast-mlx",

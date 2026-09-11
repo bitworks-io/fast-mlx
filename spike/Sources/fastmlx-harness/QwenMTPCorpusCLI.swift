@@ -662,6 +662,11 @@ private func runMTPDrain(
     parameters: GenerateParameters,
     promptPreparationEvaluationOrder: MTPPromptPreparationEvaluationOrder? = nil
 ) throws -> CorpusRun {
+    var parameters = parameters
+    // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+    // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+    // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+    parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
@@ -770,6 +775,11 @@ private func runMTPCancelAfterExtraGenerated(
     parameters: GenerateParameters,
     retainedTokens: Int
 ) throws -> CorpusRun {
+    var parameters = parameters
+    // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+    // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+    // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+    parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)
@@ -835,6 +845,11 @@ private func runMTPCancelAfterAcceptedDraft(
     pair: Qwen35ExactMTPLoadedPair,
     parameters: GenerateParameters
 ) throws -> CorpusRun {
+    var parameters = parameters
+    // Production's MTP serving route always sets this explicitly (`MTPSpeculativeDecoder`); left
+    // unset, `GenerateParameters` silently defaults to the vendored 512 instead of production's
+    // `MLXDecoder.defaultPrefillChunkSize` (2048) -- see `HarnessMTPPrefillGeometry`'s doc comment.
+    parameters.prefillStepSize = try HarnessMTPPrefillGeometry.prefillChunkSize()
     let input = input(for: spec, tokenizer: pair.target.tokenizer)
     let promptTokenCount = promptTokenCount(for: spec, tokenizer: pair.target.tokenizer)
     let cache = pair.target.model.newCache(parameters: parameters)

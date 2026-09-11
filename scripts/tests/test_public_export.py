@@ -80,9 +80,23 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # an earlier draft that named the internal model family in comments), references no host,
 # credential, competitor or machine-local path, and reports only fast-mlx's own measured
 # evidence about a public dependency's documented behaviour.
+# Cycle 67 (2026-09-11), 918 -> 920: adds
+# spike/Sources/fastmlx-harness/HarnessMTPPrefillGeometry.swift and
+# spike/Tests/FastMLXHarnessTests/HarnessMTPPrefillGeometryTests.swift -- the harness's single
+# source of truth for its MTP prefill chunk size, closing the measurement-validity defect where
+# seven harness CLI iterator constructions silently inherited the vendored GenerateParameters
+# default (512) instead of production's MLXDecoder.defaultPrefillChunkSize (2048).
+# Conscious decision to publish: both are family-neutral (no internal model-family identifier in
+# path or content), reference no host, credential, competitor or machine-local path, and describe
+# only fast-mlx's own configuration of a public dependency's documented parameter.
+# Cycle 71 (2026-09-11), 920 -> 921: adds
+# docs/content/2026-09-11-the-lever-was-worth-ten-percent.md, registered via site/publications.json.
+# Conscious decision to publish: the note is family-neutral (no internal model-family identifier),
+# references no host, credential, competitor or machine-local path, and describes only fast-mlx's
+# own measured evidence about a self-built instrument's return before the change was made.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 918,
-    "pathModeSha256": "621b80c8a3a4fdd9db0f78855a6880cdc039a539ae850bebe88e96f15d3336d6",
+    "pathCount": 921,
+    "pathModeSha256": "7425fd37561d5a602cf65b236017fa2a6eb7540b0140f22cab45ff275c725a83",
 }
 
 
