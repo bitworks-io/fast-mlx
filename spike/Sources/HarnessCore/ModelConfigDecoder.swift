@@ -651,10 +651,19 @@ public enum ModelConfigDecoder {
             // key is absent), switching every full-attention layer from dense attention to the QSA
             // "compact" gather route — a decode-time config toggle, not a serve-time flag this sizer
             // already sees. Measured directly against the family's selected-KV attention test fixture,
-            // not estimated: at L=512 (the production prefill chunk) with keyLength=4096, compact allocates
-            // 4,364,271,736 B for a SINGLE full-attention layer versus dense's 0 — roughly 52 GB summed
-            // over the 12 full-attention layers this profile models, none of which the growing-KV
-            // formula above or the indexer aux term just above expresses. Modelling it honestly would
+            // not estimated: at L=512 with keyLength=4096, compact allocates 4,364,271,736 B for a
+            // SINGLE full-attention layer versus dense's 0.
+            //
+            // That fixture UNDERSTATES production, and the earlier version of this comment compounded
+            // it by calling L=512 "the production prefill chunk". It is not: the production chunk is
+            // 2048 (`MLXDecoder.defaultPrefillChunkSize`), and the fixture's width is K=4099 where
+            // production's is K=2051 (indexer_budget 2048 + compress_ratio 4 - 1). The honest
+            // production figure is 2 x (B 1 x Hkv 2 x L 2048 x K 2051 x D 256 x 2 B) =
+            // 8,602,517,504 B — ~8.60 GB for a SINGLE full-attention layer, ~103 GB summed over the 12
+            // full-attention layers this profile models, roughly DOUBLE the ~52 GB previously claimed.
+            // Nothing guards it: there is no query-length condition anywhere on the compact path, so
+            // this fires on the first prefill chunk past the 2051 crossover. None of it is expressed by
+            // the growing-KV formula above or the indexer aux term just above. Modelling it honestly would
             // need the runtime cache class AND the prefill chunk size, neither of which reaches this
             // decoder, so refuse rather than silently reintroduce the exact phantom-GREEN-then-abort
             // hole the indexer aux term above exists to close. Absent and explicit `"dense"` are
