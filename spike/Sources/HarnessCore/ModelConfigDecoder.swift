@@ -652,15 +652,31 @@ public enum ModelConfigDecoder {
             // "compact" gather route — a decode-time config toggle, not a serve-time flag this sizer
             // already sees. Measured directly against the family's selected-KV attention test fixture,
             // not estimated: at L=512 with keyLength=4096, compact allocates 4,364,271,736 B for a
-            // SINGLE full-attention layer versus dense's 0.
+            // SINGLE full-attention layer against dense's 113,246,210 B at the same row — ~38.54x.
             //
             // That fixture UNDERSTATES production, and the earlier version of this comment compounded
             // it by calling L=512 "the production prefill chunk". It is not: the production chunk is
-            // 2048 (`MLXDecoder.defaultPrefillChunkSize`), and the fixture's width is K=4099 where
-            // production's is K=2051 (indexer_budget 2048 + compress_ratio 4 - 1). The honest
+            // 2048 (`MLXDecoder.defaultPrefillChunkSize`) against the fixture's L=512, so the fixture
+            // understates production by 4x in the query dimension alone. The GATHERED width is K=2051
+            // (indexer_budget 2048 + compress_ratio 4 - 1) in BOTH — the fixture pins that same 2051,
+            // and an earlier version of this comment put the fixture at 4099, which is a different
+            // fixture's width and does not belong here. The honest
             // production figure is 2 x (B 1 x Hkv 2 x L 2048 x K 2051 x D 256 x 2 B) =
-            // 8,602,517,504 B — ~8.60 GB for a SINGLE full-attention layer, ~103 GB summed over the 12
-            // full-attention layers this profile models, roughly DOUBLE the ~52 GB previously claimed.
+            // 8,602,517,504 B — ~8.60 GB for a SINGLE full-attention layer. Summed naively over the
+            // 12 full-attention layers this profile models, that is ~103 GB — but that sum is an
+            // UPPER BOUND, not a demonstrated simultaneous peak: nothing here shows the 12 layers'
+            // gathers are co-resident, and MLX releases intermediates as their last use passes, so
+            // the per-layer transients may well be sequential rather than all held at once. The
+            // measured single-layer anchor above (4,364,271,736 B at the fixture's L=512/keyLength=4096
+            // shape) is the only figure in this family that is MEASURED rather than derived, and it runs
+            // ~2.03x the 2,150,629,376 B this law predicts for that fixture's GATHERED width — the excess
+            // being downstream temporaries the law does not model. So the two inaccuracies point in
+            // OPPOSITE directions: the law UNDER-states a single layer, while the 12x sum OVER-states the
+            // total. One trap for a future reader: that fixture's keyLength 4096 is almost exactly twice
+            // the gathered width 2051, so evaluating the law at the full keyLength instead of the gathered
+            // width coincidentally lands within 2% of the measured number. That is NOT the right law — at
+            // decode the same gather measures 4,304,896 B against 4,200,448 B for the gathered width and
+            // 67,110,912 B for the full key length, so the gathered width is what the allocation follows.
             // As of the per-phase QSA seam this is no longer UNguarded: the compact path now carries a
             // per-forward query-length bound on the family's attention layer
             // (`productionCompactDecodeQueryLengthLimit`, deliberately spelled without the
@@ -672,8 +688,10 @@ public enum ModelConfigDecoder {
             //
             // The refusal STAYS anyway, and the figure is why. This decoder cannot see `qL` or the runtime
             // cache class, so it cannot VERIFY that bound is in force — a single un-backstopped `if` in the
-            // attention layer is now all that separates this config from ~103 GB, and the prefill-allocation
-            // guard that would backstop it does not exist yet. Compact is also not bit-exact against dense
+            // attention layer is now all that separates this config from that unverified ~103 GB
+            // upper bound — and, regardless of co-residency, from the measured 4.36 GB single-layer
+            // hazard, which the query-length bound does not touch — and the prefill-allocation guard
+            // that would backstop it does not exist yet. Compact is also not bit-exact against dense
             // (max deviation 2^-12 on a genuine reduction), so admitting it here would silently change
             // numerics as well as memory. None of it is expressed by
             // the growing-KV formula above or the indexer aux term just above. Modelling it honestly would
@@ -1357,10 +1375,10 @@ public extension ModelConfigDecoder {
         }
 
         // `selected_kv_execution_mode` refusal, mirroring `decode`'s `isSparseIndexerHybrid` block
-        // exactly (same runtime effect, same ~103 GB compact-vs-dense figure at production geometry, same
-        // fail-closed rationale — see that comment for the full explanation, including why the seam's
-        // per-forward query-length bound does not lift this refusal). Absent/`"dense"` unchanged; anything
-        // else refuses.
+        // exactly (same runtime effect, same ~8.60 GB per-layer figure and unverified ~103 GB
+        // 12-layer upper bound at production geometry, same fail-closed rationale — see that comment
+        // for the full explanation, including why the seam's per-forward query-length bound does not
+        // lift this refusal). Absent/`"dense"` unchanged; anything else refuses.
         if let rawMode = geom("selected_kv_execution_mode") {
             guard let mode = rawMode as? String, mode == "dense" else {
                 throw ModelConfigDecodeError.invalidField("selected_kv_execution_mode")
