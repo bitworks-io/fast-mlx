@@ -686,14 +686,31 @@ public enum ModelConfigDecoder {
             // `qL`, so that bound caps the transient at 12,601,344 B per layer and makes the 8.60 GB figure
             // above unreachable while it holds.
             //
-            // The refusal STAYS anyway, and the figure is why. This decoder cannot see `qL` or the runtime
-            // cache class, so it cannot VERIFY that bound is in force — a single un-backstopped `if` in the
-            // attention layer is now all that separates this config from that unverified ~103 GB
-            // upper bound — and, regardless of co-residency, from the measured 4.36 GB single-layer
-            // hazard, which the query-length bound does not touch — and the prefill-allocation guard
-            // that would backstop it does not exist yet. Compact is also not bit-exact against dense
-            // (max deviation 2^-12 on a genuine reduction), so admitting it here would silently change
-            // numerics as well as memory. None of it is expressed by
+            // The refusal STAYS, but the `if` in the attention layer is no longer un-backstopped: a
+            // per-forward gather byte budget (`productionCompactGatherByteBudget`, 268,435,456 B / 256
+            // MiB) is now enforced in the compact path's `validate`, BEFORE the gather allocates and
+            // BEFORE `cache.update`, so a bypass of the query-length bound above is REFUSED at forward
+            // time rather than silently allocated, and the caches stay consistent.
+            // That budget REFUSES both figures above, not merely leaves them un-modelled — but read the
+            // UNITS before quoting a factor, because the budget bounds GATHER bytes and only one of the
+            // two figures above is in those units. The 8,602,517,504 B prefill-shaped figure IS a gather
+            // quantity, so it is ~32x over budget directly. The measured 4,364,271,736 B single-layer
+            // hazard is a PEAK, not a gather: its gather component is the 2,150,629,376 B this law
+            // predicts for that fixture's gathered width, which is ~8x over budget, and the measured peak
+            // ran ~2.03x that on downstream temporaries the budget does not model. Both geometries are
+            // therefore refused before allocating, which also makes the naive ~103 GB 12-layer sum
+            // unreachable since even one layer's gather is refused first — but the budget is a bound on
+            // gathers, NOT a peak cap, and must not be quoted as one.
+            // The budget first binds at qL ≈ 64 against the production limit of 3, so at today's
+            // reachable geometry it is slack by ~21x — a catastrophe backstop, not a tight bound. That
+            // slack is deliberate: the budget was sized to admit B=8 at qL=3, a batch capability the
+            // compact route cannot yet reach (it requires `cache is KVCacheSimple`).
+            // The refusal here stays anyway, on the ground that survives: this decoder still cannot see
+            // `qL` or the runtime cache class, so it still cannot verify from config alone which route a
+            // forward will take or model the compact transient. Compact is also not bit-exact against
+            // dense (max deviation 2^-12 on a genuine reduction), so admitting it here would silently
+            // change numerics as well as memory. What changed is only the consequence of being wrong: a
+            // bounded, catchable refusal at forward time, not an unbounded allocation. None of it is expressed by
             // the growing-KV formula above or the indexer aux term just above. Modelling it honestly would
             // need the runtime cache class AND the prefill chunk size, neither of which reaches this
             // decoder, so refuse rather than silently reintroduce the exact phantom-GREEN-then-abort
