@@ -661,8 +661,21 @@ public enum ModelConfigDecoder {
             // production figure is 2 x (B 1 x Hkv 2 x L 2048 x K 2051 x D 256 x 2 B) =
             // 8,602,517,504 B — ~8.60 GB for a SINGLE full-attention layer, ~103 GB summed over the 12
             // full-attention layers this profile models, roughly DOUBLE the ~52 GB previously claimed.
-            // Nothing guards it: there is no query-length condition anywhere on the compact path, so
-            // this fires on the first prefill chunk past the 2051 crossover. None of it is expressed by
+            // As of the per-phase QSA seam this is no longer UNguarded: the compact path now carries a
+            // per-forward query-length bound on the family's attention layer
+            // (`productionCompactDecodeQueryLengthLimit`, deliberately spelled without the
+            // implementation-family prefix so this projected file stays family-neutral), pinned at 3 —
+            // the largest `qL` any production decode forward constructs, since the MTP verify
+            // pass evaluates a whole `blockSize` block in one forward. The allocation law is linear in
+            // `qL`, so that bound caps the transient at 12,601,344 B per layer and makes the 8.60 GB figure
+            // above unreachable while it holds.
+            //
+            // The refusal STAYS anyway, and the figure is why. This decoder cannot see `qL` or the runtime
+            // cache class, so it cannot VERIFY that bound is in force — a single un-backstopped `if` in the
+            // attention layer is now all that separates this config from ~103 GB, and the prefill-allocation
+            // guard that would backstop it does not exist yet. Compact is also not bit-exact against dense
+            // (max deviation 2^-12 on a genuine reduction), so admitting it here would silently change
+            // numerics as well as memory. None of it is expressed by
             // the growing-KV formula above or the indexer aux term just above. Modelling it honestly would
             // need the runtime cache class AND the prefill chunk size, neither of which reaches this
             // decoder, so refuse rather than silently reintroduce the exact phantom-GREEN-then-abort
@@ -1344,8 +1357,9 @@ public extension ModelConfigDecoder {
         }
 
         // `selected_kv_execution_mode` refusal, mirroring `decode`'s `isSparseIndexerHybrid` block
-        // exactly (same runtime effect, same measured ~52 GB compact-vs-dense figure, same fail-closed
-        // rationale — see that comment for the full explanation). Absent/`"dense"` unchanged; anything
+        // exactly (same runtime effect, same ~103 GB compact-vs-dense figure at production geometry, same
+        // fail-closed rationale — see that comment for the full explanation, including why the seam's
+        // per-forward query-length bound does not lift this refusal). Absent/`"dense"` unchanged; anything
         // else refuses.
         if let rawMode = geom("selected_kv_execution_mode") {
             guard let mode = rawMode as? String, mode == "dense" else {
