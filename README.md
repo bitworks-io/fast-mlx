@@ -94,6 +94,22 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 The assistant replies with an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`); send the
 tool result back as a `{"role":"tool","tool_call_id":…,"content":…}` message to continue.
 
+`POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
+such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style
+harnesses. It shares the same sampling, completion-budget, and admission behavior as
+`/v1/chat/completions`, but applies no chat template: `prompt` (a non-empty string, or an array of
+exactly one string) is tokenized as-is and completed verbatim, with `choices[0].text` in the
+response. `n`, `best_of`, and `echo` are only accepted at their neutral single-choice/no-echo values;
+`suffix` (insertion mode) is not supported, and `logprobs` must be absent or null — this server never
+computes per-token log-probabilities, and even `logprobs:0` asks for the sampled token's own
+logprob. Only the single-stream scalar serving route serves this route today (including in-checkpoint
+MTP on that route); the continuous-batch route, the separate draft-model speculative route, and
+evidence-recording mode all fail closed with
+`completions_unsupported` rather than silently mistreating raw text as an already-templated chat
+prompt. An omitted `max_tokens` does not fall back to the legacy API's 16-token default — it uses
+the server's own completion-budget policy, the same one `/v1/chat/completions` applies when
+`max_completion_tokens` is omitted.
+
 Completion length is model- and host-fit-aware. The default request budget is 4,096 tokens, but it
 is not a global maximum: when `--max-completion-tokens` is omitted, the loaded model's authenticated
 context and the pre-load host-fit decision determine the ceiling. Use

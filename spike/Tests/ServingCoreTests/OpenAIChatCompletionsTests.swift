@@ -438,6 +438,133 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertEqual(events[4], "data: [DONE]\n\n")
     }
 
+    // MARK: - OpenAICompletionRequest (legacy /v1/completions)
+
+    func testCompletionRequestDecodesStringPrompt() throws {
+        let body = """
+        {"model":"qwen3-32b","prompt":"Once upon a time"}
+        """
+        let request = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.model, "qwen3-32b")
+        XCTAssertEqual(request.prompt, "Once upon a time")
+    }
+
+    func testCompletionRequestDecodesSingleElementArrayPrompt() throws {
+        let body = """
+        {"model":"qwen3-32b","prompt":["Once upon a time"]}
+        """
+        let request = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.prompt, "Once upon a time")
+    }
+
+    func testCompletionRequestRejectsUnsupportedPromptAndFieldShapes() throws {
+        let cases: [(String, String)] = [
+            (#"{"model":"qwen3-32b","prompt":[1,2,3]}"#, "prompt"),
+            (#"{"model":"qwen3-32b","prompt":["a","b"]}"#, "prompt"),
+            (#"{"model":"qwen3-32b","prompt":""}"#, "prompt"),
+            (#"{"model":"qwen3-32b","prompt":"hi","n":2}"#, "n"),
+            (#"{"model":"qwen3-32b","prompt":"hi","echo":true}"#, "echo"),
+            (#"{"model":"qwen3-32b","prompt":"hi","suffix":"x"}"#, "suffix"),
+            (#"{"model":"qwen3-32b","prompt":"hi","best_of":2}"#, "best_of"),
+            (#"{"model":"qwen3-32b","prompt":"hi","logprobs":1}"#, "logprobs"),
+            (#"{"model":"qwen3-32b","prompt":"hi","unknown":true}"#, "unknown"),
+            (#"{"model":"qwen3-32b","prompt":"hi","promptInput":"chat"}"#, "promptInput"),
+        ]
+        for (body, param) in cases {
+            XCTAssertOpenAIError(
+                try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: param,
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    // The legacy route decodes through OpenAICompletionRequest, not the chat decoder — every
+    // chat-only key is an unknown field here, never silently accepted or ignored.
+    func testCompletionRequestRejectsChatOnlyFieldsAsUnknownKeys() throws {
+        let cases: [(String, String)] = [
+            (#"{"model":"qwen3-32b","prompt":"hi","messages":[]}"#, "messages"),
+            (#"{"model":"qwen3-32b","prompt":"hi","tools":[]}"#, "tools"),
+            (#"{"model":"qwen3-32b","prompt":"hi","enable_thinking":true}"#, "enable_thinking"),
+            (#"{"model":"qwen3-32b","prompt":"hi","chat_template_kwargs":{}}"#, "chat_template_kwargs"),
+            (#"{"model":"qwen3-32b","prompt":"hi","max_completion_tokens":16}"#, "max_completion_tokens"),
+        ]
+        for (body, param) in cases {
+            XCTAssertOpenAIError(
+                try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: param,
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    // Integer `logprobs` — INCLUDING 0 — asks for the sampled token's logprob, which this server
+    // cannot return. Only `null`/absent is accepted; every integer value fails closed.
+    func testCompletionRequestRejectsAnyIntegerLogprobsIncludingZero() throws {
+        for value in [0, 1, 5] {
+            let body = #"{"model":"qwen3-32b","prompt":"hi","logprobs":\#(value)}"#
+            XCTAssertOpenAIError(
+                try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: "logprobs",
+                file: #filePath,
+                line: #line)
+        }
+
+        let nullBody = #"{"model":"qwen3-32b","prompt":"hi","logprobs":null}"#
+        let nullRequest = try OpenAICompletionRequest.decodeStrict(from: Data(nullBody.utf8))
+        XCTAssertEqual(nullRequest.ignoredFields, [])
+    }
+
+    func testCompletionRequestConversionCarriesFieldsAndSetsRawTextPromptInput() throws {
+        let body = """
+        {"model":"qwen3-32b","prompt":"Once upon a time","temperature":0.5,"top_p":0.9,
+         "max_tokens":16,"stop":["END"],"seed":7,"stream":true}
+        """
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+        let chatRequest = completionRequest.asChatCompletionRequest()
+
+        XCTAssertEqual(chatRequest.model, "qwen3-32b")
+        XCTAssertEqual(chatRequest.temperature, 0.5)
+        XCTAssertEqual(chatRequest.topP, 0.9)
+        XCTAssertEqual(chatRequest.maxCompletionTokens, 16)
+        XCTAssertEqual(chatRequest.stop, ["END"])
+        XCTAssertEqual(chatRequest.seed, 7)
+        XCTAssertTrue(chatRequest.stream)
+        XCTAssertTrue(chatRequest.messages.isEmpty)
+        XCTAssertTrue(chatRequest.tools.isEmpty)
+        XCTAssertNil(chatRequest.enableThinking)
+        XCTAssertNil(chatRequest.reasoningEffort)
+        XCTAssertEqual(chatRequest.promptInput, .rawText("Once upon a time"))
+    }
+
+    // The wire decoder for CHAT never accepts a `promptInput` or `prompt` key: both are unknown
+    // fields on `/v1/chat/completions`, proving `.rawText` cannot be set by any chat JSON payload.
+    func testChatDecodeStillRejectsPromptInputAndPromptAsUnknownKeys() throws {
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"promptInput":"chat"}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "promptInput")
+
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"prompt":"hi"}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "prompt")
+
+        // Every chat-decoded request defaults to `.chat`.
+        let plain = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}]}"#.utf8))
+        XCTAssertEqual(plain.promptInput, .chat)
+    }
+
     func testSSETerminalChunkCanCarryExactUsage() throws {
         let finish = OpenAIChatCompletionChunk(
             id: "chatcmpl-test",

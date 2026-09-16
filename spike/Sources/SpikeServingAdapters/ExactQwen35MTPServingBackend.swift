@@ -265,6 +265,15 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
         guard acceptingRequests else {
             throw ExactQwen35MTPServingBackendError.shuttingDown
         }
+        // This backend only knows how to speculate over a CHAT-templated prompt; fail closed rather
+        // than falling back to the scalar route, which would silently serve a raw-text completion off
+        // a backend explicitly documented as "only knows chat templates" for this route.
+        guard request.promptInput == .chat else {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support the legacy text-completions route for the loaded backend",
+                param: "prompt",
+                code: "completions_unsupported")
+        }
         guard request.model == launchedModel else {
             return try await scalarFallback.start(request)
         }

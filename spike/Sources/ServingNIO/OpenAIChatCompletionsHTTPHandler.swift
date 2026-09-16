@@ -193,12 +193,41 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        let isLegacyCompletions = head.uri == "/v1/completions"
+        let responseKind: ServingResponseKind = isLegacyCompletions ? .completions : .chat
         let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
+
+        // `ServingEvidence.validateCanonicalHTTPRequest` only recognizes `/v1/chat/completions` as a
+        // canonical path — building `ServingEvidence.Request` for `/v1/completions` while evidence
+        // recording is configured throws inside that constructor below, which (before this guard)
+        // left the connection with no response at all. Fail closed with a normal OpenAI-style 400
+        // BEFORE any evidence request construction or backend call, so a caller always gets a
+        // response instead of a silently dropped connection. This runs after the bearer-auth check
+        // in `validateHead` above, so an unauthenticated request still gets 401 first.
+        if isLegacyCompletions, configuration.evidence != nil {
+            writeError(
+                .invalidRequestWithCode(
+                    "The legacy text-completions route is unavailable while serving evidence is being recorded",
+                    param: "prompt",
+                    code: "completions_unsupported"),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
         let request: OpenAIChatCompletionRequest
         do {
-            request = try OpenAIChatCompletionRequest.decodeStrict(
-                from: bodyData,
-                limits: configuration.requestLimits)
+            if isLegacyCompletions {
+                request = try OpenAICompletionRequest.decodeStrict(
+                    from: bodyData,
+                    limits: configuration.requestLimits
+                ).asChatCompletionRequest()
+            } else {
+                request = try OpenAIChatCompletionRequest.decodeStrict(
+                    from: bodyData,
+                    limits: configuration.requestLimits)
+            }
             try request.requireLaunchedModel(configuration.launchedModel)
             // Diagnostic-only, never gating: names of accepted-but-ignored fields (see
             // `OpenAIChatCompletionRequest.ignoredFields`), never their values. Reuses the existing
@@ -262,6 +291,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         activeWritabilityGate = writabilityGate
         activeTask = Self.makeGenerationTask(
             request: request,
+            responseKind: responseKind,
             keepAlive: head.isKeepAlive,
             configuration: configuration,
             backend: backend,
@@ -275,16 +305,18 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         _ head: HTTPRequestHead
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
         let isChat = head.uri == "/v1/chat/completions"
+        let isCompletions = head.uri == "/v1/completions"
         let isModels = head.uri == "/v1/models"
         let isMetrics = head.uri == "/metrics"
         let isHealthz = head.uri == "/healthz"
         let isReadyz = head.uri == "/readyz"
-        guard isChat || isModels || isMetrics || isHealthz || isReadyz else {
+        guard isChat || isCompletions || isModels || isMetrics || isHealthz || isReadyz else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
         }
         guard (isChat && head.method == .POST)
+            || (isCompletions && head.method == .POST)
             || (isModels && head.method == .GET)
             || (isMetrics && head.method == .GET)
             || (isHealthz && head.method == .GET)
@@ -525,6 +557,15 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     }
 }
 
+/// Selects the wire shape `runGeneration`/`stream`/`writeSSETerminal`/`writeJSONResponse` encode a
+/// completed generation into. `.chat` is byte-for-byte the pre-existing `/v1/chat/completions` shape;
+/// `.completions` is the legacy `/v1/completions` (`text_completion`) shape. Both routes share the
+/// SAME admission/generation/backpressure machinery — only the final encoding branches.
+private enum ServingResponseKind: Sendable, Equatable {
+    case chat
+    case completions
+}
+
 private extension OpenAIChatCompletionsHTTPHandler {
     enum RunError: Error {
         case backpressureTimeout
@@ -536,6 +577,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func makeGenerationTask(
         request: OpenAIChatCompletionRequest,
+        responseKind: ServingResponseKind,
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
         backend: any ServingGenerationBackend,
@@ -552,6 +594,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 .withValue(responseAccumulator) {
                     await runGeneration(
                         request: request,
+                        responseKind: responseKind,
                         keepAlive: keepAlive,
                         configuration: configuration,
                         backend: backend,
@@ -645,6 +688,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func runGeneration(
         request: OpenAIChatCompletionRequest,
+        responseKind: ServingResponseKind,
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
         backend: any ServingGenerationBackend,
@@ -685,6 +729,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
             guard started.model == request.model,
                 !started.responseID.isEmpty,
                 started.created >= 0,
+                // The legacy `/v1/completions` shape has no reasoning split — a backend that marks
+                // its handle `separatesReasoning` on this route is violating the contract, not
+                // producing a response this route can honestly encode.
+                !(responseKind == .completions && started.separatesReasoning),
                 await started.lease.activate()
             else {
                 throw RunError.invalidBackendHandle
@@ -715,53 +763,87 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 guard let first else {
                     throw RunError.missingCompletion
                 }
-                try await writeRoleChunk(
-                    for: started,
-                    channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                // The legacy text_completion stream shape has no `delta` wrapper and never announces
+                // a role.
+                if responseKind == .chat {
+                    try await writeRoleChunk(
+                        for: started,
+                        channel: channel,
+                        timeout: configuration.backpressureStallTimeout)
+                }
                 let completion = try await stream(
                     first: first,
                     handle: started,
                     configuration: configuration,
                     channel: channel,
-                    writabilityGate: writabilityGate)
+                    writabilityGate: writabilityGate,
+                    responseKind: responseKind)
                 try await writeSSETerminal(
                     completion,
                     handle: started,
                     channel: channel,
                     writabilityGate: writabilityGate,
                     includeUsage: request.includeUsage,
+                    responseKind: responseKind,
                     timeout: configuration.backpressureStallTimeout)
             } else {
                 let result = try await collectNonStreaming(
                     handle: started,
                     maximumBytes: configuration.maximumNonStreamingResponseBytes)
-                // Separate Qwen `<think>…</think>` reasoning from the visible answer (non-streaming).
-                // With `</think>` present, split at it (unchanged). With no `</think>`, thinking was
-                // truncated mid-reasoning: when this request separates reasoning (the SAME per-request
-                // gate the streaming path uses at line ~620), retro-label the whole output as
-                // reasoning_content with empty content — non-streaming parity with the shipped streaming
-                // Option A contract. Separation off leaves a plain answer as verbatim content, unchanged.
-                let split = ReasoningContentSplitter.split(
-                    result.text,
-                    separationActive: started.separatesReasoning)
-                let response = OpenAIChatCompletionResponse(
-                    id: started.responseID,
-                    created: started.created,
-                    model: started.model,
-                    content: split.content,
-                    finishReason: result.completion.finishReason,
-                    usage: result.completion.usage,
-                    toolCalls: result.toolCalls,
-                    reasoningContent: split.reasoning)
-                try await writeJSONResponse(
-                    response,
-                    handle: started,
-                    maximumBytes: configuration.maximumNonStreamingResponseBytes,
-                    keepAlive: keepAlive,
-                    channel: channel,
-                    writabilityGate: writabilityGate,
-                    timeout: configuration.backpressureStallTimeout)
+                switch responseKind {
+                case .chat:
+                    // Separate Qwen `<think>…</think>` reasoning from the visible answer
+                    // (non-streaming). With `</think>` present, split at it (unchanged). With no
+                    // `</think>`, thinking was truncated mid-reasoning: when this request separates
+                    // reasoning (the SAME per-request gate the streaming path uses), retro-label the
+                    // whole output as reasoning_content with empty content — non-streaming parity with
+                    // the shipped streaming Option A contract. Separation off leaves a plain answer as
+                    // verbatim content, unchanged.
+                    let split = ReasoningContentSplitter.split(
+                        result.text,
+                        separationActive: started.separatesReasoning)
+                    let response = OpenAIChatCompletionResponse(
+                        id: started.responseID,
+                        created: started.created,
+                        model: started.model,
+                        content: split.content,
+                        finishReason: result.completion.finishReason,
+                        usage: result.completion.usage,
+                        toolCalls: result.toolCalls,
+                        reasoningContent: split.reasoning)
+                    try await writeJSONResponse(
+                        response,
+                        handle: started,
+                        maximumBytes: configuration.maximumNonStreamingResponseBytes,
+                        keepAlive: keepAlive,
+                        channel: channel,
+                        writabilityGate: writabilityGate,
+                        timeout: configuration.backpressureStallTimeout)
+                case .completions:
+                    // Raw-text completions never separate reasoning and never parse tool calls (no
+                    // tools are ever active on this route). A backend that emits tool calls anyway is
+                    // violating the contract for this route — treat it as an invalid backend handle
+                    // rather than silently dropping the tool calls or fabricating finish_reason
+                    // "tool_calls" on a shape that has no way to carry them.
+                    guard result.toolCalls.isEmpty else {
+                        throw RunError.invalidBackendHandle
+                    }
+                    let response = OpenAITextCompletionResponse(
+                        id: completionsResponseID(started.responseID),
+                        created: started.created,
+                        model: started.model,
+                        text: result.text,
+                        finishReason: result.completion.finishReason,
+                        usage: result.completion.usage)
+                    try await writeJSONResponse(
+                        response,
+                        handle: started,
+                        maximumBytes: configuration.maximumNonStreamingResponseBytes,
+                        keepAlive: keepAlive,
+                        channel: channel,
+                        writabilityGate: writabilityGate,
+                        timeout: configuration.backpressureStallTimeout)
+                }
                 responseStarted = true
             }
 
@@ -924,7 +1006,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         handle: ServingGenerationHandle,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
-        writabilityGate: ServingChannelWritabilityGate
+        writabilityGate: ServingChannelWritabilityGate,
+        responseKind: ServingResponseKind
     ) async throws -> ServingGenerationCompletion {
         var pending: ServingResponseDelta? = first
         var completion: ServingGenerationCompletion?
@@ -985,20 +1068,40 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 try await waitUntilWritable(
                     writabilityGate,
                     timeout: configuration.backpressureStallTimeout)
-                let chunk = OpenAIChatCompletionChunk(
-                    id: handle.responseID,
-                    created: handle.created,
-                    model: handle.model,
-                    index: 0,
-                    delta: .init(role: nil, content: text),
-                    finishReason: nil)
-                try await writeBody(
-                    chunk.sseEvent(),
-                    channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                switch responseKind {
+                case .chat:
+                    let chunk = OpenAIChatCompletionChunk(
+                        id: handle.responseID,
+                        created: handle.created,
+                        model: handle.model,
+                        index: 0,
+                        delta: .init(role: nil, content: text),
+                        finishReason: nil)
+                    try await writeBody(
+                        chunk.sseEvent(),
+                        channel: channel,
+                        timeout: configuration.backpressureStallTimeout)
+                case .completions:
+                    let chunk = OpenAITextCompletionChunk(
+                        id: completionsResponseID(handle.responseID),
+                        created: handle.created,
+                        model: handle.model,
+                        text: text,
+                        finishReason: nil)
+                    try await writeBody(
+                        chunk.sseEvent(),
+                        channel: channel,
+                        timeout: configuration.backpressureStallTimeout)
+                }
             case .toolCalls(let calls):
                 guard completion == nil else {
                     throw RunError.missingCompletion
+                }
+                // The legacy text_completion shape has no field to carry a tool call — a backend
+                // emitting one on this route is violating the contract, not producing chat-shaped
+                // chunks this route can honestly downgrade into plain text.
+                guard responseKind != .completions else {
+                    throw RunError.invalidBackendHandle
                 }
                 // Emit OpenAI streaming tool-call deltas: a head chunk (id + type + name) then an
                 // arguments chunk (the JSON string as a single fragment). `index` distinguishes
@@ -1161,30 +1264,52 @@ private extension OpenAIChatCompletionsHTTPHandler {
         channel: any Channel,
         writabilityGate: ServingChannelWritabilityGate,
         includeUsage: Bool,
+        responseKind: ServingResponseKind,
         timeout: Duration
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
-        let finish = OpenAIChatCompletionChunk(
-            id: handle.responseID,
-            created: handle.created,
-            model: handle.model,
-            index: 0,
-            delta: .init(role: nil, content: nil),
-            finishReason: completion.finishReason,
-            usage: completion.usage)
-        try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
-        // `stream_options.include_usage` opt-in only: this extra empty-choices usage chunk is the
-        // one byte-shape difference from today's stream. Emitted only on this normal-completion
-        // path — an error path that never reaches here writes no usage chunk, by design (see
-        // OpenAIChatCompletionsHTTPHandlerTests for the byte-identical-when-absent contract).
-        if includeUsage {
-            try await waitUntilWritable(writabilityGate, timeout: timeout)
-            let usageChunk = OpenAIChatCompletionUsageChunk(
+        switch responseKind {
+        case .chat:
+            let finish = OpenAIChatCompletionChunk(
                 id: handle.responseID,
                 created: handle.created,
                 model: handle.model,
+                index: 0,
+                delta: .init(role: nil, content: nil),
+                finishReason: completion.finishReason,
                 usage: completion.usage)
-            try await writeBody(usageChunk.sseEvent(), channel: channel, timeout: timeout)
+            try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
+            // `stream_options.include_usage` opt-in only: this extra empty-choices usage chunk is the
+            // one byte-shape difference from today's stream. Emitted only on this normal-completion
+            // path — an error path that never reaches here writes no usage chunk, by design (see
+            // OpenAIChatCompletionsHTTPHandlerTests for the byte-identical-when-absent contract).
+            if includeUsage {
+                try await waitUntilWritable(writabilityGate, timeout: timeout)
+                let usageChunk = OpenAIChatCompletionUsageChunk(
+                    id: handle.responseID,
+                    created: handle.created,
+                    model: handle.model,
+                    usage: completion.usage)
+                try await writeBody(usageChunk.sseEvent(), channel: channel, timeout: timeout)
+            }
+        case .completions:
+            let finish = OpenAITextCompletionChunk(
+                id: completionsResponseID(handle.responseID),
+                created: handle.created,
+                model: handle.model,
+                text: "",
+                finishReason: completion.finishReason,
+                usage: completion.usage)
+            try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
+            if includeUsage {
+                try await waitUntilWritable(writabilityGate, timeout: timeout)
+                let usageChunk = OpenAITextCompletionUsageChunk(
+                    id: completionsResponseID(handle.responseID),
+                    created: handle.created,
+                    model: handle.model,
+                    usage: completion.usage)
+                try await writeBody(usageChunk.sseEvent(), channel: channel, timeout: timeout)
+            }
         }
         try await writeBody(
             OpenAIChatCompletionChunk.doneSSEEvent,
@@ -1193,8 +1318,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         try await writePart(.end(nil), channel: channel, timeout: timeout)
     }
 
-    static func writeJSONResponse(
-        _ response: OpenAIChatCompletionResponse,
+    static func writeJSONResponse<Response: Encodable>(
+        _ response: Response,
         handle: ServingGenerationHandle,
         maximumBytes: Int,
         keepAlive: Bool,
@@ -1472,6 +1597,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
             keepAlive: keepAlive,
             channel: channel,
             timeout: configuration.backpressureStallTimeout)
+    }
+
+    /// OpenAI's legacy `/v1/completions` response ids use the `cmpl-` prefix, distinct from chat's
+    /// `chatcmpl-`. Every backend generates ids with the SAME `chatcmpl-` prefix regardless of route
+    /// (there is exactly one id-generation site per backend, shared by both routes) — this is purely
+    /// an HTTP-encoding-layer rewrite for `.completions` responses, never a change to what the
+    /// backend generates or to any chat-route id.
+    static func completionsResponseID(_ id: String) -> String {
+        if id.hasPrefix("chatcmpl-") {
+            return "cmpl-\(id.dropFirst("chatcmpl-".count))"
+        }
+        return "cmpl-\(id)"
     }
 
     static func addCompletionBudgetHeaders(

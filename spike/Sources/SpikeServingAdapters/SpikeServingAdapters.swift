@@ -59,7 +59,23 @@ public protocol ScalarServingTextCodec: Sendable {
         enableThinking: Bool?,
         reasoningEffort: String?
     ) throws -> [Int]
+    /// Tokenizes a legacy `/v1/completions` raw-text prompt with NO chat template applied. The
+    /// default implementation below fails closed (`completions_unsupported`) so every codec that has
+    /// not opted in behaves exactly as before this route existed.
+    func encode(rawText: String) throws -> [Int]
     func makeDetokenizer() -> any ScalarServingDetokenizer
+}
+
+extension ScalarServingTextCodec {
+    /// Fail-closed default: a codec that has not implemented raw-text tokenization cannot honestly
+    /// serve `/v1/completions` (it would otherwise silently run the prompt through a chat template,
+    /// or crash). Only `MLXScalarTextCodec` overrides this today.
+    public func encode(rawText: String) throws -> [Int] {
+        throw OpenAIServingError.invalidRequestWithCode(
+            "This server does not support the legacy text-completions route for the loaded codec",
+            param: "prompt",
+            code: "completions_unsupported")
+    }
 }
 
 public struct ScalarServingBackendConfiguration: Sendable {
@@ -275,11 +291,11 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         var promptTokens: [Int]?
         var completionBudgetResolution: ServingCompletionBudgetResolution?
         if let capabilities = configuration.modelCapabilities {
-            let rendered = try codec.render(
-                messages: request.messages,
+            let rendered = try Self.renderPrompt(
+                request,
+                codec: codec,
                 tools: activeTools,
-                enableThinking: resolvedEnableThinking,
-                reasoningEffort: request.reasoningEffort)
+                enableThinking: resolvedEnableThinking)
             guard !rendered.isEmpty else {
                 throw ScalarServingBackendError.emptyRenderedPrompt
             }
@@ -311,11 +327,11 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 retryAfterSeconds: configuration.queueRetryAfterSeconds)
         }
         if promptTokens == nil {
-            promptTokens = try codec.render(
-                messages: request.messages,
+            promptTokens = try Self.renderPrompt(
+                request,
+                codec: codec,
                 tools: activeTools,
-                enableThinking: resolvedEnableThinking,
-                reasoningEffort: request.reasoningEffort)
+                enableThinking: resolvedEnableThinking)
         }
         let renderedPromptTokens = promptTokens ?? []
         guard !renderedPromptTokens.isEmpty else {
@@ -373,9 +389,35 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             mailbox: mailbox,
             lease: lease,
             completionBudgetResolution: completionBudgetResolution,
-            separatesReasoning: servingSeparatesReasoning(
-                thinksByDefault: configuration.thinksByDefault,
-                resolvedEnableThinking: resolvedEnableThinking))
+            // Raw-text completions never separate reasoning: there is no chat template pre-filling a
+            // `<think>` block, so nothing in the output stream is reasoning to split out.
+            separatesReasoning: request.promptInput == .chat
+                && servingSeparatesReasoning(
+                    thinksByDefault: configuration.thinksByDefault,
+                    resolvedEnableThinking: resolvedEnableThinking))
+    }
+
+    /// Renders the prompt for either request shape: `.chat` goes through the codec's chat-template
+    /// `render`, unchanged; `.rawText` goes through `encode(rawText:)` (no template, no tools, no
+    /// thinking control — the codec's default implementation fails closed with
+    /// `completions_unsupported` for a codec that has not opted in). Both call sites in `start(...)`
+    /// above share this so the branch cannot drift between them.
+    private static func renderPrompt(
+        _ request: OpenAIChatCompletionRequest,
+        codec: any ScalarServingTextCodec,
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?
+    ) throws -> [Int] {
+        switch request.promptInput {
+        case .chat:
+            return try codec.render(
+                messages: request.messages,
+                tools: tools,
+                enableThinking: enableThinking,
+                reasoningEffort: request.reasoningEffort)
+        case .rawText(let prompt):
+            return try codec.encode(rawText: prompt)
+        }
     }
 
     public func snapshot() -> ScalarServingBackendSnapshot {

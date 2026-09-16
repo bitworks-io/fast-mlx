@@ -226,6 +226,64 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
         XCTAssertEqual(scalar.snapshot().startCount, 0)
     }
 
+    // This backend only knows how to speculate over a CHAT-templated prompt — a legacy
+    // `/v1/completions` request (`.rawText`) must be rejected with `completions_unsupported`
+    // rather than silently falling back to the scalar route.
+    func testRawTextCompletionsRequestIsRejectedWithoutCallingRunnerOrScalarFallback() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(
+            from: Data(#"{"model":"fixture-model","prompt":"private prompt","max_tokens":2}"#.utf8))
+        let rawTextRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertEqual(rawTextRequest.promptInput, .rawText("private prompt"))
+
+        do {
+            _ = try await backend.start(rawTextRequest)
+            XCTFail("MTP route must reject a raw-text completions request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "prompt")
+            XCTAssertEqual(code, "completions_unsupported")
+        }
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+    }
+
+    // The `.rawText` guard must fire BEFORE the `model != launchedModel` scalar-fallback branch:
+    // a legacy completions request naming a different model is still `completions_unsupported`,
+    // never silently routed to the scalar fallback.
+    func testRawTextCompletionsRequestWithMismatchedModelIsRejectedBeforeScalarFallback() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(
+            from: Data(#"{"model":"some-other-model","prompt":"private prompt","max_tokens":2}"#.utf8))
+        let rawTextRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertNotEqual(rawTextRequest.model, "fixture-model")
+
+        do {
+            _ = try await backend.start(rawTextRequest)
+            XCTFail("MTP route must reject a raw-text completions request before falling back")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "prompt")
+            XCTAssertEqual(code, "completions_unsupported")
+        }
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        // The decisive assertion: the fallback the model-mismatch branch would otherwise reach for
+        // was never started.
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+    }
+
     func testConstructionRejectsScalarFallbackThatMayShareRawTarget() {
         XCTAssertThrowsError(
             try makeBackend(

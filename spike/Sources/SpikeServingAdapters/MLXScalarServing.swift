@@ -106,6 +106,17 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
         }
     }
 
+    /// Tokenizes a legacy `/v1/completions` raw-text prompt with NO chat template applied — the
+    /// caller's bytes go straight to the tokenizer, exactly as a pre-chat-template completions API
+    /// would. Uses `Tokenizer.encode(text:)` (the vendored `MLXLMCommon.Tokenizer` extension's
+    /// DEFAULT special-token handling, i.e. whatever `encode(text:addSpecialTokens:)`'s own default
+    /// resolves to for this tokenizer) rather than threading an explicit `addSpecialTokens` choice
+    /// through this route — the same default every other plain-text encode call in this codebase
+    /// already relies on.
+    public func encode(rawText: String) throws -> [Int] {
+        tokenizer.encode(text: rawText)
+    }
+
     public func makeDetokenizer() -> any ScalarServingDetokenizer {
         MLXScalarDetokenizer(tokenizer: tokenizer)
     }

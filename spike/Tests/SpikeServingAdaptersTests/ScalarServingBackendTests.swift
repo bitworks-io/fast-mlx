@@ -112,6 +112,116 @@ final class ScalarServingBackendTests: XCTestCase {
         _ = try await collect(handle.mailbox)
     }
 
+    // MARK: - Legacy /v1/completions (promptInput: .rawText)
+
+    // A `.rawText` request must go through `codec.encode(rawText:)`, never `codec.render(...)` — the
+    // chat-template path must not be exercised for a request that carries no messages to template.
+    func testRawTextPromptCallsEncodeRawTextAndSkipsRender() async throws {
+        let renderCounter = RenderCounter()
+        let encodeRawTextCounter = RenderCounter()
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10],
+            rawTextTokens: [20, 21],
+            pieces: [1: "hi"],
+            renderCounter: renderCounter,
+            encodeRawTextCounter: encodeRawTextCounter)
+        let backend = makeBackendWithCodec(script: [1, 99], codec: codec)
+
+        let handle = try await backend.start(rawTextRequest(prompt: "Once upon a time", maxTokens: 2))
+        _ = try await collect(handle.mailbox)
+
+        XCTAssertEqual(renderCounter.value, 0)
+        XCTAssertEqual(encodeRawTextCounter.value, 1)
+    }
+
+    // Negative control: an ordinary `.chat` request on the SAME codec must still go through
+    // `render(...)` and must NOT call `encode(rawText:)` — proving the branch is real, not incidental.
+    func testChatPromptStillCallsRenderAndSkipsEncodeRawText() async throws {
+        let renderCounter = RenderCounter()
+        let encodeRawTextCounter = RenderCounter()
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10],
+            rawTextTokens: [20, 21],
+            pieces: [1: "hi"],
+            renderCounter: renderCounter,
+            encodeRawTextCounter: encodeRawTextCounter)
+        let backend = makeBackendWithCodec(script: [1, 99], codec: codec)
+
+        let handle = try await backend.start(request(maxTokens: 2))
+        _ = try await collect(handle.mailbox)
+
+        XCTAssertEqual(renderCounter.value, 1)
+        XCTAssertEqual(encodeRawTextCounter.value, 0)
+    }
+
+    // `ScalarServingTextCodec`'s default `encode(rawText:)` (the protocol extension) fails closed
+    // with `completions_unsupported` for any codec that has not opted in — `FixtureScalarTextCodec`
+    // below deliberately does NOT override it.
+    func testDefaultEncodeRawTextThrowsCompletionsUnsupported() async throws {
+        let backend = makeBackend(script: [1, 99], pieces: [1: "hi"], promptTokens: [10])
+
+        do {
+            _ = try await backend.start(rawTextRequest(prompt: "hi", maxTokens: 2))
+            XCTFail("Expected completions_unsupported rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "completions_unsupported")
+            XCTAssertEqual(error.openAIError.param, "prompt")
+        }
+    }
+
+    // Raw-text completions never separate reasoning, even for a family that thinks by default —
+    // there is no chat template pre-filling a `<think>` block for a raw-text prompt to begin inside.
+    func testHandleDoesNotSeparateReasoningForRawTextEvenWhenFamilyThinksByDefault() async throws {
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10],
+            rawTextTokens: [20],
+            pieces: [1: "hi"],
+            renderCounter: RenderCounter(),
+            encodeRawTextCounter: RenderCounter())
+        let backend = makeBackendWithCodec(script: [1, 99], codec: codec, thinksByDefault: true)
+
+        let handle = try await backend.start(rawTextRequest(prompt: "hi", maxTokens: 2))
+        XCTAssertFalse(handle.separatesReasoning)
+        _ = try await collect(handle.mailbox)
+    }
+
+    // The empty-rendered-prompt screen applies to raw text exactly as it does to chat.
+    func testRawTextEmptyRenderedPromptIsRejected() async throws {
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10],
+            rawTextTokens: [],
+            pieces: [:],
+            renderCounter: RenderCounter(),
+            encodeRawTextCounter: RenderCounter())
+        let backend = makeBackendWithCodec(script: [99], codec: codec)
+
+        do {
+            _ = try await backend.start(rawTextRequest(prompt: "", maxTokens: 2))
+            XCTFail("Expected emptyRenderedPrompt rejection")
+        } catch let error as ScalarServingBackendError {
+            XCTAssertEqual(error, .emptyRenderedPrompt)
+        }
+    }
+
+    // The rejected-prompt-token screen applies to raw text exactly as it does to chat.
+    func testRawTextRejectedPromptTokenIsCaught() async throws {
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10],
+            rawTextTokens: [7],
+            pieces: [:],
+            renderCounter: RenderCounter(),
+            encodeRawTextCounter: RenderCounter())
+        let backend = makeBackendWithCodec(
+            script: [99], codec: codec, rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(rawTextRequest(prompt: "hi", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+        }
+    }
+
     func testScalarRoutePublishesExactTextUsageAndLength() async throws {
         let backend = makeBackend(
             script: [1, 2, 99],
@@ -683,6 +793,46 @@ private func makeBackend(
             rejectedPromptTokenIDs: rejectedPromptTokenIDs))
 }
 
+/// Minimal harness for the legacy-completions tests: only requires `script` + `codec`, since the
+/// `.rawText` tests need a codec that overrides `encode(rawText:)` (unlike `FixtureScalarTextCodec`,
+/// which deliberately does not, so it exercises the protocol-default `completions_unsupported` path).
+private func makeBackendWithCodec(
+    script: [Int],
+    codec: any ScalarServingTextCodec,
+    thinksByDefault: Bool = false,
+    rejectedPromptTokenIDs: Set<Int> = []
+) -> ScalarServingBackend {
+    ScalarServingBackend(
+        launchedModel: "fixture-model",
+        inference: InferenceActor(
+            decoder: ScriptedDecoder(script: script, eos: 99)),
+        codec: codec,
+        stopTokenIDs: [99],
+        modelStopStrings: [],
+        configuration: .init(
+            defaultMaximumCompletionTokens: 8,
+            maximumQueuedRequests: 2,
+            queueRetryAfterSeconds: 2,
+            mailboxCapacity: .init(maxDeltas: 4, maxBytes: 1_024),
+            thinksByDefault: thinksByDefault,
+            rejectedPromptTokenIDs: rejectedPromptTokenIDs))
+}
+
+private func rawTextRequest(
+    prompt: String,
+    maxTokens: Int
+) -> OpenAIChatCompletionRequest {
+    OpenAIChatCompletionRequest(
+        model: "fixture-model",
+        messages: [],
+        maxCompletionTokens: maxTokens,
+        temperature: 0,
+        choiceCount: 1,
+        stream: true,
+        stop: [],
+        promptInput: .rawText(prompt))
+}
+
 private let weatherTool = OpenAIToolSpec(
     name: "get_weather",
     description: "Look up the weather for a city",
@@ -783,6 +933,36 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
     ) throws -> [Int] {
         renderCounter?.increment()
         return tools.isEmpty ? promptTokens : promptTokens + extraPromptTokensWhenToolsPresent
+    }
+
+    func makeDetokenizer() -> any ScalarServingDetokenizer {
+        FixtureScalarDetokenizer(pieces: pieces)
+    }
+}
+
+/// A codec that DOES override `encode(rawText:)` (unlike `FixtureScalarTextCodec` above, which
+/// exercises the protocol-default fail-closed path) — lets tests independently observe which of
+/// `render(...)` / `encode(rawText:)` a given request shape actually invoked.
+private struct RawTextFixtureScalarTextCodec: ScalarServingTextCodec {
+    let chatPromptTokens: [Int]
+    let rawTextTokens: [Int]
+    let pieces: [Int: String]
+    let renderCounter: RenderCounter
+    let encodeRawTextCounter: RenderCounter
+
+    func render(
+        messages: [OpenAIChatMessage],
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?,
+        reasoningEffort: String?
+    ) throws -> [Int] {
+        renderCounter.increment()
+        return chatPromptTokens
+    }
+
+    func encode(rawText: String) throws -> [Int] {
+        encodeRawTextCounter.increment()
+        return rawTextTokens
     }
 
     func makeDetokenizer() -> any ScalarServingDetokenizer {

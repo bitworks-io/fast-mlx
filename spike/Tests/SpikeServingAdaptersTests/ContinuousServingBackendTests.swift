@@ -98,6 +98,50 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// The continuous-batch route only knows how to render a CHAT-templated prompt — a legacy
+    /// `/v1/completions` request (`.rawText`) must be rejected with `completions_unsupported`
+    /// BEFORE anything is rendered or decoded, never silently mistreated as an already-templated
+    /// chat prompt.
+    func testContinuousBatchRouteRejectsRawTextCompletionsRequestBeforeRenderingOrDecoding()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(
+            from: Data(#"{"model":"fixture","prompt":"solo","max_tokens":2}"#.utf8))
+        let rawTextRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertEqual(rawTextRequest.promptInput, .rawText("solo"))
+
+        do {
+            _ = try await backend.start(rawTextRequest)
+            XCTFail("continuous route must reject a raw-text completions request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "prompt")
+            XCTAssertEqual(code, "completions_unsupported")
+        }
+        XCTAssertTrue(recorder.decodeActions.isEmpty)
+        XCTAssertTrue(recorder.admissionBatchSizes.isEmpty)
+        await backend.shutdown()
+    }
+
     /// `repetitionPenalty` is a MULTIPLICATIVE penalty (the vendored `RepetitionContext`:
     /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`. Both
     /// HF-recommended presets for the deployed model send `repetition_penalty: 1.0` on every

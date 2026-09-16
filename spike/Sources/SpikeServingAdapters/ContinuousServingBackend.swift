@@ -255,6 +255,15 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard acceptingRequests else {
             throw ContinuousServingBackendError.shuttingDown
         }
+        // The continuous-batch route only knows how to render a CHAT-templated prompt (it has no
+        // tokenizer-only codepath); fail closed rather than silently mistreating raw completions text
+        // as an already-templated chat prompt.
+        guard request.promptInput == .chat else {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support the legacy text-completions route for the loaded backend",
+                param: "prompt",
+                code: "completions_unsupported")
+        }
         try request.requireLaunchedModel(launchedModel)
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ContinuousServingBackendError.invalidStopTokenIDs

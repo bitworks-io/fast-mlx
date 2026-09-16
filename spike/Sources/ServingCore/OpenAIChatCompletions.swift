@@ -128,6 +128,14 @@ public struct OpenAIChatRequestLimits: Sendable, Equatable {
     }
 }
 
+/// Distinguishes a chat-templated request from a legacy raw-text completion. NOT a wire key: it is
+/// never present in the allowed-keys set for `OpenAIChatCompletionRequest.decodeStrict`, so chat JSON
+/// can never set `.rawText` — the only way to produce one is `OpenAICompletionRequest.asChatCompletionRequest()`.
+public enum ServingPromptInput: Sendable, Equatable {
+    case chat
+    case rawText(String)
+}
+
 public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var model: String
     public var messages: [OpenAIChatMessage]
@@ -168,6 +176,11 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     /// this request (OpenAI SDK metadata such as `user`/`metadata`/`store`/`service_tier`, plus
     /// neutral-valued semantic fields such as `logprobs:false`). Never carries field VALUES.
     public var ignoredFields: [String]
+    /// `.chat` for every request decoded from `/v1/chat/completions` (the only value
+    /// `decodeStrict` can ever produce). `.rawText(prompt)` is set exclusively by
+    /// `OpenAICompletionRequest.asChatCompletionRequest()` for the legacy `/v1/completions` route —
+    /// there is no wire key that can set it here.
+    public var promptInput: ServingPromptInput
 
     public init(
         model: String,
@@ -190,7 +203,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         frequencyPenalty: Double? = nil,
         repetitionPenalty: Double? = nil,
         includeUsage: Bool = false,
-        ignoredFields: [String] = []
+        ignoredFields: [String] = [],
+        promptInput: ServingPromptInput = .chat
     ) {
         self.model = model
         self.messages = messages
@@ -213,6 +227,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
+        self.promptInput = promptInput
     }
 
     public static func decodeStrict(
@@ -304,14 +319,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let enableThinking = try optionalBool(root["enable_thinking"], param: "enable_thinking")
 
         let topP = try optionalDouble(root["top_p"], param: "top_p")
-        let topK = try optionalInt(root["top_k"], param: "top_k")
-        if let topK, topK <= 0 {
-            throw OpenAIServingError.invalidRequest("top_k must be greater than zero", param: "top_k")
-        }
-        let minP = try optionalDouble(root["min_p"], param: "min_p")
-        if let minP, !(minP >= 0 && minP <= 1) {
-            throw OpenAIServingError.invalidRequest("min_p must be between 0 and 1", param: "min_p")
-        }
+        let topK = try optionalTopK(root["top_k"])
+        let minP = try optionalMinP(root["min_p"])
         let seed = try optionalInt64(root["seed"], param: "seed")
 
         let topLevelReasoningEffort = try optionalReasoningEffort(root["reasoning_effort"], param: "reasoning_effort")
@@ -319,21 +328,9 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let resolvedEnableThinking = enableThinking ?? kwargsEnableThinking
         let resolvedReasoningEffort = topLevelReasoningEffort ?? kwargsReasoningEffort
 
-        let presencePenalty = try optionalDouble(root["presence_penalty"], param: "presence_penalty")
-        if let presencePenalty, !(presencePenalty >= -2 && presencePenalty <= 2) {
-            throw OpenAIServingError.invalidRequest(
-                "presence_penalty must be between -2 and 2", param: "presence_penalty")
-        }
-        let frequencyPenalty = try optionalDouble(root["frequency_penalty"], param: "frequency_penalty")
-        if let frequencyPenalty, !(frequencyPenalty >= -2 && frequencyPenalty <= 2) {
-            throw OpenAIServingError.invalidRequest(
-                "frequency_penalty must be between -2 and 2", param: "frequency_penalty")
-        }
-        let repetitionPenalty = try optionalDouble(root["repetition_penalty"], param: "repetition_penalty")
-        if let repetitionPenalty, !(repetitionPenalty > 0) {
-            throw OpenAIServingError.invalidRequest(
-                "repetition_penalty must be greater than zero", param: "repetition_penalty")
-        }
+        let presencePenalty = try optionalPresencePenalty(root["presence_penalty"])
+        let frequencyPenalty = try optionalFrequencyPenalty(root["frequency_penalty"])
+        let repetitionPenalty = try optionalRepetitionPenalty(root["repetition_penalty"])
 
         // Metadata-only OpenAI SDK fields: validated for type, then accepted and ignored — they
         // describe OpenAI-side bookkeeping (caller identity, storage, service tier) that this
@@ -389,6 +386,213 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             repetitionPenalty: repetitionPenalty,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields)
+    }
+
+    public func requireLaunchedModel(_ launchedModel: String) throws {
+        guard model == launchedModel else {
+            throw OpenAIServingError.invalidRequest(
+                "The requested model is not loaded by this server",
+                param: "model")
+        }
+    }
+}
+
+/// The legacy OpenAI text-completions request (`POST /v1/completions`). No chat template is ever
+/// applied to `prompt` — `asChatCompletionRequest()` carries it through as `promptInput: .rawText`,
+/// which every serving backend must treat as already-tokenizable raw text, never as a message to
+/// template. Sampling/budget/stop/seed/stream/stream_options/penalty fields behave identically to
+/// the chat route (this decoder reuses the SAME range validators) so the two routes cannot silently
+/// drift apart on what counts as a valid temperature/top_p/etc.
+public struct OpenAICompletionRequest: Sendable, Equatable {
+    public var model: String
+    public var prompt: String
+    public var maxCompletionTokens: Int?
+    public var temperature: Double?
+    public var topP: Double?
+    public var topK: Int?
+    public var minP: Double?
+    public var seed: Int64?
+    public var stream: Bool
+    public var stop: [String]
+    public var presencePenalty: Double?
+    public var frequencyPenalty: Double?
+    public var repetitionPenalty: Double?
+    public var includeUsage: Bool
+    /// Same contract as `OpenAIChatCompletionRequest.ignoredFields`: sorted, dedup-free field
+    /// NAMES only (never values) for accepted-but-ignored top-level fields.
+    public var ignoredFields: [String]
+
+    public init(
+        model: String,
+        prompt: String,
+        maxCompletionTokens: Int? = nil,
+        temperature: Double? = nil,
+        topP: Double? = nil,
+        topK: Int? = nil,
+        minP: Double? = nil,
+        seed: Int64? = nil,
+        stream: Bool = false,
+        stop: [String] = [],
+        presencePenalty: Double? = nil,
+        frequencyPenalty: Double? = nil,
+        repetitionPenalty: Double? = nil,
+        includeUsage: Bool = false,
+        ignoredFields: [String] = []
+    ) {
+        self.model = model
+        self.prompt = prompt
+        self.maxCompletionTokens = maxCompletionTokens
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.seed = seed
+        self.stream = stream
+        self.stop = stop
+        self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.repetitionPenalty = repetitionPenalty
+        self.includeUsage = includeUsage
+        self.ignoredFields = ignoredFields
+    }
+
+    public static func decodeStrict(
+        from data: Data,
+        limits: OpenAIChatRequestLimits = .productionDefault
+    ) throws -> OpenAICompletionRequest {
+        guard data.count <= limits.maximumBodyBytes else {
+            throw OpenAIServingError.invalidRequest(
+                "Request body exceeds the configured byte limit",
+                param: nil)
+        }
+
+        let root = try decodeJSONObject(data, param: nil)
+        let allowedKeys: Set<String> = [
+            "model",
+            "prompt",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "n",
+            "stream",
+            "stream_options",
+            "stop",
+            "seed",
+            "presence_penalty",
+            "frequency_penalty",
+            "repetition_penalty",
+            "user",
+            "metadata",
+            "logit_bias",
+            "logprobs",
+            "echo",
+            "suffix",
+            "best_of",
+        ]
+        try rejectUnknownKeys(in: root, allowed: allowedKeys, paramPrefix: nil)
+
+        let model = try requiredString(root["model"], param: "model")
+        guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw OpenAIServingError.invalidRequest("model must be a non-empty string", param: "model")
+        }
+
+        let prompt = try decodeCompletionPrompt(root["prompt"])
+
+        let completionBudget = try optionalPositiveInt(root["max_tokens"], param: "max_tokens")
+        if limits.enforceMaximumCompletionTokensDuringDecoding,
+           let completionBudget,
+           completionBudget > limits.maximumCompletionTokens {
+            throw OpenAIServingError.invalidRequest(
+                "max_tokens exceeds the configured limit", param: "max_tokens")
+        }
+
+        let temperature = try optionalDouble(root["temperature"], param: "temperature")
+        let topP = try optionalDouble(root["top_p"], param: "top_p")
+        let topK = try optionalTopK(root["top_k"])
+        let minP = try optionalMinP(root["min_p"])
+        let seed = try optionalInt64(root["seed"], param: "seed")
+
+        let choiceCount = try optionalInt(root["n"], param: "n") ?? 1
+        guard choiceCount == 1 else {
+            throw OpenAIServingError.invalidRequest("n must be 1 for this route", param: "n")
+        }
+
+        let stream = try optionalBool(root["stream"], param: "stream") ?? false
+        let stop = try decodeStop(root["stop"])
+
+        let presencePenalty = try optionalPresencePenalty(root["presence_penalty"])
+        let frequencyPenalty = try optionalFrequencyPenalty(root["frequency_penalty"])
+        let repetitionPenalty = try optionalRepetitionPenalty(root["repetition_penalty"])
+
+        let user = try optionalUser(root["user"])
+        let metadata = try optionalMetadata(root["metadata"])
+        let logprobs = try optionalNeutralCompletionLogprobs(root["logprobs"])
+        let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
+        let echoPresent = try validateNeutralEcho(root["echo"])
+        try rejectIfPresentSuffix(root["suffix"])
+        let bestOf = try optionalInt(root["best_of"], param: "best_of")
+        if let bestOf, bestOf != 1 {
+            throw OpenAIServingError.invalidRequest("best_of must be 1", param: "best_of")
+        }
+
+        let includeUsage = try decodeStreamOptions(root["stream_options"], stream: stream)
+
+        var ignoredFields: [String] = []
+        if user != nil { ignoredFields.append("user") }
+        if metadata != nil { ignoredFields.append("metadata") }
+        if logprobs != nil { ignoredFields.append("logprobs") }
+        if logitBiasPresent { ignoredFields.append("logit_bias") }
+        if echoPresent { ignoredFields.append("echo") }
+        ignoredFields.sort()
+
+        return OpenAICompletionRequest(
+            model: model,
+            prompt: prompt,
+            maxCompletionTokens: completionBudget,
+            temperature: temperature,
+            topP: topP,
+            topK: topK,
+            minP: minP,
+            seed: seed,
+            stream: stream,
+            stop: stop,
+            presencePenalty: presencePenalty,
+            frequencyPenalty: frequencyPenalty,
+            repetitionPenalty: repetitionPenalty,
+            includeUsage: includeUsage,
+            ignoredFields: ignoredFields)
+    }
+
+    /// Converts to the shared `OpenAIChatCompletionRequest` shape every serving backend consumes.
+    /// `messages` is empty, `tools`/`toolChoice` carry no tools, and `enableThinking`/`reasoningEffort`
+    /// are nil — this route never applies a chat template. `promptInput: .rawText(prompt)` is the ONLY
+    /// place in the codebase that constructs a non-`.chat` `ServingPromptInput`.
+    public func asChatCompletionRequest() -> OpenAIChatCompletionRequest {
+        OpenAIChatCompletionRequest(
+            model: model,
+            messages: [],
+            maxCompletionTokens: maxCompletionTokens,
+            temperature: temperature,
+            choiceCount: 1,
+            stream: stream,
+            stop: stop,
+            tools: [],
+            toolChoice: .none,
+            parallelToolCalls: nil,
+            enableThinking: nil,
+            topP: topP,
+            topK: topK,
+            minP: minP,
+            seed: seed,
+            reasoningEffort: nil,
+            presencePenalty: presencePenalty,
+            frequencyPenalty: frequencyPenalty,
+            repetitionPenalty: repetitionPenalty,
+            includeUsage: includeUsage,
+            ignoredFields: ignoredFields,
+            promptInput: .rawText(prompt))
     }
 
     public func requireLaunchedModel(_ launchedModel: String) throws {
@@ -641,6 +845,179 @@ public struct OpenAIChatCompletionUsageChunk: Encodable, Sendable, Equatable {
     public var created: Int
     public var model: String
     public var choices: [OpenAIChatCompletionChunk.Choice] = []
+    public var usage: OpenAIChatUsage
+
+    public init(id: String, created: Int, model: String, usage: OpenAIChatUsage) {
+        self.id = id
+        self.created = created
+        self.model = model
+        self.usage = usage
+    }
+
+    public func sseEvent() throws -> String {
+        let data = try JSONEncoder.openAI.encode(self)
+        return "data: \(String(decoding: data, as: UTF8.self))\n\n"
+    }
+}
+
+/// Non-streaming response body for the legacy `POST /v1/completions` route: `object:"text_completion"`,
+/// a single `choices[0].text` (the full completion, verbatim — no reasoning split, no tool-call
+/// parsing), and `logprobs` always `null` (this server never computes per-token log-probabilities).
+public struct OpenAITextCompletionResponse: Encodable, Sendable, Equatable {
+    public var id: String
+    public var object = "text_completion"
+    public var created: Int
+    public var model: String
+    public var choices: [Choice]
+    public var usage: OpenAIChatUsage
+
+    public init(
+        id: String,
+        created: Int,
+        model: String,
+        text: String,
+        finishReason: OpenAIChatFinishReason,
+        usage: OpenAIChatUsage
+    ) {
+        self.id = id
+        self.created = created
+        self.model = model
+        self.choices = [Choice(index: 0, text: text, finishReason: finishReason)]
+        self.usage = usage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case object
+        case created
+        case model
+        case choices
+        case usage
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(object, forKey: .object)
+        try container.encode(created, forKey: .created)
+        try container.encode(model, forKey: .model)
+        try container.encode(choices, forKey: .choices)
+        try container.encode(usage, forKey: .usage)
+    }
+
+    public struct Choice: Encodable, Sendable, Equatable {
+        public var index: Int
+        public var text: String
+        public var finishReason: OpenAIChatFinishReason
+
+        private enum CodingKeys: String, CodingKey {
+            case index
+            case text
+            case logprobs
+            case finishReason = "finish_reason"
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(index, forKey: .index)
+            try container.encode(text, forKey: .text)
+            try container.encodeNil(forKey: .logprobs)
+            try container.encode(finishReason, forKey: .finishReason)
+        }
+    }
+}
+
+/// Streaming SSE chunk for the legacy `POST /v1/completions` route. Unlike
+/// `OpenAIChatCompletionChunk` there is no `delta` wrapper and no `role` announcement — the legacy
+/// shape puts the incremental text directly on `choices[0].text`.
+public struct OpenAITextCompletionChunk: Encodable, Sendable, Equatable {
+    public var id: String
+    public var object = "text_completion"
+    public var created: Int
+    public var model: String
+    public var choices: [Choice]
+    public var usage: OpenAIChatUsage?
+
+    public init(
+        id: String,
+        created: Int,
+        model: String,
+        text: String,
+        finishReason: OpenAIChatFinishReason?,
+        usage: OpenAIChatUsage? = nil
+    ) {
+        self.id = id
+        self.created = created
+        self.model = model
+        self.choices = [Choice(index: 0, text: text, finishReason: finishReason)]
+        self.usage = usage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case object
+        case created
+        case model
+        case choices
+        case usage
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(object, forKey: .object)
+        try container.encode(created, forKey: .created)
+        try container.encode(model, forKey: .model)
+        try container.encode(choices, forKey: .choices)
+        if let usage {
+            try container.encode(usage, forKey: .usage)
+        } else {
+            try container.encodeNil(forKey: .usage)
+        }
+    }
+
+    public static let doneSSEEvent = OpenAIChatCompletionChunk.doneSSEEvent
+
+    public func sseEvent() throws -> String {
+        let data = try JSONEncoder.openAI.encode(self)
+        return "data: \(String(decoding: data, as: UTF8.self))\n\n"
+    }
+
+    public struct Choice: Encodable, Sendable, Equatable {
+        public var index: Int
+        public var text: String
+        public var finishReason: OpenAIChatFinishReason?
+
+        private enum CodingKeys: String, CodingKey {
+            case index
+            case text
+            case logprobs
+            case finishReason = "finish_reason"
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(index, forKey: .index)
+            try container.encode(text, forKey: .text)
+            try container.encodeNil(forKey: .logprobs)
+            if let finishReason {
+                try container.encode(finishReason, forKey: .finishReason)
+            } else {
+                try container.encodeNil(forKey: .finishReason)
+            }
+        }
+    }
+}
+
+/// Terminal usage-only SSE chunk for `/v1/completions` streaming, mirroring
+/// `OpenAIChatCompletionUsageChunk`: emitted only when the caller opts in via
+/// `stream_options.include_usage`, with an EMPTY `choices` array.
+public struct OpenAITextCompletionUsageChunk: Encodable, Sendable, Equatable {
+    public var id: String
+    public var object = "text_completion"
+    public var created: Int
+    public var model: String
+    public var choices: [OpenAITextCompletionChunk.Choice] = []
     public var usage: OpenAIChatUsage
 
     public init(id: String, created: Int, model: String, usage: OpenAIChatUsage) {
@@ -1204,6 +1581,114 @@ private func exactInteger<T>(
         throw OpenAIServingError.invalidRequest("\(param) must be an integer", param: param)
     }
     return value
+}
+
+/// Shared by both `OpenAIChatCompletionRequest.decodeStrict` and `OpenAICompletionRequest.decodeStrict`
+/// so the two routes cannot silently drift on what counts as a valid `top_k`.
+private func optionalTopK(_ raw: Any?, param: String = "top_k") throws -> Int? {
+    let topK = try optionalInt(raw, param: param)
+    if let topK, topK <= 0 {
+        throw OpenAIServingError.invalidRequest("\(param) must be greater than zero", param: param)
+    }
+    return topK
+}
+
+private func optionalMinP(_ raw: Any?, param: String = "min_p") throws -> Double? {
+    let minP = try optionalDouble(raw, param: param)
+    if let minP, !(minP >= 0 && minP <= 1) {
+        throw OpenAIServingError.invalidRequest("\(param) must be between 0 and 1", param: param)
+    }
+    return minP
+}
+
+private func optionalPresencePenalty(_ raw: Any?, param: String = "presence_penalty") throws -> Double? {
+    let value = try optionalDouble(raw, param: param)
+    if let value, !(value >= -2 && value <= 2) {
+        throw OpenAIServingError.invalidRequest("\(param) must be between -2 and 2", param: param)
+    }
+    return value
+}
+
+private func optionalFrequencyPenalty(_ raw: Any?, param: String = "frequency_penalty") throws -> Double? {
+    let value = try optionalDouble(raw, param: param)
+    if let value, !(value >= -2 && value <= 2) {
+        throw OpenAIServingError.invalidRequest("\(param) must be between -2 and 2", param: param)
+    }
+    return value
+}
+
+private func optionalRepetitionPenalty(_ raw: Any?, param: String = "repetition_penalty") throws -> Double? {
+    let value = try optionalDouble(raw, param: param)
+    if let value, !(value > 0) {
+        throw OpenAIServingError.invalidRequest("\(param) must be greater than zero", param: param)
+    }
+    return value
+}
+
+/// `prompt` accepts a non-empty string, or an array containing exactly ONE non-empty string —
+/// OpenAI's legacy batch-of-prompts shape is not supported (`n` is already pinned to 1 for this
+/// route), and a token-ID array is rejected the same way a non-string single-element array is:
+/// `array[0] as? String` fails to cast an `NSNumber`.
+private func decodeCompletionPrompt(_ raw: Any?) throws -> String {
+    guard let raw, !(raw is NSNull) else {
+        throw OpenAIServingError.invalidRequest("prompt is required", param: "prompt")
+    }
+    if let string = raw as? String {
+        guard !string.isEmpty else {
+            throw OpenAIServingError.invalidRequest("prompt must not be empty", param: "prompt")
+        }
+        return string
+    }
+    if let array = raw as? [Any] {
+        guard array.count == 1, let only = array[0] as? String else {
+            throw OpenAIServingError.invalidRequest(
+                "prompt must be a non-empty string, or an array containing exactly one string",
+                param: "prompt")
+        }
+        guard !only.isEmpty else {
+            throw OpenAIServingError.invalidRequest("prompt must not be empty", param: "prompt")
+        }
+        return only
+    }
+    throw OpenAIServingError.invalidRequest(
+        "prompt must be a non-empty string, or an array containing exactly one string",
+        param: "prompt")
+}
+
+/// `logprobs` on the legacy completions route is an INTEGER (unlike chat's boolean) requesting the
+/// sampled token's logprob (and, if > 0, additional top-alternative logprobs) — even `0` asks for the
+/// sampled token's logprob, which this server cannot return. Only `null`/absent is accepted; any
+/// integer (including 0) fails closed.
+private func optionalNeutralCompletionLogprobs(_ raw: Any?) throws -> Int? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard (try optionalInt(raw, param: "logprobs")) == nil else {
+        throw OpenAIServingError.invalidRequest(
+            "Unsupported value for logprobs: only null/absent is supported", param: "logprobs")
+    }
+    return nil
+}
+
+/// `echo` is only accepted at its neutral value (`false`/absent) — echoing the prompt back into
+/// `choices[0].text` is not implemented, and silently ignoring `true` would return a response
+/// missing content the caller explicitly asked for. Returns whether the field was present (non-null).
+private func validateNeutralEcho(_ raw: Any?) throws -> Bool {
+    guard let raw, !(raw is NSNull) else { return false }
+    guard let value = raw as? Bool else {
+        throw OpenAIServingError.invalidRequest("echo must be a boolean", param: "echo")
+    }
+    guard value == false else {
+        throw OpenAIServingError.invalidRequest(
+            "Unsupported value for echo: only false is supported", param: "echo")
+    }
+    return true
+}
+
+/// `suffix` (insertion-mode completion) is not implemented at all; any non-null value fails closed
+/// rather than silently ignoring the caller's insertion request.
+private func rejectIfPresentSuffix(_ raw: Any?) throws {
+    guard let raw, !(raw is NSNull) else { return }
+    _ = raw
+    throw OpenAIServingError.invalidRequest("suffix is not supported", param: "suffix")
 }
 
 private func optionalString(_ raw: Any?, param: String) throws -> String? {

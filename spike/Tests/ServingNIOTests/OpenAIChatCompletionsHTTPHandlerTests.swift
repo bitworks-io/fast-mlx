@@ -517,6 +517,294 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // MARK: - Legacy POST /v1/completions
+
+    func testCompletionsNonStreamingReturnsTextCompletionObjectShape() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        XCTAssertEqual(object["object"] as? String, "text_completion")
+        // Legacy completions ids use `cmpl-`, not chat's `chatcmpl-` — the backend generates
+        // `chatcmpl-1` for the first request; the HTTP encoding layer rewrites it for this route.
+        XCTAssertEqual(object["id"] as? String, "cmpl-1")
+        let choice = try XCTUnwrap((object["choices"] as? [[String: Any]])?.first)
+        XCTAssertEqual(choice["text"] as? String, "hello")
+        XCTAssertEqual(choice["index"] as? Int, 0)
+        XCTAssertEqual(choice["finish_reason"] as? String, "stop")
+        XCTAssertTrue(choice.keys.contains("logprobs"))
+        XCTAssertTrue(choice["logprobs"] is NSNull)
+        let usage = try XCTUnwrap(object["usage"] as? [String: Any])
+        XCTAssertEqual(usage["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(usage["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 5)
+
+        _ = try await channel.finish()
+    }
+
+    func testCompletionsStreamingChunkShapeAndDone() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(
+                text: ["hel", "lo"],
+                finishReason: .length,
+                promptTokens: 3,
+                completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "text/event-stream")
+        // No role announcement — the legacy shape has no `delta` wrapper at all.
+        XCTAssertFalse(response.body.contains(#""role""#), response.body)
+        let events = try sseJSONEvents(from: response.body)
+        XCTAssertTrue(events.allSatisfy { $0["object"] as? String == "text_completion" })
+        // Every streamed chunk (including the terminal one) carries the `cmpl-` prefixed id.
+        XCTAssertTrue(events.allSatisfy { $0["id"] as? String == "cmpl-1" }, response.body)
+        let texts = events.compactMap { event -> String? in
+            (event["choices"] as? [[String: Any]])?.first?["text"] as? String
+        }
+        XCTAssertEqual(texts, ["hel", "lo", ""])
+        let finishReasons = events.compactMap { event -> String? in
+            (event["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String
+        }
+        XCTAssertEqual(finishReasons, ["length"])
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    // The legacy `text_completion` shape has no field to carry a tool call. A backend emitting one
+    // on this route must be treated as an invalid backend handle — never silently dropped, and
+    // never surfaced as a fabricated `finish_reason:"tool_calls"` on a shape that cannot represent it.
+    func testCompletionsNonStreamingBackendToolCallEmissionIsInvalidBackendHandle() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completedWithToolCalls(
+                text: ["partial"],
+                toolCalls: [
+                    OpenAIToolCall(id: "call_1", function: .init(name: "get_weather", arguments: "{}"))
+                ],
+                finishReason: .toolCalls,
+                promptTokens: 3,
+                completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .internalServerError)
+        XCTAssertTrue(response.body.contains(#""code":"generation_failed""#), response.body)
+        XCTAssertFalse(response.body.contains(#""tool_calls""#), response.body)
+        XCTAssertFalse(response.body.contains(#""finish_reason":"tool_calls""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
+    // Same contract on the streaming path: a tool-call event mid-stream on `/v1/completions` must
+    // not be downgraded into chat-shaped delta chunks — it fails the generation instead.
+    func testCompletionsStreamingBackendToolCallEmissionIsInvalidBackendHandle() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completedWithToolCalls(
+                text: ["partial"],
+                toolCalls: [
+                    OpenAIToolCall(id: "call_1", function: .init(name: "get_weather", arguments: "{}"))
+                ],
+                finishReason: .toolCalls,
+                promptTokens: 3,
+                completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        // The SSE head is already sent by the time the tool-call event arrives, so the failure is
+        // reported as a terminal SSE error event rather than a fresh HTTP status.
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains(#""code":"generation_failed""#), response.body)
+        XCTAssertFalse(response.body.contains(#""tool_calls""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
+    func testCompletionsStreamOptionsIncludeUsageEmitsTerminalUsageChunkBeforeDone() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(
+            channel,
+            body: """
+            {"model":"qwen3-32b","prompt":"Hello","max_tokens":8,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}
+            """)
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let events = try sseJSONEvents(from: response.body)
+        let usageOnlyEvents = events.filter { object in
+            (object["choices"] as? [[String: Any]])?.isEmpty == true
+        }
+        XCTAssertEqual(usageOnlyEvents.count, 1, response.body)
+        let usage = try XCTUnwrap(usageOnlyEvents.first?["usage"] as? [String: Any])
+        XCTAssertEqual(usage["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(usage["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 5)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    // Same auth contract as chat: a configured bearer token is required on /v1/completions too.
+    func testCompletionsRequiresBearerTokenExactlyLikeChat() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .unauthorized)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+
+        _ = try await channel.finish()
+    }
+
+    // `validateHead` checks method against route membership with the exact same structure for
+    // `/v1/completions` as for `/v1/chat/completions` (`isCompletions && head.method == .POST`
+    // alongside `isChat && head.method == .POST`, in the same combined guard) — no separate method
+    // check was added for the legacy route. This test pins that a `GET` on either route is refused
+    // identically (405, same error body shape), proving the shared behavior rather than assuming it.
+    func testCompletionsRejectsWrongMethodExactlyLikeChat() async throws {
+        let completionsBackend = ScriptedBackend(scripts: [])
+        let completionsChannel = try await makeChannel(backend: completionsBackend)
+        try await writeHeadOnlyRequest(completionsChannel, method: .GET, uri: "/v1/completions")
+        let completionsResponse = try await collectResponse(from: completionsChannel)
+        XCTAssertEqual(completionsResponse.head.status, .methodNotAllowed)
+        XCTAssertEqual(completionsBackend.snapshot().startCount, 0)
+        _ = try await completionsChannel.finish()
+
+        let chatBackend = ScriptedBackend(scripts: [])
+        let chatChannel = try await makeChannel(backend: chatBackend)
+        try await writeHeadOnlyRequest(chatChannel, method: .GET, uri: "/v1/chat/completions")
+        let chatResponse = try await collectResponse(from: chatChannel)
+        XCTAssertEqual(chatResponse.head.status, .methodNotAllowed)
+        XCTAssertEqual(chatBackend.snapshot().startCount, 0)
+        _ = try await chatChannel.finish()
+
+        XCTAssertEqual(completionsResponse.body, chatResponse.body)
+    }
+
+    // `ServingEvidence.validateCanonicalHTTPRequest` only recognizes `/v1/chat/completions` as a
+    // canonical path — building `ServingEvidence.Request` for `/v1/completions` while evidence is
+    // configured previously threw inside that constructor with no response ever written, dropping
+    // the connection. With evidence enabled, `/v1/completions` must instead get a clean 400
+    // `completions_unsupported` BEFORE the backend is ever started, while `/v1/chat/completions` on
+    // the SAME evidence-enabled configuration still succeeds exactly as before.
+    func testCompletionsRefusesRequestWithoutDroppingConnectionWhenEvidenceIsEnabled() async throws {
+        let recorder = ServingEvidenceRecorder()
+        let evidenceConfiguration = ServingHTTPEvidenceConfiguration(
+            snapshot: nil,
+            record: { evidence in try await recorder.record(evidence) },
+            reportFailure: { message in
+                Task { await recorder.recordFailure(message) }
+            })
+
+        let completionsBackend = ScriptedBackend(scripts: [
+            .completed(text: ["should-not-run"], promptTokens: 1, completionTokens: 1)
+        ])
+        let completionsChannel = try await makeChannel(
+            backend: completionsBackend,
+            configuration: defaultConfiguration(evidence: evidenceConfiguration))
+        try await writeCompletionsRequest(completionsChannel, body: completionsRequestBody(stream: false))
+        let completionsResponse = try await collectResponse(from: completionsChannel)
+
+        XCTAssertEqual(completionsResponse.head.status, .badRequest)
+        XCTAssertTrue(
+            completionsResponse.body.contains(#""code":"completions_unsupported""#),
+            completionsResponse.body)
+        XCTAssertTrue(
+            completionsResponse.body.contains(#""param":"prompt""#), completionsResponse.body)
+        XCTAssertEqual(completionsBackend.snapshot().startCount, 0)
+        _ = try await completionsChannel.finish()
+
+        // The SAME evidence-enabled configuration still serves chat normally.
+        let chatBackend = ScriptedBackend(scripts: [
+            .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+        ])
+        let chatChannel = try await makeChannel(
+            backend: chatBackend,
+            configuration: defaultConfiguration(evidence: evidenceConfiguration))
+        try await writeRequest(chatChannel, body: requestBody(stream: false))
+        let chatResponse = try await collectResponse(from: chatChannel)
+
+        XCTAssertEqual(chatResponse.head.status, .ok)
+        XCTAssertEqual(chatBackend.snapshot().startCount, 1)
+        await waitUntil { await recorder.evidence.count == 1 }
+        let recorded = await recorder.snapshot()
+        XCTAssertEqual(recorded.evidence.first?.response.status, 200)
+        XCTAssertTrue(recorded.failures.isEmpty)
+        _ = try await chatChannel.finish()
+    }
+
+    // The backend must receive a request whose `promptInput == .rawText(<prompt>)` — proving the
+    // route decodes through `OpenAICompletionRequest` and converts, rather than reusing the chat
+    // decoder directly.
+    func testCompletionsBackendReceivesRawTextPromptInput() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(
+            channel, body: completionsRequestBody(prompt: "Once upon a time", stream: false))
+        _ = try await collectResponse(from: channel)
+
+        XCTAssertEqual(
+            backend.snapshot().lastRequest?.promptInput, .rawText("Once upon a time"))
+
+        _ = try await channel.finish()
+    }
+
+    // A backend that cannot serve this route (e.g. a chat-template-only backend) throws
+    // `completions_unsupported`, which must map to HTTP 400 exactly like any other
+    // `invalidRequestWithCode` — the shared error-mapping path, not a special case.
+    func testCompletionsBackendCompletionsUnsupportedMapsToHTTP400() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .servingError(
+                .invalidRequestWithCode(
+                    "This server does not support the legacy text-completions route for the loaded backend",
+                    param: "prompt",
+                    code: "completions_unsupported"))
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: completionsRequestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        XCTAssertTrue(response.body.contains(#""code":"completions_unsupported""#), response.body)
+        XCTAssertTrue(response.body.contains(#""param":"prompt""#), response.body)
+
+        _ = try await channel.finish()
+    }
+
     // Streaming reasoning separation (happy path): a thinks-by-default handle
     // (separatesReasoning=true) routes `.text` deltas through StreamingReasoningSplitter, so the
     // `<think>` block arrives as delta.reasoning_content and the answer as delta.content — the joined
@@ -2419,6 +2707,39 @@ private func writeRequest(
     _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
 }
 
+private func completionsRequestBody(prompt: String = "Hello", stream: Bool) -> String {
+    """
+    {"model":"qwen3-32b","prompt":"\(prompt)","max_tokens":8,"temperature":0,"stream":\(stream)}
+    """
+}
+
+private func completionsHead(contentLength: Int) -> HTTPRequestHead {
+    HTTPRequestHead(
+        version: .http1_1,
+        method: .POST,
+        uri: "/v1/completions",
+        headers: [
+            "host": "localhost",
+            "content-type": "application/json",
+            "content-length": "\(contentLength)",
+        ])
+}
+
+private func writeCompletionsRequest(
+    _ channel: NIOAsyncTestingChannel,
+    body: String,
+    authorization: String? = nil
+) async throws {
+    var head = completionsHead(contentLength: body.utf8.count)
+    if let authorization {
+        head.headers.add(name: "authorization", value: authorization)
+    }
+    _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+    _ = try await channel.writeInbound(
+        HTTPServerRequestPart.body(ByteBuffer(string: body)))
+    _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
 private func writeHeadOnlyRequest(
     _ channel: NIOAsyncTestingChannel,
     method: HTTPMethod,
@@ -2561,6 +2882,7 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
         let cancelCount: Int
         let lastMailbox: BoundedDeltaMailbox?
         let lastLease: ServingRequestLease?
+        let lastRequest: OpenAIChatCompletionRequest?
     }
 
     enum Script: Sendable {
@@ -2594,6 +2916,7 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
         var cancelCount = 0
         var lastMailbox: BoundedDeltaMailbox?
         var lastLease: ServingRequestLease?
+        var lastRequest: OpenAIChatCompletionRequest?
     }
 
     private let state: OSAllocatedUnfairLock<State>
@@ -2614,6 +2937,7 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
         let (script, sequence) = state.withLock { state -> (Script, Int) in
             state.startCount += 1
+            state.lastRequest = request
             let script = state.scripts.isEmpty ? .held : state.scripts.removeFirst()
             return (script, state.startCount)
         }
@@ -2718,7 +3042,8 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
                 startCount: $0.startCount,
                 cancelCount: $0.cancelCount,
                 lastMailbox: $0.lastMailbox,
-                lastLease: $0.lastLease)
+                lastLease: $0.lastLease,
+                lastRequest: $0.lastRequest)
         }
     }
 }
