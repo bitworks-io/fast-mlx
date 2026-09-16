@@ -99,6 +99,13 @@ public struct ServingHTTPConfiguration: Sendable {
     /// even when no evidence sink was configured. `nil` by default so every existing construction
     /// site keeps compiling unchanged.
     public let requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter?
+    /// Backs `GET /readyz`. Defaults to always-ready: `fastmlx-serve` only binds its listen socket
+    /// after the model has finished loading, so "the process is accepting connections" already
+    /// implies "ready" on every production call site — no caller needs to pass this. The hook
+    /// exists so a future drain/shutdown state can flip readiness without a new route, and so the
+    /// 503 branch of `/readyz` is exercisable from tests. Must stay `Sendable`-clean: it can be
+    /// invoked from any NIO event loop thread.
+    public let readiness: @Sendable () -> Bool
 
     public init(
         launchedModel: String,
@@ -109,7 +116,8 @@ public struct ServingHTTPConfiguration: Sendable {
         evidence: ServingHTTPEvidenceConfiguration? = nil,
         modelCapabilities: ServingModelCapabilities? = nil,
         metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil,
-        requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter? = nil
+        requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter? = nil,
+        readiness: @escaping @Sendable () -> Bool = { true }
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -133,6 +141,7 @@ public struct ServingHTTPConfiguration: Sendable {
         self.modelCapabilities = modelCapabilities
         self.metricsSnapshot = metricsSnapshot
         self.requestFailureReporter = requestFailureReporter
+        self.readiness = readiness
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")

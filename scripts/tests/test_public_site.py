@@ -4260,6 +4260,169 @@ class PublicSiteTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 build_public_site.load_articles(root)
 
+    @staticmethod
+    def quality_guide_manifest() -> dict[str, object]:
+        return json.loads(
+            (REPOSITORY_ROOT / "scripts/tests/fixtures/quality-guides.sample.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    @staticmethod
+    def write_quality_guide_manifest(root: Path, manifest: dict[str, object]) -> None:
+        path = root / "site/quality-guides.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_quality_guide_is_skipped_gracefully_when_manifest_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "site").mkdir()
+            self.assertIsNone(build_public_site.load_quality_guides(root))
+
+    def test_quality_guide_renders_legible_cards_from_manifest(self) -> None:
+        manifest = self.quality_guide_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+
+        self.assertIsNotNone(loaded)
+        cards = loaded["cards"]
+        self.assertEqual(len(cards), 4)
+        page = build_public_site.render_quality_guide(cards)
+
+        no_go_card = next(card for card in cards if card["verdict"] == "NO_GO")
+        reference_card = next(card for card in cards if card["verdict"] == "REFERENCE")
+        vendor_card = next(
+            card for card in cards if card["provenance"]["source"] == "vendor-reported"
+        )
+
+        # Every card's tier and headline render.
+        for card in cards:
+            self.assertIn(card["legible"]["tier"].upper(), page)
+            self.assertIn(card["legible"]["headline"], page)
+
+        # The NO_GO card reads as an opt-in choice with its stated cost, never "broken".
+        self.assertIn(no_go_card["admission"]["reason"], page)
+        self.assertNotIn("broken", page.lower())
+
+        # Both a fast-mlx-measured label and a vendor-reported + "Unsloth" label render.
+        self.assertIn("fast-mlx-measured", page)
+        self.assertIn("vendor-reported", page)
+        self.assertIn("Unsloth", page)
+        self.assertEqual(vendor_card["provenance"]["vendor"], "Unsloth")
+
+        # rawMetrics is only ever available behind a <details> expander.
+        self.assertIn("<details", page)
+        self.assertIn("Raw metrics", page)
+        for card in cards:
+            for value in card["rawMetrics"].values():
+                self.assertNotIn(str(value), page.split("<details", 1)[0])
+
+        # A null speedX renders its speedXStatus text and no fabricated multiplier.
+        self.assertIsNone(no_go_card["legible"]["benefit"]["speedX"])
+        self.assertIn(no_go_card["legible"]["benefit"]["speedXStatus"], page)
+
+        # The boundary scope caveat renders for every card.
+        for card in cards:
+            self.assertIn(card["boundary"]["scope"], page)
+
+        self.assertIn(reference_card["legible"]["headline"], page)
+
+    def test_quality_guide_reference_and_exact_cards_render_null_safely(self) -> None:
+        """REFERENCE (null drift/regression) and EXACT/MTP (mostly-null card) render
+        with no leaked "None" and the documented null-specific copy."""
+
+        manifest = self.quality_guide_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+
+        cards = loaded["cards"]
+        reference_card = next(card for card in cards if card["verdict"] == "REFERENCE")
+        exact_card = next(card for card in cards if card["verdict"] == "EXACT")
+        self.assertIsNone(reference_card["legible"]["nextWordDrift"])
+        self.assertIsNone(reference_card["legible"]["regressionFocus"])
+        self.assertIsNone(exact_card["config"]["quant"])
+        self.assertIsNone(exact_card["legible"]["nextWordDrift"]["oneInK"])
+        self.assertIsNone(exact_card["legible"]["regressionFocus"])
+        self.assertIsNone(exact_card["legible"]["benefit"]["fit"])
+        self.assertEqual(exact_card["rawMetrics"], {})
+        self.assertIsNone(exact_card["provenance"]["harnessGitSHA"])
+        self.assertIsNone(exact_card["provenance"]["measuredAt"])
+
+        page = build_public_site.render_quality_guide(cards)
+
+        def card_html(card_id: str) -> str:
+            match = re.search(
+                r'<article class="quality-card" data-quality-card="'
+                + re.escape(card_id)
+                + r'"[^>]*>(.*?)</article>',
+                page,
+                re.S,
+            )
+            self.assertIsNotNone(match, f"card {card_id!r} not found in rendered page")
+            return match.group(1)
+
+        reference_html = card_html(str(reference_card["id"]))
+        self.assertNotIn("None", reference_html)
+        self.assertNotIn("quality-drift", reference_html)
+        self.assertNotIn("Regression focus", reference_html)
+
+        exact_html = card_html(str(exact_card["id"]))
+        self.assertNotIn("None", exact_html)
+        self.assertIn("Identical output", exact_html)
+        self.assertIn("no next-word drift", exact_html)
+        self.assertNotIn("Regression focus", exact_html)
+        self.assertNotIn("<dt>Fit</dt>", exact_html)
+        self.assertIn("<details", exact_html)
+        self.assertIn("{}", exact_html)
+
+        # Both cards pass the fail-closed loader and validator.
+        manifest_failures = validate_public_site.validate_quality_guide_manifest(loaded)
+        self.assertEqual(manifest_failures, [])
+
+    def test_quality_guide_page_is_generated_when_manifest_is_present(self) -> None:
+        manifest = self.quality_guide_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            with mock.patch.object(
+                build_public_site, "load_quality_guides", return_value=manifest
+            ):
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            self.assertTrue((output / "quality/index.html").is_file())
+            self.assertTrue((output / "quality/index.json").is_file())
+            failures = validate_public_site.validate(output)
+            self.assertEqual(failures, [])
+
+    def test_validator_rejects_unknown_quality_verdict_and_provenance_source(self) -> None:
+        base_manifest = self.quality_guide_manifest()
+
+        unknown_verdict = json.loads(json.dumps(base_manifest))
+        unknown_verdict["cards"][0]["verdict"] = "MAYBE"
+        failures = validate_public_site.validate_quality_guide_manifest(unknown_verdict)
+        self.assertTrue(
+            any("unknown verdict" in failure for failure in failures), failures
+        )
+
+        unknown_source = json.loads(json.dumps(base_manifest))
+        unknown_source["cards"][2]["provenance"]["source"] = "vibes-based"
+        failures = validate_public_site.validate_quality_guide_manifest(unknown_source)
+        self.assertTrue(
+            any("unknown source" in failure for failure in failures), failures
+        )
+
+        # And the build-time loader fails closed the same way.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, unknown_verdict)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,242 @@
+{
+  "schema": "fast-mlx-quality-card-v1",
+  "generatedAt": "2026-09-02T20:35:47Z",
+  "cards": [
+    {
+      "id": "qwen38-27b-optiq-4bit@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+        "hfPin": "b04599de"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": true,
+          "note": "261 tensors kept @8 (KL-sensitivity)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "quality-degraded vs 8-bit reference; not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 6 differs from what the full 8-bit model would say.",
+        "nextWordDrift": { "oneInK": 6, "top1AgreementPct": 84.45 },
+        "regressionFocus": "code and long-context (long-context top-1 ~80-84%)",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract from task-evidence jsonl"
+        },
+        "benefit": {
+          "fit": "20.7 GB — fits a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1": "277/328 = 84.45%",
+        "klMedianNats": 0.004054,
+        "klLongContextTailP95Nats": 11.2,
+        "pplDeltaPct": 15.79
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced vs 8-bit mxfp8 reference",
+        "confound": "different-weights: blends 4-bit quant loss with checkpoint difference",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "measurement-corpus-v2",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-09-02T20:35:47Z"
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": ["decode throughput (speedX)", "tool-call quality"]
+      }
+    },
+    {
+      "id": "qwen38-27b-target-v3-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "mlx-community/Qwen3.8-27B-target-v3-8bit",
+        "hfPin": "target-v3"
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "REFERENCE",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "measurement reference and current production default"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "This is the measurement reference other configs are compared against.",
+        "nextWordDrift": null,
+        "regressionFocus": null,
+        "example": {
+          "status": "illustrative",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "reference config; not independently gated vs full precision"
+        },
+        "benefit": {
+          "fit": "36.2 GB — fits a 48 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "ppl": 2.9202
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced perplexity, measurement-corpus-v2",
+        "confound": null,
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "measurement-corpus-v2",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-09-02T20:35:47Z"
+      },
+      "boundary": {
+        "scope": "measurement reference for THIS build on THIS hardware class",
+        "unmeasured": ["independent gate vs full precision"]
+      }
+    },
+    {
+      "id": "qwen38-27b-unsloth-dynamic-4bit@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "unsloth/Qwen3.8-27B-GGUF",
+        "hfPin": "unsloth-dyn-4bit"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 32,
+          "mixedBit": true,
+          "note": "vendor dynamic GGUF quant, not an MLX affine quant"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "PASS",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "vendor-reported quality only; not independently gated by fast-mlx"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "Unsloth reports this dynamic quant as close to full precision on their own suite.",
+        "nextWordDrift": { "oneInK": 8, "top1AgreementPct": 87.5 },
+        "regressionFocus": "unreported for this MLX build",
+        "example": {
+          "status": "illustrative",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "vendor-reported only; no fast-mlx-measured example yet"
+        },
+        "benefit": {
+          "fit": "15.9 GB — fits a 16 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "vendorReportedTop1": "87.5%"
+      },
+      "provenance": {
+        "source": "vendor-reported",
+        "vendor": "Unsloth",
+        "method": "vendor's own dynamic-quant quality report",
+        "confound": "dynamic GGUF quant is not an MLX affine quant; indicative only",
+        "hardware": "unspecified (vendor report)",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "vendor-external",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-08-15T00:00:00Z"
+      },
+      "boundary": {
+        "scope": "vendor-reported quality signal only; not a fast-mlx measurement of the MLX build we serve",
+        "unmeasured": ["fast-mlx-measured top-1", "fast-mlx-measured perplexity delta"]
+      }
+    },
+    {
+      "id": "qwen38-27b-mtp@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": null,
+        "hfPin": null
+      },
+      "config": {
+        "quant": null,
+        "enhancement": "mtp",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "EXACT",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "free speedup; proven token-for-token identical, opt-in pending broader rollout"
+      },
+      "legible": {
+        "tier": "Exact",
+        "headline": "Identical output, just faster — proven token-for-token by the MTP exactness gate.",
+        "nextWordDrift": { "oneInK": null, "top1AgreementPct": 100.0 },
+        "regressionFocus": null,
+        "example": {
+          "status": "illustrative",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "exactness is proven by the MTP exactness gate, not a spot example"
+        },
+        "benefit": {
+          "fit": null,
+          "speedX": null,
+          "speedXStatus": "measured separately in the MTP performance scorecard"
+        }
+      },
+      "rawMetrics": {},
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "MTP exactness gate: token-for-token output equality",
+        "confound": null,
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": null,
+        "corpusId": null,
+        "sourceVerdict": null,
+        "measuredAt": null
+      },
+      "boundary": {
+        "scope": "output-equality proof for THIS build on THIS hardware class",
+        "unmeasured": ["decode throughput (speedX, tracked in the MTP performance scorecard)"]
+      }
+    }
+  ]
+}

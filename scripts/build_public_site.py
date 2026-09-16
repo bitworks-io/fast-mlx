@@ -41,6 +41,7 @@ HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 CODE_SPAN = re.compile(r"`([^`]+)`")
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+QUALITY_CARD_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+)*")
 WHITEPAPER_THEME = re.compile(
     r"^(?:>\s*)?\*\*Whitepaper themes?:\*\*\s*(.*)$", re.IGNORECASE
 )
@@ -69,6 +70,18 @@ CAPABILITY_STATUS_DEFINITIONS: Tuple[Tuple[str, str, str], ...] = (
 )
 CAPABILITY_STATUSES = {item[0] for item in CAPABILITY_STATUS_DEFINITIONS}
 HIGHLIGHT_DECISIONS = {"promoted-scoped", "shelved"}
+QUALITY_GUIDE_SCHEMA = "fast-mlx-quality-card-v1"
+QUALITY_VERDICTS = {"NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"}
+QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
+QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant"}
+QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
+QUALITY_VERDICT_LABELS: Dict[str, str] = {
+    "NO_GO": "Opt-in only",
+    "PASS": "Passes review",
+    "REFERENCE": "Production default",
+    "EXACT": "Identical output",
+    "UNMEASURED": "Not yet measured",
+}
 RELEASE_CATEGORIES = {"foundation", "operations", "product"}
 RELEASE_CATEGORY_LABELS = {
     "foundation": "Foundation",
@@ -369,12 +382,34 @@ def require_text(entry: Dict[str, object], key: str, label: str) -> str:
     return value
 
 
+def require_nullable_text(entry: Dict[str, object], key: str, label: str) -> Optional[str]:
+    """Require `key` to be a non-empty, non-whitespace-padded string, or explicitly null."""
+
+    value = entry.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        fail(f"{label} {key} must be a non-empty string or null")
+    if value != value.strip():
+        fail(f"{label} {key} contains surrounding whitespace")
+    return value
+
+
 def require_iso_date(entry: Dict[str, object], key: str, label: str) -> str:
     value = require_text(entry, key, label)
     try:
         dt.date.fromisoformat(value)
     except ValueError:
         fail(f"{label} {key} is not an ISO date")
+    return value
+
+
+def require_iso_timestamp(entry: Dict[str, object], key: str, label: str) -> str:
+    value = require_text(entry, key, label)
+    try:
+        dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        fail(f"{label} {key} is not an ISO-8601 timestamp")
     return value
 
 
@@ -609,6 +644,225 @@ def load_release_catalog(repository_root: Path) -> Dict[str, object]:
                 fail(f"{label} has a duplicate public link path")
             seen_paths.add(link["path"])
     return catalog
+
+
+def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
+    """Load the optional public quality-card manifest (`fast-mlx-quality-card-v1`).
+
+    The manifest is owned by a separate emitter (`scripts/emit_quality_card.py`).
+    Its absence is not a build failure: the quality-guide page is simply skipped,
+    exactly like an optional section. Presence is validated with a strict,
+    fail-closed schema — an unknown schema, verdict, provenance source, or a
+    card missing a required field refuses the build rather than rendering a
+    partial or fabricated card.
+    """
+
+    manifest_path = repository_root / "site/quality-guides.json"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return None
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        fail("site/quality-guides.json is present but not a regular file")
+    manifest = require_exact_keys(
+        read_json(manifest_path),
+        {"schema", "generatedAt", "cards"},
+        "site/quality-guides.json",
+    )
+    if manifest.get("schema") != QUALITY_GUIDE_SCHEMA:
+        fail(f"site/quality-guides.json must use schema {QUALITY_GUIDE_SCHEMA!r}")
+    require_iso_timestamp(manifest, "generatedAt", "site/quality-guides.json")
+
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in serialized.casefold():
+            fail(f"quality-guide manifest contains private marker {marker!r}")
+
+    cards = manifest.get("cards")
+    if not isinstance(cards, list) or not cards:
+        fail("site/quality-guides.json must contain at least one card")
+    seen_ids: set[str] = set()
+    validated_cards: List[Dict[str, object]] = []
+    for index, raw_card in enumerate(cards):
+        label = f"quality card entry {index}"
+        card = require_exact_keys(
+            raw_card,
+            {
+                "id",
+                "model",
+                "config",
+                "verdict",
+                "admission",
+                "legible",
+                "rawMetrics",
+                "provenance",
+                "boundary",
+            },
+            label,
+        )
+        identifier = require_text(card, "id", label)
+        if not QUALITY_CARD_ID.fullmatch(identifier) or identifier in seen_ids:
+            fail(f"{label} has an invalid or duplicate id")
+        seen_ids.add(identifier)
+
+        model = require_exact_keys(card.get("model"), {"family", "repo", "hfPin"}, f"{label} model")
+        require_text(model, "family", f"{label} model")
+        # repo/hfPin may be null for a card that has no distinct HF-hosted checkpoint
+        # (an internal reference build, or an enhancement layered on an already-covered repo).
+        for key in ("repo", "hfPin"):
+            value = model.get(key)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                fail(f"{label} model.{key} must be a non-empty string or null")
+
+        config = require_exact_keys(
+            card.get("config"), {"quant", "enhancement", "hardwareClass"}, f"{label} config"
+        )
+        # `quant` is null for a pure enhancement card (e.g. MTP) that carries no distinct
+        # quantization variant; `groupSize` is null for a quant format (e.g. mxfp8) that has
+        # no blockwise/affine group concept.
+        raw_quant = config.get("quant")
+        if raw_quant is not None:
+            quant = require_exact_keys(
+                raw_quant, {"bits", "groupSize", "mixedBit", "note"}, f"{label} config.quant"
+            )
+            if not isinstance(quant.get("bits"), int) or isinstance(quant.get("bits"), bool):
+                fail(f"{label} config.quant.bits is not an int")
+            group_size = quant.get("groupSize")
+            if group_size is not None and (
+                not isinstance(group_size, int) or isinstance(group_size, bool)
+            ):
+                fail(f"{label} config.quant.groupSize must be an int or null")
+            if not isinstance(quant.get("mixedBit"), bool):
+                fail(f"{label} config.quant.mixedBit is not a bool")
+            note = quant.get("note")
+            if note is not None and (not isinstance(note, str) or not note.strip()):
+                fail(f"{label} config.quant.note must be a non-empty string or null")
+        require_text(config, "enhancement", f"{label} config")
+        require_text(config, "hardwareClass", f"{label} config")
+
+        verdict = require_text(card, "verdict", label)
+        if verdict not in QUALITY_VERDICTS:
+            fail(f"{label} has unknown verdict {verdict!r}")
+
+        admission = require_exact_keys(
+            card.get("admission"), {"default", "optIn", "reason"}, f"{label} admission"
+        )
+        if not isinstance(admission.get("default"), bool):
+            fail(f"{label} admission.default is not a bool")
+        if not isinstance(admission.get("optIn"), bool):
+            fail(f"{label} admission.optIn is not a bool")
+        require_text(admission, "reason", f"{label} admission")
+
+        legible = require_exact_keys(
+            card.get("legible"),
+            {"tier", "headline", "nextWordDrift", "regressionFocus", "example", "benefit"},
+            f"{label} legible",
+        )
+        tier = require_text(legible, "tier", f"{label} legible")
+        if tier not in QUALITY_TIERS:
+            fail(f"{label} legible has unknown tier {tier!r}")
+        require_text(legible, "headline", f"{label} legible")
+        # regressionFocus is only meaningful for a card that admits a quality trade
+        # (NO_GO/PASS); REFERENCE (the reference itself) and EXACT (identical output)
+        # have no regression to report and may leave it null.
+        if verdict in {"NO_GO", "PASS"}:
+            require_text(legible, "regressionFocus", f"{label} legible")
+        else:
+            require_nullable_text(legible, "regressionFocus", f"{label} legible")
+
+        # nextWordDrift itself is null for REFERENCE (no drift concept vs itself).
+        raw_next_word_drift = legible.get("nextWordDrift")
+        if raw_next_word_drift is not None:
+            next_word_drift = require_exact_keys(
+                raw_next_word_drift,
+                {"oneInK", "top1AgreementPct"},
+                f"{label} legible.nextWordDrift",
+            )
+            # oneInK is null for EXACT (identical output, so there is no "1 in K" to state).
+            one_in_k = next_word_drift.get("oneInK")
+            if one_in_k is not None and (
+                not isinstance(one_in_k, int) or isinstance(one_in_k, bool)
+            ):
+                fail(f"{label} legible.nextWordDrift.oneInK must be an int or null")
+            top1 = next_word_drift.get("top1AgreementPct")
+            if not isinstance(top1, (int, float)) or isinstance(top1, bool):
+                fail(f"{label} legible.nextWordDrift.top1AgreementPct is not a number")
+
+        example = require_exact_keys(
+            legible.get("example"),
+            {"status", "prompt", "referenceOutput", "configOutput", "note"},
+            f"{label} legible.example",
+        )
+        example_status = example.get("status")
+        if example_status not in QUALITY_EXAMPLE_STATUSES:
+            fail(f"{label} legible.example has unknown status {example_status!r}")
+
+        benefit = require_exact_keys(
+            legible.get("benefit"), {"fit", "speedX", "speedXStatus"}, f"{label} legible.benefit"
+        )
+        # fit is null for an enhancement card with no footprint of its own (e.g. MTP).
+        require_nullable_text(benefit, "fit", f"{label} legible.benefit")
+        speed_x = benefit.get("speedX")
+        if speed_x is not None and (not isinstance(speed_x, (int, float)) or isinstance(speed_x, bool)):
+            fail(f"{label} legible.benefit.speedX must be a number or null")
+        require_text(benefit, "speedXStatus", f"{label} legible.benefit")
+
+        # rawMetrics is always an object; it may be empty only for EXACT (identical
+        # output has no per-config metric of its own to show).
+        raw_metrics = card.get("rawMetrics")
+        if not isinstance(raw_metrics, dict):
+            fail(f"{label} rawMetrics must be an object")
+        if not raw_metrics and verdict != "EXACT":
+            fail(f"{label} rawMetrics must be a non-empty object")
+
+        provenance = require_exact_keys(
+            card.get("provenance"),
+            {
+                "source",
+                "vendor",
+                "method",
+                "confound",
+                "hardware",
+                "harnessGitSHA",
+                "corpusId",
+                "sourceVerdict",
+                "measuredAt",
+            },
+            f"{label} provenance",
+        )
+        source = require_text(provenance, "source", f"{label} provenance")
+        if source not in QUALITY_PROVENANCE_SOURCES:
+            fail(f"{label} provenance has unknown source {source!r}")
+        vendor = provenance.get("vendor")
+        if source == "vendor-reported":
+            if not isinstance(vendor, str) or not vendor.strip():
+                fail(f"{label} provenance.vendor is required when source is vendor-reported")
+        elif vendor is not None:
+            fail(f"{label} provenance.vendor must be null unless source is vendor-reported")
+        for key in ("method", "hardware"):
+            require_text(provenance, key, f"{label} provenance")
+        # harnessGitSHA/corpusId/sourceVerdict/measuredAt are null for a curated card not
+        # sourced from a dated gate verdict (e.g. the MTP exactness card).
+        for key in ("harnessGitSHA", "corpusId", "sourceVerdict"):
+            require_nullable_text(provenance, key, f"{label} provenance")
+        if provenance.get("measuredAt") is not None:
+            require_iso_timestamp(provenance, "measuredAt", f"{label} provenance")
+        confound = provenance.get("confound")
+        if confound is not None and (not isinstance(confound, str) or not confound.strip()):
+            fail(f"{label} provenance.confound must be a non-empty string or null")
+
+        boundary = require_exact_keys(
+            card.get("boundary"), {"scope", "unmeasured"}, f"{label} boundary"
+        )
+        require_text(boundary, "scope", f"{label} boundary")
+        unmeasured = boundary.get("unmeasured")
+        if not isinstance(unmeasured, list) or any(
+            not isinstance(item, str) or not item.strip() for item in unmeasured
+        ):
+            fail(f"{label} boundary.unmeasured must be a list of non-empty strings")
+
+        validated_cards.append(card)
+
+    manifest["cards"] = validated_cards
+    return manifest
 
 
 def load_articles(repository_root: Path) -> List[Article]:
@@ -900,6 +1154,7 @@ def render_template(
     *,
     public_path: Optional[str] = None,
     article_section: Optional[str] = None,
+    quality_nav_available: bool = False,
 ) -> str:
     nav_root = html.escape(root, quote=True)
 
@@ -926,6 +1181,7 @@ def render_template(
         "{{process_nav}}": nav_link("process", "The loop"),
         "{{methodology_nav}}": nav_link("methodology", "Methodology"),
         "{{research_nav}}": nav_link("research", "Research notes"),
+        "{{quality_nav}}": nav_link("quality", "Quality guide") if quality_nav_available else "",
         "{{page_script}}": page_script,
     }
     rendered = template
@@ -949,6 +1205,7 @@ def render_head_metadata(
         return ""
     if (
         public_path not in CORE_PUBLIC_PAGE_PATHS
+        and public_path != "quality/"
         and not re.fullmatch(
             r"research/[a-z0-9]+(?:-[a-z0-9]+)*/", public_path
         )
@@ -1763,6 +2020,157 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
     return "\n".join(body)
 
 
+def quality_provenance_label(provenance: Dict[str, object]) -> str:
+    source = str(provenance["source"])
+    if source == "vendor-reported":
+        return f'vendor-reported ({provenance.get("vendor")})'
+    return source
+
+
+def quality_speed_line(benefit: Dict[str, object]) -> str:
+    speed_x = benefit.get("speedX")
+    if speed_x is None:
+        return str(benefit["speedXStatus"])
+    return f'{speed_x}x faster on this engine (measured)'
+
+
+def quality_admission_framing(verdict: str, admission: Dict[str, object]) -> str:
+    if verdict == "NO_GO":
+        return f'Opt-in choice, not a silent default — {admission["reason"]}'
+    if verdict == "REFERENCE":
+        return "This is the production default; not an opt-in."
+    if verdict == "EXACT":
+        return "Identical output, just faster — proven token-for-token, not a quality trade."
+    if verdict == "PASS":
+        return "Passes review as an informational result."
+    return "Not yet measured; the existing serving path is unchanged for this config."
+
+
+def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
+    """Render the public, user-legible quality-guide page from validated quality cards.
+
+    Every card leads with the legible summary (tier, headline, next-word drift,
+    regression focus, benefit) and mandatory provenance + boundary; `rawMetrics`
+    is only ever available behind a `<details>` expander.
+    """
+
+    body: List[str] = [
+        '<section class="page-hero shell quality-hero">',
+        '<p class="eyebrow">Quality guide</p>',
+        '<h1>What a lower-bit or enhanced config actually costs you.</h1>',
+        '<p class="lede">Each card translates a measured fast-mlx quality signal into a '
+        'plain-language decision: what changes for you on this model, and whether that '
+        'trade is one you would elect. Raw metrics stay one click away — never the '
+        'headline.</p>',
+        '</section>',
+        '<section class="section shell" aria-labelledby="quality-cards-heading">',
+        '<div class="section-heading"><p class="eyebrow">Reviewed fast-mlx evidence only</p>'
+        '<h2 id="quality-cards-heading">Lead with the plain-language cost, not the raw number.</h2>'
+        '<p class="section-intro">A NO-GO card is an informed opt-in with a stated cost, never '
+        'a defect report. A REFERENCE card is the production default. An EXACT card is a free '
+        'speedup with proven identical output.</p></div>',
+        '<div class="quality-card-grid">',
+    ]
+    for card in cards:
+        legible = card["legible"]
+        benefit = legible["benefit"]
+        provenance = card["provenance"]
+        boundary = card["boundary"]
+        admission = card["admission"]
+        verdict = str(card["verdict"])
+        tier = str(legible["tier"])
+        verdict_label = QUALITY_VERDICT_LABELS[verdict]
+        drift = legible.get("nextWordDrift")
+        regression_focus = legible.get("regressionFocus")
+        fit = benefit.get("fit")
+
+        body.extend(
+            [
+                '<article class="quality-card" data-quality-card="'
+                + html.escape(str(card["id"]), quote=True)
+                + '" data-quality-verdict="'
+                + html.escape(verdict, quote=True)
+                + '">',
+                '<div class="card-topline">'
+                f'<span class="quality-tier-badge" data-quality-tier="{html.escape(tier, quote=True)}">{html.escape(tier.upper())}</span>'
+                f'<span class="quality-verdict-badge" data-quality-verdict-label>{html.escape(verdict_label)}</span>'
+                '</div>',
+                f'<h3>{html.escape(str(legible["headline"]))}</h3>',
+            ]
+        )
+        # nextWordDrift is null for REFERENCE (no drift vs itself); oneInK is null for
+        # EXACT (identical output, so there is no "1 in K" to state).
+        if drift is not None:
+            one_in_k = drift.get("oneInK")
+            top1 = drift["top1AgreementPct"]
+            if one_in_k is None:
+                body.append(
+                    '<p class="quality-drift">Identical output — no next-word drift '
+                    f'(top-1 {html.escape(str(top1))}%).</p>'
+                )
+            else:
+                body.append(
+                    '<p class="quality-drift">Next-word drift: about 1 word in '
+                    f'{html.escape(str(one_in_k))} '
+                    f'(top-1 agreement {html.escape(str(top1))}%).</p>'
+                )
+        if regression_focus is not None:
+            body.append(
+                f'<p class="quality-regression"><strong>Regression focus:</strong> {html.escape(str(regression_focus))}</p>'
+            )
+        body.extend(
+            [
+                f'<p class="quality-admission"><strong>{html.escape(verdict_label)}:</strong> '
+                f'{html.escape(quality_admission_framing(verdict, admission))}</p>',
+                '<dl class="evidence-context">',
+            ]
+        )
+        if fit is not None:
+            body.append(f'<div><dt>Fit</dt><dd>{html.escape(str(fit))}</dd></div>')
+        body.extend(
+            [
+                f'<div><dt>Speed</dt><dd>{html.escape(quality_speed_line(benefit))}</dd></div>',
+                '</dl>',
+                f'<p class="quality-provenance"><strong>Provenance:</strong> {html.escape(quality_provenance_label(provenance))}</p>',
+            ]
+        )
+        confound = provenance.get("confound")
+        if confound:
+            body.append(
+                f'<p class="quality-confound"><strong>Confound:</strong> {html.escape(str(confound))}</p>'
+            )
+        body.append(
+            f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(boundary["scope"]))}</p>'
+        )
+        body.extend(
+            [
+                '<details class="quality-raw-metrics">',
+                '<summary>Raw metrics</summary>',
+                '<pre>'
+                + html.escape(
+                    json.dumps(card["rawMetrics"], indent=2, ensure_ascii=False, sort_keys=True)
+                )
+                + '</pre>',
+                '</details>',
+                '</article>',
+            ]
+        )
+    body.extend(
+        [
+            '</div>',
+            '</section>',
+            '<section class="section shell callout quality-callout" aria-labelledby="quality-boundary-heading">',
+            '<p class="eyebrow">Claim boundary</p>',
+            '<h2 id="quality-boundary-heading">A quality card never becomes a serve refusal on its own.</h2>',
+            '<p>An unmeasured model or config serves exactly as it does today. Only a card carrying '
+            'verdict NO_GO gates a silent default, and only for the exact model, config, and hardware '
+            'class it was measured on.</p>',
+            '</section>',
+        ]
+    )
+    return "\n".join(body)
+
+
 def research_search_text(article: Article) -> str:
     """Return the exact public fields searched by the research archive."""
 
@@ -2217,10 +2625,16 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     articles = load_articles(repository_root)
     catalog = load_capability_catalog(repository_root, {article.slug for article in articles})
     release_catalog = load_release_catalog(repository_root)
+    quality_manifest = load_quality_guides(repository_root)
+    quality_available = quality_manifest is not None
     template = (repository_root / "site/templates/base.html").read_text(encoding="utf-8")
     assets = repository_root / "site/assets"
     validate_asset_tree(assets)
     shutil.copytree(assets, output / "assets", dirs_exist_ok=True)
+
+    def render_page(*args: object, **kwargs: object) -> str:
+        kwargs.setdefault("quality_nav_available", quality_available)
+        return render_template(*args, **kwargs)  # type: ignore[arg-type]
 
     home = (repository_root / "site/fragments/home.html").read_text(encoding="utf-8")
     if home.count("{{current_cycle}}") != 1:
@@ -2232,7 +2646,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "index.html",
-        render_template(
+        render_page(
             template,
             "fast-mlx — a self-improving MLX inference engine",
             "A self-improving MLX inference engine for Apple Silicon: an automated loop that researches, tests candidates against exact baselines, and publishes its own results with little human intervention.",
@@ -2245,7 +2659,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "status/index.html",
-        render_template(
+        render_page(
             template,
             "Current status — fast-mlx",
             "A manifest-derived view of fast-mlx capabilities, measured proof points, reviewed releases, research, and unchanged authority boundaries.",
@@ -2282,7 +2696,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             f"{name}/index.html",
-            render_template(
+            render_page(
                 template,
                 title,
                 description,
@@ -2297,7 +2711,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "capabilities/index.html",
-        render_template(
+        render_page(
             template,
             "Capabilities & evidence — fast-mlx",
             "A status-aware inventory of fast-mlx features and scoped measured results.",
@@ -2318,7 +2732,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             public_path + "index.html",
-            render_template(
+            render_page(
                 template,
                 capability_detail_title(capability),
                 capability_detail_description(capability),
@@ -2338,7 +2752,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "benchmarks/index.html",
-        render_template(
+        render_page(
             template,
             "Benchmark explorer — fast-mlx",
             "Filter reviewed fast-mlx measurements without separating results from their scope, caveats, or evidence.",
@@ -2355,7 +2769,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             public_path + "index.html",
-            render_template(
+            render_page(
                 template,
                 benchmark_detail_title(highlight),
                 benchmark_detail_description(),
@@ -2365,11 +2779,31 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
                 public_path=public_path,
             ),
         )
+    if quality_manifest is not None:
+        write_page(
+            output,
+            "quality/index.html",
+            render_page(
+                template,
+                "Quality guide — fast-mlx",
+                "Plain-language fast-mlx quality cards: what a lower-bit or enhanced config "
+                "costs on this model, with raw metrics behind an expander.",
+                "../",
+                render_quality_guide(quality_manifest["cards"]),
+                "quality",
+                public_path="quality/",
+            ),
+        )
+        write_page(
+            output,
+            "quality/index.json",
+            json.dumps(quality_manifest, indent=2, ensure_ascii=False),
+        )
     release_body, release_index = render_release_catalog(release_catalog)
     write_page(
         output,
         "releases/index.html",
-        render_template(
+        render_page(
             template,
             "Releases — fast-mlx",
             "A reviewed ledger of fast-mlx public milestones, exact commits, shipped surfaces, and unchanged boundaries.",
@@ -2391,7 +2825,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             public_path + "index.html",
-            render_template(
+            render_page(
                 template,
                 release_detail_title(release),
                 RELEASE_DETAIL_DESCRIPTION,
@@ -2405,7 +2839,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "research/index.html",
-        render_template(
+        render_page(
             template,
             "Research notes — fast-mlx",
             "Dated fast-mlx investigations and measured negative results.",
@@ -2433,7 +2867,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         write_page(
             output,
             article.output_file,
-            render_template(
+            render_page(
                 template,
                 f"{article.title} — fast-mlx",
                 article.summary,
@@ -2521,7 +2955,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     write_page(
         output,
         "404.html",
-        render_template(
+        render_page(
             template,
             "Not found — fast-mlx",
             "The requested fast-mlx page was not found.",

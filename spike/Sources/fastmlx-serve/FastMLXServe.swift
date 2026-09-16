@@ -153,6 +153,18 @@ struct FastMLXServe {
             _ = try QuantPickPreference.validated(rawPrefer)
         }
 
+        // Quality-guidance moat admission gate (docs/quality-card-schema-v1.md, "Admission
+        // discriminator rules"): consult a quality card for the resolved model, if one exists, and
+        // refuse/flag a NO_GO verdict. Absent a manifest (no `--quality-cards` override and no
+        // `site/quality-guides.json` under the working directory) this is a no-op and the default
+        // serve path/output stays byte-identical to today -- but the resolved path (or its absence)
+        // is always ANNOUNCED in the startup line via `qualityCardsAnnounce` below, closing the
+        // defect where a server launched from an unexpected working directory silently ran with no
+        // gate. An EXPLICIT `--quality-cards` path that does not exist or fails to decode refuses
+        // startup instead of failing open (see `QualityCardsManifestResolver`'s doc comment).
+        let qualityCardsAnnounce = applyQualityAdmissionGate(
+            model: arguments.model, rawArguments: CommandLine.arguments)
+
         let hostReport = detectedServingHostReport(arguments)
         // Apply the operator's own `--memory-limit-bytes` as a further planning bound on top of the
         // host-use-derived envelope — deliberately on the DERIVED `SystemProfile`, never stored on
@@ -232,7 +244,9 @@ struct FastMLXServe {
             throw error
         }
 
-        print(prepared.startupLine(localAddress: server.localAddress.description))
+        print(
+            prepared.startupLine(localAddress: server.localAddress.description)
+                + " \(qualityCardsAnnounce)")
         print("fastmlx-serve ready=true; press Control-C to stop.")
 
         await waitForShutdownSignal()
@@ -542,6 +556,85 @@ private func runQuantPickOnly(
         throw FitCheckRefusal(lines: resolution.summaryLines())
     }
     print(winnerLine)
+}
+
+/// Scan the raw argument list for an explicit `--quality-cards <path>` value. Mirrors
+/// `QualityOptIn.parse`'s scan idiom exactly (additive, off `CommandLine.arguments` directly, so
+/// `ServingCore`'s strict allowlist parser only needs to accept + value-consume the flag, never
+/// store it — see the flag's own case comment in `FastMLXServeArguments.parse`).
+private func qualityCardsExplicitPathArgument(rawArguments: [String]) -> String? {
+    guard let index = rawArguments.firstIndex(of: "--quality-cards"),
+        index + 1 < rawArguments.count
+    else {
+        return nil
+    }
+    return rawArguments[index + 1]
+}
+
+/// The quality-guidance moat's pre-load admission hook. Resolves the effective manifest path once
+/// (`QualityCardsManifestResolver.resolve`, against the REAL process working directory — the only
+/// place in this file that reads it for this gate), loads the card for `model` if a manifest
+/// applies, and applies `QualityAdmission.decide`. Returns the machine-readable `quality_cards=`
+/// startup-line fragment (`quality_cards=<absolute path>` when a manifest is active,
+/// `quality_cards=none` when it is not) so an operator can always SEE — never merely infer —
+/// whether this run is consulting a manifest at all; this is the fix for the defect where a
+/// default lookup relative to the CWD silently ran with no gate.
+///
+/// `.admit`/`.admitUnmeasured` proceed silently — the required behavior when no manifest/card
+/// exists, keeping the default announce byte-identical apart from the new `quality_cards=`
+/// fragment. `.admitWithQualityFlag` prints its one-line message and proceeds;
+/// `.refuseQualityFlagged` prints to stderr and exits non-zero, mirroring the other fail-closed
+/// validations in `run()`. An EXPLICIT `--quality-cards` path that does not exist or fails to
+/// decode ALSO exits non-zero (never fails open); the conventional default keeps today's
+/// fail-open behavior on the same two conditions.
+private func applyQualityAdmissionGate(model: String, rawArguments: [String]) -> String {
+    let explicitPath = qualityCardsExplicitPathArgument(rawArguments: rawArguments)
+    let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+    let resolution: QualityCardsManifestResolution
+    do {
+        resolution = try QualityCardsManifestResolver.resolve(explicitPath: explicitPath, cwd: cwd)
+    } catch {
+        FileHandle.standardError.write(
+            Data(
+                "fastmlx-serve configuration=refused reason=quality_cards detail=\(error)\n"
+                    .utf8))
+        exit(2)
+    }
+
+    guard case .active(let manifestURL, let explicit) = resolution else {
+        return "quality_cards=none"
+    }
+
+    let cards: [QualityCard]
+    do {
+        cards = try QualityCardStore.loadManifest(contentsOf: manifestURL)
+    } catch {
+        guard !explicit else {
+            FileHandle.standardError.write(
+                Data(
+                    "fastmlx-serve configuration=refused reason=quality_cards detail=\(error)\n"
+                        .utf8))
+            exit(2)
+        }
+        // The conventional default keeps today's fail-open behavior: a broken/unreadable default
+        // manifest behaves exactly like no manifest at all -- every model admits unmeasured.
+        return "quality_cards=none"
+    }
+
+    let card = cards.first { $0.model.repo == model }
+    let optIn = QualityOptIn.parse(rawArguments)
+    let outcome = QualityAdmission.decide(
+        card: card, optIn: optIn.isElected(cardID: card?.id, repoID: card?.model.repo))
+    switch outcome {
+    case .admit, .admitUnmeasured:
+        break
+    case .admitWithQualityFlag(let message):
+        print(message)
+    case .refuseQualityFlagged(let message):
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+        exit(2)
+    }
+    return "quality_cards=\(manifestURL.path)"
 }
 
 /// Resolve the `--tier` serve dial into a `ServingPolicy`, composing any explicit `--kv-quant`

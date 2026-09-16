@@ -837,6 +837,31 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertTrue(arguments.quantCandidateDirectories.isEmpty)
     }
 
+    // MARK: - Quality-guidance moat admission flags. The strict allowlist parser MUST accept
+    // --quality-cards <path> and --accept-quality <id> (their values are consumed by the pre-load
+    // QualityAdmission gate directly off CommandLine, so they carry no struct fields of their own).
+    // Regression guard: these flags were initially absent from the allowlist, so the parser threw
+    // `unknownArgument` and the admission gate was dead on arrival — a CLI smoke test caught it.
+
+    func testQualityAdmissionFlagsAreAcceptedByTheParser() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--model", "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+            "--quality-cards", "/site/quality-guides.json",
+            "--accept-quality", "qwen38-27b-optiq-4bit@m3ultra",
+        ])
+        XCTAssertEqual(arguments.backend, .scripted)
+        XCTAssertEqual(arguments.model, "mlx-community/Qwen3.8-27B-OptiQ-4bit")
+    }
+
+    func testQualityCardsFlagRequiresAValue() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--quality-cards"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--quality-cards"))
+        }
+    }
+
     // MARK: - --quant-pick-only: a dry-run that resolves which quant would load and exits, with NO
     // model load. It is its own early-return mode (like --help), so it needs ONLY --quant-candidates
     // (+ optional --context) — never the runtime load limits, because nothing is loaded.

@@ -159,6 +159,39 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeMetrics(keepAlive: head.isKeepAlive, context: context)
             return
         }
+        if head.method == .GET, head.uri == "/healthz" {
+            guard body.readableBytes == 0 else {
+                writeError(
+                    .invalidRequest("GET /healthz does not accept a request body", param: nil),
+                    status: .badRequest,
+                    keepAlive: head.isKeepAlive,
+                    context: context)
+                return
+            }
+            writeHealthProbe(
+                status: "ok",
+                httpStatus: .ok,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+        if head.method == .GET, head.uri == "/readyz" {
+            guard body.readableBytes == 0 else {
+                writeError(
+                    .invalidRequest("GET /readyz does not accept a request body", param: nil),
+                    status: .badRequest,
+                    keepAlive: head.isKeepAlive,
+                    context: context)
+                return
+            }
+            let ready = configuration.readiness()
+            writeHealthProbe(
+                status: ready ? "ready" : "not_ready",
+                httpStatus: ready ? .ok : .serviceUnavailable,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
 
         let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
         let request: OpenAIChatCompletionRequest
@@ -244,7 +277,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         let isChat = head.uri == "/v1/chat/completions"
         let isModels = head.uri == "/v1/models"
         let isMetrics = head.uri == "/metrics"
-        guard isChat || isModels || isMetrics else {
+        let isHealthz = head.uri == "/healthz"
+        let isReadyz = head.uri == "/readyz"
+        guard isChat || isModels || isMetrics || isHealthz || isReadyz else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
@@ -252,10 +287,34 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         guard (isChat && head.method == .POST)
             || (isModels && head.method == .GET)
             || (isMetrics && head.method == .GET)
+            || (isHealthz && head.method == .GET)
+            || (isReadyz && head.method == .GET)
         else {
             return (
                 .methodNotAllowed,
                 .invalidRequest("Method is not supported for this route", param: nil))
+        }
+
+        // Liveness/readiness probes bypass the bearer-token check entirely: an orchestrator health
+        // check carries no API key, and the response body below never includes model, version,
+        // path, or backend state, so there is nothing sensitive to protect. Every other route below
+        // this point keeps requiring the token exactly as before.
+        if isHealthz || isReadyz {
+            let lengthHeaders = head.headers["content-length"]
+            guard lengthHeaders.count <= 1 else {
+                return (
+                    .badRequest,
+                    .invalidRequest("Content-Length must be unique", param: nil))
+            }
+            if let rawLength = lengthHeaders.first,
+                (Int(rawLength) ?? -1) != 0
+            {
+                let route = isHealthz ? "/healthz" : "/readyz"
+                return (
+                    .badRequest,
+                    .invalidRequest("GET \(route) does not accept a request body", param: nil))
+            }
+            return nil
         }
 
         if let requiredBearerToken = configuration.requiredBearerToken {
@@ -341,6 +400,45 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             let head = HTTPResponseHead(
                 version: .http1_1,
                 status: .ok,
+                headers: headers)
+            var body = context.channel.allocator.buffer(capacity: data.count)
+            body.writeBytes(data)
+            context.write(wrapOutboundOut(.head(head)), promise: nil)
+            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
+            if !keepAlive {
+                let channel = context.channel
+                completion.whenComplete { _ in
+                    channel.close(promise: nil)
+                }
+            }
+        } catch {
+            context.close(promise: nil)
+        }
+    }
+
+    /// Backs both `/healthz` and `/readyz`. Fully synchronous (unlike `writeMetrics`, which hands
+    /// off to a detached `Task`): probes never touch `backend` or `configuration.evidence`, so
+    /// there is no async backend work to await and no request evidence to record — the same
+    /// no-evidence contract `writeModelList` already follows for `/v1/models`. The body is a fixed
+    /// two-key literal (`{"status":"..."}`) with no model id, version, path, or backend state.
+    private func writeHealthProbe(
+        status: String,
+        httpStatus: HTTPResponseStatus,
+        keepAlive: Bool,
+        context: ChannelHandlerContext
+    ) {
+        do {
+            let data = try JSONEncoder.openAI.encode(HealthProbeStatus(status: status))
+            var headers = HTTPHeaders()
+            headers.add(name: "content-type", value: "application/json")
+            headers.add(name: "content-length", value: "\(data.count)")
+            if !keepAlive {
+                headers.add(name: "connection", value: "close")
+            }
+            let head = HTTPResponseHead(
+                version: .http1_1,
+                status: httpStatus,
                 headers: headers)
             var body = context.channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
@@ -1825,6 +1923,13 @@ private actor ServingResponseEvidenceAccumulator {
             bodyBytes: bodyBytes,
             bodySHA256: digest)
     }
+}
+
+/// Response body for `/healthz` and `/readyz`: exactly `{"status":"..."}`, nothing else — no model
+/// id, version, path, or backend state, since both routes bypass the bearer-token check and must
+/// not leak anything to an unauthenticated caller.
+private struct HealthProbeStatus: Encodable {
+    let status: String
 }
 
 private func contentLength(from head: HTTPRequestHead) -> Int? {

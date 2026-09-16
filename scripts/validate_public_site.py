@@ -27,6 +27,13 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN RSA" + " PRIVATE KEY",
 )
 CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelved"}
+QUALITY_GUIDE_SCHEMA = "fast-mlx-quality-card-v1"
+QUALITY_VERDICTS = {"NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"}
+QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
+QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant"}
+QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
+QUALITY_CARD_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+)*")
+QUALITY_GUIDE_PUBLIC_FILE = "quality/index.html"
 CAPABILITY_STATUS_LABELS = {
     "implemented": "Implemented",
     "promoted-scoped": "Promoted · scoped",
@@ -2493,6 +2500,22 @@ def require_str(
     return value
 
 
+def require_nullable_str(
+    entry: Dict[str, object], key: str, label: str, failures: List[str]
+) -> Optional[str]:
+    """Require `key` to be a non-empty, non-whitespace-padded string, or explicitly null."""
+
+    value = entry.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        failures.append(f"{label} {key} must be a non-empty string or null")
+        return None
+    if value != value.strip():
+        failures.append(f"{label} {key} contains surrounding whitespace")
+    return value
+
+
 def parse_release_timestamp(
     entry: Dict[str, object], key: str, label: str, failures: List[str]
 ) -> Optional[dt.datetime]:
@@ -3655,7 +3678,7 @@ def validate_reviewed_head_metadata(site: Path) -> List[str]:
         (public_path + "index.html") if public_path else "index.html": public_path
         for public_path in REVIEWED_PAGE_METADATA
     }
-    allowed_html_files = set(expected_files) | {"404.html"}
+    allowed_html_files = set(expected_files) | {"404.html", QUALITY_GUIDE_PUBLIC_FILE}
     actual_html_files = {
         path.relative_to(site).as_posix()
         for path in site.rglob("*")
@@ -4514,6 +4537,389 @@ def validate_capability_detail_pages(site: Path) -> List[str]:
     return failures
 
 
+class QualityCardCollector(html.parser.HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cards: List[Dict[str, object]] = []
+        self._current: Optional[Dict[str, object]] = None
+        self._details_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        if tag == "article" and "data-quality-card" in attributes:
+            self._current = {
+                "id": attributes.get("data-quality-card"),
+                "verdict": attributes.get("data-quality-verdict"),
+                "has_details": False,
+                "text_parts": [],
+            }
+            self._details_depth = 0
+        elif self._current is not None and tag == "details":
+            self._details_depth += 1
+            self._current["has_details"] = True
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "details" and self._current is not None and self._details_depth > 0:
+            self._details_depth -= 1
+        if tag == "article" and self._current is not None:
+            parts = self._current.pop("text_parts")
+            self._current["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.cards.append(self._current)
+            self._current = None
+
+
+def validate_quality_guide_manifest(value: object) -> List[str]:
+    """Fail-closed schema check for the `fast-mlx-quality-card-v1` manifest.
+
+    Mirrors `build_public_site.load_quality_guides` but accumulates failures
+    instead of refusing the process, so it can validate an already-generated
+    `quality/index.json` artifact.
+    """
+
+    failures: List[str] = []
+    failures.extend(key_failures(value, {"schema", "generatedAt", "cards"}, "quality-guide manifest"))
+    if failures or not isinstance(value, dict):
+        return failures
+    if value.get("schema") != QUALITY_GUIDE_SCHEMA:
+        failures.append(f"quality-guide manifest must use schema {QUALITY_GUIDE_SCHEMA!r}")
+    require_str(value, "generatedAt", "quality-guide manifest", failures)
+
+    cards = value.get("cards")
+    if not isinstance(cards, list) or not cards:
+        failures.append("quality-guide manifest must contain at least one card")
+        return failures
+
+    seen_ids: set[str] = set()
+    for index, raw_card in enumerate(cards):
+        label = f"quality card entry {index}"
+        failures.extend(
+            key_failures(
+                raw_card,
+                {
+                    "id",
+                    "model",
+                    "config",
+                    "verdict",
+                    "admission",
+                    "legible",
+                    "rawMetrics",
+                    "provenance",
+                    "boundary",
+                },
+                label,
+            )
+        )
+        if not isinstance(raw_card, dict):
+            continue
+        card = raw_card
+        identifier = require_str(card, "id", label, failures)
+        if identifier is not None:
+            if not QUALITY_CARD_ID.fullmatch(identifier) or identifier in seen_ids:
+                failures.append(f"{label} has an invalid or duplicate id")
+            seen_ids.add(identifier)
+
+        model = card.get("model")
+        failures.extend(key_failures(model, {"family", "repo", "hfPin"}, f"{label} model"))
+        if isinstance(model, dict):
+            require_str(model, "family", f"{label} model", failures)
+            for key in ("repo", "hfPin"):
+                field_value = model.get(key)
+                if field_value is not None and (
+                    not isinstance(field_value, str) or not field_value.strip()
+                ):
+                    failures.append(f"{label} model.{key} must be a non-empty string or null")
+
+        config = card.get("config")
+        failures.extend(
+            key_failures(config, {"quant", "enhancement", "hardwareClass"}, f"{label} config")
+        )
+        if isinstance(config, dict):
+            raw_quant = config.get("quant")
+            if raw_quant is not None:
+                failures.extend(
+                    key_failures(
+                        raw_quant,
+                        {"bits", "groupSize", "mixedBit", "note"},
+                        f"{label} config.quant",
+                    )
+                )
+                if isinstance(raw_quant, dict):
+                    if not isinstance(raw_quant.get("bits"), int) or isinstance(
+                        raw_quant.get("bits"), bool
+                    ):
+                        failures.append(f"{label} config.quant.bits is not an int")
+                    group_size = raw_quant.get("groupSize")
+                    if group_size is not None and (
+                        not isinstance(group_size, int) or isinstance(group_size, bool)
+                    ):
+                        failures.append(f"{label} config.quant.groupSize must be an int or null")
+                    if not isinstance(raw_quant.get("mixedBit"), bool):
+                        failures.append(f"{label} config.quant.mixedBit is not a bool")
+                    note = raw_quant.get("note")
+                    if note is not None and (not isinstance(note, str) or not note.strip()):
+                        failures.append(
+                            f"{label} config.quant.note must be a non-empty string or null"
+                        )
+            require_str(config, "enhancement", f"{label} config", failures)
+            require_str(config, "hardwareClass", f"{label} config", failures)
+
+        verdict = require_str(card, "verdict", label, failures)
+        if verdict is not None and verdict not in QUALITY_VERDICTS:
+            failures.append(f"{label} has unknown verdict {verdict!r}")
+
+        admission = card.get("admission")
+        failures.extend(
+            key_failures(admission, {"default", "optIn", "reason"}, f"{label} admission")
+        )
+        if isinstance(admission, dict):
+            require_str(admission, "reason", f"{label} admission", failures)
+
+        legible = card.get("legible")
+        failures.extend(
+            key_failures(
+                legible,
+                {"tier", "headline", "nextWordDrift", "regressionFocus", "example", "benefit"},
+                f"{label} legible",
+            )
+        )
+        benefit: Dict[str, object] = {}
+        if isinstance(legible, dict):
+            tier = require_str(legible, "tier", f"{label} legible", failures)
+            if tier is not None and tier not in QUALITY_TIERS:
+                failures.append(f"{label} legible has unknown tier {tier!r}")
+            require_str(legible, "headline", f"{label} legible", failures)
+            # regressionFocus is required only for a card that admits a quality trade
+            # (NO_GO/PASS); REFERENCE and EXACT have no regression to report.
+            if verdict in {"NO_GO", "PASS"}:
+                require_str(legible, "regressionFocus", f"{label} legible", failures)
+            else:
+                require_nullable_str(legible, "regressionFocus", f"{label} legible", failures)
+
+            # nextWordDrift itself is null for REFERENCE (no drift vs itself).
+            raw_drift = legible.get("nextWordDrift")
+            if raw_drift is not None:
+                failures.extend(
+                    key_failures(
+                        raw_drift,
+                        {"oneInK", "top1AgreementPct"},
+                        f"{label} legible.nextWordDrift",
+                    )
+                )
+                if isinstance(raw_drift, dict):
+                    # oneInK is null for EXACT (identical output has no "1 in K" to state).
+                    one_in_k = raw_drift.get("oneInK")
+                    if one_in_k is not None and (
+                        not isinstance(one_in_k, int) or isinstance(one_in_k, bool)
+                    ):
+                        failures.append(
+                            f"{label} legible.nextWordDrift.oneInK must be an int or null"
+                        )
+                    top1 = raw_drift.get("top1AgreementPct")
+                    if not isinstance(top1, (int, float)) or isinstance(top1, bool):
+                        failures.append(
+                            f"{label} legible.nextWordDrift.top1AgreementPct is not a number"
+                        )
+
+            example = legible.get("example")
+            failures.extend(
+                key_failures(
+                    example,
+                    {"status", "prompt", "referenceOutput", "configOutput", "note"},
+                    f"{label} legible.example",
+                )
+            )
+            if isinstance(example, dict) and example.get("status") not in QUALITY_EXAMPLE_STATUSES:
+                failures.append(
+                    f'{label} legible.example has unknown status {example.get("status")!r}'
+                )
+            raw_benefit = legible.get("benefit")
+            failures.extend(
+                key_failures(raw_benefit, {"fit", "speedX", "speedXStatus"}, f"{label} legible.benefit")
+            )
+            if isinstance(raw_benefit, dict):
+                benefit = raw_benefit
+                # fit is null for an enhancement card with no footprint of its own (e.g. MTP).
+                require_nullable_str(benefit, "fit", f"{label} legible.benefit", failures)
+                require_str(benefit, "speedXStatus", f"{label} legible.benefit", failures)
+
+        # rawMetrics is always an object; it may be empty only for EXACT (identical
+        # output has no per-config metric of its own to show).
+        raw_metrics = card.get("rawMetrics")
+        if not isinstance(raw_metrics, dict):
+            failures.append(f"{label} rawMetrics must be an object")
+        elif not raw_metrics and verdict != "EXACT":
+            failures.append(f"{label} rawMetrics must be a non-empty object")
+
+        provenance = card.get("provenance")
+        failures.extend(
+            key_failures(
+                provenance,
+                {
+                    "source",
+                    "vendor",
+                    "method",
+                    "confound",
+                    "hardware",
+                    "harnessGitSHA",
+                    "corpusId",
+                    "sourceVerdict",
+                    "measuredAt",
+                },
+                f"{label} provenance",
+            )
+        )
+        if isinstance(provenance, dict):
+            source = require_str(provenance, "source", f"{label} provenance", failures)
+            if source is not None and source not in QUALITY_PROVENANCE_SOURCES:
+                failures.append(f"{label} provenance has unknown source {source!r}")
+            vendor = provenance.get("vendor")
+            if source == "vendor-reported":
+                if not isinstance(vendor, str) or not vendor.strip():
+                    failures.append(
+                        f"{label} provenance.vendor is required when source is vendor-reported"
+                    )
+            elif vendor is not None:
+                failures.append(
+                    f"{label} provenance.vendor must be null unless source is vendor-reported"
+                )
+            for key in ("method", "hardware"):
+                require_str(provenance, key, f"{label} provenance", failures)
+            # harnessGitSHA/corpusId/sourceVerdict/measuredAt are null for a curated card
+            # not sourced from a dated gate verdict (e.g. the MTP exactness card).
+            for key in ("harnessGitSHA", "corpusId", "sourceVerdict"):
+                require_nullable_str(provenance, key, f"{label} provenance", failures)
+            measured_at = require_nullable_str(provenance, "measuredAt", f"{label} provenance", failures)
+            if measured_at is not None:
+                try:
+                    dt.datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
+                except ValueError:
+                    failures.append(f"{label} provenance measuredAt is not an ISO-8601 timestamp")
+
+        boundary = card.get("boundary")
+        failures.extend(key_failures(boundary, {"scope", "unmeasured"}, f"{label} boundary"))
+        if isinstance(boundary, dict):
+            require_str(boundary, "scope", f"{label} boundary", failures)
+            unmeasured = boundary.get("unmeasured")
+            if not isinstance(unmeasured, list) or any(
+                not isinstance(item, str) or not item.strip() for item in unmeasured
+            ):
+                failures.append(f"{label} boundary.unmeasured must be a list of non-empty strings")
+    return failures
+
+
+def validate_quality_guide_page(site: Path) -> List[str]:
+    """Validate the optional public quality-guide page and its manifest.
+
+    Absence of both `quality/index.html` and `quality/index.json` is not a
+    failure: the page is skipped gracefully when no quality-card manifest was
+    available at build time, exactly like the build script.
+    """
+
+    failures: List[str] = []
+    html_path = site / "quality/index.html"
+    json_path = site / "quality/index.json"
+    html_present = html_path.is_file() and not html_path.is_symlink()
+    json_present = json_path.is_file() and not json_path.is_symlink()
+    if not html_present and not json_present:
+        return failures
+    if html_present != json_present:
+        failures.append(
+            "quality/index.html and quality/index.json must both be present or both absent"
+        )
+        return failures
+
+    try:
+        manifest = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"invalid quality/index.json: {exc}"]
+
+    manifest_failures = validate_quality_guide_manifest(manifest)
+    failures.extend(manifest_failures)
+    if manifest_failures or not isinstance(manifest, dict):
+        return failures
+
+    cards = manifest.get("cards", [])
+    collector = QualityCardCollector()
+    html_text = html_path.read_text(encoding="utf-8")
+    try:
+        collector.feed(html_text)
+        collector.close()
+    except Exception as exc:
+        return failures + [f"cannot parse quality/index.html: {exc}"]
+
+    head_collector = HeadMetadataCollector()
+    try:
+        head_collector.feed(html_text)
+    except Exception as exc:
+        failures.append(f"cannot parse quality/index.html metadata: {exc}")
+    else:
+        expected_canonical = PUBLIC_SITE_URL + "quality/"
+        if head_collector.canonicals != [expected_canonical]:
+            failures.append("quality/index.html has the wrong canonical metadata")
+
+    rendered_by_id = {
+        str(card["id"]): card for card in collector.cards if isinstance(card.get("id"), str)
+    }
+    expected_ids = {str(card["id"]) for card in cards if isinstance(card, dict)}
+    if set(rendered_by_id) != expected_ids:
+        failures.append("quality/index.html cards do not match quality/index.json cards")
+
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        card_id = str(card["id"])
+        rendered = rendered_by_id.get(card_id)
+        if rendered is None:
+            continue
+        if not rendered.get("has_details"):
+            failures.append(
+                f"quality card {card_id!r} is missing its rawMetrics <details> expander"
+            )
+        text = str(rendered.get("text", ""))
+        legible = card["legible"]
+        if str(legible["headline"]) not in text:
+            failures.append(f"quality card {card_id!r} does not render its headline")
+        if str(legible["tier"]).upper() not in text.upper():
+            failures.append(f"quality card {card_id!r} does not render its tier")
+        if str(card["verdict"]) == "NO_GO":
+            reason = str(card["admission"]["reason"])
+            if reason not in text:
+                failures.append(
+                    f"quality card {card_id!r} (NO_GO) does not render its admission reason"
+                )
+            if "broken" in text.lower():
+                failures.append(
+                    f'quality card {card_id!r} (NO_GO) must not read as "broken"'
+                )
+        source = str(card["provenance"]["source"])
+        if source not in text:
+            failures.append(f"quality card {card_id!r} does not render its provenance source")
+        if source == "vendor-reported":
+            vendor = str(card["provenance"].get("vendor"))
+            if vendor not in text:
+                failures.append(f"quality card {card_id!r} does not render its vendor")
+        benefit = legible["benefit"]
+        if benefit.get("speedX") is None and str(benefit["speedXStatus"]) not in text:
+            failures.append(
+                f"quality card {card_id!r} does not render its speedXStatus text"
+            )
+        if str(card["boundary"]["scope"]) not in text:
+            failures.append(f"quality card {card_id!r} does not render its boundary scope")
+        if re.search(r"\bNone\b", text):
+            failures.append(
+                f"quality card {card_id!r} leaks a null field as literal text \"None\""
+            )
+    return failures
+
+
 def validate_benchmark_detail_pages(site: Path) -> List[str]:
     failures: List[str] = []
     benchmark_root = site / "benchmarks"
@@ -4827,6 +5233,7 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_quickstart_navigation(site))
     failures.extend(validate_status_navigation(site))
     failures.extend(validate_research_page(site))
+    failures.extend(validate_quality_guide_page(site))
 
     expected_benchmark_cards = reviewed_benchmark_cards()
 

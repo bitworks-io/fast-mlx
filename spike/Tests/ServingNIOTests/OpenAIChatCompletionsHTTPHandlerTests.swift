@@ -2169,6 +2169,119 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(backend.snapshot().cancelCount, 0)
         _ = try await channel.finish(acceptAlreadyClosed: true)
     }
+
+    // MARK: - Health / readiness probes
+
+    func testHealthzReturnsOkWithExactBodyAndNoBearerTokenConfigured() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: defaultConfiguration())
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/healthz")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        XCTAssertEqual(response.body, #"{"status":"ok"}"#)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testHealthzBypassesBearerTokenWhileModelsStillRequiresIt() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+
+        // No Authorization header at all — an orchestrator health probe carries no API key.
+        let healthzBackend = ScriptedBackend(scripts: [])
+        let healthzChannel = try await makeChannel(
+            backend: healthzBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(healthzChannel, method: .GET, uri: "/healthz")
+        let healthzResponse = try await collectResponse(from: healthzChannel)
+        XCTAssertEqual(healthzResponse.head.status, .ok)
+        XCTAssertEqual(healthzResponse.body, #"{"status":"ok"}"#)
+        _ = try await healthzChannel.finish()
+
+        // Control: the same configuration still enforces the bearer token on every other route.
+        let modelsBackend = ScriptedBackend(scripts: [])
+        let modelsChannel = try await makeChannel(
+            backend: modelsBackend,
+            configuration: configuration)
+        try await writeHeadOnlyRequest(modelsChannel, method: .GET, uri: "/v1/models")
+        let modelsResponse = try await collectResponse(from: modelsChannel)
+        XCTAssertEqual(modelsResponse.head.status, .unauthorized)
+        _ = try await modelsChannel.finish()
+    }
+
+    func testReadyzReturnsReadyByDefault() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: defaultConfiguration())
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/readyz")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        XCTAssertEqual(response.body, #"{"status":"ready"}"#)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testReadyzReturns503WhenReadinessHookReportsNotReady() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            readiness: { false })
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/readyz")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .serviceUnavailable)
+        XCTAssertEqual(response.body, #"{"status":"not_ready"}"#)
+        _ = try await channel.finish()
+    }
+
+    func testPostHealthzReturns405() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: defaultConfiguration())
+
+        try await writeHeadOnlyRequest(channel, method: .POST, uri: "/healthz")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .methodNotAllowed)
+        _ = try await channel.finish()
+    }
+
+    func testHealthzTrailingSlashIsAnUnknownRouteLikeOtherUnmatchedURIs() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: defaultConfiguration())
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/healthz/")
+        let response = try await collectResponse(from: channel)
+
+        // `validateHead` matches routes by exact `head.uri ==` comparison (see `/v1/models` and
+        // `/metrics` above), so a trailing-slash variant is an unmatched URI and 404s exactly like
+        // any other unknown route — pinning that behavior here rather than inventing new
+        // normalization for probes only.
+        XCTAssertEqual(response.head.status, .notFound)
+        _ = try await channel.finish()
+    }
 }
 
 private struct CollectedResponse {

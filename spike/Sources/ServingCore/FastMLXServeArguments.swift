@@ -1208,6 +1208,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidDefaultSampling
                 }
                 defaultSampling = parsedDefaultSampling
+            case "--quality-cards", "--accept-quality":
+                // Quality-guidance moat admission flags. Accepted + value-consumed here so the strict
+                // allowlist parser does not reject them; the values are read directly off
+                // CommandLine.arguments by the pre-load QualityAdmission gate in FastMLXServe.run()
+                // (keeps ServingCore free of a HarnessCore dependency — same boundary idiom as
+                // --kv-quant/--tier/--prefer). Fail closed on a missing value.
+                index += 1
+                _ = try value(at: index, in: arguments, for: argument)
             default:
                 preconditionFailure("supported option was not handled")
             }
@@ -1745,6 +1753,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--fit-check-only",
         "--offload-plan-check-only",
         "--default-sampling",
+        "--quality-cards",
+        "--accept-quality",
     ]
 
     private static func value(

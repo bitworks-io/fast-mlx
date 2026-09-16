@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 921,
-    "pathModeSha256": "7425fd37561d5a602cf65b236017fa2a6eb7540b0140f22cab45ff275c725a83"
+    "pathCount": 925,
+    "pathModeSha256": "c5e25967b667f9ca4b2e2eaed36413e8fcef4798c793dd0998af1dbad8b1eab6"
   },
   "files": [
     {
@@ -88,6 +88,10 @@
     {
       "source": "scripts/tests/test_public_site.py",
       "destination": "scripts/tests/test_public_site.py"
+    },
+    {
+      "source": "scripts/tests/fixtures/quality-guides.sample.json",
+      "destination": "scripts/tests/fixtures/quality-guides.sample.json"
     },
     {
       "source": "scripts/tests/test_public_status.py",

@@ -94,9 +94,17 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: the note is family-neutral (no internal model-family identifier),
 # references no host, credential, competitor or machine-local path, and describes only fast-mlx's
 # own measured evidence about a self-built instrument's return before the change was made.
+# 2026-09-16, 921 -> 924: lands the quality-card admission moat, adding
+# site/quality-guides.json, spike/Sources/HarnessCore/QualityAdmission.swift and
+# spike/Tests/HarnessCoreTests/QualityAdmissionTests.swift. Conscious decision to publish: all three
+# are family-neutral fast-mlx source/data, reference no host, credential, competitor or
+# machine-local path (the card publishes only its verdict's file name), and were marker-scanned.
+# 2026-09-16, 924 -> 925: adds scripts/tests/fixtures/quality-guides.sample.json. The projected
+# test_public_site.py quality-guide tests read it, so without it public CI errors (caught by
+# running the suite inside a fresh export). Same four public cards as site/quality-guides.json.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 921,
-    "pathModeSha256": "7425fd37561d5a602cf65b236017fa2a6eb7540b0140f22cab45ff275c725a83",
+    "pathCount": 925,
+    "pathModeSha256": "c5e25967b667f9ca4b2e2eaed36413e8fcef4798c793dd0998af1dbad8b1eab6",
 }
 
 
