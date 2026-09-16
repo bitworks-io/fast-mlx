@@ -167,6 +167,15 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 from: bodyData,
                 limits: configuration.requestLimits)
             try request.requireLaunchedModel(configuration.launchedModel)
+            // Diagnostic-only, never gating: names of accepted-but-ignored fields (see
+            // `OpenAIChatCompletionRequest.ignoredFields`), never their values. Reuses the existing
+            // `requestFailureReporter` sink (see `ServingHTTPConfiguration.requestFailureReporter`)
+            // rather than writing to standard error directly, since it is already the handler's one
+            // configured diagnostic-line sink independent of `evidence`.
+            if !request.ignoredFields.isEmpty {
+                configuration.requestFailureReporter?(
+                    "fastmlx-serve: ignored request fields: \(request.ignoredFields.joined(separator: ","))")
+            }
         } catch let error as OpenAIServingError {
             writeError(error, status: .badRequest, keepAlive: head.isKeepAlive, context: context)
             return
@@ -623,6 +632,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     handle: started,
                     channel: channel,
                     writabilityGate: writabilityGate,
+                    includeUsage: request.includeUsage,
                     timeout: configuration.backpressureStallTimeout)
             } else {
                 let result = try await collectNonStreaming(
@@ -1052,6 +1062,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         handle: ServingGenerationHandle,
         channel: any Channel,
         writabilityGate: ServingChannelWritabilityGate,
+        includeUsage: Bool,
         timeout: Duration
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
@@ -1064,6 +1075,19 @@ private extension OpenAIChatCompletionsHTTPHandler {
             finishReason: completion.finishReason,
             usage: completion.usage)
         try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
+        // `stream_options.include_usage` opt-in only: this extra empty-choices usage chunk is the
+        // one byte-shape difference from today's stream. Emitted only on this normal-completion
+        // path — an error path that never reaches here writes no usage chunk, by design (see
+        // OpenAIChatCompletionsHTTPHandlerTests for the byte-identical-when-absent contract).
+        if includeUsage {
+            try await waitUntilWritable(writabilityGate, timeout: timeout)
+            let usageChunk = OpenAIChatCompletionUsageChunk(
+                id: handle.responseID,
+                created: handle.created,
+                model: handle.model,
+                usage: completion.usage)
+            try await writeBody(usageChunk.sseEvent(), channel: channel, timeout: timeout)
+        }
         try await writeBody(
             OpenAIChatCompletionChunk.doneSSEEvent,
             channel: channel,

@@ -452,6 +452,71 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // `stream_options.include_usage:true` opt-in: one extra empty-choices usage chunk lands
+    // immediately before `data: [DONE]`, carrying the SAME prompt/completion numbers the
+    // finish-reason chunk (and the non-streaming path) would report.
+    func testStreamOptionsIncludeUsageEmitsTerminalUsageChunkBeforeDone() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(
+            channel,
+            body: """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":true,"stream_options":{"include_usage":true}}
+            """)
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let doneRange = try XCTUnwrap(response.body.range(of: "data: [DONE]\n\n"))
+        let events = try sseJSONEvents(from: response.body)
+        let usageOnlyEvents = events.filter { object in
+            (object["choices"] as? [[String: Any]])?.isEmpty == true
+        }
+        XCTAssertEqual(usageOnlyEvents.count, 1, response.body)
+        let usage = try XCTUnwrap(usageOnlyEvents.first?["usage"] as? [String: Any])
+        XCTAssertEqual(usage["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(usage["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(usage["total_tokens"] as? Int, 5)
+
+        // Positioned immediately before [DONE]: nothing else appears between the usage chunk and it.
+        let usageChunkRange = try XCTUnwrap(response.body.range(of: #""choices":[]"#))
+        XCTAssertLessThan(usageChunkRange.lowerBound, doneRange.lowerBound)
+        let between = response.body[usageChunkRange.upperBound..<doneRange.lowerBound]
+        XCTAssertFalse(
+            between.contains("data: "),
+            "expected no other chunk between the usage chunk and [DONE], got: \(between)")
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
+    // Absence of `stream_options` must leave today's streamed bytes unchanged: no empty-choices
+    // usage chunk, and the same four events (role, two content deltas, finish) as before this
+    // increment.
+    func testStreamingWithoutStreamOptionsEmitsNoUsageChunkByteShapeUnchanged() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(
+                text: ["hel", "lo"],
+                finishReason: .length,
+                promptTokens: 3,
+                completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertFalse(response.body.contains(#""choices":[]"#), response.body)
+        let events = try sseJSONEvents(from: response.body)
+        XCTAssertEqual(events.count, 4, response.body)
+        XCTAssertEqual(response.body.components(separatedBy: "data: [DONE]\n\n").count - 1, 1)
+
+        _ = try await channel.finish()
+    }
+
     // Streaming reasoning separation (happy path): a thinks-by-default handle
     // (separatesReasoning=true) routes `.text` deltas through StreamingReasoningSplitter, so the
     // `<think>` block arrives as delta.reasoning_content and the answer as delta.content — the joined

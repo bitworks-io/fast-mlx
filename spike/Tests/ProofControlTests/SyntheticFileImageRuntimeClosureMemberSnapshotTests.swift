@@ -70,27 +70,26 @@ final class SyntheticFileImageRuntimeClosureMemberSnapshotTests:
             row.loadCommandsSHA256,
             comparison.loadCommandsSHA256
         )
+        // Typed binding: Xcode 27's type checker times out on the inline concatenation.
+        let expectedCanonicalRecord: String =
+            "member_0007_content_evidence_id=" +
+                "2e58401402ee183219e1ce2b7e2ee113" +
+                "a9297aafba067153abf6d9299bbc6073\n" +
+                "member_0007_storage=file\n" +
+                "member_0007_install_name_bytes=30\n" +
+                "member_0007_install_name_base64url=" +
+                "L3Vzci9saWIvbGliRmFzdE1MWFByb29mLmR5bGli\n" +
+                "member_0007_macho_uuid=" +
+                "0123456789abcdef1032547698badcfe\n" +
+                "member_0007_primary_code_directory_blob_sha256=" +
+                "2dcc134ef85a3fc06f6d547c30443d2f" +
+                "554dc50ae837bb985929b3f0edb56906\n" +
+                "member_0007_load_commands_sha256=" +
+                "7b0f03fbdb71b4b2a770e4a3b85a77ec" +
+                "1e2a9c28283307f8e498c4308f241ccb\n"
         XCTAssertEqual(
             row.canonicalRecordBytes,
-            Data(
-                (
-                    "member_0007_content_evidence_id=" +
-                        "2e58401402ee183219e1ce2b7e2ee113" +
-                        "a9297aafba067153abf6d9299bbc6073\n" +
-                        "member_0007_storage=file\n" +
-                        "member_0007_install_name_bytes=30\n" +
-                        "member_0007_install_name_base64url=" +
-                        "L3Vzci9saWIvbGliRmFzdE1MWFByb29mLmR5bGli\n" +
-                        "member_0007_macho_uuid=" +
-                        "0123456789abcdef1032547698badcfe\n" +
-                        "member_0007_primary_code_directory_blob_sha256=" +
-                        "2dcc134ef85a3fc06f6d547c30443d2f" +
-                        "554dc50ae837bb985929b3f0edb56906\n" +
-                        "member_0007_load_commands_sha256=" +
-                        "7b0f03fbdb71b4b2a770e4a3b85a77ec" +
-                        "1e2a9c28283307f8e498c4308f241ccb\n"
-                ).utf8
-            )
+            Data(expectedCanonicalRecord.utf8)
         )
         Self.assertInert(row)
 

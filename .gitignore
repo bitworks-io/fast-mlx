@@ -16,3 +16,7 @@ spike/harness-evidence.jsonl
 spike/*.csv
 # deploy-time git provenance written by private deployment tooling, not source
 spike/.harness-sha
+# machine-local Claude Code overrides: fleet host/IP/SSH allow-rules stay PRIVATE, never committed
+.claude/settings.local.json
+# machine-specific project-init customizations (e.g. CODEX_ENV_PRIVATE_OVERLAY); never commit
+project-init.local

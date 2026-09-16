@@ -977,8 +977,8 @@ private extension FileImageExecutionIdentityComparisonVerifier {
     gitClosure: RuntimeClosureExpectationTrustAnchor,
     selfGuardClosure: RuntimeClosureExpectationTrustAnchor
   ) -> Data {
-    Data(
-      ([
+    // Typed binding: Xcode 27's type checker times out on the inline literal. Bytes unchanged.
+    let lines: [String] = [
         anchorContextDomain,
         "git_tool_policy_v2_expected_sha256="
           + gitTool.expectedCurrentPolicySHA256,
@@ -1028,8 +1028,8 @@ private extension FileImageExecutionIdentityComparisonVerifier {
           + "\(selfGuardClosure.minimumEvidenceGeneration)",
         "self_guard_closure_verification_unix_seconds="
           + "\(selfGuardClosure.verificationUnixSeconds)",
-      ].joined(separator: "\n") + "\n").utf8
-    )
+    ]
+    return Data((lines.joined(separator: "\n") + "\n").utf8)
   }
 
   static func comparisonPreimage(

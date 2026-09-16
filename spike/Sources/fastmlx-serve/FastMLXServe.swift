@@ -79,7 +79,8 @@ struct FastMLXServe {
             // none of those ran. `chat_template_source=unproven` mirrors `--fit-check-only`'s
             // `offload_path_resolvable=unproven` field: the resolved chat template is read only at
             // the scalar-load seam this dry run stops before reaching.
-            print(
+            // Typed binding: Xcode 27's type checker times out on the inline concatenation.
+            let checkLine: String =
                 "fastmlx-serve offload_plan_check=complete weights_loaded=false "
                     + "model_constructed=false "
                     + "rows_device=\(completed.rowsDevice) rows_inode=\(completed.rowsInode) "
@@ -91,7 +92,8 @@ struct FastMLXServe {
                     + "eligibility_host=\(completed.eligibilityHost) "
                     + "eligibility_resolved_from=\(completed.eligibilityResolvedFrom) "
                     + "ngram_exclusion_audited=false mtp_drafter_loaded=false "
-                    + "chat_template_source=unproven")
+                    + "chat_template_source=unproven"
+            print(checkLine)
             exit(0)
         } catch is FitCheckRefusal {
             // The refusal summary was already written to stderr by emitFitCheck; fail closed with a

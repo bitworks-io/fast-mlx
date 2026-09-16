@@ -160,6 +160,14 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var frequencyPenalty: Double?
     /// HF-style repetition penalty > 0 (nil = none; 1.0 = no penalty).
     public var repetitionPenalty: Double?
+    /// Client opt-in (`stream_options.include_usage`) for a terminal usage-only SSE chunk on the
+    /// streaming path (ignored when `stream` is false). Defaults to false so every non-streaming
+    /// caller and every streaming caller that never sent `stream_options` is unaffected.
+    public var includeUsage: Bool
+    /// Sorted, deduplication-free list of accepted-but-ignored top-level field names present on
+    /// this request (OpenAI SDK metadata such as `user`/`metadata`/`store`/`service_tier`, plus
+    /// neutral-valued semantic fields such as `logprobs:false`). Never carries field VALUES.
+    public var ignoredFields: [String]
 
     public init(
         model: String,
@@ -180,7 +188,9 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         reasoningEffort: String? = nil,
         presencePenalty: Double? = nil,
         frequencyPenalty: Double? = nil,
-        repetitionPenalty: Double? = nil
+        repetitionPenalty: Double? = nil,
+        includeUsage: Bool = false,
+        ignoredFields: [String] = []
     ) {
         self.model = model
         self.messages = messages
@@ -201,6 +211,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
         self.repetitionPenalty = repetitionPenalty
+        self.includeUsage = includeUsage
+        self.ignoredFields = ignoredFields
     }
 
     public static func decodeStrict(
@@ -236,6 +248,15 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             "presence_penalty",
             "frequency_penalty",
             "repetition_penalty",
+            "user",
+            "metadata",
+            "store",
+            "service_tier",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "logit_bias",
+            "stream_options",
         ]
         try rejectUnknownKeys(in: root, allowed: allowedKeys, paramPrefix: nil)
 
@@ -314,6 +335,38 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
                 "repetition_penalty must be greater than zero", param: "repetition_penalty")
         }
 
+        // Metadata-only OpenAI SDK fields: validated for type, then accepted and ignored — they
+        // describe OpenAI-side bookkeeping (caller identity, storage, service tier) that this
+        // server has no equivalent for and cannot honor, but which real SDK clients send by
+        // default. Each is recorded in `ignoredFields` (names only, never values) so a caller can
+        // be told what was silently dropped without leaking user data into logs.
+        let user = try optionalUser(root["user"])
+        let metadata = try optionalMetadata(root["metadata"])
+        let store = try optionalBool(root["store"], param: "store")
+        let serviceTier = try optionalString(root["service_tier"], param: "service_tier")
+
+        // Neutral-valued semantic fields: accepted ONLY at the value that is equivalent to "not
+        // requested", so a client that always sends its SDK defaults is not rejected, while a
+        // client asking for real structured-output/logprobs behavior this server cannot provide
+        // still gets a fail-closed 400 rather than a silently wrong response.
+        let logprobs = try optionalNeutralLogprobs(root["logprobs"])
+        let topLogprobs = try optionalNeutralTopLogprobs(root["top_logprobs"])
+        let responseFormatPresent = try validateNeutralResponseFormat(root["response_format"])
+        let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
+
+        let includeUsage = try decodeStreamOptions(root["stream_options"], stream: stream)
+
+        var ignoredFields: [String] = []
+        if user != nil { ignoredFields.append("user") }
+        if metadata != nil { ignoredFields.append("metadata") }
+        if store != nil { ignoredFields.append("store") }
+        if serviceTier != nil { ignoredFields.append("service_tier") }
+        if logprobs != nil { ignoredFields.append("logprobs") }
+        if topLogprobs != nil { ignoredFields.append("top_logprobs") }
+        if responseFormatPresent { ignoredFields.append("response_format") }
+        if logitBiasPresent { ignoredFields.append("logit_bias") }
+        ignoredFields.sort()
+
         return OpenAIChatCompletionRequest(
             model: model,
             messages: messages,
@@ -333,7 +386,9 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             reasoningEffort: resolvedReasoningEffort,
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
-            repetitionPenalty: repetitionPenalty)
+            repetitionPenalty: repetitionPenalty,
+            includeUsage: includeUsage,
+            ignoredFields: ignoredFields)
     }
 
     public func requireLaunchedModel(_ launchedModel: String) throws {
@@ -573,6 +628,31 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
             if let reasoningContent { try container.encode(reasoningContent, forKey: .reasoningContent) }
             if let toolCalls, !toolCalls.isEmpty { try container.encode(toolCalls, forKey: .toolCalls) }
         }
+    }
+}
+
+/// Terminal usage-only SSE chunk emitted when the caller opts in via
+/// `stream_options.include_usage`, immediately before `data: [DONE]`. Shaped like the normal
+/// stream chunks (same `id`/`object`/`created`/`model`) but with an EMPTY `choices` array — this is
+/// the one chunk shape OpenAI's own `stream_options.include_usage` contract carries no delta on.
+public struct OpenAIChatCompletionUsageChunk: Encodable, Sendable, Equatable {
+    public var id: String
+    public var object = "chat.completion.chunk"
+    public var created: Int
+    public var model: String
+    public var choices: [OpenAIChatCompletionChunk.Choice] = []
+    public var usage: OpenAIChatUsage
+
+    public init(id: String, created: Int, model: String, usage: OpenAIChatUsage) {
+        self.id = id
+        self.created = created
+        self.model = model
+        self.usage = usage
+    }
+
+    public func sseEvent() throws -> String {
+        let data = try JSONEncoder.openAI.encode(self)
+        return "data: \(String(decoding: data, as: UTF8.self))\n\n"
     }
 }
 
@@ -1143,6 +1223,112 @@ private func optionalReasoningEffort(_ raw: Any?, param: String) throws -> Strin
             "\(param) must be one of xhigh, medium, low", param: param)
     }
     return value
+}
+
+private func optionalUser(_ raw: Any?) throws -> String? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let value = raw as? String else {
+        throw OpenAIServingError.invalidRequest("user must be a string", param: "user")
+    }
+    return value
+}
+
+/// `metadata` must be an object whose values are strings (OpenAI's contract); `null`/absent means
+/// no metadata was sent. Values are validated but never retained beyond this call — only presence
+/// is recorded (see `ignoredFields`), never the metadata content.
+private func optionalMetadata(_ raw: Any?) throws -> [String: String]? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let object = raw as? [String: Any] else {
+        throw OpenAIServingError.invalidRequest("metadata must be an object", param: "metadata")
+    }
+    var result: [String: String] = [:]
+    for (key, value) in object {
+        guard let stringValue = value as? String else {
+            throw OpenAIServingError.invalidRequest(
+                "metadata values must be strings", param: "metadata")
+        }
+        result[key] = stringValue
+    }
+    return result
+}
+
+/// `logprobs` is accepted only at its OpenAI-default-equivalent value (`false`/absent). `true`
+/// would silently promise per-token log-probabilities this server does not compute, so it fails
+/// closed rather than returning a response missing data the caller explicitly asked for.
+private func optionalNeutralLogprobs(_ raw: Any?) throws -> Bool? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let value = raw as? Bool else {
+        throw OpenAIServingError.invalidRequest("logprobs must be a boolean", param: "logprobs")
+    }
+    guard value == false else {
+        throw OpenAIServingError.invalidRequest(
+            "Unsupported value for logprobs: only false is supported", param: "logprobs")
+    }
+    return value
+}
+
+/// `top_logprobs` is only meaningful alongside `logprobs:true`, which this server rejects — so the
+/// only value it can honestly accept here is `0`/absent.
+private func optionalNeutralTopLogprobs(_ raw: Any?) throws -> Int? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let value = try optionalInt(raw, param: "top_logprobs") else { return nil }
+    guard value == 0 else {
+        throw OpenAIServingError.invalidRequest(
+            "Unsupported value for top_logprobs: only 0 is supported", param: "top_logprobs")
+    }
+    return value
+}
+
+/// `response_format` is only accepted at its OpenAI-default-equivalent shape
+/// (`{"type":"text"}`/absent) — this server does not implement structured output
+/// (`json_object`/`json_schema`), and silently accepting one would return free text where the
+/// caller expects parseable JSON. Returns whether the field was present (non-null).
+private func validateNeutralResponseFormat(_ raw: Any?) throws -> Bool {
+    guard let raw, !(raw is NSNull) else { return false }
+    guard let object = raw as? [String: Any] else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format must be an object", param: "response_format")
+    }
+    let type = try requiredString(object["type"], param: "response_format")
+    guard type == "text", Set(object.keys) == ["type"] else {
+        throw OpenAIServingError.invalidRequest(
+            "Structured output is not supported yet; only response_format.type=text is accepted",
+            param: "response_format")
+    }
+    return true
+}
+
+/// `logit_bias` is only accepted empty/absent — a non-empty bias map would change sampling in a
+/// way this server does not implement, and returning ordinary output while claiming to have
+/// applied a bias would be a silent behavior mismatch. Returns whether the field was present
+/// (non-null).
+private func validateNeutralLogitBias(_ raw: Any?) throws -> Bool {
+    guard let raw, !(raw is NSNull) else { return false }
+    guard let object = raw as? [String: Any] else {
+        throw OpenAIServingError.invalidRequest("logit_bias must be an object", param: "logit_bias")
+    }
+    guard object.isEmpty else {
+        throw OpenAIServingError.invalidRequest(
+            "Unsupported value for logit_bias: only an empty object is supported", param: "logit_bias")
+    }
+    return true
+}
+
+/// Decodes `stream_options` and resolves whether a terminal usage-only SSE chunk should be
+/// emitted. Mirrors OpenAI's own validation: the field is meaningless (and rejected) unless
+/// `stream:true`, and only the single documented inner key is accepted.
+private func decodeStreamOptions(_ raw: Any?, stream: Bool) throws -> Bool {
+    guard let raw, !(raw is NSNull) else { return false }
+    guard stream else {
+        throw OpenAIServingError.invalidRequest(
+            "stream_options requires stream to be true", param: "stream_options")
+    }
+    guard let object = raw as? [String: Any] else {
+        throw OpenAIServingError.invalidRequest(
+            "stream_options must be an object", param: "stream_options")
+    }
+    try rejectUnknownKeys(in: object, allowed: ["include_usage"], paramPrefix: "stream_options")
+    return try optionalBool(object["include_usage"], param: "stream_options.include_usage") ?? false
 }
 
 /// Decodes the Qwen `chat_template_kwargs` passthrough dict, extracting only the

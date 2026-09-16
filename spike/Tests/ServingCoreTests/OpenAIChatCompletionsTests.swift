@@ -219,6 +219,141 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         }
     }
 
+    func testMetadataOnlyFieldsAreAcceptedAndRecordedAsIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],
+         "user":"user-123","metadata":{"a":"b"},"store":true,"service_tier":"auto"}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(
+            request.ignoredFields,
+            ["metadata", "service_tier", "store", "user"])
+    }
+
+    func testStoreFalseIsAlsoAcceptedAndRecordedAsIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"store":false}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["store"])
+    }
+
+    func testWrongTypedUserAndMetadataAreRejected() throws {
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"user":42}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "user")
+
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"metadata":"nope"}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "metadata")
+
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"metadata":{"a":1}}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "metadata")
+    }
+
+    func testNeutralValuedFieldsAreAcceptedAndRecordedAsIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],
+         "logprobs":false,"top_logprobs":0,"response_format":{"type":"text"},"logit_bias":{}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(
+            request.ignoredFields,
+            ["logit_bias", "logprobs", "response_format", "top_logprobs"])
+    }
+
+    func testNonNeutralValuedFieldsAreRejectedWithSpecificParam() throws {
+        let cases: [(String, String)] = [
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true}"#, "logprobs"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_logprobs":1}"#, "top_logprobs"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#, "response_format"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text","extra":1}}"#, "response_format"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}}"#, "logit_bias"),
+        ]
+        for (body, param) in cases {
+            XCTAssertOpenAIError(
+                try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: param,
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    func testStreamOptionsIncludeUsageIsParsedBothWays() throws {
+        let trueBody = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream":true,"stream_options":{"include_usage":true}}
+        """
+        XCTAssertTrue(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(trueBody.utf8)).includeUsage)
+
+        let falseBody = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream":true,"stream_options":{"include_usage":false}}
+        """
+        XCTAssertFalse(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(falseBody.utf8)).includeUsage)
+
+        // Absent stream_options entirely: includeUsage stays false, and it never appears ignored
+        // (it is honored, not ignored).
+        let absentBody = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream":true}
+        """
+        let absent = try OpenAIChatCompletionRequest.decodeStrict(from: Data(absentBody.utf8))
+        XCTAssertFalse(absent.includeUsage)
+        XCTAssertEqual(absent.ignoredFields, [])
+    }
+
+    func testStreamOptionsUnknownInnerKeyIsRejectedWithDottedParam() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream":true,"stream_options":{"foo":true}}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "stream_options.foo")
+    }
+
+    func testStreamOptionsWithoutStreamTrueIsRejected() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream":false,"stream_options":{"include_usage":true}}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "stream_options")
+
+        let defaultStreamBody = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"stream_options":{"include_usage":true}}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(defaultStreamBody.utf8)),
+            type: .invalidRequest,
+            param: "stream_options")
+    }
+
+    func testUnknownFieldIsStillRejected() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"unknown":true}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "unknown")
+    }
+
     func testErrorEnvelopeAlwaysCarriesOfficialShape() throws {
         let error = OpenAIServingError.invalidRequest("Unsupported field: tools", param: "tools")
         let data = try JSONEncoder.openAI.encode(OpenAIErrorEnvelope(error: error.openAIError))
