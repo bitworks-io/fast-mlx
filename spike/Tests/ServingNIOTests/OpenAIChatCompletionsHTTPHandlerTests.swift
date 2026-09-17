@@ -3370,6 +3370,80 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // MARK: - `response_format: {"type":"json_object"}` capability gate (slice 1c)
+    //
+    // No backend applies the token constraint yet (slice 1a/1b) — see
+    // `ServingGenerationBackend.supportsJSONObjectResponseFormat`'s doc comment and
+    // `validateResponseFormatCapability`. These tests exercise the single dispatch-point gate in
+    // `OpenAIChatCompletionsHTTPHandler`, complementing the parsing-level tests in
+    // `ResponseFormatJSONObjectRequestTests` (ServingCoreTests).
+
+    // A backend that never declares the capability (the default every real backend still has) must
+    // refuse a `json_object` request with a 400 and never see `backend.start(_:)` called at all.
+    func testJSONObjectResponseFormatIsRefusedByDefaultCapabilityFalseBackend() async throws {
+        // Scripted with a completion on purpose: if the gate were missing, the request would be
+        // served (200) and this test fails fast instead of hanging on an empty script.
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["not json"], promptTokens: 1, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"response_format":{"type":"json_object"}}
+            """
+        try await writeRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["param"] as? String, "response_format")
+        XCTAssertEqual(
+            error["message"] as? String,
+            "response_format json_object is not supported by the loaded model's decoding route")
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    // Control: an ordinary `text`-equivalent request (no `response_format` at all) still reaches
+    // the same capability-false backend normally — the gate is conditional on
+    // `responseFormat == .jsonObject`, not an unconditional refusal of every request to that backend.
+    func testTextRequestStillReachesDefaultCapabilityFalseBackend() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertNil(backend.snapshot().lastRequest?.responseFormat)
+        _ = try await channel.finish()
+    }
+
+    // A backend that opts into the capability receives the request, and that request carries
+    // `.jsonObject` — proving the field is threaded through to the backend (not dropped) and that
+    // the gate is not unconditionally closed.
+    func testJSONObjectResponseFormatReachesBackendThatDeclaresTheCapability() async throws {
+        let backend = ScriptedBackend(
+            scripts: [.completed(text: ["{}"], promptTokens: 1, completionTokens: 1)],
+            supportsJSONObjectResponseFormat: true)
+        let channel = try await makeChannel(backend: backend)
+
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"response_format":{"type":"json_object"}}
+            """
+        try await writeRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().lastRequest?.responseFormat, .jsonObject)
+        _ = try await channel.finish()
+    }
+
     // MARK: - Request log (`--request-log json` / `ServingHTTPConfiguration.requestLog`)
 
     func testRequestLogChatNonStreamingSuccessEmitsExactlyOneLineWithNoContent() async throws {
@@ -3986,15 +4060,21 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
     private let separatesReasoning: Bool
 
     private let mailboxMaximumBytes: Int
+    /// Test-only override of `ServingGenerationBackend.supportsJSONObjectResponseFormat` (default
+    /// `false`, matching the protocol-extension default every real backend still has in slice 1c —
+    /// see `OpenAIChatCompletionsHTTPHandlerTests`'s response-format capability-gate tests).
+    let supportsJSONObjectResponseFormat: Bool
 
     init(
         scripts: [Script],
         separatesReasoning: Bool = false,
-        mailboxMaximumBytes: Int = 1_024
+        mailboxMaximumBytes: Int = 1_024,
+        supportsJSONObjectResponseFormat: Bool = false
     ) {
         state = OSAllocatedUnfairLock(initialState: State(scripts: scripts))
         self.separatesReasoning = separatesReasoning
         self.mailboxMaximumBytes = mailboxMaximumBytes
+        self.supportsJSONObjectResponseFormat = supportsJSONObjectResponseFormat
     }
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {

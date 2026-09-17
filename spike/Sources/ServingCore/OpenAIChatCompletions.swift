@@ -136,6 +136,16 @@ public enum ServingPromptInput: Sendable, Equatable {
     case rawText(String)
 }
 
+/// The subset of OpenAI's `response_format` this server actually changes generation behavior for.
+/// Absent/`null`/`{"type":"text"}` is the default free-text behavior and is represented by a `nil`
+/// `OpenAIChatCompletionRequest.responseFormat` (and recorded in `ignoredFields`), never a case here.
+/// `json_object` is HONORED (never listed in `ignoredFields`): the loaded backend must additionally
+/// declare `ServingGenerationBackend.supportsJSONObjectResponseFormat` before a request carrying it
+/// can be dispatched (see `ServingGenerationBackend`'s doc comment).
+public enum ServingResponseFormat: Sendable, Equatable {
+    case jsonObject
+}
+
 public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var model: String
     public var messages: [OpenAIChatMessage]
@@ -183,6 +193,10 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     /// only state that leaves every existing response byte-for-byte unchanged. See
     /// `ServingLogprobsRequest`'s doc comment for the chat vs. legacy-completions distinction.
     public var logprobsRequest: ServingLogprobsRequest?
+    /// Validated, HONORED `response_format` request, or `nil` when absent/`{"type":"text"}` (the
+    /// only state that leaves every existing response byte-for-byte unchanged) — see
+    /// `ServingResponseFormat`'s doc comment. Never listed in `ignoredFields` when non-nil.
+    public var responseFormat: ServingResponseFormat?
     /// `.chat` for every request decoded from `/v1/chat/completions` (the only value
     /// `decodeStrict` can ever produce). `.rawText(prompt)` is set exclusively by
     /// `OpenAICompletionRequest.asChatCompletionRequest()` for the legacy `/v1/completions` route —
@@ -212,6 +226,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         includeUsage: Bool = false,
         ignoredFields: [String] = [],
         logprobsRequest: ServingLogprobsRequest? = nil,
+        responseFormat: ServingResponseFormat? = nil,
         promptInput: ServingPromptInput = .chat
     ) {
         self.model = model
@@ -236,6 +251,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
         self.logprobsRequest = logprobsRequest
+        self.responseFormat = responseFormat
         self.promptInput = promptInput
     }
 
@@ -358,7 +374,30 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         // real, honored feature (see `decodeChatLogprobs`), not a neutral-only field.
         let logprobsRequest = try decodeChatLogprobs(
             logprobs: root["logprobs"], topLogprobs: root["top_logprobs"])
-        let responseFormatPresent = try validateNeutralResponseFormat(root["response_format"])
+        let (responseFormatIgnoredPresent, responseFormat) = try decodeChatResponseFormat(
+            root["response_format"])
+        if responseFormat == .jsonObject {
+            // Slice-1 refusals (see the response-format design doc): each combination gets its own
+            // message/param rather than folding into a generic "unsupported" 400, so a caller can
+            // programmatically tell which field to drop. `n > 1` needs no check here: it is already
+            // refused unconditionally above (line ~318), independent of `response_format`.
+            guard tools.isEmpty else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object is not supported together with tools",
+                    param: "tools")
+            }
+            guard logprobsRequest == nil else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object is not supported together with logprobs: "
+                        + "logprobs would be computed from pre-constraint logits",
+                    param: "logprobs")
+            }
+            guard stop.isEmpty else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object is not supported together with stop",
+                    param: "stop")
+            }
+        }
         let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
 
         let includeUsage = try decodeStreamOptions(root["stream_options"], stream: stream)
@@ -368,7 +407,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         if metadata != nil { ignoredFields.append("metadata") }
         if store != nil { ignoredFields.append("store") }
         if serviceTier != nil { ignoredFields.append("service_tier") }
-        if responseFormatPresent { ignoredFields.append("response_format") }
+        if responseFormatIgnoredPresent { ignoredFields.append("response_format") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
         ignoredFields.append(contentsOf: unknownTopLevelKeys)
         ignoredFields.sort()
@@ -395,7 +434,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             repetitionPenalty: repetitionPenalty,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
-            logprobsRequest: logprobsRequest)
+            logprobsRequest: logprobsRequest,
+            responseFormat: responseFormat)
     }
 
     public func requireLaunchedModel(_ launchedModel: String) throws {
@@ -1957,23 +1997,48 @@ private func finishChatLogprobs(logprobs: Bool?, topLogprobs: Int?) throws -> Se
     return .chat(topLogprobs: topLogprobs ?? 0)
 }
 
-/// `response_format` is only accepted at its OpenAI-default-equivalent shape
-/// (`{"type":"text"}`/absent) — this server does not implement structured output
-/// (`json_object`/`json_schema`), and silently accepting one would return free text where the
-/// caller expects parseable JSON. Returns whether the field was present (non-null).
-private func validateNeutralResponseFormat(_ raw: Any?) throws -> Bool {
-    guard let raw, !(raw is NSNull) else { return false }
+/// `response_format` is accepted at its OpenAI-default-equivalent shape (`{"type":"text"}`/absent,
+/// returned as `(true, nil)` and recorded in `ignoredFields`) and at `{"type":"json_object"}`
+/// (returned as `(false, .jsonObject)`: HONORED, so never recorded in `ignoredFields` — see
+/// `ServingResponseFormat`). `json_schema` and any other type, or extra keys on a recognized type,
+/// fail closed with a 400: this server has no way to return free text where the caller expects
+/// parseable JSON, or to honor a schema it cannot enforce.
+private func decodeChatResponseFormat(
+    _ raw: Any?
+) throws -> (ignoredPresent: Bool, honored: ServingResponseFormat?) {
+    guard let raw, !(raw is NSNull) else { return (false, nil) }
     guard let object = raw as? [String: Any] else {
         throw OpenAIServingError.invalidRequest(
             "response_format must be an object", param: "response_format")
     }
     let type = try requiredString(object["type"], param: "response_format")
-    guard type == "text", Set(object.keys) == ["type"] else {
+    switch type {
+    case "text":
+        guard Set(object.keys) == ["type"] else {
+            throw OpenAIServingError.invalidRequest(
+                "Structured output is not supported yet; only response_format.type=text and "
+                    + "response_format.type=json_object are accepted",
+                param: "response_format")
+        }
+        return (true, nil)
+    case "json_object":
+        guard Set(object.keys) == ["type"] else {
+            throw OpenAIServingError.invalidRequest(
+                "response_format.type=json_object accepts no additional keys",
+                param: "response_format")
+        }
+        return (false, .jsonObject)
+    case "json_schema":
         throw OpenAIServingError.invalidRequest(
-            "Structured output is not supported yet; only response_format.type=text is accepted",
+            "response_format.type=json_schema is not supported yet; "
+                + "response_format.type=json_object is",
+            param: "response_format")
+    default:
+        throw OpenAIServingError.invalidRequest(
+            "Structured output is not supported yet; only response_format.type=text and "
+                + "response_format.type=json_object are accepted",
             param: "response_format")
     }
-    return true
 }
 
 /// `logit_bias` is only accepted empty/absent — a non-empty bias map would change sampling in a

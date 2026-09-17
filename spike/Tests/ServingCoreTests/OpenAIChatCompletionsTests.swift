@@ -192,7 +192,6 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"min_p":1.5}"#, "min_p"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"seed":true}"#, "seed"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"n":2}"#, "n"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}"#, "messages.content"),
             (#"{"model":"","messages":[{"role":"user","content":"Hi"}]}"#, "model"),
             (#"{"model":"qwen3-32b","messages":[]}"#, "messages"),
@@ -283,8 +282,10 @@ final class OpenAIChatCompletionsTests: XCTestCase {
     func testNonNeutralValuedFieldsAreRejectedWithSpecificParam() throws {
         let cases: [(String, String)] = [
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_logprobs":1}"#, "top_logprobs"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text","extra":1}}"#, "response_format"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object","extra":1}}"#, "response_format"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#, "response_format"),
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"bogus"}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}}"#, "logit_bias"),
         ]
         for (body, param) in cases {

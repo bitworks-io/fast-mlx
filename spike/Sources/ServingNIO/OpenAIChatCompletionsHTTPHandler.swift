@@ -339,6 +339,41 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        // `response_format: {"type":"json_object"}` is a real feature (see `ServingResponseFormat`),
+        // but no backend applies its token constraint yet (slice 1a/1b of the response-format
+        // design) — the single ServingCore admission check below fails a request carrying it closed
+        // with a 400 unless the dispatched backend declares
+        // `supportsJSONObjectResponseFormat == true`, so this is the one place that can never be
+        // bypassed: every request reaches this line before `backend.start(_:)` is ever called (see
+        // `runGeneration` below, the only call site).
+        do {
+            try validateResponseFormatCapability(
+                request: request,
+                backendSupportsJSONObjectResponseFormat: backend.supportsJSONObjectResponseFormat)
+        } catch let error as OpenAIServingError {
+            writeError(
+                error,
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
+            return
+        } catch {
+            // `validateResponseFormatCapability` only ever throws `OpenAIServingError` — this
+            // catch-all exists solely so the `do` block's error type does not widen to `any Error`
+            // (matching every other typed catch in this method, e.g. the decode `do` above).
+            writeError(
+                .invalidRequest(
+                    "response_format json_object is not supported by the loaded model's decoding route",
+                    param: "response_format"),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
         // Serving evidence recording has no way to serialize per-token logprobs into
         // `ServingEvidence.Request`/`Response` today — fail closed with a normal OpenAI-style 400
         // BEFORE any evidence request construction, exactly like the `isLegacyCompletions` guard

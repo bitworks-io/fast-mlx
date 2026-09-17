@@ -7,6 +7,14 @@ public protocol ServingGenerationBackend: Sendable {
         resolvedCompletionBudget: ServingCompletionBudgetResolution
     ) async throws -> ServingGenerationHandle
     func shutdown() async
+    /// Whether this backend's decoding route can apply the `response_format: {"type":"json_object"}`
+    /// token constraint (the byte-level JSON pushdown automaton in slice 1a/1b of the response-format
+    /// design). Defaults to `false` in the protocol extension below, so every existing and
+    /// not-yet-updated backend fails closed: `validateResponseFormatCapability` (this file) must be
+    /// called at the single dispatch point before `start(_:)` so a request carrying
+    /// `.responseFormat == .jsonObject` is refused with a 400 rather than silently served as free
+    /// text by a backend that never applies the mask. No backend sets this `true` yet (slice 1c).
+    var supportsJSONObjectResponseFormat: Bool { get }
 }
 
 extension ServingGenerationBackend {
@@ -20,6 +28,28 @@ extension ServingGenerationBackend {
     }
 
     public func shutdown() async {}
+
+    public var supportsJSONObjectResponseFormat: Bool { false }
+}
+
+/// The single ServingCore-level admission check for `response_format: {"type":"json_object"}`
+/// against a specific backend's declared capability. Callers must invoke this at the one dispatch
+/// point that calls `backend.start(_:)` for a chat/completions request, before construction of any
+/// evidence/admission state for that request, so a capability-false backend never receives a
+/// request it would silently serve as free text. Throws `OpenAIServingError.invalidRequest` (param
+/// `response_format`) when `request.responseFormat == .jsonObject` and
+/// `backendSupportsJSONObjectResponseFormat` is `false`; otherwise returns normally (including when
+/// `request.responseFormat` is `nil`, i.e. every request before this feature existed).
+public func validateResponseFormatCapability(
+    request: OpenAIChatCompletionRequest,
+    backendSupportsJSONObjectResponseFormat: Bool
+) throws {
+    guard request.responseFormat == .jsonObject, !backendSupportsJSONObjectResponseFormat else {
+        return
+    }
+    throw OpenAIServingError.invalidRequest(
+        "response_format json_object is not supported by the loaded model's decoding route",
+        param: "response_format")
 }
 
 public struct ServingBackendAdmissionError: Error, Equatable, Sendable {

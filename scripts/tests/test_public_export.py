@@ -106,9 +106,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # spike/Tests/ServingCoreTests/ServingLogprobsTests.swift (OpenAI logprobs request/response
 # plumbing). Conscious decision to publish: both are family-neutral serving source/tests and
 # reference no host, credential, competitor or machine-local path.
+# 2026-09-17, 931 -> 940: adds the OpenAI response_format json_object token constraint
+# (spike/Sources/ServingCore/{ByteLevelTokenBytes,JSONObjectConstraintAutomaton,
+# JSONObjectConstraintTrie,JSONObjectTokenConstraint}.swift), the /v1/embeddings request/response
+# contract (spike/Sources/ServingCore/OpenAIEmbeddings.swift) and their five ServingCoreTests files.
+# Conscious decision to publish: all are family-neutral serving source/tests and reference no host,
+# credential, competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 931,
-    "pathModeSha256": "a0788ecb3fcd17ba6dca24efc9c5d8aa2f1dde7418aa98ecf5d2a2cebb21b407",
+    "pathCount": 940,
+    "pathModeSha256": "4f654b7f482604ebc611b3094e0c019538ef21defe773e006c40099ec016e753",
 }
 
 
