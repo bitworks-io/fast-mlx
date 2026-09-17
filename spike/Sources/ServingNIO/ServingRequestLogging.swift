@@ -85,7 +85,8 @@ func servingRequestLogTemplatedRoute(_ uri: String) -> String {
 }
 
 private let servingRequestLogKnownRoutes: Set<String> = [
-    "/v1/chat/completions", "/v1/completions", "/v1/models", "/metrics", "/healthz", "/readyz",
+    "/v1/chat/completions", "/v1/completions", "/v1/models", "/v1/embeddings", "/metrics",
+    "/healthz", "/readyz",
 ]
 
 /// Millisecond elapsed time on the monotonic clock, matching the conversion

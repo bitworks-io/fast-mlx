@@ -11,6 +11,11 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
 
     private let configuration: ServingHTTPConfiguration
     private let backend: any ServingGenerationBackend
+    /// Backs `POST /v1/embeddings`. `nil` (the default on both initializers below) means no
+    /// embedding model is loaded -- every request to that route then gets a 404 `invalid_request_error`
+    /// (see `handleEmbeddings`) instead of being silently accepted or routed to the chat `backend`
+    /// above, which has no embeddings capability at all.
+    private let embeddingsBackend: (any ServingEmbeddingsBackend)?
 
     private var pendingHead: HTTPRequestHead?
     private var pendingBody: ByteBuffer?
@@ -66,11 +71,13 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
 
     public convenience init(
         configuration: ServingHTTPConfiguration,
-        backend: any ServingGenerationBackend
+        backend: any ServingGenerationBackend,
+        embeddingsBackend: (any ServingEmbeddingsBackend)? = nil
     ) {
         self.init(
             configuration: configuration,
             backend: backend,
+            embeddingsBackend: embeddingsBackend,
             responseCompletionTestHook: nil,
             finalWriteRaceTestHook: nil)
     }
@@ -82,11 +89,13 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     internal init(
         configuration: ServingHTTPConfiguration,
         backend: any ServingGenerationBackend,
+        embeddingsBackend: (any ServingEmbeddingsBackend)? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) {
         self.configuration = configuration
         self.backend = backend
+        self.embeddingsBackend = embeddingsBackend
         self.responseCompletionTestHook = responseCompletionTestHook
         self.finalWriteRaceTestHook = finalWriteRaceTestHook
     }
@@ -282,9 +291,15 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
+
+        if head.uri == "/v1/embeddings" {
+            handleEmbeddings(head: head, bodyData: bodyData, context: context)
+            return
+        }
+
         let isLegacyCompletions = head.uri == "/v1/completions"
         let responseKind: ServingResponseKind = isLegacyCompletions ? .completions : .chat
-        let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
 
         // `ServingEvidence.validateCanonicalHTTPRequest` only recognizes `/v1/chat/completions` as a
         // canonical path — building `ServingEvidence.Request` for `/v1/completions` while evidence
@@ -448,6 +463,63 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
+    /// `POST /v1/embeddings`. Method is already confirmed `POST` by `validateHead` before
+    /// `receiveEnd` can reach here. No embedding model loaded (`embeddingsBackend == nil`, the
+    /// default) is answered with a 404 `invalid_request_error` -- distinct from every other route's
+    /// 400/401/415 rejections -- because the ROUTE exists but this server instance serves no
+    /// embedding model, mirroring OpenAI's own "the model does not exist" 404 shape rather than
+    /// pretending success or silently routing to the unrelated chat `backend`. A configured backend
+    /// still requires the request body to decode via `OpenAIEmbeddingsRequest.decodeStrict` before
+    /// any backend call, exactly like the chat/completions decode step above.
+    private func handleEmbeddings(
+        head: HTTPRequestHead,
+        bodyData: Data,
+        context: ChannelHandlerContext
+    ) {
+        guard let embeddingsBackend else {
+            writeError(
+                .invalidRequestWithCode(
+                    "This server does not serve embeddings: no embedding model is loaded",
+                    param: nil,
+                    code: "embeddings_unsupported"),
+                status: .notFound,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
+        let request: OpenAIEmbeddingsRequest
+        do {
+            request = try OpenAIEmbeddingsRequest.decodeStrict(
+                from: bodyData,
+                limits: configuration.requestLimits)
+        } catch let error as OpenAIServingError {
+            writeError(error, status: .badRequest, keepAlive: head.isKeepAlive, context: context)
+            return
+        } catch {
+            writeError(
+                .invalidRequest("Request body is not valid JSON", param: nil),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
+        let control = ServingTransportRequestControl()
+        let configuration = self.configuration
+        let channel = context.channel
+        activeControl = control
+        activeTask = Self.makeEmbeddingsTask(
+            request: request,
+            keepAlive: head.isKeepAlive,
+            configuration: configuration,
+            embeddingsBackend: embeddingsBackend,
+            channel: channel,
+            control: control,
+            requestLogPreamble: pendingRequestLogPreamble,
+            finalWriteRaceTestHook: finalWriteRaceTestHook)
+    }
+
     /// `GET /v1/models/{id}` (e.g. the OpenAI SDK's `models.retrieve`) has a variable path, so it
     /// cannot be matched with a plain `==` like the other routes. Returns the raw (still
     /// percent-ENCODED — callers must decode it) non-empty remainder after the `/v1/models/` prefix,
@@ -467,18 +539,23 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
         let isChat = head.uri == "/v1/chat/completions"
         let isCompletions = head.uri == "/v1/completions"
+        let isEmbeddings = head.uri == "/v1/embeddings"
         let isModels = head.uri == "/v1/models"
         let isModelDetail = Self.modelDetailPathSuffix(head.uri) != nil
         let isMetrics = head.uri == "/metrics"
         let isHealthz = head.uri == "/healthz"
         let isReadyz = head.uri == "/readyz"
-        guard isChat || isCompletions || isModels || isModelDetail || isMetrics || isHealthz || isReadyz else {
+        guard
+            isChat || isCompletions || isEmbeddings || isModels || isModelDetail || isMetrics
+                || isHealthz || isReadyz
+        else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
         }
         guard (isChat && head.method == .POST)
             || (isCompletions && head.method == .POST)
+            || (isEmbeddings && head.method == .POST)
             || (isModels && head.method == .GET)
             || (isModelDetail && head.method == .GET)
             || (isMetrics && head.method == .GET)
@@ -919,6 +996,180 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         responseCompletionTestHook: responseCompletionTestHook,
                         finalWriteRaceTestHook: finalWriteRaceTestHook)
                 }
+        }
+    }
+
+    static func makeEmbeddingsTask(
+        request: OpenAIEmbeddingsRequest,
+        keepAlive: Bool,
+        configuration: ServingHTTPConfiguration,
+        embeddingsBackend: any ServingEmbeddingsBackend,
+        channel: any Channel,
+        control: ServingTransportRequestControl,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+    ) -> Task<Void, Never> {
+        Task.detached {
+            await runEmbeddings(
+                request: request,
+                keepAlive: keepAlive,
+                configuration: configuration,
+                embeddingsBackend: embeddingsBackend,
+                channel: channel,
+                control: control,
+                requestLogPreamble: requestLogPreamble,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
+        }
+    }
+
+    /// `POST /v1/embeddings`'s non-streaming request/response cycle: call the configured
+    /// `ServingEmbeddingsBackend`, validate the shape of what it returns (a backend defect is
+    /// reported as a 500, never silently reshaped into a 200), encode with
+    /// `OpenAIEmbeddingsResponseBuilder`, and write one JSON response. No SSE, no backpressure
+    /// writability gate, and no per-token mailbox -- unlike chat/completions, an embeddings response
+    /// is a single bounded JSON payload, so this mirrors `runMetrics`'s simpler shape rather than
+    /// `runGeneration`'s streaming one.
+    ///
+    /// `dimensions` handling: if the request asked for a specific `dimensions` and the backend's
+    /// native vector length differs, this refuses with a 400 (`embeddings_dimensions_unsupported`)
+    /// rather than truncating and L2-renormalizing the backend's vectors here -- `OpenAIEmbeddings
+    /// .swift`'s contract (`OpenAIEmbeddingsRequest`/`OpenAIEmbeddingsResponseBuilder`) documents no
+    /// truncation/renormalization behavior for `dimensions`, so fabricating one at this layer would
+    /// silently misrepresent what the loaded model actually produced.
+    static func runEmbeddings(
+        request: OpenAIEmbeddingsRequest,
+        keepAlive: Bool,
+        configuration: ServingHTTPConfiguration,
+        embeddingsBackend: any ServingEmbeddingsBackend,
+        channel: any Channel,
+        control: ServingTransportRequestControl,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+    ) async {
+        // Redundant-but-harmless safety net, matching `runGeneration`/`runMetrics`'s own `defer` --
+        // every return path below already routes its final response part through `writeFinalPart`
+        // (directly, or via `writeServingFailure`), both of which mark `control` terminal before
+        // that write is even initiated.
+        defer {
+            control.markTerminal()
+        }
+        let requestLogID = UUID().uuidString
+
+        do {
+            try Task.checkCancellation()
+            let result = try await embeddingsBackend.embed(request)
+            try Task.checkCancellation()
+
+            guard result.vectors.count == request.inputs.count else {
+                throw OpenAIServingError.server(
+                    "embeddings backend returned \(result.vectors.count) vectors for \(request.inputs.count) inputs",
+                    code: "embeddings_vector_count_mismatch")
+            }
+            guard let nativeLength = result.vectors.first?.count, nativeLength > 0,
+                result.vectors.allSatisfy({ $0.count == nativeLength })
+            else {
+                throw OpenAIServingError.server(
+                    "embeddings backend returned vectors of inconsistent or zero length",
+                    code: "embeddings_vector_shape_invalid")
+            }
+            if let dimensions = request.dimensions, dimensions != nativeLength {
+                throw OpenAIServingError.invalidRequestWithCode(
+                    "dimensions=\(dimensions) is not supported by the loaded embedding model (native embedding length is \(nativeLength))",
+                    param: "dimensions",
+                    code: "embeddings_dimensions_unsupported")
+            }
+
+            let response = try OpenAIEmbeddingsResponseBuilder.encode(
+                embeddings: result.vectors,
+                model: request.model,
+                encodingFormat: request.encodingFormat,
+                promptTokens: result.promptTokens)
+            let data = try JSONEncoder.openAI.encode(response)
+            guard data.count <= configuration.maximumNonStreamingResponseBytes else {
+                throw OpenAIServingError.invalidRequestWithCode(
+                    "Response exceeds the configured byte limit",
+                    param: nil,
+                    code: "response_too_large")
+            }
+
+            var headers = HTTPHeaders()
+            headers.add(name: "content-type", value: "application/json")
+            headers.add(name: "content-length", value: "\(data.count)")
+            if !keepAlive {
+                headers.add(name: "connection", value: "close")
+            }
+            let head = HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)
+            try await writePart(
+                .head(head), channel: channel, timeout: configuration.backpressureStallTimeout)
+            var buffer = channel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            try await writePart(
+                .body(.byteBuffer(buffer)), channel: channel,
+                timeout: configuration.backpressureStallTimeout)
+            try await writeFinalPart(
+                control: control,
+                channel: channel,
+                timeout: configuration.backpressureStallTimeout,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
+
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: requestLogID,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .completed,
+                stream: false,
+                model: request.model,
+                promptTokens: result.promptTokens,
+                completionTokens: 0,
+                ignoredFields: request.ignoredFields)
+            if !keepAlive {
+                await close(channel)
+            }
+        } catch let servingError as OpenAIServingError {
+            _ = await writeServingFailure(
+                servingError,
+                responseStarted: false,
+                keepAlive: keepAlive,
+                channel: channel,
+                control: control,
+                timeout: configuration.backpressureStallTimeout,
+                configuration: configuration,
+                requestLogPreamble: requestLogPreamble,
+                requestLogRequestID: requestLogID,
+                requestLogStream: false,
+                requestLogModel: request.model,
+                requestLogIgnoredFields: request.ignoredFields,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
+        } catch is CancellationError {
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: requestLogID,
+                status: Int(HTTPResponseStatus.internalServerError.code),
+                outcome: .clientDisconnected,
+                stream: false,
+                model: request.model,
+                ignoredFields: request.ignoredFields)
+            await close(channel)
+        } catch {
+            // Any non-`OpenAIServingError` thrown directly by `embeddingsBackend.embed` is a
+            // backend defect, never a client-request problem -- mapped to a 500 exactly like
+            // `runGeneration`'s own untyped catch-all, rather than leaking the raw error message.
+            _ = await writeServingFailure(
+                .server("embeddings backend failed", code: "embeddings_backend_failed"),
+                responseStarted: false,
+                keepAlive: keepAlive,
+                channel: channel,
+                control: control,
+                timeout: configuration.backpressureStallTimeout,
+                configuration: configuration,
+                requestLogPreamble: requestLogPreamble,
+                requestLogRequestID: requestLogID,
+                requestLogStream: false,
+                requestLogModel: request.model,
+                requestLogIgnoredFields: request.ignoredFields,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
         }
     }
 

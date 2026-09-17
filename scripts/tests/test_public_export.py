@@ -112,9 +112,12 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # contract (spike/Sources/ServingCore/OpenAIEmbeddings.swift) and their five ServingCoreTests files.
 # Conscious decision to publish: all are family-neutral serving source/tests and reference no host,
 # credential, competitor or machine-local path.
+# 2026-09-17, 940 -> 942: adds spike/Sources/ServingCore/ServingEmbeddingsBackend.swift (the
+# embeddings backend protocol behind POST /v1/embeddings) and
+# spike/Tests/ServingNIOTests/OpenAIEmbeddingsHTTPHandlerTests.swift. Same publish rationale.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 940,
-    "pathModeSha256": "4f654b7f482604ebc611b3094e0c019538ef21defe773e006c40099ec016e753",
+    "pathCount": 942,
+    "pathModeSha256": "87f56eabfe2f06b1a2fec55e73d219622bbe4fa85604d655a0c1b23cdcbff499",
 }
 
 

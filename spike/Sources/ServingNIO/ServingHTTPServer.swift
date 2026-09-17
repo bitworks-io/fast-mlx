@@ -128,6 +128,7 @@ public actor ServingHTTPServer {
         bind: ServingHTTPBind = .loopbackEphemeral,
         configuration: ServingHTTPConfiguration,
         backend: any ServingGenerationBackend,
+        embeddingsBackend: (any ServingEmbeddingsBackend)? = nil,
         eventLoopThreads: Int = 1,
         tuning: ServingHTTPTransportTuning = .productionDefault
     ) async throws -> ServingHTTPServer {
@@ -153,7 +154,8 @@ public actor ServingHTTPServer {
                     try pipeline.addHandler(
                         OpenAIChatCompletionsHTTPHandler(
                             configuration: configuration,
-                            backend: backend))
+                            backend: backend,
+                            embeddingsBackend: embeddingsBackend))
                     guard connections.register(channel) else {
                         throw ServingHTTPServerError.serverStopping
                     }
