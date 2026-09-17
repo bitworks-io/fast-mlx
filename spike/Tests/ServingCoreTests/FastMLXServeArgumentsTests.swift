@@ -2608,19 +2608,28 @@ final class FastMLXServeArgumentsTests: XCTestCase {
     /// read fails, arm text not found — this test FAILS with a named reason; it must never silently
     /// skip (this repo has been bitten before by a conditional assertion that skips instead of
     /// failing).
-    func testFastMLXServeArgumentErrorCatchArmCallSitePinExists() {
-        // Resolve the call site by SEARCHING ancestors for it, not by counting levels. The
-        // repository layout is not the only one this file compiles under: the fleet sync script
-        // deploys `spike/`'s CONTENTS as the package root on the fleet hosts, so the package sits
-        // one directory shallower there and a fixed four-level walk lands on a path that does not
-        // exist. `#filePath` is baked at compile time, so on the fleet that would be a spurious
-        // FAILURE, not a skip -- and a pin that cries wolf gets muted, which is how a real pin dies.
-        // Both layouts are accepted; neither found is still a hard failure.
+    /// Outcome of searching for and reading `FastMLXServe.swift` from a test file's compile-time
+    /// `#filePath`, distinguishing "not found" from "found but unreadable" so each call site can
+    /// render its own named failure reason rather than collapsing both into one message.
+    private enum FastMLXServeSourceLookup {
+        case found(path: String, source: String)
+        case notFound
+        case unreadable(path: String, error: Error)
+    }
+
+    /// Locate `FastMLXServe.swift` by SEARCHING ancestors of `filePath`, not by counting levels.
+    /// The repository layout is not the only one this file compiles under: the fleet sync script
+    /// deploys `spike/`'s CONTENTS as the package root on the fleet hosts, so the package sits one
+    /// directory shallower there and a fixed four-level walk lands on a path that does not exist.
+    /// `#filePath` is baked at compile time, so on the fleet that would be a spurious FAILURE, not
+    /// a skip -- and a pin that cries wolf gets muted, which is how a real pin dies. Both layouts
+    /// are accepted; neither found is still a hard failure, left to the caller to render.
+    private func locateFastMLXServeSource(searchingFrom filePath: String) -> FastMLXServeSourceLookup {
         let candidateSuffixes = [
             ["spike", "Sources", "fastmlx-serve", "FastMLXServe.swift"],
             ["Sources", "fastmlx-serve", "FastMLXServe.swift"],
         ]
-        var searchDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var searchDirectory = URL(fileURLWithPath: filePath).deletingLastPathComponent()
         var resolvedMainFile: URL?
         for _ in 0..<8 {
             for suffix in candidateSuffixes {
@@ -2634,21 +2643,31 @@ final class FastMLXServeArgumentsTests: XCTestCase {
             searchDirectory.deleteLastPathComponent()
         }
 
-        guard let mainFilePath = resolvedMainFile else {
+        guard let mainFilePath = resolvedMainFile else { return .notFound }
+
+        do {
+            let source = try String(contentsOf: mainFilePath, encoding: .utf8)
+            return .found(path: mainFilePath.path, source: source)
+        } catch {
+            return .unreadable(path: mainFilePath.path, error: error)
+        }
+    }
+
+    func testFastMLXServeArgumentErrorCatchArmCallSitePinExists() {
+        let source: String
+        switch locateFastMLXServeSource(searchingFrom: #filePath) {
+        case .found(_, let foundSource):
+            source = foundSource
+        case .notFound:
             XCTFail(
                 "could not locate FastMLXServe.swift by walking up from #filePath (\(#filePath)); "
                     + "the repo/package layout moved relative to this test file. Fix the search "
                     + "above rather than letting this pin go silent.")
             return
-        }
-
-        let source: String
-        do {
-            source = try String(contentsOf: mainFilePath, encoding: .utf8)
-        } catch {
+        case .unreadable(let path, let error):
             XCTFail(
                 "could not read FastMLXServe.swift from the #filePath-derived path "
-                    + "\(mainFilePath.path) — repo layout moved relative to this test file, or "
+                    + "\(path) — repo layout moved relative to this test file, or "
                     + "#filePath resolution regressed; fix the path derivation above rather than "
                     + "letting this pin go silent: \(error)")
             return
@@ -2678,5 +2697,67 @@ final class FastMLXServeArgumentsTests: XCTestCase {
             armBody.contains("exit(2)"),
             "the FastMLXServeArgumentError catch arm no longer calls exit(2); the process would "
                 + "fall through instead of exiting cleanly")
+    }
+
+    /// The live-host defect this pins: `fastmlx-serve` announces its startup/ready line, per-
+    /// request failure lines, and `shutdown=complete` with plain `print` to stdout. When stdout is
+    /// redirected to a file -- as both launchd and nohup do -- libc block-buffers a non-terminal
+    /// stdout, so those lines sit in the buffer and only reach the log file at process exit. A
+    /// script polling the log for `ready=true` therefore times out against an otherwise-healthy
+    /// server. Assert the fix runs before `run()` is ever awaited, not merely that the call exists
+    /// somewhere in the file: read only the text between `main()`'s opening brace and its first
+    /// `try await run()`, after stripping `//`-commented lines so a commented-out call cannot
+    /// satisfy this pin.
+    func testFastMLXServeLineBuffersStdoutBeforeRunning() {
+        let source: String
+        switch locateFastMLXServeSource(searchingFrom: #filePath) {
+        case .found(_, let foundSource):
+            source = foundSource
+        case .notFound:
+            XCTFail(
+                "could not locate FastMLXServe.swift by walking up from #filePath (\(#filePath)); "
+                    + "the repo/package layout moved relative to this test file. Fix the search "
+                    + "above rather than letting this pin go silent.")
+            return
+        case .unreadable(let path, let error):
+            XCTFail(
+                "could not read FastMLXServe.swift from the #filePath-derived path "
+                    + "\(path) — repo layout moved relative to this test file, or "
+                    + "#filePath resolution regressed; fix the path derivation above rather than "
+                    + "letting this pin go silent: \(error)")
+            return
+        }
+
+        let uncommentedLines = source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+        let uncommented = uncommentedLines.joined(separator: "\n")
+
+        let mainMarker = "static func main() async throws {"
+        guard let mainRange = uncommented.range(of: mainMarker) else {
+            XCTFail(
+                "FastMLXServe.swift no longer declares `\(mainMarker)`; fix the marker above "
+                    + "rather than letting this pin go silent")
+            return
+        }
+
+        guard
+            let runRange = uncommented.range(
+                of: "try await run()", range: mainRange.upperBound..<uncommented.endIndex)
+        else {
+            XCTFail(
+                "FastMLXServe.swift's main() no longer calls `try await run()`; fix the marker "
+                    + "above rather than letting this pin go silent")
+            return
+        }
+
+        let mainPrologue = uncommented[mainRange.upperBound..<runRange.lowerBound]
+
+        XCTAssertTrue(
+            mainPrologue.contains("setvbuf(stdout, nil, _IOLBF, 0)"),
+            "fastmlx-serve's main() no longer line-buffers stdout before awaiting run(); "
+                + "startup/ready/failure/shutdown lines will stay stuck in a block buffer until "
+                + "process exit when stdout is redirected to a file (launchd, nohup), and a "
+                + "script polling the log for ready=true against a healthy server will time out")
     }
 }

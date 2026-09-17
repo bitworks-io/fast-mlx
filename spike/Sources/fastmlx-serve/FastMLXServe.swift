@@ -44,6 +44,12 @@ private func servingCapacityThresholds(
 @main
 struct FastMLXServe {
     static func main() async throws {
+        // Supervisors and scripts (launchd, nohup) read the startup/ready, per-request-failure,
+        // and shutdown lines below from a redirected-to-file stdout. A non-terminal stdout is
+        // block-buffered by default, so those `print` lines would otherwise sit in the buffer
+        // until process exit instead of reaching the log promptly -- making a healthy, still-
+        // running server look hung to anything polling the log for `ready=true`.
+        setvbuf(stdout, nil, _IOLBF, 0)
         do {
             try await run()
         } catch let completed as FitCheckOnlyCompleted {
