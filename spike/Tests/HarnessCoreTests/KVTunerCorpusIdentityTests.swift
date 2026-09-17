@@ -9,20 +9,11 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
         }.sorted()
     }
 
-    private func builtInMeasurementCorpus() throws -> MeasurementCorpus {
-        var directory = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-        for _ in 0..<8 {
-            let candidate = directory.appendingPathComponent(
-                "corpus/measurement-corpus-v2.json")
-            if FileManager.default.fileExists(atPath: candidate.path) {
-                return try MeasurementCorpusLoader.load(
-                    from: Data(contentsOf: candidate))
-            }
-            directory.deleteLastPathComponent()
-        }
-        throw CocoaError(.fileNoSuchFile)
-    }
+    // builtInMeasurementCorpus() (loaded spike/corpus/measurement-corpus-v2.json off disk) and the
+    // three cases that used it — testOnlyExactBuiltInMeasurementCorpusReceivesAuditedSourceProvenance,
+    // testFullContentSHARejectsCollisionStyleMeasurementIdentity, and
+    // testCustomConstructionRequiresSourceRowsAndCannotDecodeAuditedAssertion — moved verbatim to
+    // KVTunerAuditedCorpusProvenanceTests.swift, since the public projection cannot ship that asset.
 
     func testMeasurementIdentityHashesExactTextIndependentOfEntryID() throws {
         let originalEntries = [
@@ -161,74 +152,6 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
                 KVTunerEvaluationCorpusIdentity.self,
                 from: JSONEncoder().encode(identity)),
             identity)
-    }
-
-    func testOnlyExactBuiltInMeasurementCorpusReceivesAuditedSourceProvenance() throws {
-        let corpus = try builtInMeasurementCorpus()
-        let identity = try KVTunerEvaluationCorpusIdentity.measurementCorpus(
-            corpus)
-        XCTAssertEqual(
-            identity.sourceProvenance,
-            .firstPartyAuditedNoGSM8K)
-        XCTAssertEqual(
-            identity.canonicalSourceItemDigests.count,
-            corpus.entries.count)
-        XCTAssertEqual(
-            try JSONDecoder().decode(
-                KVTunerEvaluationCorpusIdentity.self,
-                from: JSONEncoder().encode(identity)),
-            identity)
-
-        var alteredEntries = corpus.entries
-        alteredEntries[0] = MeasurementCorpusEntry(
-            id: alteredEntries[0].id,
-            tag: alteredEntries[0].tag,
-            text: "Question: rewrapped calibration source\nAnswer:")
-        let forgedAggregate = MeasurementCorpus(
-            corpusId: corpus.corpusId,
-            entries: alteredEntries,
-            contentHash: corpus.contentHash)
-        XCTAssertThrowsError(
-            try KVTunerEvaluationCorpusIdentity.measurementCorpus(
-                forgedAggregate)
-        ) { error in
-            XCTAssertEqual(
-                error as? KVTunerEvaluationCorpusIdentityError,
-                .canonicalSourceItemsRequired)
-        }
-
-        let customIdentity = try KVTunerEvaluationCorpusIdentity
-            .measurementCorpus(
-                forgedAggregate,
-                canonicalSourceItemDigests: sourceRows(
-                    "rewrapped-measurement", count: alteredEntries.count))
-        XCTAssertEqual(customIdentity.sourceProvenance, .canonicalSourceItems)
-    }
-
-    func testFullContentSHARejectsCollisionStyleMeasurementIdentity() throws {
-        let corpus = try builtInMeasurementCorpus()
-        var renamedEntries = corpus.entries
-        let first = renamedEntries[0]
-        renamedEntries[0] = MeasurementCorpusEntry(
-            id: first.id + "-renamed",
-            tag: first.tag,
-            text: first.text)
-        let forged = MeasurementCorpus(
-            corpusId: corpus.corpusId,
-            entries: renamedEntries,
-            contentHash: corpus.contentHash)
-
-        XCTAssertEqual(
-            corpus.entries.map { KVTunerPromptDigest.exactText($0.text) }.sorted(),
-            renamedEntries.map { KVTunerPromptDigest.exactText($0.text) }.sorted(),
-            "the collision-style input preserves every old prompt fingerprint")
-        XCTAssertThrowsError(
-            try KVTunerEvaluationCorpusIdentity.measurementCorpus(forged)
-        ) { error in
-            XCTAssertEqual(
-                error as? KVTunerEvaluationCorpusIdentityError,
-                .canonicalSourceItemsRequired)
-        }
     }
 
     func testFullContentSHAIncludesTaskScoringExpectations() throws {
@@ -384,58 +307,97 @@ final class KVTunerCorpusIdentityTests: XCTestCase {
         }
     }
 
-    func testCustomConstructionRequiresSourceRowsAndCannotDecodeAuditedAssertion() throws {
-        XCTAssertThrowsError(try KVTunerEvaluationCorpusIdentity(
-            id: "evaluation-v1",
-            aggregateDigest: "1111111111111111",
-            canonicalEntryDigests: ["2222222222222222"],
-            canonicalSourceItemDigests: []
-        )) { error in
+    // testOnlyExactBuiltInMeasurementCorpusReceivesAuditedSourceProvenance,
+    // testFullContentSHARejectsCollisionStyleMeasurementIdentity, and
+    // testCustomConstructionRequiresSourceRowsAndCannotDecodeAuditedAssertion moved verbatim to
+    // KVTunerAuditedCorpusProvenanceTests.swift (see note near sourceRows above).
+
+    /// Documents and pins the refusal branch of `measurementCorpus(_:)` using only synthetic
+    /// data — the admit branch (needs the real, unpublishable corpus bytes) is covered in
+    /// KVTunerAuditedCorpusProvenanceTests.swift instead.
+    ///
+    /// LIMITATION (verified, not assumed): `measurementCorpus(_:)` gates admission on FOUR
+    /// ANDed comparisons — corpusId, contentHash, entries.count, and a transcript SHA256 computed
+    /// fresh from the corpus's exact entries (id/tag/text) via
+    /// `KVTunerEvaluationCorpusAudit.measurementTranscriptSHA256(_:)`. That transcript hash
+    /// necessarily also encodes corpusId and entries.count as transcript fields, so it is a
+    /// strict superset of the other three checks: no synthetic (non-real) corpus can ever satisfy
+    /// it, which means the transcript-mismatch alone already forces refusal for every case below
+    /// regardless of whether the corpusId/contentHash/entries.count comparisons still exist in the
+    /// source. A mutation that DELETES any one of those three redundant comparisons therefore
+    /// cannot be caught by a synthetic-corpus test — doing so would require forging entries whose
+    /// SHA256 transcript collides with the pinned literal, which is only possible with the real,
+    /// unpublishable corpus content (or a SHA256 preimage break). This was confirmed empirically
+    /// by temporarily deleting the `contentHash` comparison from `measurementCorpus(_:)`,
+    /// rebuilding, and observing that every case below still passed (still threw) unchanged; the
+    /// mutation was then reverted. See the task handoff report for that mutation run.
+    /// What IS discriminating here: whether the refusal path exists and fires at all (e.g. a
+    /// mutation that always admits, or that stops throwing `.canonicalSourceItemsRequired`,
+    /// IS caught by every case below).
+    func testMeasurementCorpusThrowsForEachIndependentlyConstructibleRefusalReason() throws {
+        // Case 1: corpusId wrong; contentHash forged to the real pinned literal (public — it's
+        // already a source-code literal, not private content) and entries.count == 5 to keep the
+        // other two surface-level pins as close to "correct" as achievable without the private
+        // corpus bytes.
+        let wrongCorpusId = MeasurementCorpus(
+            corpusId: "not-measurement-corpus-v2",
+            entries: (0..<5).map {
+                MeasurementCorpusEntry(
+                    id: "synthetic-\($0)", tag: .prose, text: "synthetic entry \($0)")
+            },
+            contentHash: "8dd73ade100742f2")
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.measurementCorpus(wrongCorpusId)
+        ) { error in
             XCTAssertEqual(
                 error as? KVTunerEvaluationCorpusIdentityError,
                 .canonicalSourceItemsRequired)
         }
 
-        let canonical = try KVTunerEvaluationCorpusIdentity(
-            id: "evaluation-v1",
-            aggregateDigest: "1111111111111111",
-            canonicalEntryDigests: ["2222222222222222"],
-            canonicalSourceItemDigests: sourceRows("evaluation", count: 1))
-        var object = try XCTUnwrap(
-            JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(canonical)) as? [String: Any])
-        object["sourceProvenance"] =
-            "first-party-audited-no-gsm8k-v1"
-        object["canonicalSourceItemDigests"] =
-            KVTunerEvaluationSourceProvenance.auditedSourceItemDigests(
-                entryDigests: canonical.canonicalEntryDigests)
+        // Case 2: corpusId and entries.count correct; contentHash forged to an obviously wrong
+        // value (contentHash is a stored, forgeable field on MeasurementCorpus — see the public
+        // initializer — so it can be set independently of corpusId/entries.count here).
+        let wrongContentHash = MeasurementCorpus(
+            corpusId: "measurement-corpus-v2",
+            entries: (0..<5).map {
+                MeasurementCorpusEntry(
+                    id: "synthetic-\($0)", tag: .prose, text: "synthetic entry \($0)")
+            },
+            contentHash: "0000000000000000")
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.measurementCorpus(wrongContentHash)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerEvaluationCorpusIdentityError,
+                .canonicalSourceItemsRequired)
+        }
 
-        XCTAssertThrowsError(try JSONDecoder().decode(
-            KVTunerEvaluationCorpusIdentity.self,
-            from: JSONSerialization.data(withJSONObject: object)))
+        // Case 3: corpusId and contentHash correct-looking; entries.count wrong (4, not 5).
+        let wrongEntryCount = MeasurementCorpus(
+            corpusId: "measurement-corpus-v2",
+            entries: (0..<4).map {
+                MeasurementCorpusEntry(
+                    id: "synthetic-\($0)", tag: .prose, text: "synthetic entry \($0)")
+            },
+            contentHash: "8dd73ade100742f2")
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.measurementCorpus(wrongEntryCount)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerEvaluationCorpusIdentityError,
+                .canonicalSourceItemsRequired)
+        }
 
-        let builtIn = try KVTunerEvaluationCorpusIdentity.measurementCorpus(
-            builtInMeasurementCorpus())
-        var modifiedAudited = try XCTUnwrap(
-            JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(builtIn)) as? [String: Any])
-        modifiedAudited["id"] = "custom-collision-style-identity"
-        XCTAssertThrowsError(try JSONDecoder().decode(
-            KVTunerEvaluationCorpusIdentity.self,
-            from: JSONSerialization.data(withJSONObject: modifiedAudited)))
-
-        let replacementEntryDigest = "3333333333333333"
-        modifiedAudited = try XCTUnwrap(
-            JSONSerialization.jsonObject(
-                with: JSONEncoder().encode(builtIn)) as? [String: Any])
-        modifiedAudited["canonicalEntryDigests"] = [
-            replacementEntryDigest
-        ]
-        modifiedAudited["canonicalSourceItemDigests"] =
-            KVTunerEvaluationSourceProvenance.auditedSourceItemDigests(
-                entryDigests: [replacementEntryDigest])
-        XCTAssertThrowsError(try JSONDecoder().decode(
-            KVTunerEvaluationCorpusIdentity.self,
-            from: JSONSerialization.data(withJSONObject: modifiedAudited)))
+        // Case 4: an entirely empty/degenerate corpus — the coarsest possible refusal check,
+        // included so a mutation that special-cases "empty" into acceptance is also caught.
+        let empty = MeasurementCorpus(
+            corpusId: "measurement-corpus-v2", entries: [], contentHash: "")
+        XCTAssertThrowsError(
+            try KVTunerEvaluationCorpusIdentity.measurementCorpus(empty)
+        ) { error in
+            XCTAssertEqual(
+                error as? KVTunerEvaluationCorpusIdentityError,
+                .canonicalSourceItemsRequired)
+        }
     }
 }

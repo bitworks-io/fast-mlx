@@ -136,9 +136,40 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: family-neutral (no internal model-family CamelCase identifier --
 # only the lowercase snake_case "qwen4_exp" JSON field value already used throughout this
 # projected test directory), references no host, credential, competitor or machine-local path.
+# 2026-09-17, 968 -> 967: makes the projected public test suite green by excluding the three
+# HarnessCoreTests files whose cases require assets the projection cannot ship. The first
+# measurement of the eight MLX-free projected targets found 2565 tests with 75 assertion failures
+# (47 cases), every one of them an asset dependency rather than a logic defect.
+# (a) LoadedBenchQualificationRunnerTests.swift (41 cases) is excluded: every case spawns the
+# loaded-bench qualification shell script, which lives under a forbidden public path prefix that
+# both export_public_repository.py and validate_public_repository.py enforce, so it is never
+# projected. Projecting it was reviewed and rejected on the merits -- not for secrecy (its
+# qualification protocol is already published in HarnessCore and fastmlx-harness sources, and a
+# marker scan of it is clean) but because it would require deleting a category-level boundary from
+# two projected scripts, and because it cannot run in a public checkout at all: it requires the
+# harness stamp file (itself a forbidden public path) and a build product from a private
+# DerivedData path. Projecting it would publish a decorative, non-runnable artifact. No public
+# coverage is lost, because the code it exercises is not public either.
+# (b) MeasurementCorpusRealAssetTests.swift and (c) KVTunerAuditedCorpusProvenanceTests.swift are
+# NEW dev-only files, each excluded. Three cases from MeasurementCorpusTests.swift and three from
+# KVTunerCorpusIdentityTests.swift move into them verbatim: those six read the measurement corpus
+# JSON under spike/corpus/, which holds private comparative benchmark data and can never be
+# published. The split is deliberate -- exclusion is file-granular, so excluding the two original
+# files wholesale would have dropped 22 passing cases of genuinely public logic. After the split
+# the originals stay projected with 12 and 11 cases respectively.
+# Net -1 path: one previously projected file excluded; the two new files are dev-only.
+# The dropped coverage is replaced, not silently lost: KVTunerCorpusIdentityTests.swift gains
+# testMeasurementCorpusThrowsForEachIndependentlyConstructibleRefusalReason, which pins the
+# refusal branch of measurementCorpus(_:) using only synthetic corpora. Its doc comment records a
+# verified limitation rather than overclaiming -- the pinned transcript SHA256 is a strict superset
+# of the corpusId/contentHash/entries.count checks, so no synthetic corpus can discriminate those
+# three clauses individually; a mutation run confirmed the refusal-path-exists assertion IS
+# discriminating (replacing the gate with an unconditional admit fails all four assertions).
+# Conscious decision to publish: family-neutral serving/harness tests, no host, credential,
+# competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 968,
-    "pathModeSha256": "a362c9f4d1dd108b37e13d57af5ffe2d9136c6616c15a8d3d553a67b546dcb89",
+    "pathCount": 967,
+    "pathModeSha256": "f00272f8751eff6e81d21bb08b3fb24d24bc19bc8c583b9958bff97b06c86265",
 }
 
 

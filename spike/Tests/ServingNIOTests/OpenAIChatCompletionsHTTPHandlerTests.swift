@@ -943,7 +943,15 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertTrue(response.body.contains(#""code":"generation_failed""#), response.body)
         XCTAssertFalse(response.body.contains(#""tool_calls""#), response.body)
 
-        _ = try await channel.finish()
+        // This test's handler emits a TERMINAL SSE error event and then closes the connection, so
+        // by teardown the channel may already be closed -- unlike the tests around it, whose
+        // handlers leave it open. Whether the close has landed by the time `finish()` runs is a
+        // race: under suite load it usually has not (the full bundle passes), but run in isolation
+        // this test lost that race 12 times out of 12 and failed with ChannelError.alreadyClosed.
+        // `acceptAlreadyClosed: true` tolerates exactly that one condition and nothing else -- any
+        // other ChannelError still throws, and `throwIfErrorCaught()` still runs -- so this keeps
+        // the teardown assertion rather than weakening it into a bare `try?`.
+        _ = try await channel.finish(acceptAlreadyClosed: true)
     }
 
     func testCompletionsStreamOptionsIncludeUsageEmitsTerminalUsageChunkBeforeDone() async throws {
