@@ -84,6 +84,19 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
     private var hits = 0
     private var misses = 0
 
+    /// Slice 1f miss-path optimization: the STAY bitset + EXIT candidate list for a string-
+    /// internal lexical sub-state (see `JSONObjectAutomaton.StringLexicalKey`,
+    /// `JSONObjectConstraintTrie.classifyStringRun(from:)`). At most ~13 distinct keys are ever
+    /// reachable (the lexical sub-state space is bounded by the automaton's own grammar, not by
+    /// vocab size or request traffic), so this is computed lazily, once per key, and never evicted.
+    private struct StringRunEntry {
+        let stayBitset: [UInt64]
+        let exitCandidates: [(id: Int, bytes: [UInt8])]
+        let byteSize: Int
+    }
+    private var stringRunCache: [JSONObjectAutomaton.StringLexicalKey: StringRunEntry] = [:]
+    private var stringRunBytesUsed = 0
+
     public convenience init(
         classifications: [TokenByteClassification],
         cacheByteBudget: Int = JSONObjectConstraintTable.defaultCacheByteBudget
@@ -154,7 +167,7 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
             "{\"k\":\"v\",",  // comma -> objectExpectKey
             "{\"k\":\"v\", ",  // structural whitespace after comma
             "{}",  // completed document (empty object)
-            "{} ",  // completed document, trailing whitespace
+            "{\n  ",  // pretty-print indentation after '{' (line break already seen in the run)
             "{\"k\":\"v\"}",  // completed document (non-empty object)
             "{\"k\":[",  // arrayExpectValueOrEnd
             "{\"k\":[1",  // number (intDigits), inside an array
@@ -257,7 +270,16 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
         if let cached = lookupCache(key) {
             return cached
         }
-        var bitset = trie.allowedBitset(from: automaton, wordCount: wordCount)
+        var bitset: [UInt64]
+        if let lexicalKey = automaton.stringLexicalKey {
+            // Miss-path fast path (slice 1f): a novel state deep inside a string no longer pays an
+            // O(vocab) trie DFS. The STAY bitset for this lexical sub-state is computed once (ever)
+            // and shared across every automaton state with the same key; only the (small) EXIT
+            // candidate list is re-checked per miss, against THIS automaton's real context.
+            bitset = stringRunBitset(for: lexicalKey, automaton: automaton)
+        } else {
+            bitset = trie.allowedBitset(from: automaton, wordCount: wordCount)
+        }
         if automaton.isComplete {
             for id in sortedEOSIds {
                 Self.setBit(&bitset, id)
@@ -316,12 +338,85 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
         return value
     }
 
+    /// Builds (or reuses) `key`'s STAY bitset, then re-checks only its EXIT candidates against
+    /// `automaton`'s REAL state — a full per-token replay (copy the automaton, feed every byte),
+    /// exactly what `JSONObjectTokenConstraint.advance(token:)` already does for a single token,
+    /// just restricted to the small EXIT list instead of the whole vocab.
+    private func stringRunBitset(
+        for key: JSONObjectAutomaton.StringLexicalKey, automaton: JSONObjectAutomaton
+    ) -> [UInt64] {
+        let entry = stringRunEntry(for: key, automaton: automaton)
+        var bitset = entry.stayBitset
+        for candidate in entry.exitCandidates {
+            var probe = automaton
+            var ok = true
+            for byte in candidate.bytes {
+                guard probe.advance(byte: byte) else {
+                    ok = false
+                    break
+                }
+            }
+            if ok {
+                Self.setBit(&bitset, candidate.id)
+            }
+        }
+        return bitset
+    }
+
+    /// Lazily computes and caches `key`'s `StringRunEntry`. Held entirely under `lock` — this runs
+    /// at most ~13 times ever (see `JSONObjectAutomaton.StringLexicalKey`'s doc comment), so paying
+    /// the full O(vocab) trie walk under the lock is negligible, and avoids a redundant duplicate
+    /// computation race between two concurrent first-misses on the same key.
+    private func stringRunEntry(
+        for key: JSONObjectAutomaton.StringLexicalKey, automaton: JSONObjectAutomaton
+    ) -> StringRunEntry {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = stringRunCache[key] {
+            return cached
+        }
+        let (stayIds, exitCandidates) = trie.classifyStringRun(from: automaton)
+        var stayBitset = [UInt64](repeating: 0, count: wordCount)
+        for id in stayIds {
+            Self.setBit(&stayBitset, id)
+        }
+        let byteSize =
+            stayBitset.count * MemoryLayout<UInt64>.stride
+            + exitCandidates.reduce(0) { $0 + MemoryLayout<Int>.stride + $1.bytes.count }
+        let entry = StringRunEntry(stayBitset: stayBitset, exitCandidates: exitCandidates, byteSize: byteSize)
+        stringRunCache[key] = entry
+        stringRunBytesUsed += byteSize
+        return entry
+    }
+
+    /// Total bytes held by the string-run cache (STAY bitsets + EXIT candidate byte lists), across
+    /// at most ~13 entries. Test-only seam (internal): proves this memory is bounded and accounted
+    /// for, not unbounded or invisible to the byte budget — see `storeCache`'s effective budget.
+    var stringRunCacheBytes: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stringRunBytesUsed
+    }
+
+    /// Number of distinct string-internal lexical sub-states seen so far (bounded, ~13 max). Test-
+    /// only seam (internal).
+    var stringRunCacheEntryCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stringRunCache.count
+    }
+
     private func storeCache(_ key: JSONObjectAutomaton.MaskCacheKey, _ bitset: [UInt64]) {
         lock.lock()
         defer { lock.unlock() }
         guard cache[key] == nil else { return }
         let entryBytes = bitset.count * MemoryLayout<UInt64>.stride
-        while cachedBytesUsed + entryBytes > cacheByteBudget, orderHead < order.count {
+        // The string-run cache (STAY bitsets + EXIT candidate lists) is accounted against the SAME
+        // byte budget as the per-state mask cache, not a separate unbounded pool — it is tiny
+        // (bounded entry count) but real memory, so it must actually reduce how much the FIFO mask
+        // cache is allowed to hold, not merely be reported alongside it.
+        let effectiveBudget = max(0, cacheByteBudget - stringRunBytesUsed)
+        while cachedBytesUsed + entryBytes > effectiveBudget, orderHead < order.count {
             let oldest = order[orderHead]
             orderHead += 1
             if let removed = cache.removeValue(forKey: oldest) {

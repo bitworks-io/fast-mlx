@@ -88,8 +88,12 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
         XCTAssertTrue(JSONObjectAutomaton.accepts(#"{"a":"café"}"#))
     }
 
-    func testAcceptsSurroundingWhitespace() {
-        XCTAssertTrue(JSONObjectAutomaton.accepts("  {  \"a\" : 1  }  "))
+    func testAcceptsInteriorWhitespace() {
+        // Updated for defect B (json_object slice 1f): whitespace is no longer accepted BEFORE the
+        // top-level `{` or AFTER the top-level `}` closes — see `JSONObjectConstraintWhitespaceTests`
+        // — but interior structural whitespace (around a key, colon, value, and before the close)
+        // is unaffected.
+        XCTAssertTrue(JSONObjectAutomaton.accepts("{  \"a\" : 1  }"))
     }
 
     func testAcceptsDepth64Nesting() {
@@ -485,8 +489,11 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
 
     func testWhitespacePreferringScorerWithoutCapWouldNeverTerminate() {
         // Positive control: with the production cap, an unbounded run of whitespace bytes stops
-        // exactly at the cap.
+        // exactly at the cap. Structural whitespace only exists INSIDE the object (defect B, slice
+        // 1f: none is accepted before the top-level `{`), so both automatons here are first driven
+        // past `{` before the run of spaces under test.
         var capped = JSONObjectAutomaton()
+        XCTAssertTrue(capped.advance(byte: UInt8(ascii: "{")))
         var cappedConsumed = 0
         for _ in 0..<(JSONObjectAutomaton.defaultMaxConsecutiveWhitespace * 10) {
             guard capped.advance(byte: 0x20) else { break }
@@ -498,8 +505,10 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
         // just asserting the capped behavior again. A whitespace-preferring scorer facing this
         // automaton would never terminate: every one of a large bounded step budget must still be
         // accepted, proving nothing else in the automaton independently bounds a whitespace run —
-        // the production cap is the only thing that does.
+        // the production cap is the only thing that does. (All bytes here are plain spaces, so the
+        // separate one-line-break-per-run limit is never in play.)
         var uncapped = JSONObjectAutomaton(maxConsecutiveWhitespace: Int.max)
+        XCTAssertTrue(uncapped.advance(byte: UInt8(ascii: "{")))
         let stepBudget = JSONObjectAutomaton.defaultMaxConsecutiveWhitespace * 1000
         var uncappedConsumed = 0
         for _ in 0..<stepBudget {

@@ -63,6 +63,14 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
     private var beforeTopLevel = true
     private var afterTopLevel = false
     private var whitespaceRun = 0
+    // At most one line-break EVENT is allowed per structural whitespace run (defect B: unbounded
+    // blank lines/indentation otherwise slip through even under the 16-byte cap). `\n`, a lone
+    // `\r`, and an immediately-paired `\r\n` each count as exactly one event; `pendingCR` tracks
+    // "the previous byte in this run was a bare `\r`, which may still merge with a following `\n`"
+    // so that merge doesn't double-count. Both fields reset with `whitespaceRun` — see every site
+    // that zeroes `whitespaceRun`.
+    private var lineBreakSeenInRun = false
+    private var pendingCR = false
     private var rejected = false
 
     /// - Parameter maxConsecutiveWhitespace: The consecutive-structural-whitespace cap. Defaults
@@ -112,6 +120,8 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         fileprivate let beforeTopLevel: Bool
         fileprivate let afterTopLevel: Bool
         fileprivate let whitespaceRun: Int
+        fileprivate let lineBreakSeenInRun: Bool
+        fileprivate let pendingCR: Bool
         fileprivate let rejected: Bool
         fileprivate let stackCountBefore: Int
         fileprivate let stackTopBefore: Frame?
@@ -127,7 +137,8 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         guard !rejected else { return nil }
         let undo = WalkUndo(
             lexeme: lexeme, beforeTopLevel: beforeTopLevel, afterTopLevel: afterTopLevel,
-            whitespaceRun: whitespaceRun, rejected: rejected,
+            whitespaceRun: whitespaceRun, lineBreakSeenInRun: lineBreakSeenInRun, pendingCR: pendingCR,
+            rejected: rejected,
             stackCountBefore: stack.count, stackTopBefore: stack.last)
         guard advanceInner(byte: byte) else {
             restoreForWalk(undo)
@@ -157,6 +168,8 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         beforeTopLevel = undo.beforeTopLevel
         afterTopLevel = undo.afterTopLevel
         whitespaceRun = undo.whitespaceRun
+        lineBreakSeenInRun = undo.lineBreakSeenInRun
+        pendingCR = undo.pendingCR
         rejected = undo.rejected
         if stack.count == undo.stackCountBefore + 1 {
             stack.removeLast()
@@ -172,6 +185,30 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
                 stack[stack.count - 1] = top
             }
         }
+    }
+
+    // MARK: - String-run lexical key (slice 1f miss-path optimization)
+
+    /// Opaque key for the string-internal lexical sub-state (escape progress, `\uXXXX` countdown,
+    /// pending UTF-8 continuation expectation) — see `stringLexicalKey`. Two automaton states with
+    /// equal keys accept EXACTLY the same set of "STAY" tokens (tokens fully consumed while
+    /// remaining inside the string): `advanceString(byte:state:isKey:)` never reads or writes
+    /// `stack`, and never branches its accept/reject decision on `isKey` (only the terminating
+    /// quote's SIDE EFFECT — whether `completedValue()` runs — depends on `isKey`, not whether the
+    /// quote byte itself is accepted). `StringState` is only ~13 distinct reachable values (1
+    /// normal + 1 escape + 4 unicode-escape countdown steps + 7 distinct UTF-8 continuation specs —
+    /// `remaining` decrements always reset `min`/`max` to `0x80`/`0xBF`, so the "mid-sequence"
+    /// states collapse onto the same 7 specs reachable directly after a lead byte), which is why
+    /// `JSONObjectConstraintTable` can afford to precompute each one's full STAY bitset once, ever.
+    struct StringLexicalKey: Hashable, Sendable {
+        fileprivate let state: StringState
+    }
+
+    /// Non-`nil` iff the automaton is currently inside a JSON string (any sub-state) — see
+    /// `StringLexicalKey`.
+    var stringLexicalKey: StringLexicalKey? {
+        guard case .string(let state, _) = lexeme else { return nil }
+        return StringLexicalKey(state: state)
     }
 
     // MARK: - Mask cache key
@@ -196,6 +233,10 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         fileprivate let beforeTopLevel: Bool
         fileprivate let afterTopLevel: Bool
         fileprivate let whitespaceRun: Int
+        // Like `whitespaceRun`, both decide whether a further line-break byte is accepted, so
+        // states differing only in them must not share a cache entry (differential test + mutation).
+        fileprivate let lineBreakSeenInRun: Bool
+        fileprivate let pendingCR: Bool
         fileprivate let rejected: Bool
         fileprivate let visibleFrames: [Frame]
         fileprivate let hasHiddenFrames: Bool
@@ -215,7 +256,8 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         }
         return MaskCacheKey(
             lexeme: lexeme, beforeTopLevel: beforeTopLevel, afterTopLevel: afterTopLevel,
-            whitespaceRun: whitespaceRun, rejected: rejected,
+            whitespaceRun: whitespaceRun, lineBreakSeenInRun: lineBreakSeenInRun, pendingCR: pendingCR,
+            rejected: rejected,
             visibleFrames: visibleFrames, hasHiddenFrames: hasHiddenFrames)
     }
 
@@ -251,16 +293,12 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
     }
 
     private mutating func advanceStructural(byte: UInt8) -> Bool {
-        if Self.isWhitespace(byte) {
-            whitespaceRun += 1
-            return whitespaceRun <= maxConsecutiveWhitespace
-        }
-        whitespaceRun = 0
-
+        // No whitespace is ever valid before the top-level `{` or after the top-level object
+        // closes: only `{` (beforeTopLevel) or nothing but EOS (afterTopLevel) may appear there,
+        // so whitespace handling below only ever runs strictly BETWEEN those two points.
         if afterTopLevel {
-            return false  // trailing non-whitespace content after the top-level object closed
+            return false  // only EOS may follow — see `isComplete`
         }
-
         if beforeTopLevel {
             guard byte == ASCII.openBrace else { return false }
             guard stack.count < Self.maxDepth else { return false }
@@ -268,6 +306,31 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
             stack.append(.objectExpectKeyOrEnd)
             return true
         }
+
+        if Self.isWhitespace(byte) {
+            whitespaceRun += 1
+            guard whitespaceRun <= maxConsecutiveWhitespace else { return false }
+            switch byte {
+            case 0x0A:  // '\n'
+                if pendingCR {
+                    pendingCR = false  // completes a '\r\n' pair: already counted by the '\r'
+                } else {
+                    guard !lineBreakSeenInRun else { return false }
+                    lineBreakSeenInRun = true
+                }
+            case 0x0D:  // '\r'
+                guard !lineBreakSeenInRun else { return false }
+                lineBreakSeenInRun = true
+                pendingCR = true
+            default:  // space or tab: does not end a pending '\r's chance to pair, but a byte
+                // between '\r' and '\n' means they are no longer adjacent, so no pairing.
+                pendingCR = false
+            }
+            return true
+        }
+        whitespaceRun = 0
+        lineBreakSeenInRun = false
+        pendingCR = false
 
         guard let top = stack.last else { return false }
         switch top {
@@ -374,6 +437,8 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         if stack.isEmpty {
             afterTopLevel = true
             whitespaceRun = 0
+            lineBreakSeenInRun = false
+            pendingCR = false
         }
     }
 

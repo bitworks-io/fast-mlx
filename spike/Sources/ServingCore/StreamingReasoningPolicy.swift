@@ -24,13 +24,22 @@ import Foundation
 /// the model-type string alone.
 private let attestedNativeHeterogeneousThinkingFamilies: Set<String> = ["qwen3_5", "qwen4_exp"]
 
-/// Family-level classifier: does this model emit its reasoning block by DEFAULT, with no leading
-/// `<think>` opener (reasoning starts at token 0)?
+/// Model-type strings admitted to reasoning separation on the DENSE (`.compiled`) route. Dense Qwen3's
+/// chat template appends a closed `<think>\n\n</think>\n\n` stub only when `enable_thinking` is false;
+/// otherwise nothing follows `<|im_start|>assistant\n` and the model emits the opening `<think>` itself
+/// (the heterogeneous families' templates pre-open it instead). Before adding a family, confirm its own
+/// template's `add_generation_prompt` shape. Tool calling with thinking on is live-checked in json_object
+/// slice 1f's acceptance (see `servingDisablesThinkingWhenToolsActive`).
+private let attestedCompiledThinkingFamilies: Set<String> = ["qwen3"]
+
+/// Family-level classifier: does generation begin inside the reasoning block, so the splitter starts in
+/// its reasoning phase from token 0? The splitter strips an optional leading `<think>`, so a family whose
+/// template pre-opens the block and one whose model emits the opener are handled identically.
 ///
 /// The gate is a THREE-way conjunction, all REQUIRED:
-/// 1. `route == .nativeHeterogeneous` — the cache shape carrying every attested thinking family.
-/// 2. `modelType` is in `attestedNativeHeterogeneousThinkingFamilies` — a reviewed, live-captured
-///    family, not an inference from cache shape alone.
+/// 1. The route selects the allowlist: `.nativeHeterogeneous` uses
+///    `attestedNativeHeterogeneousThinkingFamilies`, `.compiled` uses `attestedCompiledThinkingFamilies`.
+/// 2. `modelType` is in that allowlist — a reviewed family, not an inference from cache shape alone.
 /// 3. `templateAttestsThinkMarkers` — the LOADED checkpoint's own chat template (not a hardcoded
 ///    assumption about the family) contains the `<think>`/`</think>` markers the streaming splitter
 ///    hardcodes. This is artifact-derived, not a compile-time constant: a future checkpoint that
@@ -55,9 +64,8 @@ private let attestedNativeHeterogeneousThinkingFamilies: Set<String> = ["qwen3_5
 /// today's byte-identical passthrough, zero regression, until that family is live-captured and added
 /// to the attested set.
 ///
-/// The `.compiled` (dense) route stays conservative `false` regardless of `modelType` or the template
-/// probe: its streamed reasoning shape has not been live-captured, so it keeps today's byte-identical
-/// passthrough until one attests it. Flipping it is a recorded handoff item, not a guess.
+/// On the `.compiled` (dense) route only `attestedCompiledThinkingFamilies` can separate; every other
+/// dense family keeps today's byte-identical passthrough.
 public func servingThinksByDefault(
     route: ScalarServingDecoderRoute,
     modelType: String?,
@@ -71,7 +79,11 @@ public func servingThinksByDefault(
         return attestedNativeHeterogeneousThinkingFamilies.contains(modelType)
             && templateAttestsThinkMarkers
     case .compiled:
-        return false
+        guard let modelType else {
+            return false
+        }
+        return attestedCompiledThinkingFamilies.contains(modelType)
+            && templateAttestsThinkMarkers
     }
 }
 
@@ -79,19 +91,15 @@ public func servingThinksByDefault(
 /// tools are attached and the client did not set it explicitly? Set ONLY for very old dense Qwen3
 /// (QwenLM/Qwen3 #1817), where thinking-with-tools regressed reliability.
 ///
-/// This is the exact negation of `servingThinksByDefault`, DELIBERATELY: every live-attested
-/// thinking family (`.nativeHeterogeneous` + an attested `modelType` + an attesting template) is
-/// trusted to think AND call tools without the legacy workaround, and every other combination keeps
-/// it. For `qwen4_exp` (Flash Next) specifically, this coupling was live-verified this cycle: with
-/// thinking ON and tools attached, a well-formed `get_weather{"city":"Paris"}` tool call was still
-/// produced, `finish_reason=tool_calls`, in both streaming and non-streaming — so turning the legacy
-/// workaround OFF for an attested `qwen4_exp` checkpoint is evidence-supported, not a guess. Every
-/// other combination — `.compiled` (dense), any not-yet-attested `.nativeHeterogeneous` family, or an
-/// attested family whose loaded template does NOT attest the think markers — keeps the legacy
-/// workaround (`true`). Applying it conservatively to an unattested combination avoids the
-/// thinking-on latency trap of assuming a model/checkpoint tolerates thinking-with-tools before that
-/// is proven live. Do NOT decouple these two functions: the tools-active workaround and the
-/// streaming-separation gate must always agree on which combinations are trusted.
+/// This is the exact negation of `servingThinksByDefault`, DELIBERATELY: every admitted combination
+/// is trusted to think AND call tools without the legacy workaround, and every other combination keeps
+/// it. For `qwen4_exp` (Flash Next) this was live-verified: with thinking ON and tools attached, a
+/// well-formed `get_weather{"city":"Paris"}` call was produced with `finish_reason=tool_calls`, streaming
+/// and non-streaming. Dense `qwen3` passed the same live check (json_object slice 1f acceptance, two
+/// runs each way). If a later check fails, remove `qwen3` from `attestedCompiledThinkingFamilies`
+/// rather than decoupling these functions.
+/// Do NOT decouple them: the tools-active workaround and the streaming-separation gate must always agree
+/// on which combinations are trusted.
 public func servingDisablesThinkingWhenToolsActive(
     route: ScalarServingDecoderRoute,
     modelType: String?,

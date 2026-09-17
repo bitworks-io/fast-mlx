@@ -181,44 +181,87 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
         var checkpoints: [Checkpoint] = []
 
         func record() { checkpoints.append(Checkpoint(prefix: out, depth: depth)) }
+
+        // Defect B (slice 1f): a structural whitespace run may contain at most ONE line-break
+        // EVENT (`\n`, a lone `\r`, or an immediately-paired `\r\n` all count as one) — mirrors
+        // `JSONObjectAutomaton`'s own pairing rule exactly, so this generator keeps producing only
+        // VALID prefixes under the tightened grammar (an invalid prefix here would trip the
+        // `referenceAutomaton.advance` assertion below for a reason unrelated to what this test
+        // proves). This is generator-only bookkeeping, not a change to the reference decision.
+        //
+        // Run state is tracked across EVERY appended byte, not just within one `emitWhitespace()`
+        // call: `emitValue()` starts with its own `emitWhitespace()`, and callers like
+        // `emitObjectBody` (after `:`) and `emitArrayBody` (after `,`) also call `emitWhitespace()`
+        // immediately before invoking `emitValue()` — so two `emitWhitespace()` calls can be
+        // directly adjacent with no non-whitespace byte between them, forming ONE continuous
+        // whitespace run from the automaton's point of view even though the generator issues it as
+        // two separate calls. Routing every appended byte (whitespace or not, structural or string
+        // content) through `appendByte`/`appendBytes` keeps `runLineBreakSeen`/`runPendingCR`
+        // accurate across that boundary: any non-whitespace byte — including a string's own
+        // content bytes, which are irrelevant to this tracking but harmless to pass through —
+        // always resets the run, matching `JSONObjectAutomaton.advanceStructural`'s own reset.
+        var runLineBreakSeen = false
+        var runPendingCR = false
+        func appendByte(_ byte: UInt8) {
+            switch byte {
+            case 0x0A:
+                if runPendingCR { runPendingCR = false } else { runLineBreakSeen = true }
+            case 0x0D:
+                runLineBreakSeen = true
+                runPendingCR = true
+            case 0x20, 0x09:
+                runPendingCR = false
+            default:
+                runLineBreakSeen = false
+                runPendingCR = false
+            }
+            out.append(byte)
+        }
+        func appendBytes(_ bytes: [UInt8]) { bytes.forEach(appendByte) }
+
         func emitWhitespace() {
             let n = rng.nextInt(3)
-            for _ in 0..<n { out.append([0x20, 0x09, 0x0A, 0x0D][rng.nextInt(4)]) }
+            for _ in 0..<n {
+                var candidates: [UInt8] = [0x20, 0x09]
+                if runPendingCR || !runLineBreakSeen { candidates.append(0x0A) }
+                if !runLineBreakSeen { candidates.append(0x0D) }
+                appendByte(candidates[rng.nextInt(candidates.count)])
+            }
             record()
         }
         func emitStringBytes() {
-            out.append(0x22)
+            appendByte(0x22)
             let length = rng.nextInt(5)
             for _ in 0..<length {
                 switch rng.nextInt(6) {
-                case 0: out.append(UInt8(0x61 + rng.nextInt(26)))
-                case 1: out.append(contentsOf: [0x5C, 0x6E])  // \n
-                case 2: out.append(contentsOf: Array("\\u00e9".utf8))
-                case 3: out.append(contentsOf: [0xC3, 0xA9])  // raw "é"
-                case 4: out.append(contentsOf: [0xF0, 0x9F, 0x98, 0x80])  // raw "😀"
-                default: out.append(0x20)
+                case 0: appendByte(UInt8(0x61 + rng.nextInt(26)))
+                case 1: appendBytes([0x5C, 0x6E])  // \n
+                case 2: appendBytes(Array("\\u00e9".utf8))
+                case 3: appendBytes([0xC3, 0xA9])  // raw "é"
+                case 4: appendBytes([0xF0, 0x9F, 0x98, 0x80])  // raw "😀"
+                default: appendByte(0x20)
                 }
             }
-            out.append(0x22)
+            appendByte(0x22)
             record()
         }
         func emitNumber() {
-            if rng.nextBool() { out.append(0x2D) }
-            out.append(UInt8(0x30 + rng.nextInt(10)))
+            if rng.nextBool() { appendByte(0x2D) }
+            appendByte(UInt8(0x30 + rng.nextInt(10)))
             if rng.nextInt(3) == 0 {
-                out.append(0x2E)
-                out.append(UInt8(0x30 + 1 + rng.nextInt(9)))
+                appendByte(0x2E)
+                appendByte(UInt8(0x30 + 1 + rng.nextInt(9)))
             }
             if rng.nextInt(3) == 0 {
-                out.append(rng.nextBool() ? 0x65 : 0x45)
-                if rng.nextBool() { out.append(rng.nextBool() ? 0x2B : 0x2D) }
-                out.append(UInt8(0x30 + rng.nextInt(10)))
+                appendByte(rng.nextBool() ? 0x65 : 0x45)
+                if rng.nextBool() { appendByte(rng.nextBool() ? 0x2B : 0x2D) }
+                appendByte(UInt8(0x30 + rng.nextInt(10)))
             }
             record()
         }
         func emitLiteral() {
             let words: [[UInt8]] = [Array("true".utf8), Array("false".utf8), Array("null".utf8)]
-            out.append(contentsOf: words[rng.nextInt(3)])
+            appendBytes(words[rng.nextInt(3)])
             record()
         }
         // Forward-declared so emitValue/emitObjectBody/emitArrayBody can call each other.
@@ -230,19 +273,19 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
             let choice = allowNest ? rng.nextInt(5) : 2 + rng.nextInt(3)
             switch choice {
             case 0:
-                out.append(0x7B)
+                appendByte(0x7B)
                 depth += 1
                 record()
                 emitObjectBody()
-                out.append(0x7D)
+                appendByte(0x7D)
                 depth -= 1
                 record()
             case 1:
-                out.append(0x5B)
+                appendByte(0x5B)
                 depth += 1
                 record()
                 emitArrayBody()
-                out.append(0x5D)
+                appendByte(0x5D)
                 depth -= 1
                 record()
             case 2: emitStringBytes()
@@ -257,13 +300,13 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
                 let count = 1 + rng.nextInt(3)
                 for i in 0..<count {
                     if i > 0 {
-                        out.append(0x2C)
+                        appendByte(0x2C)
                         record()
                         emitWhitespace()
                     }
                     emitStringBytes()
                     emitWhitespace()
-                    out.append(0x3A)
+                    appendByte(0x3A)
                     record()
                     emitWhitespace()
                     emitValue()
@@ -277,7 +320,7 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
                 let count = 1 + rng.nextInt(3)
                 for i in 0..<count {
                     if i > 0 {
-                        out.append(0x2C)
+                        appendByte(0x2C)
                         record()
                         emitWhitespace()
                     }
@@ -287,11 +330,11 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
             emitWhitespace()
         }
 
-        out.append(0x7B)
+        appendByte(0x7B)
         depth += 1
         record()
         emitObjectBody()
-        out.append(0x7D)
+        appendByte(0x7D)
         depth -= 1
         record()  // completed-document checkpoint: depth == 0
         return checkpoints
@@ -495,5 +538,67 @@ final class JSONObjectConstraintDifferentialTests: XCTestCase {
                 XCTAssertFalse(actual.contains(bannedId))
             }
         }
+    }
+
+    /// Defect B (slice 1f) mask-cache-key proof: two automaton states that agree on EVERY other
+    /// field the cache key captures (same lexeme, same stack, same `whitespaceRun` byte COUNT) but
+    /// differ only in whether a line-break event has already occurred in the current whitespace
+    /// run must NOT collide onto the same cache entry — otherwise one of them would be served the
+    /// OTHER's mask. Uses a small vocab with whitespace-run-shaped multi-byte tokens (`"\n"`,
+    /// `"\n\n"`, `" \n"`, `"\n  "`, `"  "`) alongside every raw byte, so the trie DFS actually walks
+    /// those shapes (not just a hand-checked single byte).
+    func testDifferentialAgreementJustAfterLineBreakInRunDistinguishesCacheKeyState() throws {
+        enum LineBreakVocab {
+            static let classifications: [TokenByteClassification] = {
+                var out: [TokenByteClassification] = (0...255).map { .bytes([UInt8($0)]) }
+                out.append(.bytes(Array("\n".utf8)))
+                out.append(.bytes(Array("\n\n".utf8)))
+                out.append(.bytes(Array(" \n".utf8)))
+                out.append(.bytes(Array("\n  ".utf8)))
+                out.append(.bytes(Array("  ".utf8)))
+                out.append(.eos)
+                return out
+            }()
+        }
+
+        let table = JSONObjectConstraintTable(classifications: LineBreakVocab.classifications)
+
+        // State A: "{ \n" — whitespaceRun == 2, a line-break event (the '\n') has already occurred.
+        var afterSpaceThenNewline = JSONObjectAutomaton()
+        for byte in Array("{ \n".utf8) {
+            XCTAssertTrue(afterSpaceThenNewline.advance(byte: byte))
+        }
+        // State B: "{  " — whitespaceRun == 2, NO line-break event yet (both bytes are spaces).
+        var afterTwoSpaces = JSONObjectAutomaton()
+        for byte in Array("{  ".utf8) {
+            XCTAssertTrue(afterTwoSpaces.advance(byte: byte))
+        }
+
+        let referenceAfterNewline = Self.referenceAllowedIds(
+            from: afterSpaceThenNewline, classifications: LineBreakVocab.classifications)
+        let referenceAfterSpaces = Self.referenceAllowedIds(
+            from: afterTwoSpaces, classifications: LineBreakVocab.classifications)
+
+        // Query the OPTIMIZED (cached, trie-DFS) path for both states through the SAME shared
+        // table — this is exactly the scenario a truncated/under-specified cache key would get
+        // wrong: the second lookup could otherwise hit the first lookup's (wrong) cached entry.
+        let optimizedAfterNewline = Set(try table.allowedTokenIds(for: afterSpaceThenNewline))
+        let optimizedAfterSpaces = Set(try table.allowedTokenIds(for: afterTwoSpaces))
+
+        XCTAssertEqual(
+            optimizedAfterNewline, referenceAfterNewline,
+            "optimized path mismatch just after a line break in the run")
+        XCTAssertEqual(
+            optimizedAfterSpaces, referenceAfterSpaces,
+            "optimized path mismatch with no line break yet in the run")
+
+        // The discriminating assertion: a bare '\n' token must be allowed with no line break seen
+        // yet (state B) but REJECTED once one has already occurred in the same run (state A) —
+        // proving the two states are genuinely different-in-kind, not just superficially so.
+        let newlineId = Int(UInt8(ascii: "\n"))
+        XCTAssertTrue(referenceAfterSpaces.contains(newlineId))
+        XCTAssertFalse(referenceAfterNewline.contains(newlineId))
+        XCTAssertTrue(optimizedAfterSpaces.contains(newlineId))
+        XCTAssertFalse(optimizedAfterNewline.contains(newlineId))
     }
 }

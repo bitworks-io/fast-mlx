@@ -57,6 +57,32 @@ final class StreamingReasoningPolicyTests: XCTestCase {
                 route: .compiled, modelType: "qwen4_exp", templateAttestsThinkMarkers: true))
     }
 
+    /// Positive: dense Qwen3 on `.compiled` with a template that attests the markers. Its model emits
+    /// the opening `<think>` itself, which the splitter strips.
+    func testThinksByDefaultIsTrueForCompiledQwen3WithAttestingTemplate() {
+        XCTAssertTrue(
+            servingThinksByDefault(
+                route: .compiled, modelType: "qwen3", templateAttestsThinkMarkers: true))
+    }
+
+    /// Regression lock: dense Qwen3 whose loaded template does NOT attest the markers must stay
+    /// passthrough — the family string alone is necessary but not sufficient, same discipline as the
+    /// `.nativeHeterogeneous` families above.
+    func testThinksByDefaultIsFalseForCompiledQwen3WhenTemplateDoesNotAttestMarkers() {
+        XCTAssertFalse(
+            servingThinksByDefault(
+                route: .compiled, modelType: "qwen3", templateAttestsThinkMarkers: false))
+    }
+
+    /// Discriminating negative: a DIFFERENT dense family must not inherit qwen3's newly-attested
+    /// shape — admitting `qwen3` to the dense allowlist must not broaden to "any `.compiled` family
+    /// with an attesting template".
+    func testThinksByDefaultIsFalseForCompiledOtherDenseFamilyEvenWithAttestingTemplate() {
+        XCTAssertFalse(
+            servingThinksByDefault(
+                route: .compiled, modelType: "llama3", templateAttestsThinkMarkers: true))
+    }
+
     /// Discriminating negative: `qwen4_exp` on `.nativeHeterogeneous` whose loaded template does NOT
     /// attest the markers must stay passthrough — a family string is not proof for a specific
     /// checkpoint's template.
@@ -98,6 +124,15 @@ final class StreamingReasoningPolicyTests: XCTestCase {
         XCTAssertFalse(
             servingDisablesThinkingWhenToolsActive(
                 route: .nativeHeterogeneous, modelType: "qwen4_exp", templateAttestsThinkMarkers: true))
+    }
+
+    /// Coupling lock: admitting dense `qwen3` also turns the legacy tools-thinking workaround off for
+    /// it. This proves only that the two functions stay coupled; tool calling with thinking on is
+    /// checked live.
+    func testDisablesThinkingWhenToolsActiveIsFalseForCompiledQwen3WithAttestingTemplate() {
+        XCTAssertFalse(
+            servingDisablesThinkingWhenToolsActive(
+                route: .compiled, modelType: "qwen3", templateAttestsThinkMarkers: true))
     }
 
     /// An attested family (`qwen4_exp`) whose loaded template does NOT attest the markers must keep

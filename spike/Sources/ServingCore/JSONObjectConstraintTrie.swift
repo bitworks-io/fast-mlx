@@ -87,4 +87,85 @@ final class JSONObjectConstraintTrie: @unchecked Sendable {
             automaton.undoForWalk(undo)
         }
     }
+
+    // MARK: - String-run classification (slice 1f miss-path optimization)
+
+    /// Classifies every `.bytes` token against `automaton`'s CURRENT in-string state (caller
+    /// guarantees `automaton.stringLexicalKey != nil`) into two exact classes:
+    ///
+    /// - STAY: the token's full byte sequence is consumed while `automaton` remains inside the
+    ///   SAME string throughout (no unescaped closing `"` reached). Depends only on the string-
+    ///   internal lexical sub-state (see `JSONObjectAutomaton.StringLexicalKey`), so this result is
+    ///   valid for ANY automaton sharing that key, regardless of stack/depth/key-vs-value context —
+    ///   `JSONObjectConstraintTable` caches it keyed by that lexical key alone, computed once.
+    /// - EXIT candidates: tokens where, walked from this state, some byte closes the string (an
+    ///   unescaped `"` from `.normal`) partway through (or exactly at the last byte). Once a token's
+    ///   walk crosses that boundary, the validity of any FURTHER bytes is structural and depends on
+    ///   the REAL automaton's stack/key-vs-value context — this method does not attempt to decide
+    ///   that; it only enumerates every token whose byte sequence closes the string at some point
+    ///   (returning each one's FULL bytes so the caller can replay them against the real automaton,
+    ///   exactly as `JSONObjectTokenConstraint.advance(token:)` already does for a single token). A
+    ///   token that is lexically invalid inside the string before ever reaching a close (e.g. an
+    ///   unescaped control byte, a bad `\u` hex digit, an out-of-range UTF-8 continuation byte) is
+    ///   pruned immediately and appears in neither list — that verdict does not depend on context
+    ///   either.
+    func classifyStringRun(
+        from automaton: JSONObjectAutomaton
+    ) -> (stayIds: [Int], exitCandidates: [(id: Int, bytes: [UInt8])]) {
+        var stayIds: [Int] = []
+        var exitCandidates: [(id: Int, bytes: [UInt8])] = []
+        var walker = automaton
+        var path: [UInt8] = []
+        visitStringRun(
+            nodeIndex: 0, automaton: &walker, path: &path, stayIds: &stayIds,
+            exitCandidates: &exitCandidates)
+        return (stayIds, exitCandidates)
+    }
+
+    /// In-string phase: steps `automaton` forward for real (via `tryAdvanceForWalk`, same
+    /// allocation-free walk `allowedBitset(from:wordCount:)` uses), pruning a byte that is
+    /// lexically invalid inside the string. The moment a byte closes the string (automaton leaves
+    /// `.string` state), this stops driving `automaton` further — the closing byte's own
+    /// terminal ids (and everything below it in the trie) are handed to `collectExitSubtree`, a
+    /// plain trie enumeration that makes no automaton-context assumption.
+    private func visitStringRun(
+        nodeIndex: Int, automaton: inout JSONObjectAutomaton, path: inout [UInt8],
+        stayIds: inout [Int], exitCandidates: inout [(id: Int, bytes: [UInt8])]
+    ) {
+        let node = nodes[nodeIndex]
+        for id in node.terminalIds {
+            stayIds.append(id)  // token ended here; automaton is still inside the string
+        }
+        for (byte, childIndex) in node.children {
+            guard let undo = automaton.tryAdvanceForWalk(byte: byte) else { continue }
+            path.append(byte)
+            if automaton.stringLexicalKey != nil {
+                visitStringRun(
+                    nodeIndex: Int(childIndex), automaton: &automaton, path: &path, stayIds: &stayIds,
+                    exitCandidates: &exitCandidates)
+            } else {
+                collectExitSubtree(nodeIndex: Int(childIndex), path: &path, exitCandidates: &exitCandidates)
+            }
+            path.removeLast()
+            automaton.undoForWalk(undo)
+        }
+    }
+
+    /// Post-close phase: pure trie enumeration, no automaton stepping — every terminal id under
+    /// this subtree becomes an EXIT candidate carrying its full accumulated byte path, since
+    /// whether those post-close bytes are structurally valid depends on context this walk does not
+    /// have (see `classifyStringRun`'s doc comment).
+    private func collectExitSubtree(
+        nodeIndex: Int, path: inout [UInt8], exitCandidates: inout [(id: Int, bytes: [UInt8])]
+    ) {
+        let node = nodes[nodeIndex]
+        for id in node.terminalIds {
+            exitCandidates.append((id, path))
+        }
+        for (byte, childIndex) in node.children {
+            path.append(byte)
+            collectExitSubtree(nodeIndex: Int(childIndex), path: &path, exitCandidates: &exitCandidates)
+            path.removeLast()
+        }
+    }
 }
