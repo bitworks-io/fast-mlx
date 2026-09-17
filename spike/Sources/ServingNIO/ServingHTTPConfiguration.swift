@@ -117,6 +117,14 @@ public struct ServingHTTPConfiguration: Sendable {
     /// (unbuffered), satisfying "flushed" with no separate fsync step. Must stay `Sendable`-clean:
     /// invoked from both synchronous NIO event-loop callbacks and detached generation `Task`s.
     public let requestLog: (@Sendable (String) -> Void)?
+    /// Backs the `/metrics` HTTP dependability series (`fastmlx_http_requests_total`,
+    /// `fastmlx_http_request_duration_seconds`, `fastmlx_http_time_to_first_token_seconds`) --
+    /// see `ServingHTTPMetricsRecorder`'s own doc comment. Unlike `requestLog`, this is never
+    /// `nil`: these series are always-on baseline dependability signals, not an opt-in
+    /// diagnostic, so every construction site gets a fresh, empty recorder by default. A class
+    /// (reference type) so every copy of this configuration value shares one recorder instance --
+    /// the same sharing `ServingHTTPEvidenceConfiguration.tracker` already relies on.
+    let httpMetrics: ServingHTTPMetricsRecorder
 
     public init(
         launchedModel: String,
@@ -155,6 +163,7 @@ public struct ServingHTTPConfiguration: Sendable {
         self.requestFailureReporter = requestFailureReporter
         self.readiness = readiness
         self.requestLog = requestLog
+        self.httpMetrics = ServingHTTPMetricsRecorder()
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")

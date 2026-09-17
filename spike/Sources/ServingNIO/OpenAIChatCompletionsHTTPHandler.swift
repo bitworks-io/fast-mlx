@@ -18,14 +18,20 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private var activeControl: ServingTransportRequestControl?
     private var activeTask: Task<Void, Never>?
     private var activeWritabilityGate: ServingChannelWritabilityGate?
-    /// Timing/routing facts for the request-log line (`--request-log json`), captured in
-    /// `receiveHead` -- before routing/decoding -- so every finishing path can emit from the same
-    /// starting point. `nil` end-to-end whenever `configuration.requestLog` is `nil` (the `off`
-    /// default), so the feature costs nothing when disabled. Safe to overwrite on each new
-    /// `receiveHead` without explicit per-branch clearing: the guard at the top of `receiveHead`
-    /// already refuses a new request head while a previous one is still in flight (`activeControl
-    /// == nil, pendingHead == nil`), so there is never more than one request's preamble live at once
-    /// on this handler.
+    /// Timing/routing facts for this request's finishing point, captured in `receiveHead` --
+    /// before routing/decoding -- so every finishing path can emit from the same starting point.
+    /// ALWAYS populated (independent of `configuration.requestLog`): `servingEmitRequestLog`
+    /// (every finishing path funnels through it, directly or via the `emitRequestLog` helper)
+    /// uses this preamble to feed `configuration.httpMetrics` -- the always-on `/metrics` HTTP
+    /// dependability series -- unconditionally, and only THEN conditionally also emits the
+    /// `--request-log json` line when `configuration.requestLog` is non-`nil`. `nil` still means
+    /// "no preamble was ever captured for the currently in-flight request" (there is no such gap
+    /// in practice, since `receiveHead` sets it before any rejection path can run), not "request
+    /// logging is off" -- that distinction now lives entirely inside `servingEmitRequestLog`'s own
+    /// `configuration.requestLog` check. Safe to overwrite on each new `receiveHead` without
+    /// explicit per-branch clearing: the guard at the top of `receiveHead` already refuses a new
+    /// request head while a previous one is still in flight (`activeControl == nil, pendingHead ==
+    /// nil`), so there is never more than one request's preamble live at once on this handler.
     private var pendingRequestLogPreamble: ServingRequestLogPreamble?
 
     public init(
@@ -90,15 +96,14 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
-        // Captured before routing/decoding so a REJECTED head (auth failure, unknown route, bad
-        // method, bad content-type) still gets a request-log line -- `nil` whenever request logging
-        // is off, so this costs nothing on the default path.
-        pendingRequestLogPreamble = configuration.requestLog.map { _ in
-            ServingRequestLogPreamble(
-                method: head.method.rawValue,
-                route: servingRequestLogTemplatedRoute(head.uri),
-                startedAt: ContinuousClock().now)
-        }
+        // Captured before routing/decoding, and ALWAYS (independent of `configuration.requestLog`)
+        // -- see the field's own doc comment -- so a REJECTED head (auth failure, unknown route,
+        // bad method, bad content-type) still feeds `configuration.httpMetrics`, not just a
+        // `--request-log json` line.
+        pendingRequestLogPreamble = ServingRequestLogPreamble(
+            method: head.method.rawValue,
+            route: servingRequestLogTemplatedRoute(head.uri),
+            startedAt: ContinuousClock().now)
 
         if let rejection = validateHead(head) {
             discardingRequestBody = true
@@ -867,7 +872,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
         let bodyText: String
         do {
-            bodyText = try await metricsText(from: snapshotProvider)
+            bodyText = try await metricsText(
+                from: snapshotProvider, httpMetrics: configuration.httpMetrics)
         } catch is CancellationError {
             emitRequestLog(
                 configuration: configuration,
@@ -922,12 +928,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
     }
 
     static func metricsText(
-        from snapshotProvider: ServingHTTPEvidenceConfiguration.SnapshotProvider
+        from snapshotProvider: ServingHTTPEvidenceConfiguration.SnapshotProvider,
+        httpMetrics: ServingHTTPMetricsRecorder
     ) async throws -> String {
         try Task.checkCancellation()
         let snapshot = try await snapshotProvider()
         try Task.checkCancellation()
-        return prometheusMetrics(from: snapshot)
+        return prometheusMetrics(from: snapshot, httpMetrics: httpMetrics)
     }
 
     static func runGeneration(
@@ -950,9 +957,12 @@ private extension OpenAIChatCompletionsHTTPHandler {
         var beforeResources: ServingEvidence.ResourceSnapshot?
         var activeResources: ServingEvidence.ResourceSnapshot?
         var failedSnapshots: [ServingEvidence.ResourceSnapshotStage] = []
-        // Request-log-only state (all unused when `requestLogPreamble` is `nil`, i.e. `--request-log
-        // off`): `requestLogID` is the "existing response id if one exists, else a generated one"
-        // contract -- generated up front so every catch branch, including ones reached before a
+        // Request-finishing state, fed to `emitRequestLog`/`servingEmitRequestLog` below on every
+        // request regardless of `--request-log` -- that call always feeds `configuration
+        // .httpMetrics` and only conditionally also emits a JSON access-log line (see
+        // `pendingRequestLogPreamble`'s own doc comment). `requestLogID` is the "existing response
+        // id if one exists, else a generated one" contract -- generated up front so every catch
+        // branch, including ones reached before a
         // backend handle exists, has an id to report. `requestLogTTFTAt` is set once, the first time
         // a generated token becomes available on the STREAMING path (see below); left `nil` for a
         // non-streaming response and for a request that fails before any token is produced.
@@ -2284,7 +2294,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
     }
 
     static func prometheusMetrics(
-        from snapshot: ServingEvidence.ResourceSnapshot
+        from snapshot: ServingEvidence.ResourceSnapshot,
+        httpMetrics: ServingHTTPMetricsRecorder
     ) -> String {
         var lines: [String] = []
         appendMetric(
@@ -2419,7 +2430,73 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 value: counters.passthroughActive ? 1 : 0,
                 to: &lines)
         }
+        appendHTTPRequestMetrics(httpMetrics.snapshot(), to: &lines)
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Appends the three always-on `/metrics` HTTP dependability series -- see
+    /// `ServingHTTPMetricsRecorder`'s own doc comment for why these are fed independently of
+    /// `--request-log`. Each family's `# HELP`/`# TYPE` header is emitted even when the recorder
+    /// has observed nothing yet for that family (an empty snapshot still renders the header with
+    /// zero sample lines) -- a scrape taken before any traffic must still declare these series
+    /// exist, matching Prometheus' own guidance that a metric family's shape shouldn't depend on
+    /// whether it has been populated yet.
+    static func appendHTTPRequestMetrics(
+        _ snapshot: ServingHTTPMetricsRecorder.Snapshot,
+        to lines: inout [String]
+    ) {
+        lines.append(
+            "# HELP fastmlx_http_requests_total Cumulative count of finished HTTP requests, "
+                + "labeled by templated route, response status class, and outcome.")
+        lines.append("# TYPE fastmlx_http_requests_total counter")
+        for entry in snapshot.counters {
+            lines.append(
+                "fastmlx_http_requests_total{route=\"\(entry.route)\","
+                    + "status_class=\"\(entry.statusClass)\",outcome=\"\(entry.outcome)\"} "
+                    + "\(entry.count)")
+        }
+
+        appendHTTPHistogramMetrics(
+            name: "fastmlx_http_request_duration_seconds",
+            help: "Finished HTTP request duration in seconds, labeled by templated route.",
+            entries: snapshot.durationHistograms,
+            to: &lines)
+
+        appendHTTPHistogramMetrics(
+            name: "fastmlx_http_time_to_first_token_seconds",
+            help: "Time to first streamed token in seconds, for streaming chat/completions "
+                + "successes only, labeled by templated route.",
+            entries: snapshot.ttftHistograms,
+            to: &lines)
+    }
+
+    /// Shared renderer for both histogram families above: standard Prometheus cumulative
+    /// `_bucket{le=...}` samples (including the synthetic `+Inf` bucket, which always equals
+    /// `histogram.count` by construction -- see `ServingHTTPMetricsHistogram`), plus `_sum` and
+    /// `_count`. A route with no observations for this family is simply absent from `entries` --
+    /// no zero-filled row is fabricated for it (see `appendHTTPRequestMetrics`'s doc comment on
+    /// the family-level header still being emitted regardless).
+    static func appendHTTPHistogramMetrics(
+        name: String,
+        help: String,
+        entries: [(route: String, histogram: ServingHTTPMetricsHistogram)],
+        to lines: inout [String]
+    ) {
+        lines.append("# HELP \(name) \(help)")
+        lines.append("# TYPE \(name) histogram")
+        for entry in entries {
+            let cumulative = entry.histogram.cumulativeBucketCounts
+            for (index, boundary) in servingHTTPMetricsHistogramBuckets.enumerated() {
+                lines.append(
+                    "\(name)_bucket{route=\"\(entry.route)\","
+                        + "le=\"\(servingHTTPMetricsFormatBoundary(boundary))\"} \(cumulative[index])"
+                )
+            }
+            lines.append(
+                "\(name)_bucket{route=\"\(entry.route)\",le=\"+Inf\"} \(entry.histogram.count)")
+            lines.append("\(name)_sum{route=\"\(entry.route)\"} \(entry.histogram.sum)")
+            lines.append("\(name)_count{route=\"\(entry.route)\"} \(entry.histogram.count)")
+        }
     }
 
     static func appendOptionalMetric(

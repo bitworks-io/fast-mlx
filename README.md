@@ -147,6 +147,14 @@ default, and set per host — an interim protection expected to lift once prefil
 Authenticated clients can inspect every effective token and byte limit at
 `GET /v1/models` instead of guessing from a model name.
 
+`GET /metrics` (Prometheus text, bearer-authenticated like the API routes) reports resource and
+fit gauges plus three HTTP series that are always recorded, whether or not `--request-log json` is
+on: `fastmlx_http_requests_total` (labeled by route template, status class and outcome),
+`fastmlx_http_request_duration_seconds`, and `fastmlx_http_time_to_first_token_seconds` (streaming
+successes only). The histograms use fixed buckets from 5 ms to 300 s. Route labels come from the same
+bounded set the access log uses, and any unmatched path is labeled `other`, so label cardinality
+stays bounded.
+
 ### Transport-only (no model)
 
 ```sh

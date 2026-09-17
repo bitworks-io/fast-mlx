@@ -112,11 +112,17 @@ func servingRequestLogTimestamp(_ date: Date = Date()) -> String {
     return formatter.string(from: date)
 }
 
-/// Encodes and emits one request-log line through `configuration.requestLog`. A no-op when that
-/// sink is `nil` (`--request-log off`, the default) -- callers may call this unconditionally at
-/// every finishing point without their own `if configuration.requestLog != nil` guard. Encoding
-/// failure is swallowed (`try?`): a request-log defect must never throw into or block the request
-/// path (see the serve flag's own doc comment).
+/// Shared finishing point for every request this handler serves: ALWAYS records the `/metrics`
+/// HTTP dependability series (`configuration.httpMetrics` -- see `ServingHTTPMetricsRecorder`),
+/// then, only when `configuration.requestLog` is non-`nil` (`--request-log json`), also encodes
+/// and emits one request-log line through it. `preamble` is unconditionally populated by
+/// `OpenAIChatCompletionsHTTPHandler` regardless of the `--request-log` setting precisely so this
+/// function can feed the metrics recorder on every request, not just when the JSON access log is
+/// enabled -- callers may call this unconditionally at every finishing point without their own
+/// `if configuration.requestLog != nil` guard. Encoding failure for the JSON line is swallowed
+/// (`try?`): a request-log defect must never throw into or block the request path (see the serve
+/// flag's own doc comment); metrics recording is a synchronous, non-throwing, in-memory update and
+/// carries no equivalent failure mode.
 func servingEmitRequestLog(
     configuration: ServingHTTPConfiguration,
     preamble: ServingRequestLogPreamble,
@@ -133,6 +139,14 @@ func servingEmitRequestLog(
     ignoredFields: [String] = [],
     finishedAt: ContinuousClock.Instant = ContinuousClock().now
 ) {
+    let durationMs = servingRequestLogDurationMilliseconds(from: preamble.startedAt, to: finishedAt)
+    configuration.httpMetrics.record(
+        route: preamble.route,
+        status: status,
+        outcome: outcome.rawValue,
+        durationSeconds: durationMs / 1_000,
+        ttftSeconds: ttftMs.map { $0 / 1_000 })
+
     guard let sink = configuration.requestLog else {
         return
     }
@@ -148,8 +162,7 @@ func servingEmitRequestLog(
         promptTokens: promptTokens,
         completionTokens: completionTokens,
         ttftMs: ttftMs,
-        durationMs: servingRequestLogDurationMilliseconds(
-            from: preamble.startedAt, to: finishedAt),
+        durationMs: durationMs,
         finishReason: finishReason,
         errorCode: errorCode,
         ignoredFields: ignoredFields.isEmpty ? nil : ignoredFields)

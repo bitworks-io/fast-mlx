@@ -1539,9 +1539,15 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(
             response.head.headers.first(name: "content-type"),
             "text/plain; version=0.0.4; charset=utf-8")
-        XCTAssertEqual(
-            response.body,
-            """
+        // The evidence-derived gauge block is still fully deterministic -- asserted as an exact
+        // prefix. It is no longer the WHOLE body: the always-on `/metrics` HTTP dependability
+        // series (`ServingHTTPMetricsRecorder`, fed by every finished request on this shared
+        // `configuration`, including the 401 rejection above) is appended after it, and that tail
+        // embeds a real wall-clock request duration -- asserting the full body via `==` would pin
+        // a nondeterministic float and make this test flaky. See the dedicated
+        // `ServingHTTPMetricsTests` unit suite and the `/metrics`-specific end-to-end tests below
+        // for exact, deterministic coverage of that series' shape.
+        let expectedEvidenceGaugeBlock = """
             # HELP fastmlx_up fast-mlx serving metrics endpoint availability.
             # TYPE fastmlx_up gauge
             fastmlx_up 1
@@ -1585,7 +1591,35 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
             # TYPE fastmlx_fit_modeled_headroom_bytes gauge
             fastmlx_fit_modeled_headroom_bytes 50000
 
-            """)
+            """
+        XCTAssertTrue(
+            response.body.hasPrefix(expectedEvidenceGaugeBlock),
+            "evidence gauge block prefix changed:\n\(response.body)")
+        // The 401-rejected scrape above (same shared `configuration`) is the only prior request,
+        // so it is the sole observation backing these always-on HTTP series.
+        XCTAssertTrue(
+            response.body.contains(
+                "# HELP fastmlx_http_requests_total Cumulative count of finished HTTP requests, "
+                    + "labeled by templated route, response status class, and outcome.\n"
+                    + "# TYPE fastmlx_http_requests_total counter\n"))
+        XCTAssertTrue(
+            response.body.contains(
+                #"fastmlx_http_requests_total{route="/metrics",status_class="4xx",outcome="error"} 1"#))
+        XCTAssertTrue(
+            response.body.contains(
+                #"fastmlx_http_request_duration_seconds_bucket{route="/metrics",le="+Inf"} 1"#))
+        XCTAssertTrue(
+            response.body.contains(
+                #"fastmlx_http_request_duration_seconds_count{route="/metrics"} 1"#))
+        XCTAssertTrue(
+            response.body.contains(#"fastmlx_http_request_duration_seconds_sum{route="/metrics"} "#),
+            "a _sum line must exist for the route, even though its real wall-clock value isn't pinned")
+        XCTAssertTrue(
+            response.body.hasSuffix(
+                "# HELP fastmlx_http_time_to_first_token_seconds Time to first streamed token in "
+                    + "seconds, for streaming chat/completions successes only, labeled by templated "
+                    + "route.\n# TYPE fastmlx_http_time_to_first_token_seconds histogram\n"),
+            "the 401 rejection never produced a TTFT, so that family stays header-only")
         XCTAssertEqual(
             response.head.headers.first(name: "content-length"),
             "\(response.body.utf8.count)")
@@ -2187,6 +2221,148 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
             ["serving metrics snapshot failed"])
         XCTAssertEqual(recorderSnapshot.evidence.count, 0)
         _ = try await channel.finish()
+    }
+
+    // MARK: - Always-on `/metrics` HTTP dependability series (`ServingHTTPMetricsRecorder`)
+
+    // A scrape taken before any other traffic must still declare all three families' shape (`#
+    // HELP`/`# TYPE` headers), with zero sample lines -- Prometheus' own guidance that a metric
+    // family's shape shouldn't depend on whether it has been populated yet.
+    func testMetricsEndpointRendersHTTPRequestMetricsHeadersWithNoSamplesWhenRecorderIsEmpty()
+        async throws
+    {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        let channel = try await makeChannel(backend: ScriptedBackend(scripts: []), configuration: configuration)
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertTrue(response.body.contains("# TYPE fastmlx_http_requests_total counter"))
+        XCTAssertTrue(response.body.contains("# TYPE fastmlx_http_request_duration_seconds histogram"))
+        XCTAssertTrue(response.body.contains("# TYPE fastmlx_http_time_to_first_token_seconds histogram"))
+        XCTAssertFalse(response.body.contains("fastmlx_http_requests_total{"), "no traffic yet: no sample")
+        XCTAssertFalse(response.body.contains("fastmlx_http_request_duration_seconds_bucket{"))
+        XCTAssertFalse(response.body.contains("fastmlx_http_time_to_first_token_seconds_bucket{"))
+        _ = try await channel.finish()
+    }
+
+    // The core Lane 2 acceptance criterion: an operator scraping `/metrics` sees the HTTP
+    // dependability counters even though `--request-log` was never turned on (the default,
+    // `configuration.requestLog == nil`) -- these series are a baseline signal, not an opt-in
+    // diagnostic.
+    func testMetricsEndpointRecordsHTTPRequestCounterIndependentlyOfRequestLogSetting() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        XCTAssertNil(configuration.requestLog, "must stay off to prove metrics are independent of it")
+
+        let requestChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(requestChannel, method: .GET, uri: "/no/such/route")
+        let notFound = try await collectResponse(from: requestChannel)
+        XCTAssertEqual(notFound.head.status, .notFound)
+        _ = try await requestChannel.finish()
+
+        let scrapeChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(scrapeChannel, method: .GET, uri: "/metrics")
+        let scrape = try await collectResponse(from: scrapeChannel)
+
+        XCTAssertEqual(scrape.head.status, .ok)
+        XCTAssertTrue(
+            scrape.body.contains(
+                #"fastmlx_http_requests_total{route="other",status_class="4xx",outcome="error"} 1"#))
+        _ = try await scrapeChannel.finish()
+    }
+
+    // Deterministic, non-timing-dependent slice of the histogram render shape for one series: the
+    // `+Inf` bucket and `_count` always equal the observation count by construction regardless of
+    // wall-clock duration, so both are asserted exactly; `_sum` embeds a real duration and is only
+    // checked for presence (see the dedicated `ServingHTTPMetricsTests` unit suite for exact,
+    // synthetic-value histogram/bucket-boundary coverage).
+    func testMetricsEndpointRendersExactHTTPRequestDurationHistogramLinesForOneRoute() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+
+        let requestChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(requestChannel, method: .GET, uri: "/v1/models/qwen3-32b")
+        let modelResponse = try await collectResponse(from: requestChannel)
+        XCTAssertEqual(modelResponse.head.status, .ok)
+        _ = try await requestChannel.finish()
+
+        let scrapeChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(scrapeChannel, method: .GET, uri: "/metrics")
+        let scrape = try await collectResponse(from: scrapeChannel)
+        let lines = scrape.body.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        XCTAssertTrue(
+            lines.contains(
+                #"fastmlx_http_requests_total{route="/v1/models/{id}",status_class="2xx",outcome="completed"} 1"#))
+        XCTAssertTrue(
+            lines.contains(
+                #"fastmlx_http_request_duration_seconds_bucket{route="/v1/models/{id}",le="+Inf"} 1"#))
+        XCTAssertTrue(
+            lines.contains(#"fastmlx_http_request_duration_seconds_count{route="/v1/models/{id}"} 1"#))
+        XCTAssertTrue(
+            lines.contains {
+                $0.hasPrefix(#"fastmlx_http_request_duration_seconds_sum{route="/v1/models/{id}"} "#)
+            },
+            "a _sum line must exist; the value itself is real wall-clock duration and isn't pinned")
+        _ = try await scrapeChannel.finish()
+    }
+
+    // Both always-on paths fire for the same finished request when `--request-log` IS enabled:
+    // the JSON access-log line (opt-in) and the `/metrics` counter (always-on) are independent
+    // outputs of the same `servingEmitRequestLog` call, not alternatives.
+    func testMetricsAndRequestLogBothRecordTheSameRequestWhenRequestLoggingIsEnabled() async throws {
+        let recorder = RequestLogRecorder()
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() },
+            requestLog: recorder.sink())
+
+        let requestChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(requestChannel, method: .GET, uri: "/no/such/route")
+        let notFound = try await collectResponse(from: requestChannel)
+        XCTAssertEqual(notFound.head.status, .notFound)
+        await waitUntil { recorder.lines().count == 1 }
+        _ = try await requestChannel.finish()
+
+        let scrapeChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(scrapeChannel, method: .GET, uri: "/metrics")
+        let scrape = try await collectResponse(from: scrapeChannel)
+        XCTAssertTrue(
+            scrape.body.contains(
+                #"fastmlx_http_requests_total{route="other",status_class="4xx",outcome="error"} 1"#))
+
+        let object = try requestLogJSONObject(try XCTUnwrap(recorder.lines().first))
+        XCTAssertEqual(object["status"] as? Int, 404)
+        XCTAssertEqual(object["outcome"] as? String, "error")
+        _ = try await scrapeChannel.finish()
     }
 
     func testBackendInvalidRequestWithCodeReturnsHTTP400InsteadOfInternalError()
@@ -3163,6 +3339,20 @@ private func requestBody(stream: Bool) -> String {
     """
     {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":\(stream)}
     """
+}
+
+/// A minimal all-zero snapshot for `/metrics` tests that only care about the always-on HTTP
+/// dependability series (`ServingHTTPMetricsRecorder`), not the evidence-derived gauges -- avoids
+/// each such test repeating the same seven-field literal.
+private func emptyResourceSnapshot() throws -> ServingEvidence.ResourceSnapshot {
+    try ServingEvidence.ResourceSnapshot(
+        activeRequests: 0,
+        coordinatorSlots: 0,
+        reservedKVBytes: 0,
+        maxReservedKVBytes: 0,
+        mlxActiveBytes: 0,
+        mlxCacheBytes: 0,
+        mlxPeakBytes: 0)
 }
 
 private func modelCapabilities(
