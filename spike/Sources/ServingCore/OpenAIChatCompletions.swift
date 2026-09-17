@@ -174,7 +174,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var includeUsage: Bool
     /// Sorted, deduplication-free list of accepted-but-ignored top-level field names present on
     /// this request (OpenAI SDK metadata such as `user`/`metadata`/`store`/`service_tier`, plus
-    /// neutral-valued semantic fields such as `response_format:{"type":"text"}`). Never carries
+    /// neutral-valued semantic fields such as `response_format:{"type":"text"}`, plus any unrecognized
+    /// top-level key recorded as `"unknown:<key>"` — see `rejectUnknownTopLevelKeys`). Never carries
     /// field VALUES. `logprobs`/`top_logprobs` are never listed here even when present: a
     /// validated request is HONORED (see `logprobsRequest`), not ignored.
     public var ignoredFields: [String]
@@ -281,7 +282,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             "logit_bias",
             "stream_options",
         ]
-        try rejectUnknownKeys(in: root, allowed: allowedKeys, paramPrefix: nil)
+        let unknownTopLevelKeys = try rejectUnknownTopLevelKeys(in: root, allowed: allowedKeys)
 
         let model = try requiredString(root["model"], param: "model")
         guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -369,6 +370,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         if serviceTier != nil { ignoredFields.append("service_tier") }
         if responseFormatPresent { ignoredFields.append("response_format") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
+        ignoredFields.append(contentsOf: unknownTopLevelKeys)
         ignoredFields.sort()
 
         return OpenAIChatCompletionRequest(
@@ -505,7 +507,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             "suffix",
             "best_of",
         ]
-        try rejectUnknownKeys(in: root, allowed: allowedKeys, paramPrefix: nil)
+        let unknownTopLevelKeys = try rejectUnknownTopLevelKeys(in: root, allowed: allowedKeys)
 
         let model = try requiredString(root["model"], param: "model")
         guard !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -558,6 +560,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         if metadata != nil { ignoredFields.append("metadata") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
         if echoPresent { ignoredFields.append("echo") }
+        ignoredFields.append(contentsOf: unknownTopLevelKeys)
         ignoredFields.sort()
 
         return OpenAICompletionRequest(
@@ -1474,6 +1477,71 @@ private func rejectUnknownKeys(in object: [String: Any], allowed: Set<String>, p
         let param = paramPrefix.map { "\($0).\(key)" } ?? key
         throw OpenAIServingError.invalidRequest("Unsupported field: \(param)", param: param)
     }
+}
+
+/// Top-level OpenAI keys that change output semantics this server cannot honor: `audio`/`modalities`
+/// request non-text response modalities, `prediction` supplies a speculative-decoding hint tied to a
+/// specific predicted completion, `web_search_options` wires a built-in tool this server never
+/// implements, and `functions`/`function_call` are the legacy (pre-`tools`) function-calling contract
+/// that this server never supported alongside the modern `tools`/`tool_choice` API. Silently accepting
+/// any of these would produce a response the caller explicitly asked for but never receives, so they
+/// stay a hard 400 (`Unsupported field: <key>`) even under the lenient-unknown-top-level-key policy in
+/// `rejectUnknownTopLevelKeys` below.
+private let semanticallyUnsupportedTopLevelKeys: Set<String> = [
+    "audio", "modalities", "prediction", "web_search_options", "functions", "function_call",
+]
+
+/// Lenient TOP-LEVEL-only counterpart to `rejectUnknownKeys`: real OpenAI SDK clients and agent
+/// frameworks routinely send newer/vendor top-level fields this server does not yet recognize, so an
+/// unknown top-level key is no longer a 400 — it is tolerated and returned here as one
+/// `"unknown:<key>"` entry per key for the caller to fold into `ignoredFields` (the existing
+/// accepted-but-ignored warning channel), EXCEPT `semanticallyUnsupportedTopLevelKeys`, which still
+/// throws the same `Unsupported field: <key>` 400 as before (fail-closed, since those keys change
+/// output semantics this server cannot honor). Nested objects (messages entries, tools,
+/// `stream_options`, content parts, ...) are unaffected: they keep calling the strict
+/// `rejectUnknownKeys` above unchanged.
+///
+/// Never returns raw values, only key names — and only a sanitized shape of the name
+/// (`^[A-Za-z0-9_.-]{1,64}$`); any key outside that shape collapses into a single
+/// `"unknown:<invalid-key>"` sentinel instead of being echoed verbatim, so an attacker-controlled key
+/// cannot inject unexpected bytes (commas, control characters, ...) into the comma-joined diagnostic
+/// log line this ultimately feeds. The result is capped at 16 recorded entries plus one trailing
+/// `"unknown:<more>"` sentinel, so a request carrying hundreds of junk keys cannot inflate
+/// `ignoredFields` unboundedly.
+private func rejectUnknownTopLevelKeys(in object: [String: Any], allowed: Set<String>) throws -> [String] {
+    var entries: [String] = []
+    var hasInvalidKeyName = false
+    for key in object.keys.sorted() where !allowed.contains(key) {
+        if semanticallyUnsupportedTopLevelKeys.contains(key) {
+            throw OpenAIServingError.invalidRequest("Unsupported field: \(key)", param: key)
+        }
+        if isValidUnknownTopLevelKeyName(key) {
+            entries.append("unknown:\(key)")
+        } else {
+            hasInvalidKeyName = true
+        }
+    }
+    if hasInvalidKeyName {
+        entries.append("unknown:<invalid-key>")
+    }
+    if entries.count > 16 {
+        entries = Array(entries.prefix(16))
+        entries.append("unknown:<more>")
+    }
+    return entries
+}
+
+private func isValidUnknownTopLevelKeyName(_ key: String) -> Bool {
+    guard (1...64).contains(key.count) else { return false }
+    for scalar in key.unicodeScalars {
+        switch scalar {
+        case "A"..."Z", "a"..."z", "0"..."9", "_", ".", "-":
+            continue
+        default:
+            return false
+        }
+    }
+    return true
 }
 
 private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {

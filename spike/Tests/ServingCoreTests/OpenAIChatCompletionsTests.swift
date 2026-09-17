@@ -178,9 +178,12 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertNoThrow(try request.requireLaunchedModel("other-model"))
     }
 
+    // An arbitrary unknown TOP-LEVEL key (e.g. "unknown") is no longer rejected here — it is now
+    // tolerated (see `testUnknownTopLevelFieldsAreAcceptedAndRecordedAsIgnored` below). Every
+    // remaining case here is either a nested-object violation (still strict) or a typed/range
+    // violation of a KNOWN field name, neither of which this policy change affects.
     func testRejectsUnknownAndUnsupportedFieldsBeforeAdmission() throws {
         let cases: [(String, String?)] = [
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"unknown":true}"#, "unknown"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"temperature":true}"#, "temperature"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_p":true}"#, "top_p"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_k":0}"#, "top_k"),
@@ -433,14 +436,80 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             param: "stream_options")
     }
 
-    func testUnknownFieldIsStillRejected() throws {
+    // MARK: - Lenient unknown top-level keys (real SDK/vendor fields this server does not recognize)
+
+    func testUnknownTopLevelFieldsAreAcceptedAndRecordedAsIgnored() throws {
         let body = """
-        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"unknown":true}
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"unknown":true,"vendor_extension":"x"}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["unknown:unknown", "unknown:vendor_extension"])
+    }
+
+    func testCompletionsUnknownTopLevelFieldIsAcceptedAndRecordedAsIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","prompt":"hi","unknown":true}
+        """
+        let request = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["unknown:unknown"])
+    }
+
+    // `semanticallyUnsupportedTopLevelKeys` change output semantics this server cannot honor, so they
+    // stay a hard 400 even though other unknown top-level keys are now tolerated.
+    func testDenylistedSemanticTopLevelKeysAreStillRejected() throws {
+        let keys = ["audio", "modalities", "prediction", "web_search_options", "functions", "function_call"]
+        for key in keys {
+            let chatBody = #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"\#(key)":true}"#
+            XCTAssertOpenAIError(
+                try OpenAIChatCompletionRequest.decodeStrict(from: Data(chatBody.utf8)),
+                type: .invalidRequest,
+                param: key,
+                file: #filePath,
+                line: #line)
+
+            let completionsBody = #"{"model":"qwen3-32b","prompt":"hi","\#(key)":true}"#
+            XCTAssertOpenAIError(
+                try OpenAICompletionRequest.decodeStrict(from: Data(completionsBody.utf8)),
+                type: .invalidRequest,
+                param: key,
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    // Nested objects (a messages entry here) stay strict: an unknown key inside a message is still a
+    // 400, unaffected by the top-level leniency policy.
+    func testUnknownKeyInsideMessageIsStillRejected() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi","bogus":true}]}
         """
         XCTAssertOpenAIError(
             try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
             type: .invalidRequest,
-            param: "unknown")
+            param: "messages.bogus")
+    }
+
+    // A key shape outside `^[A-Za-z0-9_.-]{1,64}$` never has its literal name echoed into
+    // `ignoredFields`: it collapses into a single `unknown:<invalid-key>` sentinel.
+    func testInvalidShapedUnknownKeyNameCollapsesToSentinel() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"bad key!":true,"also,bad":1}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["unknown:<invalid-key>"])
+    }
+
+    // More than 16 distinct unknown top-level keys are capped at 16 recorded entries plus one
+    // trailing `unknown:<more>` sentinel.
+    func testUnknownTopLevelKeysAreCappedAtSixteenPlusMoreSentinel() throws {
+        let extraKeys = (1...20).map { "extra_\($0)" }
+        let extraFields = extraKeys.map { #""\#($0)":true"# }.joined(separator: ",")
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\(extraFields)}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        let expected = (extraKeys.sorted().prefix(16).map { "unknown:\($0)" } + ["unknown:<more>"]).sorted()
+        XCTAssertEqual(request.ignoredFields, expected)
     }
 
     func testErrorEnvelopeAlwaysCarriesOfficialShape() throws {
@@ -557,8 +626,6 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","prompt":"hi","best_of":2}"#, "best_of"),
             (#"{"model":"qwen3-32b","prompt":"hi","logprobs":6}"#, "logprobs"),
             (#"{"model":"qwen3-32b","prompt":"hi","logprobs":-1}"#, "logprobs"),
-            (#"{"model":"qwen3-32b","prompt":"hi","unknown":true}"#, "unknown"),
-            (#"{"model":"qwen3-32b","prompt":"hi","promptInput":"chat"}"#, "promptInput"),
         ]
         for (body, param) in cases {
             XCTAssertOpenAIError(
@@ -571,8 +638,11 @@ final class OpenAIChatCompletionsTests: XCTestCase {
     }
 
     // The legacy route decodes through OpenAICompletionRequest, not the chat decoder — every
-    // chat-only key is an unknown field here, never silently accepted or ignored.
-    func testCompletionRequestRejectsChatOnlyFieldsAsUnknownKeys() throws {
+    // chat-only key is an unknown field here. Under the lenient-unknown-top-level-key policy this is
+    // no longer a 400: each is silently accepted and recorded as "unknown:<key>" in `ignoredFields`,
+    // exactly like any other unrecognized top-level key (none of these names are on the
+    // `semanticallyUnsupportedTopLevelKeys` denylist).
+    func testCompletionRequestAcceptsChatOnlyFieldsAsIgnoredUnknownKeys() throws {
         let cases: [(String, String)] = [
             (#"{"model":"qwen3-32b","prompt":"hi","messages":[]}"#, "messages"),
             (#"{"model":"qwen3-32b","prompt":"hi","tools":[]}"#, "tools"),
@@ -580,13 +650,9 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","prompt":"hi","chat_template_kwargs":{}}"#, "chat_template_kwargs"),
             (#"{"model":"qwen3-32b","prompt":"hi","max_completion_tokens":16}"#, "max_completion_tokens"),
         ]
-        for (body, param) in cases {
-            XCTAssertOpenAIError(
-                try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8)),
-                type: .invalidRequest,
-                param: param,
-                file: #filePath,
-                line: #line)
+        for (body, key) in cases {
+            let request = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTAssertEqual(request.ignoredFields, ["unknown:\(key)"], body)
         }
     }
 
@@ -648,24 +714,25 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertEqual(chatRequest.promptInput, .rawText("Once upon a time"))
     }
 
-    // The wire decoder for CHAT never accepts a `promptInput` or `prompt` key: both are unknown
-    // fields on `/v1/chat/completions`, proving `.rawText` cannot be set by any chat JSON payload.
-    func testChatDecodeStillRejectsPromptInputAndPromptAsUnknownKeys() throws {
-        XCTAssertOpenAIError(
-            try OpenAIChatCompletionRequest.decodeStrict(
-                from: Data(
-                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"promptInput":"chat"}"#
-                        .utf8)),
-            type: .invalidRequest,
-            param: "promptInput")
+    // The wire decoder for CHAT never RECOGNIZES a `promptInput` or `prompt` key: neither is in the
+    // chat decoder's allowed-keys set, so both fall through the lenient-unknown-top-level-key policy
+    // — accepted and recorded as ignored, but never read into `promptInput`/messages. This still
+    // proves `.rawText` cannot be set by any chat JSON payload; a client sending either key gets
+    // `.chat` regardless.
+    func testChatDecodeIgnoresPromptInputAndPromptAsUnknownKeysNotRawText() throws {
+        let promptInputRequest = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(
+                #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"promptInput":"chat"}"#
+                    .utf8))
+        XCTAssertEqual(promptInputRequest.ignoredFields, ["unknown:promptInput"])
+        XCTAssertEqual(promptInputRequest.promptInput, .chat)
 
-        XCTAssertOpenAIError(
-            try OpenAIChatCompletionRequest.decodeStrict(
-                from: Data(
-                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"prompt":"hi"}"#
-                        .utf8)),
-            type: .invalidRequest,
-            param: "prompt")
+        let promptRequest = try OpenAIChatCompletionRequest.decodeStrict(
+            from: Data(
+                #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"prompt":"hi"}"#
+                    .utf8))
+        XCTAssertEqual(promptRequest.ignoredFields, ["unknown:prompt"])
+        XCTAssertEqual(promptRequest.promptInput, .chat)
 
         // Every chat-decoded request defaults to `.chat`.
         let plain = try OpenAIChatCompletionRequest.decodeStrict(

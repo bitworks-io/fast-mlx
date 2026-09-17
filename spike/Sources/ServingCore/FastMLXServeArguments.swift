@@ -43,6 +43,17 @@ public enum FastMLXServeDefaultSampling: String, Equatable, Sendable {
     case generationConfig = "generation-config"
 }
 
+/// `--request-log`: whether `ServingNIO` emits a compact one-line-per-finished-request JSON access
+/// log. `off` (the default) preserves today's production log volume byte-for-byte -- no per-request
+/// line is ever built or written. `json` opts into it: the request-log fields (never message/
+/// completion content, Authorization/API-key material, raw query strings, or client IP) are written
+/// through an injectable sink, one JSON object per line. See `ServingHTTPConfiguration.requestLog`
+/// and `ServingRequestLogRecord` in `ServingNIO`.
+public enum FastMLXServeRequestLogMode: String, Equatable, Sendable {
+    case off
+    case json
+}
+
 public enum FastMLXExactMTPSelection: String, Equatable, Sendable {
     case qwen35_9BDepth1 = "qwen35-9b-depth1"
     case qwen38_27BMXFP8Depth1 = "qwen38-27b-mxfp8-depth1"
@@ -262,6 +273,7 @@ public enum FastMLXServeArgumentError:
     /// throughput cliff, not a silent drop -- so this combination is refused unless
     /// `--qwen4exp-sampled-mtp` is also present.
     case defaultSamplingWithInCheckpointMTPRequiresSampledMTP
+    case invalidRequestLogMode
 
     public var description: String {
         switch self {
@@ -406,6 +418,8 @@ public enum FastMLXServeArgumentError:
             "--default-sampling generation-config requires --qwen4exp-sampled-mtp when "
                 + "--qwen4exp-mtp is enabled: without it every param-less request would move from "
                 + "accelerated greedy MTP to unaccelerated scalar decode"
+        case .invalidRequestLogMode:
+            "--request-log must be off or json"
         }
     }
 }
@@ -614,6 +628,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       --qwen4exp-sampled-mtp (otherwise every
                                       param-less request would move from accelerated
                                       greedy MTP to unaccelerated scalar decode).
+          --request-log MODE          Per-request structured access log (default: off).
+                                      off emits nothing (byte-identical to today). json
+                                      emits one compact JSON object per finished
+                                      request (method, templated route, status,
+                                      outcome, timing, token counts when known) to
+                                      stderr -- never message/completion content,
+                                      the Authorization header/API key, raw query
+                                      strings, or client IP. Applies to every route,
+                                      including --scripted.
           --host HOST                 Bind host (default: 127.0.0.1).
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
@@ -852,6 +875,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// without `--qwen4exp-sampled-mtp` would move every param-less request from accelerated
     /// greedy MTP to unaccelerated scalar decode (`defaultSamplingWithInCheckpointMTPRequiresSampledMTP`).
     public let defaultSampling: FastMLXServeDefaultSampling
+    /// `--request-log`: `off` (the default) preserves today's behavior byte-for-byte -- `ServingNIO`
+    /// never builds or writes a per-request log line. `json` opts a NEW production log stream in;
+    /// unlike `--default-sampling`/`--chat-template`/etc, it names no route/mode this flag would be
+    /// silently dropped on (every route -- including `--scripted` -- reaches the same handler
+    /// finishing points), so it carries no companion "requires"/"conflicts with" refusals.
+    public let requestLog: FastMLXServeRequestLogMode
 
     private init(
         backend: FastMLXServeBackend?,
@@ -893,7 +922,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         chatTemplateURL: URL? = nil,
         fitCheckOnly: Bool = false,
         offloadPlanCheckOnly: Bool = false,
-        defaultSampling: FastMLXServeDefaultSampling = .off
+        defaultSampling: FastMLXServeDefaultSampling = .off,
+        requestLog: FastMLXServeRequestLogMode = .off
     ) {
         self.backend = backend
         self.host = host
@@ -934,6 +964,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.fitCheckOnly = fitCheckOnly
         self.offloadPlanCheckOnly = offloadPlanCheckOnly
         self.defaultSampling = defaultSampling
+        self.requestLog = requestLog
     }
 
     public static func parse<S: Sequence>(
@@ -987,6 +1018,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var fitCheckOnly = false
         var offloadPlanCheckOnly = false
         var defaultSampling = FastMLXServeDefaultSampling.off
+        var requestLog = FastMLXServeRequestLogMode.off
 
         var index = 0
         while index < arguments.count {
@@ -1208,6 +1240,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidDefaultSampling
                 }
                 defaultSampling = parsedDefaultSampling
+            case "--request-log":
+                index += 1
+                let rawRequestLog = try value(at: index, in: arguments, for: argument)
+                guard
+                    let parsedRequestLog = FastMLXServeRequestLogMode(rawValue: rawRequestLog)
+                else {
+                    throw FastMLXServeArgumentError.invalidRequestLogMode
+                }
+                requestLog = parsedRequestLog
             case "--quality-cards", "--accept-quality":
                 // Quality-guidance moat admission flags. Accepted + value-consumed here so the strict
                 // allowlist parser does not reject them; the values are read directly off
@@ -1247,7 +1288,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
                 maximumRequestBodyBytes: maximumRequestBodyBytes,
                 maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
-                completionLimitPolicy: completionLimitPolicy)
+                completionLimitPolicy: completionLimitPolicy,
+                requestLog: requestLog)
         }
 
         if requestedHostUse == .dedicatedServing {
@@ -1497,7 +1539,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     planConcurrency: planConcurrency,
                     preferMode: preferMode,
                     autoQuantBase: base,
-                    memoryLimitBytes: memoryLimitBytes)
+                    memoryLimitBytes: memoryLimitBytes,
+                    requestLog: requestLog)
             }
             guard !quantCandidateDirs.isEmpty else {
                 throw FastMLXServeArgumentError.missingRequiredOption("--quant-candidates")
@@ -1527,7 +1570,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 serveTier: serveTier,
                 planConcurrency: planConcurrency,
                 preferMode: preferMode,
-                memoryLimitBytes: memoryLimitBytes)
+                memoryLimitBytes: memoryLimitBytes,
+                requestLog: requestLog)
         }
 
         let hasQuantCandidates = !quantCandidateDirs.isEmpty
@@ -1599,7 +1643,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumNonStreamingCompletionTokens: maximumNonStreamingCompletionTokens,
                 maximumRequestBodyBytes: maximumRequestBodyBytes,
                 maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
-                completionLimitPolicy: completionLimitPolicy)
+                completionLimitPolicy: completionLimitPolicy,
+                requestLog: requestLog)
         }
 
         guard continuousModeSelected || hasLoadedModelOptions else {
@@ -1706,7 +1751,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             chatTemplateURL: chatTemplateURL,
             fitCheckOnly: fitCheckOnly,
             offloadPlanCheckOnly: offloadPlanCheckOnly,
-            defaultSampling: defaultSampling)
+            defaultSampling: defaultSampling,
+            requestLog: requestLog)
     }
 
     private static let supportedOptions: Set<String> = [
@@ -1753,6 +1799,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--fit-check-only",
         "--offload-plan-check-only",
         "--default-sampling",
+        "--request-log",
         "--quality-cards",
         "--accept-quality",
     ]

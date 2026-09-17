@@ -1353,6 +1353,136 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await authorizedChannel.finish()
     }
 
+    // MARK: - GET /v1/models/{id}
+
+    func testModelDetailEndpointReturnsModelObjectForServedId() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models/qwen3-32b")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        XCTAssertEqual(object["id"] as? String, "qwen3-32b")
+        XCTAssertEqual(object["object"] as? String, "model")
+        XCTAssertNotNil(object["created"])
+        XCTAssertEqual(object["owned_by"] as? String, "fast-mlx")
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    // Model ids may contain `/` (e.g. `org/name`); a client may percent-encode the path segment.
+    func testModelDetailEndpointDecodesPercentEncodedSlashInModelId() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "org/name",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models/org%2Fname")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        XCTAssertEqual(object["id"] as? String, "org/name")
+        _ = try await channel.finish()
+    }
+
+    func testModelDetailEndpointIgnoresQueryStringInModelId() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "org/name",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models/org%2Fname?probe=1")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        XCTAssertEqual(object["id"] as? String, "org/name")
+        _ = try await channel.finish()
+    }
+
+    func testModelDetailEndpointReturns404ForUnknownModelId() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend)
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models/does-not-exist")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .notFound)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let errorObject = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(errorObject["type"] as? String, "invalid_request_error")
+        XCTAssertEqual(errorObject["code"] as? String, "model_not_found")
+        XCTAssertEqual(
+            errorObject["message"] as? String,
+            "The model 'does-not-exist' does not exist")
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testModelDetailEndpointRequiresAuthWhenConfigured() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+
+        let unauthorizedBackend = ScriptedBackend(scripts: [])
+        let unauthorizedChannel = try await makeChannel(
+            backend: unauthorizedBackend, configuration: configuration)
+        try await writeHeadOnlyRequest(unauthorizedChannel, method: .GET, uri: "/v1/models/qwen3-32b")
+        let unauthorized = try await collectResponse(from: unauthorizedChannel)
+        XCTAssertEqual(unauthorized.head.status, .unauthorized)
+        _ = try await unauthorizedChannel.finish()
+
+        let authorizedBackend = ScriptedBackend(scripts: [])
+        let authorizedChannel = try await makeChannel(
+            backend: authorizedBackend, configuration: configuration)
+        try await writeHeadOnlyRequest(
+            authorizedChannel,
+            method: .GET,
+            uri: "/v1/models/qwen3-32b",
+            authorization: "Bearer secret")
+        let authorized = try await collectResponse(from: authorizedChannel)
+        XCTAssertEqual(authorized.head.status, .ok)
+        _ = try await authorizedChannel.finish()
+    }
+
+    // Same method handling as `/v1/models`: a non-GET is rejected before any backend admission.
+    func testModelDetailEndpointRejectsWrongMethod() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend)
+        try await writeHeadOnlyRequest(channel, method: .POST, uri: "/v1/models/qwen3-32b")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .methodNotAllowed)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testModelDetailEndpointRejectsRequestBody() async throws {
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend)
+        try await writeHeadWithBodyRequest(
+            channel, method: .GET, uri: "/v1/models/qwen3-32b", body: "{}")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        _ = try await channel.finish()
+    }
+
     func testMetricsEndpointRequiresAuthAndReturnsSnapshotPrometheusText()
         async throws
     {
@@ -2755,6 +2885,216 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(error["code"] as? String, "logprobs_unsupported")
         _ = try await channel.finish()
     }
+
+    // MARK: - Request log (`--request-log json` / `ServingHTTPConfiguration.requestLog`)
+
+    func testRequestLogChatNonStreamingSuccessEmitsExactlyOneLineWithNoContent() async throws {
+        let promptSentinel = "PROMPT-SENTINEL-requestlog"
+        let generatedSentinel = "GENERATED-SENTINEL-requestlog"
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: [generatedSentinel], promptTokens: 3, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"\(promptSentinel)"}],"max_completion_tokens":8,"temperature":0,"stream":false}
+            """
+
+        try await writeRequest(channel, body: body)
+        _ = try await collectResponse(from: channel)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["method"] as? String, "POST")
+        XCTAssertEqual(object["route"] as? String, "/v1/chat/completions")
+        XCTAssertEqual(object["status"] as? Int, 200)
+        XCTAssertEqual(object["outcome"] as? String, "completed")
+        XCTAssertEqual(object["stream"] as? Bool, false)
+        XCTAssertEqual(object["model"] as? String, "qwen3-32b")
+        XCTAssertEqual(object["prompt_tokens"] as? Int, 3)
+        XCTAssertEqual(object["completion_tokens"] as? Int, 2)
+        XCTAssertEqual(object["finish_reason"] as? String, "stop")
+        XCTAssertNotNil(object["request_id"] as? String)
+        XCTAssertNotNil(object["duration_ms"] as? Double)
+        XCTAssertNotNil(object["ts"] as? String)
+        // Never message/prompt content or the model's generated text.
+        XCTAssertFalse(line.contains(promptSentinel))
+        XCTAssertFalse(line.contains(generatedSentinel))
+        _ = try await channel.finish()
+    }
+
+    func testRequestLogStreamingSuccessEmitsExactlyOneLineWithTTFT() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], finishReason: .length, promptTokens: 3, completionTokens: 2)
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeRequest(channel, body: requestBody(stream: true))
+        _ = try await collectResponse(from: channel)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["route"] as? String, "/v1/chat/completions")
+        XCTAssertEqual(object["status"] as? Int, 200)
+        XCTAssertEqual(object["outcome"] as? String, "completed")
+        XCTAssertEqual(object["stream"] as? Bool, true)
+        XCTAssertEqual(object["finish_reason"] as? String, "length")
+        let ttft = try XCTUnwrap(object["ttft_ms"] as? Double)
+        XCTAssertGreaterThanOrEqual(ttft, 0)
+        _ = try await channel.finish()
+    }
+
+    func testRequestLog400InvalidRequestEmitsExactlyOneErrorLine() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeRequest(channel, body: "not json")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .badRequest)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["status"] as? Int, 400)
+        XCTAssertEqual(object["outcome"] as? String, "error")
+        XCTAssertNotNil(object["error_code"] as? String)
+        _ = try await channel.finish()
+    }
+
+    // A wrong/missing bearer token must log status 401 with no key material anywhere in the line.
+    func testRequestLog401AuthFailureEmitsLineWithNoKeyMaterial() async throws {
+        let apiKeySentinel = "sk-API-KEY-SENTINEL-requestlog"
+        let wrongKeySentinel = "sk-WRONG-KEY-SENTINEL-requestlog"
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [])
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: apiKeySentinel,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            requestLog: recorder.sink())
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(
+            channel,
+            body: requestBody(stream: false),
+            authorization: "Bearer \(wrongKeySentinel)")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .unauthorized)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["status"] as? Int, 401)
+        XCTAssertEqual(object["outcome"] as? String, "error")
+        XCTAssertFalse(line.contains(apiKeySentinel))
+        XCTAssertFalse(line.contains(wrongKeySentinel))
+        XCTAssertFalse(line.lowercased().contains("bearer"))
+        XCTAssertFalse(line.lowercased().contains("authorization"))
+        _ = try await channel.finish()
+    }
+
+    func testRequestLog404UnknownRouteEmitsExactlyOneLine() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/no/such/route-zq7secret")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .notFound)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["method"] as? String, "GET")
+        XCTAssertEqual(object["route"] as? String, "<unmatched>")
+        XCTAssertFalse(line.contains("zq7secret"))
+        XCTAssertEqual(object["status"] as? Int, 404)
+        XCTAssertEqual(object["outcome"] as? String, "error")
+        _ = try await channel.finish()
+    }
+
+    // `GET /v1/models/{id}` must log the TEMPLATED route, never the raw requested id.
+    func testRequestLogModelDetailRouteIsTemplated() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models/qwen3-32b")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .ok)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertEqual(object["route"] as? String, "/v1/models/{id}")
+        XCTAssertFalse(line.contains("/v1/models/qwen3-32b"))
+        XCTAssertEqual(object["status"] as? Int, 200)
+        XCTAssertEqual(object["outcome"] as? String, "completed")
+        _ = try await channel.finish()
+    }
+
+    // An unrecognized top-level request field is accepted-but-ignored (see
+    // `OpenAIChatCompletionRequest.ignoredFields`); the request-log line must surface its
+    // sanitized `"unknown:<key>"` name.
+    func testRequestLogIgnoredFieldsPresentForUnknownTopLevelKey() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"a_totally_unknown_field":true}
+            """
+
+        try await writeRequest(channel, body: body)
+        _ = try await collectResponse(from: channel)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        let ignoredFields = try XCTUnwrap(object["ignored_fields"] as? [String])
+        XCTAssertEqual(ignoredFields, ["unknown:a_totally_unknown_field"])
+        _ = try await channel.finish()
+    }
+
+    // A successful request with NO ignored fields must omit the key entirely (never an empty
+    // array), matching the serve flag's "omitted when empty" contract.
+    func testRequestLogOmitsIgnoredFieldsKeyWhenEmpty() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        _ = try await collectResponse(from: channel)
+        await waitUntil { recorder.lines().count == 1 }
+
+        let line = try XCTUnwrap(recorder.lines().first)
+        let object = try requestLogJSONObject(line)
+        XCTAssertNil(object["ignored_fields"])
+        _ = try await channel.finish()
+    }
 }
 
 private struct CollectedResponse {
@@ -2800,6 +3140,23 @@ private func defaultConfiguration(
         maximumNonStreamingResponseBytes: 1_048_576,
         backpressureStallTimeout: .seconds(1),
         requestFailureReporter: requestFailureReporter)
+}
+
+private func requestLogConfiguration(
+    sink: @escaping @Sendable (String) -> Void
+) -> ServingHTTPConfiguration {
+    ServingHTTPConfiguration(
+        launchedModel: "qwen3-32b",
+        requestLimits: .productionDefault,
+        requiredBearerToken: nil,
+        maximumNonStreamingResponseBytes: 1_048_576,
+        backpressureStallTimeout: .seconds(1),
+        requestLog: sink)
+}
+
+private func requestLogJSONObject(_ line: String) throws -> [String: Any] {
+    try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
 }
 
 private func requestBody(stream: Bool) -> String {
@@ -2950,6 +3307,25 @@ private func writeHeadWithBodyRequest(
     _ = try await channel.writeInbound(
         HTTPServerRequestPart.body(ByteBuffer(string: body)))
     _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+}
+
+/// Captures `--request-log json` lines through a synchronous, thread-safe sink: unlike
+/// `ServingEvidenceRecorder` (an actor), `ServingHTTPConfiguration.requestLog` is a plain
+/// `@Sendable (String) -> Void` closure invoked from both synchronous NIO event-loop callbacks and
+/// detached generation `Task`s, so the capture point itself must be synchronous -- an
+/// `OSAllocatedUnfairLock`-backed array, mirroring `ServingHTTPEvidenceTracker`'s own lock usage.
+private final class RequestLogRecorder: Sendable {
+    private let state = OSAllocatedUnfairLock<[String]>(initialState: [])
+
+    func sink() -> @Sendable (String) -> Void {
+        { [state] line in
+            state.withLock { $0.append(line) }
+        }
+    }
+
+    func lines() -> [String] {
+        state.withLock { $0 }
+    }
 }
 
 private actor ServingEvidenceRecorder {

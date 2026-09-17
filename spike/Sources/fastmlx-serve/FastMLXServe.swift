@@ -231,7 +231,12 @@ struct FastMLXServe {
             // `ServingHTTPConfiguration.requestFailureReporter`). Uses the same bare `print`
             // (stdout) mechanism as `startupLine` and the `mtp_request_*` line, so a swallowed
             // generation failure is readable off a live serve the same way those already are.
-            requestFailureReporter: { line in print(line) })
+            requestFailureReporter: { line in print(line) },
+            // `--request-log`: `off` (the default) leaves this `nil`, so `ServingNIO` never builds
+            // or writes a request-log line -- byte-identical to today. `json` wires in the
+            // production stderr sink; every route (including `--scripted`) shares this one
+            // `ServingHTTPConfiguration` construction site.
+            requestLog: arguments.requestLog == .json ? servingRequestLogStandardErrorSink() : nil)
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(

@@ -106,6 +106,17 @@ public struct ServingHTTPConfiguration: Sendable {
     /// 503 branch of `/readyz` is exercisable from tests. Must stay `Sendable`-clean: it can be
     /// invoked from any NIO event loop thread.
     public let readiness: @Sendable () -> Bool
+    /// Backs the structured per-request access log (`--request-log json`). `nil` (the default)
+    /// preserves today's behavior byte-for-byte: `OpenAIChatCompletionsHTTPHandler` never builds or
+    /// writes a request-log line at all, on any route. Non-`nil` opts a sink in: the handler emits
+    /// exactly one compact, sorted-keys JSON object per finished request (see
+    /// `ServingRequestLogRecord`) by calling this closure with the already-encoded line (no trailing
+    /// newline). Injectable so tests can capture lines into an array instead of writing to stderr;
+    /// the production default (`servingRequestLogStandardErrorSink()`) appends a trailing newline and
+    /// writes through `FileHandle.standardError.write`, which issues the `write(2)` syscall directly
+    /// (unbuffered), satisfying "flushed" with no separate fsync step. Must stay `Sendable`-clean:
+    /// invoked from both synchronous NIO event-loop callbacks and detached generation `Task`s.
+    public let requestLog: (@Sendable (String) -> Void)?
 
     public init(
         launchedModel: String,
@@ -117,7 +128,8 @@ public struct ServingHTTPConfiguration: Sendable {
         modelCapabilities: ServingModelCapabilities? = nil,
         metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil,
         requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter? = nil,
-        readiness: @escaping @Sendable () -> Bool = { true }
+        readiness: @escaping @Sendable () -> Bool = { true },
+        requestLog: (@Sendable (String) -> Void)? = nil
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -142,6 +154,7 @@ public struct ServingHTTPConfiguration: Sendable {
         self.metricsSnapshot = metricsSnapshot
         self.requestFailureReporter = requestFailureReporter
         self.readiness = readiness
+        self.requestLog = requestLog
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")

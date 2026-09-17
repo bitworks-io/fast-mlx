@@ -107,8 +107,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # plumbing). Conscious decision to publish: both are family-neutral serving source/tests and
 # reference no host, credential, competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 927,
-    "pathModeSha256": "ba0e7717e312aeb8ce2c1818d7941da83bec8dc7a95b7f73ab8d8d10ad6cffe6",
+    "pathCount": 929,
+    "pathModeSha256": "c9527cfb9a9212183871e2839c0e39a8d756a5a16dc9ac4261d7080b7126a489",
 }
 
 

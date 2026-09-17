@@ -18,6 +18,15 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private var activeControl: ServingTransportRequestControl?
     private var activeTask: Task<Void, Never>?
     private var activeWritabilityGate: ServingChannelWritabilityGate?
+    /// Timing/routing facts for the request-log line (`--request-log json`), captured in
+    /// `receiveHead` -- before routing/decoding -- so every finishing path can emit from the same
+    /// starting point. `nil` end-to-end whenever `configuration.requestLog` is `nil` (the `off`
+    /// default), so the feature costs nothing when disabled. Safe to overwrite on each new
+    /// `receiveHead` without explicit per-branch clearing: the guard at the top of `receiveHead`
+    /// already refuses a new request head while a previous one is still in flight (`activeControl
+    /// == nil, pendingHead == nil`), so there is never more than one request's preamble live at once
+    /// on this handler.
+    private var pendingRequestLogPreamble: ServingRequestLogPreamble?
 
     public init(
         configuration: ServingHTTPConfiguration,
@@ -79,6 +88,16 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             cancelActive(.clientDisconnected)
             context.close(promise: nil)
             return
+        }
+
+        // Captured before routing/decoding so a REJECTED head (auth failure, unknown route, bad
+        // method, bad content-type) still gets a request-log line -- `nil` whenever request logging
+        // is off, so this costs nothing on the default path.
+        pendingRequestLogPreamble = configuration.requestLog.map { _ in
+            ServingRequestLogPreamble(
+                method: head.method.rawValue,
+                route: servingRequestLogTemplatedRoute(head.uri),
+                startedAt: ContinuousClock().now)
         }
 
         if let rejection = validateHead(head) {
@@ -145,6 +164,22 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 return
             }
             writeModelList(keepAlive: head.isKeepAlive, context: context)
+            return
+        }
+        if head.method == .GET, let rawModelId = Self.modelDetailPathSuffix(head.uri) {
+            guard body.readableBytes == 0 else {
+                writeError(
+                    .invalidRequest("GET /v1/models/{id} does not accept a request body", param: nil),
+                    status: .badRequest,
+                    keepAlive: head.isKeepAlive,
+                    context: context)
+                return
+            }
+            // Model ids may contain `/` (e.g. `org/name`); a client may send the path segment
+            // percent-encoded (`org%2Fname`) or, less strictly, raw. Accept both — decode when
+            // possible, otherwise fall back to the raw segment unchanged.
+            let requestedModelId = rawModelId.removingPercentEncoding ?? rawModelId
+            writeModelObject(id: requestedModelId, keepAlive: head.isKeepAlive, context: context)
             return
         }
         if head.method == .GET, head.uri == "/metrics" {
@@ -263,7 +298,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                     code: "logprobs_unsupported"),
                 status: .badRequest,
                 keepAlive: head.isKeepAlive,
-                context: context)
+                context: context,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
             return
         }
 
@@ -315,7 +353,22 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             channel: channel,
             control: control,
             writabilityGate: writabilityGate,
-            requestEvidence: requestEvidence)
+            requestEvidence: requestEvidence,
+            requestLogPreamble: pendingRequestLogPreamble)
+    }
+
+    /// `GET /v1/models/{id}` (e.g. the OpenAI SDK's `models.retrieve`) has a variable path, so it
+    /// cannot be matched with a plain `==` like the other routes. Returns the raw (still
+    /// percent-ENCODED — callers must decode it) non-empty remainder after the `/v1/models/` prefix,
+    /// or `nil` when `uri` is not a model-detail request (including the bare `/v1/models/` with no id
+    /// at all, which is treated as an unknown route rather than an empty model id).
+    private static func modelDetailPathSuffix(_ uri: String) -> String? {
+        let prefix = "/v1/models/"
+        // A query string is not part of the model id (`/v1/models/org%2Fname?x=1`).
+        let path = uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        guard path.hasPrefix(prefix) else { return nil }
+        let suffix = String(path.dropFirst(prefix.count))
+        return suffix.isEmpty ? nil : suffix
     }
 
     private func validateHead(
@@ -324,10 +377,11 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         let isChat = head.uri == "/v1/chat/completions"
         let isCompletions = head.uri == "/v1/completions"
         let isModels = head.uri == "/v1/models"
+        let isModelDetail = Self.modelDetailPathSuffix(head.uri) != nil
         let isMetrics = head.uri == "/metrics"
         let isHealthz = head.uri == "/healthz"
         let isReadyz = head.uri == "/readyz"
-        guard isChat || isCompletions || isModels || isMetrics || isHealthz || isReadyz else {
+        guard isChat || isCompletions || isModels || isModelDetail || isMetrics || isHealthz || isReadyz else {
             return (
                 .notFound,
                 .invalidRequest("Unknown route", param: nil))
@@ -335,6 +389,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         guard (isChat && head.method == .POST)
             || (isCompletions && head.method == .POST)
             || (isModels && head.method == .GET)
+            || (isModelDetail && head.method == .GET)
             || (isMetrics && head.method == .GET)
             || (isHealthz && head.method == .GET)
             || (isReadyz && head.method == .GET)
@@ -378,7 +433,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             }
         }
 
-        if isModels || isMetrics {
+        if isModels || isModelDetail || isMetrics {
             let lengthHeaders = head.headers["content-length"]
             guard lengthHeaders.count <= 1 else {
                 return (
@@ -388,7 +443,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             if let rawLength = lengthHeaders.first,
                 (Int(rawLength) ?? -1) != 0
             {
-                let route = isMetrics ? "/metrics" : "/v1/models"
+                let route = isMetrics ? "/metrics" : (isModelDetail ? "/v1/models/{id}" : "/v1/models")
                 return (
                     .badRequest,
                     .invalidRequest("GET \(route) does not accept a request body", param: nil))
@@ -435,9 +490,78 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         keepAlive: Bool,
         context: ChannelHandlerContext
     ) {
+        if let preamble = pendingRequestLogPreamble {
+            Self.emitRequestLog(
+                configuration: configuration,
+                preamble: preamble,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .completed)
+        }
         do {
             let data = try JSONEncoder.openAI.encode(
                 OpenAIModelListResponse(
+                    model: configuration.launchedModel,
+                    capabilities: configuration.modelCapabilities))
+            var headers = HTTPHeaders()
+            headers.add(name: "content-type", value: "application/json")
+            headers.add(name: "content-length", value: "\(data.count)")
+            if !keepAlive {
+                headers.add(name: "connection", value: "close")
+            }
+            let head = HTTPResponseHead(
+                version: .http1_1,
+                status: .ok,
+                headers: headers)
+            var body = context.channel.allocator.buffer(capacity: data.count)
+            body.writeBytes(data)
+            context.write(wrapOutboundOut(.head(head)), promise: nil)
+            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
+            if !keepAlive {
+                let channel = context.channel
+                completion.whenComplete { _ in
+                    channel.close(promise: nil)
+                }
+            }
+        } catch {
+            context.close(promise: nil)
+        }
+    }
+
+    /// `GET /v1/models/{id}` (e.g. the OpenAI SDK's `models.retrieve`). Reuses `OpenAIModelObject` —
+    /// the exact same per-model object builder `writeModelList`/`OpenAIModelListResponse` use for the
+    /// list route — so the two routes can never drift on which fields a model object carries. A
+    /// requested id other than the one launched model this server serves 404s with the OpenAI error
+    /// envelope (`invalid_request_error` / `model_not_found`), same as OpenAI's own behavior for an
+    /// unknown model id; the echoed id is truncated to 256 chars so an oversized path segment cannot
+    /// inflate the error body.
+    private func writeModelObject(
+        id: String,
+        keepAlive: Bool,
+        context: ChannelHandlerContext
+    ) {
+        guard id == configuration.launchedModel else {
+            let truncatedId = String(id.prefix(256))
+            writeError(
+                .invalidRequestWithCode(
+                    "The model '\(truncatedId)' does not exist",
+                    param: "model",
+                    code: "model_not_found"),
+                status: .notFound,
+                keepAlive: keepAlive,
+                context: context)
+            return
+        }
+        if let preamble = pendingRequestLogPreamble {
+            Self.emitRequestLog(
+                configuration: configuration,
+                preamble: preamble,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .completed)
+        }
+        do {
+            let data = try JSONEncoder.openAI.encode(
+                OpenAIModelObject(
                     model: configuration.launchedModel,
                     capabilities: configuration.modelCapabilities))
             var headers = HTTPHeaders()
@@ -477,6 +601,17 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         keepAlive: Bool,
         context: ChannelHandlerContext
     ) {
+        // A probe route's own reported state (`ready`/`not_ready`) is not a request FAILURE in the
+        // access-log sense -- it is the server truthfully answering "am I ready?", including when
+        // the honest answer is 503. Both `/healthz` and `/readyz` always log outcome `completed`
+        // here regardless of `httpStatus`.
+        if let preamble = pendingRequestLogPreamble {
+            Self.emitRequestLog(
+                configuration: configuration,
+                preamble: preamble,
+                status: Int(httpStatus.code),
+                outcome: .completed)
+        }
         do {
             let data = try JSONEncoder.openAI.encode(HealthProbeStatus(status: status))
             var headers = HTTPHeaders()
@@ -511,20 +646,43 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     ) {
         let control = ServingTransportRequestControl()
         let channel = context.channel
+        let requestLogPreamble = pendingRequestLogPreamble
         activeControl = control
         activeTask = Self.makeMetricsTask(
             keepAlive: keepAlive,
             configuration: configuration,
             channel: channel,
-            control: control)
+            control: control,
+            requestLogPreamble: requestLogPreamble)
     }
 
     private func writeError(
         _ error: OpenAIServingError,
         status: HTTPResponseStatus,
         keepAlive: Bool,
-        context: ChannelHandlerContext
+        context: ChannelHandlerContext,
+        // Known only at ONE call site (the logprobs-vs-evidence conflict check in `receiveEnd`,
+        // which runs AFTER a successful decode): every other `writeError` call site rejects the
+        // request before a request/model is ever decoded, so these default to "unknown" rather than
+        // guessing. `writeError` never echoes an arbitrary client-supplied model string here -- the
+        // caller passes `configuration.launchedModel` only once it has independently confirmed a
+        // match via `requireLaunchedModel`, mirroring the same rule `runGeneration` follows.
+        requestLogStream: Bool? = nil,
+        requestLogModel: String? = nil,
+        requestLogIgnoredFields: [String] = []
     ) {
+        if let preamble = pendingRequestLogPreamble {
+            let payload = error.openAIError
+            Self.emitRequestLog(
+                configuration: configuration,
+                preamble: preamble,
+                status: Int(status.code),
+                outcome: .error,
+                stream: requestLogStream,
+                model: requestLogModel,
+                errorCode: payload.code ?? payload.type.rawValue,
+                ignoredFields: requestLogIgnoredFields)
+        }
         do {
             let data = try JSONEncoder.openAI.encode(
                 OpenAIErrorEnvelope(error: error.openAIError))
@@ -592,6 +750,48 @@ private extension OpenAIChatCompletionsHTTPHandler {
         case writeFailure
     }
 
+    /// Shared request-log emission point for every static (non-instance) finishing path --
+    /// `runGeneration`'s many outcomes and `runMetrics`'s success/failure branches -- mirroring the
+    /// instance-side emission `writeError` does internally. `preamble: nil` (request logging off, or
+    /// a route this handler does not track a preamble for) is a no-op, so every call site here can
+    /// call this unconditionally. `requestID` defaults to a freshly generated id, matching the
+    /// serve flag's "the existing response id if one exists, else a generated one" contract --
+    /// callers that already minted a real response id (a started generation handle) pass it
+    /// explicitly instead.
+    static func emitRequestLog(
+        configuration: ServingHTTPConfiguration,
+        preamble: ServingRequestLogPreamble?,
+        requestID: String = UUID().uuidString,
+        status: Int,
+        outcome: ServingRequestLogRecord.Outcome,
+        stream: Bool? = nil,
+        model: String? = nil,
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        ttftMs: Double? = nil,
+        finishReason: String? = nil,
+        errorCode: String? = nil,
+        ignoredFields: [String] = []
+    ) {
+        guard let preamble else {
+            return
+        }
+        servingEmitRequestLog(
+            configuration: configuration,
+            preamble: preamble,
+            requestID: requestID,
+            status: status,
+            outcome: outcome,
+            stream: stream,
+            model: model,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            ttftMs: ttftMs,
+            finishReason: finishReason,
+            errorCode: errorCode,
+            ignoredFields: ignoredFields)
+    }
+
     static func makeGenerationTask(
         request: OpenAIChatCompletionRequest,
         responseKind: ServingResponseKind,
@@ -601,7 +801,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         channel: any Channel,
         control: ServingTransportRequestControl,
         writabilityGate: ServingChannelWritabilityGate,
-        requestEvidence: ServingEvidence.Request?
+        requestEvidence: ServingEvidence.Request?,
+        requestLogPreamble: ServingRequestLogPreamble? = nil
     ) -> Task<Void, Never> {
         let responseAccumulator = requestEvidence.map { _ in
             ServingResponseEvidenceAccumulator()
@@ -619,7 +820,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         control: control,
                         writabilityGate: writabilityGate,
                         requestEvidence: requestEvidence,
-                        responseAccumulator: responseAccumulator)
+                        responseAccumulator: responseAccumulator,
+                        requestLogPreamble: requestLogPreamble)
                 }
         }
     }
@@ -628,14 +830,16 @@ private extension OpenAIChatCompletionsHTTPHandler {
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
-        control: ServingTransportRequestControl
+        control: ServingTransportRequestControl,
+        requestLogPreamble: ServingRequestLogPreamble? = nil
     ) -> Task<Void, Never> {
         Task.detached {
             await runMetrics(
                 keepAlive: keepAlive,
                 configuration: configuration,
                 channel: channel,
-                control: control)
+                control: control,
+                requestLogPreamble: requestLogPreamble)
         }
     }
 
@@ -643,7 +847,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
-        control: ServingTransportRequestControl
+        control: ServingTransportRequestControl,
+        requestLogPreamble: ServingRequestLogPreamble? = nil
     ) async {
         defer {
             control.markTerminal()
@@ -655,7 +860,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 code: "metrics_unavailable",
                 keepAlive: keepAlive,
                 configuration: configuration,
-                channel: channel)
+                channel: channel,
+                requestLogPreamble: requestLogPreamble)
             return
         }
 
@@ -663,6 +869,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
         do {
             bodyText = try await metricsText(from: snapshotProvider)
         } catch is CancellationError {
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                status: Int(HTTPResponseStatus.internalServerError.code),
+                outcome: .clientDisconnected)
             await close(channel)
             return
         } catch {
@@ -673,7 +884,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 code: "metrics_snapshot_failed",
                 keepAlive: keepAlive,
                 configuration: configuration,
-                channel: channel)
+                channel: channel,
+                requestLogPreamble: requestLogPreamble)
             return
         }
 
@@ -684,12 +896,27 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 keepAlive: keepAlive,
                 channel: channel,
                 timeout: configuration.backpressureStallTimeout)
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .completed)
             if !keepAlive {
                 await close(channel)
             }
         } catch is CancellationError {
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .clientDisconnected)
             await close(channel)
         } catch {
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                status: Int(HTTPResponseStatus.ok.code),
+                outcome: .error)
             await close(channel)
         }
     }
@@ -713,7 +940,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         control: ServingTransportRequestControl,
         writabilityGate: ServingChannelWritabilityGate,
         requestEvidence: ServingEvidence.Request?,
-        responseAccumulator: ServingResponseEvidenceAccumulator?
+        responseAccumulator: ServingResponseEvidenceAccumulator?,
+        requestLogPreamble: ServingRequestLogPreamble? = nil
     ) async {
         var handle: ServingGenerationHandle?
         var responseStarted = false
@@ -722,6 +950,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
         var beforeResources: ServingEvidence.ResourceSnapshot?
         var activeResources: ServingEvidence.ResourceSnapshot?
         var failedSnapshots: [ServingEvidence.ResourceSnapshotStage] = []
+        // Request-log-only state (all unused when `requestLogPreamble` is `nil`, i.e. `--request-log
+        // off`): `requestLogID` is the "existing response id if one exists, else a generated one"
+        // contract -- generated up front so every catch branch, including ones reached before a
+        // backend handle exists, has an id to report. `requestLogTTFTAt` is set once, the first time
+        // a generated token becomes available on the STREAMING path (see below); left `nil` for a
+        // non-streaming response and for a request that fails before any token is produced.
+        // `requestLogCompletion` is set from whichever branch (streaming/non-streaming) actually
+        // finishes, so the single success-path emission below does not need to duplicate either
+        // branch's own completion-handling logic.
+        let requestLogID = UUID().uuidString
+        var requestLogTTFTAt: ContinuousClock.Instant?
+        var requestLogCompletion: ServingGenerationCompletion?
         defer {
             control.markTerminal()
             configuration.evidence?.tracker.end()
@@ -777,6 +1017,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     timeout: configuration.backpressureStallTimeout)
                 responseStarted = true
                 let first = try await started.mailbox.next()
+                requestLogTTFTAt = ContinuousClock().now
                 guard let first else {
                     throw RunError.missingCompletion
                 }
@@ -796,6 +1037,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     writabilityGate: writabilityGate,
                     responseKind: responseKind,
                     logprobsRequest: request.logprobsRequest)
+                requestLogCompletion = streamResult.completion
                 try await writeSSETerminal(
                     streamResult.completion,
                     handle: started,
@@ -811,6 +1053,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 let result = try await collectNonStreaming(
                     handle: started,
                     maximumBytes: configuration.maximumNonStreamingResponseBytes)
+                requestLogCompletion = result.completion
                 switch responseKind {
                 case .chat:
                     // Separate Qwen `<think>…</think>` reasoning from the visible answer
@@ -883,6 +1126,25 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
             _ = await started.lease.complete()
             control.markTerminal()
+            if let requestLogPreamble {
+                let ttftMs = requestLogTTFTAt.map {
+                    servingRequestLogDurationMilliseconds(
+                        from: requestLogPreamble.startedAt, to: $0)
+                }
+                emitRequestLog(
+                    configuration: configuration,
+                    preamble: requestLogPreamble,
+                    requestID: started.responseID,
+                    status: Int(HTTPResponseStatus.ok.code),
+                    outcome: .completed,
+                    stream: request.stream,
+                    model: configuration.launchedModel,
+                    promptTokens: requestLogCompletion?.usage.promptTokens,
+                    completionTokens: requestLogCompletion?.usage.completionTokens,
+                    ttftMs: ttftMs,
+                    finishReason: requestLogCompletion?.finishReason.rawValue,
+                    ignoredFields: request.ignoredFields)
+            }
             if !keepAlive {
                 await close(channel)
             }
@@ -895,7 +1157,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 responseStarted: responseStarted,
                 keepAlive: keepAlive,
                 channel: channel,
-                timeout: configuration.backpressureStallTimeout)
+                timeout: configuration.backpressureStallTimeout,
+                configuration: configuration,
+                requestLogPreamble: requestLogPreamble,
+                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
@@ -905,22 +1173,58 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 admissionError,
                 keepAlive: keepAlive,
                 channel: channel,
-                timeout: configuration.backpressureStallTimeout)
+                timeout: configuration.backpressureStallTimeout,
+                configuration: configuration,
+                requestLogPreamble: requestLogPreamble,
+                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
         } catch is CancellationError {
             await control.cancellation.cancel(.clientDisconnected)
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: handle?.responseID ?? requestLogID,
+                status: Int(
+                    (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
+                outcome: .clientDisconnected,
+                stream: request.stream,
+                model: configuration.launchedModel,
+                ignoredFields: request.ignoredFields)
             await close(channel)
         } catch let gateError as ServingChannelWritabilityGate.GateError {
             if case .backpressureTimeout = gateError {
                 await control.cancellation.cancel(.backpressureTimeout)
             }
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: handle?.responseID ?? requestLogID,
+                status: Int(
+                    (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
+                outcome: .error,
+                stream: request.stream,
+                model: configuration.launchedModel,
+                ignoredFields: request.ignoredFields)
             await close(channel)
         } catch let mailboxError as ServingMailboxError {
             switch mailboxError {
             case .cancelled(let reason):
                 await control.cancellation.cancel(reason)
+                emitRequestLog(
+                    configuration: configuration,
+                    preamble: requestLogPreamble,
+                    requestID: handle?.responseID ?? requestLogID,
+                    status: Int(
+                        (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
+                    outcome: reason == .clientDisconnected ? .clientDisconnected : .error,
+                    stream: request.stream,
+                    model: configuration.launchedModel,
+                    ignoredFields: request.ignoredFields)
                 await close(channel)
             case .backend(let message):
                 _ = await handle?.lease.fail(message)
@@ -928,7 +1232,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                    timeout: configuration.backpressureStallTimeout,
+                    configuration: configuration,
+                    requestLogPreamble: requestLogPreamble,
+                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestLogStream: request.stream,
+                    requestLogModel: configuration.launchedModel,
+                    requestLogIgnoredFields: request.ignoredFields)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -937,6 +1247,16 @@ private extension OpenAIChatCompletionsHTTPHandler {
             switch runError {
             case .backpressureTimeout:
                 await control.cancellation.cancel(.backpressureTimeout)
+                emitRequestLog(
+                    configuration: configuration,
+                    preamble: requestLogPreamble,
+                    requestID: handle?.responseID ?? requestLogID,
+                    status: Int(
+                        (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
+                    outcome: .error,
+                    stream: request.stream,
+                    model: configuration.launchedModel,
+                    ignoredFields: request.ignoredFields)
                 await close(channel)
             case .responseLimitExceeded:
                 let writeCancellation = await writeServingFailure(
@@ -947,11 +1267,27 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                    timeout: configuration.backpressureStallTimeout,
+                    configuration: configuration,
+                    requestLogPreamble: requestLogPreamble,
+                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestLogStream: request.stream,
+                    requestLogModel: configuration.launchedModel,
+                    requestLogIgnoredFields: request.ignoredFields)
                 await control.cancellation.cancel(
                     writeCancellation ?? .responseLimitExceeded)
             case .writeFailure:
                 await control.cancellation.cancel(.clientDisconnected)
+                emitRequestLog(
+                    configuration: configuration,
+                    preamble: requestLogPreamble,
+                    requestID: handle?.responseID ?? requestLogID,
+                    status: Int(
+                        (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
+                    outcome: .clientDisconnected,
+                    stream: request.stream,
+                    model: configuration.launchedModel,
+                    ignoredFields: request.ignoredFields)
                 await close(channel)
             case .invalidBackendHandle:
                 admission = .backendFailure
@@ -960,7 +1296,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                    timeout: configuration.backpressureStallTimeout,
+                    configuration: configuration,
+                    requestLogPreamble: requestLogPreamble,
+                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestLogStream: request.stream,
+                    requestLogModel: configuration.launchedModel,
+                    requestLogIgnoredFields: request.ignoredFields)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -970,7 +1312,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
-                    timeout: configuration.backpressureStallTimeout)
+                    timeout: configuration.backpressureStallTimeout,
+                    configuration: configuration,
+                    requestLogPreamble: requestLogPreamble,
+                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestLogStream: request.stream,
+                    requestLogModel: configuration.launchedModel,
+                    requestLogIgnoredFields: request.ignoredFields)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -988,7 +1336,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 responseStarted: responseStarted,
                 keepAlive: keepAlive,
                 channel: channel,
-                timeout: configuration.backpressureStallTimeout)
+                timeout: configuration.backpressureStallTimeout,
+                configuration: configuration,
+                requestLogPreamble: requestLogPreamble,
+                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
@@ -1600,12 +1954,35 @@ private extension OpenAIChatCompletionsHTTPHandler {
         responseStarted: Bool,
         keepAlive: Bool,
         channel: any Channel,
-        timeout: Duration
+        timeout: Duration,
+        configuration: ServingHTTPConfiguration? = nil,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        requestLogRequestID: String? = nil,
+        requestLogStream: Bool? = nil,
+        requestLogModel: String? = nil,
+        requestLogIgnoredFields: [String] = []
     ) async -> ServingCancellationReason? {
         let error = OpenAIErrorEnvelope(
             error: OpenAIServingError.server(
                 "Generation failed",
                 code: "generation_failed").openAIError)
+        func logOutcome(_ outcome: ServingRequestLogRecord.Outcome) {
+            guard let configuration, let requestLogPreamble else {
+                return
+            }
+            let reportedStatus = responseStarted
+                ? Int(HTTPResponseStatus.ok.code) : Int(HTTPResponseStatus.internalServerError.code)
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: requestLogRequestID ?? UUID().uuidString,
+                status: reportedStatus,
+                outcome: outcome,
+                stream: requestLogStream,
+                model: requestLogModel,
+                errorCode: "generation_failed",
+                ignoredFields: requestLogIgnoredFields)
+        }
         do {
             let data = try JSONEncoder.openAI.encode(error)
             if responseStarted {
@@ -1636,16 +2013,35 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     await close(channel)
                 }
             }
+            logOutcome(.error)
             return nil
         } catch RunError.backpressureTimeout {
+            logOutcome(.error)
             await close(channel)
             return .backpressureTimeout
         } catch RunError.writeFailure {
+            logOutcome(.clientDisconnected)
             await close(channel)
             return .clientDisconnected
         } catch {
+            logOutcome(.error)
             await close(channel)
             return nil
+        }
+    }
+
+    /// Shared with the request-log emission at each `writeServingFailure` exit below, so the status
+    /// this function actually sends and the status the request-log line reports can never drift.
+    static func servingErrorHTTPStatus(_ error: OpenAIServingError) -> HTTPResponseStatus {
+        switch error.openAIError.type {
+        case .invalidRequest:
+            error.openAIError.code == "response_too_large"
+                ? .payloadTooLarge
+                : .badRequest
+        case .rateLimit:
+            .tooManyRequests
+        case .serverError:
+            .internalServerError
         }
     }
 
@@ -1654,18 +2050,37 @@ private extension OpenAIChatCompletionsHTTPHandler {
         responseStarted: Bool,
         keepAlive: Bool,
         channel: any Channel,
-        timeout: Duration
+        timeout: Duration,
+        configuration: ServingHTTPConfiguration? = nil,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        requestLogRequestID: String? = nil,
+        requestLogStream: Bool? = nil,
+        requestLogModel: String? = nil,
+        requestLogIgnoredFields: [String] = []
     ) async -> ServingCancellationReason? {
-        let status: HTTPResponseStatus
-        switch error.openAIError.type {
-        case .invalidRequest:
-            status = error.openAIError.code == "response_too_large"
-                ? .payloadTooLarge
-                : .badRequest
-        case .rateLimit:
-            status = .tooManyRequests
-        case .serverError:
-            status = .internalServerError
+        let status = servingErrorHTTPStatus(error)
+        // `configuration` is `nil` only when a caller has nothing to log (never constructed for a
+        // preamble-bearing call site) -- `emitRequestLog` itself already no-ops whenever `preamble`
+        // is `nil`, so a `nil` configuration here is always paired with a `nil` preamble.
+        func logOutcome(_ outcome: ServingRequestLogRecord.Outcome) {
+            guard let configuration, let requestLogPreamble else {
+                return
+            }
+            let payload = error.openAIError
+            // `responseStarted` means an SSE head (status 200) already went out before this error
+            // was known -- that 200 is what actually reached the wire, not the computed error status
+            // a fresh (never-started) response would have used.
+            let reportedStatus = responseStarted ? Int(HTTPResponseStatus.ok.code) : Int(status.code)
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: requestLogRequestID ?? UUID().uuidString,
+                status: reportedStatus,
+                outcome: outcome,
+                stream: requestLogStream,
+                model: requestLogModel,
+                errorCode: payload.code ?? payload.type.rawValue,
+                ignoredFields: requestLogIgnoredFields)
         }
         do {
             let data = try JSONEncoder.openAI.encode(
@@ -1698,14 +2113,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     await close(channel)
                 }
             }
+            logOutcome(.error)
             return nil
         } catch RunError.backpressureTimeout {
+            logOutcome(.error)
             await close(channel)
             return .backpressureTimeout
         } catch RunError.writeFailure {
+            logOutcome(.clientDisconnected)
             await close(channel)
             return .clientDisconnected
         } catch {
+            logOutcome(.error)
             await close(channel)
             return nil
         }
@@ -1716,14 +2135,17 @@ private extension OpenAIChatCompletionsHTTPHandler {
         code: String,
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
-        channel: any Channel
+        channel: any Channel,
+        requestLogPreamble: ServingRequestLogPreamble? = nil
     ) async {
         let _ = await writeServingFailure(
             .server(message, code: code),
             responseStarted: false,
             keepAlive: keepAlive,
             channel: channel,
-            timeout: configuration.backpressureStallTimeout)
+            timeout: configuration.backpressureStallTimeout,
+            configuration: configuration,
+            requestLogPreamble: requestLogPreamble)
     }
 
     /// OpenAI's legacy `/v1/completions` response ids use the `cmpl-` prefix, distinct from chat's
@@ -1768,7 +2190,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
         _ admissionError: ServingBackendAdmissionError,
         keepAlive: Bool,
         channel: any Channel,
-        timeout: Duration
+        timeout: Duration,
+        configuration: ServingHTTPConfiguration? = nil,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        requestLogRequestID: String? = nil,
+        requestLogStream: Bool? = nil,
+        requestLogModel: String? = nil,
+        requestLogIgnoredFields: [String] = []
     ) async -> ServingCancellationReason? {
         let payload: OpenAIErrorPayload
         let status: HTTPResponseStatus
@@ -1788,6 +2216,21 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 "Request exceeds the loaded model or KV limit",
                 param: "messages").openAIError
             status = .badRequest
+        }
+        func logOutcome(_ outcome: ServingRequestLogRecord.Outcome) {
+            guard let configuration, let requestLogPreamble else {
+                return
+            }
+            emitRequestLog(
+                configuration: configuration,
+                preamble: requestLogPreamble,
+                requestID: requestLogRequestID ?? UUID().uuidString,
+                status: Int(status.code),
+                outcome: outcome,
+                stream: requestLogStream,
+                model: requestLogModel,
+                errorCode: payload.code ?? payload.type.rawValue,
+                ignoredFields: requestLogIgnoredFields)
         }
 
         do {
@@ -1819,14 +2262,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
             if !keepAlive {
                 await close(channel)
             }
+            logOutcome(.error)
             return nil
         } catch RunError.backpressureTimeout {
+            logOutcome(.error)
             await close(channel)
             return .backpressureTimeout
         } catch RunError.writeFailure {
+            logOutcome(.clientDisconnected)
             await close(channel)
             return .clientDisconnected
         } catch {
+            logOutcome(.error)
             await close(channel)
             return nil
         }
