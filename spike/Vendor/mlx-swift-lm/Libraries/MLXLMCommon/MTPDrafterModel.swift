@@ -48,6 +48,12 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// whose target hidden/position state cannot be reproduced exactly.
     func supportsSpeculation(for input: LMInput) -> Bool
 
+    /// Whether this drafter can pair with the concrete target model for
+    /// speculation. Input support and target support are separate gates so
+    /// architecture-specific drafters can fail closed before touching target
+    /// embeddings, heads, or other concrete implementation details.
+    func supportsSpeculation(for input: LMInput, target: any LanguageModel) -> Bool
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -94,6 +100,12 @@ extension MTPDrafterModel {
     public var requiresPromptPrefill: Bool { false }
     public var requiresGreedySampling: Bool { false }
     public func supportsSpeculation(for _: LMInput) -> Bool { true }
+    public func supportsSpeculation(
+        for input: LMInput,
+        target _: any LanguageModel
+    ) -> Bool {
+        supportsSpeculation(for: input)
+    }
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.

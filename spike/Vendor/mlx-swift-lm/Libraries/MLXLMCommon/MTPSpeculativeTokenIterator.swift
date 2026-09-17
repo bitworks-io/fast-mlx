@@ -166,6 +166,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let initialPassthroughReason: String?
         if !drafter.supportsSpeculation(for: input) {
             initialPassthroughReason = "drafter does not support this prompt input"
+        } else if !drafter.supportsSpeculation(for: input, target: mainModel) {
+            initialPassthroughReason = "drafter does not support this target model"
         } else if drafter.requiresGreedySampling, parameters.temperature != 0,
             !providerIsEligible
         {

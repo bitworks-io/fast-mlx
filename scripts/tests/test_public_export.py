@@ -36,11 +36,11 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPDrafterModel.swift",
-        "sha256": "9cc537a054f0d609406aaeefc1ff0969ea11de9a23fe349585415b2e7f311ff0",
+        "sha256": "10b3a4ab5cc05500f5d2e2b93981b891a1aa33fa816190e80be586143fc4a07e",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift",
-        "sha256": "7b19b2391cc09c0ee7f09f56bb26b9786e78eae4346c82e3588620355ceed014",
+        "sha256": "0b02b4de420de4adf6d2c80adfcdfb5229d3b6f729d386470af234493a7b3de5",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift",
@@ -121,9 +121,24 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # rationale; family-neutral symbols and comments.
 # 2026-09-17, 957 -> 958: adds spike/Sources/ServingCore/JSONSchemaResponseFormat.swift (the
 # json_schema response_format subset IR). Family-neutral serving source; same publish rationale.
+# 2026-09-17, 967 -> 968: the six offloaded-n-gram-serving cases in MLXScalarServingTests.swift
+# that only ever exercised the excluded development plan-resolution path (they fail against the
+# frozen public-projection twin of checkOffloadedNGramPlanOnly, which unconditionally throws
+# ModelFactoryError.unsupportedModelType) move verbatim to a new dev-only file,
+# spike/Tests/SpikeServingAdaptersTests/OffloadedNGramPlanCheckTests.swift, newly excluded from the
+# projection so the count is unaffected by the move itself. The net +1 is a NEW projection-only
+# file, public/sanitized-projection/spike/Tests/SpikeServingAdaptersTests/
+# OffloadedNGramPlanTwinContractTests.swift, mapped to
+# spike/Tests/SpikeServingAdaptersTests/OffloadedNGramPlanTwinContractTests.swift: it asserts the
+# twin's own throw contract directly (via the real loadScalarServingModel call site, since the
+# SpikeServingAdaptersTests target does not depend on MLXLLM), so the exclusion above does not
+# silently drop test coverage of the public projection's offload-plan-check-only behavior.
+# Conscious decision to publish: family-neutral (no internal model-family CamelCase identifier --
+# only the lowercase snake_case "qwen4_exp" JSON field value already used throughout this
+# projected test directory), references no host, credential, competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 967,
-    "pathModeSha256": "0143ad4a524a5501af46e198f96b731d1124cb71aa23092c0d22d5f2ffd1f9a8",
+    "pathCount": 968,
+    "pathModeSha256": "a362c9f4d1dd108b37e13d57af5ffe2d9136c6616c15a8d3d553a67b546dcb89",
 }
 
 
