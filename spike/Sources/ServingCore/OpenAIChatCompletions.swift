@@ -141,9 +141,14 @@ public enum ServingPromptInput: Sendable, Equatable {
 /// `OpenAIChatCompletionRequest.responseFormat` (and recorded in `ignoredFields`), never a case here.
 /// `json_object` is HONORED (never listed in `ignoredFields`): the loaded backend must additionally
 /// declare `ServingGenerationBackend.supportsJSONObjectResponseFormat` before a request carrying it
-/// can be dispatched (see `ServingGenerationBackend`'s doc comment).
+/// can be dispatched (see `ServingGenerationBackend`'s doc comment). `json_schema` is likewise
+/// HONORED (response-format slice 2): the schema is compiled to the frozen IR by
+/// `JSONSchemaSubsetCompiler` at decode time, and the loaded backend must additionally declare
+/// `ServingGenerationBackend.supportsJSONSchemaResponseFormat` before a request carrying it can be
+/// dispatched — no backend declares that yet (stage 2a), so it is refused at the capability gate.
 public enum ServingResponseFormat: Sendable, Equatable {
     case jsonObject
+    case jsonSchema(JSONSchemaResponseFormat)
 }
 
 public struct OpenAIChatCompletionRequest: Sendable, Equatable {
@@ -375,26 +380,34 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let logprobsRequest = try decodeChatLogprobs(
             logprobs: root["logprobs"], topLogprobs: root["top_logprobs"])
         let (responseFormatIgnoredPresent, responseFormat) = try decodeChatResponseFormat(
-            root["response_format"])
-        if responseFormat == .jsonObject {
-            // Slice-1 refusals (see the response-format design doc): each combination gets its own
-            // message/param rather than folding into a generic "unsupported" 400, so a caller can
-            // programmatically tell which field to drop. `n > 1` needs no check here: it is already
-            // refused unconditionally above (line ~318), independent of `response_format`.
+            root["response_format"], rawBody: data)
+        if let responseFormat {
+            // Slice-1/slice-2 refusals (see the response-format design docs): each combination gets
+            // its own message/param rather than folding into a generic "unsupported" 400, so a
+            // caller can programmatically tell which field to drop. `n > 1` needs no check here: it
+            // is already refused unconditionally above (line ~318), independent of
+            // `response_format`. Exhaustive `switch` (not `== .jsonObject`) so a future
+            // `ServingResponseFormat` case cannot silently skip this refusal (the response-format
+            // design doc's "fail-open guard" finding).
+            let kind: String
+            switch responseFormat {
+            case .jsonObject: kind = "json_object"
+            case .jsonSchema: kind = "json_schema"
+            }
             guard tools.isEmpty else {
                 throw OpenAIServingError.invalidRequest(
-                    "response_format json_object is not supported together with tools",
+                    "response_format \(kind) is not supported together with tools",
                     param: "tools")
             }
             guard logprobsRequest == nil else {
                 throw OpenAIServingError.invalidRequest(
-                    "response_format json_object is not supported together with logprobs: "
+                    "response_format \(kind) is not supported together with logprobs: "
                         + "logprobs would be computed from pre-constraint logits",
                     param: "logprobs")
             }
             guard stop.isEmpty else {
                 throw OpenAIServingError.invalidRequest(
-                    "response_format json_object is not supported together with stop",
+                    "response_format \(kind) is not supported together with stop",
                     param: "stop")
             }
         }
@@ -1998,13 +2011,17 @@ private func finishChatLogprobs(logprobs: Bool?, topLogprobs: Int?) throws -> Se
 }
 
 /// `response_format` is accepted at its OpenAI-default-equivalent shape (`{"type":"text"}`/absent,
-/// returned as `(true, nil)` and recorded in `ignoredFields`) and at `{"type":"json_object"}`
-/// (returned as `(false, .jsonObject)`: HONORED, so never recorded in `ignoredFields` — see
-/// `ServingResponseFormat`). `json_schema` and any other type, or extra keys on a recognized type,
-/// fail closed with a 400: this server has no way to return free text where the caller expects
-/// parseable JSON, or to honor a schema it cannot enforce.
+/// returned as `(true, nil)` and recorded in `ignoredFields`), at `{"type":"json_object"}`
+/// (returned as `(false, .jsonObject)`), and at `{"type":"json_schema", "json_schema":{...}}`
+/// (returned as `(false, .jsonSchema(...))`, compiled via `JSONSchemaSubsetCompiler`) — all three
+/// HONORED, so never recorded in `ignoredFields` (see `ServingResponseFormat`). Any other type, or
+/// extra keys on a recognized type, fails closed with a 400: this server has no way to return free
+/// text where the caller expects parseable JSON, or to honor a schema it cannot enforce/compile.
+/// `rawBody` is the ORIGINAL request body bytes (already known to be valid JSON — see
+/// `decodeStrict`), used only on the `json_schema` path to recover the DECLARED property order
+/// `JSONSerialization` loses (see `decodeJSONSchemaResponseFormat`).
 private func decodeChatResponseFormat(
-    _ raw: Any?
+    _ raw: Any?, rawBody: Data
 ) throws -> (ignoredPresent: Bool, honored: ServingResponseFormat?) {
     guard let raw, !(raw is NSNull) else { return (false, nil) }
     guard let object = raw as? [String: Any] else {
@@ -2016,8 +2033,9 @@ private func decodeChatResponseFormat(
     case "text":
         guard Set(object.keys) == ["type"] else {
             throw OpenAIServingError.invalidRequest(
-                "Structured output is not supported yet; only response_format.type=text and "
-                    + "response_format.type=json_object are accepted",
+                "Structured output is not supported yet; only response_format.type=text, "
+                    + "response_format.type=json_object, and response_format.type=json_schema "
+                    + "are accepted",
                 param: "response_format")
         }
         return (true, nil)
@@ -2029,16 +2047,123 @@ private func decodeChatResponseFormat(
         }
         return (false, .jsonObject)
     case "json_schema":
-        throw OpenAIServingError.invalidRequest(
-            "response_format.type=json_schema is not supported yet; "
-                + "response_format.type=json_object is",
-            param: "response_format")
+        return (false, try decodeJSONSchemaResponseFormat(object, rawBody: rawBody))
     default:
         throw OpenAIServingError.invalidRequest(
-            "Structured output is not supported yet; only response_format.type=text and "
-                + "response_format.type=json_object are accepted",
+            "Structured output is not supported yet; only response_format.type=text, "
+                + "response_format.type=json_object, and response_format.type=json_schema "
+                + "are accepted",
             param: "response_format")
     }
+}
+
+/// Decodes and compiles `{"type":"json_schema", "json_schema":{"name":..., "schema":..., ...}}`.
+/// Envelope validation (exact top-level keys, `json_schema`'s allowed keys, `name`'s shape,
+/// `strict`'s type) uses the ordinary `JSONSerialization`-decoded `object` — key ORDER never
+/// matters for these scalar fields. Only `json_schema.schema` needs declared property order, which
+/// `JSONSerialization` has already discarded by the time `object` exists — so `schema` is recovered
+/// by re-parsing `rawBody` (already known to be syntactically valid JSON) with
+/// `JSONSchemaSubsetCompiler`'s own order-preserving parser and extracting the same
+/// `response_format.json_schema.schema` subtree from THAT tree. This re-parse only runs on the
+/// `json_schema` path (bounded by `OpenAIChatRequestLimits.maximumBodyBytes`), never on the far more
+/// common `text`/`json_object`/absent paths.
+private func decodeJSONSchemaResponseFormat(
+    _ object: [String: Any], rawBody: Data
+) throws -> ServingResponseFormat {
+    guard Set(object.keys) == ["type", "json_schema"] else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.type=json_schema requires exactly type and json_schema",
+            param: "response_format")
+    }
+    guard let envelope = object["json_schema"] as? [String: Any] else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema must be an object", param: "response_format")
+    }
+    let allowedEnvelopeKeys: Set<String> = ["name", "description", "schema", "strict"]
+    guard Set(envelope.keys).isSubset(of: allowedEnvelopeKeys) else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema accepts only name, description, schema, and strict",
+            param: "response_format")
+    }
+    guard let nameRaw = envelope["name"], !(nameRaw is NSNull) else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.name is required", param: "response_format")
+    }
+    guard let name = nameRaw as? String, isValidJSONSchemaName(name) else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.name must match ^[A-Za-z0-9_-]{1,64}$",
+            param: "response_format")
+    }
+    if let descriptionRaw = envelope["description"], !(descriptionRaw is NSNull) {
+        guard descriptionRaw is String else {
+            throw OpenAIServingError.invalidRequest(
+                "response_format.json_schema.description must be a string", param: "response_format")
+        }
+    }
+    let strict =
+        try optionalBool(envelope["strict"], param: "response_format.json_schema.strict") ?? false
+    guard let schemaRaw = envelope["schema"], !(schemaRaw is NSNull) else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.schema is required", param: "response_format")
+    }
+    guard schemaRaw is [String: Any] else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.schema must be an object", param: "response_format")
+    }
+
+    let orderedSchema = try extractOrderedJSONSchemaSchema(from: rawBody)
+    do {
+        let compiled = try JSONSchemaSubsetCompiler.compile(
+            name: name, schema: orderedSchema, strict: strict)
+        return .jsonSchema(compiled)
+    } catch let compileError as JSONSchemaCompileError {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.schema\(compileError.path): \(compileError.message)",
+            param: "response_format")
+    }
+}
+
+private func isValidJSONSchemaName(_ name: String) -> Bool {
+    guard (1...64).contains(name.count) else { return false }
+    for scalar in name.unicodeScalars {
+        switch scalar {
+        case "A"..."Z", "a"..."z", "0"..."9", "_", "-":
+            continue
+        default:
+            return false
+        }
+    }
+    return true
+}
+
+/// Re-parses `rawBody` with `JSONSchemaSubsetCompiler.parseOrdered` and extracts the
+/// `response_format.json_schema.schema` subtree, preserving the caller's DECLARED property order.
+/// `rawBody` is already known to be syntactically valid top-level JSON (the `JSONSerialization`
+/// parse in `decodeStrict` succeeded before this is ever called), so a thrown
+/// `JSONSchemaCompileError` here indicates a construct only this stricter parser refuses (e.g. a
+/// duplicate key) — mapped to the same `response_format.json_schema.schema` 400 family used for
+/// every other schema-compile error.
+private func extractOrderedJSONSchemaSchema(
+    from rawBody: Data
+) throws -> JSONSchemaSubsetCompiler.RawValue {
+    let root: JSONSchemaSubsetCompiler.RawValue
+    do {
+        root = try JSONSchemaSubsetCompiler.parseOrdered(rawBody)
+    } catch let compileError as JSONSchemaCompileError {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.schema: \(compileError.message)", param: "response_format")
+    }
+    guard case .object(let pairs) = root,
+        case .object(let responseFormatPairs)? = pairs.first(where: { $0.key == "response_format" })?
+            .value,
+        case .object(let jsonSchemaPairs)? = responseFormatPairs.first(where: { $0.key == "json_schema" })?
+            .value,
+        let schema = jsonSchemaPairs.first(where: { $0.key == "schema" })?.value
+    else {
+        throw OpenAIServingError.invalidRequest(
+            "response_format.json_schema.schema is required", param: "response_format")
+    }
+    return schema
 }
 
 /// `logit_bias` is only accepted empty/absent — a non-empty bias map would change sampling in a

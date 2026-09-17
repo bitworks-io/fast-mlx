@@ -110,6 +110,28 @@ default, refuse them. `top_logprobs` without `logprobs:true` is rejected
 (`top_logprobs` param), matching OpenAI's own validation. `logprobs:false`/absent is unchanged — no
 `logprobs` key at all, byte-identical to before this feature existed.
 
+Structured output: `"response_format":{"type":"json_object"}` and
+`"response_format":{"type":"json_schema","json_schema":{"name":…,"schema":…,"strict":…}}` are enforced
+by masking tokens during decoding, so the reply always parses (and, for `json_schema`, validates
+against the schema). This covers the OpenAI SDK's `client.chat.completions.parse(response_format=
+<Pydantic model>)`, streaming or not. `json_schema` accepts a JSON Schema subset:
+- `type` is `object`, `array`, `string`, `number`, `integer`, `boolean` or `null`, or `[T,"null"]`.
+- Supported keywords: `properties`, `required`, `additionalProperties:false`, `items`, `enum` of
+  scalar literals, `anyOf` whose branches differ in their first character, and local non-recursive
+  `$ref` into `$defs` or `definitions`.
+- `title`, `description`, `$schema`, `default` and `examples` are ignored.
+- Anything else gets a 400 whose message names the JSON-pointer path of the unsupported keyword.
+  That includes `pattern`, `format`, length and range bounds, `oneOf`, `allOf`, `not`, `const`,
+  recursive `$ref`, and open `additionalProperties`.
+- `strict:true` also requires every object to set `additionalProperties:false` and list every
+  property in `required`.
+- Properties are generated in declared order, and optional ones may be omitted.
+- With thinking on, reasoning is generated first and the constraint applies to the reply.
+
+Both formats are served only by the single-stream scalar route and its non-speculative decoders.
+Speculative and continuous-batch routes return a 400, and so does combining either format with
+`tools`, `logprobs` or `stop`.
+
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
 such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style
 harnesses. It shares the same sampling, completion-budget, and admission behavior as

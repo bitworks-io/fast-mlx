@@ -614,6 +614,14 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
     }
 }
 
+/// Conformance-only (stage 3a, response-format slice 2c): lets the shared `JSONObjectConstraintTrie`
+/// DFS and (in a future wiring stage) a shared mask table drive `JSONObjectAutomaton` through the
+/// same generic `ByteWalkAutomaton` surface `JSONSchemaAutomaton` also conforms to. Every required
+/// member (`WalkUndo`, `MaskCacheKey`, `tryAdvanceForWalk`, `undoForWalk`, `isComplete`,
+/// `maskCacheKey(maxTokenBytes:)`) already existed above, unchanged — this adds no new code, only
+/// the conformance declaration.
+extension JSONObjectAutomaton: ByteWalkAutomaton {}
+
 /// ASCII byte constants used by the JSON automaton, named for readability at call sites.
 fileprivate enum ASCII {
     static let quote: UInt8 = 0x22

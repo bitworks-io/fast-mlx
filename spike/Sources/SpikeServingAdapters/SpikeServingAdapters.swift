@@ -143,6 +143,15 @@ public struct ScalarServingBackendConfiguration: Sendable {
     /// every existing construction site keeps compiling and behaving unchanged (capability stays
     /// `false`).
     public var jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport?
+    /// Load-time `response_format: json_schema` support for this checkpoint's tokenizer — see
+    /// `loadScalarServingJSONSchemaConstraintSupport`'s doc comment (derived strictly from
+    /// `jsonObjectConstraintSupport`, never resolved independently). `nil` when unsupported/not
+    /// attempted. Combined with `isNonSpeculativeScalarRoute` AND
+    /// `decoderSupportsResponseFormatConstraint` (all three must hold) to compute
+    /// `ScalarServingBackend.supportsJSONSchemaResponseFormat` — same three-AND-term shape as
+    /// `supportsJSONObjectResponseFormat`. Defaults `nil`: every existing construction site keeps
+    /// compiling and behaving unchanged (capability stays `false`).
+    public var jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport?
     /// Whether the decoder THIS backend was constructed with is the plain, non-speculative scalar
     /// `MLXDecoder` route — `false` for the compiled-fp16 route and for the in-checkpoint MTP
     /// speculative route, per the response-format design's "MTP eligibility cannot see this
@@ -176,6 +185,7 @@ public struct ScalarServingBackendConfiguration: Sendable {
         rejectedPromptTokenIDs: Set<Int> = [],
         samplingDefaults: ServingSamplingDefaults? = nil,
         jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
+        jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
         isNonSpeculativeScalarRoute: Bool = false,
         decoderSupportsResponseFormatConstraint: Bool = false
     ) {
@@ -199,6 +209,7 @@ public struct ScalarServingBackendConfiguration: Sendable {
         self.rejectedPromptTokenIDs = rejectedPromptTokenIDs
         self.samplingDefaults = samplingDefaults
         self.jsonObjectConstraintSupport = jsonObjectConstraintSupport
+        self.jsonSchemaConstraintSupport = jsonSchemaConstraintSupport
         self.isNonSpeculativeScalarRoute = isNonSpeculativeScalarRoute
         self.decoderSupportsResponseFormatConstraint = decoderSupportsResponseFormatConstraint
     }
@@ -262,10 +273,16 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let sampling: DecoderSampling
         let penalties: DecoderPenalties
         let logprobsRequest: ServingLogprobsRequest?
-        /// Built once at admission (`start`) when `request.responseFormat == .jsonObject`; `nil`
-        /// otherwise (every request predating this feature). Threaded into `generateBounded`'s
-        /// `responseFormatConstraint:` parameter in `execute` unchanged.
-        let responseFormatConstraint: JSONObjectMaskingLogitProcessor?
+        /// Built once at admission (`start`) when `request.responseFormat` is `.jsonObject` or
+        /// `.jsonSchema`; `nil` otherwise (every request predating this feature, or one with no
+        /// `response_format`). Threaded into `generateBounded`'s `responseFormatConstraint:`
+        /// parameter in `execute` unchanged. Typed as the composed existential (not the concrete
+        /// `JSONObjectMaskingLogitProcessor`) so EITHER format's masking processor fits this one
+        /// slot: `LogitProcessor` is what `generateBounded` runs, `ConstraintProcessorFailureReporting`
+        /// is what `MLXDecoder` reads a stuck-request failure through (via `as?`, so any conformer
+        /// works, not just this exact existential), and `Sendable` is required to store a value here
+        /// inside this `Sendable` struct.
+        let responseFormatConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
         let activeTools: [OpenAIToolSpec]
         let mailbox: BoundedDeltaMailbox
         let lease: ServingRequestLease
@@ -332,6 +349,21 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             && configuration.decoderSupportsResponseFormatConstraint
     }
 
+    /// Same three-AND-term shape as `supportsJSONObjectResponseFormat` above (see that property's
+    /// doc comment for the full reasoning — it applies identically here, substituting
+    /// `jsonSchemaConstraintSupport` for `jsonObjectConstraintSupport`), `true` exactly when the
+    /// checkpoint's `json_schema` support was loaded AND this backend is the non-speculative scalar
+    /// route AND its bound decoder itself reports the constraint capability. Every OTHER
+    /// `ServingGenerationBackend` conformer (the MTP/speculative route, the continuous-batching
+    /// route, any future route-switching wrapper) never overrides `ServingGenerationBackend`'s
+    /// `supportsJSONSchemaResponseFormat` default (`false`, `ServingGenerationBackend.swift`), so
+    /// `json_schema` stays refused there by construction, not by omission here.
+    public nonisolated var supportsJSONSchemaResponseFormat: Bool {
+        configuration.jsonSchemaConstraintSupport != nil
+            && configuration.isNonSpeculativeScalarRoute
+            && configuration.decoderSupportsResponseFormatConstraint
+    }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
@@ -390,14 +422,22 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             && servingSeparatesReasoning(
                 thinksByDefault: configuration.thinksByDefault,
                 resolvedEnableThinking: resolvedEnableThinking)
-        // Per-request `json_object` refusal (response-format design item #4): the GLOBAL capability
-        // gate (`ServingCore.validateResponseFormatCapability`, enforced upstream before `start` is
-        // ever reached) only knows whether THIS BACKEND can run the constraint at all — it cannot
-        // see that a SPECIFIC thinking request has no resolvable `</think>` token id to phase-switch
-        // on. Refuse that combination here, per-request, rather than silently leaving the mask
-        // active from token 0 and corrupting the reasoning block, or silently never activating it.
-        var responseFormatConstraint: JSONObjectMaskingLogitProcessor?
-        if request.responseFormat == .jsonObject {
+        // Per-request `response_format` refusal (response-format design item #4): the GLOBAL
+        // capability gate (`ServingCore.validateResponseFormatCapability`, enforced upstream before
+        // `start` is ever reached) only knows whether THIS BACKEND can run a given constraint at
+        // all — it cannot see that a SPECIFIC thinking request has no resolvable `</think>` token id
+        // to phase-switch on. Refuse that combination here, per-request, rather than silently
+        // leaving the mask active from token 0 and corrupting the reasoning block, or silently never
+        // activating it. Exhaustive `switch` (not `== .jsonObject`) as defense in depth: even though
+        // the global gate above already refuses a format this backend does not declare support for
+        // (`supportsJSONObjectResponseFormat`/`supportsJSONSchemaResponseFormat`), a scalar-route
+        // request must never fall through a missing case here and be silently served as free text —
+        // see the response-format design doc's "fail-open guard" finding.
+        var responseFormatConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
+        switch request.responseFormat {
+        case nil:
+            break
+        case .jsonObject:
             guard let support = configuration.jsonObjectConstraintSupport else {
                 throw OpenAIServingError.invalidRequest(
                     "response_format json_object is not supported by the loaded model's decoding route",
@@ -416,6 +456,28 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             // `ScalarServingBackend`'s single-actor execution the way a lazy on-actor build would.
             responseFormatConstraint = JSONObjectMaskingLogitProcessor(
                 table: await support.table,
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+        case .jsonSchema(let format):
+            guard let support = configuration.jsonSchemaConstraintSupport else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_schema is not supported by the loaded model's decoding route",
+                    param: "response_format")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_schema cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "response_format")
+            }
+            // Same never-blocks-the-actor-executor contract as the `.jsonObject` branch above (see
+            // `ScalarServingJSONSchemaConstraintSupport.table`'s doc comment) — this table is
+            // per-MODEL, shared by every schema request; only the per-request automaton
+            // (`JSONSchemaTokenConstraint`, built fresh here from THIS request's compiled `format`)
+            // is request-specific.
+            let schemaConstraint = JSONSchemaTokenConstraint(table: await support.table, format: format)
+            responseFormatConstraint = JSONSchemaMaskingLogitProcessor(
+                constraint: schemaConstraint,
                 activeFromStart: !separatesReasoning,
                 thinkEndTokenID: support.thinkEndTokenID)
         }

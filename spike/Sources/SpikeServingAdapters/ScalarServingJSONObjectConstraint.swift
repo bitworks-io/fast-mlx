@@ -42,7 +42,10 @@ public final class ScalarServingJSONObjectConstraintSupport: @unchecked Sendable
     /// trigger `JSONObjectMaskingLogitProcessor` activates on for a request that separates
     /// reasoning. `nil` for a tokenizer with no such token (a non-thinking model, most commonly):
     /// `ScalarServingBackend.start` refuses `json_object` only for a THINKING request against a
-    /// `nil` value here, never for a non-thinking one.
+    /// `nil` value here, never for a non-thinking one. Also what a sibling
+    /// `ScalarServingJSONSchemaConstraintSupport` reports for `json_schema`'s OWN thinking-phase
+    /// gate — see `loadScalarServingJSONSchemaConstraintSupport`'s doc comment for why json_schema
+    /// shares this value rather than resolving it a second time.
     public let thinkEndTokenID: Int?
 
     /// Started at `init` (i.e. as soon as this support object exists, which only happens on the
@@ -54,23 +57,91 @@ public final class ScalarServingJSONObjectConstraintSupport: @unchecked Sendable
     /// below awaits this SAME task's `.value` — a suspension, not a blocking lock acquisition — so
     /// a caller on an actor (like `start()`) yields the actor's executor while waiting rather than
     /// occupying its thread.
-    private let tableTask: Task<JSONObjectConstraintTable, Never>
+    ///
+    /// Builds BOTH the `json_object` table and a sibling `json_schema` table from ONE
+    /// `ServingCore.makeSharedVocabConstraintTables` call (stage 3b requirement: one trie build per
+    /// loaded model, shared by both response-format kinds — see that function's doc comment) rather
+    /// than two independent `JSONObjectConstraintTable(classifications:)` calls. A sibling
+    /// `ScalarServingJSONSchemaConstraintSupport` (built via
+    /// `loadScalarServingJSONSchemaConstraintSupport(sharing:)`) reads `schemaTable` below to reuse
+    /// this SAME background build instead of re-parsing tokenizer.json / rebuilding the trie a
+    /// second time for the same checkpoint.
+    private let sharedTablesTask: Task<
+        (object: JSONObjectConstraintTable, schema: JSONSchemaConstraintTable), Never
+    >
 
     init(classifications: [TokenByteClassification], thinkEndTokenID: Int?) {
         self.thinkEndTokenID = thinkEndTokenID
-        self.tableTask = Task.detached(priority: .utility) {
-            JSONObjectConstraintTable(classifications: classifications)
+        self.sharedTablesTask = Task.detached(priority: .utility) {
+            makeSharedVocabConstraintTables(classifications: classifications)
         }
     }
 
     /// The shared byte-trie constraint table, shared read-only across every `json_object` request
     /// on this backend. `await`-ing this NEVER runs the trie build on the caller's own executor
-    /// (see `tableTask`'s doc comment): if the background build already finished (the common case,
-    /// since it started at load time, well before the first request), this returns immediately;
-    /// otherwise the caller suspends until it does.
+    /// (see `sharedTablesTask`'s doc comment): if the background build already finished (the common
+    /// case, since it started at load time, well before the first request), this returns
+    /// immediately; otherwise the caller suspends until it does.
     public var table: JSONObjectConstraintTable {
-        get async { await tableTask.value }
+        get async { await sharedTablesTask.value.object }
     }
+
+    /// The SAME background build's `JSONSchemaConstraintTable` half — internal (not `public`):
+    /// reached only via `loadScalarServingJSONSchemaConstraintSupport(sharing:)`, never directly by
+    /// a request-serving call site (those go through `ScalarServingJSONSchemaConstraintSupport
+    /// .table`).
+    var schemaTable: JSONSchemaConstraintTable {
+        get async { await sharedTablesTask.value.schema }
+    }
+}
+
+/// Load-time result of attempting to enable `response_format: json_schema` for the plain scalar
+/// serving route. Derived STRICTLY from a sibling `ScalarServingJSONObjectConstraintSupport`
+/// (`loadScalarServingJSONSchemaConstraintSupport(sharing:)`) rather than independently re-parsing
+/// tokenizer.json: `json_schema`'s eligibility prerequisites (byte-level tokenizer, resolvable EOS,
+/// resolvable model vocab size, the BOM self-check) are IDENTICAL to `json_object`'s — see
+/// `loadScalarServingJSONObjectConstraintSupport`'s disablement enumeration — so whatever disables
+/// one disables the other, and there is nothing for a second, independent check to discover.
+/// Reusing the sibling's already-started detached background build
+/// (`ScalarServingJSONObjectConstraintSupport.schemaTable`) also means this checkpoint's byte trie
+/// is built exactly ONCE for BOTH formats (`ServingCore.makeSharedVocabConstraintTables`), never
+/// twice.
+public final class ScalarServingJSONSchemaConstraintSupport: @unchecked Sendable {
+    /// Same value, same phase-switch role, as `ScalarServingJSONObjectConstraintSupport
+    /// .thinkEndTokenID` (see that property's doc comment) — copied from the sibling support at
+    /// construction rather than re-resolved.
+    public let thinkEndTokenID: Int?
+    private let objectSupport: ScalarServingJSONObjectConstraintSupport
+
+    init(objectSupport: ScalarServingJSONObjectConstraintSupport) {
+        self.thinkEndTokenID = objectSupport.thinkEndTokenID
+        self.objectSupport = objectSupport
+    }
+
+    /// The shared byte-trie constraint table backing every `json_schema` request against this
+    /// checkpoint, independent of any one request's OWN schema (`JSONSchemaConstraintTable` is
+    /// per-model, not per-schema — see that type's doc comment). Awaits the SAME detached build
+    /// `ScalarServingJSONObjectConstraintSupport.table` awaits (never re-triggers it).
+    public var table: JSONSchemaConstraintTable {
+        get async { await objectSupport.schemaTable }
+    }
+}
+
+/// Builds `ScalarServingJSONSchemaConstraintSupport` from an already-built (possibly `nil`)
+/// `ScalarServingJSONObjectConstraintSupport` — see that type's doc comment for why `json_schema`
+/// has no independent disablement check of its own. `nil` in, `nil` out, with a matching machine-
+/// readable disablement line (`fastmlx-serve response_format=json_schema support=disabled
+/// reason=...`), mirroring every OTHER disablement reason's `key=value` shape.
+public func loadScalarServingJSONSchemaConstraintSupport(
+    sharing objectSupport: ScalarServingJSONObjectConstraintSupport?
+) -> ScalarServingJSONSchemaConstraintSupport? {
+    guard let objectSupport else {
+        print(
+            "fastmlx-serve response_format=json_schema support=disabled "
+                + "reason=json_object_support_unavailable")
+        return nil
+    }
+    return ScalarServingJSONSchemaConstraintSupport(objectSupport: objectSupport)
 }
 
 /// Attempts to build `ScalarServingJSONObjectConstraintSupport` for the checkpoint at
@@ -199,11 +270,20 @@ func resolveThinkEndTokenID(
     return candidate
 }
 
-/// Applies the `json_object` grammar mask AFTER any penalty processor `MLXDecoder.setPenalties`
+/// Applies a `TokenConstraint`'s grammar mask AFTER any penalty processor `MLXDecoder.setPenalties`
 /// already composed — `SpikeCore.MLXDecoder` enforces that ordering itself via its OWN separate
 /// `constraintProcessor` slot (`setResponseFormatConstraint`), applied strictly after `processor`
 /// (penalties) inside `selectSampleAndAdvance`, so THIS type never wraps or needs to know about the
 /// penalty processor.
+///
+/// GENERIC over `C: TokenConstraint` (stage 3b) so `response_format: json_object` and
+/// `response_format: json_schema` share ONE masking/thinking-phase-gate/failure-reporting
+/// implementation instead of two copies that could drift apart — `JSONObjectMaskingLogitProcessor`
+/// below is a thin, API-preserving wrapper around `ConstraintMaskingLogitProcessor<
+/// JSONObjectTokenConstraint>`; `response_format: json_schema` (`ScalarServingBackend.start`)
+/// constructs `ConstraintMaskingLogitProcessor<JSONSchemaTokenConstraint>` (aliased
+/// `JSONSchemaMaskingLogitProcessor` below) directly, with no wrapper needed since it has no
+/// pre-existing call sites to preserve.
 ///
 /// A CLASS (not a struct): `SpikeCore.ConstraintProcessorFailureReporting` is a class-constrained
 /// protocol specifically so `MLXDecoder` can read `recordedFailure` through an `as?` cast on the
@@ -215,10 +295,10 @@ func resolveThinkEndTokenID(
 /// ever calls `process`/`didSample` on it (mirrors `JSONObjectConstraintTable`'s own `@unchecked
 /// Sendable` justification: every mutation happens from a single, non-overlapping call sequence,
 /// never concurrently).
-public final class JSONObjectMaskingLogitProcessor: LogitProcessor, ConstraintProcessorFailureReporting,
-    @unchecked Sendable
+public final class ConstraintMaskingLogitProcessor<C: TokenConstraint>: LogitProcessor,
+    ConstraintProcessorFailureReporting, @unchecked Sendable
 {
-    private var constraint: JSONObjectTokenConstraint
+    private var constraint: C
     /// When `false`, `process(logits:)` is a no-op passthrough and `didSample` only watches for
     /// `thinkEndTokenID` — the thinking-phase-gate contract (response-format design item #4):
     /// active from the first token for a request that does NOT separate reasoning; inactive until
@@ -233,8 +313,8 @@ public final class JSONObjectMaskingLogitProcessor: LogitProcessor, ConstraintPr
     ///     `thinkEndTokenID` is sampled). Callers must not pass `false` with a `nil`
     ///     `thinkEndTokenID` — see `ScalarServingBackend`'s admission-time refusal for that
     ///     combination, which this type does not itself re-check (it would simply never activate).
-    public init(table: JSONObjectConstraintTable, activeFromStart: Bool, thinkEndTokenID: Int?) {
-        self.constraint = JSONObjectTokenConstraint(table: table)
+    public init(constraint: C, activeFromStart: Bool, thinkEndTokenID: Int?) {
+        self.constraint = constraint
         self.active = activeFromStart
         self.thinkEndTokenID = thinkEndTokenID
     }
@@ -292,4 +372,35 @@ public final class JSONObjectMaskingLogitProcessor: LogitProcessor, ConstraintPr
             recordedFailure = error
         }
     }
+}
+
+/// `response_format: json_schema`'s masking processor — a plain specialization of
+/// `ConstraintMaskingLogitProcessor`, with no wrapper needed (unlike `JSONObjectMaskingLogitProcessor`
+/// below, this type has no pre-3b call sites/tests to keep source-compatible).
+public typealias JSONSchemaMaskingLogitProcessor = ConstraintMaskingLogitProcessor<JSONSchemaTokenConstraint>
+
+/// `response_format: json_object`'s masking processor. A THIN WRAPPER around
+/// `ConstraintMaskingLogitProcessor<JSONObjectTokenConstraint>` (stage 3b): every method/property
+/// below simply forwards to `inner`. Kept as its own concrete type — rather than a bare typealias,
+/// unlike `JSONSchemaMaskingLogitProcessor` above — SOLELY to preserve this type's pre-existing
+/// `init(table:activeFromStart:thinkEndTokenID:)` label (`table:`, not the generic processor's
+/// `constraint:`), which every call site and test predating stage 3b (`ScalarServingBackend.start`,
+/// `JSONObjectMaskingLogitProcessorTests`, `ScalarServingJSONObjectRequestWiringTests`) already
+/// uses; a bare typealias cannot add its own initializer with a different argument label.
+public final class JSONObjectMaskingLogitProcessor: LogitProcessor, ConstraintProcessorFailureReporting,
+    @unchecked Sendable
+{
+    private let inner: ConstraintMaskingLogitProcessor<JSONObjectTokenConstraint>
+
+    public init(table: JSONObjectConstraintTable, activeFromStart: Bool, thinkEndTokenID: Int?) {
+        self.inner = ConstraintMaskingLogitProcessor(
+            constraint: JSONObjectTokenConstraint(table: table),
+            activeFromStart: activeFromStart,
+            thinkEndTokenID: thinkEndTokenID)
+    }
+
+    public var recordedFailure: Error? { inner.recordedFailure }
+    public func prompt(_ prompt: MLXArray) { inner.prompt(prompt) }
+    public func process(logits: MLXArray) -> MLXArray { inner.process(logits: logits) }
+    public func didSample(token: MLXArray) { inner.didSample(token: token) }
 }

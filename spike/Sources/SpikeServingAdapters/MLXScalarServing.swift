@@ -1394,8 +1394,14 @@ public func loadScalarServingModel(
         backendConfiguration.jsonObjectConstraintSupport = loadScalarServingJSONObjectConstraintSupport(
             modelDirectory: configuration.modelDirectory,
             tokenizer: tokenizer)
+        // Derived strictly from the `json_object` support just built above — see
+        // `loadScalarServingJSONSchemaConstraintSupport`'s doc comment for why `json_schema` has no
+        // independent tokenizer.json check of its own (identical prerequisites, shared trie build).
+        backendConfiguration.jsonSchemaConstraintSupport = loadScalarServingJSONSchemaConstraintSupport(
+            sharing: backendConfiguration.jsonObjectConstraintSupport)
     } else {
         print("fastmlx-serve response_format=json_object support=disabled reason=speculative_route")
+        print("fastmlx-serve response_format=json_schema support=disabled reason=speculative_route")
     }
     backendConfiguration.isNonSpeculativeScalarRoute = isNonSpeculativeScalarRoute
     // Captured from the ACTUAL bound decoder instance (not merely inferred from the route), via the

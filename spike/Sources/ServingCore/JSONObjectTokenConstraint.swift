@@ -21,6 +21,16 @@ public protocol TokenConstraint: Sendable {
     /// Throws only in the (asserted-unreachable) case where no id is allowed.
     func allowedTokenIds() throws -> [Int]
 
+    /// Compact bitset accessor mirroring `allowedTokenIds()` (`id`'s bit lives at `bitset[id >> 6]
+    /// & (1 << (id & 63))`) — see `JSONObjectTokenConstraint.allowedTokenBitset()`'s doc comment for
+    /// why a masking processor should prefer this over materializing the full `[Int]` list. A
+    /// PROTOCOL requirement (not just a convention both conformers happen to share) so a processor
+    /// generic over `TokenConstraint` (`ConstraintMaskingLogitProcessor` in `SpikeServingAdapters`)
+    /// can build its `-inf` mask directly, without downcasting to a specific conformer. Both
+    /// existing conformers (`JSONObjectTokenConstraint`, `JSONSchemaTokenConstraint`) already
+    /// implement this with an identical signature, so adding it here is purely additive.
+    func allowedTokenBitset() throws -> [UInt64]
+
     /// Advances the constraint by one sampled token. Throws if `token` is not currently allowed.
     mutating func advance(token: Int) throws
 
@@ -125,6 +135,27 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
         if warmCache {
             warmCommonStates()
         }
+    }
+
+    /// Builds against an ALREADY-BUILT `SharedVocabConstraintResources`, sharing its trie/
+    /// classification/EOS-id/word-count build with a sibling `JSONSchemaConstraintTable` — see
+    /// that type's mirroring `init(resources:...)` and `SharedVocabConstraintResources`'s own doc
+    /// comment for the model-load wiring this exists for (`ServingCore.
+    /// makeSharedVocabConstraintTables`, consumed by `SpikeServingAdapters`). Still warms THIS
+    /// table's own common-state cache (`warmCommonStates()`) exactly as the classifications-based
+    /// initializer above does: `JSONSchemaConstraintTable` deliberately does NOT warm (see that
+    /// type's doc comment, point 3), so sharing `resources` does not also share warm cache entries
+    /// between the two formats' tables — each table's cache is independently populated/owned.
+    init(
+        resources: SharedVocabConstraintResources,
+        cacheByteBudget: Int = JSONObjectConstraintTable.defaultCacheByteBudget
+    ) {
+        self.classifications = resources.classifications
+        self.trie = resources.trie
+        self.sortedEOSIds = resources.sortedEOSIds
+        self.wordCount = resources.wordCount
+        self.cacheByteBudget = cacheByteBudget
+        warmCommonStates()
     }
 
     /// Pre-populates the mask cache for a curated set of canonical, SHALLOW (depth <= 2) automaton

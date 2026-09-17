@@ -119,9 +119,11 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # ServingCore/ByteLevelTokenizerDescriptor.swift, SpikeCore/DecoderResponseFormatConstraint.swift,
 # SpikeServingAdapters/ScalarServingJSONObjectConstraint.swift and seven test files. Same publish
 # rationale; family-neutral symbols and comments.
+# 2026-09-17, 957 -> 958: adds spike/Sources/ServingCore/JSONSchemaResponseFormat.swift (the
+# json_schema response_format subset IR). Family-neutral serving source; same publish rationale.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 957,
-    "pathModeSha256": "c2b04186f5a9ba49aabf7dfd986ac0cb117b24460688efd8d6455ac868a00ae3",
+    "pathCount": 967,
+    "pathModeSha256": "0143ad4a524a5501af46e198f96b731d1124cb71aa23092c0d22d5f2ffd1f9a8",
 }
 
 

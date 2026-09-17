@@ -1,5 +1,26 @@
 import Foundation
 
+/// Minimal per-byte walk surface the shared trie DFS (and shared mask-cache table) need from ANY
+/// grammar automaton — `JSONObjectAutomaton` (response-format slice 1) and `JSONSchemaAutomaton`
+/// (response-format slice 2b) both conform. A PROTOCOL, not a class hierarchy or an existential
+/// parameter: every call site below is a GENERIC function (`<A: ByteWalkAutomaton>`), so the
+/// compiler specializes a dedicated copy of the DFS for each concrete conforming type at each
+/// instantiation site — the json_object hot path pays no indirect (existential witness-table)
+/// dispatch cost from this trie also supporting json_schema. See each conformer's own
+/// `tryAdvanceForWalk`/`undoForWalk` doc comment for its specific undo strategy and cost (the two
+/// conformers deliberately differ: `JSONObjectAutomaton` uses an O(1) field-diff restore,
+/// `JSONSchemaAutomaton` uses a simpler but more expensive full-value snapshot — see that type's
+/// doc comment for why).
+protocol ByteWalkAutomaton {
+    associatedtype WalkUndo
+    associatedtype MaskCacheKey: Hashable
+
+    mutating func tryAdvanceForWalk(byte: UInt8) -> WalkUndo?
+    mutating func undoForWalk(_ undo: WalkUndo)
+    var isComplete: Bool { get }
+    func maskCacheKey(maxTokenBytes: Int) -> MaskCacheKey
+}
+
 /// An immutable, shared byte trie over every `.bytes` token in a vocab's classification table.
 ///
 /// Built once per loaded model/tokenizer and shared read-only across requests — hence `final`
@@ -69,14 +90,22 @@ final class JSONObjectConstraintTrie: @unchecked Sendable {
     /// avoid. `walker` starts as a copy of the caller's `automaton` (one, up front — cheap until its
     /// first mutation, and the caller's own value is never touched), then every push/pop/replace
     /// from that point on mutates a uniquely-referenced array in place.
-    func allowedBitset(from automaton: JSONObjectAutomaton, wordCount: Int) -> [UInt64] {
+    ///
+    /// Generic over `A: ByteWalkAutomaton` (specialized per conforming type at each call site, not
+    /// existential-dispatched): the trie's own node/edge structure depends only on the vocab's
+    /// classifications, never on which grammar automaton is walking it, so ONE trie instance (built
+    /// once from `classifications`) serves both `JSONObjectAutomaton` and `JSONSchemaAutomaton`
+    /// walks — see `SharedVocabConstraintResources` (`JSONSchemaTokenConstraint.swift`), which is
+    /// how a future caller shares one trie build across both response-format kinds for the same
+    /// loaded model.
+    func allowedBitset<A: ByteWalkAutomaton>(from automaton: A, wordCount: Int) -> [UInt64] {
         var bitset = [UInt64](repeating: 0, count: wordCount)
         var walker = automaton
         visit(nodeIndex: 0, automaton: &walker, bitset: &bitset)
         return bitset
     }
 
-    private func visit(nodeIndex: Int, automaton: inout JSONObjectAutomaton, bitset: inout [UInt64]) {
+    private func visit<A: ByteWalkAutomaton>(nodeIndex: Int, automaton: inout A, bitset: inout [UInt64]) {
         let node = nodes[nodeIndex]
         for id in node.terminalIds {
             bitset[id >> 6] |= (UInt64(1) << UInt64(id & 63))

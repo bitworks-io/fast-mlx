@@ -354,17 +354,19 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
-        // `response_format: {"type":"json_object"}` is a real feature (see `ServingResponseFormat`),
-        // but no backend applies its token constraint yet (slice 1a/1b of the response-format
-        // design) — the single ServingCore admission check below fails a request carrying it closed
-        // with a 400 unless the dispatched backend declares
-        // `supportsJSONObjectResponseFormat == true`, so this is the one place that can never be
-        // bypassed: every request reaches this line before `backend.start(_:)` is ever called (see
-        // `runGeneration` below, the only call site).
+        // `response_format: {"type":"json_object"}` and `{"type":"json_schema",...}` are real
+        // features (see `ServingResponseFormat`), but no backend applies either constraint yet
+        // (slice 1a/1b for json_object; stage 2a/2b/3 for json_schema, response-format design docs)
+        // — the single ServingCore admission check below fails a request carrying either closed
+        // with a 400 unless the dispatched backend declares the matching
+        // `supportsJSON{Object,Schema}ResponseFormat == true`, so this is the one place that can
+        // never be bypassed: every request reaches this line before `backend.start(_:)` is ever
+        // called (see `runGeneration` below, the only call site).
         do {
             try validateResponseFormatCapability(
                 request: request,
-                backendSupportsJSONObjectResponseFormat: backend.supportsJSONObjectResponseFormat)
+                backendSupportsJSONObjectResponseFormat: backend.supportsJSONObjectResponseFormat,
+                backendSupportsJSONSchemaResponseFormat: backend.supportsJSONSchemaResponseFormat)
         } catch let error as OpenAIServingError {
             writeError(
                 error,
@@ -381,7 +383,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             // (matching every other typed catch in this method, e.g. the decode `do` above).
             writeError(
                 .invalidRequest(
-                    "response_format json_object is not supported by the loaded model's decoding route",
+                    "response_format is not supported by the loaded model's decoding route",
                     param: "response_format"),
                 status: .badRequest,
                 keepAlive: head.isKeepAlive,

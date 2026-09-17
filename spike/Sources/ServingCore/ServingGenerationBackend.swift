@@ -15,6 +15,12 @@ public protocol ServingGenerationBackend: Sendable {
     /// `.responseFormat == .jsonObject` is refused with a 400 rather than silently served as free
     /// text by a backend that never applies the mask. No backend sets this `true` yet (slice 1c).
     var supportsJSONObjectResponseFormat: Bool { get }
+    /// Whether this backend's decoding route can apply a compiled `response_format:
+    /// {"type":"json_schema", ...}` constraint (response-format slice 2). Defaults to `false` in the
+    /// protocol extension below, matching `supportsJSONObjectResponseFormat`'s fail-closed default —
+    /// no backend sets this `true` yet (stage 2a compiles/validates the schema but wires no
+    /// automaton).
+    var supportsJSONSchemaResponseFormat: Bool { get }
 }
 
 extension ServingGenerationBackend {
@@ -30,26 +36,40 @@ extension ServingGenerationBackend {
     public func shutdown() async {}
 
     public var supportsJSONObjectResponseFormat: Bool { false }
+    public var supportsJSONSchemaResponseFormat: Bool { false }
 }
 
-/// The single ServingCore-level admission check for `response_format: {"type":"json_object"}`
-/// against a specific backend's declared capability. Callers must invoke this at the one dispatch
-/// point that calls `backend.start(_:)` for a chat/completions request, before construction of any
-/// evidence/admission state for that request, so a capability-false backend never receives a
-/// request it would silently serve as free text. Throws `OpenAIServingError.invalidRequest` (param
-/// `response_format`) when `request.responseFormat == .jsonObject` and
-/// `backendSupportsJSONObjectResponseFormat` is `false`; otherwise returns normally (including when
+/// The single ServingCore-level admission check for `response_format` against a specific backend's
+/// declared capabilities. Callers must invoke this at the one dispatch point that calls
+/// `backend.start(_:)` for a chat/completions request, before construction of any evidence/admission
+/// state for that request, so a capability-false backend never receives a request it would silently
+/// serve as free text. Uses an EXHAUSTIVE `switch` over `request.responseFormat` (not `==` against a
+/// single case) so a future `ServingResponseFormat` case cannot silently skip this gate and fail
+/// OPEN — see the response-format design doc's "fail-open guard" finding. Throws
+/// `OpenAIServingError.invalidRequest` (param `response_format`) naming the actual format when the
+/// matching capability flag is `false`; otherwise returns normally (including when
 /// `request.responseFormat` is `nil`, i.e. every request before this feature existed).
 public func validateResponseFormatCapability(
     request: OpenAIChatCompletionRequest,
-    backendSupportsJSONObjectResponseFormat: Bool
+    backendSupportsJSONObjectResponseFormat: Bool,
+    backendSupportsJSONSchemaResponseFormat: Bool
 ) throws {
-    guard request.responseFormat == .jsonObject, !backendSupportsJSONObjectResponseFormat else {
+    switch request.responseFormat {
+    case nil:
         return
+    case .jsonObject:
+        guard backendSupportsJSONObjectResponseFormat else {
+            throw OpenAIServingError.invalidRequest(
+                "response_format json_object is not supported by the loaded model's decoding route",
+                param: "response_format")
+        }
+    case .jsonSchema:
+        guard backendSupportsJSONSchemaResponseFormat else {
+            throw OpenAIServingError.invalidRequest(
+                "response_format json_schema is not supported by the loaded model's decoding route",
+                param: "response_format")
+        }
     }
-    throw OpenAIServingError.invalidRequest(
-        "response_format json_object is not supported by the loaded model's decoding route",
-        param: "response_format")
 }
 
 public struct ServingBackendAdmissionError: Error, Equatable, Sendable {
