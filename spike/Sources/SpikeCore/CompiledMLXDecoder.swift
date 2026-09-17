@@ -184,7 +184,7 @@ public struct CompiledMLXRestoredPrefillMeasurement:
 /// chunked grow, identity-preserving reset).
 /// Keeps MLXDecoder's submit-first lookahead: the next step's compiled call is
 /// submitted (asyncEval) BEFORE the current token's blocking `.item()` readback.
-public struct CompiledMLXDecoder: Decoder {
+public struct CompiledMLXDecoder: Decoder, KVCacheReleasingDecoder {
     private let model: any LanguageModel
     private let kvCacheKind: KVCacheKind
     private let affineAttentionMode: AffineKVAttentionMode
@@ -895,6 +895,27 @@ public struct CompiledMLXDecoder: Decoder {
         snapshotSpeculativeStateActive = false
         pendingNext = nil
         cachedTokens = 0
+    }
+
+    /// `KVCacheReleasingDecoder` conformance for `RouteSwitchingDecoder`'s cross-route memory
+    /// invariant: unlike `reset()` (which keeps `caches`/`compiledStep` alive IN PLACE so a later
+    /// same-route request retraces nothing), this drops every reference to the preallocated KV
+    /// storage AND everything that captures it, putting this decoder back into EXACTLY the cold
+    /// state a freshly constructed one starts in.
+    ///
+    /// Provably safe: `prefillCore`'s `if caches.isEmpty { ... }` branch (this file, above) is the
+    /// same branch a brand-new decoder's first-ever `prefill` takes — rebuilding caches sized off
+    /// the new prompt, then rebuilding `compiledStep`/`compiledVerifyStep` lazily (`if compiledStep
+    /// == nil`) over the fresh `caches` array. Clearing all four fields here is exactly the
+    /// precondition those two branches already handle, so the next `prefill` after
+    /// `releaseKVCaches()` rebuilds and retraces correctly with no further adaptation needed.
+    public mutating func releaseKVCaches() {
+        caches = []
+        compiledStep = nil
+        compiledVerifyStep = nil
+        pendingNext = nil
+        cachedTokens = 0
+        snapshotSpeculativeStateActive = false
     }
 
     /// The token scalar is already the decode loop's synchronization point. Folding the

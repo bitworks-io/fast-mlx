@@ -329,21 +329,13 @@ public enum ScalarServingModelLoadError: Error, Equatable, Sendable {
     /// to fix. Carries the underlying typed failure so the operator-facing line can distinguish "file
     /// missing" from "do_sample: false" rather than collapsing every cause into one message.
     case defaultSamplingGenerationConfigUnavailable(GenerationConfigSamplingDefaultsError)
-    /// `configuration.defaultSampling == .generationConfig` but the RESOLVED scalar decoder strategy
-    /// is `.compiledFP16`. Unlike `inCheckpointMTPIncompatibleWithCompiledDecoderStrategy`'s pairing
-    /// (provably unreachable for qwen4_exp today), this combination is NOT a rare edge case: the
-    /// model family is unconstrained for `--default-sampling`, and `.compiledFP16` is the DOMINANT
-    /// resolution for any all-dense-attention checkpoint --
-    /// `classifyScalarServingDecoderRoute` (`ScalarServingCacheLayoutPolicy.swift:~145`) returns
-    /// `.compiled` whenever no layer classifies `.recurrentState`, and `.compiled` + the default
-    /// `.fp16` KV tier resolves to `.compiledFP16` (`scalarServingDecoderStrategy`). Refused at load
-    /// because `CompiledMLXDecoder` does not opt into `Decoder.supportsSampling` (it takes the
-    /// protocol-extension default of `false`): with the flag on, the GREEDY startup probe
-    /// (`verifyScalarServingResetParity`) would still pass and the server would boot healthy, and
-    /// then every real param-less request -- now resolved to `.sampled` by this very flag -- would
-    /// hit `InferenceActor.generateBounded`'s per-request capability guard and surface an opaque
-    /// mid-stream `samplingUnsupportedByDecoder` backend error instead of a clean refusal to start.
-    case defaultSamplingIncompatibleWithCompiledDecoderStrategy
+    // `defaultSamplingIncompatibleWithCompiledDecoderStrategy` (refused `--default-sampling
+    // generation-config` + `.compiledFP16` at load) was REMOVED once `.compiledFP16` became a
+    // `RouteSwitchingDecoder` whose general side genuinely opts into `Decoder.supportsSampling` —
+    // see `RouteSwitchingDecoder`'s doc comment. The combination this case used to refuse is now
+    // admitted: the greedy startup probe passes AND every real sampled request the flag resolves
+    // routes to the general side instead of hitting `InferenceActor.generateBounded`'s per-request
+    // capability guard, so the refusal this case existed to force would now be actively wrong.
 }
 
 enum ScalarServingDecoderStrategy: Equatable {
@@ -381,43 +373,29 @@ func scalarServingInCheckpointMTPDecoderStrategyError(
     return .inCheckpointMTPIncompatibleWithCompiledDecoderStrategy
 }
 
-/// Fail-closed compatibility guard between `configuration.defaultSampling` and the RESOLVED
-/// `ScalarServingDecoderStrategy`. Mirrors `scalarServingInCheckpointMTPDecoderStrategyError`'s
-/// shape (a pure function returning the error to throw, or `nil` to admit) but NOT its
-/// unreachability claim -- read `ScalarServingModelLoadError.defaultSamplingIncompatibleWithCompiledDecoderStrategy`'s
-/// own doc comment for why `.compiledFP16` is the DOMINANT resolution here, not a rare edge case,
-/// and why refusing at load (rather than letting the per-request capability guard in
-/// `InferenceActor.generateBounded` catch it) is required: the greedy startup probe would still
-/// pass, so the server would boot healthy and then fail every real sampled request mid-stream with
-/// an opaque backend error instead of a clean refusal to start.
-func scalarServingDefaultSamplingDecoderStrategyError(
-    defaultSampling: FastMLXServeDefaultSampling,
-    decoderStrategy: ScalarServingDecoderStrategy
-) -> ScalarServingModelLoadError? {
-    guard defaultSampling == .generationConfig, decoderStrategy == .compiledFP16 else {
-        return nil
-    }
-    return .defaultSamplingIncompatibleWithCompiledDecoderStrategy
-}
-
 /// Pure route-flag derivation for `response_format: json_object`'s capability gate (response-format
 /// design item #4: "MTP eligibility cannot see this processor" — a request carrying
 /// `response_format` is refused with 400 rather than forced onto a non-speculative path). `true`
-/// only for the plain, non-speculative scalar decode route: `.nativeCaches` with NO retained
-/// in-checkpoint MTP drafter. `false` for:
-/// - `.compiledFP16` (the compiled fast path has no `setResponseFormatConstraint` seam), and
-/// - EVERY speculative composition of `.nativeCaches` — a retained in-checkpoint MTP drafter routes
-///   to `MTPSpeculativeDecoder` regardless of whether `sampledMTPBlockDecisionsEnabled` layers
-///   sampled block decisions on top of it; both compositions are equally "speculative" for this
-///   gate's purposes, since neither binds the plain `MLXDecoder` this capability requires.
+/// for the plain, non-speculative scalar decode route — `.compiledFP16` (now a
+/// `RouteSwitchingDecoder` whose general side genuinely honors `setResponseFormatConstraint`, per
+/// that type's doc comment) or `.nativeCaches`, EITHER ONE with NO retained in-checkpoint MTP
+/// drafter. `false` only for a speculative composition of `.nativeCaches` — a retained
+/// in-checkpoint MTP drafter routes to `MTPSpeculativeDecoder` regardless of whether
+/// `sampledMTPBlockDecisionsEnabled` layers sampled block decisions on top of it; both compositions
+/// are equally "speculative" for this gate's purposes, since neither binds a decoder this
+/// capability requires. `.compiledFP16` can never itself carry a retained drafter in production —
+/// `scalarServingInCheckpointMTPDecoderStrategyError` already refuses that pairing at load — but
+/// this function still keys on `hasRetainedInCheckpointMTPDrafter` for BOTH strategy cases rather
+/// than assuming that unreachability, matching this file's existing style of asserting invariants
+/// where cheap instead of relying on an upstream guard alone.
 func scalarServingIsNonSpeculativeScalarRoute(
     decoderStrategy: ScalarServingDecoderStrategy,
     hasRetainedInCheckpointMTPDrafter: Bool
 ) -> Bool {
-    if case .nativeCaches = decoderStrategy, !hasRetainedInCheckpointMTPDrafter {
-        return true
+    switch decoderStrategy {
+    case .compiledFP16, .nativeCaches:
+        return !hasRetainedInCheckpointMTPDrafter
     }
-    return false
 }
 
 func scalarServingDecoderStrategy(
@@ -525,8 +503,7 @@ public struct ScalarServingModelLoadConfiguration: Sendable {
     /// `--default-sampling`: `.off` (the default) preserves today's behavior byte-for-byte -- a
     /// request omitting sampling parameters decodes greedy argmax. `.generationConfig` opts into
     /// resolving the served checkpoint's `generation_config.json` sampling subset for the SCALAR
-    /// serve route ONLY, fail-closed at load (see `loadScalarServingModel`'s generation-config load
-    /// and `scalarServingDefaultSamplingDecoderStrategyError`).
+    /// serve route ONLY, fail-closed at load (see `loadScalarServingModel`'s generation-config load).
     ///
     /// There are TWO construction sites for this type. `spike/Sources/fastmlx-serve/FastMLXServe.swift`
     /// (`loadScalarServingBackend`, ~:815) forwards `FastMLXServeArguments.defaultSampling` here.
@@ -1171,14 +1148,10 @@ public func loadScalarServingModel(
         selection: configuration.inCheckpointMTPSelection, decoderStrategy: decoderStrategy) {
         throw decoderStrategyError
     }
-    // Fail-closed BEFORE any drafter weight load, same seam as the MTP guard immediately above: see
-    // `scalarServingDefaultSamplingDecoderStrategyError`'s doc comment -- unlike the MTP guard, this
-    // combination is NOT provably unreachable in production; it is the dominant resolution for any
-    // all-dense-attention checkpoint.
-    if let defaultSamplingDecoderStrategyError = scalarServingDefaultSamplingDecoderStrategyError(
-        defaultSampling: configuration.defaultSampling, decoderStrategy: decoderStrategy) {
-        throw defaultSamplingDecoderStrategyError
-    }
+    // The load-time refusal that used to sit here (`scalarServingDefaultSamplingDecoderStrategyError`,
+    // `--default-sampling generation-config` + `.compiledFP16`) was REMOVED once `.compiledFP16`
+    // became a `RouteSwitchingDecoder` whose general side genuinely supports sampling — see
+    // `RouteSwitchingDecoder`'s doc comment and `ScalarServingModelLoadError`'s removed-case note.
     let codec = MLXScalarTextCodec(tokenizer: tokenizer)
     let stopTokenIDs = try resolveScalarServingStopTokenIDs(
         configuration: modelConfiguration,
@@ -1305,7 +1278,19 @@ public func loadScalarServingModel(
     let inference: InferenceActor
     switch decoderStrategy {
     case .compiledFP16:
-        inference = InferenceActor(decoder: CompiledMLXDecoder(model: context.model))
+        // The compiled fast path is greedy-only by construction (see `CompiledMLXDecoder`'s doc
+        // comment), so a `RouteSwitchingDecoder` pairs it with a plain `MLXDecoder` over the SAME
+        // model for every capability the compiled step cannot honor (sampling, penalties,
+        // response-format constraints, logprobs) — see that type's own doc comment. The general
+        // side's cache factory is the SAME `scalarServingNativeCacheFactory(decision: .fp16, ...)`
+        // the `.nativeCaches(.fp16)` branch below builds, so an fp16-tier request routed to either
+        // decoder strategy gets byte-identical KV storage.
+        let model = context.model
+        let generalCacheFactory = scalarServingNativeCacheFactory(decision: .fp16, model: model)
+        inference = InferenceActor(
+            decoder: RouteSwitchingDecoder(
+                fast: CompiledMLXDecoder(model: model),
+                general: MLXDecoder(model: model, cacheFactory: generalCacheFactory)))
     case .nativeCaches(let decision):
         // The same factory owns initial construction and every later request reset, for BOTH
         // `MLXDecoder` and (when MTP is selected) `MTPSpeculativeDecoder` below — a single
@@ -1863,10 +1848,6 @@ public func scalarServingModelLoadRefusalAnnounceLine(
         return "fastmlx-serve configuration=refused "
             + "reason=default_sampling_generation_config_unavailable "
             + "detail=\(underlying) remedy=--default-sampling_off"
-    case .defaultSamplingIncompatibleWithCompiledDecoderStrategy:
-        return "fastmlx-serve configuration=refused "
-            + "reason=default_sampling_incompatible_with_compiled_decoder_strategy "
-            + "remedy=--default-sampling_off"
     default:
         return "fastmlx-serve configuration=refused reason=scalar_serving_model_load_error "
             + "detail=\(error)"

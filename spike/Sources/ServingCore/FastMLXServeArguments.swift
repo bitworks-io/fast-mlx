@@ -860,12 +860,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// per-request: `GenerationConfigSamplingDefaults.load(contentsOf:)` runs against
     /// `generation_config.json` inside the model directory before any weight load, and a
     /// missing/unparseable file, `do_sample: false`, absent/zero `temperature`, or an out-of-range
-    /// sampling field refuses to start rather than silently falling back to greedy. Also refused at
-    /// load when the resolved scalar decoder strategy is `.compiledFP16`
-    /// (`scalarServingDefaultSamplingDecoderStrategyError`) -- that decoder does not opt into
-    /// `Decoder.supportsSampling`, so admitting the combination would boot healthy on the greedy
-    /// startup probe and then fail every real sampled request mid-stream with an opaque backend
-    /// error instead. Refused here at PARSE TIME (this type) against every OTHER route that would
+    /// sampling field refuses to start rather than silently falling back to greedy. The compiled
+    /// dense route (`.compiledFP16`) is admitted: it serves sampled requests on the general side of
+    /// its `RouteSwitchingDecoder`. Refused here at PARSE TIME (this type) against every OTHER route that would
     /// otherwise silently ignore this flag or regress accepted behavior when it converts
     /// param-less traffic into sampled traffic: `--scripted` and `--quant-pick-only` never serve a
     /// request at all (`defaultSamplingWithScripted` / `defaultSamplingWithQuantPickOnly`);

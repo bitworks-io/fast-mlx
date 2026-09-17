@@ -92,10 +92,15 @@ public final class ScalarServingJSONObjectConstraintSupport: @unchecked Sendable
 /// 6. `eos_out_of_range` — every resolved EOS id is `>= vocabSize`, so none of them could ever
 ///    classify as `.eos` in `ByteLevelTokenBytes.classify` (which only classifies `0..<vocabSize`):
 ///    the automaton would then have no legal way to terminate, identically to `no_eos_token_id`.
-/// 7. `self_check_mismatch` — `ByteLevelTokenBytes.selfCheckMismatches` found at least one id whose
-///    recovered bytes disagree with the tokenizer's own `decode([id])` (see that function's doc
-///    comment for why this must never be silently trusted). The log line also carries the FIRST
-///    mismatching id, so a live disablement is diagnosable from stdout alone.
+/// 7. `self_check_mismatch` — `ByteLevelTokenBytes.excludingKnownBOMArtifacts` found at least one id
+///    whose recovered bytes disagree with the tokenizer's own `decode([id])` and that disagreement
+///    is NOT the known leading-BOM-stripping artifact (see that function's doc comment: Foundation's
+///    `String(bytes:encoding:.utf8)` silently drops a leading U+FEFF that a real byte-level
+///    `decode([id])` keeps, which would otherwise false-positive on any vocab id whose raw bytes are
+///    or start with the UTF-8 BOM). That one recognized shape is excluded and its id reclassified
+///    `.banned` rather than disabling the feature; every other mismatch still disables it. The log
+///    line also carries the FIRST mismatching id, so a live disablement is diagnosable from stdout
+///    alone.
 public func loadScalarServingJSONObjectConstraintSupport(
     modelDirectory: URL,
     tokenizer: any MLXLMCommon.Tokenizer
@@ -144,19 +149,21 @@ public func loadScalarServingJSONObjectConstraintSupport(
         return disabled("eos_out_of_range")
     }
 
-    let classifications = ByteLevelTokenBytes.classify(
+    let unfilteredClassifications = ByteLevelTokenBytes.classify(
         vocabSize: vocabSize,
         vocabString: { descriptor.vocabStringsByID[$0] },
         addedTokenIds: descriptor.addedTokenIds,
         eosTokenIds: eosTokenIds)
 
-    let mismatches = ByteLevelTokenBytes.selfCheckMismatches(classifications: classifications) {
-        id in
+    let selfCheck = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+        classifications: unfilteredClassifications
+    ) { id in
         tokenizer.decode(tokenIds: [id], skipSpecialTokens: false)
     }
-    guard mismatches.isEmpty else {
-        return disabled("self_check_mismatch", detail: "id=\(mismatches[0].id)")
+    guard selfCheck.mismatches.isEmpty else {
+        return disabled("self_check_mismatch", detail: "id=\(selfCheck.mismatches[0].id)")
     }
+    let classifications = selfCheck.classifications
 
     // `</think>` need not exist in every tokenizer's vocabulary — a non-thinking model's tokenizer
     // legitimately has no such token. `nil` here is not itself a disablement; see

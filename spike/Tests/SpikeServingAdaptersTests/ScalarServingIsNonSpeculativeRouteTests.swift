@@ -17,14 +17,26 @@ final class ScalarServingIsNonSpeculativeRouteTests: XCTestCase {
                 hasRetainedInCheckpointMTPDrafter: false))
     }
 
-    /// Compiled fp16: never non-speculative for this gate, regardless of drafter retention (which
-    /// cannot co-occur with `.compiledFP16` in production, but the pure function must still answer
-    /// `false` here rather than assume the combination is unreachable).
-    func testCompiledRouteIsNotNonSpeculative() {
-        XCTAssertFalse(
+    /// Compiled fp16 with no retained drafter: NOW non-speculative. `.compiledFP16` resolves to a
+    /// `RouteSwitchingDecoder` whose general side genuinely honors `setResponseFormatConstraint`
+    /// (see that type's doc comment), so it is no longer excluded from this gate the way the
+    /// greedy-only `CompiledMLXDecoder` alone used to be.
+    func testCompiledRouteWithNoDrafterIsNonSpeculative() {
+        XCTAssertTrue(
             scalarServingIsNonSpeculativeScalarRoute(
                 decoderStrategy: .compiledFP16,
                 hasRetainedInCheckpointMTPDrafter: false))
+    }
+
+    /// Compiled fp16 WITH a retained drafter: still `false`. This pairing cannot occur in
+    /// production (`scalarServingInCheckpointMTPDecoderStrategyError` refuses it at load), but the
+    /// pure function must still answer defensively rather than assume the combination is
+    /// unreachable — see the function's own doc comment.
+    func testCompiledRouteWithDrafterIsNotNonSpeculative() {
+        XCTAssertFalse(
+            scalarServingIsNonSpeculativeScalarRoute(
+                decoderStrategy: .compiledFP16,
+                hasRetainedInCheckpointMTPDrafter: true))
     }
 
     /// In-checkpoint MTP: `.nativeCaches` WITH a retained drafter routes to

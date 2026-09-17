@@ -206,4 +206,76 @@ final class ByteLevelTokenBytesTests: XCTestCase {
             decode: { _ in "should not matter" })
         XCTAssertTrue(mismatches.isEmpty)
     }
+
+    // MARK: - BOM self-check exclusion (slice 1e item 2)
+    //
+    // `recoveredUTF8` is computed with Foundation's `String(bytes:encoding:.utf8)`, which silently
+    // drops a leading U+FEFF byte-order mark; the tokenizer's own byte-level `decode([id])` path
+    // does NOT drop it. A token whose raw bytes are (or start with) the 3-byte UTF-8 BOM therefore
+    // self-checks as a false mismatch — `decoded` legitimately carries the leading U+FEFF that
+    // `recoveredUTF8` lost. `excludingKnownBOMArtifacts` must recognize exactly this shape, refuse
+    // to report it as a mismatch, and reclassify the id `.banned` so no emitted text can diverge
+    // from what the automaton validated.
+
+    func testExcludingKnownBOMArtifactsBansPureBOMTokenWithoutReportingMismatch() {
+        // Raw bytes EF BB BF are the UTF-8 encoding of U+FEFF. Foundation's
+        // `String(bytes:encoding:.utf8)` strips it, producing "" for `recoveredUTF8`; the
+        // tokenizer's decode path does not strip it, producing "\u{FEFF}" for `decoded` — mirrors
+        // the real Qwen vocab id 3121 (`self_check_mismatch id=3121`).
+        let classifications: [TokenByteClassification] = [.bytes([0xEF, 0xBB, 0xBF])]
+        let result = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+            classifications: classifications,
+            decode: { _ in "\u{FEFF}" })
+        XCTAssertTrue(result.mismatches.isEmpty, "a BOM-only-strip divergence must not self-check as a mismatch")
+        XCTAssertEqual(result.classifications[0], .banned, "the BOM token must be excluded, never allowed")
+    }
+
+    func testExcludingKnownBOMArtifactsBansBOMPrefixedTokenWithoutReportingMismatch() {
+        // Raw bytes EF BB BF 61 are BOM + "a". `String(bytes:encoding:.utf8)` strips the leading
+        // BOM and returns "a"; a decode that mirrors the same stripping legitimately returns "a"
+        // too, so `decoded == "a"` here IS a BOM-prefixed match on the decode side (this is the
+        // "\u{FEFF}" + decoded == recoveredUTF8 shape from the opposite direction — decode already
+        // agrees with the stripped form). Use a decode that keeps the BOM, matching the real
+        // tokenizer's byte-level decoder, so `decoded == "\u{FEFF}a"` while `recoveredUTF8 == "a"`.
+        let classifications: [TokenByteClassification] = [.bytes([0xEF, 0xBB, 0xBF, 0x61])]
+        let result = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+            classifications: classifications,
+            decode: { _ in "\u{FEFF}a" })
+        XCTAssertTrue(result.mismatches.isEmpty)
+        XCTAssertEqual(result.classifications[0], .banned)
+    }
+
+    func testExcludingKnownBOMArtifactsStillReportsUnrelatedMismatches() {
+        // Control: a decode divergence that is NOT the BOM-stripping shape must still be reported
+        // and must NOT be silently banned.
+        let classifications: [TokenByteClassification] = [.bytes(Array("hi".utf8))]
+        let result = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+            classifications: classifications,
+            decode: { _ in "WRONG" })
+        XCTAssertEqual(result.mismatches.count, 1)
+        XCTAssertEqual(result.mismatches[0].id, 0)
+        XCTAssertEqual(result.mismatches[0].recoveredUTF8, "hi")
+        XCTAssertEqual(result.mismatches[0].decoded, "WRONG")
+        XCTAssertEqual(result.classifications[0], .bytes(Array("hi".utf8)), "an unrelated mismatch must not be reclassified")
+    }
+
+    func testExcludingKnownBOMArtifactsDoesNotBanWhenDecodedHasNoLeadingBOM() {
+        // Control: `decoded` differs from `recoveredUTF8` but does NOT carry a leading U+FEFF that
+        // `recoveredUTF8` lacks — this must still be a real, reported mismatch, not an exclusion.
+        let classifications: [TokenByteClassification] = [.bytes(Array("a".utf8))]
+        let result = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+            classifications: classifications,
+            decode: { _ in "b" })
+        XCTAssertEqual(result.mismatches.count, 1)
+        XCTAssertEqual(result.classifications[0], .bytes(Array("a".utf8)))
+    }
+
+    func testExcludingKnownBOMArtifactsLeavesAgreeingTokensUntouched() {
+        let classifications: [TokenByteClassification] = [.bytes(Array("hi".utf8)), .eos, .banned]
+        let result = ByteLevelTokenBytes.excludingKnownBOMArtifacts(
+            classifications: classifications,
+            decode: { id in id == 0 ? "hi" : "should not matter" })
+        XCTAssertTrue(result.mismatches.isEmpty)
+        XCTAssertEqual(result.classifications, classifications)
+    }
 }

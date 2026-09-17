@@ -146,6 +146,31 @@ public struct TokenByteMismatch: Sendable, Equatable {
 }
 
 extension ByteLevelTokenBytes {
+    /// Shared core for the self-check family: walks every `.bytes` id whose recovered bytes are
+    /// themselves standalone-valid UTF-8, compares against `decode`, and yields every disagreement
+    /// found (along with the raw bytes that produced it). `selfCheckMismatches` and
+    /// `excludingKnownBOMArtifacts` both build on this single pass so the divergence-detection
+    /// logic — which entries even qualify for comparison — can never drift between the two.
+    ///
+    /// Ids whose bytes are valid UTF-8 only as part of a larger multi-token sequence (e.g. one half
+    /// of a split CJK character) are skipped here, since `decode([id])` is expected to disagree for
+    /// those by design (it substitutes U+FFFD) — that's exactly why the constraint must never call
+    /// `decode([id])` on its own.
+    private static func rawMismatches(
+        classifications: [TokenByteClassification],
+        decode: (Int) -> String?
+    ) -> [(id: Int, bytes: [UInt8], recoveredUTF8: String, decoded: String)] {
+        var out: [(id: Int, bytes: [UInt8], recoveredUTF8: String, decoded: String)] = []
+        for (id, classification) in classifications.enumerated() {
+            guard case .bytes(let bytes) = classification else { continue }
+            guard let recoveredUTF8 = String(bytes: bytes, encoding: .utf8) else { continue }
+            let decoded = decode(id) ?? "<nil>"
+            guard decoded != recoveredUTF8 else { continue }
+            out.append((id: id, bytes: bytes, recoveredUTF8: recoveredUTF8, decoded: decoded))
+        }
+        return out
+    }
+
     /// Self-check: for every `.bytes` id whose recovered bytes are themselves valid UTF-8, verify
     /// `decode([id])` agrees. Ids whose bytes are valid UTF-8 only as part of a larger multi-token
     /// sequence (e.g. one half of a split CJK character) are skipped here, since `decode([id])` is
@@ -155,16 +180,48 @@ extension ByteLevelTokenBytes {
         classifications: [TokenByteClassification],
         decode: (Int) -> String?
     ) -> [TokenByteMismatch] {
-        var mismatches: [TokenByteMismatch] = []
-        for (id, classification) in classifications.enumerated() {
-            guard case .bytes(let bytes) = classification else { continue }
-            guard let recoveredUTF8 = String(bytes: bytes, encoding: .utf8) else { continue }
-            let decoded = decode(id) ?? "<nil>"
-            if decoded != recoveredUTF8 {
-                mismatches.append(
-                    TokenByteMismatch(id: id, recoveredUTF8: recoveredUTF8, decoded: decoded))
-            }
+        rawMismatches(classifications: classifications, decode: decode).map {
+            TokenByteMismatch(id: $0.id, recoveredUTF8: $0.recoveredUTF8, decoded: $0.decoded)
         }
-        return mismatches
+    }
+
+    /// Result of `excludingKnownBOMArtifacts`: the surviving (non-BOM-artifact) mismatches, plus the
+    /// classifications with every recognized BOM artifact id reclassified `.banned`.
+    public struct BOMExclusionResult: Sendable, Equatable {
+        public let mismatches: [TokenByteMismatch]
+        public let classifications: [TokenByteClassification]
+
+        public init(mismatches: [TokenByteMismatch], classifications: [TokenByteClassification]) {
+            self.mismatches = mismatches
+            self.classifications = classifications
+        }
+    }
+
+    /// Same self-check as `selfCheckMismatches`, but recognizes one specific false-positive shape and
+    /// excludes it instead of reporting it: Foundation's `String(bytes:encoding:.utf8)` (used to
+    /// compute `recoveredUTF8`) silently STRIPS a leading U+FEFF byte-order mark, while a real
+    /// byte-level tokenizer's `decode([id])` does not strip it. An id whose raw bytes start with the
+    /// 3-byte UTF-8 BOM (`EF BB BF`) and whose `decoded` value equals `"\u{FEFF}" + recoveredUTF8` is
+    /// exactly that artifact — never a genuine inversion bug — so it is reclassified `.banned` (never
+    /// allowed by the grammar, since the constraint's own trie would still be walking the
+    /// BOM-stripped bytes while the tokenizer's real decode keeps the BOM: allowing it risks emitted
+    /// text diverging from what the automaton validated) rather than disabling the whole feature.
+    /// Every other mismatch is reported unchanged, and its classification is left untouched.
+    public static func excludingKnownBOMArtifacts(
+        classifications: [TokenByteClassification],
+        decode: (Int) -> String?
+    ) -> BOMExclusionResult {
+        let bomPrefix: [UInt8] = [0xEF, 0xBB, 0xBF]
+        var mismatches: [TokenByteMismatch] = []
+        var outClassifications = classifications
+        for raw in rawMismatches(classifications: classifications, decode: decode) {
+            if raw.bytes.starts(with: bomPrefix), raw.decoded == "\u{FEFF}" + raw.recoveredUTF8 {
+                outClassifications[raw.id] = .banned
+                continue
+            }
+            mismatches.append(
+                TokenByteMismatch(id: raw.id, recoveredUTF8: raw.recoveredUTF8, decoded: raw.decoded))
+        }
+        return BOMExclusionResult(mismatches: mismatches, classifications: outClassifications)
     }
 }

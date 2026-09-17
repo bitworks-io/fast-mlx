@@ -169,6 +169,46 @@ final class ScalarServingJSONObjectConstraintSupportTests: XCTestCase {
             loadScalarServingJSONObjectConstraintSupport(modelDirectory: directory, tokenizer: tokenizer))
     }
 
+    // MARK: - BOM self-check exclusion (slice 1e item 2)
+
+    /// A vocab id whose byte-level-encoded string round-trips to raw bytes `EF BB BF` (the UTF-8
+    /// byte-order mark) self-checks as a mismatch under naive `String(bytes:encoding:.utf8)` (which
+    /// silently strips the leading BOM) vs. a real tokenizer `decode([id])` that keeps it — mirrors
+    /// the live Qwen vocab id 3121 finding. This must NOT disable the whole feature
+    /// (`self_check_mismatch`); it must be recognized and excluded, with the BOM id itself banned
+    /// from the constraint table so it can never be emitted.
+    func testBOMOnlyVocabEntryDoesNotDisableFeatureAndIsBanned() async throws {
+        // "ï»¿" (U+00EF U+00BB U+00BF) is the byte-level `bytes_to_unicode` encoding of raw bytes
+        // `EF BB BF` — all three bytes fall in the identity range, so each maps to itself.
+        let tokenizerJSON: [String: Any] = [
+            "decoder": ["type": "ByteLevel"],
+            "model": [
+                "vocab": ["a": 0, "b": 1, "</s>": 2, "</think>": 3, "ï»¿": 4]
+            ],
+            "added_tokens": [["id": 3, "content": "</think>", "special": true]],
+        ]
+        let directory = try makeFixtureModelDirectory(
+            tokenizerJSON: tokenizerJSON, configJSON: ["vocab_size": 5])
+        let tokenizer = FakeByteLevelTokenizer(
+            vocabStringsByID: [
+                0: "a", 1: "b", 2: "</s>", 3: "</think>",
+                // `decode([4])` mirrors a real byte-level decoder that keeps the leading BOM, unlike
+                // `String(bytes:encoding:.utf8)` on the recovered raw bytes, which strips it.
+                4: "\u{FEFF}",
+            ],
+            eosToken: "</s>")
+
+        let support = loadScalarServingJSONObjectConstraintSupport(
+            modelDirectory: directory, tokenizer: tokenizer)
+
+        let unwrapped = try XCTUnwrap(
+            support, "a BOM-only self-check divergence must not disable response_format=json_object")
+        let table = await unwrapped.table
+        XCTAssertEqual(
+            table.classification(for: 4), .banned,
+            "the BOM artifact id must be excluded/banned, never allowed by the grammar")
+    }
+
     // MARK: - Nested `text_config` vocab_size (VL-wrapped hybrid checkpoints)
 
     /// `config.json`'s `vocab_size` lives under `text_config` on a VL-wrapped hybrid checkpoint,

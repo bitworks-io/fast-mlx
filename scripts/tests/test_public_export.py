@@ -120,8 +120,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # SpikeServingAdapters/ScalarServingJSONObjectConstraint.swift and seven test files. Same publish
 # rationale; family-neutral symbols and comments.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 952,
-    "pathModeSha256": "0b8a6d4eece8c31b92da6c7e1531e59f2029c14d9cc4f3ee5812ff6bc5fac4ae",
+    "pathCount": 955,
+    "pathModeSha256": "579802c9c348340acfe7c6cdc67f04afa7bbf8970ffcb562e16ba8f1e7ce3dcd",
 }
 
 

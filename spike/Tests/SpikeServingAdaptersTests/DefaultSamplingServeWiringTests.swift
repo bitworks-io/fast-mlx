@@ -8,44 +8,21 @@ import SpikeCore
 /// Increment 2 of `docs/task-inbox/2026-09-09-default-sampling-params-DECISION.md`: wires
 /// `--default-sampling generation-config` into the SCALAR serve route only, fail-closed at load.
 /// Increment 1 (the pure resolver, `ServingSamplingPolicy.resolve(from:defaults:)`) is already
-/// covered by `ServingSamplingPolicyTests.swift`; this file covers the NEW load-time guard
-/// (`scalarServingDefaultSamplingDecoderStrategyError`), the isolation invariant that keeps the
-/// default confined to the scalar route, and that the resolved defaults are genuinely APPLIED at
-/// admission, not merely accepted.
+/// covered by `ServingSamplingPolicyTests.swift`; this file covers the isolation invariant that
+/// keeps the default confined to the scalar route, and that the resolved defaults are genuinely
+/// APPLIED at admission, not merely accepted. It no longer covers a `.compiledFP16` load-time
+/// refusal — `scalarServingDefaultSamplingDecoderStrategyError` was REMOVED once `.compiledFP16`
+/// became a `RouteSwitchingDecoder` whose general side genuinely supports sampling (see
+/// `RouteSwitchingDecoder`'s doc comment); that combination is now admitted, not refused.
 final class DefaultSamplingServeWiringTests: XCTestCase {
 
-    // MARK: - Guard-unit tests, mirroring MTPDecoderBridgeSelectionTests
-
-    /// The refusal: `.generationConfig` + `.compiledFP16` must refuse with the specific case. See
-    /// `ScalarServingModelLoadError.defaultSamplingIncompatibleWithCompiledDecoderStrategy`'s doc
-    /// comment for why this combination is the DOMINANT resolution for `--default-sampling
-    /// generation-config`, not a rare edge case (unlike the MTP guard this mirrors).
-    func testDefaultSamplingDecoderStrategyGuardRefusesGenerationConfigWithCompiledFP16() {
-        let error = scalarServingDefaultSamplingDecoderStrategyError(
-            defaultSampling: .generationConfig, decoderStrategy: .compiledFP16)
-        XCTAssertEqual(error, .defaultSamplingIncompatibleWithCompiledDecoderStrategy)
-    }
-
-    /// Control A: `.off` (the flag not requested at all) paired with `.compiledFP16` must ADMIT. A
-    /// guard reading only `decoderStrategy` (ignoring `defaultSampling` entirely) would refuse this
-    /// too, which would break every existing `--compiled` serve that never asked for
-    /// `--default-sampling generation-config`. Required alongside Control B: with only one control, a
-    /// guard reading a single operand alone still passes.
-    func testDefaultSamplingDecoderStrategyGuardAdmitsOffWithCompiledFP16() {
-        XCTAssertNil(
-            scalarServingDefaultSamplingDecoderStrategyError(
-                defaultSampling: .off, decoderStrategy: .compiledFP16))
-    }
-
-    /// Control B: `.generationConfig` paired with `.nativeCaches(.fp16)` (NOT `.compiledFP16`) must
-    /// ADMIT. A guard reading only `defaultSampling` (ignoring `decoderStrategy` entirely) would
-    /// refuse this too, which would break every non-compiled route that opts into the flag. Required
-    /// alongside Control A for the same single-operand-coverage reason.
-    func testDefaultSamplingDecoderStrategyGuardAdmitsGenerationConfigWithNativeCaches() {
-        XCTAssertNil(
-            scalarServingDefaultSamplingDecoderStrategyError(
-                defaultSampling: .generationConfig, decoderStrategy: .nativeCaches(.fp16)))
-    }
+    // The guard-unit tests that used to live here (`scalarServingDefaultSamplingDecoderStrategyError`,
+    // refusing `.generationConfig` + `.compiledFP16`) were REMOVED along with that function: once
+    // `.compiledFP16` became a `RouteSwitchingDecoder` whose general side genuinely supports
+    // sampling (see `RouteSwitchingDecoder`'s doc comment), the combination that guard used to
+    // refuse is now correctly admitted — there is no longer a load-time refusal to unit test here.
+    // `ScalarServingIsNonSpeculativeRouteTests.swift` and `RouteSwitchingDecoderTests.swift` cover
+    // the new behavior instead.
 
     // MARK: - Isolation invariant, pinned BY CONSTRUCTION (not by grep)
 

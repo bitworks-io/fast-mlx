@@ -96,6 +96,129 @@ public struct JSONObjectAutomaton: Hashable, Sendable {
         return copy.advance(byte: byte) ? copy : nil
     }
 
+    // MARK: - Allocation-free walk (trie DFS)
+
+    /// Opaque per-byte undo token for `tryAdvanceForWalk(byte:)`/`undoForWalk(_:)`: captures
+    /// exactly the scalar fields plus the (at most one push, pop, or same-index top replacement)
+    /// `stack` delta a single byte transition can make, so the caller can restore the automaton to
+    /// its pre-call state in O(1) with no array copy. A naive "copy self, then mutate the copy"
+    /// probe (as `advancing(byte:)` does) forces Swift's copy-on-write to materialize a real copy
+    /// of `stack` the moment the copy's mutation diverges from the original — which is exactly the
+    /// per-byte cost a trie DFS visiting many branches must avoid. This type intentionally exposes
+    /// no public initializer or fields: it is meaningful only as the token `tryAdvanceForWalk`
+    /// hands back to `undoForWalk`.
+    struct WalkUndo {
+        fileprivate let lexeme: Lexeme
+        fileprivate let beforeTopLevel: Bool
+        fileprivate let afterTopLevel: Bool
+        fileprivate let whitespaceRun: Int
+        fileprivate let rejected: Bool
+        fileprivate let stackCountBefore: Int
+        fileprivate let stackTopBefore: Frame?
+    }
+
+    /// Trial advance for the trie DFS: mutates `self` in place. On success, returns an undo token
+    /// that `undoForWalk(_:)` later restores; on rejection, `self` is left exactly as it was
+    /// (internally rolled back) and `nil` is returned. Unlike `advance(byte:)`, this never sets the
+    /// permanent `rejected` latch on a live walker — it is meant to be called many times over the
+    /// SAME automaton instance during a single DFS, alternating with `undoForWalk` as the walk
+    /// backtracks, not once per terminal outcome.
+    mutating func tryAdvanceForWalk(byte: UInt8) -> WalkUndo? {
+        guard !rejected else { return nil }
+        let undo = WalkUndo(
+            lexeme: lexeme, beforeTopLevel: beforeTopLevel, afterTopLevel: afterTopLevel,
+            whitespaceRun: whitespaceRun, rejected: rejected,
+            stackCountBefore: stack.count, stackTopBefore: stack.last)
+        guard advanceInner(byte: byte) else {
+            restoreForWalk(undo)
+            return nil
+        }
+        return undo
+    }
+
+    /// Restores exactly what the matching `tryAdvanceForWalk(byte:)` call touched.
+    mutating func undoForWalk(_ undo: WalkUndo) {
+        restoreForWalk(undo)
+    }
+
+    /// A single byte transition changes `stack` by at most one push, one pop, or one same-index
+    /// top replacement — see `advanceStructural`/`beginValue`: the ONLY paths that touch `stack` at
+    /// all either `append`/`removeLast` exactly once, or reassign `stack[stack.count - 1]` exactly
+    /// once (sometimes immediately followed by a push from `beginValue`, e.g. `{"a":{` replaces the
+    /// outer frame's `.objectExpectValue` with `.objectExpectCommaOrEnd` THEN pushes the inner
+    /// object's frame — both in the same byte). That means the count delta alone doesn't always
+    /// tell the whole story: a push can co-occur with the pre-existing top frame having been
+    /// replaced, so undoing a push must restore both the removed frame's absence AND the
+    /// possibly-mutated frame beneath it. A pop never co-occurs with a same-call top replacement
+    /// (the removeLast/append pop sites never reassign `stack[stack.count - 1]` first), so undoing
+    /// a pop only needs to put the popped frame back.
+    private mutating func restoreForWalk(_ undo: WalkUndo) {
+        lexeme = undo.lexeme
+        beforeTopLevel = undo.beforeTopLevel
+        afterTopLevel = undo.afterTopLevel
+        whitespaceRun = undo.whitespaceRun
+        rejected = undo.rejected
+        if stack.count == undo.stackCountBefore + 1 {
+            stack.removeLast()
+            if let top = undo.stackTopBefore, !stack.isEmpty {
+                stack[stack.count - 1] = top
+            }
+        } else if stack.count == undo.stackCountBefore - 1 {
+            if let top = undo.stackTopBefore {
+                stack.append(top)
+            }
+        } else if stack.count == undo.stackCountBefore {
+            if let top = undo.stackTopBefore, !stack.isEmpty {
+                stack[stack.count - 1] = top
+            }
+        }
+    }
+
+    // MARK: - Mask cache key
+
+    /// Opaque, `Hashable` mask-cache key: the automaton state truncated to what a token of at most
+    /// `maxTokenBytes` bytes can ever observe from here. A single token's bytes can pop at most
+    /// `maxTokenBytes` stack frames (one pop per closing `}`/`]` byte, and the token has at most
+    /// that many bytes total), and the trie DFS that computes a mask never walks deeper than
+    /// `maxTokenBytes` edges from the root — so two automaton states that agree on the lexical
+    /// state, the whitespace run, and the top `min(depth, maxTokenBytes)` stack frames produce the
+    /// IDENTICAL allowed-mask, regardless of what (if anything) sits below that window. `hasHiddenFrames`
+    /// distinguishes "the visible frames are the WHOLE stack" (so popping through all of them
+    /// bottoms out at the empty stack, i.e. can complete the document) from "there is at least one
+    /// more frame below the window" (so the deepest visible pop can never itself bottom out within
+    /// a single token) — without that flag, two states with the same visible frames but different
+    /// bottoming-out behavior would incorrectly collide. This is an EXACT reduction, not an
+    /// approximation: every included field is either already used unchanged (lexeme, whitespaceRun,
+    /// beforeTopLevel/afterTopLevel/rejected) or is the precise subset of `stack` any within-budget
+    /// token walk could ever read.
+    struct MaskCacheKey: Hashable {
+        fileprivate let lexeme: Lexeme
+        fileprivate let beforeTopLevel: Bool
+        fileprivate let afterTopLevel: Bool
+        fileprivate let whitespaceRun: Int
+        fileprivate let rejected: Bool
+        fileprivate let visibleFrames: [Frame]
+        fileprivate let hasHiddenFrames: Bool
+    }
+
+    /// Builds this state's `MaskCacheKey` against a table whose longest `.bytes` token is
+    /// `maxTokenBytes` bytes (see `JSONObjectConstraintTrie.maxTokenByteLength`).
+    func maskCacheKey(maxTokenBytes: Int) -> MaskCacheKey {
+        let visibleFrames: [Frame]
+        let hasHiddenFrames: Bool
+        if stack.count > maxTokenBytes {
+            visibleFrames = maxTokenBytes > 0 ? Array(stack.suffix(maxTokenBytes)) : []
+            hasHiddenFrames = true
+        } else {
+            visibleFrames = stack
+            hasHiddenFrames = false
+        }
+        return MaskCacheKey(
+            lexeme: lexeme, beforeTopLevel: beforeTopLevel, afterTopLevel: afterTopLevel,
+            whitespaceRun: whitespaceRun, rejected: rejected,
+            visibleFrames: visibleFrames, hasHiddenFrames: hasHiddenFrames)
+    }
+
     /// Convenience for whole-string acceptance tests: feeds `string`'s UTF-8 bytes through a
     /// fresh automaton and reports whether the result is both valid and complete.
     public static func accepts(_ string: String) -> Bool {

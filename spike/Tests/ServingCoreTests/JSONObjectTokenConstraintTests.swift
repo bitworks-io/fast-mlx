@@ -514,7 +514,10 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
     // MARK: - Cache
 
     func testRepeatedAutomatonStateProducesACacheHit() throws {
-        let table = JSONObjectConstraintTable(classifications: AdversarialVocab.classifications)
+        // `warmCache: false`: the table-build-time warm-up (see `testCommonStatesAreWarmedAtTableBuild`)
+        // pre-populates exactly this state (the initial, before-top-level state), which would
+        // otherwise turn the "first call must miss" assertion below into a false failure.
+        let table = JSONObjectConstraintTable(classifications: AdversarialVocab.classifications, warmCache: false)
         let constraint = JSONObjectTokenConstraint(table: table)
 
         let missesBefore = table.cacheMissCount
@@ -530,7 +533,10 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
     }
 
     func testDifferentAutomatonStatesProduceDistinctCacheEntries() throws {
-        let table = JSONObjectConstraintTable(classifications: AdversarialVocab.classifications)
+        // `warmCache: false`: both the initial state and the after-`{` state are in the table-
+        // build warm-up's curated list (see `testCommonStatesAreWarmedAtTableBuild`), which would
+        // otherwise make the post-`{` lookup below a hit, not the miss this test asserts.
+        let table = JSONObjectConstraintTable(classifications: AdversarialVocab.classifications, warmCache: false)
         var constraint = JSONObjectTokenConstraint(table: table)
 
         _ = try constraint.allowedTokenIds()  // state: before top level
@@ -538,6 +544,30 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
         let missesBefore = table.cacheMissCount
         _ = try constraint.allowedTokenIds()  // a genuinely different state
         XCTAssertEqual(table.cacheMissCount, missesBefore + 1)
+    }
+
+    func testCommonStatesAreWarmedAtTableBuild() throws {
+        // Positive control for `JSONObjectConstraintTable.warmCommonStates()`: the DEFAULT
+        // (warm-up enabled) initializer must leave the two canonical states every real request
+        // starts at — the initial, before-top-level state, and the state right after `{` —
+        // already cached, so a request's very FIRST lookup is a cache HIT, not the O(vocab) miss
+        // defect 3 measured at 78.5ms p99. Uses `FullASCIIVocab` (one token per printable ASCII
+        // byte) so every warm-up prefix is reachable-with-continuation, unlike the tiny
+        // `AdversarialVocab` fixture the cache-mechanics tests above deliberately opt out of
+        // warming (`warmCache: false`) to test raw miss/hit behavior in isolation.
+        let table = JSONObjectConstraintTable(classifications: FullASCIIVocab.classifications)
+        XCTAssertEqual(table.cacheMissCount, 0, "warm-up must not be counted as a real miss")
+        XCTAssertEqual(table.cacheHitCount, 0, "warm-up must not be counted as a real hit either")
+
+        var constraint = JSONObjectTokenConstraint(table: table)
+        _ = try constraint.allowedTokenIds()  // the very FIRST real lookup, at the initial state
+        XCTAssertEqual(table.cacheMissCount, 0, "the initial state must already be warm")
+        XCTAssertEqual(table.cacheHitCount, 1)
+
+        try constraint.advance(token: FullASCIIVocab.id(for: 0x7B))  // '{'
+        _ = try constraint.allowedTokenIds()
+        XCTAssertEqual(table.cacheMissCount, 0, "the post-'{' state must already be warm")
+        XCTAssertEqual(table.cacheHitCount, 2)
     }
 
     func testCacheByteBudgetBindsOnLargeSyntheticVocab() throws {
@@ -550,6 +580,16 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
         }
         var classifications: [TokenByteClassification] = [
             .bytes([0x7B]), .bytes([0x22]), .bytes([0x6B]), .bytes([0x3A]), .bytes([0x5B]),
+            // A single token at least `maxDepth` bytes long: the mask cache key now truncates a
+            // state's visible stack to the vocab's longest `.bytes` token length (see
+            // `JSONObjectAutomaton.maskCacheKey(maxTokenBytes:)`), since no shorter token could
+            // ever observe deeper frames. Without an anchor token this long, every nesting depth
+            // past that bound would collapse onto the SAME cache key — which is the intended,
+            // exact cache-efficiency win this slice adds, but it would make the ~60 distinct
+            // states this test relies on stop being distinct, defeating the eviction control
+            // below. Present only to keep `maxTokenBytes` >= `maxDepth` for this test; never
+            // advanced through.
+            .bytes(Array(repeating: UInt8(0x5A), count: JSONObjectAutomaton.maxDepth)),
         ]
         while classifications.count < vocabSize {
             classifications.append(.bytes([UInt8(0x41 + classifications.count % 26)]))
@@ -693,10 +733,8 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
             classifications.append(.bytes(bytes))
         }
         classifications.append(.eos)
-
-        let table = JSONObjectConstraintTable(classifications: classifications)
         let eosId = classifications.count - 1
-        var constraint = JSONObjectTokenConstraint(table: table)
+        _ = eosId
 
         // A recorded ~900-byte JSON trace: a flat object with 100 `"k<i>": "v<i>"` pairs, each
         // separated by `", "` — string VALUES (not just keys) and structural whitespace, so the
@@ -712,29 +750,59 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
         }
         traceJSON += " }"
 
-        var missDurations: [Double] = []
-        var hitDurations: [Double] = []
-
-        for byte in traceJSON.utf8 {
-            let missesBefore = table.cacheMissCount
-            let start = DispatchTime.now()
-            let allowed = try constraint.allowedTokenIds()
-            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
-            if table.cacheMissCount > missesBefore {
-                missDurations.append(elapsedMs)
-            } else {
-                hitDurations.append(elapsedMs)
-            }
-            XCTAssertFalse(allowed.isEmpty)
-            // Best-effort: find a single-byte token id matching this trace byte and advance by it.
-            if let id = classifications.firstIndex(where: {
-                if case .bytes(let b) = $0 { return b == [byte] }
-                return false
-            }), allowed.contains(id) {
-                try constraint.advance(token: id)
-            }
+        struct BenchResult {
+            var tableBuildMs: Double
+            var warmupMs: Double
+            var missDurations: [Double]
+            var hitDurations: [Double]
+            var hitRate: Double
         }
-        _ = eosId
+
+        // Replays `traceJSON` once against a freshly built table (`warmCache` controls whether the
+        // table-build-time cache warm — see `JSONObjectConstraintTable.warmCommonStates()` — runs
+        // first). Factored out so the SAME trace/measurement logic backs both the `warmCache: false`
+        // run (isolates the allocation-free trie walk's own per-miss improvement, since it forces
+        // every state in the trace to actually miss at least once — the production default would
+        // otherwise pre-warm all of them and report zero misses here) and the `warmCache: true` run
+        // (the actual production default, reported alongside it).
+        func runBenchmark(warmCache: Bool) throws -> BenchResult {
+            let tableBuildStart = DispatchTime.now()
+            let table = JSONObjectConstraintTable(
+                classifications: classifications, warmCache: warmCache)
+            let tableBuildMs =
+                Double(DispatchTime.now().uptimeNanoseconds - tableBuildStart.uptimeNanoseconds) / 1_000_000
+            var constraint = JSONObjectTokenConstraint(table: table)
+
+            var missDurations: [Double] = []
+            var hitDurations: [Double] = []
+            var warmupMs: Double?
+
+            for byte in traceJSON.utf8 {
+                let missesBefore = table.cacheMissCount
+                let start = DispatchTime.now()
+                let allowed = try constraint.allowedTokenIds()
+                let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+                if warmupMs == nil { warmupMs = elapsedMs }
+                if table.cacheMissCount > missesBefore {
+                    missDurations.append(elapsedMs)
+                } else {
+                    hitDurations.append(elapsedMs)
+                }
+                XCTAssertFalse(allowed.isEmpty)
+                // Best-effort: find a single-byte token id matching this trace byte and advance by it.
+                if let id = classifications.firstIndex(where: {
+                    if case .bytes(let b) = $0 { return b == [byte] }
+                    return false
+                }), allowed.contains(id) {
+                    try constraint.advance(token: id)
+                }
+            }
+
+            let hitRate = Double(table.cacheHitCount) / Double(max(1, table.cacheHitCount + table.cacheMissCount))
+            return BenchResult(
+                tableBuildMs: tableBuildMs, warmupMs: warmupMs ?? .nan,
+                missDurations: missDurations, hitDurations: hitDurations, hitRate: hitRate)
+        }
 
         func percentile(_ values: [Double], _ p: Double) -> Double {
             guard !values.isEmpty else { return .nan }
@@ -743,12 +811,24 @@ final class JSONObjectTokenConstraintTests: XCTestCase {
             return sorted[index]
         }
 
-        let hitRate = Double(table.cacheHitCount) / Double(max(1, table.cacheHitCount + table.cacheMissCount))
-        print("""
-        [json-constraint-bench] vocabSize=\(vocabSize) traceBytes=\(traceJSON.utf8.count) \
-        misses=\(missDurations.count) hits=\(hitDurations.count) hitRate=\(hitRate) \
-        missP50ms=\(percentile(missDurations, 0.50)) missP99ms=\(percentile(missDurations, 0.99)) \
-        hitP50ms=\(percentile(hitDurations, 0.50)) hitP99ms=\(percentile(hitDurations, 0.99))
-        """)
+        // `nowarm`: isolates the allocation-free trie walk / truncated cache key's own per-miss
+        // improvement, on the SAME trace, by forcing every visited state to actually miss once
+        // (table-build warm-up disabled). `warm` (unlabeled, matches the metric name used by the
+        // 1d/1e predeclaration): the actual production default — reported alongside it, not in
+        // place of it, since a real deployment always uses the warmed default.
+        let nowarm = try runBenchmark(warmCache: false)
+        let warm = try runBenchmark(warmCache: true)
+
+        func line(_ label: String, _ result: BenchResult) -> String {
+            """
+            [json-constraint-bench\(label)] vocabSize=\(vocabSize) traceBytes=\(traceJSON.utf8.count) \
+            misses=\(result.missDurations.count) hits=\(result.hitDurations.count) hitRate=\(result.hitRate) \
+            missP50ms=\(percentile(result.missDurations, 0.50)) missP99ms=\(percentile(result.missDurations, 0.99)) \
+            hitP50ms=\(percentile(result.hitDurations, 0.50)) hitP99ms=\(percentile(result.hitDurations, 0.99)) \
+            tableBuildMs=\(result.tableBuildMs) warmupMs=\(result.warmupMs)
+            """
+        }
+        print(line("-nowarm", nowarm))
+        print(line("", warm))
     }
 }

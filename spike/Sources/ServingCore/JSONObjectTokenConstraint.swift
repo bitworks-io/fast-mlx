@@ -67,27 +67,153 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
     private let cacheByteBudget: Int
 
     private let lock = NSLock()
-    private var cache: [JSONObjectAutomaton: [UInt64]] = [:]
+    // Keyed by `JSONObjectAutomaton.MaskCacheKey`, NOT the automaton itself: the key truncates
+    // `stack` to the top `min(depth, trie.maxTokenByteLength)` frames (see that type's doc
+    // comment), so distinct automaton states that no reachable token could ever tell apart
+    // deliberately collide onto one cache entry — cutting first-miss traffic on real, deeply
+    // nested request traces without approximating the mask itself.
+    private var cache: [JSONObjectAutomaton.MaskCacheKey: [UInt64]] = [:]
     // FIFO eviction queue: `order[orderHead...]` are the live entries, oldest first. Eviction only
     // ever dequeues from `orderHead` (no scan), and lookup on a HIT never touches `order` at all —
     // this is a plain FIFO, not a strict LRU, specifically so a cache hit stays O(1) with no
     // per-hit reordering scan.
-    private var order: [JSONObjectAutomaton] = []
+    private var order: [JSONObjectAutomaton.MaskCacheKey] = []
     private var orderHead = 0
     private var cachedBytesUsed = 0
     private var evictionCount = 0
     private var hits = 0
     private var misses = 0
 
-    public init(
+    public convenience init(
         classifications: [TokenByteClassification],
         cacheByteBudget: Int = JSONObjectConstraintTable.defaultCacheByteBudget
+    ) {
+        self.init(classifications: classifications, cacheByteBudget: cacheByteBudget, warmCache: true)
+    }
+
+    /// Test-only seam (internal, visible via `@testable import`): lets a cache-mechanics unit test
+    /// observe RAW hit/miss behavior (a state's first lookup always misses, a repeat always hits)
+    /// without `warmCommonStates()` pre-populating the exact canonical states those tests probe —
+    /// that pre-population is real, correct, and tested separately (see
+    /// `JSONObjectConstraintTests.testCommonStatesAreWarmedAtTableBuild`); it would otherwise turn
+    /// "first call at a fresh state" into a hit for the small set of canonical states, which is
+    /// not what this seam's callers are testing. Production code always goes through the public
+    /// initializer above, which warms unconditionally.
+    init(
+        classifications: [TokenByteClassification],
+        cacheByteBudget: Int = JSONObjectConstraintTable.defaultCacheByteBudget,
+        warmCache: Bool
     ) {
         self.classifications = classifications
         self.trie = JSONObjectConstraintTrie(classifications: classifications)
         self.sortedEOSIds = classifications.enumerated().compactMap { $1 == .eos ? $0 : nil }
         self.wordCount = (classifications.count + 63) / 64
         self.cacheByteBudget = cacheByteBudget
+        if warmCache {
+            warmCommonStates()
+        }
+    }
+
+    /// Pre-populates the mask cache for a curated set of canonical, SHALLOW (depth <= 2) automaton
+    /// states at table-BUILD time. This is what closes the remaining miss-path gap after the
+    /// allocation-free trie walk and truncated cache key: even with those in place, a state's
+    /// FIRST occurrence still pays an O(vocab) trie DFS (hundreds of ms on a real ~248k-token
+    /// vocab, since a state like "inside an open string" accepts nearly every token) — see defect
+    /// 3. Every real request's early bytes revisit the same handful of shallow, common grammar
+    /// states (an opened object, a key string, a colon, a value string, a comma, structural
+    /// whitespace, a completed document, a number/literal/nested-container start, ...), so
+    /// computing their masks ONCE here — amortized into model load, not any decode step, and
+    /// reported separately from the per-step budget — turns what would otherwise be each state's
+    /// first-request miss into a cache hit from the very first request onward. This is an exact
+    /// cache-WARMING optimization, not an approximation: `allowedTokenBitset(for:)` below is the
+    /// same call any request makes, so a warmed entry is byte-for-byte the value a real first miss
+    /// would have computed. The prefixes are chosen to touch every `Frame` case, every `Lexeme`
+    /// category (structural/string-normal/escape/unicode-escape/number sub-states/literal), and
+    /// the completed-document state — not to match any single benchmark or request's exact trace.
+    /// A prefix the automaton itself rejects (none should, but this stays defensive rather than
+    /// asserting) is simply skipped.
+    private func warmCommonStates() {
+        let prefixes: [String] = [
+            "",  // initial: beforeTopLevel, empty stack
+            "{",  // objectExpectKeyOrEnd
+            "{ ",  // structural whitespace after '{'
+            "{\"",  // inside a KEY string (normal)
+            "{\"k",  // inside a KEY string (normal), content byte consumed
+            "{\"k\"",  // key string closed -> objectExpectColon
+            "{\"k\":",  // colon consumed -> objectExpectValue
+            "{\"k\": ",  // structural whitespace after colon
+            "{\"k\":\"",  // inside a VALUE string (normal)
+            "{\"k\":\"v",  // inside a VALUE string, content byte consumed
+            "{\"k\":\"v\\",  // string escape started
+            "{\"k\":\"v\\n",  // string escape resolved (simple escape) -> back to normal
+            "{\"k\":\"v\\u",  // unicode escape started
+            "{\"k\":\"v\\u00",  // unicode escape, hex digits partially consumed
+            "{\"k\":\"v\\u00e9",  // unicode escape fully consumed -> back to normal
+            "{\"k\":\"v\"",  // value string closed -> objectExpectCommaOrEnd
+            "{\"k\":\"v\" ",  // structural whitespace after a closed value, before comma/close
+            "{\"k\":\"v\",",  // comma -> objectExpectKey
+            "{\"k\":\"v\", ",  // structural whitespace after comma
+            "{}",  // completed document (empty object)
+            "{} ",  // completed document, trailing whitespace
+            "{\"k\":\"v\"}",  // completed document (non-empty object)
+            "{\"k\":[",  // arrayExpectValueOrEnd
+            "{\"k\":[1",  // number (intDigits), inside an array
+            "{\"k\":[1,",  // arrayExpectValue (after comma)
+            "{\"k\":[1]",  // array closed -> back to objectExpectCommaOrEnd
+            "{\"k\":-",  // number afterMinus
+            "{\"k\":0",  // number leadingZero
+            "{\"k\":1.",  // number afterPoint
+            "{\"k\":1.5",  // number fracDigits
+            "{\"k\":1.5e",  // number expectExponentDigitsOrSign
+            "{\"k\":1.5e+",  // number expectExponentDigits
+            "{\"k\":1.5e+1",  // number exponentDigits
+            "{\"k\":t",  // literal true, in progress
+            "{\"k\":tr",
+            "{\"k\":f",  // literal false, in progress
+            "{\"k\":n",  // literal null, in progress
+            "{\"k\":{",  // nested object (depth 2) — one level of real nesting
+            "{\"k\":{\"k\":",  // nested object, depth 2, expecting value
+        ]
+        for prefix in prefixes {
+            var automaton = JSONObjectAutomaton()
+            var ok = true
+            for byte in prefix.utf8 {
+                guard automaton.advance(byte: byte) else {
+                    ok = false
+                    break
+                }
+            }
+            guard ok else { continue }
+            warmState(automaton)
+        }
+    }
+
+    /// Best-effort single-state cache warm, used only by `warmCommonStates()`. Deliberately
+    /// separate from `allowedTokenBitset(for:)`: that method's "no allowed tokens" case is a
+    /// hard invariant violation for a REAL request on a real byte-level vocab (every reachable
+    /// grammar state always has a continuation), so it asserts and throws. A warm-up prefix is
+    /// only a grammar-shaped GUESS at a commonly-visited state — it can legitimately be
+    /// unreachable-with-continuation against a small or intentionally-incomplete vocab (e.g. a
+    /// unit-test fixture missing some raw byte's token), which is not that invariant violation.
+    /// Also does not touch `hits`/`misses`: warming is not a real cache lookup, so it must not
+    /// perturb the hit/miss counters a caller reads later.
+    private func warmState(_ automaton: JSONObjectAutomaton) {
+        let key = automaton.maskCacheKey(maxTokenBytes: trie.maxTokenByteLength)
+        guard !isCached(key) else { return }
+        var bitset = trie.allowedBitset(from: automaton, wordCount: wordCount)
+        if automaton.isComplete {
+            for id in sortedEOSIds {
+                Self.setBit(&bitset, id)
+            }
+        }
+        guard bitset.contains(where: { $0 != 0 }) else { return }
+        storeCache(key, bitset)
+    }
+
+    private func isCached(_ key: JSONObjectAutomaton.MaskCacheKey) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[key] != nil
     }
 
     public func classification(for id: Int) -> TokenByteClassification {
@@ -127,7 +253,8 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
     /// lives at `bitset[id >> 6] & (1 << (id & 63))`). A logits processor can consult this
     /// directly to build a `-inf` mask without materializing a full `[Int]` id list.
     func allowedTokenBitset(for automaton: JSONObjectAutomaton) throws -> [UInt64] {
-        if let cached = lookupCache(automaton) {
+        let key = automaton.maskCacheKey(maxTokenBytes: trie.maxTokenByteLength)
+        if let cached = lookupCache(key) {
             return cached
         }
         var bitset = trie.allowedBitset(from: automaton, wordCount: wordCount)
@@ -141,7 +268,7 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
                 "JSONObjectConstraintTable: no tokens allowed for automaton state \(automaton)")
             throw JSONObjectConstraintError.noAllowedTokens
         }
-        storeCache(automaton, bitset)
+        storeCache(key, bitset)
         return bitset
     }
 
@@ -178,10 +305,10 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
         return result
     }
 
-    private func lookupCache(_ automaton: JSONObjectAutomaton) -> [UInt64]? {
+    private func lookupCache(_ key: JSONObjectAutomaton.MaskCacheKey) -> [UInt64]? {
         lock.lock()
         defer { lock.unlock() }
-        guard let value = cache[automaton] else {
+        guard let value = cache[key] else {
             misses += 1
             return nil
         }
@@ -189,10 +316,10 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
         return value
     }
 
-    private func storeCache(_ automaton: JSONObjectAutomaton, _ bitset: [UInt64]) {
+    private func storeCache(_ key: JSONObjectAutomaton.MaskCacheKey, _ bitset: [UInt64]) {
         lock.lock()
         defer { lock.unlock() }
-        guard cache[automaton] == nil else { return }
+        guard cache[key] == nil else { return }
         let entryBytes = bitset.count * MemoryLayout<UInt64>.stride
         while cachedBytesUsed + entryBytes > cacheByteBudget, orderHead < order.count {
             let oldest = order[orderHead]
@@ -206,8 +333,8 @@ public final class JSONObjectConstraintTable: @unchecked Sendable {
             order.removeFirst(orderHead)
             orderHead = 0
         }
-        order.append(automaton)
-        cache[automaton] = bitset
+        order.append(key)
+        cache[key] = bitset
         cachedBytesUsed += entryBytes
     }
 }
