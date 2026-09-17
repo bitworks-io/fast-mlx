@@ -195,6 +195,8 @@ private func runLoadedExactQwen35MTPBackendProof(
             XCTFail("MTP backend completed before cancellation point")
         case .toolCalls:
             XCTFail("exact MTP backend should not publish tool calls in this proof")
+        case .tokenLogprobs:
+            break
         }
     }
     XCTAssertFalse(cancelledText.isEmpty)
@@ -503,6 +505,8 @@ private func collectBackend(
             text += value
         case .toolCalls:
             XCTFail("exact MTP backend should not publish tool calls in this proof")
+        case .tokenLogprobs:
+            break
         case .completion(let value):
             completion = value
         }
@@ -633,6 +637,8 @@ private func runTimedBackend(
             text += value
         case .toolCalls:
             XCTFail("exact MTP backend should not publish tool calls in this proof")
+        case .tokenLogprobs:
+            break
         case .completion(let value):
             completion = value
             completionEnd = clock.now

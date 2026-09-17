@@ -105,6 +105,70 @@ extension Decoder {
     public var supportsPenalties: Bool { false }
 }
 
+/// One alternative token a decode step considered, alongside the token actually selected. Carried
+/// as a plain value type across the `InferenceActor` boundary — never an `MLXArray` — matching the
+/// contract of `ServingCore.ServingTokenLogprobCandidate` one layer up the stack (SpikeCore has no
+/// notion of token TEXT; that mapping happens in the serving adapter, which owns the tokenizer).
+public struct DecodedTokenLogprobCandidate: Equatable, Sendable {
+    public let tokenID: Int
+    public let logprob: Float
+
+    public init(tokenID: Int, logprob: Float) {
+        self.tokenID = tokenID
+        self.logprob = logprob
+    }
+}
+
+/// One generation step's REAL log-probability under the model's RAW (pre-processor) distribution:
+/// `log_softmax` of the step's own output logits, computed BEFORE any penalty/temperature/top-p/
+/// top-k logit processing or sampling-time filtering runs — mirrors `ServingCore.
+/// ServingTokenLogprob`'s documented contract one layer up. `top` holds up to the requested
+/// `topN` alternatives BY THAT SAME RAW LOG-PROBABILITY, sorted strictly descending, with any
+/// non-finite entry excluded; it may or may not include `tokenID` itself (this type does not
+/// deduplicate, matching `ServingTokenLogprob.topCandidates`'s own no-dedup contract).
+public struct DecodedTokenLogprob: Equatable, Sendable {
+    public let tokenID: Int
+    public let logprob: Float
+    public let top: [DecodedTokenLogprobCandidate]
+
+    public init(tokenID: Int, logprob: Float, top: [DecodedTokenLogprobCandidate] = []) {
+        self.tokenID = tokenID
+        self.logprob = logprob
+        self.top = top
+    }
+}
+
+/// Optional capability a `Decoder` may add to report each step's REAL logprob (see
+/// `DecodedTokenLogprob`'s doc comment) alongside the ordinarily selected token. Kept as a
+/// SEPARATE protocol (mirroring `SpeculativeTelemetryProviding`) rather than widening `Decoder`
+/// itself, so a decoder that cannot cheaply/correctly provide this (e.g. `ScriptedDecoder`,
+/// `CompiledMLXDecoder`, `MTPSpeculativeDecoder`) needs no change and is detected as unsupporting
+/// by ordinary `is`/`as?` conformance — exactly like `SpeculativeTelemetryProviding` is detected
+/// today. `InferenceActor.generateBounded` is the guard that enforces this: a request carrying a
+/// non-nil `logprobTopN` against a decoder that does NOT conform throws
+/// `InferenceActorError.logprobsUnsupportedByDecoder` rather than silently generating without
+/// logprobs. `LogprobDecoding: Decoder` (rather than a free-standing protocol) so a value fetched
+/// via `decoder as? any LogprobDecoding`, mutated, can be written back into the actor's `any
+/// Decoder`-typed stored property without an extra cast.
+///
+/// Token selection (sampling/RNG consumption) on the `*WithLogprob` variants MUST be byte-for-byte
+/// identical to the corresponding `prefill`/`step` call — these exist to REPORT the raw logprob of
+/// whichever token was already going to be selected, never to change what gets selected. See
+/// `MLXDecoder`'s conformance, which shares its token-selection code with `prefill`/`step` for
+/// exactly this reason.
+public protocol LogprobDecoding: Decoder {
+    /// Prefill the prompt and return the first token id plus its `DecodedTokenLogprob`. `topN <=
+    /// 0` means "no alternatives, just the sampled token's own logprob" (mirrors
+    /// `ServingLogprobsRequest.completions(topLogprobs: 0)`).
+    mutating func prefillWithLogprob(
+        _ promptTokens: [Int], topN: Int
+    ) throws -> (token: Int, logprob: DecodedTokenLogprob)
+    /// Given the last token, produce the next token id plus its `DecodedTokenLogprob`.
+    mutating func stepWithLogprob(
+        last: Int, topN: Int
+    ) throws -> (token: Int, logprob: DecodedTokenLogprob)
+}
+
 /// Point-in-time speculative-decoding counters. `Sendable`/`Equatable` so a snapshot can cross
 /// the actor boundary and be compared directly in tests. `passthroughReason` is `nil` when the
 /// decoder speculated for the entire observed lifetime (across resets — see
@@ -197,6 +261,10 @@ public enum InferenceActorError: Error, Equatable, Sendable {
     /// to a decoder whose `supportsPenalties` is `false`. Refused here — before any state
     /// mutation — rather than silently ignoring the penalty.
     case penaltiesUnsupportedByDecoder
+    /// A request carrying a non-nil `logprobTopN` was routed to a decoder that does not conform to
+    /// `LogprobDecoding`. Refused here — before any state mutation — rather than silently
+    /// generating without reporting logprobs while the caller believes it requested them.
+    case logprobsUnsupportedByDecoder
 }
 
 public enum InferenceTokenDisposition: Equatable, Sendable {
@@ -287,6 +355,16 @@ public actor InferenceActor {
         (decoder as? SpeculativeTelemetryProviding)?.speculativeTelemetrySnapshot
     }
 
+    /// Whether the bound decoder can report per-step logprobs (see `LogprobDecoding`'s doc
+    /// comment). Read-only and side-effect-free, unlike the `supportsSampling`/`supportsPenalties`
+    /// guards inside `generateBounded` (which only fire once a request is already in flight): a
+    /// serving adapter calls this at ADMISSION time, before generation starts, so a logprobs
+    /// request against a non-conforming decoder (e.g. `CompiledMLXDecoder`, `MTPSpeculativeDecoder`)
+    /// gets a clean 400 rather than reaching `generateBounded` only to be refused mid-request.
+    public func supportsLogprobs() -> Bool {
+        decoder is LogprobDecoding
+    }
+
     /// Non-blocking: returns a stream immediately; decode runs inside the actor.
     public func submit(promptTokens: [Int], maxTokens: Int, eos: Int = 2) -> AsyncThrowingStream<Int, Error> {
         guard !boundedGenerationActive else {
@@ -316,6 +394,8 @@ public actor InferenceActor {
         eos: Int,
         sampling: DecoderSampling = .greedy,
         penalties: DecoderPenalties = .none,
+        logprobTopN: Int? = nil,
+        onLogprob: (@Sendable (DecodedTokenLogprob) async throws -> Void)? = nil,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
         try await generateBounded(
@@ -324,16 +404,30 @@ public actor InferenceActor {
             stopTokenIDs: [eos],
             sampling: sampling,
             penalties: penalties,
+            logprobTopN: logprobTopN,
+            onLogprob: onLogprob,
             consume: consume)
     }
 
     /// Generate one scalar request and stop before publishing any configured stop token.
+    ///
+    /// `logprobTopN` defaults to `nil`, the byte-for-byte-unchanged path: every existing call site
+    /// predating this parameter keeps calling the ORIGINAL `decoder.prefill`/`.step` (never the
+    /// `LogprobDecoding` variants) and pays zero added cost. When non-nil, a decoder that does not
+    /// conform to `LogprobDecoding` is refused with `InferenceActorError.logprobsUnsupportedByDecoder`
+    /// — before any state mutation, alongside the sampling/penalties capability guards — and
+    /// `onLogprob` (when supplied) is invoked once per GENERATED token (never for the intercepted
+    /// stop token, matching `consume`'s own gating), immediately BEFORE that token's `consume` call
+    /// so a caller that forwards both into the same ordered stream (e.g. a mailbox) naturally
+    /// delivers a token's logprob no later than its text.
     public func generateBounded(
         promptTokens: [Int],
         maxTokens: Int,
         stopTokenIDs: Set<Int>,
         sampling: DecoderSampling = .greedy,
         penalties: DecoderPenalties = .none,
+        logprobTopN: Int? = nil,
+        onLogprob: (@Sendable (DecodedTokenLogprob) async throws -> Void)? = nil,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
         guard !promptTokens.isEmpty else {
@@ -361,6 +455,9 @@ public actor InferenceActor {
         }
         guard penalties.isEmpty || decoder.supportsPenalties else {
             throw InferenceActorError.penaltiesUnsupportedByDecoder
+        }
+        guard logprobTopN == nil || decoder is LogprobDecoding else {
+            throw InferenceActorError.logprobsUnsupportedByDecoder
         }
 
         boundedGenerationActive = true
@@ -414,8 +511,36 @@ public actor InferenceActor {
                 speculativeDelta: speculativeDelta)
         }
 
+        // Single decode-step seam shared by prefill and every subsequent step: `logprobTopN == nil`
+        // (every call site predating this parameter) takes the ORIGINAL `decoder.prefill`/`.step`
+        // branch unchanged — no cast, no extra computation, byte-for-byte the prior code path. A
+        // non-nil `logprobTopN` — already guarded above to require `LogprobDecoding` conformance —
+        // casts the stored `any Decoder` to `any LogprobDecoding`, mutates the LOCAL copy, and
+        // writes it back into `self.decoder` (`LogprobDecoding: Decoder` makes that assignment
+        // legal) so the mutation is not lost the way it would be if this only read a throwaway
+        // copy of a value-type decoder.
+        func decodeStep(previous: Int?) throws -> (token: Int, logprob: DecodedTokenLogprob?) {
+            if let topN = logprobTopN {
+                guard var logprobDecoder = decoder as? any LogprobDecoding else {
+                    throw InferenceActorError.logprobsUnsupportedByDecoder
+                }
+                let result: (token: Int, logprob: DecodedTokenLogprob)
+                if let previous {
+                    result = try logprobDecoder.stepWithLogprob(last: previous, topN: topN)
+                } else {
+                    result = try logprobDecoder.prefillWithLogprob(promptTokens, topN: topN)
+                }
+                decoder = logprobDecoder
+                return (result.token, result.logprob)
+            }
+            if let previous {
+                return (try decoder.step(last: previous), nil)
+            }
+            return (try decoder.prefill(promptTokens), nil)
+        }
+
         try Task.checkCancellation()
-        var token = try decoder.prefill(promptTokens)
+        var (token, logprob) = try decodeStep(previous: nil)
         var generatedTokenCount = 0
 
         while true {
@@ -428,6 +553,12 @@ public actor InferenceActor {
                 throw InferenceActorError.invalidTokenID(token)
             }
 
+            // Reported for every GENERATED token only — never for the stop token intercepted just
+            // above — and always BEFORE `consume`, so a caller forwarding both into one ordered
+            // sink naturally delivers a token's logprob no later than its text/tool-call delta.
+            if let logprob {
+                try await onLogprob?(logprob)
+            }
             generatedTokenCount += 1
             let disposition = try await consume(token)
             if disposition == .stopGeneration {
@@ -440,7 +571,7 @@ public actor InferenceActor {
             }
 
             try Task.checkCancellation()
-            token = try decoder.step(last: token)
+            (token, logprob) = try decodeStep(previous: token)
         }
     }
 

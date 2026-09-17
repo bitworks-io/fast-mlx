@@ -142,6 +142,48 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// The continuous-batch route has no seam to observe a step's raw logits — a request carrying
+    /// a validated `logprobsRequest` must be rejected with `logprobs_unsupported` BEFORE anything
+    /// is rendered or decoded, mirroring `completions_unsupported`'s mechanics exactly (never a
+    /// silently-wrong response omitting the logprobs the caller asked for).
+    func testContinuousBatchRouteRejectsLogprobsRequestBeforeRenderingOrDecoding()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        var logprobsRequest = request(text: "solo", maxTokens: 2)
+        logprobsRequest.logprobsRequest = .chat(topLogprobs: 0)
+
+        do {
+            _ = try await backend.start(logprobsRequest)
+            XCTFail("continuous route must reject a logprobs request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "logprobs")
+            XCTAssertEqual(code, "logprobs_unsupported")
+        }
+        XCTAssertTrue(recorder.decodeActions.isEmpty)
+        XCTAssertTrue(recorder.admissionBatchSizes.isEmpty)
+        await backend.shutdown()
+    }
+
     /// `repetitionPenalty` is a MULTIPLICATIVE penalty (the vendored `RepetitionContext`:
     /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`. Both
     /// HF-recommended presets for the deployed model send `repetition_penalty: 1.0` on every

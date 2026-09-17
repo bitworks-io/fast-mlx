@@ -2570,6 +2570,191 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(response.head.status, .notFound)
         _ = try await channel.finish()
     }
+
+    // MARK: - Logprobs
+
+    func testChatNonStreamingResponseIncludesLogprobsForEveryGeneratedTokenInOrder() async throws {
+        let tokenA = ServingTokenLogprob(
+            tokenText: "Hi",
+            logprob: -0.05,
+            topCandidates: [
+                ServingTokenLogprobCandidate(tokenText: "Hi", logprob: -0.05),
+                ServingTokenLogprobCandidate(tokenText: "Hey", logprob: -3.0),
+            ])
+        let tokenB = ServingTokenLogprob(tokenText: " there", logprob: -0.2)
+        let backend = LogprobsScriptedBackend(
+            deltas: [.tokenLogprobs([tokenA]), .text("Hi"), .tokenLogprobs([tokenB]), .text(" there")])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"logprobs":true,"top_logprobs":2}
+            """
+        try await writeRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choices = try XCTUnwrap(object["choices"] as? [[String: Any]])
+        let logprobs = try XCTUnwrap(choices.first?["logprobs"] as? [String: Any])
+        XCTAssertTrue(logprobs["refusal"] is NSNull)
+        let content = try XCTUnwrap(logprobs["content"] as? [[String: Any]])
+        XCTAssertEqual(content.count, 2)
+        XCTAssertEqual(content[0]["token"] as? String, "Hi")
+        XCTAssertEqual(content[0]["logprob"] as? Double, -0.05)
+        XCTAssertEqual((content[0]["top_logprobs"] as? [[String: Any]])?.count, 2)
+        XCTAssertEqual(content[1]["token"] as? String, " there")
+        _ = try await channel.finish()
+    }
+
+    // Contract: `logprobs:false`/absent must leave every existing response BYTE-IDENTICAL to
+    // before this feature existed — no `logprobs` key on the chat choice at all.
+    func testChatResponseWithoutLogprobsRequestOmitsLogprobsKeyEntirely() async throws {
+        let backend = ScriptedBackend(
+            scripts: [.completed(text: ["Hello"], promptTokens: 3, completionTokens: 1)])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let response = try await collectResponse(from: channel)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choices = try XCTUnwrap(object["choices"] as? [[String: Any]])
+        XCTAssertFalse(choices.first?.keys.contains("logprobs") ?? true)
+        _ = try await channel.finish()
+    }
+
+    // The streaming "carry to the next emitted chunk" contract: a `.tokenLogprobs` delta with no
+    // following `.text` before completion must not be lost — it is flushed on the finish chunk.
+    // Concatenating `logprobs.content` across every chunk this stream emits must cover exactly the
+    // three generated tokens, in order, each exactly once.
+    func testChatStreamingLogprobsCarryToNextChunkAndFinalChunkFlushesRemainder() async throws {
+        let tokenA = ServingTokenLogprob(tokenText: "A", logprob: -0.1)
+        let tokenB = ServingTokenLogprob(tokenText: "B", logprob: -0.2)
+        let tokenC = ServingTokenLogprob(tokenText: "C", logprob: -0.3)
+        let backend = LogprobsScriptedBackend(
+            deltas: [
+                .tokenLogprobs([tokenA]), .tokenLogprobs([tokenB]), .text("AB"),
+                .tokenLogprobs([tokenC]),
+            ])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":true,"logprobs":true,"top_logprobs":0}
+            """
+        try await writeRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        let events = try sseJSONEvents(from: response.body)
+
+        // Role-announcement chunk carries no logprobs at all.
+        let roleChoice = try XCTUnwrap((events.first?["choices"] as? [[String: Any]])?.first)
+        XCTAssertFalse(roleChoice.keys.contains("logprobs"))
+
+        var seenTokens: [String] = []
+        for event in events.dropFirst() {
+            guard let choice = (event["choices"] as? [[String: Any]])?.first,
+                let logprobs = choice["logprobs"] as? [String: Any],
+                let content = logprobs["content"] as? [[String: Any]]
+            else { continue }
+            seenTokens.append(contentsOf: content.compactMap { $0["token"] as? String })
+        }
+        XCTAssertEqual(seenTokens, ["A", "B", "C"])
+        _ = try await channel.finish()
+    }
+
+    func testCompletionsNonStreamingResponseIncludesLogprobsWithTextOffsets() async throws {
+        let tokenA = ServingTokenLogprob(tokenText: "a", logprob: -0.1)
+        let tokenB = ServingTokenLogprob(tokenText: "b", logprob: -0.2)
+        let backend = LogprobsScriptedBackend(deltas: [.tokenLogprobs([tokenA, tokenB]), .text("ab")])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        let body = """
+            {"model":"qwen3-32b","prompt":"Hello","max_tokens":8,"temperature":0,"stream":false,"logprobs":2}
+            """
+        try await writeCompletionsRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choices = try XCTUnwrap(object["choices"] as? [[String: Any]])
+        let logprobs = try XCTUnwrap(choices.first?["logprobs"] as? [String: Any])
+        XCTAssertEqual(logprobs["tokens"] as? [String], ["a", "b"])
+        XCTAssertEqual(logprobs["token_logprobs"] as? [Double], [-0.1, -0.2])
+        XCTAssertEqual(logprobs["text_offset"] as? [Int], [0, 1])
+        _ = try await channel.finish()
+    }
+
+    // `logprobs:0` (legacy completions) means "sampled token's logprob only" — a MEANINGFUL,
+    // distinct request, never "off" — but `top_logprobs[i]` must still be `null` for every token.
+    func testCompletionsLogprobsZeroForcesNullTopLogprobsEntries() async throws {
+        let token = ServingTokenLogprob(
+            tokenText: "a",
+            logprob: -0.1,
+            topCandidates: [ServingTokenLogprobCandidate(tokenText: "a", logprob: -0.1)])
+        let backend = LogprobsScriptedBackend(deltas: [.tokenLogprobs([token]), .text("a")])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        let body = """
+            {"model":"qwen3-32b","prompt":"Hello","max_tokens":8,"temperature":0,"stream":false,"logprobs":0}
+            """
+        try await writeCompletionsRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let choices = try XCTUnwrap(object["choices"] as? [[String: Any]])
+        let logprobs = try XCTUnwrap(choices.first?["logprobs"] as? [String: Any])
+        let topLogprobs = try XCTUnwrap(logprobs["top_logprobs"] as? [Any])
+        XCTAssertEqual(topLogprobs.count, 1)
+        XCTAssertTrue(topLogprobs[0] is NSNull)
+        _ = try await channel.finish()
+    }
+
+    // The running `text_offset` must continue across streaming chunks, not reset to 0 each time.
+    func testCompletionsStreamingLogprobsTextOffsetContinuesAcrossChunks() async throws {
+        let tokenA = ServingTokenLogprob(tokenText: "Hel", logprob: -0.1)
+        let tokenB = ServingTokenLogprob(tokenText: "lo", logprob: -0.2)
+        let backend = LogprobsScriptedBackend(
+            deltas: [.tokenLogprobs([tokenA]), .text("Hel"), .tokenLogprobs([tokenB]), .text("lo")])
+        let channel = try await makeChannel(backend: backend, configuration: defaultConfiguration())
+
+        let body = """
+            {"model":"qwen3-32b","prompt":"Hello","max_tokens":8,"temperature":0,"stream":true,"logprobs":1}
+            """
+        try await writeCompletionsRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        let events = try sseJSONEvents(from: response.body)
+
+        var offsets: [Int] = []
+        for event in events {
+            guard let choice = (event["choices"] as? [[String: Any]])?.first,
+                let logprobs = choice["logprobs"] as? [String: Any],
+                let textOffset = logprobs["text_offset"] as? [Int],
+                !textOffset.isEmpty
+            else { continue }
+            offsets.append(contentsOf: textOffset)
+        }
+        XCTAssertEqual(offsets, [0, 3])
+        _ = try await channel.finish()
+    }
+
+    // Serving evidence recording has no way to serialize per-token logprobs — a logprobs request
+    // must be rejected with a normal 400 (never a dropped connection) while evidence is configured.
+    func testLogprobsRequestIsRejectedWhenEvidenceRecordingIsConfigured() async throws {
+        let recorder = ServingEvidenceRecorder()
+        let evidenceConfiguration = ServingHTTPEvidenceConfiguration(
+            snapshot: nil,
+            record: { evidence in try await recorder.record(evidence) },
+            reportFailure: { message in
+                Task { await recorder.recordFailure(message) }
+            })
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: defaultConfiguration(evidence: evidenceConfiguration))
+
+        let body = """
+            {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"logprobs":true}
+            """
+        try await writeRequest(channel, body: body)
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .badRequest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "logprobs_unsupported")
+        _ = try await channel.finish()
+    }
 }
 
 private struct CollectedResponse {
@@ -2578,7 +2763,7 @@ private struct CollectedResponse {
 }
 
 private func makeChannel(
-    backend: ScriptedBackend,
+    backend: any ServingGenerationBackend,
     configuration: ServingHTTPConfiguration = defaultConfiguration()
 ) async throws -> NIOAsyncTestingChannel {
     try await NIOAsyncTestingChannel { channel in
@@ -3045,6 +3230,63 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
                 lastLease: $0.lastLease,
                 lastRequest: $0.lastRequest)
         }
+    }
+}
+
+/// A minimal fake backend that streams an exact, caller-specified sequence of `ServingResponseDelta`
+/// values (including `.tokenLogprobs`) into the mailbox, then completes. Unlike `ScriptedBackend`'s
+/// enum-driven scripts, this exists specifically to test the logprobs-carrying contract at the HTTP
+/// layer: how `.tokenLogprobs` deltas interleaved with `.text`/`.toolCalls` deltas turn into
+/// `logprobs.content`/`OpenAICompletionLogprobs` on real chunks and the final non-streaming response.
+private final class LogprobsScriptedBackend: ServingGenerationBackend, Sendable {
+    private let deltas: [ServingResponseDelta]
+    private let finishReason: OpenAIChatFinishReason
+    private let promptTokens: Int
+    private let completionTokens: Int
+    private let mailboxMaximumBytes: Int
+
+    init(
+        deltas: [ServingResponseDelta],
+        finishReason: OpenAIChatFinishReason = .stop,
+        promptTokens: Int = 3,
+        completionTokens: Int = 3,
+        mailboxMaximumBytes: Int = 4_096
+    ) {
+        self.deltas = deltas
+        self.finishReason = finishReason
+        self.promptTokens = promptTokens
+        self.completionTokens = completionTokens
+        self.mailboxMaximumBytes = mailboxMaximumBytes
+    }
+
+    func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
+        let mailbox = BoundedDeltaMailbox(
+            capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 64, maxBytes: mailboxMaximumBytes))
+        let lease = ServingRequestLease(id: ServingRequestID("logprobs-request"), onCancel: {})
+        let handle = ServingGenerationHandle(
+            responseID: "chatcmpl-logprobs",
+            created: 1_775_000_000,
+            model: request.model,
+            route: .continuousBatchNoSpec,
+            mailbox: mailbox,
+            lease: lease)
+        let deltas = self.deltas
+        let finishReason = self.finishReason
+        let promptTokens = self.promptTokens
+        let completionTokens = self.completionTokens
+        Task {
+            for delta in deltas {
+                try? await mailbox.send(delta)
+            }
+            try? await mailbox.send(
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: finishReason,
+                        usage: OpenAIChatUsage(
+                            promptTokens: promptTokens, completionTokens: completionTokens))))
+            await mailbox.finish()
+        }
+        return handle
     }
 }
 

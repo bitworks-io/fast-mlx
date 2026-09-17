@@ -169,6 +169,88 @@ final class ScalarServingBackendTests: XCTestCase {
         }
     }
 
+    // `makeBackend` binds a `ScriptedDecoder`, which does not conform to `SpikeCore.
+    // LogprobDecoding` — this is the "decoder capability" refusal path (mirrors the
+    // compiled-fp16/MTP-speculative production routes, neither of which conforms either), distinct
+    // from `testScalarRouteEmitsRealTokenLogprobsWhenDecoderSupportsThem` below, which proves the
+    // ADMITTED path against a decoder that DOES conform.
+    func testLogprobsRequestThrowsLogprobsUnsupported() async throws {
+        let backend = makeBackend(script: [1, 99], pieces: [1: "hi"], promptTokens: [10])
+        var logprobsRequest = request(maxTokens: 2)
+        logprobsRequest.logprobsRequest = .chat(topLogprobs: 0)
+
+        do {
+            _ = try await backend.start(logprobsRequest)
+            XCTFail("Expected logprobs_unsupported rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "logprobs_unsupported")
+            XCTAssertEqual(error.openAIError.param, "logprobs")
+        }
+    }
+
+    // The scalar backend now computes REAL per-token logprobs when its bound decoder conforms to
+    // `SpikeCore.LogprobDecoding` (in production: a plain `MLXDecoder`, never `CompiledMLXDecoder`
+    // or `MTPSpeculativeDecoder` — see `SpikeServingAdapters.swift`'s admission-guard comment).
+    // `FixtureLogprobDecoder` stands in for that real decoder here so this stays MLX-free: it
+    // proves the WIRING (mapping `DecodedTokenLogprob` -> `ServingTokenLogprob`, resolving token
+    // text via `codec.decodeSingleToken`, and emitting `.tokenLogprobs` in generation order) without
+    // needing a real model — `MLXDecoderLogprobComputationTests` (`SpikeCoreTests`) already covers
+    // the underlying `logSoftmax`/top-N computation itself.
+    func testScalarRouteEmitsRealTokenLogprobsWhenDecoderSupportsThem() async throws {
+        let decoder = FixtureLogprobDecoder(
+            script: [1, 2, 99], eos: 99, candidateTokenIDs: [50, 60])
+        let codec = LogprobFixtureScalarTextCodec(
+            promptTokens: [10], pieces: [1: "a", 2: "b"])
+        let backend = makeLogprobBackend(decoder: decoder, codec: codec)
+
+        var logprobsRequest = request(maxTokens: 4)
+        logprobsRequest.logprobsRequest = .chat(topLogprobs: 1)
+
+        let handle = try await backend.start(logprobsRequest)
+        let events = try await collect(handle.mailbox)
+
+        let logprobBatches = events.compactMap { event -> [ServingTokenLogprob]? in
+            if case .tokenLogprobs(let tokens) = event { return tokens }
+            return nil
+        }
+        let tokens = logprobBatches.flatMap { $0 }
+
+        XCTAssertEqual(tokens.map(\.tokenText), ["tok1", "tok2"], "events: \(events)")
+        XCTAssertEqual(tokens[0].topCandidates.map(\.tokenText), ["tok50"])
+        XCTAssertEqual(tokens[1].topCandidates.map(\.tokenText), ["tok60"])
+
+        // `.tokenLogprobs` for a token must appear no later than that same token's own `.text`
+        // delta (the streaming carry-once ordering `onLogprob`'s doc comment documents).
+        let textIndex = events.firstIndex { if case .text = $0 { return true }; return false }
+        let firstLogprobIndex = events.firstIndex { if case .tokenLogprobs = $0 { return true }; return false }
+        XCTAssertNotNil(textIndex)
+        XCTAssertNotNil(firstLogprobIndex)
+        XCTAssertLessThan(firstLogprobIndex!, textIndex!)
+
+        let finish = events.compactMap { event -> OpenAIChatFinishReason? in
+            if case .completion(let completion) = event { return completion.finishReason }
+            return nil
+        }.first
+        XCTAssertEqual(finish, .stop)
+    }
+
+    // Negative control for the ordering assertion above: `logprobsRequest == nil` on the SAME
+    // logprob-capable decoder/codec must never emit `.tokenLogprobs` — proves the feature is
+    // opt-in, not "on whenever the decoder happens to support it".
+    func testScalarRouteOmitsTokenLogprobsWhenNotRequestedEvenOnASupportingDecoder() async throws {
+        let decoder = FixtureLogprobDecoder(
+            script: [1, 2, 99], eos: 99, candidateTokenIDs: [50, 60])
+        let codec = LogprobFixtureScalarTextCodec(
+            promptTokens: [10], pieces: [1: "a", 2: "b"])
+        let backend = makeLogprobBackend(decoder: decoder, codec: codec)
+
+        let handle = try await backend.start(request(maxTokens: 4))
+        let events = try await collect(handle.mailbox)
+
+        let hasLogprobs = events.contains { if case .tokenLogprobs = $0 { return true }; return false }
+        XCTAssertFalse(hasLogprobs, "events: \(events)")
+    }
+
     // Raw-text completions never separate reasoning, even for a family that thinks by default —
     // there is no chat template pre-filling a `<think>` block for a raw-text prompt to begin inside.
     func testHandleDoesNotSeparateReasoningForRawTextEvenWhenFamilyThinksByDefault() async throws {
@@ -818,6 +900,27 @@ private func makeBackendWithCodec(
             rejectedPromptTokenIDs: rejectedPromptTokenIDs))
 }
 
+/// Builds a backend around a CALLER-SUPPLIED decoder/codec pair (unlike `makeBackend`/
+/// `makeBackendWithCodec`, which always bind `ScriptedDecoder`) — used by the logprobs tests to
+/// bind a `SpikeCore.LogprobDecoding`-conforming decoder so `ScalarServingBackend` actually admits
+/// and serves a logprobs request instead of refusing at `InferenceActor.supportsLogprobs()`.
+private func makeLogprobBackend(
+    decoder: sending any Decoder,
+    codec: any ScalarServingTextCodec
+) -> ScalarServingBackend {
+    ScalarServingBackend(
+        launchedModel: "fixture-model",
+        inference: InferenceActor(decoder: decoder),
+        codec: codec,
+        stopTokenIDs: [99],
+        modelStopStrings: [],
+        configuration: .init(
+            defaultMaximumCompletionTokens: 8,
+            maximumQueuedRequests: 2,
+            queueRetryAfterSeconds: 2,
+            mailboxCapacity: .init(maxDeltas: 8, maxBytes: 4_096)))
+}
+
 private func rawTextRequest(
     prompt: String,
     maxTokens: Int
@@ -914,6 +1017,87 @@ private func waitUntil(
         await Task.yield()
     }
     XCTFail("Condition was not reached")
+}
+
+/// Test double conforming to `SpikeCore.LogprobDecoding`: replays a fixed script like
+/// `ScriptedDecoder` (never a real MLX computation), and reports a synthetic `DecodedTokenLogprob`
+/// per generated token — one candidate per token, sourced from `candidateTokenIDs` by generation
+/// order — so `ScalarServingBackendTests`'s logprobs tests can assert the ADAPTER'S wiring
+/// (`DecodedTokenLogprob` -> `ServingTokenLogprob`, token-text resolution, delta ordering) without
+/// needing a real model; the underlying `logSoftmax`/top-N computation itself is covered by
+/// `MLXDecoderLogprobComputationTests` (`SpikeCoreTests`).
+private struct FixtureLogprobDecoder: LogprobDecoding {
+    let script: [Int]
+    let eos: Int
+    let candidateTokenIDs: [Int]
+    var i = 0
+
+    mutating func prefill(_ promptTokens: [Int]) -> Int {
+        defer { i += 1 }
+        return script[i]
+    }
+
+    mutating func step(last: Int) -> Int {
+        defer { i += 1 }
+        return script[i]
+    }
+
+    mutating func reset() { i = 0 }
+
+    mutating func prefillWithLogprob(
+        _ promptTokens: [Int], topN: Int
+    ) -> (token: Int, logprob: DecodedTokenLogprob) {
+        let index = i
+        let token = prefill(promptTokens)
+        return (token, makeLogprob(token: token, generationIndex: index, topN: topN))
+    }
+
+    mutating func stepWithLogprob(
+        last: Int, topN: Int
+    ) -> (token: Int, logprob: DecodedTokenLogprob) {
+        let index = i
+        let token = step(last: last)
+        return (token, makeLogprob(token: token, generationIndex: index, topN: topN))
+    }
+
+    private func makeLogprob(
+        token: Int, generationIndex: Int, topN: Int
+    ) -> DecodedTokenLogprob {
+        var top: [DecodedTokenLogprobCandidate] = []
+        if topN > 0, generationIndex < candidateTokenIDs.count {
+            top = [
+                DecodedTokenLogprobCandidate(
+                    tokenID: candidateTokenIDs[generationIndex], logprob: -1.0)
+            ]
+        }
+        return DecodedTokenLogprob(
+            tokenID: token, logprob: Float(-(generationIndex + 1)), top: top)
+    }
+}
+
+/// Codec fixture for the logprobs tests: fixed prompt/pieces like `FixtureScalarTextCodec`, but ALSO
+/// overrides `decodeSingleToken` (unlike `FixtureScalarTextCodec`, which relies on the protocol's
+/// empty-string default) so a test can assert on real per-token text.
+private struct LogprobFixtureScalarTextCodec: ScalarServingTextCodec {
+    let promptTokens: [Int]
+    let pieces: [Int: String]
+
+    func render(
+        messages: [OpenAIChatMessage],
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?,
+        reasoningEffort: String?
+    ) throws -> [Int] {
+        promptTokens
+    }
+
+    func makeDetokenizer() -> any ScalarServingDetokenizer {
+        FixtureScalarDetokenizer(pieces: pieces)
+    }
+
+    func decodeSingleToken(_ tokenID: Int) -> String {
+        "tok\(tokenID)"
+    }
 }
 
 private struct FixtureScalarTextCodec: ScalarServingTextCodec {

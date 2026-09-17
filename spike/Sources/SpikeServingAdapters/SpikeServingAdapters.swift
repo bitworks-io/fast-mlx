@@ -64,6 +64,14 @@ public protocol ScalarServingTextCodec: Sendable {
     /// not opted in behaves exactly as before this route existed.
     func encode(rawText: String) throws -> [Int]
     func makeDetokenizer() -> any ScalarServingDetokenizer
+    /// Decode a SINGLE token ID into its own text, independent of any other token — the OpenAI
+    /// per-token logprobs contract (`ServingCore.ServingTokenLogprob`) needs each token's OWN piece
+    /// text, not text merged through the incremental multi-token `makeDetokenizer()` detokenizer,
+    /// which deliberately coalesces UTF-8 continuation bytes and BPE space-prefix merges across
+    /// generation steps to produce clean display text. Only invoked once a decoder capability
+    /// check (`InferenceActor.supportsLogprobs()`) has already admitted a logprobs request, so the
+    /// default below never fires in production — see the extension's doc comment.
+    func decodeSingleToken(_ tokenID: Int) -> String
 }
 
 extension ScalarServingTextCodec {
@@ -75,6 +83,17 @@ extension ScalarServingTextCodec {
             "This server does not support the legacy text-completions route for the loaded codec",
             param: "prompt",
             code: "completions_unsupported")
+    }
+
+    /// Default: empty text. Every codec that predates `decodeSingleToken` (test fixtures; any
+    /// future codec that has not opted in) keeps compiling unchanged, and this default is never
+    /// reached on a production route — `ScalarServingBackend.start` only ever calls it after
+    /// `InferenceActor.supportsLogprobs()` has already gated the request on a decoder that
+    /// genuinely computes logprobs, and only `MLXScalarTextCodec` (paired with a plain `MLXDecoder`)
+    /// is wired to that combination today. Only `MLXScalarTextCodec` overrides this with a real
+    /// tokenizer decode.
+    public func decodeSingleToken(_ tokenID: Int) -> String {
+        ""
     }
 }
 
@@ -207,6 +226,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let completionBudgetResolution: ServingCompletionBudgetResolution?
         let sampling: DecoderSampling
         let penalties: DecoderPenalties
+        let logprobsRequest: ServingLogprobsRequest?
         let activeTools: [OpenAIToolSpec]
         let mailbox: BoundedDeltaMailbox
         let lease: ServingRequestLease
@@ -280,6 +300,21 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         }
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ScalarServingBackendError.invalidStopTokenIDs
+        }
+        // Real per-token logprobs require the bound decoder to conform to `SpikeCore.
+        // LogprobDecoding` (today: a plain `MLXDecoder` — see `MLXScalarServing.swift`'s
+        // `decoderStrategy` switch). The compiled-fp16 route (`CompiledMLXDecoder`) and the
+        // in-checkpoint-MTP speculative route (`MTPSpeculativeDecoder`) do NOT conform — a
+        // speculative decoder's accepted tokens do not carry the target model's own per-step
+        // distribution the way this contract requires, and the compiled route has no cheap seam
+        // for it either — so a logprobs request against either refuses here with a clean 400
+        // rather than reaching `generateBounded` only to be refused mid-request. See README.md's
+        // logprobs section for the production configuration table.
+        if request.logprobsRequest != nil, await !inference.supportsLogprobs() {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not compute per-token logprobs for the loaded backend",
+                param: "logprobs",
+                code: "logprobs_unsupported")
         }
 
         let activeTools = request.activeTools
@@ -371,6 +406,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             completionBudgetResolution: completionBudgetResolution,
             sampling: sampling,
             penalties: penalties,
+            logprobsRequest: request.logprobsRequest,
             activeTools: activeTools,
             mailbox: mailbox,
             lease: lease)
@@ -597,13 +633,29 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             return
         }
 
+        // Built as a standalone `var`, assigned from a plain `if` (rather than a ternary, and
+        // rather than inline in the `generateBounded` call below) — a conditional closure literal
+        // in either of those positions defeated the type checker outright ("failed to produce
+        // diagnostic for expression").
+        var onLogprobCallback: (@Sendable (DecodedTokenLogprob) async throws -> Void)?
+        if request.logprobsRequest != nil {
+            onLogprobCallback = { [weak self] logprob in
+                guard let self else {
+                    throw CancellationError()
+                }
+                try await self.publishLogprob(logprob, for: id)
+            }
+        }
+
         do {
             let summary = try await inference.generateBounded(
                 promptTokens: request.promptTokens,
                 maxTokens: request.maximumCompletionTokens,
                 stopTokenIDs: stopTokenIDs,
                 sampling: request.sampling,
-                penalties: request.penalties
+                penalties: request.penalties,
+                logprobTopN: request.logprobsRequest?.topLogprobs,
+                onLogprob: onLogprobCallback
             ) { [weak self] token in
                 guard let self else {
                     throw CancellationError()
@@ -692,6 +744,34 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         }
         try Task.checkCancellation()
         return output?.stopped == true ? .stopGeneration : .continueGeneration
+    }
+
+    /// Map one `SpikeCore.DecodedTokenLogprob` (a raw token ID + candidates, no notion of text) to
+    /// the `ServingCore.ServingTokenLogprob` wire-level value — resolving every token ID's TEXT via
+    /// `codec.decodeSingleToken`, which decodes each token INDEPENDENTLY of any other (see that
+    /// method's doc comment for why this must NOT reuse `current.detokenizer`). Called from
+    /// `InferenceActor.generateBounded`'s `onLogprob` callback, which fires BEFORE `consume` for the
+    /// same token (see that parameter's doc comment) — so this always sends its `.tokenLogprobs`
+    /// delta before the corresponding `.text`/`.toolCalls` delta for the same generation step,
+    /// matching the streaming carry-once contract `OpenAIChatCompletionsHTTPHandler.stream` expects.
+    private func publishLogprob(
+        _ logprob: DecodedTokenLogprob,
+        for id: ServingRequestID
+    ) async throws {
+        try Task.checkCancellation()
+        guard let current = active, current.request.id == id else {
+            throw CancellationError()
+        }
+        let candidates = logprob.top.map { candidate in
+            ServingTokenLogprobCandidate(
+                tokenText: codec.decodeSingleToken(candidate.tokenID),
+                logprob: Double(candidate.logprob))
+        }
+        let served = ServingTokenLogprob(
+            tokenText: codec.decodeSingleToken(logprob.tokenID),
+            logprob: Double(logprob.logprob),
+            topCandidates: candidates)
+        try await current.request.mailbox.send(.tokenLogprobs([served]))
     }
 
     private func flushStopFilter(for id: ServingRequestID) async throws {

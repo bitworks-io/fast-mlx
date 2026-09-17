@@ -284,6 +284,34 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
         XCTAssertEqual(scalar.snapshot().startCount, 0)
     }
 
+    // Draft-model speculative decoding has no seam to observe the target model's raw per-step
+    // logits — a request carrying a validated `logprobsRequest` must be rejected with
+    // `logprobs_unsupported`, at the SAME point (before the fallback decision) as the
+    // `completions_unsupported` guard above, rather than silently falling back to the scalar
+    // route or serving a response claiming logprobs it never computed.
+    func testLogprobsRequestIsRejectedWithoutCallingRunnerOrScalarFallback() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+
+        var logprobsRequest = request(maxTokens: 4)
+        logprobsRequest.logprobsRequest = .chat(topLogprobs: 0)
+
+        do {
+            _ = try await backend.start(logprobsRequest)
+            XCTFail("MTP route must reject a logprobs request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "logprobs")
+            XCTAssertEqual(code, "logprobs_unsupported")
+        }
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+    }
+
     func testConstructionRejectsScalarFallbackThatMayShareRawTarget() {
         XCTAssertThrowsError(
             try makeBackend(

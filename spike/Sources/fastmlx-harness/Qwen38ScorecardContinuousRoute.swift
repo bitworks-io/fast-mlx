@@ -663,6 +663,14 @@ enum Qwen38ScorecardProductionRouteRunner {
                             throw Qwen38ScorecardContinuousRouteError
                                 .incompleteRequest(
                                     index: request.requestIndex)
+                        case .tokenLogprobs:
+                            // This harness route never requests logprobs (the continuous-batch
+                            // backend refuses `logprobsRequest != nil` with `logprobs_unsupported`
+                            // before admission), so this delta is unreachable here — treated the
+                            // same as the equally-unreachable `.toolCalls` case above.
+                            throw Qwen38ScorecardContinuousRouteError
+                                .incompleteRequest(
+                                    index: request.requestIndex)
                         case .completion(let value):
                             completion = value
                         }
@@ -1024,6 +1032,11 @@ public enum Qwen38ScorecardContinuousRouteRunner {
                 }
                 outputTokens.append(token)
             case .toolCalls:
+                throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
+            case .tokenLogprobs:
+                // Unreachable: this harness route never requests logprobs (the continuous-batch
+                // backend refuses `logprobsRequest != nil` before admission) — same treatment as
+                // the equally-unreachable `.toolCalls` case above.
                 throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
             case .completion(let value):
                 completion = value

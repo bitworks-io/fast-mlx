@@ -267,17 +267,18 @@ final class OpenAIChatCompletionsTests: XCTestCase {
     func testNeutralValuedFieldsAreAcceptedAndRecordedAsIgnored() throws {
         let body = """
         {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],
-         "logprobs":false,"top_logprobs":0,"response_format":{"type":"text"},"logit_bias":{}}
+         "logprobs":false,"response_format":{"type":"text"},"logit_bias":{}}
         """
         let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
         XCTAssertEqual(
             request.ignoredFields,
-            ["logit_bias", "logprobs", "response_format", "top_logprobs"])
+            ["logit_bias", "response_format"])
+        // `logprobs:false` is honored (not ignored): it decodes to no logprobs request at all.
+        XCTAssertNil(request.logprobsRequest)
     }
 
     func testNonNeutralValuedFieldsAreRejectedWithSpecificParam() throws {
         let cases: [(String, String)] = [
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true}"#, "logprobs"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_logprobs":1}"#, "top_logprobs"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object"}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"text","extra":1}}"#, "response_format"),
@@ -291,6 +292,94 @@ final class OpenAIChatCompletionsTests: XCTestCase {
                 file: #filePath,
                 line: #line)
         }
+    }
+
+    // MARK: - Chat logprobs / top_logprobs (real feature)
+
+    func testChatLogprobsTrueWithNoTopLogprobsDefaultsToZeroAlternatives() throws {
+        let body = #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true}"#
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.logprobsRequest, .chat(topLogprobs: 0))
+        XCTAssertEqual(request.ignoredFields, [])
+    }
+
+    func testChatLogprobsTrueWithTopLogprobsIsHonored() throws {
+        let body = #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":5}"#
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.logprobsRequest, .chat(topLogprobs: 5))
+    }
+
+    func testChatLogprobsFalseOrAbsentLeavesNoLogprobsRequest() throws {
+        for body in [
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}]}"#,
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":false}"#,
+        ] {
+            let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTAssertNil(request.logprobsRequest, body)
+        }
+    }
+
+    // Threshold is exactly `> 0` (OpenAI's own behavior): `top_logprobs:1` without `logprobs:true`
+    // is rejected...
+    func testChatTopLogprobsWithoutLogprobsTrueIsRejected() throws {
+        let cases = [
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_logprobs":1}"#,
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":false,"top_logprobs":1}"#,
+        ]
+        for body in cases {
+            XCTAssertOpenAIError(
+                try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: "top_logprobs",
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    // ...but `top_logprobs:0` alone is neutral: zero alternatives is the same "not requested" state
+    // as omitting the field entirely, so it must NOT 400.
+    func testChatTopLogprobsZeroWithoutLogprobsTrueIsNeutral() throws {
+        let cases = [
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"top_logprobs":0}"#,
+            #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":false,"top_logprobs":0}"#,
+        ]
+        for body in cases {
+            let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTAssertNil(request.logprobsRequest, body)
+        }
+    }
+
+    func testChatTopLogprobsOutOfRangeIsRejected() throws {
+        for value in [-1, 21] {
+            let body = #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":\#(value)}"#
+            XCTAssertOpenAIError(
+                try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+                type: .invalidRequest,
+                param: "top_logprobs",
+                file: #filePath,
+                line: #line)
+        }
+    }
+
+    func testChatTopLogprobsBoundaryValuesAreAccepted() throws {
+        for value in [0, 20] {
+            let body = #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":true,"top_logprobs":\#(value)}"#
+            let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTAssertEqual(request.logprobsRequest, .chat(topLogprobs: value))
+        }
+    }
+
+    // Matches the SAME `as? Bool` convention every other boolean field in this decoder uses (e.g.
+    // `validateNeutralEcho`), including its NSNumber-bridging quirk (a numeric `0`/`1` casts to
+    // `Bool` on this platform) — a non-numeric, non-boolean value like a string still fails closed.
+    func testChatLogprobsWrongTypeIsRejected() throws {
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(
+                from: Data(
+                    #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logprobs":"true"}"#
+                        .utf8)),
+            type: .invalidRequest,
+            param: "logprobs")
     }
 
     func testStreamOptionsIncludeUsageIsParsedBothWays() throws {
@@ -466,7 +555,8 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","prompt":"hi","echo":true}"#, "echo"),
             (#"{"model":"qwen3-32b","prompt":"hi","suffix":"x"}"#, "suffix"),
             (#"{"model":"qwen3-32b","prompt":"hi","best_of":2}"#, "best_of"),
-            (#"{"model":"qwen3-32b","prompt":"hi","logprobs":1}"#, "logprobs"),
+            (#"{"model":"qwen3-32b","prompt":"hi","logprobs":6}"#, "logprobs"),
+            (#"{"model":"qwen3-32b","prompt":"hi","logprobs":-1}"#, "logprobs"),
             (#"{"model":"qwen3-32b","prompt":"hi","unknown":true}"#, "unknown"),
             (#"{"model":"qwen3-32b","prompt":"hi","promptInput":"chat"}"#, "promptInput"),
         ]
@@ -500,10 +590,25 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         }
     }
 
-    // Integer `logprobs` — INCLUDING 0 — asks for the sampled token's logprob, which this server
-    // cannot return. Only `null`/absent is accepted; every integer value fails closed.
-    func testCompletionRequestRejectsAnyIntegerLogprobsIncludingZero() throws {
+    // Integer `logprobs` 0...5 is a real, honored request: `0` means "the sampled token's logprob
+    // only, no alternatives" — a MEANINGFUL, distinct value, never "logprobs off". Only a value
+    // outside 0...5 fails closed; `null`/absent means not requested at all.
+    func testCompletionRequestAcceptsInRangeIntegerLogprobs() throws {
         for value in [0, 1, 5] {
+            let body = #"{"model":"qwen3-32b","prompt":"hi","logprobs":\#(value)}"#
+            let request = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTAssertEqual(request.logprobsRequest, .completions(topLogprobs: value))
+            XCTAssertEqual(request.ignoredFields, [])
+        }
+
+        let nullBody = #"{"model":"qwen3-32b","prompt":"hi","logprobs":null}"#
+        let nullRequest = try OpenAICompletionRequest.decodeStrict(from: Data(nullBody.utf8))
+        XCTAssertEqual(nullRequest.ignoredFields, [])
+        XCTAssertNil(nullRequest.logprobsRequest)
+    }
+
+    func testCompletionRequestRejectsOutOfRangeIntegerLogprobs() throws {
+        for value in [-1, 6] {
             let body = #"{"model":"qwen3-32b","prompt":"hi","logprobs":\#(value)}"#
             XCTAssertOpenAIError(
                 try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8)),
@@ -512,10 +617,13 @@ final class OpenAIChatCompletionsTests: XCTestCase {
                 file: #filePath,
                 line: #line)
         }
+    }
 
-        let nullBody = #"{"model":"qwen3-32b","prompt":"hi","logprobs":null}"#
-        let nullRequest = try OpenAICompletionRequest.decodeStrict(from: Data(nullBody.utf8))
-        XCTAssertEqual(nullRequest.ignoredFields, [])
+    func testCompletionRequestConversionCarriesLogprobsRequest() throws {
+        let body = #"{"model":"qwen3-32b","prompt":"hi","logprobs":3}"#
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(from: Data(body.utf8))
+        let chatRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertEqual(chatRequest.logprobsRequest, .completions(topLogprobs: 3))
     }
 
     func testCompletionRequestConversionCarriesFieldsAndSetsRawTextPromptInput() throws {

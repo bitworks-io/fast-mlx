@@ -264,6 +264,16 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 param: "prompt",
                 code: "completions_unsupported")
         }
+        // The continuous-batch route has no seam to observe a step's raw logits (its decode loop is
+        // driven entirely inside the batched scheduler, with no per-request hook comparable to the
+        // scalar route's detokenizer callback) — fail closed rather than silently omitting logprobs
+        // from a response that claims to carry them.
+        guard request.logprobsRequest == nil else {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support per-token logprobs on the loaded backend",
+                param: "logprobs",
+                code: "logprobs_unsupported")
+        }
         try request.requireLaunchedModel(launchedModel)
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ContinuousServingBackendError.invalidStopTokenIDs

@@ -250,6 +250,23 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        // Serving evidence recording has no way to serialize per-token logprobs into
+        // `ServingEvidence.Request`/`Response` today — fail closed with a normal OpenAI-style 400
+        // BEFORE any evidence request construction, exactly like the `isLegacyCompletions` guard
+        // above, rather than silently recording evidence that omits the logprobs the caller asked
+        // for (or, worse, throwing later with no response at all).
+        if configuration.evidence != nil, request.logprobsRequest != nil {
+            writeError(
+                .invalidRequestWithCode(
+                    "Per-token logprobs are unavailable while serving evidence is being recorded",
+                    param: "logprobs",
+                    code: "logprobs_unsupported"),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
         let requestEvidence: ServingEvidence.Request?
         do {
             requestEvidence = try configuration.evidence.map { _ in
@@ -771,21 +788,25 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         channel: channel,
                         timeout: configuration.backpressureStallTimeout)
                 }
-                let completion = try await stream(
+                let streamResult = try await stream(
                     first: first,
                     handle: started,
                     configuration: configuration,
                     channel: channel,
                     writabilityGate: writabilityGate,
-                    responseKind: responseKind)
+                    responseKind: responseKind,
+                    logprobsRequest: request.logprobsRequest)
                 try await writeSSETerminal(
-                    completion,
+                    streamResult.completion,
                     handle: started,
                     channel: channel,
                     writabilityGate: writabilityGate,
                     includeUsage: request.includeUsage,
                     responseKind: responseKind,
-                    timeout: configuration.backpressureStallTimeout)
+                    timeout: configuration.backpressureStallTimeout,
+                    logprobsRequest: request.logprobsRequest,
+                    remainderLogprobs: streamResult.remainderLogprobs,
+                    completionsTextOffset: streamResult.completionsTextOffset)
             } else {
                 let result = try await collectNonStreaming(
                     handle: started,
@@ -810,7 +831,14 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         finishReason: result.completion.finishReason,
                         usage: result.completion.usage,
                         toolCalls: result.toolCalls,
-                        reasoningContent: split.reasoning)
+                        reasoningContent: split.reasoning,
+                        // Covers every generated token in generation order (see
+                        // `ServingResponseDelta.tokenLogprobs`'s doc comment) — including tokens
+                        // that rendered into `reasoningContent` above or into `toolCalls`, not just
+                        // the visible `split.content` text.
+                        logprobs: request.logprobsRequest.map { _ in
+                            OpenAIChatLogprobs(tokens: result.logprobs)
+                        })
                     try await writeJSONResponse(
                         response,
                         handle: started,
@@ -834,7 +862,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         model: started.model,
                         text: result.text,
                         finishReason: result.completion.finishReason,
-                        usage: result.completion.usage)
+                        usage: result.completion.usage,
+                        logprobs: request.logprobsRequest.map {
+                            OpenAICompletionLogprobs.build(
+                                tokens: result.logprobs,
+                                requestedTopLogprobs: $0.topLogprobs,
+                                startingOffset: 0)
+                        })
                     try await writeJSONResponse(
                         response,
                         handle: started,
@@ -1001,14 +1035,26 @@ private extension OpenAIChatCompletionsHTTPHandler {
         }
     }
 
+    /// Result of a streamed generation: the terminal `ServingGenerationCompletion`, any
+    /// `.tokenLogprobs` the loop accumulated but never got to attach to an emitted chunk (there was
+    /// no further `.text`/`.toolCalls` delta to carry them — the caller's `writeSSETerminal` flushes
+    /// these onto the finish chunk), and (for `.completions` only) the running code-point text
+    /// offset the finish chunk's own `OpenAICompletionLogprobs.build` must continue from.
+    struct StreamResult {
+        let completion: ServingGenerationCompletion
+        let remainderLogprobs: [ServingTokenLogprob]
+        let completionsTextOffset: Int
+    }
+
     static func stream(
         first: ServingResponseDelta,
         handle: ServingGenerationHandle,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         writabilityGate: ServingChannelWritabilityGate,
-        responseKind: ServingResponseKind
-    ) async throws -> ServingGenerationCompletion {
+        responseKind: ServingResponseKind,
+        logprobsRequest: ServingLogprobsRequest?
+    ) async throws -> StreamResult {
         var pending: ServingResponseDelta? = first
         var completion: ServingGenerationCompletion?
         // When the handle separates reasoning, `.text` deltas are partitioned incrementally into
@@ -1018,9 +1064,37 @@ private extension OpenAIChatCompletionsHTTPHandler {
         var splitter: StreamingReasoningSplitter? =
             handle.separatesReasoning ? StreamingReasoningSplitter() : nil
 
+        // Tokens whose `.tokenLogprobs` delta has been consumed but not yet attached to an emitted
+        // chunk. Drained (and cleared) by `drainLogprobs()` every time this loop is ABOUT to emit a
+        // chunk that carries new tokens — this is exactly the "carried to the next emitted chunk"
+        // contract: a token generated between two emitted chunks always ends up on the LATER one.
+        var pendingLogprobs: [ServingTokenLogprob] = []
+        var completionsTextOffset = 0
+
+        func drainLogprobs() -> [ServingTokenLogprob] {
+            defer { pendingLogprobs.removeAll() }
+            return pendingLogprobs
+        }
+
+        func chatLogprobs() -> OpenAIChatLogprobs? {
+            guard logprobsRequest != nil else { return nil }
+            return OpenAIChatLogprobs(tokens: drainLogprobs())
+        }
+
+        func completionLogprobs(_ requested: Int) -> OpenAICompletionLogprobs {
+            let tokens = drainLogprobs()
+            let built = OpenAICompletionLogprobs.build(
+                tokens: tokens, requestedTopLogprobs: requested, startingOffset: completionsTextOffset)
+            completionsTextOffset = OpenAICompletionLogprobs.endingOffset(
+                startingOffset: completionsTextOffset, tokens: tokens)
+            return built
+        }
+
         // Emit a reasoning_content chunk then a content chunk for whatever the splitter produced now
-        // (each side may be nil — held-back bytes emit nothing this call).
+        // (each side may be nil — held-back bytes emit nothing this call). Any buffered logprobs are
+        // attached to whichever of the two chunks is emitted LAST this call (content when both fire).
         func emitSplit(_ piece: (reasoning: String?, content: String?)) async throws {
+            let attachToReasoning = piece.reasoning != nil && piece.content == nil
             if let reasoning = piece.reasoning {
                 try await waitUntilWritable(
                     writabilityGate,
@@ -1031,7 +1105,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     model: handle.model,
                     index: 0,
                     delta: .init(role: nil, content: nil, reasoningContent: reasoning),
-                    finishReason: nil)
+                    finishReason: nil,
+                    logprobs: attachToReasoning ? chatLogprobs() : nil)
                 try await writeBody(
                     chunk.sseEvent(),
                     channel: channel,
@@ -1047,7 +1122,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     model: handle.model,
                     index: 0,
                     delta: .init(role: nil, content: content),
-                    finishReason: nil)
+                    finishReason: nil,
+                    logprobs: chatLogprobs())
                 try await writeBody(
                     chunk.sseEvent(),
                     channel: channel,
@@ -1076,18 +1152,21 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         model: handle.model,
                         index: 0,
                         delta: .init(role: nil, content: text),
-                        finishReason: nil)
+                        finishReason: nil,
+                        logprobs: chatLogprobs())
                     try await writeBody(
                         chunk.sseEvent(),
                         channel: channel,
                         timeout: configuration.backpressureStallTimeout)
                 case .completions:
+                    let requested = logprobsRequest?.topLogprobs
                     let chunk = OpenAITextCompletionChunk(
                         id: completionsResponseID(handle.responseID),
                         created: handle.created,
                         model: handle.model,
                         text: text,
-                        finishReason: nil)
+                        finishReason: nil,
+                        logprobs: requested.map(completionLogprobs))
                     try await writeBody(
                         chunk.sseEvent(),
                         channel: channel,
@@ -1106,11 +1185,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 // Emit OpenAI streaming tool-call deltas: a head chunk (id + type + name) then an
                 // arguments chunk (the JSON string as a single fragment). `index` distinguishes
                 // parallel calls. The terminal finish chunk (finish_reason "tool_calls") is sent
-                // by writeSSETerminal from the completion.
+                // by writeSSETerminal from the completion. Any buffered logprobs (tokens that
+                // rendered into these tool calls) are attached to the FIRST head chunk of this
+                // batch — an implementation choice, not a wire contract; concatenation across every
+                // chunk this stream emits still covers every generated token exactly once.
+                var attachedLogprobsThisBatch = false
                 for (toolIndex, call) in calls.enumerated() {
                     try await waitUntilWritable(
                         writabilityGate,
                         timeout: configuration.backpressureStallTimeout)
+                    let headLogprobs: OpenAIChatLogprobs? =
+                        attachedLogprobsThisBatch ? nil : chatLogprobs()
+                    attachedLogprobsThisBatch = true
                     let head = OpenAIChatCompletionChunk(
                         id: handle.responseID,
                         created: handle.created,
@@ -1126,7 +1212,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                                     type: "function",
                                     function: .init(name: call.function.name, arguments: nil))
                             ]),
-                        finishReason: nil)
+                        finishReason: nil,
+                        logprobs: headLogprobs)
                     try await writeBody(
                         head.sseEvent(),
                         channel: channel,
@@ -1157,6 +1244,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
                             timeout: configuration.backpressureStallTimeout)
                     }
                 }
+            case .tokenLogprobs(let tokens):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                pendingLogprobs.append(contentsOf: tokens)
             case .completion(let value):
                 guard completion == nil else {
                     throw RunError.missingCompletion
@@ -1174,16 +1266,23 @@ private extension OpenAIChatCompletionsHTTPHandler {
         guard let completion else {
             throw RunError.missingCompletion
         }
-        return completion
+        return StreamResult(
+            completion: completion,
+            remainderLogprobs: drainLogprobs(),
+            completionsTextOffset: completionsTextOffset)
     }
 
     static func collectNonStreaming(
         handle: ServingGenerationHandle,
         maximumBytes: Int
-    ) async throws -> (text: String, toolCalls: [OpenAIToolCall], completion: ServingGenerationCompletion) {
+    ) async throws -> (
+        text: String, toolCalls: [OpenAIToolCall], completion: ServingGenerationCompletion,
+        logprobs: [ServingTokenLogprob]
+    ) {
         var text = ""
         var byteCount = 0
         var toolCalls: [OpenAIToolCall] = []
+        var logprobs: [ServingTokenLogprob] = []
         var completion: ServingGenerationCompletion?
         while let event = try await handle.mailbox.next() {
             switch event {
@@ -1209,6 +1308,20 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 }
                 byteCount = newCount
                 toolCalls.append(contentsOf: calls)
+            case .tokenLogprobs(let tokens):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                let (newCount, overflow) = byteCount.addingReportingOverflow(
+                    event.utf8ByteCount)
+                guard !overflow, newCount <= maximumBytes else {
+                    throw RunError.responseLimitExceeded
+                }
+                byteCount = newCount
+                // Appended in GENERATION order, independent of how the `.text`/`.toolCalls` deltas
+                // above happen to group display text — this array covers every generated token,
+                // including ones that rendered into reasoning_content or a tool call's arguments.
+                logprobs.append(contentsOf: tokens)
             case .completion(let value):
                 guard completion == nil else {
                     throw RunError.missingCompletion
@@ -1219,7 +1332,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         guard let completion else {
             throw RunError.missingCompletion
         }
-        return (text, toolCalls, completion)
+        return (text, toolCalls, completion, logprobs)
     }
 
     static func writeSSEHead(
@@ -1265,11 +1378,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
         writabilityGate: ServingChannelWritabilityGate,
         includeUsage: Bool,
         responseKind: ServingResponseKind,
-        timeout: Duration
+        timeout: Duration,
+        logprobsRequest: ServingLogprobsRequest? = nil,
+        remainderLogprobs: [ServingTokenLogprob] = [],
+        completionsTextOffset: Int = 0
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
         switch responseKind {
         case .chat:
+            // Flushes any tokens `stream()` accumulated but never got to attach to an emitted
+            // chunk — the "final chunk flushes any remainder" streaming contract. `nil` (not an
+            // empty array) when logprobs were not requested, so a non-requesting caller's finish
+            // chunk stays byte-identical to before this field existed.
             let finish = OpenAIChatCompletionChunk(
                 id: handle.responseID,
                 created: handle.created,
@@ -1277,7 +1397,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 index: 0,
                 delta: .init(role: nil, content: nil),
                 finishReason: completion.finishReason,
-                usage: completion.usage)
+                usage: completion.usage,
+                logprobs: logprobsRequest.map { _ in OpenAIChatLogprobs(tokens: remainderLogprobs) })
             try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
             // `stream_options.include_usage` opt-in only: this extra empty-choices usage chunk is the
             // one byte-shape difference from today's stream. Emitted only on this normal-completion
@@ -1299,7 +1420,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 model: handle.model,
                 text: "",
                 finishReason: completion.finishReason,
-                usage: completion.usage)
+                usage: completion.usage,
+                logprobs: logprobsRequest.map {
+                    OpenAICompletionLogprobs.build(
+                        tokens: remainderLogprobs,
+                        requestedTopLogprobs: $0.topLogprobs,
+                        startingOffset: completionsTextOffset)
+                })
             try await writeBody(finish.sseEvent(), channel: channel, timeout: timeout)
             if includeUsage {
                 try await waitUntilWritable(writabilityGate, timeout: timeout)

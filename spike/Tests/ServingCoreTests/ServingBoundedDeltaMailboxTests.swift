@@ -86,6 +86,33 @@ final class ServingBoundedDeltaMailboxTests: XCTestCase {
         }
     }
 
+    func testTokenLogprobsCountAgainstMailboxByteCapacityAndSendSucceedsUnderIt() async throws {
+        let token = ServingTokenLogprob(
+            tokenText: "hi",
+            logprob: -0.1,
+            topCandidates: [ServingTokenLogprobCandidate(tokenText: "hi", logprob: -0.1)])
+        let delta = ServingResponseDelta.tokenLogprobs([token])
+        XCTAssertGreaterThan(delta.utf8ByteCount, 0)
+
+        let mailbox = BoundedDeltaMailbox(capacity: .init(maxDeltas: 1, maxBytes: 4_096))
+        try await mailbox.send(delta)
+        let received = try await mailbox.next()
+        XCTAssertEqual(received, delta)
+    }
+
+    func testOversizedTokenLogprobsExceedsMailboxByteCapacity() async throws {
+        let token = ServingTokenLogprob(tokenText: String(repeating: "x", count: 200), logprob: -0.1)
+        let delta = ServingResponseDelta.tokenLogprobs([token])
+
+        let mailbox = BoundedDeltaMailbox(capacity: .init(maxDeltas: 1, maxBytes: 16))
+        do {
+            try await mailbox.send(delta)
+            XCTFail("Expected the serialized token-logprob payload to exceed mailbox capacity")
+        } catch let error as ServingMailboxError {
+            XCTAssertEqual(error, .backend("delta exceeds mailbox byte capacity"))
+        }
+    }
+
     func testCancelResumesBlockedProducerAndClearsCapacity() async throws {
         let mailbox = BoundedDeltaMailbox(
             capacity: BoundedDeltaMailbox.Capacity(maxDeltas: 1, maxBytes: 4))

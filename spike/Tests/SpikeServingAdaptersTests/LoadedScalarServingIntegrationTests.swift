@@ -132,6 +132,8 @@ private func collectControl(
             text += value
         case .toolCalls:
             break
+        case .tokenLogprobs:
+            break
         case .completion(let value):
             completion = value
         }

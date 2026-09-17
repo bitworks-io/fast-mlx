@@ -274,6 +274,17 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
                 param: "prompt",
                 code: "completions_unsupported")
         }
+        // Draft-model speculative decoding has no seam to observe the TARGET model's raw per-step
+        // logits (the verify pass runs entirely inside the speculative decode loop, with no hook
+        // comparable to the scalar route's detokenizer callback) — fail closed the same way and at
+        // the same point as the `promptInput` guard above, before the fallback decision, so this
+        // backend never silently serves a response claiming logprobs it did not compute.
+        guard request.logprobsRequest == nil else {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support per-token logprobs on the loaded backend",
+                param: "logprobs",
+                code: "logprobs_unsupported")
+        }
         guard request.model == launchedModel else {
             return try await scalarFallback.start(request)
         }

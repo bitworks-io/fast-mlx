@@ -120,6 +120,16 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
     public func makeDetokenizer() -> any ScalarServingDetokenizer {
         MLXScalarDetokenizer(tokenizer: tokenizer)
     }
+
+    /// Decode exactly ONE token ID into its own text — the per-token logprobs contract
+    /// (`ScalarServingTextCodec.decodeSingleToken`'s doc comment) needs each token's OWN piece
+    /// text, never text merged across generation steps by `makeDetokenizer()`'s incremental
+    /// detokenizer. `skipSpecialTokens: false` so a logprobs candidate that happens to land on a
+    /// special token (e.g. an EOS alternative reported in `top_logprobs`) still decodes to
+    /// SOMETHING rather than silently vanishing.
+    public func decodeSingleToken(_ tokenID: Int) -> String {
+        tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: false)
+    }
 }
 
 /// Translates a Jinja chat-template's own `raise_exception(...)` refusal — surfaced to Swift as

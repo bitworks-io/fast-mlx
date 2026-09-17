@@ -94,21 +94,43 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/jso
 The assistant replies with an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`); send the
 tool result back as a `{"role":"tool","tool_call_id":…,"content":…}` message to continue.
 
+Set `"logprobs":true` (with optional `"top_logprobs":0…20`) to get real per-token log-probabilities
+on `choices[0].logprobs.content` (streaming: the same shape as a sibling of `delta` on each chunk
+that carries new tokens). Each value is `log_softmax` of the model's own RAW output logits for that
+generation step — computed BEFORE temperature, top-p/top-k, min-p, and any penalty/logit processor,
+matching vLLM's default logprobs semantics rather than the post-sampling distribution actually drawn
+from. Real logprobs are served only by the single-stream scalar route, and only when that route is
+serving a plain (native-cache, non-speculative) decoder: a scalar serve running the compiled-fp16
+path or in-checkpoint MTP speculative decoding, the continuous-batch route, the separate draft-model
+speculative route, and evidence-recording mode all fail closed with 400 `logprobs_unsupported`
+rather than silently omitting the values a caller asked for, or reporting logprobs for tokens a
+speculative decoder didn't itself score. In practice, hybrid-attention checkpoints served without
+MTP compute logprobs. Dense-attention checkpoints, which take the compiled fp16 fast path by
+default, refuse them. `top_logprobs` without `logprobs:true` is rejected
+(`top_logprobs` param), matching OpenAI's own validation. `logprobs:false`/absent is unchanged — no
+`logprobs` key at all, byte-identical to before this feature existed.
+
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
 such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style
 harnesses. It shares the same sampling, completion-budget, and admission behavior as
 `/v1/chat/completions`, but applies no chat template: `prompt` (a non-empty string, or an array of
 exactly one string) is tokenized as-is and completed verbatim, with `choices[0].text` in the
-response. `n`, `best_of`, and `echo` are only accepted at their neutral single-choice/no-echo values;
-`suffix` (insertion mode) is not supported, and `logprobs` must be absent or null — this server never
-computes per-token log-probabilities, and even `logprobs:0` asks for the sampled token's own
-logprob. Only the single-stream scalar serving route serves this route today (including in-checkpoint
-MTP on that route); the continuous-batch route, the separate draft-model speculative route, and
-evidence-recording mode all fail closed with
-`completions_unsupported` rather than silently mistreating raw text as an already-templated chat
-prompt. An omitted `max_tokens` does not fall back to the legacy API's 16-token default — it uses
-the server's own completion-budget policy, the same one `/v1/chat/completions` applies when
-`max_completion_tokens` is omitted.
+response. `n`, `best_of`, and `echo` are only accepted at their neutral single-choice/no-echo values,
+and `suffix` (insertion mode) is not supported. Integer `logprobs` (0…5) is a real, honored request —
+`0` means "the sampled token's own logprob, no alternatives", a meaningful value distinct from
+"logprobs off" — returning `choices[0].logprobs` with `tokens`/`token_logprobs`/`top_logprobs`
+(`null` per-token when `logprobs:0`)/`text_offset` (the code-point offset of each token into the
+full completion text), same raw-logits semantics as the chat route above; a value outside 0…5 is
+rejected. Only the single-stream scalar serving route serves this route today (including
+in-checkpoint MTP on that route); the continuous-batch route, the separate draft-model speculative
+route, and evidence-recording mode all fail closed with `completions_unsupported` (or
+`logprobs_unsupported` for a logprobs request) rather than silently mistreating raw text as an
+already-templated chat prompt or omitting values a caller asked for. As with the chat route, a
+`logprobs` request against the scalar route ITSELF still refuses with `logprobs_unsupported` when
+that scalar serve is running the compiled-fp16 path or in-checkpoint MTP speculative decoding — only
+a plain (native-cache, non-speculative) scalar decoder computes real values. An omitted `max_tokens` does
+not fall back to the legacy API's 16-token default — it uses the server's own completion-budget
+policy, the same one `/v1/chat/completions` applies when `max_completion_tokens` is omitted.
 
 Completion length is model- and host-fit-aware. The default request budget is 4,096 tokens, but it
 is not a global maximum: when `--max-completion-tokens` is omitted, the loaded model's authenticated

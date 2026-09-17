@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -100,5 +101,141 @@ private final class SucceedsOnceThenThrowsEvaluationModel: Module, LanguageModel
         let vocab = 4
         let logits = MLXArray.zeros([1, input.tokens.dim(1), vocab])
         return LMOutput(logits: logits)
+    }
+}
+
+/// Covers `MLXDecoder`'s `LogprobDecoding` conformance (`prefillWithLogprob`/`stepWithLogprob`):
+/// acceptance criteria (a) the reported logprob and top-N candidates are the REAL `logSoftmax` of
+/// the raw (pre-processor) logits, sorted strictly descending, finite-only, at most `topN` long;
+/// and (b) turning logprobs on changes nothing about which tokens get SELECTED — same seed/
+/// temperature/top-p must produce the identical sampled sequence as the no-logprobs path. Reuses
+/// this file's `AlwaysThrowingEvaluationModel`-style minimal `LanguageModel` fixture idiom.
+final class MLXDecoderLogprobComputationTests: XCTestCase {
+    /// Deliberately distinct, non-monotonic values (including a negative one) so argmax, the top-3
+    /// ranking, and the manual `logSoftmax` oracle below all pin down a UNIQUE, unambiguous answer.
+    private let fixedLogits: [Float] = [0.2, 3.0, -5.0, 1.0, 4.0, 2.5]
+
+    /// Pure-Swift oracle for `logSoftmax`, computed independently of MLX/MLXNN so this test does
+    /// not validate the production computation against itself.
+    private func manualLogSoftmax(_ logits: [Float]) -> [Float] {
+        let maxValue = logits.max()!
+        let shifted = logits.map { $0 - maxValue }
+        let sumExp = shifted.reduce(Float(0)) { $0 + Foundation.exp($1) }
+        let logSumExp = Foundation.log(sumExp)
+        return shifted.map { $0 - logSumExp }
+    }
+
+    func testPrefillWithLogprobMatchesManualLogSoftmaxAndSortsTopNDescending() throws {
+        var decoder = MLXDecoder(
+            model: FixedLogitsModel(logits: fixedLogits),
+            cache: [KVCacheSimple()])
+
+        let (token, logprob) = try decoder.prefillWithLogprob([1], topN: 3)
+        let expected = manualLogSoftmax(fixedLogits)
+
+        // The default sampler is `ArgMaxSampler`: it selects the largest raw logit — index 4 (4.0).
+        XCTAssertEqual(token, 4)
+        XCTAssertEqual(logprob.tokenID, token)
+        XCTAssertEqual(Double(logprob.logprob), Double(expected[4]), accuracy: 1e-5)
+
+        XCTAssertLessThanOrEqual(logprob.top.count, 3)
+        XCTAssertTrue(logprob.top.allSatisfy { $0.logprob.isFinite })
+        for i in 1..<logprob.top.count {
+            XCTAssertGreaterThan(logprob.top[i - 1].logprob, logprob.top[i].logprob)
+        }
+        // The top 3 raw logits are indices 4 (4.0), 1 (3.0), 5 (2.5), in that order.
+        XCTAssertEqual(logprob.top.map(\.tokenID), [4, 1, 5])
+        for candidate in logprob.top {
+            XCTAssertEqual(
+                Double(candidate.logprob), Double(expected[candidate.tokenID]), accuracy: 1e-5)
+        }
+    }
+
+    func testStepWithLogprobMatchesManualLogSoftmax() throws {
+        var decoder = MLXDecoder(
+            model: FixedLogitsModel(logits: fixedLogits),
+            cache: [KVCacheSimple()])
+        let first = try decoder.prefill([1])
+
+        let (token, logprob) = try decoder.stepWithLogprob(last: first, topN: 2)
+
+        let expected = manualLogSoftmax(fixedLogits)
+        XCTAssertEqual(token, 4)
+        XCTAssertEqual(Double(logprob.logprob), Double(expected[4]), accuracy: 1e-5)
+        XCTAssertEqual(logprob.top.map(\.tokenID), [4, 1])
+    }
+
+    func testTopNZeroReturnsNoCandidatesButStillReportsSampledLogprob() throws {
+        var decoder = MLXDecoder(
+            model: FixedLogitsModel(logits: fixedLogits),
+            cache: [KVCacheSimple()])
+
+        let (token, logprob) = try decoder.prefillWithLogprob([1], topN: 0)
+
+        XCTAssertEqual(token, 4)
+        XCTAssertTrue(logprob.top.isEmpty)
+        let expected = manualLogSoftmax(fixedLogits)
+        XCTAssertEqual(Double(logprob.logprob), Double(expected[4]), accuracy: 1e-5)
+    }
+
+    /// Acceptance (b): logprobs on vs off, same seed/temperature/top-p, must select the IDENTICAL
+    /// token sequence. `prefillWithLogprob`/`stepWithLogprob` SHARE `selectSampleAndAdvance` with
+    /// `prefill`/`step` (see `MLXDecoder.swift`), so this is a regression guard against a future
+    /// edit that duplicates instead of shares that code and drifts RNG consumption.
+    func testLogprobsOnVsOffProduceIdenticalSampledTokenSequence() throws {
+        let sampling = DecoderSampling.sampled(
+            temperature: 1.0, topP: 1.0, topK: nil, minP: nil, seed: 42)
+
+        var withoutLogprobs = MLXDecoder(
+            model: FixedLogitsModel(logits: fixedLogits),
+            cache: [KVCacheSimple()])
+        withoutLogprobs.setSampling(sampling)
+        var withoutTokens: [Int] = []
+        withoutTokens.append(try withoutLogprobs.prefill([1]))
+        withoutTokens.append(try withoutLogprobs.step(last: withoutTokens[0]))
+        withoutTokens.append(try withoutLogprobs.step(last: withoutTokens[1]))
+
+        var withLogprobs = MLXDecoder(
+            model: FixedLogitsModel(logits: fixedLogits),
+            cache: [KVCacheSimple()])
+        withLogprobs.setSampling(sampling)
+        var withTokens: [Int] = []
+        let first = try withLogprobs.prefillWithLogprob([1], topN: 3)
+        withTokens.append(first.token)
+        let second = try withLogprobs.stepWithLogprob(last: withTokens[0], topN: 3)
+        withTokens.append(second.token)
+        let third = try withLogprobs.stepWithLogprob(last: withTokens[1], topN: 3)
+        withTokens.append(third.token)
+
+        XCTAssertEqual(withoutTokens, withTokens)
+    }
+}
+
+/// A `LanguageModel` fixture returning the SAME fixed per-token logit vector at every position and
+/// every call, ignoring input entirely — deliberately simpler than a real forward pass so a test
+/// can assert an EXACT `logSoftmax` value against hand-computed Swift floating point, and so two
+/// independently constructed decoders driven through different call sequences (`prefill`/`step` vs
+/// `prefillWithLogprob`/`stepWithLogprob`) see byte-identical logits at every step.
+private final class FixedLogitsModel: Module, LanguageModel, KVCacheDimensionProvider {
+    let kvHeads: [Int] = [1]
+    let logits: [Float]
+
+    init(logits: [Float]) {
+        self.logits = logits
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func evaluateThrowing(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) throws -> LMOutput {
+        let seqLen = input.tokens.dim(1)
+        let row = MLXArray(logits)
+        let full = MLXArray.zeros([1, seqLen, logits.count]) + row
+        return LMOutput(logits: full)
     }
 }

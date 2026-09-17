@@ -277,6 +277,105 @@ final class InferenceActorTests: XCTestCase {
         XCTAssertEqual(summary.generatedTokenCount, 1)
         XCTAssertEqual(summary.finishReason, .endOfSequence)
     }
+
+    // MARK: - Logprobs plumbing (`logprobTopN`/`onLogprob`)
+
+    /// A non-nil `logprobTopN` against a decoder that does not conform to `LogprobDecoding`
+    /// (`ScriptedDecoder`) is refused with the specific error case, before any state mutation —
+    /// mirroring `DecoderSamplingCapabilityTests`'s R1/R2 shape for the sampling/penalties guards.
+    func testLogprobsRequestAgainstNonConformingDecoderThrowsLogprobsUnsupported() async throws {
+        let actor = InferenceActor(decoder: ScriptedDecoder(script: [5, 6, 2], eos: 2))
+
+        do {
+            _ = try await actor.generateBounded(
+                promptTokens: [1],
+                maxTokens: 10,
+                eos: 2,
+                logprobTopN: 3
+            ) { _ in .continueGeneration }
+            XCTFail("expected logprobsUnsupportedByDecoder")
+        } catch let error as InferenceActorError {
+            XCTAssertEqual(error, .logprobsUnsupportedByDecoder)
+        }
+    }
+
+    /// The SAME actor remains usable after a refused logprobs request — mirrors
+    /// `DecoderSamplingCapabilityTests.testActorRemainsUsableAfterARefusedSampledRequest`: the
+    /// guard must sit before `boundedGenerationActive = true`, never bricking the actor.
+    func testActorRemainsUsableAfterARefusedLogprobsRequest() async throws {
+        let actor = InferenceActor(decoder: ScriptedDecoder(script: [5, 6, 2], eos: 2))
+
+        do {
+            _ = try await actor.generateBounded(
+                promptTokens: [1], maxTokens: 10, eos: 2, logprobTopN: 3
+            ) { _ in .continueGeneration }
+            XCTFail("expected logprobsUnsupportedByDecoder")
+        } catch let error as InferenceActorError {
+            XCTAssertEqual(error, .logprobsUnsupportedByDecoder)
+        }
+
+        let recorder = TokenRecorder()
+        let summary = try await actor.generateBounded(
+            promptTokens: [1], maxTokens: 10, eos: 2
+        ) { token in
+            await recorder.append(token)
+            return .continueGeneration
+        }
+        let values = await recorder.values
+        XCTAssertEqual(values, [5, 6])
+        XCTAssertEqual(summary.finishReason, .endOfSequence)
+    }
+
+    /// A `logprobTopN: nil` request (every call site predating this parameter) against a decoder
+    /// that does NOT conform to `LogprobDecoding` still admits and generates normally — the guard
+    /// must gate on `logprobTopN` being non-nil, not merely on the decoder's capability, so the
+    /// zero-cost/unchanged default path is never accidentally narrowed to logprob-capable decoders
+    /// only.
+    func testNilLogprobTopNAgainstNonConformingDecoderStillAdmits() async throws {
+        let actor = InferenceActor(decoder: ScriptedDecoder(script: [5, 6, 2], eos: 2))
+
+        let recorder = TokenRecorder()
+        let summary = try await actor.generateBounded(
+            promptTokens: [1], maxTokens: 10, eos: 2, logprobTopN: nil
+        ) { token in
+            await recorder.append(token)
+            return .continueGeneration
+        }
+        let values = await recorder.values
+        XCTAssertEqual(values, [5, 6])
+        XCTAssertEqual(summary.finishReason, .endOfSequence)
+    }
+
+    /// A `LogprobDecoding`-conforming decoder admits a logprobs request, and `onLogprob` fires
+    /// EXACTLY once per GENERATED token (never for the intercepted stop token), each call
+    /// immediately BEFORE that token's own `consume` — the ordering the streaming carry-once rule
+    /// downstream (`ServingCore`/`ServingNIO`, already tested end-to-end against a fake backend)
+    /// depends on.
+    func testConformingDecoderDeliversOnLogprobBeforeConsumeForEveryGeneratedToken() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedLogprobDecoder(script: [5, 6, 2], eos: 2))
+        let events = EventRecorder()
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 10,
+            eos: 2,
+            logprobTopN: 2,
+            onLogprob: { logprob in
+                await events.append("logprob:\(logprob.tokenID)")
+            }
+        ) { token in
+            await events.append("consume:\(token)")
+            return .continueGeneration
+        }
+
+        let values = await events.values
+        XCTAssertEqual(
+            values,
+            ["logprob:5", "consume:5", "logprob:6", "consume:6"])
+        XCTAssertEqual(summary.finishReason, .endOfSequence)
+        XCTAssertEqual(summary.generatedTokenCount, 2)
+    }
 }
 
 private actor TokenRecorder {
@@ -288,6 +387,63 @@ private actor TokenRecorder {
 
     func append(_ token: Int) {
         tokens.append(token)
+    }
+}
+
+/// Records ordered string events from both `onLogprob` and `consume`, so a test can assert their
+/// RELATIVE ordering (not just that each fired) — see
+/// `testConformingDecoderDeliversOnLogprobBeforeConsumeForEveryGeneratedToken`.
+private actor EventRecorder {
+    private var events: [String] = []
+
+    var values: [String] {
+        events
+    }
+
+    func append(_ event: String) {
+        events.append(event)
+    }
+}
+
+/// Test double conforming to `LogprobDecoding`: replays a fixed script like `ScriptedDecoder`
+/// (never a real MLX computation — proving `InferenceActor`'s plumbing is correct independent of
+/// MLX, mirroring `ScriptedDecoder`'s own doc comment), and reports a synthetic
+/// `DecodedTokenLogprob` for each generated token so a test can assert `onLogprob` actually
+/// receives the token this decoder just selected.
+private struct ScriptedLogprobDecoder: LogprobDecoding {
+    let script: [Int]
+    let eos: Int
+    var i = 0
+
+    init(script: [Int], eos: Int) {
+        self.script = script
+        self.eos = eos
+    }
+
+    mutating func prefill(_ promptTokens: [Int]) -> Int {
+        defer { i += 1 }
+        return script[i]
+    }
+
+    mutating func step(last: Int) -> Int {
+        defer { i += 1 }
+        return script[i]
+    }
+
+    mutating func reset() { i = 0 }
+
+    mutating func prefillWithLogprob(
+        _ promptTokens: [Int], topN: Int
+    ) -> (token: Int, logprob: DecodedTokenLogprob) {
+        let token = prefill(promptTokens)
+        return (token, DecodedTokenLogprob(tokenID: token, logprob: Float(-token)))
+    }
+
+    mutating func stepWithLogprob(
+        last: Int, topN: Int
+    ) -> (token: Int, logprob: DecodedTokenLogprob) {
+        let token = step(last: last)
+        return (token, DecodedTokenLogprob(tokenID: token, logprob: Float(-token)))
     }
 }
 

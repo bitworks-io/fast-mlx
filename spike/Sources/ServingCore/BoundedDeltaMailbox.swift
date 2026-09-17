@@ -34,6 +34,15 @@ private final class PendingContinuationGate: Sendable {
 public enum ServingResponseDelta: Equatable, Sendable {
     case text(String)
     case toolCalls([OpenAIToolCall])
+    /// One or more newly generated tokens' logprobs, in generation order. Sent as its own delta
+    /// (never merged into `.text`) so a backend can report a token's logprob at the moment it is
+    /// generated even when the incremental detokenizer has not yet flushed any display text for
+    /// it — the HTTP layer buffers `.tokenLogprobs` deltas and attaches them to whichever `.text`/
+    /// `.toolCalls` delta it next emits a chunk for (see `OpenAIChatCompletionsHTTPHandler.stream`),
+    /// which is exactly the "carried to the next emitted chunk" streaming contract. A backend that
+    /// never sends `.tokenLogprobs` (logprobs not requested, or not supported) is byte-identical to
+    /// before this case existed.
+    case tokenLogprobs([ServingTokenLogprob])
     case completion(ServingGenerationCompletion)
 
     public var utf8ByteCount: Int {
@@ -54,6 +63,21 @@ public enum ServingResponseDelta: Equatable, Sendable {
                 count = saturatingAdd(
                     count,
                     jsonStringPayloadUpperBound(call.function.arguments))
+            }
+            return count
+        case .tokenLogprobs(let tokens):
+            // Conservative upper bound: per-token object overhead plus each candidate's own text —
+            // real payloads are far smaller (at most a handful of tokens, each with ≤ 20 candidates).
+            var count = 2  // array brackets
+            for token in tokens {
+                count = saturatingAdd(count, 80)
+                count = saturatingAdd(count, jsonStringPayloadUpperBound(token.tokenText))
+                count = saturatingAdd(count, token.tokenBytes.count * 4)
+                for candidate in token.topCandidates {
+                    count = saturatingAdd(count, 48)
+                    count = saturatingAdd(count, jsonStringPayloadUpperBound(candidate.tokenText))
+                    count = saturatingAdd(count, candidate.tokenBytes.count * 4)
+                }
             }
             return count
         case .completion:

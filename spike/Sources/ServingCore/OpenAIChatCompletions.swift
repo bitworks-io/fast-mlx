@@ -174,8 +174,14 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var includeUsage: Bool
     /// Sorted, deduplication-free list of accepted-but-ignored top-level field names present on
     /// this request (OpenAI SDK metadata such as `user`/`metadata`/`store`/`service_tier`, plus
-    /// neutral-valued semantic fields such as `logprobs:false`). Never carries field VALUES.
+    /// neutral-valued semantic fields such as `response_format:{"type":"text"}`). Never carries
+    /// field VALUES. `logprobs`/`top_logprobs` are never listed here even when present: a
+    /// validated request is HONORED (see `logprobsRequest`), not ignored.
     public var ignoredFields: [String]
+    /// Validated `logprobs`/`top_logprobs` request, or `nil` when logprobs were not requested — the
+    /// only state that leaves every existing response byte-for-byte unchanged. See
+    /// `ServingLogprobsRequest`'s doc comment for the chat vs. legacy-completions distinction.
+    public var logprobsRequest: ServingLogprobsRequest?
     /// `.chat` for every request decoded from `/v1/chat/completions` (the only value
     /// `decodeStrict` can ever produce). `.rawText(prompt)` is set exclusively by
     /// `OpenAICompletionRequest.asChatCompletionRequest()` for the legacy `/v1/completions` route —
@@ -204,6 +210,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         repetitionPenalty: Double? = nil,
         includeUsage: Bool = false,
         ignoredFields: [String] = [],
+        logprobsRequest: ServingLogprobsRequest? = nil,
         promptInput: ServingPromptInput = .chat
     ) {
         self.model = model
@@ -227,6 +234,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
+        self.logprobsRequest = logprobsRequest
         self.promptInput = promptInput
     }
 
@@ -344,10 +352,11 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
 
         // Neutral-valued semantic fields: accepted ONLY at the value that is equivalent to "not
         // requested", so a client that always sends its SDK defaults is not rejected, while a
-        // client asking for real structured-output/logprobs behavior this server cannot provide
-        // still gets a fail-closed 400 rather than a silently wrong response.
-        let logprobs = try optionalNeutralLogprobs(root["logprobs"])
-        let topLogprobs = try optionalNeutralTopLogprobs(root["top_logprobs"])
+        // client asking for real structured-output behavior this server cannot provide still gets a
+        // fail-closed 400 rather than a silently wrong response. `logprobs`/`top_logprobs` are a
+        // real, honored feature (see `decodeChatLogprobs`), not a neutral-only field.
+        let logprobsRequest = try decodeChatLogprobs(
+            logprobs: root["logprobs"], topLogprobs: root["top_logprobs"])
         let responseFormatPresent = try validateNeutralResponseFormat(root["response_format"])
         let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
 
@@ -358,8 +367,6 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         if metadata != nil { ignoredFields.append("metadata") }
         if store != nil { ignoredFields.append("store") }
         if serviceTier != nil { ignoredFields.append("service_tier") }
-        if logprobs != nil { ignoredFields.append("logprobs") }
-        if topLogprobs != nil { ignoredFields.append("top_logprobs") }
         if responseFormatPresent { ignoredFields.append("response_format") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
         ignoredFields.sort()
@@ -385,7 +392,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             frequencyPenalty: frequencyPenalty,
             repetitionPenalty: repetitionPenalty,
             includeUsage: includeUsage,
-            ignoredFields: ignoredFields)
+            ignoredFields: ignoredFields,
+            logprobsRequest: logprobsRequest)
     }
 
     public func requireLaunchedModel(_ launchedModel: String) throws {
@@ -419,8 +427,12 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
     public var repetitionPenalty: Double?
     public var includeUsage: Bool
     /// Same contract as `OpenAIChatCompletionRequest.ignoredFields`: sorted, dedup-free field
-    /// NAMES only (never values) for accepted-but-ignored top-level fields.
+    /// NAMES only (never values) for accepted-but-ignored top-level fields. `logprobs` is never
+    /// listed here even when present: a validated value is HONORED, not ignored.
     public var ignoredFields: [String]
+    /// Validated integer `logprobs` request (0...5), or `nil` when not requested. See
+    /// `ServingLogprobsRequest`'s doc comment.
+    public var logprobsRequest: ServingLogprobsRequest?
 
     public init(
         model: String,
@@ -437,7 +449,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         frequencyPenalty: Double? = nil,
         repetitionPenalty: Double? = nil,
         includeUsage: Bool = false,
-        ignoredFields: [String] = []
+        ignoredFields: [String] = [],
+        logprobsRequest: ServingLogprobsRequest? = nil
     ) {
         self.model = model
         self.prompt = prompt
@@ -454,6 +467,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         self.repetitionPenalty = repetitionPenalty
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
+        self.logprobsRequest = logprobsRequest
     }
 
     public static func decodeStrict(
@@ -528,7 +542,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
 
         let user = try optionalUser(root["user"])
         let metadata = try optionalMetadata(root["metadata"])
-        let logprobs = try optionalNeutralCompletionLogprobs(root["logprobs"])
+        let logprobsRequest = try decodeCompletionLogprobs(root["logprobs"])
         let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
         let echoPresent = try validateNeutralEcho(root["echo"])
         try rejectIfPresentSuffix(root["suffix"])
@@ -542,7 +556,6 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         var ignoredFields: [String] = []
         if user != nil { ignoredFields.append("user") }
         if metadata != nil { ignoredFields.append("metadata") }
-        if logprobs != nil { ignoredFields.append("logprobs") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
         if echoPresent { ignoredFields.append("echo") }
         ignoredFields.sort()
@@ -562,7 +575,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             frequencyPenalty: frequencyPenalty,
             repetitionPenalty: repetitionPenalty,
             includeUsage: includeUsage,
-            ignoredFields: ignoredFields)
+            ignoredFields: ignoredFields,
+            logprobsRequest: logprobsRequest)
     }
 
     /// Converts to the shared `OpenAIChatCompletionRequest` shape every serving backend consumes.
@@ -592,6 +606,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             repetitionPenalty: repetitionPenalty,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
+            logprobsRequest: logprobsRequest,
             promptInput: .rawText(prompt))
     }
 
@@ -650,7 +665,8 @@ public struct OpenAIChatCompletionResponse: Encodable, Sendable, Equatable {
         finishReason: OpenAIChatFinishReason,
         usage: OpenAIChatUsage,
         toolCalls: [OpenAIToolCall] = [],
-        reasoningContent: String? = nil
+        reasoningContent: String? = nil,
+        logprobs: OpenAIChatLogprobs? = nil
     ) {
         self.id = id
         self.created = created
@@ -663,7 +679,8 @@ public struct OpenAIChatCompletionResponse: Encodable, Sendable, Equatable {
                     content: content,
                     toolCalls: toolCalls.isEmpty ? nil : toolCalls,
                     reasoningContent: reasoningContent),
-                finishReason: finishReason)
+                finishReason: finishReason,
+                logprobs: logprobs)
         ]
         self.usage = usage
     }
@@ -672,11 +689,36 @@ public struct OpenAIChatCompletionResponse: Encodable, Sendable, Equatable {
         public var index: Int
         public var message: Message
         public var finishReason: OpenAIChatFinishReason
+        /// `nil` when logprobs were not requested — the choice then encodes with NO `logprobs` key
+        /// at all, byte-identical to before this field existed. Present with `content` populated
+        /// (possibly empty) when the request validated a `ServingLogprobsRequest.chat`.
+        public var logprobs: OpenAIChatLogprobs?
+
+        public init(
+            index: Int, message: Message, finishReason: OpenAIChatFinishReason,
+            logprobs: OpenAIChatLogprobs? = nil
+        ) {
+            self.index = index
+            self.message = message
+            self.finishReason = finishReason
+            self.logprobs = logprobs
+        }
 
         private enum CodingKeys: String, CodingKey {
             case index
             case message
             case finishReason = "finish_reason"
+            case logprobs
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(index, forKey: .index)
+            try container.encode(message, forKey: .message)
+            try container.encode(finishReason, forKey: .finishReason)
+            if let logprobs {
+                try container.encode(logprobs, forKey: .logprobs)
+            }
         }
     }
 
@@ -738,12 +780,15 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
         index: Int,
         delta: Delta,
         finishReason: OpenAIChatFinishReason?,
-        usage: OpenAIChatUsage? = nil
+        usage: OpenAIChatUsage? = nil,
+        logprobs: OpenAIChatLogprobs? = nil
     ) {
         self.id = id
         self.created = created
         self.model = model
-        self.choices = [Choice(index: index, delta: delta, finishReason: finishReason)]
+        self.choices = [
+            Choice(index: index, delta: delta, finishReason: finishReason, logprobs: logprobs)
+        ]
         self.usage = usage
     }
 
@@ -781,11 +826,27 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
         public var index: Int
         public var delta: Delta
         public var finishReason: OpenAIChatFinishReason?
+        /// Sibling of `delta`, matching OpenAI's real streaming shape (never nested inside
+        /// `delta`). `nil` when logprobs were not requested, or when this specific chunk carries no
+        /// newly generated tokens to report (e.g. the role-announcement chunk) — the choice then
+        /// encodes with NO `logprobs` key, byte-identical to before this field existed.
+        public var logprobs: OpenAIChatLogprobs?
+
+        public init(
+            index: Int, delta: Delta, finishReason: OpenAIChatFinishReason?,
+            logprobs: OpenAIChatLogprobs? = nil
+        ) {
+            self.index = index
+            self.delta = delta
+            self.finishReason = finishReason
+            self.logprobs = logprobs
+        }
 
         private enum CodingKeys: String, CodingKey {
             case index
             case delta
             case finishReason = "finish_reason"
+            case logprobs
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -796,6 +857,9 @@ public struct OpenAIChatCompletionChunk: Encodable, Sendable, Equatable {
                 try container.encode(finishReason, forKey: .finishReason)
             } else {
                 try container.encodeNil(forKey: .finishReason)
+            }
+            if let logprobs {
+                try container.encode(logprobs, forKey: .logprobs)
             }
         }
     }
@@ -862,7 +926,10 @@ public struct OpenAIChatCompletionUsageChunk: Encodable, Sendable, Equatable {
 
 /// Non-streaming response body for the legacy `POST /v1/completions` route: `object:"text_completion"`,
 /// a single `choices[0].text` (the full completion, verbatim — no reasoning split, no tool-call
-/// parsing), and `logprobs` always `null` (this server never computes per-token log-probabilities).
+/// parsing), and `logprobs` (an `OpenAICompletionLogprobs` object when the request validated a
+/// `ServingLogprobsRequest.completions`, `null` otherwise — this key is ALWAYS present, matching
+/// OpenAI's own legacy shape, unlike the chat route's `logprobs` key which is omitted entirely
+/// when absent).
 public struct OpenAITextCompletionResponse: Encodable, Sendable, Equatable {
     public var id: String
     public var object = "text_completion"
@@ -877,12 +944,13 @@ public struct OpenAITextCompletionResponse: Encodable, Sendable, Equatable {
         model: String,
         text: String,
         finishReason: OpenAIChatFinishReason,
-        usage: OpenAIChatUsage
+        usage: OpenAIChatUsage,
+        logprobs: OpenAICompletionLogprobs? = nil
     ) {
         self.id = id
         self.created = created
         self.model = model
-        self.choices = [Choice(index: 0, text: text, finishReason: finishReason)]
+        self.choices = [Choice(index: 0, text: text, finishReason: finishReason, logprobs: logprobs)]
         self.usage = usage
     }
 
@@ -909,6 +977,17 @@ public struct OpenAITextCompletionResponse: Encodable, Sendable, Equatable {
         public var index: Int
         public var text: String
         public var finishReason: OpenAIChatFinishReason
+        public var logprobs: OpenAICompletionLogprobs?
+
+        public init(
+            index: Int, text: String, finishReason: OpenAIChatFinishReason,
+            logprobs: OpenAICompletionLogprobs? = nil
+        ) {
+            self.index = index
+            self.text = text
+            self.finishReason = finishReason
+            self.logprobs = logprobs
+        }
 
         private enum CodingKeys: String, CodingKey {
             case index
@@ -921,7 +1000,11 @@ public struct OpenAITextCompletionResponse: Encodable, Sendable, Equatable {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(index, forKey: .index)
             try container.encode(text, forKey: .text)
-            try container.encodeNil(forKey: .logprobs)
+            if let logprobs {
+                try container.encode(logprobs, forKey: .logprobs)
+            } else {
+                try container.encodeNil(forKey: .logprobs)
+            }
             try container.encode(finishReason, forKey: .finishReason)
         }
     }
@@ -944,12 +1027,13 @@ public struct OpenAITextCompletionChunk: Encodable, Sendable, Equatable {
         model: String,
         text: String,
         finishReason: OpenAIChatFinishReason?,
-        usage: OpenAIChatUsage? = nil
+        usage: OpenAIChatUsage? = nil,
+        logprobs: OpenAICompletionLogprobs? = nil
     ) {
         self.id = id
         self.created = created
         self.model = model
-        self.choices = [Choice(index: 0, text: text, finishReason: finishReason)]
+        self.choices = [Choice(index: 0, text: text, finishReason: finishReason, logprobs: logprobs)]
         self.usage = usage
     }
 
@@ -987,6 +1071,17 @@ public struct OpenAITextCompletionChunk: Encodable, Sendable, Equatable {
         public var index: Int
         public var text: String
         public var finishReason: OpenAIChatFinishReason?
+        public var logprobs: OpenAICompletionLogprobs?
+
+        public init(
+            index: Int, text: String, finishReason: OpenAIChatFinishReason?,
+            logprobs: OpenAICompletionLogprobs? = nil
+        ) {
+            self.index = index
+            self.text = text
+            self.finishReason = finishReason
+            self.logprobs = logprobs
+        }
 
         private enum CodingKeys: String, CodingKey {
             case index
@@ -999,7 +1094,11 @@ public struct OpenAITextCompletionChunk: Encodable, Sendable, Equatable {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(index, forKey: .index)
             try container.encode(text, forKey: .text)
-            try container.encodeNil(forKey: .logprobs)
+            if let logprobs {
+                try container.encode(logprobs, forKey: .logprobs)
+            } else {
+                try container.encodeNil(forKey: .logprobs)
+            }
             if let finishReason {
                 try container.encode(finishReason, forKey: .finishReason)
             } else {
@@ -1656,16 +1755,18 @@ private func decodeCompletionPrompt(_ raw: Any?) throws -> String {
 }
 
 /// `logprobs` on the legacy completions route is an INTEGER (unlike chat's boolean) requesting the
-/// sampled token's logprob (and, if > 0, additional top-alternative logprobs) — even `0` asks for the
-/// sampled token's logprob, which this server cannot return. Only `null`/absent is accepted; any
-/// integer (including 0) fails closed.
-private func optionalNeutralCompletionLogprobs(_ raw: Any?) throws -> Int? {
+/// sampled token's logprob and, when `> 0`, that many additional top-alternative logprobs. `0`
+/// (unlike chat's `top_logprobs:0`) is a MEANINGFUL, distinct request: the sampled token's own
+/// logprob with NO alternatives — not "logprobs off". This server supports `0...5` (OpenAI's own
+/// legacy cap was 5); `null`/absent means not requested at all.
+private func decodeCompletionLogprobs(_ raw: Any?) throws -> ServingLogprobsRequest? {
     guard let raw, !(raw is NSNull) else { return nil }
-    guard (try optionalInt(raw, param: "logprobs")) == nil else {
+    guard let value = try optionalInt(raw, param: "logprobs") else { return nil }
+    guard (0...5).contains(value) else {
         throw OpenAIServingError.invalidRequest(
-            "Unsupported value for logprobs: only null/absent is supported", param: "logprobs")
+            "logprobs must be between 0 and 5", param: "logprobs")
     }
-    return nil
+    return .completions(topLogprobs: value)
 }
 
 /// `echo` is only accepted at its neutral value (`false`/absent) — echoing the prompt back into
@@ -1737,31 +1838,55 @@ private func optionalMetadata(_ raw: Any?) throws -> [String: String]? {
     return result
 }
 
-/// `logprobs` is accepted only at its OpenAI-default-equivalent value (`false`/absent). `true`
-/// would silently promise per-token log-probabilities this server does not compute, so it fails
-/// closed rather than returning a response missing data the caller explicitly asked for.
-private func optionalNeutralLogprobs(_ raw: Any?) throws -> Bool? {
-    guard let raw, !(raw is NSNull) else { return nil }
-    guard let value = raw as? Bool else {
-        throw OpenAIServingError.invalidRequest("logprobs must be a boolean", param: "logprobs")
+/// `logprobs` (boolean) requests per-token log-probabilities on `/v1/chat/completions`;
+/// `top_logprobs` (integer, OpenAI's own range 0...20) additionally requests that many top
+/// alternative tokens per position, and is only meaningful alongside `logprobs:true` — sending it
+/// without `logprobs:true` is a 400 on `top_logprobs`, matching OpenAI's own validation, not a
+/// silent ignore. `logprobs:false`/absent with no `top_logprobs` returns `nil`, the only state that
+/// leaves every existing response byte-for-byte unchanged.
+private func decodeChatLogprobs(logprobs rawLogprobs: Any?, topLogprobs rawTopLogprobs: Any?) throws
+    -> ServingLogprobsRequest?
+{
+    let logprobs: Bool?
+    if let rawLogprobs, !(rawLogprobs is NSNull) {
+        guard let value = rawLogprobs as? Bool else {
+            throw OpenAIServingError.invalidRequest("logprobs must be a boolean", param: "logprobs")
+        }
+        logprobs = value
+    } else {
+        logprobs = nil
     }
-    guard value == false else {
-        throw OpenAIServingError.invalidRequest(
-            "Unsupported value for logprobs: only false is supported", param: "logprobs")
+
+    let topLogprobs: Int?
+    if let rawTopLogprobs, !(rawTopLogprobs is NSNull) {
+        // `optionalInt` only returns `nil` when its input is Swift `nil`, which cannot happen here
+        // (this branch already filtered out absence and JSON `null`) — `?? 0` never actually fires,
+        // it just avoids force-unwrapping that invariant.
+        let decoded = try optionalInt(rawTopLogprobs, param: "top_logprobs") ?? 0
+        guard (0...20).contains(decoded) else {
+            throw OpenAIServingError.invalidRequest(
+                "top_logprobs must be between 0 and 20", param: "top_logprobs")
+        }
+        topLogprobs = decoded
+    } else {
+        topLogprobs = nil
     }
-    return value
+
+    return try finishChatLogprobs(logprobs: logprobs, topLogprobs: topLogprobs)
 }
 
-/// `top_logprobs` is only meaningful alongside `logprobs:true`, which this server rejects — so the
-/// only value it can honestly accept here is `0`/absent.
-private func optionalNeutralTopLogprobs(_ raw: Any?) throws -> Int? {
-    guard let raw, !(raw is NSNull) else { return nil }
-    guard let value = try optionalInt(raw, param: "top_logprobs") else { return nil }
-    guard value == 0 else {
-        throw OpenAIServingError.invalidRequest(
-            "Unsupported value for top_logprobs: only 0 is supported", param: "top_logprobs")
+private func finishChatLogprobs(logprobs: Bool?, topLogprobs: Int?) throws -> ServingLogprobsRequest? {
+    guard logprobs == true else {
+        // Only `top_logprobs > 0` without `logprobs:true` is rejected (OpenAI's own behavior,
+        // requested with this exact threshold) — `top_logprobs:0` alone is neutral (identical to
+        // omitting it entirely: zero alternatives is the same "not requested" state either way).
+        if let topLogprobs, topLogprobs > 0 {
+            throw OpenAIServingError.invalidRequest(
+                "top_logprobs requires logprobs:true", param: "top_logprobs")
+        }
+        return nil
     }
-    return value
+    return .chat(topLogprobs: topLogprobs ?? 0)
 }
 
 /// `response_format` is only accepted at its OpenAI-default-equivalent shape

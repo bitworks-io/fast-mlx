@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// Real decoder. Token selection is argmax (greedy) by default, or sampled when configured via
 /// `setSampling` (the vendored `TopPSampler` honoring temperature/top-p/top-k/min-p + optional
@@ -8,7 +9,7 @@ import MLXLMCommon
 /// the NEXT forward with asyncEval BEFORE reading the current token to CPU, so GPU compute
 /// overlaps the CPU-side .item() readback. Never call a blocking eval()+.item() in the hot path
 /// with nothing else in flight (that is the 7.3x stall this spike exists to avoid).
-public struct MLXDecoder: Decoder {
+public struct MLXDecoder: Decoder, LogprobDecoding {
     /// Prompt tokens per prefill forward. `prefill` runs the prompt through this many chunks
     /// rather than one whole-prompt forward, bounding the transient working set — for the
     /// `qwen4_exp` family the QSA indexer's O(Q·K) intermediate from a whole-prompt forward
@@ -80,6 +81,39 @@ public struct MLXDecoder: Decoder {
     }
 
     public mutating func prefill(_ promptTokens: [Int]) throws -> Int {
+        let last = try prefillRawLogits(promptTokens)
+        return try selectSampleAndAdvance(rawLogits: last)
+    }
+
+    /// Prefill the prompt through `selectSampleAndAdvance`'s SHARED token-selection code, then
+    /// additionally compute the selected token's real logprob from the SAME raw (pre-processor)
+    /// logits `prefill` itself would have used — see `LogprobDecoding`'s doc comment for why this
+    /// must never diverge in what gets selected, only in what gets reported alongside it.
+    public mutating func prefillWithLogprob(
+        _ promptTokens: [Int], topN: Int
+    ) throws -> (token: Int, logprob: DecodedTokenLogprob) {
+        let raw = try prefillRawLogits(promptTokens)
+        let token = try selectSampleAndAdvance(rawLogits: raw)
+        return (token, Self.decodedTokenLogprob(rawLogits: raw, sampledToken: token, topN: topN))
+    }
+
+    /// Given the last token, produce the next plus its real logprob — the `step` sibling of
+    /// `prefillWithLogprob`. Shares `selectSampleAndAdvance` with `step` for the same reason.
+    public mutating func stepWithLogprob(
+        last: Int, topN: Int
+    ) throws -> (token: Int, logprob: DecodedTokenLogprob) {
+        guard let logits = pendingLogits else {
+            fatalError("MLXDecoder.stepWithLogprob called before prefill")
+        }
+        let raw = logits[0..., -1, 0...]
+        let token = try selectSampleAndAdvance(rawLogits: raw)
+        return (token, Self.decodedTokenLogprob(rawLogits: raw, sampledToken: token, topN: topN))
+    }
+
+    /// Runs the chunked prefill forward and returns the FINAL chunk's last-position RAW logits
+    /// (`[1, vocab]`, before any processor/penalty runs) — the shared first half of both `prefill`
+    /// and `prefillWithLogprob`.
+    private mutating func prefillRawLogits(_ promptTokens: [Int]) throws -> MLXArray {
         let promptArray = MLXArray(promptTokens)
         processor?.prompt(promptArray) // seed the penalty context with the prompt tokens (full prompt, unchanged)
 
@@ -118,8 +152,17 @@ public struct MLXDecoder: Decoder {
         guard let lastChunkLogits else {
             preconditionFailure("prefill requires at least one prompt token")
         }
-        let last = lastChunkLogits[0..., -1, 0...] // [1, vocab] — final chunk only
-        let processed = processor?.process(logits: last) ?? last // penalties before selection
+        return lastChunkLogits[0..., -1, 0...] // [1, vocab] — final chunk only
+    }
+
+    /// Select (argmax or sampled), apply the pending penalty processor, submit the next forward
+    /// (submit-first lookahead), and return the readback token — the code SHARED by `prefill`/
+    /// `step` and their `*WithLogprob` siblings. `rawLogits` is `[1, vocab]`, BEFORE any processor
+    /// runs; callers that also need a logprob capture this same array before calling in, so the
+    /// logprob they report is guaranteed to describe the exact distribution this function selected
+    /// from.
+    private mutating func selectSampleAndAdvance(rawLogits: MLXArray) throws -> Int {
+        let processed = processor?.process(logits: rawLogits) ?? rawLogits // penalties before selection
         let next = sampler.sample(logits: processed) // [1] on GPU — argmax (greedy) or sampled
         processor?.didSample(token: next)
 
@@ -140,16 +183,61 @@ public struct MLXDecoder: Decoder {
             fatalError("MLXDecoder.step called before prefill")
         }
         let lastLogits = logits[0..., -1, 0...]
-        let processed = processor?.process(logits: lastLogits) ?? lastLogits
-        let next = sampler.sample(logits: processed)
-        processor?.didSample(token: next)
-        let nextIds = next.reshaped([1, 1])
-        let nextLogits = try model.evaluateThrowing(
-            LMInput.Text(tokens: nextIds), cache: cache, state: nil
-        ).logits // submit next
-        asyncEval(nextLogits)
-        pendingLogits = nextLogits
-        return next.item(Int.self)
+        return try selectSampleAndAdvance(rawLogits: lastLogits)
+    }
+
+    /// Computes the REAL per-step logprob from the RAW (pre-processor) logits — see
+    /// `LogprobDecoding`'s doc comment for the contract this mirrors one level up
+    /// (`ServingCore.ServingTokenLogprob`). `rawLogits` is `[1, vocab]`, the SAME slice
+    /// `selectSampleAndAdvance` was called with; `sampledToken` is the token IT ALREADY SELECTED —
+    /// this function runs strictly AFTER that selection, purely to REPORT that choice's raw
+    /// logprob, never to influence it.
+    ///
+    /// One `eval`, one small host transfer: only the sampled token's own logprob plus up to
+    /// `topN` candidate (id, logprob) pairs ever leave the GPU — never the full vocabulary row.
+    private static func decodedTokenLogprob(
+        rawLogits: MLXArray, sampledToken: Int, topN: Int
+    ) -> DecodedTokenLogprob {
+        // float32 before logSoftmax: models may emit float16/bfloat16 logits, and a half-precision
+        // log-softmax would report visibly rounded logprobs.
+        let flat = rawLogits.reshaped([rawLogits.size]).asType(.float32) // [vocab]
+        let vocab = flat.dim(0)
+        let logp = logSoftmax(flat, axis: -1) // [vocab], log-probabilities under the raw distribution
+        let n = max(0, min(topN, vocab))
+
+        let sampledLogprob = logp[sampledToken]
+        var topIDs: MLXArray?
+        var topVals: MLXArray?
+        if n > 0 {
+            // `argPartition(kth: vocab - n)` puts the top `n` values (by index, unsorted) at
+            // indices `[vocab - n, vocab)` — see its doc comment. Gathering just those `n`
+            // indices/values, rather than sorting the whole vocabulary, is what keeps this a
+            // small host transfer regardless of vocabulary size.
+            let partitioned = argPartition(logp, kth: vocab - n, axis: -1)
+            let ids = partitioned[(vocab - n)...]
+            topIDs = ids
+            topVals = logp[ids]
+        }
+
+        // ONE eval call for everything this function needs on the host, whether or not `topN > 0`.
+        if let topVals, let topIDs {
+            eval(sampledLogprob, topVals, topIDs)
+        } else {
+            eval(sampledLogprob)
+        }
+
+        let sampledValue = sampledLogprob.item(Float.self)
+        var candidates: [DecodedTokenLogprobCandidate] = []
+        if let topVals, let topIDs {
+            let ids = topIDs.asArray(Int32.self)
+            let values = topVals.asArray(Float.self)
+            candidates =
+                zip(ids, values)
+                .map { DecodedTokenLogprobCandidate(tokenID: Int($0), logprob: $1) }
+                .filter { $0.logprob.isFinite } // -infinity marks a masked-out vocabulary entry
+                .sorted { $0.logprob > $1.logprob }
+        }
+        return DecodedTokenLogprob(tokenID: sampledToken, logprob: sampledValue, top: candidates)
     }
 
     /// Rebuild the selected KV cache family and drop any pending lookahead. The factory is already

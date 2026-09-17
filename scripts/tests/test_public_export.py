@@ -102,9 +102,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # 2026-09-16, 924 -> 925: adds scripts/tests/fixtures/quality-guides.sample.json. The projected
 # test_public_site.py quality-guide tests read it, so without it public CI errors (caught by
 # running the suite inside a fresh export). Same four public cards as site/quality-guides.json.
+# 2026-09-16, 925 -> 927: adds spike/Sources/ServingCore/ServingLogprobs.swift and
+# spike/Tests/ServingCoreTests/ServingLogprobsTests.swift (OpenAI logprobs request/response
+# plumbing). Conscious decision to publish: both are family-neutral serving source/tests and
+# reference no host, credential, competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 925,
-    "pathModeSha256": "c5e25967b667f9ca4b2e2eaed36413e8fcef4798c793dd0998af1dbad8b1eab6",
+    "pathCount": 927,
+    "pathModeSha256": "ba0e7717e312aeb8ce2c1818d7941da83bec8dc7a95b7f73ab8d8d10ad6cffe6",
 }
 
 
