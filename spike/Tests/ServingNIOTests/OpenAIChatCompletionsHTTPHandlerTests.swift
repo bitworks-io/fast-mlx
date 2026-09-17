@@ -413,6 +413,126 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    /// Deterministic reproduction of
+    /// `docs/task-inbox/2026-09-16-keepalive-next-request-race-closes-connection.md`: the first
+    /// request's final response bytes are fully flushed (`collectResponse` below returns) before the
+    /// second request's head is delivered, but the handler's own request-finishing bookkeeping is
+    /// parked at `responseCompletionTestHook` -- exactly the window between "client can see the
+    /// full response" and "this connection is ready for a new request" -- until this test releases
+    /// it. Before the fix, `receiveHead` still finds a non-terminal `activeControl` for the first
+    /// request in that window and treats the second head as a concurrent request, closing the
+    /// connection out from under it.
+    func testSecondKeepAliveRequestArrivingWhileFirstResponseFinishesIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        // The handler installs ONE hook shared by every generation it runs on this connection --
+        // only the FIRST request (the one this test races against) should park on `raceGate`. The
+        // second request's own hook call must be a no-op, or it would block forever on a gate this
+        // test only ever releases once.
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2),
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            responseCompletionTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .ok)
+        XCTAssertTrue(first.body.contains(#""content":"hello""#))
+
+        // The client has now received the complete first response. The first request's own
+        // generation task is parked exactly at the race window (see the hook's own doc comment).
+        await waitUntil { await raceGate.isWaiting }
+
+        // Deliver the second keep-alive request's head+body+end while that window is still open.
+        // Before the fix, this throws `ChannelError.ioOnClosedChannel` (from the closed-channel
+        // guard `receiveHead` takes because `activeControl` is not yet terminal) instead of
+        // reaching the assertions below.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
+    /// Deterministic reproduction of the SECOND, narrower keep-alive race window described in
+    /// `docs/task-inbox/2026-09-16-keepalive-next-request-race-closes-connection.md`: even with
+    /// `control.markTerminal()` moved before `started.lease.complete()` (verified by
+    /// `testSecondKeepAliveRequestArrivingWhileFirstResponseFinishesIsNotDropped` above), the
+    /// generation `Task`'s resumption after the final response write's own internal `await` (on
+    /// the NIO write promise inside `writePart`) is scheduled independently of "the write's bytes
+    /// reached the client" -- see `finalWriteRaceTestHook`'s doc comment on
+    /// `OpenAIChatCompletionsHTTPHandler` for exactly where that gap comes from. This test parks
+    /// the FIRST request's generation task inside `writePart`'s own write-completion callback --
+    /// strictly earlier than where the test above parks -- so `collectResponse` can observe the
+    /// complete first response while `control.markTerminal()` (called from `writeFinalPart`, ahead
+    /// of the write in the fixed version, but not reached at all yet in this parked state) has not
+    /// yet run. Before the `writeFinalPart` fix, this reliably throws
+    /// `ChannelError.ioOnClosedChannel` when the second request's head is delivered; after the fix,
+    /// `control.isTerminal` is already `true` before this hook ever fires (the write has not even
+    /// started), so the second request succeeds regardless of how long this hook parks.
+    func testSecondKeepAliveRequestDuringFinalWriteCompletionIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        // Same one-hook-per-connection, only-the-first-call-parks shape as
+        // `testSecondKeepAliveRequestArrivingWhileFirstResponseFinishesIsNotDropped` above -- the
+        // second request's own final-write completion must not block forever on a gate this test
+        // only ever releases once.
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["hel", "lo"], promptTokens: 3, completionTokens: 2),
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            finalWriteRaceTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .ok)
+        XCTAssertTrue(first.body.contains(#""content":"hello""#))
+
+        // The client has now received the complete first response, but the first request's
+        // generation task is parked inside `writePart`'s write-completion callback, strictly
+        // before `writeFinalPart`'s `control.markTerminal()` call can be reached (see the fix:
+        // `control.markTerminal()` now runs BEFORE this write is even initiated, so by the time
+        // this hook fires, `control.isTerminal` is already `true`).
+        await waitUntil { await raceGate.isWaiting }
+
+        // Deliver the second keep-alive request's head+body+end while that window is still open.
+        // Before the fix, this throws `ChannelError.ioOnClosedChannel`.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
     func testStreamingRequestReturnsOrderedSSEAndExactlyOneDone() async throws {
         let backend = ScriptedBackend(scripts: [
             .completed(
@@ -3280,13 +3400,17 @@ private struct CollectedResponse {
 
 private func makeChannel(
     backend: any ServingGenerationBackend,
-    configuration: ServingHTTPConfiguration = defaultConfiguration()
+    configuration: ServingHTTPConfiguration = defaultConfiguration(),
+    responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
+    finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
 ) async throws -> NIOAsyncTestingChannel {
     try await NIOAsyncTestingChannel { channel in
         try channel.pipeline.syncOperations.addHandler(
             OpenAIChatCompletionsHTTPHandler(
                 configuration: configuration,
-                backend: backend))
+                backend: backend,
+                responseCompletionTestHook: responseCompletionTestHook,
+                finalWriteRaceTestHook: finalWriteRaceTestHook))
     }
 }
 
@@ -3857,6 +3981,28 @@ private final class LogprobsScriptedBackend: ServingGenerationBackend, Sendable 
 }
 
 private actor DelayedCancellationGate {
+    private(set) var isWaiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        isWaiting = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+/// Deterministically parks `OpenAIChatCompletionsHTTPHandler`'s `responseCompletionTestHook` --
+/// exactly the point after a keep-alive response's final bytes have been flushed to the client --
+/// until a test explicitly releases it. Same wait/isWaiting/release shape as
+/// `DelayedCancellationGate` (which parks a lease's cancellation callback instead), kept as its own
+/// type so its name doesn't imply cancellation semantics at this different call site.
+private actor ResponseCompletionRaceGate {
     private(set) var isWaiting = false
     private var continuation: CheckedContinuation<Void, Never>?
 
