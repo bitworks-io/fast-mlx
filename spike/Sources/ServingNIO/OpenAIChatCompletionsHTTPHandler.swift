@@ -709,7 +709,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             configuration: configuration,
             channel: channel,
             control: control,
-            requestLogPreamble: requestLogPreamble)
+            requestLogPreamble: requestLogPreamble,
+            finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
     private func writeError(
@@ -891,7 +892,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
-        requestLogPreamble: ServingRequestLogPreamble? = nil
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) -> Task<Void, Never> {
         Task.detached {
             await runMetrics(
@@ -899,7 +901,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 configuration: configuration,
                 channel: channel,
                 control: control,
-                requestLogPreamble: requestLogPreamble)
+                requestLogPreamble: requestLogPreamble,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
         }
     }
 
@@ -908,8 +911,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
-        requestLogPreamble: ServingRequestLogPreamble? = nil
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async {
+        // Redundant-but-harmless safety net -- see the matching comment on `runGeneration`'s own
+        // `control.markTerminal()` call. Every return path below now routes its final response part
+        // through `writeFinalPart` (directly, or via `writeServingFailure`/`writeMetricsFailure`),
+        // which marks `control` terminal BEFORE that write is even initiated -- see
+        // `writeFinalPart`'s own doc comment for why that ordering, not this `defer`, is what
+        // actually closes the keep-alive race for `/metrics`.
         defer {
             control.markTerminal()
         }
@@ -921,7 +931,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 keepAlive: keepAlive,
                 configuration: configuration,
                 channel: channel,
-                requestLogPreamble: requestLogPreamble)
+                control: control,
+                requestLogPreamble: requestLogPreamble,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             return
         }
 
@@ -946,7 +958,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 keepAlive: keepAlive,
                 configuration: configuration,
                 channel: channel,
-                requestLogPreamble: requestLogPreamble)
+                control: control,
+                requestLogPreamble: requestLogPreamble,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             return
         }
 
@@ -956,7 +970,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 contentType: "text/plain; version=0.0.4; charset=utf-8",
                 keepAlive: keepAlive,
                 channel: channel,
-                timeout: configuration.backpressureStallTimeout)
+                control: control,
+                timeout: configuration.backpressureStallTimeout,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
@@ -1248,13 +1264,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 responseStarted: responseStarted,
                 keepAlive: keepAlive,
                 channel: channel,
+                control: control,
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
                 requestLogRequestID: handle?.responseID ?? requestLogID,
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
-                requestLogIgnoredFields: request.ignoredFields)
+                requestLogIgnoredFields: request.ignoredFields,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
@@ -1264,13 +1282,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 admissionError,
                 keepAlive: keepAlive,
                 channel: channel,
+                control: control,
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
                 requestLogRequestID: handle?.responseID ?? requestLogID,
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
-                requestLogIgnoredFields: request.ignoredFields)
+                requestLogIgnoredFields: request.ignoredFields,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
@@ -1323,13 +1343,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
+                    control: control,
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
                     requestLogRequestID: handle?.responseID ?? requestLogID,
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
-                    requestLogIgnoredFields: request.ignoredFields)
+                    requestLogIgnoredFields: request.ignoredFields,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -1358,13 +1380,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
+                    control: control,
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
                     requestLogRequestID: handle?.responseID ?? requestLogID,
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
-                    requestLogIgnoredFields: request.ignoredFields)
+                    requestLogIgnoredFields: request.ignoredFields,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 await control.cancellation.cancel(
                     writeCancellation ?? .responseLimitExceeded)
             case .writeFailure:
@@ -1387,13 +1411,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
+                    control: control,
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
                     requestLogRequestID: handle?.responseID ?? requestLogID,
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
-                    requestLogIgnoredFields: request.ignoredFields)
+                    requestLogIgnoredFields: request.ignoredFields,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -1403,13 +1429,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     responseStarted: responseStarted,
                     keepAlive: keepAlive,
                     channel: channel,
+                    control: control,
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
                     requestLogRequestID: handle?.responseID ?? requestLogID,
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
-                    requestLogIgnoredFields: request.ignoredFields)
+                    requestLogIgnoredFields: request.ignoredFields,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 {
                     await control.cancellation.cancel(writeCancellation)
                 }
@@ -1427,13 +1455,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 responseStarted: responseStarted,
                 keepAlive: keepAlive,
                 channel: channel,
+                control: control,
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
                 requestLogRequestID: handle?.responseID ?? requestLogID,
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
-                requestLogIgnoredFields: request.ignoredFields)
+                requestLogIgnoredFields: request.ignoredFields,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             {
                 await control.cancellation.cancel(writeCancellation)
             }
@@ -1939,7 +1969,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         contentType: String,
         keepAlive: Bool,
         channel: any Channel,
-        timeout: Duration
+        control: ServingTransportRequestControl,
+        timeout: Duration,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async throws {
         let data = Data(text.utf8)
         var headers = HTTPHeaders()
@@ -1956,7 +1988,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
         var buffer = channel.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)
         try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
-        try await writePart(.end(nil), channel: channel, timeout: timeout)
+        try await writeFinalPart(
+            control: control,
+            channel: channel,
+            timeout: timeout,
+            finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
     static func waitUntilWritable(
@@ -2002,11 +2038,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
     /// scheduling dependency entirely: `control.markTerminal()` writes through a lock (see
     /// `ServingTransportRequestControl`), so the flag is visible to `receiveHead` on any thread as
     /// soon as this call returns, no matter which executor later processes the write or resumes
-    /// this `async` task. The only two callers are `writeJSONResponse` and `writeSSETerminal`, both
-    /// exclusively for a successful generation's terminal response part; failure responses
-    /// (`writeFailureIfPossible`/`writeServingFailure`/`writeAdmissionFailure`) and the `/metrics`
-    /// handler still mark terminal the old way and are tracked as open follow-ups in the task-inbox
-    /// doc above.
+    /// this `async` task. Callers: `writeJSONResponse`/`writeSSETerminal` for a successful
+    /// generation's terminal response part; `writeTextResponse` (the `/metrics` success body); and
+    /// the not-yet-`responseStarted` branches of `writeFailureIfPossible`/`writeServingFailure`
+    /// (shared by `writeMetricsFailure`) /`writeAdmissionFailure` -- every one of those failure
+    /// writers previously marked terminal only through `runGeneration`'s (or `runMetrics`'s)
+    /// top-level `defer`, which runs long after the response is visible to the client, so those were
+    /// actually a WIDER version of this same race, not a narrower one. A response-started (mid-SSE)
+    /// failure always closes the connection instead and is unaffected by this race, so it is not
+    /// routed through here.
     static func writeFinalPart(
         control: ServingTransportRequestControl,
         channel: any Channel,
@@ -2118,13 +2158,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
         responseStarted: Bool,
         keepAlive: Bool,
         channel: any Channel,
+        control: ServingTransportRequestControl,
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         requestLogRequestID: String? = nil,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
-        requestLogIgnoredFields: [String] = []
+        requestLogIgnoredFields: [String] = [],
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async -> ServingCancellationReason? {
         let error = OpenAIErrorEnvelope(
             error: OpenAIServingError.server(
@@ -2150,6 +2192,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
         do {
             let data = try JSONEncoder.openAI.encode(error)
             if responseStarted {
+                // A mid-stream failure (SSE head already sent) always closes the connection below —
+                // unaffected by the keep-alive race, since there is no next request to accept. Keep
+                // marking `control` terminal the old way (via `runGeneration`'s top-level `defer`);
+                // reusing `writeFinalPart` here would be a no-op change in behavior, not a fix.
                 let event = "data: \(String(decoding: data, as: UTF8.self))\n\n"
                 try await writeBody(event, channel: channel, timeout: timeout)
                 try await writePart(.end(nil), channel: channel, timeout: timeout)
@@ -2172,7 +2218,17 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     .body(.byteBuffer(body)),
                     channel: channel,
                     timeout: timeout)
-                try await writePart(.end(nil), channel: channel, timeout: timeout)
+                // Not yet started (no response bytes sent): this is the keep-alive-preserving case
+                // the race in `docs/task-inbox/2026-09-16-keepalive-next-request-race-closes-connection.md`
+                // covers. Route the final part through `writeFinalPart`, exactly like a successful
+                // response's `writeJSONResponse`/`writeSSETerminal`, so `control` is marked terminal
+                // before this write is even initiated instead of only much later in `runGeneration`'s
+                // top-level `defer`.
+                try await writeFinalPart(
+                    control: control,
+                    channel: channel,
+                    timeout: timeout,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 if !keepAlive {
                     await close(channel)
                 }
@@ -2214,13 +2270,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
         responseStarted: Bool,
         keepAlive: Bool,
         channel: any Channel,
+        control: ServingTransportRequestControl,
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         requestLogRequestID: String? = nil,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
-        requestLogIgnoredFields: [String] = []
+        requestLogIgnoredFields: [String] = [],
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async -> ServingCancellationReason? {
         let status = servingErrorHTTPStatus(error)
         // `configuration` is `nil` only when a caller has nothing to log (never constructed for a
@@ -2250,6 +2308,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
             let data = try JSONEncoder.openAI.encode(
                 OpenAIErrorEnvelope(error: error.openAIError))
             if responseStarted {
+                // A mid-stream failure always closes the connection below -- see the matching
+                // comment in `writeFailureIfPossible`; unaffected by the keep-alive race.
                 let event = "data: \(String(decoding: data, as: UTF8.self))\n\n"
                 try await writeBody(event, channel: channel, timeout: timeout)
                 try await writePart(.end(nil), channel: channel, timeout: timeout)
@@ -2272,7 +2332,14 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     .body(.byteBuffer(body)),
                     channel: channel,
                     timeout: timeout)
-                try await writePart(.end(nil), channel: channel, timeout: timeout)
+                // Not yet started -- see the matching comment in `writeFailureIfPossible`: route the
+                // final part through `writeFinalPart` so `control` is marked terminal before this
+                // write is initiated instead of only in `runGeneration`'s top-level `defer`.
+                try await writeFinalPart(
+                    control: control,
+                    channel: channel,
+                    timeout: timeout,
+                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 if !keepAlive {
                     await close(channel)
                 }
@@ -2300,16 +2367,20 @@ private extension OpenAIChatCompletionsHTTPHandler {
         keepAlive: Bool,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
-        requestLogPreamble: ServingRequestLogPreamble? = nil
+        control: ServingTransportRequestControl,
+        requestLogPreamble: ServingRequestLogPreamble? = nil,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async {
         let _ = await writeServingFailure(
             .server(message, code: code),
             responseStarted: false,
             keepAlive: keepAlive,
             channel: channel,
+            control: control,
             timeout: configuration.backpressureStallTimeout,
             configuration: configuration,
-            requestLogPreamble: requestLogPreamble)
+            requestLogPreamble: requestLogPreamble,
+            finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
     /// OpenAI's legacy `/v1/completions` response ids use the `cmpl-` prefix, distinct from chat's
@@ -2354,13 +2425,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
         _ admissionError: ServingBackendAdmissionError,
         keepAlive: Bool,
         channel: any Channel,
+        control: ServingTransportRequestControl,
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         requestLogRequestID: String? = nil,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
-        requestLogIgnoredFields: [String] = []
+        requestLogIgnoredFields: [String] = [],
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async -> ServingCancellationReason? {
         let payload: OpenAIErrorPayload
         let status: HTTPResponseStatus
@@ -2422,7 +2495,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 .body(.byteBuffer(body)),
                 channel: channel,
                 timeout: timeout)
-            try await writePart(.end(nil), channel: channel, timeout: timeout)
+            // Admission failures never have a response already in flight -- always the
+            // keep-alive-preserving case (see `writeFailureIfPossible`'s matching comment). Route
+            // the final part through `writeFinalPart` so `control` is marked terminal before this
+            // write is initiated instead of only in `runGeneration`'s top-level `defer`.
+            try await writeFinalPart(
+                control: control,
+                channel: channel,
+                timeout: timeout,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
             if !keepAlive {
                 await close(channel)
             }

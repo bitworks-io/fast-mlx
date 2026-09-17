@@ -533,6 +533,194 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    /// Extends the keep-alive race coverage above to `writeAdmissionFailure`: an admission rejection
+    /// (backend never started a generation) still writes a complete, connection-preserving response,
+    /// so it is subject to the exact same race described in
+    /// `docs/task-inbox/2026-09-16-keepalive-next-request-race-closes-connection.md`. Before the
+    /// fix, `writeAdmissionFailure` marked `control` terminal only via `runGeneration`'s top-level
+    /// `defer` -- which runs long after this response is visible to the client -- so this window was
+    /// actually WIDER than the success-path window the two tests above close. Parks at
+    /// `finalWriteRaceTestHook`, the same seam `testSecondKeepAliveRequestDuringFinalWriteCompletionIsNotDropped`
+    /// uses, now reused by `writeAdmissionFailure`'s own final-part write.
+    func testSecondKeepAliveRequestDuringAdmissionFailureFinalWriteCompletionIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let backend = ScriptedBackend(scripts: [
+            .admissionRejected(.queueFull(retryAfterSeconds: 1)),
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            finalWriteRaceTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .tooManyRequests)
+
+        // The client has now received the complete admission-failure response, but the request's
+        // own finishing task is parked inside `writePart`'s write-completion callback, strictly
+        // before `writeFinalPart`'s `control.markTerminal()` can be reached pre-fix.
+        await waitUntil { await raceGate.isWaiting }
+
+        // Before the fix, this throws `ChannelError.ioOnClosedChannel`.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
+    /// Extends the keep-alive race coverage to `writeServingFailure`'s not-yet-`responseStarted`
+    /// branch: a typed `OpenAIServingError` thrown from `backend.start` (before any response bytes
+    /// are written) still writes a complete, connection-preserving error response. Same shape and
+    /// same pre-fix failure mode as the admission-failure test above -- see its doc comment.
+    func testSecondKeepAliveRequestDuringServingFailureFinalWriteCompletionIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let backend = ScriptedBackend(scripts: [
+            .servingError(.server("Backend refused", code: "backend_refused")),
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            finalWriteRaceTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .internalServerError)
+
+        await waitUntil { await raceGate.isWaiting }
+
+        // Before the fix, this throws `ChannelError.ioOnClosedChannel`.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
+    /// Extends the keep-alive race coverage to `writeFailureIfPossible`'s not-yet-`responseStarted`
+    /// branch: an untyped error thrown from `backend.start` (landing in `runGeneration`'s catch-all,
+    /// before any response bytes are written) still writes a complete, connection-preserving 500.
+    /// Same shape and same pre-fix failure mode as the two tests above.
+    func testSecondKeepAliveRequestDuringUntypedFailureFinalWriteCompletionIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let backend = ScriptedBackend(scripts: [
+            .untypedFailure,
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            finalWriteRaceTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeRequest(channel, body: requestBody(stream: false))
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .internalServerError)
+
+        await waitUntil { await raceGate.isWaiting }
+
+        // Before the fix, this throws `ChannelError.ioOnClosedChannel`.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 2)
+
+        _ = try await channel.finish()
+    }
+
+    /// Extends the keep-alive race coverage to the `/metrics` route: `runMetrics` only ever marked
+    /// `control` terminal via its own top-level `defer`, which -- like `runGeneration`'s -- runs
+    /// after the response is already visible to the client. `writeTextResponse` (the success body)
+    /// now routes its final part through `writeFinalPart` the same way `writeJSONResponse` does,
+    /// closing the window before a second, unrelated (chat) keep-alive request arrives.
+    func testSecondKeepAliveRequestDuringMetricsFinalWriteCompletionIsNotDropped() async throws {
+        let raceGate = ResponseCompletionRaceGate()
+        let hookCallCount = OSAllocatedUnfairLock(initialState: 0)
+        let snapshot = try emptyResourceSnapshot()
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: { snapshot },
+                record: { _ in },
+                reportFailure: { _ in }))
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["again"], promptTokens: 4, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(
+            backend: backend,
+            configuration: configuration,
+            finalWriteRaceTestHook: {
+                let isFirstCall = hookCallCount.withLock { count -> Bool in
+                    count += 1
+                    return count == 1
+                }
+                if isFirstCall {
+                    await raceGate.wait()
+                }
+            })
+
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        let first = try await collectResponse(from: channel)
+        XCTAssertEqual(first.head.status, .ok)
+
+        // The client has now received the complete metrics response, but `runMetrics` is parked
+        // inside `writePart`'s write-completion callback, strictly before `control.markTerminal()`
+        // can be reached pre-fix.
+        await waitUntil { await raceGate.isWaiting }
+
+        // A second, unrelated (chat) keep-alive request in the same window. Before the fix, this
+        // throws `ChannelError.ioOnClosedChannel`.
+        try await writeRequest(channel, body: requestBody(stream: false))
+        await raceGate.release()
+
+        let second = try await collectResponse(from: channel)
+        XCTAssertEqual(second.head.status, .ok)
+        XCTAssertTrue(second.body.contains(#""content":"again""#))
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+
+        _ = try await channel.finish()
+    }
+
     func testStreamingRequestReturnsOrderedSSEAndExactlyOneDone() async throws {
         let backend = ScriptedBackend(scripts: [
             .completed(
