@@ -134,6 +134,35 @@ public struct ScalarServingBackendConfiguration: Sendable {
     /// decoder/`InferenceActor` layer. Defaults `nil`, preserving today's `defaults: nil` behavior
     /// (and every other serving route's construction, which never sets this field) byte-for-byte.
     public var samplingDefaults: ServingSamplingDefaults?
+    /// Load-time `response_format: json_object` support for this checkpoint's tokenizer (see
+    /// `loadScalarServingJSONObjectConstraintSupport`'s doc comment for the disablement
+    /// enumeration), or `nil` when unsupported/not attempted (including: not even tried, because
+    /// the route was already speculative — see `isNonSpeculativeScalarRoute`). Combined with
+    /// `isNonSpeculativeScalarRoute` AND `decoderSupportsResponseFormatConstraint` (all three must
+    /// hold) to compute `ScalarServingBackend.supportsJSONObjectResponseFormat`. Defaults `nil`:
+    /// every existing construction site keeps compiling and behaving unchanged (capability stays
+    /// `false`).
+    public var jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport?
+    /// Whether the decoder THIS backend was constructed with is the plain, non-speculative scalar
+    /// `MLXDecoder` route — `false` for the compiled-fp16 route and for the in-checkpoint MTP
+    /// speculative route, per the response-format design's "MTP eligibility cannot see this
+    /// processor" rule. Set by `loadScalarServingModel` from `scalarServingIsNonSpeculativeScalarRoute`.
+    /// Defaults `false` (FAIL CLOSED, not open): a construction site that does not explicitly opt
+    /// in must not silently gain the capability. Every existing construction site (which also
+    /// leaves `jsonObjectConstraintSupport`/`decoderSupportsResponseFormatConstraint` at their own
+    /// `nil`/`false` defaults) still computes the same `false` capability as before this field
+    /// existed, so this default is safe as well as fail-closed, not merely convenient.
+    public var isNonSpeculativeScalarRoute: Bool
+    /// Whether the CONCRETE decoder bound inside this backend's `InferenceActor` reports
+    /// `Decoder.supportsResponseFormatConstraint == true` (queried via `InferenceActor.
+    /// supportsResponseFormatConstraint()` and captured by the caller before this configuration is
+    /// handed to `ScalarServingBackend.init`). A second, independent check alongside
+    /// `isNonSpeculativeScalarRoute`: that flag records which ROUTE was selected at load, this one
+    /// records what the ACTUAL bound decoder instance says about itself — so a route
+    /// misclassification, or a decoder that predates this capability, cannot silently readmit
+    /// `json_object` just because the route flag alone said "non-speculative". Defaults `false`
+    /// (fail closed), matching `isNonSpeculativeScalarRoute`'s own default reasoning.
+    public var decoderSupportsResponseFormatConstraint: Bool
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -145,7 +174,10 @@ public struct ScalarServingBackendConfiguration: Sendable {
         thinksByDefault: Bool = false,
         modelCapabilities: ServingModelCapabilities? = nil,
         rejectedPromptTokenIDs: Set<Int> = [],
-        samplingDefaults: ServingSamplingDefaults? = nil
+        samplingDefaults: ServingSamplingDefaults? = nil,
+        jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
+        isNonSpeculativeScalarRoute: Bool = false,
+        decoderSupportsResponseFormatConstraint: Bool = false
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -166,6 +198,9 @@ public struct ScalarServingBackendConfiguration: Sendable {
         self.modelCapabilities = modelCapabilities
         self.rejectedPromptTokenIDs = rejectedPromptTokenIDs
         self.samplingDefaults = samplingDefaults
+        self.jsonObjectConstraintSupport = jsonObjectConstraintSupport
+        self.isNonSpeculativeScalarRoute = isNonSpeculativeScalarRoute
+        self.decoderSupportsResponseFormatConstraint = decoderSupportsResponseFormatConstraint
     }
 }
 
@@ -227,6 +262,10 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let sampling: DecoderSampling
         let penalties: DecoderPenalties
         let logprobsRequest: ServingLogprobsRequest?
+        /// Built once at admission (`start`) when `request.responseFormat == .jsonObject`; `nil`
+        /// otherwise (every request predating this feature). Threaded into `generateBounded`'s
+        /// `responseFormatConstraint:` parameter in `execute` unchanged.
+        let responseFormatConstraint: JSONObjectMaskingLogitProcessor?
         let activeTools: [OpenAIToolSpec]
         let mailbox: BoundedDeltaMailbox
         let lease: ServingRequestLease
@@ -271,6 +310,26 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             configuration.modelCapabilities == nil
                 || configuration.modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")
+    }
+
+    /// `true` only when ALL THREE hold: (1) `loadScalarServingJSONObjectConstraintSupport` succeeded
+    /// for this checkpoint's tokenizer at load, (2) this backend was constructed with the plain,
+    /// non-speculative scalar decoder ROUTE (`configuration.isNonSpeculativeScalarRoute`), AND (3)
+    /// the CONCRETE decoder instance bound inside this backend's `InferenceActor` itself reports
+    /// `supportsResponseFormatConstraint == true` (`configuration.
+    /// decoderSupportsResponseFormatConstraint`). See `ScalarServingBackendConfiguration`'s doc
+    /// comments on all three fields for how each is set — (3) is deliberately independent of (2) so
+    /// a route-classification bug, or a decoder that predates this capability, cannot silently
+    /// readmit `json_object` on the strength of (1)+(2) alone.
+    ///
+    /// NOTE (response-format design "MTP" contract): a request carrying `response_format` is
+    /// REFUSED with 400 when this is `false` — it is never forced onto a non-speculative decoder
+    /// route to make the constraint reachable. MTP eligibility must never see this processor, so a
+    /// speculative-route deployment simply cannot serve `json_object`, by design, not by omission.
+    public nonisolated var supportsJSONObjectResponseFormat: Bool {
+        configuration.jsonObjectConstraintSupport != nil
+            && configuration.isNonSpeculativeScalarRoute
+            && configuration.decoderSupportsResponseFormatConstraint
     }
 
     public func start(
@@ -323,6 +382,43 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         // with a splitter still engaged would mislabel the answer).
         let resolvedEnableThinking = request.resolvedEnableThinking(
             disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive)
+        // Raw-text completions never separate reasoning (no chat template pre-fills a `<think>`
+        // block) — mirrors the `separatesReasoning:` computation on `ServingGenerationHandle` below,
+        // which this value now feeds instead of recomputing independently.
+        let separatesReasoning =
+            request.promptInput == .chat
+            && servingSeparatesReasoning(
+                thinksByDefault: configuration.thinksByDefault,
+                resolvedEnableThinking: resolvedEnableThinking)
+        // Per-request `json_object` refusal (response-format design item #4): the GLOBAL capability
+        // gate (`ServingCore.validateResponseFormatCapability`, enforced upstream before `start` is
+        // ever reached) only knows whether THIS BACKEND can run the constraint at all — it cannot
+        // see that a SPECIFIC thinking request has no resolvable `</think>` token id to phase-switch
+        // on. Refuse that combination here, per-request, rather than silently leaving the mask
+        // active from token 0 and corrupting the reasoning block, or silently never activating it.
+        var responseFormatConstraint: JSONObjectMaskingLogitProcessor?
+        if request.responseFormat == .jsonObject {
+            guard let support = configuration.jsonObjectConstraintSupport else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object is not supported by the loaded model's decoding route",
+                    param: "response_format")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "response_format")
+            }
+            // `await support.table`: this NEVER builds the trie on THIS actor's executor (see
+            // `ScalarServingJSONObjectConstraintSupport.table`'s doc comment) — the build runs on a
+            // detached background task kicked off at load time, so this suspends only until that
+            // (already-in-flight, usually-already-finished) task completes, rather than blocking
+            // `ScalarServingBackend`'s single-actor execution the way a lazy on-actor build would.
+            responseFormatConstraint = JSONObjectMaskingLogitProcessor(
+                table: await support.table,
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+        }
         var promptTokens: [Int]?
         var completionBudgetResolution: ServingCompletionBudgetResolution?
         if let capabilities = configuration.modelCapabilities {
@@ -407,6 +503,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             sampling: sampling,
             penalties: penalties,
             logprobsRequest: request.logprobsRequest,
+            responseFormatConstraint: responseFormatConstraint,
             activeTools: activeTools,
             mailbox: mailbox,
             lease: lease)
@@ -425,12 +522,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             mailbox: mailbox,
             lease: lease,
             completionBudgetResolution: completionBudgetResolution,
-            // Raw-text completions never separate reasoning: there is no chat template pre-filling a
-            // `<think>` block, so nothing in the output stream is reasoning to split out.
-            separatesReasoning: request.promptInput == .chat
-                && servingSeparatesReasoning(
-                    thinksByDefault: configuration.thinksByDefault,
-                    resolvedEnableThinking: resolvedEnableThinking))
+            separatesReasoning: separatesReasoning)
     }
 
     /// Renders the prompt for either request shape: `.chat` goes through the codec's chat-template
@@ -655,6 +747,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 sampling: request.sampling,
                 penalties: request.penalties,
                 logprobTopN: request.logprobsRequest?.topLogprobs,
+                responseFormatConstraint: request.responseFormatConstraint,
                 onLogprob: onLogprobCallback
             ) { [weak self] token in
                 guard let self else {

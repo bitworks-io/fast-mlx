@@ -400,6 +400,26 @@ func scalarServingDefaultSamplingDecoderStrategyError(
     return .defaultSamplingIncompatibleWithCompiledDecoderStrategy
 }
 
+/// Pure route-flag derivation for `response_format: json_object`'s capability gate (response-format
+/// design item #4: "MTP eligibility cannot see this processor" — a request carrying
+/// `response_format` is refused with 400 rather than forced onto a non-speculative path). `true`
+/// only for the plain, non-speculative scalar decode route: `.nativeCaches` with NO retained
+/// in-checkpoint MTP drafter. `false` for:
+/// - `.compiledFP16` (the compiled fast path has no `setResponseFormatConstraint` seam), and
+/// - EVERY speculative composition of `.nativeCaches` — a retained in-checkpoint MTP drafter routes
+///   to `MTPSpeculativeDecoder` regardless of whether `sampledMTPBlockDecisionsEnabled` layers
+///   sampled block decisions on top of it; both compositions are equally "speculative" for this
+///   gate's purposes, since neither binds the plain `MLXDecoder` this capability requires.
+func scalarServingIsNonSpeculativeScalarRoute(
+    decoderStrategy: ScalarServingDecoderStrategy,
+    hasRetainedInCheckpointMTPDrafter: Bool
+) -> Bool {
+    if case .nativeCaches = decoderStrategy, !hasRetainedInCheckpointMTPDrafter {
+        return true
+    }
+    return false
+}
+
 func scalarServingDecoderStrategy(
     route: ScalarServingDecoderRoute,
     kvCacheDecision: KVCacheQuantDecision
@@ -1270,6 +1290,18 @@ public func loadScalarServingModel(
         try validateScalarServingMemoryLimits(configuration)
     }
 
+    // Captured BEFORE the decoder-construction switch below `sending`-transfers `retainedInCheckpointMTPDrafter`/
+    // `context.model` into whichever decoder gets built: reading `retainedInCheckpointMTPDrafter`
+    // again AFTER that transfer (as the response-format wiring below would otherwise do) trips the
+    // Swift 6 region checker's "risks causing races" diagnostic, since a reference sent into actor
+    // isolation must not be read again from this (now non-isolated-relative) side. Captured as a
+    // plain `Bool` here, before any transfer happens, so the response-format wiring downstream reads
+    // only that already-resolved value. The derivation itself lives in the pure, independently
+    // unit-tested `scalarServingIsNonSpeculativeScalarRoute` below.
+    let isNonSpeculativeScalarRoute = scalarServingIsNonSpeculativeScalarRoute(
+        decoderStrategy: decoderStrategy,
+        hasRetainedInCheckpointMTPDrafter: retainedInCheckpointMTPDrafter != nil)
+
     let inference: InferenceActor
     switch decoderStrategy {
     case .compiledFP16:
@@ -1364,6 +1396,29 @@ public func loadScalarServingModel(
     // `rejectedPromptTokenIDs` was captured earlier, before `context.model` was sent into the
     // decoder actor — see the comment at its capture site.
     backendConfiguration.rejectedPromptTokenIDs = rejectedPromptTokenIDs
+    // `response_format: json_object` (response-format design slice 1b): attempt to build the
+    // grammar constraint's byte classification table from THIS checkpoint's own tokenizer.json —
+    // never lets loading fail (see that function's doc comment for the disablement enumeration).
+    // Attempted ONLY on the plain, non-speculative scalar route (`isNonSpeculativeScalarRoute`,
+    // computed above by the pure, independently-tested `scalarServingIsNonSpeculativeScalarRoute`):
+    // a compiled or MTP-speculative load has no `setResponseFormatConstraint` seam to plug this
+    // into at all, so parsing tokenizer.json / self-checking the byte inversion for it would be
+    // pure waste (an extra tokenizer.json parse, classify, and self-check on every such load) for a
+    // capability that gate always keeps at `false` regardless of what this call would find.
+    if isNonSpeculativeScalarRoute {
+        backendConfiguration.jsonObjectConstraintSupport = loadScalarServingJSONObjectConstraintSupport(
+            modelDirectory: configuration.modelDirectory,
+            tokenizer: tokenizer)
+    } else {
+        print("fastmlx-serve response_format=json_object support=disabled reason=speculative_route")
+    }
+    backendConfiguration.isNonSpeculativeScalarRoute = isNonSpeculativeScalarRoute
+    // Captured from the ACTUAL bound decoder instance (not merely inferred from the route), via the
+    // same actor-isolated-read idiom as `InferenceActor.supportsLogprobs()` — see
+    // `ScalarServingBackendConfiguration.decoderSupportsResponseFormatConstraint`'s doc comment for
+    // why this is a second, independent check rather than redundant with `isNonSpeculativeScalarRoute`.
+    backendConfiguration.decoderSupportsResponseFormatConstraint =
+        await inference.supportsResponseFormatConstraint()
     // `--default-sampling generation-config`: applied ONLY at scalar-backend ADMISSION
     // (`ScalarServingBackend.resolveDecoderSampling`, via `ServingSamplingPolicy.resolve(from:defaults:)`),
     // deliberately NOT at the decoder/`InferenceActor` layer. `runScalarServingStartupProbe`

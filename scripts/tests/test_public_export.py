@@ -115,9 +115,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # 2026-09-17, 940 -> 942: adds spike/Sources/ServingCore/ServingEmbeddingsBackend.swift (the
 # embeddings backend protocol behind POST /v1/embeddings) and
 # spike/Tests/ServingNIOTests/OpenAIEmbeddingsHTTPHandlerTests.swift. Same publish rationale.
+# 2026-09-17, 942 -> 952: wires the json_object token mask into the scalar decode route. Adds
+# ServingCore/ByteLevelTokenizerDescriptor.swift, SpikeCore/DecoderResponseFormatConstraint.swift,
+# SpikeServingAdapters/ScalarServingJSONObjectConstraint.swift and seven test files. Same publish
+# rationale; family-neutral symbols and comments.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 942,
-    "pathModeSha256": "87f56eabfe2f06b1a2fec55e73d219622bbe4fa85604d655a0c1b23cdcbff499",
+    "pathCount": 952,
+    "pathModeSha256": "0b8a6d4eece8c31b92da6c7e1531e59f2029c14d9cc4f3ee5812ff6bc5fac4ae",
 }
 
 

@@ -1,4 +1,5 @@
 import Foundation
+import MLXLMCommon
 
 /// Per-request token-selection policy handed to the decoder before a bounded generation.
 ///
@@ -79,6 +80,27 @@ public protocol Decoder {
     /// (throwing `InferenceActorError.penaltiesUnsupportedByDecoder`) when `supportsPenalties` is
     /// `false`, rather than calling this no-op and silently ignoring the penalty.
     mutating func setPenalties(_ penalties: DecoderPenalties)
+    /// Configure a per-request `response_format: json_object` grammar mask for the NEXT generation
+    /// (applied AFTER any penalty processor — see `MLXDecoder.setResponseFormatConstraint`'s doc
+    /// comment for the composition order). Default no-op, so every decoder that predates this
+    /// capability keeps compiling and behaving unchanged. `nil` clears any previously configured
+    /// constraint (mirrors `setPenalties(.none)`'s clearing behavior). Only `MLXDecoder` honors
+    /// this today — every speculative/compiled decoder stays at the default no-op, which is safe
+    /// ONLY because `InferenceActor.generateBounded`'s capability guard (mirroring the sampling/
+    /// penalties guards) refuses a non-nil constraint against a decoder whose
+    /// `supportsResponseFormatConstraint` is `false`, rather than silently calling this no-op and
+    /// serving free text a caller believes is grammar-constrained. `MLXLMCommon.LogitProcessor` is
+    /// the same vendored protocol `setPenalties`'s own processor already conforms to — importing it
+    /// here (this file otherwise needs no MLX type) is the smallest surface that lets a real MLX
+    /// masking processor built in `SpikeServingAdapters` cross into this MLX-aware decoder slot
+    /// without SpikeCore needing any ServingCore/JSON-specific knowledge.
+    mutating func setResponseFormatConstraint(_ constraint: (any LogitProcessor)?)
+    /// Whether `setResponseFormatConstraint` on this decoder actually applies the configured mask
+    /// before token selection. Defaults to `false` for the same fail-closed reason as
+    /// `supportsSampling`/`supportsPenalties`: an unlisted conformer is assumed NOT to honor the
+    /// constraint, so a request carrying one against it is refused rather than silently served as
+    /// free text.
+    var supportsResponseFormatConstraint: Bool { get }
     /// Whether `setSampling` on this decoder actually changes token selection — i.e. a `.sampled`
     /// request honors the REQUESTED DISTRIBUTION (temperature/top-p/top-k/min-p), not merely that
     /// the route is fast. A decoder may support sampling while being "merely unaccelerated, not
@@ -98,11 +120,13 @@ public protocol Decoder {
 extension Decoder {
     public mutating func setSampling(_ sampling: DecoderSampling) {}
     public mutating func setPenalties(_ penalties: DecoderPenalties) {}
+    public mutating func setResponseFormatConstraint(_ constraint: (any LogitProcessor)?) {}
     // Permissive-default trap: do NOT flip these to `true`. `true` here would silently readmit
     // the exact fail-open defect this capability pair exists to close — see the protocol's doc
     // comments and `InferenceActor.generateBounded`'s refusal guard.
     public var supportsSampling: Bool { false }
     public var supportsPenalties: Bool { false }
+    public var supportsResponseFormatConstraint: Bool { false }
 }
 
 /// One alternative token a decode step considered, alongside the token actually selected. Carried
@@ -265,6 +289,10 @@ public enum InferenceActorError: Error, Equatable, Sendable {
     /// `LogprobDecoding`. Refused here — before any state mutation — rather than silently
     /// generating without reporting logprobs while the caller believes it requested them.
     case logprobsUnsupportedByDecoder
+    /// A request carrying a non-nil `responseFormatConstraint` was routed to a decoder whose
+    /// `supportsResponseFormatConstraint` is `false`. Refused here — before any state mutation —
+    /// rather than silently serving free text a caller believes is grammar-constrained.
+    case responseFormatConstraintUnsupportedByDecoder
 }
 
 public enum InferenceTokenDisposition: Equatable, Sendable {
@@ -365,6 +393,15 @@ public actor InferenceActor {
         decoder is LogprobDecoding
     }
 
+    /// Whether the bound decoder's `supportsResponseFormatConstraint` is `true` — the SAME
+    /// admission-time-readable pattern as `supportsLogprobs()` above, for the SAME reason: a
+    /// serving adapter that needs to know this BEFORE calling `generateBounded` (e.g. to decide,
+    /// once at model load, whether to advertise `response_format: json_object` at all) can await
+    /// this instead of only discovering the answer from `generateBounded`'s in-flight refusal.
+    public func supportsResponseFormatConstraint() -> Bool {
+        decoder.supportsResponseFormatConstraint
+    }
+
     /// Non-blocking: returns a stream immediately; decode runs inside the actor.
     public func submit(promptTokens: [Int], maxTokens: Int, eos: Int = 2) -> AsyncThrowingStream<Int, Error> {
         guard !boundedGenerationActive else {
@@ -395,6 +432,7 @@ public actor InferenceActor {
         sampling: DecoderSampling = .greedy,
         penalties: DecoderPenalties = .none,
         logprobTopN: Int? = nil,
+        responseFormatConstraint: (any LogitProcessor)? = nil,
         onLogprob: (@Sendable (DecodedTokenLogprob) async throws -> Void)? = nil,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
@@ -405,6 +443,7 @@ public actor InferenceActor {
             sampling: sampling,
             penalties: penalties,
             logprobTopN: logprobTopN,
+            responseFormatConstraint: responseFormatConstraint,
             onLogprob: onLogprob,
             consume: consume)
     }
@@ -427,6 +466,7 @@ public actor InferenceActor {
         sampling: DecoderSampling = .greedy,
         penalties: DecoderPenalties = .none,
         logprobTopN: Int? = nil,
+        responseFormatConstraint: (any LogitProcessor)? = nil,
         onLogprob: (@Sendable (DecodedTokenLogprob) async throws -> Void)? = nil,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
@@ -459,15 +499,20 @@ public actor InferenceActor {
         guard logprobTopN == nil || decoder is LogprobDecoding else {
             throw InferenceActorError.logprobsUnsupportedByDecoder
         }
+        guard responseFormatConstraint == nil || decoder.supportsResponseFormatConstraint else {
+            throw InferenceActorError.responseFormatConstraintUnsupportedByDecoder
+        }
 
         boundedGenerationActive = true
         decoder.reset()
         decoder.setSampling(sampling)
         decoder.setPenalties(penalties)
+        decoder.setResponseFormatConstraint(responseFormatConstraint)
         defer {
             decoder.reset()
             decoder.setSampling(.greedy)
             decoder.setPenalties(.none)
+            decoder.setResponseFormatConstraint(nil)
             boundedGenerationActive = false
         }
 

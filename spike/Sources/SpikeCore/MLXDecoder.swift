@@ -42,6 +42,15 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
     /// Optional logit penalties (presence/frequency/repetition) applied to the logits BEFORE the
     /// sampler. `nil` = no penalty (byte-identical to the prior behavior). Built by `setPenalties`.
     private var processor: (any LogitProcessor)?
+    /// Optional trailing logit processor applied AFTER `processor` (penalties), configured via
+    /// `setResponseFormatConstraint`. A SEPARATE slot from `processor` deliberately: unlike
+    /// penalties (a value-typed `PenaltyProcessor` built fresh per request), a response-format
+    /// constraint also needs the `ConstraintProcessorFailureReporting` failure-surfacing contract
+    /// `selectSampleAndAdvance` checks after every `didSample` call — see that method and
+    /// `ConstraintProcessorFailureReporting`'s doc comment for why this composes LAST (mask applied
+    /// to the already-penalized logits) per the response-format design's "penalties first, grammar
+    /// mask last" contract.
+    private var constraintProcessor: (any LogitProcessor)?
     /// Per-instance override of `defaultPrefillChunkSize`. Production call sites use the default
     /// parameter value and get `defaultPrefillChunkSize`; tests use small values to exercise
     /// multi-chunk prefill without multi-thousand-token fixtures.
@@ -56,6 +65,10 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
     /// `GenerateParameters.processor()` and applies it before token selection (see its doc
     /// comment) — a real opt-in, not a stub.
     public var supportsPenalties: Bool { true }
+    /// `setResponseFormatConstraint` genuinely composes the injected processor AFTER `processor`
+    /// (penalties) inside `selectSampleAndAdvance` and surfaces a recorded mask violation as a real
+    /// thrown error (see that method) — a real opt-in, not a stub.
+    public var supportsResponseFormatConstraint: Bool { true }
 
     public init(
         model: any LanguageModel, cache: [KVCache],
@@ -162,17 +175,42 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
     /// logprob they report is guaranteed to describe the exact distribution this function selected
     /// from.
     private mutating func selectSampleAndAdvance(rawLogits: MLXArray) throws -> Int {
-        let processed = processor?.process(logits: rawLogits) ?? rawLogits // penalties before selection
+        let afterPenalties = processor?.process(logits: rawLogits) ?? rawLogits // penalties first
+        // Grammar mask LAST, on the already-penalized logits — the response-format design's
+        // ordering contract (see `constraintProcessor`'s doc comment).
+        let processed = constraintProcessor?.process(logits: afterPenalties) ?? afterPenalties
         let next = sampler.sample(logits: processed) // [1] on GPU — argmax (greedy) or sampled
         processor?.didSample(token: next)
 
-        // submit-first: kick the next forward before we read `next` to CPU
+        // submit-first: kick the next forward BEFORE reading `next` back to the CPU for ANY
+        // purpose — including `constraintProcessor?.didSample`'s own readback below. The vendored
+        // `JSONObjectMaskingLogitProcessor.didSample` calls `token.item(Int.self)` to advance the
+        // automaton; doing that HERE (before this forward is submitted) would stall the pipeline
+        // exactly like calling `next.item(Int.self)` early would — the same "7.3x stall" this
+        // decoder exists to avoid (see the type's own doc comment), just introduced via the
+        // constraint processor instead of the return statement.
         let nextIds = next.reshaped([1, 1])
         let nextLogits = try model.evaluateThrowing(
             LMInput.Text(tokens: nextIds), cache: cache, state: nil
         ).logits
         asyncEval(nextLogits) // overlap GPU with the readback below
         pendingLogits = nextLogits
+
+        // Constraint advance + failure check run AFTER the next forward is already in flight (see
+        // above), so `didSample`'s host readback overlaps that forward instead of stalling ahead
+        // of it. The vendored `LogitProcessor.didSample` cannot itself throw, so a constraint
+        // violation (a sampled token the mask should have made impossible) is recorded on the
+        // processor instance and turned into a real thrown error HERE — still before this call
+        // returns a token to a caller that would otherwise treat it as legitimate output — rather
+        // than let generation silently continue past a disallowed token. See
+        // `ConstraintProcessorFailureReporting`'s doc comment. A `nil` `constraintProcessor` (every
+        // request without `response_format`) takes neither branch here, so that path's behavior
+        // and timing are unchanged.
+        constraintProcessor?.didSample(token: next)
+        if let reporter = constraintProcessor as? ConstraintProcessorFailureReporting,
+            let failure = reporter.recordedFailure {
+            throw failure
+        }
 
         return next.item(Int.self) // readback overlaps the pending forward
     }
@@ -248,6 +286,7 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
         pendingLogits = nil
         sampler = ArgMaxSampler()
         processor = nil
+        constraintProcessor = nil
     }
 
     /// Configure token selection for the next generation. `.greedy` restores argmax (the default);
@@ -281,5 +320,12 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
             presencePenalty: penalties.presencePenalty.map { Float($0) },
             frequencyPenalty: penalties.frequencyPenalty.map { Float($0) })
         processor = params.processor()
+    }
+
+    /// Configure a per-request `response_format: json_object` grammar mask for the next generation.
+    /// `nil` clears any previously configured constraint (mirrors `setPenalties(nil-equivalent)`'s
+    /// clearing behavior). See `constraintProcessor`'s doc comment for composition order.
+    public mutating func setResponseFormatConstraint(_ constraint: (any LogitProcessor)?) {
+        constraintProcessor = constraint
     }
 }
