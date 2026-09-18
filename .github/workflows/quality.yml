@@ -87,6 +87,22 @@ jobs:
             --projection . \
             --log-dir "$RUNNER_TEMP/projected-test-logs"
 
+      # The pinned-snapshot downloader and `fastmlx pull` publish with a macOS-only
+      # exclusive rename, so those cases skip on the Linux job and run here. A skip
+      # on macOS would mean they silently stopped running, so it fails the job.
+      - name: Run the macOS-only acquisition tests
+        run: |
+          log="$RUNNER_TEMP/acquisition-tests.log"
+          if ! python3 -B -m unittest scripts.tests.test_hf_pinned_snapshot_download scripts.tests.test_fastmlx_pull -v > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          if grep -q "skipped" "$log"; then
+            echo "acquisition tests skipped on macOS" >&2
+            exit 1
+          fi
+
       - name: Upload per-target test output
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 982,
-    "pathModeSha256": "2feba435f5c86f41f271a26c298cfb9c55e34a3255752e766078d4c04eb61e5e"
+    "pathCount": 984,
+    "pathModeSha256": "44b998f5e737e7093b9c0e389ade17e9ca6fc96cf8cdc27999bf73e2f347a330"
   },
   "files": [
     {
@@ -60,6 +60,10 @@
     {
       "source": "scripts/build-metallib.sh",
       "destination": "scripts/build-metallib.sh"
+    },
+    {
+      "source": "scripts/fastmlx.py",
+      "destination": "scripts/fastmlx.py"
     },
     {
       "source": "scripts/fastmlx_launch.py",
@@ -140,6 +144,10 @@
     {
       "source": "scripts/tests/benchmark_explorer_node_test.js",
       "destination": "scripts/tests/benchmark_explorer_node_test.js"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx.py",
+      "destination": "scripts/tests/test_fastmlx.py"
     },
     {
       "source": "scripts/tests/test_fastmlx_launch.py",

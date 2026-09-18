@@ -189,9 +189,20 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # competitor name, or credential; only path-resolution constants changed (fastmlx_launch.py's
 # REPO_ROOT now walks one fewer parent to land on the new, shallower location), no behavior
 # changed, and their 89 tests are self-contained (no network, no unprojected fixtures).
+# 2026-09-18, 982 -> 984: adds scripts/fastmlx.py (the single `fastmlx` product dispatcher --
+# pull/serve/recommend/capacity/engine subcommands) and its test module,
+# scripts/tests/test_fastmlx.py. This is the Homebrew-formula front door: the generated
+# Formula/fastmlx.rb (not itself projected) installs this file into libexec/scripts and wires
+# bin/fastmlx to exec it. Conscious decision to publish: both files were read in full and
+# contain no private host, IP, username, absolute machine-local path, competitor name, or
+# credential; fastmlx.py only imports its already-public sibling modules
+# (fastmlx_pull.py/fastmlx_launch.py/fastmlx_recommend.py) and resolves the
+# fastmlx-serve/fastmlx-capacity binary names via the same concatenation trick
+# fastmlx_launch.py already uses, never as a bare literal; its 17 tests are self-contained (no
+# network, no unprojected fixtures, os.execv mocked rather than actually exec'd).
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 982,
-    "pathModeSha256": "2feba435f5c86f41f271a26c298cfb9c55e34a3255752e766078d4c04eb61e5e",
+    "pathCount": 984,
+    "pathModeSha256": "44b998f5e737e7093b9c0e389ade17e9ca6fc96cf8cdc27999bf73e2f347a330",
 }
 
 

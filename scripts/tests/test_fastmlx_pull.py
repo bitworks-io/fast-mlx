@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,15 @@ _SPEC.loader.exec_module(FASTMLX_PULL)
 # The exact module instance fastmlx_pull.py uses internally for network
 # calls; patch attributes on *this* object, not on a separately-loaded copy.
 DOWNLOADER = FASTMLX_PULL.downloader
+
+
+# The downloader publishes with renameatx_np(RENAME_EXCL), which exists only on
+# macOS; elsewhere it refuses by design. These cases exercise that real rename,
+# so they skip off macOS. Public CI runs them in its macOS job and fails on any
+# skip there.
+REQUIRES_MACOS_EXCLUSIVE_RENAME = unittest.skipUnless(
+    sys.platform == "darwin", "exclusive rename (renameatx_np) is macOS-only"
+)
 
 REPO_ID = "example/Test-Model"
 REVISION = "e" * 40
@@ -250,6 +260,7 @@ class PullSupervisorTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # Happy path: one attempt, nothing reused, full receipt written.
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_happy_path_single_attempt_writes_a_complete_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -291,6 +302,7 @@ class PullSupervisorTests(unittest.TestCase):
     # Acceptance criterion 4: resume across attempts, reusing what a
     # failed attempt already verified; every staging tree is preserved.
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_second_attempt_reuses_the_first_attempts_verified_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -340,6 +352,7 @@ class PullSupervisorTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # Review defect: receipt hashing must stream, not load whole files.
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_receipt_hashing_streams_published_files_instead_of_reading_them_whole(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -384,6 +397,7 @@ class PullSupervisorTests(unittest.TestCase):
     # in-process attempt. A preserved staging tree left by an earlier,
     # separately-invoked pull() must be used as attempt 1's reuse source.
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_pull_resumes_from_a_staging_tree_preserved_by_an_earlier_process(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -433,6 +447,7 @@ class PullSupervisorTests(unittest.TestCase):
     # attempt 3's tree. model.safetensors is never verified in any earlier
     # tree, so it is downloaded fresh in attempt 3.
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_third_attempt_in_a_chain_succeeds_and_preserves_both_earlier_staging_trees(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

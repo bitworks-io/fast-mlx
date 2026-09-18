@@ -26,6 +26,15 @@ DOWNLOADER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DOWNLOADER)
 
 
+# The downloader publishes with renameatx_np(RENAME_EXCL), which exists only on
+# macOS; elsewhere it refuses by design. These cases exercise that real rename,
+# so they skip off macOS. Public CI runs them in its macOS job and fails on any
+# skip there.
+REQUIRES_MACOS_EXCLUSIVE_RENAME = unittest.skipUnless(
+    sys.platform == "darwin", "exclusive rename (renameatx_np) is macOS-only"
+)
+
+
 def git_blob_sha1(data: bytes) -> str:
     digest = hashlib.sha1()
     digest.update(f"blob {len(data)}\0".encode())
@@ -158,6 +167,21 @@ class SyntheticRepo:
 
 
 class HFPinnedSnapshotDownloadTests(unittest.TestCase):
+    def test_exclusive_rename_refuses_where_the_platform_lacks_it(self) -> None:
+        # Runs on every platform: without renameatx_np the downloader must refuse
+        # rather than fall back to a replacing rename.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            destination = Path(directory) / "destination"
+            source.write_bytes(b"x")
+            with mock.patch.object(DOWNLOADER.ctypes, "CDLL", return_value=object()):
+                with self.assertRaisesRegex(
+                    DOWNLOADER.AcquisitionError, "exclusive rename is unavailable"
+                ):
+                    DOWNLOADER.exclusive_rename(source, destination)
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
     def opener_for(self, repo: SyntheticRepo, **kwargs) -> FakeOpener:
         return FakeOpener(repo.api_bytes, dict(repo.content_by_name), **kwargs)
 
@@ -184,6 +208,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # 1. Happy path
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_happy_path_publishes_exact_files_and_sidecars(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -243,6 +268,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # 3. Corrupted byte content
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_rejects_corrupted_content_and_publishes_nothing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -322,6 +348,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # 6. FIX A: no *.partial residue survives into a published acquisition
     # ------------------------------------------------------------------
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_retry_leaves_no_partial_residue_in_published_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -342,6 +369,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
             partial_files = list(output.rglob("*.partial"))
             self.assertEqual(partial_files, [])
 
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_retry_unlinks_the_failed_attempt_file_immediately(self):
         # Narrower unit check on download_entry itself: after a transient
         # failure, the failed attempt file must not still be on disk once
@@ -439,6 +467,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
             args = DOWNLOADER.parse_args()
         self.assertEqual(args.reuse_verified_from, Path("/tmp/some-stage"))
 
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_reuse_verified_from_moves_only_the_fully_verified_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -537,6 +566,7 @@ class HFPinnedSnapshotDownloadTests(unittest.TestCase):
             )
 
 
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
     def test_without_reuse_flag_every_file_is_downloaded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
