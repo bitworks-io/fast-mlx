@@ -29,6 +29,7 @@ reads is ``FASTMLX_FIT_CHECK_BIN`` (a fallback for ``--fit-check-bin``).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -41,7 +42,16 @@ from typing import Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QUALITY_CARDS_RELATIVE_PATH = "site/quality-guides.json"
-PULL_RECEIPT_FILENAME = ".pull-receipt.json"
+
+# ``fastmlx_pull.py`` is the one place that decides where a pull receipt
+# lives (``receipt_path_for``) and what fields it carries; imported the same
+# sibling-file way ``fastmlx_recommend.py`` imports this module, so the
+# launcher can never drift from pull's own naming rule again.
+_PULL_PATH = Path(__file__).resolve().parent / "fastmlx_pull.py"
+_PULL_SPEC = importlib.util.spec_from_file_location("fastmlx_pull", _PULL_PATH)
+assert _PULL_SPEC is not None and _PULL_SPEC.loader is not None
+pull = importlib.util.module_from_spec(_PULL_SPEC)
+_PULL_SPEC.loader.exec_module(pull)
 
 # The one Swift binary this repository ships that can both answer a
 # ``--fit-check-only`` pre-load question and serve an OpenAI-compatible API,
@@ -476,14 +486,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _load_pull_receipt(model_path: Path) -> Optional[dict]:
-    receipt_path = model_path / PULL_RECEIPT_FILENAME
+    """Load the receipt ``fastmlx pull`` wrote for ``model_path``, if any.
+
+    The receipt lives exactly where ``fastmlx_pull.receipt_path_for`` places
+    it: a SIBLING of the model directory (``<dir>.pull-receipt.json``), named
+    from the same ``.expanduser().absolute()`` normalization ``pull()``
+    applies to its ``dest`` argument before writing. There is no separate
+    in-dir naming convention here; nothing ever writes one.
+
+    Fails open to "no receipt" (returns ``None``) on a missing file,
+    unreadable file, invalid JSON, a non-dict document -- and also on a
+    receipt whose recorded ``dest`` does not resolve to ``model_path``. That
+    last case matters because a receipt can be copied or left behind after a
+    directory is moved/renamed: without this check a stale receipt would
+    silently identify the wrong pack. A receipt that records no ``dest`` at
+    all is trusted as-is (the sibling naming already ties it to this path).
+    """
+    dest = model_path.expanduser().absolute()
+    receipt_path = pull.receipt_path_for(dest)
     if not receipt_path.is_file():
         return None
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return receipt if isinstance(receipt, dict) else None
+    if not isinstance(receipt, dict):
+        return None
+    recorded_dest = receipt.get("dest")
+    if isinstance(recorded_dest, str):
+        try:
+            if Path(recorded_dest).resolve() != model_path.resolve():
+                return None
+        except OSError:
+            return None
+    return receipt
 
 
 def _resolve_model_repo(args, model_path: Path) -> Optional[str]:
@@ -498,7 +534,7 @@ def _resolve_model_repo(args, model_path: Path) -> Optional[str]:
 
 def _resolve_model_revision(args, model_path: Path) -> Optional[str]:
     """The model's pinned HF revision, for hfPin-prefix card matching:
-    ``--model-revision`` if given, else ``.pull-receipt.json``'s
+    ``--model-revision`` if given, else the sibling pull receipt's
     ``revision`` field (the 40-char lowercase hex sha ``fastmlx pull``
     records there).
     """

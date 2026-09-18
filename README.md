@@ -34,6 +34,8 @@ are published.
 - a pre-load fit-check that sizes a model against the host and refuses rather than degrades;
 - per-model quality cards (teacher-forced KL mean/p95, top-1 agreement, task checks) that can gate
   serving admission as an opt-in;
+- a `fastmlx` command that pulls a pinned model, ranks the packs that fit this Mac by their measured
+  quality, and fit-checks and quality-gates a serve in front of any OpenAI-compatible engine;
 - a research OpenAI-compatible chat-completions HTTP/SSE server;
 - an explicit continuous-batching route for supported dense models;
 - exact prefix/session-cache and serving lifecycle controls;
@@ -182,6 +184,33 @@ on: `fastmlx_http_requests_total` (labeled by route template, status class and o
 successes only). The histograms use fixed buckets from 5 ms to 300 s. Route labels come from the same
 bounded set the access log uses, and any unmatched path is labeled `other`, so label cardinality
 stays bounded.
+
+### The `fastmlx` command: pull, recommend, serve
+
+`scripts/fastmlx.py` puts the fit check and the quality cards in front of whichever
+OpenAI-compatible engine you serve with. It needs only the Python 3 standard library. The fit check
+itself runs `fastmlx-serve --fit-check-only`, so build that first
+(`swift build -c release --package-path spike --product fastmlx-serve`). Then put
+`spike/.build/release` on `PATH`, or pass `--fit-check-bin`.
+
+```sh
+# Pull an exact Hugging Face revision: every file is hash-checked, and an interrupted pull resumes.
+python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b
+
+# Rank the local packs that fit this Mac, with each one's measured quality card.
+python3 scripts/fastmlx.py recommend --models-dir ./models
+
+# Fit check, then quality-card admission, then start the engine.
+python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
+```
+
+`pull` writes a receipt next to the model directory that records the exact revision. `serve` and
+`recommend` read it to find the model's quality card. A pack whose card says NO_GO is refused until
+you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently. A
+pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
+a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
+run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
+repository's `fastmlx-serve`.
 
 ### Transport-only (no model)
 

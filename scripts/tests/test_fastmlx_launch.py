@@ -35,6 +35,16 @@ PIN_ONLY_CARD_ID = "fixture-pin-only@test"
 PIN_ONLY_HF_PIN = "abc123ef"  # exactly the 8-char minimum, valid hex
 PIN_ONLY_REVISION = PIN_ONLY_HF_PIN + "0" * (40 - len(PIN_ONLY_HF_PIN))
 
+# An hfPin-only NO_GO card (no repo at all): identifying a pulled pack this
+# way only works if the launcher resolves the revision from the pull
+# receipt -- the integration path this file's pull/launch receipt-path bug
+# fix covers.
+PIN_ONLY_NO_GO_CARD_ID = "fixture-pin-only-no-go@test"
+PIN_ONLY_NO_GO_HF_PIN = "9fed1234"
+PIN_ONLY_NO_GO_REVISION = PIN_ONLY_NO_GO_HF_PIN + "0" * (40 - len(PIN_ONLY_NO_GO_HF_PIN))
+PIN_ONLY_NO_GO_TIER = "Noticeable"
+PIN_ONLY_NO_GO_HEADLINE = "Pin-identified NO_GO pack for pull-receipt integration coverage."
+
 
 def fixture_manifest() -> dict:
     return {
@@ -88,6 +98,20 @@ def fixture_manifest() -> dict:
                     "headline": "Matches the reference closely (pin-identified).",
                 },
             },
+            {
+                "id": PIN_ONLY_NO_GO_CARD_ID,
+                "model": {"repo": None, "hfPin": PIN_ONLY_NO_GO_HF_PIN},
+                "verdict": "NO_GO",
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "quality-degraded vs reference (pin-identified pack, no repo)",
+                },
+                "legible": {
+                    "tier": PIN_ONLY_NO_GO_TIER,
+                    "headline": PIN_ONLY_NO_GO_HEADLINE,
+                },
+            },
         ],
     }
 
@@ -96,6 +120,36 @@ def write_script(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+def write_pull_receipt(
+    model_dir: Path, repo_id, revision: str, dest: Path = None, recorded_dest: Path = None
+) -> Path:
+    """Write a receipt at exactly the path and in exactly the shape
+    ``fastmlx_pull.pull()`` writes one for ``dest`` (defaulting to
+    ``model_dir`` itself): the SAME ``receipt_path_for`` naming rule and the
+    SAME ``downloader.write_exclusive`` call pull's own code uses, so this
+    fixture can never drift from what a real pull actually produces.
+    """
+    dest = dest if dest is not None else model_dir
+    receipt_path = FASTMLX_LAUNCH.pull.receipt_path_for(dest)
+    receipt = {
+        "format_version": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "dest": str(recorded_dest if recorded_dest is not None else dest),
+        "attempts": 1,
+        "max_attempts": 3,
+        "total_files": 0,
+        "total_bytes": 0,
+        "reused_files": 0,
+        "reused_bytes": 0,
+        "downloader_script_sha256": "0" * 64,
+        "files": {},
+    }
+    receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
+    FASTMLX_LAUNCH.pull.downloader.write_exclusive(receipt_path, receipt_bytes)
+    return receipt_path
 
 
 GREEN_FIT_CHECK_BODY = f"""#!{sys.executable}
@@ -416,9 +470,26 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertIn("is missing or is not a quality-card manifest", stderr)
 
     # ------------------------------------------------------------------
-    # --model-repo defaults from DIR/.pull-receipt.json when omitted.
+    # --model-repo defaults from the SIBLING pull receipt
+    # (<dir-name>.pull-receipt.json, written by fastmlx_pull.receipt_path_for)
+    # when omitted.
     # ------------------------------------------------------------------
     def test_model_repo_defaults_from_pull_receipt(self):
+        write_pull_receipt(self.model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = json.loads(stdout)
+        self.assertEqual(plan["card"]["id"], PASS_CARD_ID)
+
+    # ------------------------------------------------------------------
+    # A receipt written the OLD in-dir way (DIR/.pull-receipt.json, which
+    # nothing writes anymore) must no longer identify the model: without a
+    # sibling receipt or explicit --model-repo, the model has no resolved
+    # identity, so the PASS card never applies and the plan admits unmeasured
+    # (a NO_GO card would instead have to be silently forced through).
+    # ------------------------------------------------------------------
+    def test_in_dir_pull_receipt_alone_no_longer_identifies_model(self):
         receipt = {"repo_id": PASS_REPO, "revision": "e" * 40}
         (self.model_dir / ".pull-receipt.json").write_text(
             json.dumps(receipt), encoding="utf-8"
@@ -427,7 +498,57 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         code, stdout, _ = self.run_main(argv)
         self.assertEqual(code, 0)
         plan = json.loads(stdout)
-        self.assertEqual(plan["card"]["id"], PASS_CARD_ID)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertIsNone(plan["card"])
+
+    # ------------------------------------------------------------------
+    # A sibling receipt whose recorded "dest" resolves to a DIFFERENT
+    # directory than this model path must be ignored -- a copied or stale
+    # receipt must never identify the wrong pack.
+    # ------------------------------------------------------------------
+    def test_mismatched_destination_receipt_is_ignored(self):
+        # The receipt sits where this model's receipt belongs, and its revision
+        # would match the hfPin-only NO_GO card -- but it records a different
+        # directory, so it must not identify this one.
+        other_dest = self.root / "some-other-model-dir"
+        write_pull_receipt(
+            self.model_dir,
+            repo_id=None,
+            revision=PIN_ONLY_NO_GO_REVISION,
+            recorded_dest=other_dest,
+        )
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = json.loads(stdout)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertIsNone(plan["card"])
+
+    # ------------------------------------------------------------------
+    # End-to-end: a receipt produced by pull's own receipt-writing code path
+    # resolves the model's pinned revision, which matches an hfPin-only
+    # NO_GO card -- refuses without --accept-quality, admits with it.
+    # ------------------------------------------------------------------
+    def test_pull_receipt_resolved_revision_gates_hf_pin_only_no_go_card(self):
+        write_pull_receipt(
+            self.model_dir, repo_id=None, revision=PIN_ONLY_NO_GO_REVISION
+        )
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn(PIN_ONLY_NO_GO_TIER, stderr)
+        self.assertIn(PIN_ONLY_NO_GO_HEADLINE, stderr)
+        self.assertIn(PIN_ONLY_NO_GO_CARD_ID, stderr)
+        self.assertIn("--accept-quality", stderr)
+
+        argv_accepted = self.base_args(
+            **{"--context": "2048", "--accept-quality": PIN_ONLY_NO_GO_CARD_ID}
+        ) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv_accepted)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_with_quality_flag")
+        self.assertEqual(plan["card"]["id"], PIN_ONLY_NO_GO_CARD_ID)
 
     # ------------------------------------------------------------------
     # --context omitted: use the fit check's context ceiling.
@@ -579,10 +700,7 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(plan["card"]["id"], PIN_ONLY_CARD_ID)
 
     def test_pin_match_also_works_from_pull_receipt_revision(self):
-        receipt = {"repo_id": None, "revision": PIN_ONLY_REVISION}
-        (self.model_dir / ".pull-receipt.json").write_text(
-            json.dumps(receipt), encoding="utf-8"
-        )
+        write_pull_receipt(self.model_dir, repo_id=None, revision=PIN_ONLY_REVISION)
         argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
         code, stdout, _ = self.run_main(argv)
         self.assertEqual(code, 0)

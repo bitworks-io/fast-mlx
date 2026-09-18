@@ -35,6 +35,14 @@ UNMEASURED_CARD_ID = "fixture-unmeasured@test"
 
 UNCARDED_REPO = "example/NoCardModel"  # no matching card in the manifest at all
 
+# An hfPin-only NO_GO card (no repo at all), identifying a pulled pack only
+# through the revision a pull receipt records.
+PIN_ONLY_NO_GO_CARD_ID = "fixture-pin-only-no-go@test"
+PIN_ONLY_NO_GO_HF_PIN = "9fed1234"
+PIN_ONLY_NO_GO_REVISION = PIN_ONLY_NO_GO_HF_PIN + "0" * (40 - len(PIN_ONLY_NO_GO_HF_PIN))
+PIN_ONLY_NO_GO_TIER = "Noticeable"
+PIN_ONLY_NO_GO_HEADLINE = "Pin-identified NO_GO pack for pull-receipt integration coverage."
+
 
 def fixture_manifest() -> dict:
     return {
@@ -84,6 +92,15 @@ def fixture_manifest() -> dict:
                 "verdict": "UNMEASURED",
                 "legible": {"tier": None, "headline": None},
             },
+            {
+                "id": PIN_ONLY_NO_GO_CARD_ID,
+                "model": {"repo": None, "hfPin": PIN_ONLY_NO_GO_HF_PIN},
+                "verdict": "NO_GO",
+                "legible": {
+                    "tier": PIN_ONLY_NO_GO_TIER,
+                    "headline": PIN_ONLY_NO_GO_HEADLINE,
+                },
+            },
         ],
     }
 
@@ -92,6 +109,33 @@ def write_script(path: Path, body: str) -> Path:
     path.write_text(body, encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     return path
+
+
+def write_pull_receipt(model_dir: Path, repo_id, revision: str, dest: Path = None) -> Path:
+    """Write a receipt at exactly the path and in exactly the shape
+    ``fastmlx_pull.pull()`` writes one for ``dest`` (defaulting to
+    ``model_dir`` itself): the SAME ``receipt_path_for`` naming rule and the
+    SAME ``downloader.write_exclusive`` call pull's own code uses.
+    """
+    dest = dest if dest is not None else model_dir
+    receipt_path = FASTMLX_RECOMMEND.launch.pull.receipt_path_for(dest)
+    receipt = {
+        "format_version": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "dest": str(dest),
+        "attempts": 1,
+        "max_attempts": 3,
+        "total_files": 0,
+        "total_bytes": 0,
+        "reused_files": 0,
+        "reused_bytes": 0,
+        "downloader_script_sha256": "0" * 64,
+        "files": {},
+    }
+    receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
+    FASTMLX_RECOMMEND.launch.pull.downloader.write_exclusive(receipt_path, receipt_bytes)
+    return receipt_path
 
 
 GREEN_FIT_CHECK_BODY = f"""#!{sys.executable}
@@ -140,10 +184,7 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         model_dir.mkdir()
         (model_dir / "config.json").write_text("{}", encoding="utf-8")
         if repo is not None or revision is not None:
-            receipt = {"repo_id": repo, "revision": revision or ("e" * 40)}
-            (model_dir / ".pull-receipt.json").write_text(
-                json.dumps(receipt), encoding="utf-8"
-            )
+            write_pull_receipt(model_dir, repo_id=repo, revision=revision or ("e" * 40))
         return model_dir
 
     def base_argv(self, model_paths, **overrides) -> list:
@@ -215,6 +256,28 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertIn(NO_GO_HEADLINE, row["message"])
         _, stdout, _ = self.run_main(self.base_argv([model_dir]))
         self.assertIn(f"--accept-quality {NO_GO_CARD_ID}", stdout)
+
+    # ------------------------------------------------------------------
+    # opt-in via a pulled layout: no --model-repo/--model-revision at all,
+    # only a sibling pull receipt (written the way fastmlx_pull.py actually
+    # writes one) resolving the pinned revision that an hfPin-only NO_GO
+    # card matches.
+    # ------------------------------------------------------------------
+    def test_pulled_layout_with_hf_pin_no_go_card_is_opt_in_with_accept_flag(self):
+        model_dir = self.root / "pinned-pull-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        write_pull_receipt(model_dir, repo_id=None, revision=PIN_ONLY_NO_GO_REVISION)
+        code, doc, _ = self.run_json(self.base_argv([model_dir]))
+        self.assertEqual(code, 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "opt-in")
+        self.assertEqual(row["revision"], PIN_ONLY_NO_GO_REVISION)
+        self.assertEqual(
+            row["accept_quality_flag"], f"--accept-quality {PIN_ONLY_NO_GO_CARD_ID}"
+        )
+        self.assertIn(PIN_ONLY_NO_GO_TIER, row["message"])
+        self.assertIn(PIN_ONLY_NO_GO_HEADLINE, row["message"])
 
     # ------------------------------------------------------------------
     # uncarded: no card at all, and a recognized-but-UNMEASURED verdict.
@@ -354,9 +417,7 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         pass_dir = models_root / "pass-model"
         pass_dir.mkdir()
         (pass_dir / "config.json").write_text("{}", encoding="utf-8")
-        (pass_dir / ".pull-receipt.json").write_text(
-            json.dumps({"repo_id": PASS_REPO, "revision": "e" * 40}), encoding="utf-8"
-        )
+        write_pull_receipt(pass_dir, repo_id=PASS_REPO, revision="e" * 40)
         no_config_dir = models_root / "not-a-model"
         no_config_dir.mkdir()  # no config.json: must not be discovered
 
@@ -382,9 +443,7 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         pass_dir = models_root / "pass-model"
         pass_dir.mkdir()
         (pass_dir / "config.json").write_text("{}", encoding="utf-8")
-        (pass_dir / ".pull-receipt.json").write_text(
-            json.dumps({"repo_id": PASS_REPO, "revision": "e" * 40}), encoding="utf-8"
-        )
+        write_pull_receipt(pass_dir, repo_id=PASS_REPO, revision="e" * 40)
 
         argv = [
             "recommend",
