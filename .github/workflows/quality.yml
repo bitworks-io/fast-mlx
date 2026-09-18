@@ -58,6 +58,66 @@ jobs:
       - name: Build dependency-free target
         run: swift build --package-path spike --target "${{ matrix.target }}"
 
+  # Runs this repository's own test suite: the 8 dependency-free targets, built and
+  # EXECUTED, against the counts pinned in scripts/projected_test_expectations.json.
+  # Building a suite is not running it, and until this job existed nothing here ran
+  # the ~300 test files this repository ships.
+  #
+  # Deliberately one job and deliberately no --target: the expectations file is the
+  # single source of truth for which targets are covered, so a target added there is
+  # gated automatically instead of waiting for someone to remember to add its name to
+  # a matrix here. Per-target attribution comes from the gate's own result table, and
+  # each target's full raw output is uploaded as an artifact on success or failure.
+  #
+  # NOT in the `pages` job's `needs:` YET, and that is a measured decision rather than
+  # timidity. The gate builds each test target individually, and whether that produces
+  # a runnable .xctest bundle is toolchain-dependent: measured on two machines, Swift
+  # 6.4 (Xcode 27) assembles a complete bundle, while Swift 6.3.3 (Xcode 26.6) reports
+  # the same build as successful and assembles no bundle at all. Which toolchain a
+  # macos-26 runner selects cannot be verified from outside CI, and a red caused by
+  # that would block the Pages deploy for a reason unrelated to test health. So this
+  # job's first runs are the measurement. PROMOTION CRITERION: once a run here shows
+  # the gate resolving and running its bundles (8/8 OK, not REFUSED), add this job to
+  # `pages`' `needs:` and drop `pure-swift-targets`, which building the test targets
+  # already subsumes.
+  projected-test-suites:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+
+      # Recorded deliberately: the gate's behaviour depends on this, so a refusal can
+      # be attributed to the toolchain instead of guessed at.
+      - name: Report Swift and Xcode toolchain
+        run: |
+          swift --version
+          xcodebuild -version || true
+          xcode-select -p
+          ls -d /Applications/Xcode*.app || true
+
+      # No pipe here, on purpose: piping into tee would report tee's exit status and
+      # turn a failing suite into a green job.
+      - name: Run the projected test suites against their pinned baseline
+        run: |
+          python3 scripts/run_projected_test_suites.py \
+            --projection . \
+            --log-dir "$RUNNER_TEMP/projected-test-logs"
+
+      - name: Upload per-target test output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: projected-test-logs
+          path: ${{ runner.temp }}/projected-test-logs
+          if-no-files-found: warn
+          retention-days: 14
+
   pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [public-boundary, pure-swift-targets]

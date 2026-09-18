@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 967,
-    "pathModeSha256": "f00272f8751eff6e81d21bb08b3fb24d24bc19bc8c583b9958bff97b06c86265"
+    "pathCount": 970,
+    "pathModeSha256": "52666d0caffd1561fc842e1a217f4d5c5203559293bdc30094cfbee7b5ae84f6"
   },
   "files": [
     {
@@ -50,6 +50,14 @@
       "destination": "scripts/export_public_repository.py"
     },
     {
+      "source": "scripts/run_projected_test_suites.py",
+      "destination": "scripts/run_projected_test_suites.py"
+    },
+    {
+      "source": "scripts/projected_test_expectations.json",
+      "destination": "scripts/projected_test_expectations.json"
+    },
+    {
       "source": "scripts/build_public_site.py",
       "destination": "scripts/build_public_site.py"
     },
@@ -84,6 +92,10 @@
     {
       "source": "scripts/tests/test_public_export.py",
       "destination": "scripts/tests/test_public_export.py"
+    },
+    {
+      "source": "scripts/tests/test_run_projected_test_suites.py",
+      "destination": "scripts/tests/test_run_projected_test_suites.py"
     },
     {
       "source": "scripts/tests/test_public_site.py",

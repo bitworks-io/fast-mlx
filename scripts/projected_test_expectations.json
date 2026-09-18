@@ -1,0 +1,52 @@
+{
+  "_comment": "Pinned baseline for scripts/run_projected_test_suites.py. Every count here was MEASURED on one host and one toolchain, not derived analytically -- treat them as host-dependent facts to be re-verified, not universal truths. `tests` and `failures` are gating: the run must match both exactly (higher OR lower than recorded is a FAIL -- see the module docstring for why). `skipped` is informational only; the gate records and displays it but never fails on a skipped-count mismatch, because XCTest's own skip conditions (platform/build-flag guards inside the projected sources) can legitimately vary the skip count without indicating a defect in this gate. To regenerate after an intentional change to the projected suites: run `python3 scripts/run_projected_test_suites.py --update-expectations`, read the printed warning, diff this file against the previous commit, and only commit the diff after confirming each changed number by hand -- this command RECORDS whatever the run currently produced, it does not validate that the new numbers are correct.",
+  "_provenance": {
+    "host": "Apple silicon, 24 GiB",
+    "date": "2026-09-17",
+    "method": "python3 scripts/export_public_repository.py --development-projection (967 files); each target built individually and its .xctest bundle run directly via this gate (scripts/run_projected_test_suites.py). The 2565-test / 75-failure predecessor baseline had been corroborated three independent ways (swift test --filter, direct xcrun xctest, and this gate), all agreeing. This re-baseline is the same gate re-run after an exclusion change; the gate CORRECTLY reported MISMATCH against the old baseline first (a drop in failures fails too, by design), and these numbers are what it then measured. Total: 2519 tests, 0 failures across all 8 targets.",
+    "scope": "The 8 MLX-free projected test targets only. SpikeCoreTests, FastMLXHarnessTests, ExactPrefixMLXTests, SpikeServingAdaptersTests (MLX/Metal targets) and the vendored MLXLMTests package are not covered here."
+  },
+  "targets": {
+    "ServingCoreTests": {
+      "tests": 721,
+      "skipped": 2,
+      "failures": 0
+    },
+    "ServingSamplingBridgeTests": {
+      "tests": 4,
+      "skipped": 0,
+      "failures": 0
+    },
+    "ServingSnapshotBridgeTests": {
+      "tests": 15,
+      "skipped": 0,
+      "failures": 0
+    },
+    "ServingNIOTests": {
+      "tests": 142,
+      "skipped": 0,
+      "failures": 0
+    },
+    "HarnessCoreTests": {
+      "tests": 1261,
+      "skipped": 0,
+      "failures": 0,
+      "note": "Re-baselined 2026-09-17 after the projected suite was made green. Was 1307 tests / 75 failures: 47 projected cases depended on assets the projection does not ship, so they are now excluded from the public projection. One new case was added in their place, pinning a refusal branch that the exclusion made newly reachable to test with only projected assets. Net -46 = -47 excluded +1 new. MEASURED by this gate, not derived."
+    },
+    "ScorecardPairControlTests": {
+      "tests": 6,
+      "skipped": 0,
+      "failures": 0
+    },
+    "ProofControlTests": {
+      "tests": 360,
+      "skipped": 1,
+      "failures": 0
+    },
+    "SystemProfilerTests": {
+      "tests": 10,
+      "skipped": 0,
+      "failures": 0
+    }
+  }
+}

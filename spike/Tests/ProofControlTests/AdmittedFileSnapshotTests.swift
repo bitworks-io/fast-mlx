@@ -166,10 +166,16 @@ final class AdmittedFileSnapshotTests: XCTestCase {
         }
         let elapsed = ContinuousClock.now - started
         delayedWriter.wait()
+        // This is a discrimination bound, not a latency budget: the delayed writer
+        // sleeps 250 ms before it would ever satisfy a blocking open, so any value
+        // strictly below 250 ms still distinguishes "rejected without waiting" from
+        // "blocked waiting for the writer." 200 ms keeps a 50 ms margin under that
+        // writer delay while giving CI runners generous headroom over an idle-machine
+        // bound, so ordinary scheduling jitter does not produce a false failure.
         XCTAssertLessThan(
             elapsed,
-            .milliseconds(100),
-            "opening an admitted FIFO must not block waiting for a writer"
+            .milliseconds(200),
+            "opening an admitted FIFO must not block waiting out the writer's delay"
         )
 
         XCTAssertThrowsError(

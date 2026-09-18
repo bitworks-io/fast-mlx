@@ -168,8 +168,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: family-neutral serving/harness tests, no host, credential,
 # competitor or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 967,
-    "pathModeSha256": "f00272f8751eff6e81d21bb08b3fb24d24bc19bc8c583b9958bff97b06c86265",
+    "pathCount": 970,
+    "pathModeSha256": "52666d0caffd1561fc842e1a217f4d5c5203559293bdc30094cfbee7b5ae84f6",
 }
 
 
