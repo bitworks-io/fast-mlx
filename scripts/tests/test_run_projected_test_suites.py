@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -195,6 +196,150 @@ class ClassSelectorsTests(unittest.TestCase):
         self.assertEqual(
             suites.class_selectors(listing, "HarnessCoreTests"),
             ["HarnessCoreTests.SpacedTests"],
+        )
+
+
+class SwiftTestingFilterPatternTests(unittest.TestCase):
+    def test_anchored_with_exact_trailing_dot_prefix(self) -> None:
+        self.assertEqual(suites.swift_testing_filter_pattern("HarnessCoreTests"), r"^HarnessCoreTests\.")
+
+    def test_escapes_regex_metacharacters_in_target_name(self) -> None:
+        # No pinned target name has regex metacharacters today, but the pattern must not silently
+        # misbehave if one ever did (e.g. a target literally named "A.B" must not have its dot
+        # treated as "any character").
+        self.assertEqual(suites.swift_testing_filter_pattern("A.B"), r"^A\.B\.")
+
+
+class ParseSwiftTestingXunitTests(unittest.TestCase):
+    """Direct tests of the Swift Testing xunit parser, using REAL `--xunit-output` artifacts
+    captured 2026-09-17 from `swift test --package-path spike --skip-build --disable-xctest
+    --filter '^HarnessCoreTests\\.' --xunit-output <path>`, trimmed to a manageable number of
+    `<testcase>` lines while preserving the exact tag/attribute shape each toolchain produced.
+    Expected counts below are recomputed for the trimmed subset actually kept, not the full
+    49-case run the untrimmed capture reported."""
+
+    # Captured on the consumer host, Swift 6.3.3 / Xcode 26.6: exactly one `<testsuite>` element
+    # for the whole filtered run (that toolchain builds one combined bundle -- see the module
+    # docstring). Trimmed to 3 real `HarnessCoreTests.*` testcases, plus one synthetic sibling
+    # line (`HarnessCoreTestsExtra.Foo`, never actually observed in this project) appended to
+    # prove the trailing-dot exact-prefix rule, the same hazard `class_selectors` guards against.
+    SIX_3_3_PASS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="TestResults" errors="0" tests="4" failures="0" skipped="0" time="0.007172792">
+    <testcase classname="HarnessCoreTests.SystemProfileOperatorBudgetTests" name="sameHostWithNilBudgetStaysMeasured()" time="0.001071166" />
+    <testcase classname="HarnessCoreTests.ForcedScoringPlanTests" name="singleChunkCoversAllPositions()" time="0.001074125" />
+    <testcase classname="HarnessCoreTests.TailStatisticTests" name="quantileUsesCeilingIndexConvention()" time="0.000628084" />
+    <testcase classname="HarnessCoreTestsExtra.Foo" name="unrelatedSiblingModule()" time="0.000100000" />
+  </testsuite>
+</testsuites>
+"""
+
+    # Captured on the same host/toolchain after a scratch `@Test func zzzScratchAlwaysFails()`
+    # was added to force a real failure shape: the `<failure message="...">` child element.
+    SIX_3_3_FAIL_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="TestResults" errors="0" tests="3" failures="1" skipped="0" time="0.007270791">
+    <testcase classname="HarnessCoreTests.WiredCeilingOvercommitGuardTests" name="boundaryIsExclusiveAtThresholdAndInclusiveOneByteAbove()" time="0.00110725" />
+    <testcase classname="HarnessCoreTests.SystemProfileOperatorBudgetTests" name="operatorBudgetDoesNotDegradeHostProvenance()" time="0.000926792" />
+    <testcase classname="HarnessCoreTests.ZZZScratchFailingTest" name="zzzScratchAlwaysFails()" time="0.00127475" >
+      <failure message="Expectation failed: 1 == 2 (error)" />
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+    # Captured for a target with genuinely zero Swift Testing cases (`ServingCoreTests`, Swift
+    # 6.3.3): a real, well-formed, empty `<testsuite>` -- must parse to (0, 0), not None.
+    SIX_3_3_ZERO_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<testsuites>\n"
+        '  <testsuite name="TestResults" errors="0" tests="0" failures="0" skipped="0" '
+        'time="0.000129834">\n\n  </testsuite>\n</testsuites>\n'
+    )
+
+    # Captured on the dev box, Swift 6.4 / Xcode 27: `--build-tests` produces per-target bundles
+    # there (see the module docstring), so the SAME filtered command still walks every OTHER
+    # bundle in the package and contributes one empty sibling `<testsuite>` per bundle walked,
+    # all identically named "TestResults". Trimmed to 3 empty siblings (the real capture had ~11)
+    # plus the one holding real `HarnessCoreTests.*` testcases (trimmed to 2 of its own).
+    SIX_4_MULTI_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+    <testsuite name="TestResults" errors="0" tests="0" failures="0" skipped="0" time="0.002097083"/>
+    <testsuite name="TestResults" errors="0" tests="0" failures="0" skipped="0" time="0.000338083"/>
+    <testsuite name="TestResults" errors="0" tests="2" failures="0" skipped="0" time="0.037702458">
+        <testcase classname="HarnessCoreTests.ForcedScoringPlanTests" name="promptLongerThanChunkYieldsRowlessLeadingChunks()" time="0.005697666"/>
+        <testcase classname="HarnessCoreTests.WiredCeilingOvercommitGuardTests" name="advisoryLinesCarrySystemCeilingBudgetExcessAndMachineToken()" time="0.005290959"/>
+    </testsuite>
+    <testsuite name="TestResults" errors="0" tests="0" failures="0" skipped="0" time="0.000290792"/>
+</testsuites>
+"""
+
+    def test_six_3_3_pass_counts_only_the_exact_module_prefix(self) -> None:
+        """Also proves the trailing-dot exact-prefix rule: the appended
+        `HarnessCoreTestsExtra.Foo` sibling testcase must not be counted towards
+        `HarnessCoreTests`, the same hazard `class_selectors` guards against for XCTest."""
+        self.assertEqual(
+            suites.parse_swift_testing_xunit(self.SIX_3_3_PASS_XML, "HarnessCoreTests"), (3, 0)
+        )
+
+    def test_six_3_3_fail_counts_the_failure_child_element(self) -> None:
+        self.assertEqual(
+            suites.parse_swift_testing_xunit(self.SIX_3_3_FAIL_XML, "HarnessCoreTests"), (3, 1)
+        )
+
+    def test_six_3_3_zero_is_a_real_tuple_not_none(self) -> None:
+        self.assertEqual(
+            suites.parse_swift_testing_xunit(self.SIX_3_3_ZERO_XML, "ServingCoreTests"), (0, 0)
+        )
+
+    def test_six_4_multi_testsuite_sums_only_the_matching_sibling(self) -> None:
+        """The empty sibling `<testsuite>` elements from other bundles must not corrupt the
+        count, and must not need to be located by name or position -- `parse_swift_testing_xunit`
+        never looks at which `<testsuite>` a `<testcase>` belongs to."""
+        self.assertEqual(
+            suites.parse_swift_testing_xunit(self.SIX_4_MULTI_XML, "HarnessCoreTests"), (2, 0)
+        )
+
+    def test_truncated_document_yields_none(self) -> None:
+        """A process that crashed mid-write leaves an invalid XML document -- must refuse, never
+        coerce to (0, 0)."""
+        truncated = '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1">'
+        self.assertIsNone(suites.parse_swift_testing_xunit(truncated, "HarnessCoreTests"))
+
+    def test_well_formed_document_with_no_testsuite_at_all_yields_none(self) -> None:
+        """Measured 2026-09-17: even a filter matching nothing still produces one empty
+        `<testsuite>` per bundle walked. A document with ZERO `<testsuite>` elements anywhere
+        means `swift test` never got far enough to report anything at all."""
+        empty = '<?xml version="1.0"?><testsuites></testsuites>'
+        self.assertIsNone(suites.parse_swift_testing_xunit(empty, "HarnessCoreTests"))
+
+    def test_not_xml_at_all_yields_none(self) -> None:
+        self.assertIsNone(
+            suites.parse_swift_testing_xunit("dyld: Library not loaded\nAbort trap: 6\n", "HarnessCoreTests")
+        )
+
+
+class SwiftTestingTargetIsKnownTests(unittest.TestCase):
+    """Direct tests of the zero-case vacuity guard, reusing `ClassSelectorsTests.LISTING`."""
+
+    LISTING = ClassSelectorsTests.LISTING
+
+    def test_target_with_xctest_cases_is_known_even_with_zero_swift_testing_cases(self) -> None:
+        self.assertTrue(suites.swift_testing_target_is_known(self.LISTING, "HarnessCoreTests"))
+        self.assertTrue(suites.swift_testing_target_is_known(self.LISTING, "ServingCoreTests"))
+
+    def test_unknown_target_is_not_known(self) -> None:
+        self.assertFalse(suites.swift_testing_target_is_known(self.LISTING, "NoSuchTarget"))
+
+    def test_sibling_module_does_not_falsely_confirm_the_real_target(self) -> None:
+        """`ServingCoreTestsExtra` existing in the listing must not make a caller asking about
+        `ServingCoreTests` itself get a false True from that unrelated module alone -- it is
+        True here only because a genuine `ServingCoreTests.` line also exists."""
+        listing_without_the_real_module = (
+            "ServingCoreTestsExtra.SomethingTests/unrelatedCase\n"
+        )
+        self.assertFalse(
+            suites.swift_testing_target_is_known(listing_without_the_real_module, "ServingCoreTests")
         )
 
 
@@ -568,6 +713,208 @@ class EvaluateTargetTests(unittest.TestCase):
         self.assertEqual(result.verdict, suites.OK)
 
 
+class EvaluateSwiftTestingTargetTests(unittest.TestCase):
+    """Tests `evaluate_swift_testing_target`'s OK/MISMATCH/REFUSED classification, with `run`
+    stubbed and a REAL temporary directory standing in for `xunit_dir` -- the function reads the
+    xunit artifact from disk, so tests exercise that real read/parse path rather than mocking it
+    away, while still requiring no real `swift` toolchain."""
+
+    LISTING = "HarnessCoreTests.SomeXCTestClass/testSomething\n"
+
+    def _run_with_xunit(
+        self,
+        target: str = "HarnessCoreTests",
+        expected_tests: int = 0,
+        expected_failures: int = 0,
+        xunit_xml: str | None = None,
+        write_xunit: bool = True,
+        list_returncode: int = 0,
+        list_stdout: str | None = None,
+        listing_cache: dict | None = None,
+    ) -> suites.SwiftTestingResult:
+        if list_stdout is None:
+            list_stdout = self.LISTING
+
+        def _fake(command, cwd):
+            if command[:3] == ["swift", "test", "list"]:
+                return subprocess.CompletedProcess(command, list_returncode, list_stdout, "")
+            if command[:2] == ["swift", "test"]:
+                if write_xunit:
+                    xunit_path = Path(command[command.index("--xunit-output") + 1])
+                    xunit_path.write_text(xunit_xml or "", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with tempfile.TemporaryDirectory() as scratch:
+            xunit_dir = Path(scratch)
+            with mock.patch.object(suites, "run", side_effect=_fake):
+                return suites.evaluate_swift_testing_target(
+                    Path("/fake/dest"),
+                    target,
+                    {"tests": expected_tests, "failures": expected_failures},
+                    log_dir=None,
+                    listing_cache=(listing_cache if listing_cache is not None else {}),
+                    xunit_dir=xunit_dir,
+                )
+
+    def test_command_uses_anchored_filter_and_disables_xctest(self) -> None:
+        captured: list[list[str]] = []
+
+        def _fake(command, cwd):
+            captured.append(command)
+            if command[:2] == ["swift", "test"]:
+                xunit_path = Path(command[command.index("--xunit-output") + 1])
+                xunit_path.write_text(
+                    '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" '
+                    'failures="0"/></testsuites>',
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(
+            suites, "run", side_effect=_fake
+        ):
+            suites.evaluate_swift_testing_target(
+                Path("/fake/dest"),
+                "HarnessCoreTests",
+                {"tests": 0, "failures": 0},
+                log_dir=None,
+                listing_cache={"done": True, "listing": self.LISTING, "error": None},
+                xunit_dir=Path(scratch),
+            )
+        self.assertEqual(len(captured), 1)
+        command = captured[0]
+        self.assertIn("--disable-xctest", command)
+        self.assertIn("--skip-build", command)
+        self.assertEqual(command[command.index("--filter") + 1], r"^HarnessCoreTests\.")
+
+    def test_nonzero_match_ok(self) -> None:
+        xml = (
+            '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1" '
+            'failures="0"><testcase classname="HarnessCoreTests.Foo" name="bar()"/>'
+            "</testsuite></testsuites>"
+        )
+        result = self._run_with_xunit(expected_tests=1, expected_failures=0, xunit_xml=xml)
+        self.assertEqual(result.verdict, suites.OK)
+        self.assertEqual((result.actual_tests, result.actual_failures), (1, 0))
+
+    def test_nonzero_count_mismatch(self) -> None:
+        xml = (
+            '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1" '
+            'failures="0"><testcase classname="HarnessCoreTests.Foo" name="bar()"/>'
+            "</testsuite></testsuites>"
+        )
+        result = self._run_with_xunit(expected_tests=2, expected_failures=0, xunit_xml=xml)
+        self.assertEqual(result.verdict, suites.MISMATCH)
+
+    def test_nonzero_failure_count_mismatch(self) -> None:
+        xml = (
+            '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1" '
+            'failures="1"><testcase classname="HarnessCoreTests.Foo" name="bar()">'
+            '<failure message="x"/></testcase></testsuite></testsuites>'
+        )
+        result = self._run_with_xunit(expected_tests=1, expected_failures=0, xunit_xml=xml)
+        self.assertEqual(result.verdict, suites.MISMATCH)
+
+    def test_legitimate_zero_is_ok_when_target_known_in_listing(self) -> None:
+        xml = '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" failures="0"/></testsuites>'
+        result = self._run_with_xunit(
+            target="HarnessCoreTests", expected_tests=0, expected_failures=0, xunit_xml=xml,
+            list_stdout="HarnessCoreTests.SomeXCTestClass/testSomething\n",
+        )
+        self.assertEqual(result.verdict, suites.OK)
+        self.assertEqual((result.actual_tests, result.actual_failures), (0, 0))
+
+    def test_zero_with_target_unknown_in_listing_is_refused(self) -> None:
+        """Closes the zero-case vacuity trap: a zero result for a target that does not otherwise
+        appear in `swift test list` must not be silently accepted as a legitimate pass, even
+        though it is pinned at zero."""
+        xml = '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" failures="0"/></testsuites>'
+        result = self._run_with_xunit(
+            target="TotallyUnbuiltTarget", expected_tests=0, expected_failures=0, xunit_xml=xml,
+            list_stdout="SomeOtherModule.Foo/bar\n",
+        )
+        self.assertEqual(result.verdict, suites.REFUSED)
+        self.assertIn("does not otherwise appear in", result.detail)
+
+    def test_zero_pin_mismatch_when_actual_is_nonzero(self) -> None:
+        xml = (
+            '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1" '
+            'failures="0"><testcase classname="HarnessCoreTests.Foo" name="bar()"/>'
+            "</testsuite></testsuites>"
+        )
+        result = self._run_with_xunit(expected_tests=0, expected_failures=0, xunit_xml=xml)
+        self.assertEqual(result.verdict, suites.MISMATCH)
+
+    def test_missing_artifact_is_refused(self) -> None:
+        result = self._run_with_xunit(write_xunit=False)
+        self.assertEqual(result.verdict, suites.REFUSED)
+        self.assertIn("no Swift Testing xunit artifact", result.detail)
+
+    def test_malformed_artifact_is_refused(self) -> None:
+        result = self._run_with_xunit(xunit_xml="<?xml version=\"1.0\"?><testsuites><testsuite>")
+        self.assertEqual(result.verdict, suites.REFUSED)
+        self.assertIn("malformed", result.detail)
+
+    def test_listing_failure_on_a_zero_result_is_refused_distinctly(self) -> None:
+        xml = '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" failures="0"/></testsuites>'
+        result = self._run_with_xunit(
+            expected_tests=0, expected_failures=0, xunit_xml=xml, list_returncode=3
+        )
+        self.assertEqual(result.verdict, suites.REFUSED)
+        self.assertIn("could not be corroborated", result.detail)
+
+    def test_refusal_shapes_are_pairwise_distinct(self) -> None:
+        missing = self._run_with_xunit(write_xunit=False)
+        malformed = self._run_with_xunit(xunit_xml="<broken")
+        zero_unknown = self._run_with_xunit(
+            target="TotallyUnbuiltTarget",
+            xunit_xml='<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" failures="0"/></testsuites>',
+            list_stdout="SomeOtherModule.Foo/bar\n",
+        )
+        listing_failed = self._run_with_xunit(
+            xunit_xml='<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="0" failures="0"/></testsuites>',
+            list_returncode=3,
+        )
+        details = {missing.detail, malformed.detail, zero_unknown.detail, listing_failed.detail}
+        self.assertEqual(len(details), 4, f"expected four distinct refusal details, got: {details}")
+        for result in (missing, malformed, zero_unknown, listing_failed):
+            self.assertEqual(result.verdict, suites.REFUSED)
+
+    def test_does_not_invoke_swift_test_list_when_actual_tests_is_nonzero(self) -> None:
+        """The listing cross-check only matters for a zero result -- a nonzero, correctly
+        attributed count is already self-evidently real and must not pay for an extra
+        subprocess."""
+        xml = (
+            '<?xml version="1.0"?><testsuites><testsuite name="TestResults" tests="1" '
+            'failures="0"><testcase classname="HarnessCoreTests.Foo" name="bar()"/>'
+            "</testsuite></testsuites>"
+        )
+
+        def _fake(command, cwd):
+            if command[:3] == ["swift", "test", "list"]:
+                raise AssertionError("swift test list must not run for a nonzero result")
+            if command[:2] == ["swift", "test"]:
+                xunit_path = Path(command[command.index("--xunit-output") + 1])
+                xunit_path.write_text(xml, encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            raise AssertionError(f"unexpected command: {command}")
+
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(
+            suites, "run", side_effect=_fake
+        ):
+            result = suites.evaluate_swift_testing_target(
+                Path("/fake/dest"),
+                "HarnessCoreTests",
+                {"tests": 1, "failures": 0},
+                log_dir=None,
+                listing_cache={},
+                xunit_dir=Path(scratch),
+            )
+        self.assertEqual(result.verdict, suites.OK)
+
+
 class SwiftTestListingTests(unittest.TestCase):
     """Direct tests of the caching wrapper around `swift test list --skip-build`."""
 
@@ -603,8 +950,14 @@ class RunGateTests(unittest.TestCase):
 
     EXPECTATIONS = {
         "targets": {
-            "AlphaTests": {"tests": 3, "skipped": 0, "failures": 0},
-            "BetaTests": {"tests": 2, "skipped": 0, "failures": 0},
+            "AlphaTests": {
+                "tests": 3, "skipped": 0, "failures": 0,
+                "swift_testing": {"tests": 0, "failures": 0},
+            },
+            "BetaTests": {
+                "tests": 2, "skipped": 0, "failures": 0,
+                "swift_testing": {"tests": 0, "failures": 0},
+            },
         }
     }
 
@@ -668,6 +1021,15 @@ class RunGateTests(unittest.TestCase):
             if command[:3] == ["swift", "test", "list"]:
                 list_calls.append(command)
                 return subprocess.CompletedProcess(command, 0, listing, "")
+            if command[:2] == ["swift", "test"] and "--disable-xctest" in command:
+                xunit_path = Path(command[command.index("--xunit-output") + 1])
+                xunit_path.write_text(
+                    '<?xml version="1.0"?><testsuites>'
+                    '<testsuite name="TestResults" tests="0" failures="0" errors="0" '
+                    'skipped="0"/></testsuites>',
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, "", "")
             if command[0] == "xcrun":
                 selector_arg = command[command.index("-XCTest") + 1]
                 if selector_arg.startswith("AlphaTests."):

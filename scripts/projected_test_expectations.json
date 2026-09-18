@@ -1,5 +1,5 @@
 {
-  "_comment": "Pinned baseline for scripts/run_projected_test_suites.py. Every count here was MEASURED on one host and one toolchain, not derived analytically -- treat them as host-dependent facts to be re-verified, not universal truths. `tests` and `failures` are gating: the run must match both exactly (higher OR lower than recorded is a FAIL -- see the module docstring for why). `skipped` is informational only; the gate records and displays it but never fails on a skipped-count mismatch, because XCTest's own skip conditions (platform/build-flag guards inside the projected sources) can legitimately vary the skip count without indicating a defect in this gate. To regenerate after an intentional change to the projected suites: run `python3 scripts/run_projected_test_suites.py --update-expectations`, read the printed warning, diff this file against the previous commit, and only commit the diff after confirming each changed number by hand -- this command RECORDS whatever the run currently produced, it does not validate that the new numbers are correct.",
+  "_comment": "Pinned baseline for scripts/run_projected_test_suites.py. Every count here was MEASURED on one host and one toolchain, not derived analytically -- treat them as host-dependent facts to be re-verified, not universal truths. `tests` and `failures` are gating: the run must match both exactly (higher OR lower than recorded is a FAIL -- see the module docstring for why). `skipped` is informational only; the gate records and displays it but never fails on a skipped-count mismatch, because XCTest's own skip conditions (platform/build-flag guards inside the projected sources) can legitimately vary the skip count without indicating a defect in this gate. `swift_testing` pins the SEPARATE Swift Testing (`@Test`) leg for the same target -- `tests` and `failures` are both gating, in either direction, exactly like the XCTest fields; 0 is a real, checked pin (see the module docstring's zero-case vacuity trap), not an absence of coverage. To regenerate after an intentional change to the projected suites: run `python3 scripts/run_projected_test_suites.py --update-expectations`, read the printed warning, diff this file against the previous commit, and only commit the diff after confirming each changed number by hand -- this command RECORDS whatever the run currently produced, it does not validate that the new numbers are correct.",
   "_provenance": {
     "host": "Apple silicon, 24 GiB",
     "date": "2026-09-17",
@@ -10,43 +10,55 @@
     "ServingCoreTests": {
       "tests": 721,
       "skipped": 2,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "ServingSamplingBridgeTests": {
       "tests": 4,
       "skipped": 0,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "ServingSnapshotBridgeTests": {
       "tests": 15,
       "skipped": 0,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "ServingNIOTests": {
       "tests": 142,
       "skipped": 0,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "HarnessCoreTests": {
       "tests": 1261,
       "skipped": 0,
       "failures": 0,
-      "note": "Re-baselined 2026-09-17 after the projected suite was made green. Was 1307 tests / 75 failures: 47 projected cases depended on assets the projection does not ship, so they are now excluded from the public projection. One new case was added in their place, pinning a refusal branch that the exclusion made newly reachable to test with only projected assets. Net -46 = -47 excluded +1 new. MEASURED by this gate, not derived."
+      "note": "Re-baselined 2026-09-17 after the projected suite was made green. Was 1307 tests / 75 failures: 47 projected cases depended on assets the projection does not ship, so they are now excluded from the public projection. One new case was added in their place, pinning a refusal branch that the exclusion made newly reachable to test with only projected assets. Net -46 = -47 excluded +1 new. MEASURED by this gate, not derived.",
+      "swift_testing": {
+        "tests": 49,
+        "failures": 0,
+        "note": "Four Swift Testing suites this gate's XCTest leg never ran: ForcedScoringPlanTests (7), SystemProfileOperatorBudgetTests (23), TailStatisticTests (10), WiredCeilingOvercommitGuardTests (9). MEASURED via `swift test --disable-xctest --filter '^HarnessCoreTests\\.'` on both Swift 6.3.3 and Swift 6.4."
+      }
     },
     "ScorecardPairControlTests": {
       "tests": 6,
       "skipped": 0,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "ProofControlTests": {
       "tests": 360,
       "skipped": 1,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     },
     "SystemProfilerTests": {
       "tests": 10,
       "skipped": 0,
-      "failures": 0
+      "failures": 0,
+      "swift_testing": {"tests": 0, "failures": 0}
     }
   }
 }

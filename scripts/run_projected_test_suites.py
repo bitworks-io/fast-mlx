@@ -70,15 +70,63 @@ Because the whole package now builds once, up front, a compile error ANYWHERE in
 broke it -- the `_package-build.log` this gate writes (when `--log-dir` is given) is what attributes
 which target's source actually caused it.
 
-SWIFT TESTING (`@Test`) CASES ARE NOT RUN BY THIS GATE, IN EITHER MODE: `swift test list` also
-enumerates Swift Testing suites/cases -- 49 of them in HarnessCoreTests as of 2026-09-17, e.g.
-`ForcedScoringPlanTests`, `SystemProfileOperatorBudgetTests`, `TailStatisticTests`,
-`WiredCeilingOvercommitGuardTests` -- that neither a direct `xcrun xctest <bundle>` run nor an
-`-XCTest <selectors>` run executes: XCTest only ever runs `XCTestCase` subclasses, in both modes.
-Passing a Swift Testing suite name through as a selector is harmless (`xcrun xctest` ignores a
-selector that names nothing it recognizes as an `XCTestCase`) but this gate makes no attempt to run
-those cases either way. Every pinned count in `projected_test_expectations.json` is an XCTest case
-count only.
+SWIFT TESTING (`@Test`) CASES GET THEIR OWN LEG, SEPARATE FROM THE XCTEST MODES ABOVE: `swift test
+list` also enumerates Swift Testing suites/cases -- 49 of them in HarnessCoreTests as of
+2026-09-17, e.g. `ForcedScoringPlanTests`, `SystemProfileOperatorBudgetTests`,
+`TailStatisticTests`, `WiredCeilingOvercommitGuardTests` -- that neither a direct `xcrun xctest
+<bundle>` run nor an `-XCTest <selectors>` run ever executes: XCTest only runs `XCTestCase`
+subclasses, in both modes. For each pinned target, after its XCTest leg above, this gate also
+runs `swift test --package-path spike --skip-build --disable-xctest --filter <pattern>
+--xunit-output <path>`, where `<pattern>` is `^<Target>\\.` -- anchored, with an exact
+module-prefix trailing dot, exactly like `class_selectors`' XCTest selectors, so a hypothetical
+sibling module cannot be mistaken for the real one. Every target is pinned a `swift_testing`
+count (0 for the seven targets that have none today) in `projected_test_expectations.json`,
+independent of its XCTest `tests`/`failures` pin, and it gates exactly the same way: MISMATCH on
+either direction, REFUSED on an unreadable result.
+
+THE FILTER MUST BE ANCHORED PER TARGET, AND THIS IS A SAFETY PROPERTY, NOT ONLY AN ATTRIBUTION
+ONE: an UNFILTERED `swift test --skip-build --disable-xctest` (no `--filter` at all) walks every
+bundle built for the whole package, including the MLX/Metal targets this gate deliberately does
+not cover (`SpikeCoreTests`, `FastMLXHarnessTests`, `ExactPrefixMLXTests`,
+`SpikeServingAdaptersTests` -- see `projected_test_expectations.json`'s `_provenance.scope`).
+Measured 2026-09-17 on the Swift 6.4 / Xcode 27 dev box: running unfiltered reaches a Swift
+Testing case inside `SpikeServingAdaptersTests` and crashes with `MLX error: Failed to load the
+default metallib ... library not found`, because this gate's projection never stages a Metal
+library. That crash also corrupted the shared `--xunit-output` file for every other bundle
+walked in the same invocation (a truncated, unparseable document) -- one MLX target's missing
+Metal library turned into eight unrelated REFUSED verdicts. A `--filter` anchored to exactly one
+of the eight MLX-free pinned targets was measured to never select anything belonging to an
+MLX/Metal target, so it never reaches that crash; this gate therefore always calls `swift test`
+once per target with an anchored filter, never once for the whole package.
+
+MEASURED XUNIT SHAPE ALSO DIFFERS BY TOOLCHAIN, THE SAME WAY THE BUNDLE LAYOUT DOES: on Swift
+6.3.3, a per-target filtered `swift test` run produces exactly one `<testsuite
+name="TestResults">` element in the xunit document, containing only the matched target's
+`<testcase>` elements. On Swift 6.4, the SAME command still produces one `<testsuite
+name="TestResults">` element PER BUNDLE walked (there is no per-bundle name to distinguish them
+by -- every one is literally named `"TestResults"`), almost all of them empty, alongside the one
+holding the target's real `<testcase>` elements. `parse_swift_testing_xunit` does not pick a
+`<testsuite>` by name or position for this reason: it collects every `<testcase>` in the whole
+document and keeps only the ones whose `classname` starts with the exact module prefix
+`f"{target}."`, so it produces the same attributed count regardless of how many empty sibling
+`<testsuite>` elements a given toolchain happens to interleave alongside the real one.
+
+THE SWIFT TESTING LEG'S OWN ZERO-CASE VACUITY TRAP, AND HOW IT IS CLOSED: seven of the eight
+pinned targets are pinned at zero Swift Testing cases, and a filtered run that legitimately finds
+none produces a well-formed report indistinguishable, BY ITS OWN OUTPUT ALONE, from a filtered
+run whose target name was mistyped, renamed, or never got built -- measured 2026-09-17 with a
+deliberately bogus `--filter` target: the resulting xunit document has exactly the same
+all-testsuites-empty shape as a real target with genuinely zero Swift Testing cases. Comparing
+the observed count only against the pinned expectation cannot close this, because a target
+permanently mis-pinned at zero and a tool permanently (and silently) unable to find that target's
+module would agree with each other forever. This gate closes it by requiring independent
+evidence that the target's module was actually part of this build before it will accept an
+observed zero: whenever a target's Swift Testing count comes back zero, it additionally checks
+that the target appears in the same `swift test list --skip-build` listing the XCTest
+combined-bundle mode already uses (cached and shared, not a second invocation) -- every one of
+the eight pinned targets has a substantial XCTest suite of its own, so a target that is really
+part of the build always appears there regardless of how many (if any) Swift Testing cases it
+has. A zero that cannot be corroborated this way is REFUSED, not accepted as a pass.
 
 Running the bundle by name/selector, not `swift test --package-path spike --filter '<Target>\\.'`,
 still matters because a `--filter` run walks EVERY `.xctest` bundle in the package: a non-matching
@@ -126,6 +174,17 @@ shape of false-green before, and every one of them is a hard FAIL (non-zero exit
   REFUSED. There is deliberately no "toolchain unavailable, skip and return success" branch anywhere
   in this file.
 
+THE SAME RULES APPLY TO THE SWIFT TESTING LEG, WITH TWO LEG-SPECIFIC ADDITIONS:
+
+- No `--xunit-output` artifact exists after the `swift test` invocation, or it exists but is not
+  parseable XML, or it parses but contains zero `<testsuite>` elements anywhere -> FAIL, reported as
+  REFUSED: exactly the "a run that produced no readable result must never be mistaken for a pass"
+  rule above, applied to this leg's own artifact shape.
+- A target whose Swift Testing count comes back zero, and which does NOT also appear in the shared
+  `swift test list` listing -> FAIL, reported as REFUSED: see "THE SWIFT TESTING LEG'S OWN ZERO-CASE
+  VACUITY TRAP" above. This is what makes the zero-executed rule meaningful for the seven targets
+  legitimately pinned at zero Swift Testing cases, instead of exempting them from it.
+
 This gate runs in CI on every push and pull request, as its own job. It is deliberately kept out of
 the fast `scripts/tests` Python suite (`python3 -m unittest discover -s scripts/tests`): exporting
 plus building and running eight targets takes tens of minutes, which would make that fast suite
@@ -134,9 +193,10 @@ unusable for quick local iteration. To run it locally against a checkout, from t
 `spike/Tests`, `spike/Sources`, or a `public/sanitized-projection/` override that a projected test
 depends on, even if you also rely on CI to catch it.
 
-Exit codes: 0 = every selected target matched its pinned expectation (test count and failure count);
-1 = at least one target mismatched or was refused; 2 = setup error (export failed, the projection
-path or expectations file is missing, or the `swift`/`xcrun` toolchain is not on PATH).
+Exit codes: 0 = every selected target matched its pinned expectation, XCTest leg and Swift Testing
+leg alike (test count and failure count); 1 = at least one target mismatched or was refused, in
+either leg; 2 = setup error (export failed, the projection path or expectations file is missing, or
+the `swift`/`xcrun` toolchain is not on PATH).
 """
 
 from __future__ import annotations
@@ -150,6 +210,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_EXPECTATIONS = REPO_ROOT / "scripts" / "projected_test_expectations.json"
@@ -180,6 +241,22 @@ class TargetResult:
     expected_failures: int
     actual_tests: int | None
     actual_skipped: int | None
+    actual_failures: int | None
+    verdict: str
+    detail: str
+
+
+@dataclasses.dataclass
+class SwiftTestingResult:
+    """One target's Swift Testing (`@Test`) leg result -- entirely separate from `TargetResult`
+    (the XCTest leg) because the two legs run independent tools (`swift test --disable-xctest`
+    vs. `xcrun xctest`) against independent artifacts, and neither leg's bundle resolution or
+    refusal affects the other's."""
+
+    target: str
+    expected_tests: int
+    expected_failures: int
+    actual_tests: int | None
     actual_failures: int | None
     verdict: str
     detail: str
@@ -252,6 +329,74 @@ def class_selectors(listing: str, target: str) -> list[str]:
         if selector.startswith(prefix):
             selectors.add(selector)
     return sorted(selectors)
+
+
+def swift_testing_filter_pattern(target: str) -> str:
+    """The anchored `swift test --filter` regular expression for exactly one target's Swift
+    Testing cases. Anchored with `^` and an exact module-prefix trailing dot
+    (`re.escape(target) + r"\\."`), the same rule `class_selectors` uses for XCTest selectors, so
+    an unanchored pattern cannot accidentally select a sibling module that merely shares a string
+    prefix. Running this filter, rather than an unfiltered `swift test`, is also what keeps this
+    gate away from the MLX/Metal targets it does not cover -- see the module docstring."""
+    return f"^{re.escape(target)}\\."
+
+
+def parse_swift_testing_xunit(xml_text: str, target: str) -> tuple[int, int] | None:
+    """Parse one `swift test --xunit-output` artifact and return `(tests, failures)`
+    attributable to exactly one target, or None if the artifact cannot be trusted at all.
+
+    Deliberately does not pick a `<testsuite>` element by name or position -- see the module
+    docstring for why every `<testsuite>` in this artifact is named identically
+    (`"TestResults"`) on every measured toolchain, and why Swift 6.4 was measured to emit one
+    such element per bundle walked while Swift 6.3.3 emits exactly one for the whole document.
+    Instead this collects every `<testcase>` anywhere in the document and keeps only the ones
+    whose `classname` attribute starts with the exact module prefix `f"{target}."` (the same
+    trailing-dot exact match `class_selectors` uses for XCTest selectors), so the attributed
+    count does not depend on how many empty sibling `<testsuite>` elements happen to be
+    interleaved alongside the real one. A matched `<testcase>` counts as a failure if it has a
+    `<failure>` or `<error>` child element, the two failure shapes Swift Testing's xUnit writer
+    was measured to use.
+
+    Returns None -- never `(0, 0)` -- when the artifact itself is not readable: invalid XML
+    (`ET.ParseError`, e.g. a process that crashed mid-write and left a truncated document), or a
+    well-formed document with zero `<testsuite>` elements anywhere. The latter was measured to
+    not happen even for a filter that matches nothing at all -- every walked bundle still reports
+    its own empty `<testsuite>` -- so a document with none of them at all means `swift test` never
+    got far enough to report anything, not that it legitimately found nothing.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    if not root.findall(".//testsuite"):
+        return None
+    prefix = f"{target}."
+    tests = 0
+    failures = 0
+    for testcase in root.findall(".//testcase"):
+        classname = testcase.get("classname", "")
+        if not classname.startswith(prefix):
+            continue
+        tests += 1
+        if testcase.find("failure") is not None or testcase.find("error") is not None:
+            failures += 1
+    return tests, failures
+
+
+def swift_testing_target_is_known(listing: str, target: str) -> bool:
+    """Whether `target` appears anywhere in a `swift test list --skip-build` listing, as an exact
+    module-prefix match (the same trailing-dot rule as `class_selectors`).
+
+    Closes one specific vacuity trap named in the module docstring: a Swift Testing filtered run
+    that finds zero matching cases produces a well-formed report indistinguishable, by its own
+    output alone, from one whose target name was mistyped, renamed, or never got built. Every
+    pinned target has a substantial XCTest suite of its own, so a target that is genuinely part
+    of the build always appears in this listing regardless of how many (if any) Swift Testing
+    cases it has. Reuses the listing `swift_test_listing` already fetched and cached for the
+    XCTest combined-bundle mode rather than invoking `swift test list` a second time.
+    """
+    prefix = f"{target}."
+    return any(line.strip().startswith(prefix) for line in listing.splitlines())
 
 
 def swift_test_listing(destination: pathlib.Path, cache: dict) -> tuple[str | None, str | None]:
@@ -559,6 +704,115 @@ def evaluate_target(
     return _classify(parsed, expected_tests, expected_failures, finish, MODE_COMBINED)
 
 
+def evaluate_swift_testing_target(
+    destination: pathlib.Path,
+    target: str,
+    expected: dict,
+    log_dir: pathlib.Path | None,
+    listing_cache: dict,
+    xunit_dir: pathlib.Path,
+) -> SwiftTestingResult:
+    """Run and classify one target's Swift Testing leg, independent of the XCTest leg's own
+    bundle resolution or verdict for the same target -- see the module docstring for why this
+    always runs `swift test --filter <anchored pattern> --disable-xctest`, never `xcrun xctest`,
+    and never an unfiltered `swift test`.
+
+    `xunit_dir` is a scratch directory the caller owns (created once per `run_gate` call, shared
+    across every target so each gets its own `<target>.xml` inside it) -- passed in rather than
+    created here so a test can control exactly what does or does not land at that path without
+    a real `swift` subprocess.
+    """
+    expected_tests = int(expected["tests"])
+    expected_failures = int(expected["failures"])
+    xunit_path = xunit_dir / f"{target}.xml"
+    log_parts: list[str] = []
+
+    def finish(
+        actual: tuple[int, int] | None, verdict: str, detail: str
+    ) -> SwiftTestingResult:
+        if log_dir is not None:
+            (log_dir / f"{target}.swift-testing.log").write_text(
+                "".join(log_parts), encoding="utf-8"
+            )
+        actual_tests, actual_failures = actual if actual else (None, None)
+        return SwiftTestingResult(
+            target=target,
+            expected_tests=expected_tests,
+            expected_failures=expected_failures,
+            actual_tests=actual_tests,
+            actual_failures=actual_failures,
+            verdict=verdict,
+            detail=detail,
+        )
+
+    command = [
+        "swift",
+        "test",
+        "--package-path",
+        "spike",
+        "--skip-build",
+        "--disable-xctest",
+        "--filter",
+        swift_testing_filter_pattern(target),
+        "--xunit-output",
+        str(xunit_path),
+    ]
+    result = run(command, cwd=destination)
+    log_parts.append(f"$ {' '.join(command)}\n")
+    log_parts.append(result.stdout)
+    log_parts.append(result.stderr)
+
+    # Deliberately not gating on result.returncode: `swift test` exits non-zero whenever any
+    # selected case fails, an expected, already-recorded shape -- exactly the same reasoning the
+    # XCTest leg above uses. The only thing that makes a run unreadable is an absent or
+    # unparseable artifact, checked next.
+    if not xunit_path.exists():
+        return finish(
+            None,
+            REFUSED,
+            "no Swift Testing xunit artifact was produced by `swift test` (exit "
+            f"{result.returncode}) [swift testing]",
+        )
+    xml_text = xunit_path.read_text(encoding="utf-8")
+    parsed = parse_swift_testing_xunit(xml_text, target)
+    if parsed is None:
+        return finish(
+            None,
+            REFUSED,
+            "Swift Testing xunit artifact was malformed or contained no <testsuite> element at "
+            "all (crash or truncated run) [swift testing]",
+        )
+    actual_tests, actual_failures = parsed
+
+    if actual_tests == 0:
+        # Close the zero-case vacuity trap named in the module docstring: a legitimate zero and
+        # a mistyped/unbuilt target look identical from this artifact alone.
+        listing, listing_error = swift_test_listing(destination, listing_cache)
+        if listing_error is not None:
+            return finish(
+                None,
+                REFUSED,
+                "Swift Testing reported zero cases and this target's existence could not be "
+                f"corroborated: {listing_error} [swift testing]",
+            )
+        if not swift_testing_target_is_known(listing or "", target):
+            return finish(
+                None,
+                REFUSED,
+                f"Swift Testing reported zero cases for {target}, and {target} does not "
+                "otherwise appear in `swift test list` -- refusing to treat this as a "
+                "legitimate zero rather than a typo'd or unbuilt target [swift testing]",
+            )
+
+    if actual_tests != expected_tests or actual_failures != expected_failures:
+        detail = (
+            f"tests {actual_tests} (expected {expected_tests}), "
+            f"failures {actual_failures} (expected {expected_failures}) [swift testing]"
+        )
+        return finish((actual_tests, actual_failures), MISMATCH, detail)
+    return finish((actual_tests, actual_failures), OK, "[swift testing]")
+
+
 def print_table(results: list[TargetResult]) -> None:
     columns = (
         f"{'TARGET':<28} {'EXP TESTS':>9} {'ACT TESTS':>9} {'EXP FAIL':>8} {'ACT FAIL':>8} "
@@ -588,8 +842,38 @@ def print_table(results: list[TargetResult]) -> None:
     )
 
 
+def print_swift_testing_table(results: list[SwiftTestingResult]) -> None:
+    """Same table style as `print_table`, for the Swift Testing leg -- no skip column, since
+    that leg's pin has no skipped-count concept."""
+    columns = f"{'TARGET':<28} {'EXP TESTS':>9} {'ACT TESTS':>9} {'EXP FAIL':>8} {'ACT FAIL':>8}  VERDICT"
+    print("\nSwift Testing (`@Test`) leg:")
+    print(columns)
+    print("-" * len(columns))
+    for result in results:
+        act_tests = "-" if result.actual_tests is None else str(result.actual_tests)
+        act_fail = "-" if result.actual_failures is None else str(result.actual_failures)
+        line = (
+            f"{result.target:<28} {result.expected_tests:>9} {act_tests:>9} "
+            f"{result.expected_failures:>8} {act_fail:>8}  {result.verdict}"
+        )
+        if result.detail:
+            line += f"  ({result.detail})"
+        print(line)
+
+    ok_count = sum(1 for r in results if r.verdict == OK)
+    mismatch_count = sum(1 for r in results if r.verdict == MISMATCH)
+    refused_count = sum(1 for r in results if r.verdict == REFUSED)
+    print(
+        f"\n{ok_count}/{len(results)} target(s) OK, {mismatch_count} MISMATCH, "
+        f"{refused_count} REFUSED"
+    )
+
+
 def update_expectations(
-    expectations_path: pathlib.Path, expectations_data: dict, results: list[TargetResult]
+    expectations_path: pathlib.Path,
+    expectations_data: dict,
+    results: list[TargetResult],
+    swift_testing_results: list[SwiftTestingResult] | None = None,
 ) -> None:
     print("\n" + "!" * 78, file=sys.stderr)
     print(
@@ -620,8 +904,39 @@ def update_expectations(
             file=sys.stderr,
         )
 
+    if swift_testing_results is not None:
+        swift_testing_not_updated = update_swift_testing_expectations(
+            expectations_data, swift_testing_results
+        )
+        if swift_testing_not_updated:
+            print(
+                "NOTE: swift_testing left unchanged (REFUSED this run, no observed counts to "
+                "record): " + ", ".join(swift_testing_not_updated),
+                file=sys.stderr,
+            )
+
     expectations_path.write_text(json.dumps(expectations_data, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote updated expectations to {expectations_path}", file=sys.stderr)
+
+
+def update_swift_testing_expectations(
+    expectations_data: dict, results: list[SwiftTestingResult]
+) -> list[str]:
+    """Update the `swift_testing` block of `expectations_data["targets"][*]` in place from this
+    run's observed counts. Returns the list of targets left unchanged (REFUSED this run). Writing
+    the file and printing the shared warning stay in `update_expectations`/`run_gate`, which
+    calls this before writing -- both legs' updates land in one write, one warning, one diff."""
+    not_updated: list[str] = []
+    for result in results:
+        if result.actual_tests is None:
+            not_updated.append(result.target)
+            continue
+        entry = expectations_data["targets"][result.target]
+        entry["swift_testing"] = {
+            "tests": result.actual_tests,
+            "failures": result.actual_failures,
+        }
+    return not_updated
 
 
 def run_gate(
@@ -670,9 +985,22 @@ def run_gate(
             )
             for target in selected
         ]
+        swift_testing_results = [
+            SwiftTestingResult(
+                target=target,
+                expected_tests=int(all_targets[target]["swift_testing"]["tests"]),
+                expected_failures=int(all_targets[target]["swift_testing"]["failures"]),
+                actual_tests=None,
+                actual_failures=None,
+                verdict=REFUSED,
+                detail=detail + " [swift testing]",
+            )
+            for target in selected
+        ]
         print_table(results)
+        print_swift_testing_table(swift_testing_results)
         if update:
-            update_expectations(expectations_path, expectations_data, results)
+            update_expectations(expectations_path, expectations_data, results, swift_testing_results)
         return 1
 
     listing_cache: dict = {}
@@ -682,10 +1010,30 @@ def run_gate(
     ]
     print_table(results)
 
-    if update:
-        update_expectations(expectations_path, expectations_data, results)
+    with tempfile.TemporaryDirectory(prefix="swift-testing-xunit-") as swift_testing_scratch:
+        swift_testing_xunit_dir = pathlib.Path(swift_testing_scratch)
+        swift_testing_results = [
+            evaluate_swift_testing_target(
+                destination,
+                target,
+                all_targets[target]["swift_testing"],
+                log_dir,
+                listing_cache,
+                swift_testing_xunit_dir,
+            )
+            for target in selected
+        ]
+    print_swift_testing_table(swift_testing_results)
 
-    return 0 if all(result.verdict == OK for result in results) else 1
+    if update:
+        update_expectations(expectations_path, expectations_data, results, swift_testing_results)
+
+    return (
+        0
+        if all(result.verdict == OK for result in results)
+        and all(result.verdict == OK for result in swift_testing_results)
+        else 1
+    )
 
 
 def main() -> int:
