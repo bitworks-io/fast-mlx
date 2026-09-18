@@ -34,6 +34,29 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
     "BEGIN RSA" + " PRIVATE KEY",
 )
 
+# Extended markers for the quality-guide manifest only (not every PRIVATE_MARKERS
+# consumer): private serving-engine names, EXCEPT when the occurrence is part of
+# the exact public token "fastmlx-serve". The names are assembled from parts so
+# this public source never carries them as literals. Host shorthand for the
+# fleet's ".25<0-3>" addresses is refused everywhere (never inside a longer
+# number, e.g. ".2519").
+QUALITY_GUIDE_ENGINE_NAME_MARKERS: Tuple[str, ...] = ("om" + "lx", "mt" + "plx", "ml" + "x-serve")
+QUALITY_GUIDE_PUBLIC_ENGINE_TOKEN = "fastmlx-serve"
+QUALITY_GUIDE_HOST_SHORTHAND = re.compile(r"(?<![0-9])\.25[0-3](?![0-9])")
+
+
+def _quality_guide_private_marker(serialized: str) -> Optional[str]:
+    """Return the first extended private marker found in `serialized`, or None."""
+    sanitized = serialized.casefold().replace(QUALITY_GUIDE_PUBLIC_ENGINE_TOKEN, "")
+    for marker in QUALITY_GUIDE_ENGINE_NAME_MARKERS:
+        if marker in sanitized:
+            return marker
+    host_match = QUALITY_GUIDE_HOST_SHORTHAND.search(serialized)
+    if host_match:
+        return host_match.group(0)
+    return None
+
+
 TABLE_SEPARATOR = re.compile(r"^:?-{3,}:?$")
 LIST_ITEM = re.compile(r"^(?:[-+*]\s+|\d+\.\s+)(.+)$")
 ORDERED_ITEM = re.compile(r"^\d+\.\s+(.+)$")
@@ -675,6 +698,9 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
     for marker in PRIVATE_MARKERS:
         if marker.casefold() in serialized.casefold():
             fail(f"quality-guide manifest contains private marker {marker!r}")
+    extended_marker = _quality_guide_private_marker(serialized)
+    if extended_marker is not None:
+        fail(f"quality-guide manifest contains private marker {extended_marker!r}")
 
     cards = manifest.get("cards")
     if not isinstance(cards, list) or not cards:
@@ -2038,7 +2064,7 @@ def quality_admission_framing(verdict: str, admission: Dict[str, object]) -> str
     if verdict == "NO_GO":
         return f'Opt-in choice, not a silent default — {admission["reason"]}'
     if verdict == "REFERENCE":
-        return "This is the production default; not an opt-in."
+        return "This is the reference other configs are measured against; not an opt-in."
     if verdict == "EXACT":
         return "Identical output, just faster — proven token-for-token, not a quality trade."
     if verdict == "PASS":
@@ -2067,11 +2093,13 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
         '<div class="section-heading"><p class="eyebrow">Reviewed fast-mlx evidence only</p>'
         '<h2 id="quality-cards-heading">Lead with the plain-language cost, not the raw number.</h2>'
         '<p class="section-intro">A NO-GO card is an informed opt-in with a stated cost, never '
-        'a defect report. A REFERENCE card is the production default. An EXACT card is a free '
+        'a defect report. A REFERENCE card is the quality bar the others are measured against. '
+        'An EXACT card is a free '
         'speedup with proven identical output.</p></div>',
         '<div class="quality-card-grid">',
     ]
     for card in cards:
+        model = card["model"]
         legible = card["legible"]
         benefit = legible["benefit"]
         provenance = card["provenance"]
@@ -2083,6 +2111,8 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
         drift = legible.get("nextWordDrift")
         regression_focus = legible.get("regressionFocus")
         fit = benefit.get("fit")
+        family = str(model["family"])
+        method = str(provenance["method"])
 
         body.extend(
             [
@@ -2095,6 +2125,7 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
                 f'<span class="quality-tier-badge" data-quality-tier="{html.escape(tier, quote=True)}">{html.escape(tier.upper())}</span>'
                 f'<span class="quality-verdict-badge" data-quality-verdict-label>{html.escape(verdict_label)}</span>'
                 '</div>',
+                f'<p class="quality-family">{html.escape(family)}</p>',
                 f'<h3>{html.escape(str(legible["headline"]))}</h3>',
             ]
         )
@@ -2132,6 +2163,7 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
                 f'<div><dt>Speed</dt><dd>{html.escape(quality_speed_line(benefit))}</dd></div>',
                 '</dl>',
                 f'<p class="quality-provenance"><strong>Provenance:</strong> {html.escape(quality_provenance_label(provenance))}</p>',
+                f'<p class="quality-method"><strong>Method:</strong> {html.escape(method)}</p>',
             ]
         )
         confound = provenance.get("confound")

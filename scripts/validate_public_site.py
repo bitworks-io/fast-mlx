@@ -198,9 +198,9 @@ MAX_LICENSE_PAGE_BYTES = 131_072
 MAX_STATUS_BYTES = 131_072
 MAX_CAPABILITY_CATALOG_BYTES = 131_072
 MAX_CAPABILITY_DETAIL_BYTES = 131_072
-REVIEWED_QUICKSTART_PAGE_BYTES = 9_794
+REVIEWED_QUICKSTART_PAGE_BYTES = 10_009
 REVIEWED_QUICKSTART_PAGE_SHA256 = (
-    "c9c990104fe7573d0f84683362c010c3a6945c13423d12dc9c4fd6058bd5506b"
+    "bd5d84a28a14daacfd1895b75b1175625187e1603dac124cfcb7f0d4cefa2b6f"
 )
 REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
@@ -4899,6 +4899,12 @@ def validate_quality_guide_page(site: Path) -> List[str]:
                 failures.append(
                     f'quality card {card_id!r} (NO_GO) must not read as "broken"'
                 )
+        family = str(card["model"]["family"])
+        if family not in text:
+            failures.append(f"quality card {card_id!r} does not render its model family")
+        method = str(card["provenance"]["method"])
+        if method not in text:
+            failures.append(f"quality card {card_id!r} does not render its provenance method")
         source = str(card["provenance"]["source"])
         if source not in text:
             failures.append(f"quality card {card_id!r} does not render its provenance source")

@@ -4279,6 +4279,43 @@ class PublicSiteTests(unittest.TestCase):
             (root / "site").mkdir()
             self.assertIsNone(build_public_site.load_quality_guides(root))
 
+    def test_quality_guide_manifest_extended_private_markers_are_refused(self) -> None:
+        # Private serving-engine names are refused EXCEPT inside the exact public
+        # token "fastmlx-serve"; a bare ".25<0-3>" host shorthand is refused
+        # everywhere. The names are assembled from parts so this public source
+        # never carries them as literals (the publication leak sweep greps for them).
+        engine = "ml" + "x-serve"
+        refused = {
+            "bare engine name": f"org/{engine}",
+            "mixed-case engine name": f"org/{engine.upper()}",
+            "embedded engine name": f"org/x-{engine.title()}-y",
+            "first component substring": "the " + "om" + "lx engine",
+            "second component substring": "an " + "mt" + "plx build",
+            "host shorthand .252": "reachable at host .252 today",
+            "host shorthand .250": "staged on host .250",
+        }
+        for label, marker_text in refused.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest = self.quality_guide_manifest()
+                manifest["cards"][0]["provenance"]["confound"] = marker_text
+                self.write_quality_guide_manifest(root, manifest)
+                with self.assertRaises(SystemExit):
+                    build_public_site.load_quality_guides(root)
+
+    def test_quality_guide_manifest_allows_fastmlx_serve_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self.quality_guide_manifest()
+            manifest["cards"][0]["provenance"]["confound"] = "served by fastmlx-serve"
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+            self.assertIsNotNone(loaded)
+
+    def test_real_quality_guide_manifest_passes_extended_private_marker_scan(self) -> None:
+        loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
+        self.assertIsNotNone(loaded)
+
     def test_quality_guide_renders_legible_cards_from_manifest(self) -> None:
         manifest = self.quality_guide_manifest()
         with tempfile.TemporaryDirectory() as directory:
@@ -4297,10 +4334,12 @@ class PublicSiteTests(unittest.TestCase):
             card for card in cards if card["provenance"]["source"] == "vendor-reported"
         )
 
-        # Every card's tier and headline render.
+        # Every card's tier, headline, model family, and provenance method render.
         for card in cards:
             self.assertIn(card["legible"]["tier"].upper(), page)
             self.assertIn(card["legible"]["headline"], page)
+            self.assertIn(html.escape(card["model"]["family"]), page)
+            self.assertIn(html.escape(card["provenance"]["method"]), page)
 
         # The NO_GO card reads as an opt-in choice with its stated cost, never "broken".
         self.assertIn(no_go_card["admission"]["reason"], page)
@@ -4397,6 +4436,40 @@ class PublicSiteTests(unittest.TestCase):
             self.assertTrue((output / "quality/index.json").is_file())
             failures = validate_public_site.validate(output)
             self.assertEqual(failures, [])
+
+    def test_validator_rejects_quality_page_missing_family_or_method(self) -> None:
+        """Mirrors the speedXStatus rendering check: a regression that stops the
+        renderer emitting a card's model family or provenance method must be
+        caught by the fail-closed page validator, not just eyeballed."""
+
+        manifest = self.quality_guide_manifest()
+        original_render_quality_guide = build_public_site.render_quality_guide
+
+        def render_without_family_or_method(cards: object) -> str:
+            page = original_render_quality_guide(cards)  # type: ignore[arg-type]
+            page = re.sub(r'<p class="quality-family">.*?</p>', "", page)
+            page = re.sub(r'<p class="quality-method">.*?</p>', "", page)
+            return page
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            with mock.patch.object(
+                build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "render_quality_guide",
+                side_effect=render_without_family_or_method,
+            ):
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            failures = validate_public_site.validate_quality_guide_page(output)
+            self.assertTrue(
+                any("does not render its model family" in f for f in failures), failures
+            )
+            self.assertTrue(
+                any("does not render its provenance method" in f for f in failures), failures
+            )
 
     def test_validator_rejects_unknown_quality_verdict_and_provenance_source(self) -> None:
         base_manifest = self.quality_guide_manifest()

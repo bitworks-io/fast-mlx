@@ -43,7 +43,7 @@ cd fast-mlx</code></pre>
         <pre><code data-command="serve-scripted">swift run --package-path spike fastmlx-serve --scripted</code></pre>
       </li>
       <li class="quickstart-step">
-        <div><span>03</span><h3>Send a JSON completion</h3><p>The current route is temperature zero and accepts n = 1. The response is an <code>application/json</code> chat completion with usage.</p></div>
+        <div><span>03</span><h3>Send a JSON completion</h3><p>The example request uses temperature zero and n = 1. The response is an <code>application/json</code> chat completion with usage.</p></div>
         <pre><code data-command="request-json">curl http://127.0.0.1:8080/v1/chat/completions \
   -H &#x27;content-type: application/json&#x27; \
   -d &#x27;{&quot;model&quot;:&quot;fastmlx-scripted&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hello&quot;}],&quot;temperature&quot;:0,&quot;n&quot;:1,&quot;stream&quot;:false}&#x27;</code></pre>
@@ -75,7 +75,7 @@ cd fast-mlx</code></pre>
     <div class="section-heading">
       <p class="eyebrow">Loaded serving boundary</p>
       <h2 id="quickstart-loaded">Read the contract before attaching a model.</h2>
-      <p class="section-intro">Loaded serving requires an absolute model path, an explicit model identity, and explicit memory and cache limits. Inspect the current flags rather than copying an unreviewed machine configuration.</p>
+      <p class="section-intro">Loaded serving requires an absolute model path and an explicit model identity. Before loading, a fit check sizes the model against this Mac, derives the memory and cache limits, and refuses a model that does not fit unless you pass <code>--force</code>. Inspect the current flags rather than copying an unreviewed machine configuration.</p>
     </div>
     <pre class="quickstart-command"><code data-command="serve-help">swift run --package-path spike fastmlx-serve --help</code></pre>
     <div class="quickstart-proof-grid">
@@ -85,7 +85,7 @@ cd fast-mlx</code></pre>
       </article>
       <article>
         <h3>Current API scope</h3>
-        <p>The reviewed route is temperature zero with <code>n = 1</code>. Unsupported sampling, tool, and structured-response fields are rejected instead of silently ignored.</p>
+        <p>The chat route accepts sampling parameters, tool calls, and JSON response formats, with <code>n = 1</code>. Unknown top-level fields are ignored and reported as warnings; a field the route cannot honour is rejected instead of silently ignored.</p>
       </article>
     </div>
   </section>

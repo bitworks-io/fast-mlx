@@ -1,7 +1,89 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-03T17:48:10Z",
+  "generatedAt": "2026-09-18T15:00:00Z",
   "cards": [
+    {
+      "id": "qwen38-flash-next-iq-3p3bpw@m3ultra",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64"
+      },
+      "config": {
+        "quant": {
+          "bits": 3,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community ~3.3 bits-per-weight mixed pack, compared against the same model's mixed 4/8-bit pack"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "picks a different next token than the mixed 4/8-bit pack 6.2% of the time; not a silent substitute for it"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "Qwen3.8-Flash-Next, 3.3-bit pack: about 1 next word in 16 differs from the mixed 4/8-bit pack. This is a peer comparison; neither pack is ground truth.",
+        "nextWordDrift": {
+          "oneInK": 16,
+          "top1AgreementPct": 93.83
+        },
+        "regressionFocus": "not localized: a peer comparison shows where the packs differ, not which one is right",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real disagreeing position from the cell's observations"
+        },
+        "benefit": {
+          "fit": null,
+          "speedX": null,
+          "speedXStatus": "not-measured"
+        }
+      },
+      "rawMetrics": {
+        "top1Disagreement": "150/2432 = 6.17%",
+        "top1DisagreementWilson95": [
+          0.0528,
+          0.0719
+        ],
+        "tvLowerBoundMedian": 0.0166,
+        "tvLowerBoundP95": 0.2519,
+        "klLowerBoundMedianNats": 0.0061,
+        "klLowerBoundP95Nats": 0.1929,
+        "boundsWeakenedPositions": "1544/2432 = 63.5%",
+        "logprobTopK": 20,
+        "promptsSkipped": "2/40",
+        "contextRegime": "native 262,144-token window, no YaRN"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "peer divergence: greedy forced trajectory from the mixed 4/8-bit pack; the 3.3-bit pack's own top-1 compared by token text, resynced at each disagreement; top-20 logprobs; same server binary and flags on both arms",
+        "confound": "peer comparison: neither pack is ground truth and no full-precision reference fits the host, so this shows the packs differ, not which is better; TV/KL are lower bounds, weakened at 63.5% of positions, so a small value is a floor, not closeness",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "3fda382e0ed1525450e83313f9c165469626e7c1",
+        "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
+        "sourceVerdict": "peer-divergence-cell-a1-2026-09-17",
+        "measuredAt": "2026-09-17T19:04:36Z"
+      },
+      "boundary": {
+        "scope": "peer comparison of two packs of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
+        "unmeasured": [
+          "context beyond the native 262,144-token window (YaRN)",
+          "which pack is closer to the full-precision model",
+          "comparison against an 8-bit pack",
+          "other serving engines",
+          "decode throughput (speedX)",
+          "tool-call quality"
+        ]
+      }
+    },
     {
       "id": "qwen38-27b-optiq-4bit@m3ultra",
       "model": {
@@ -166,7 +248,7 @@
           "bits": 8,
           "groupSize": null,
           "mixedBit": false,
-          "note": "mxfp8 reference / production default"
+          "note": "mxfp8 reference \u2014 the 8-bit reference the other 27B packs are measured against"
         },
         "enhancement": "none",
         "hardwareClass": "apple-m3-ultra"
@@ -175,11 +257,11 @@
       "admission": {
         "default": true,
         "optIn": true,
-        "reason": "production default; the measurement reference"
+        "reason": "the measurement reference other 27B packs are measured against"
       },
       "legible": {
         "tier": "Near-lossless",
-        "headline": "The production default \u2014 the quality bar the others are measured against.",
+        "headline": "The 8-bit reference: the quality bar the other 27B packs are measured against.",
         "nextWordDrift": null,
         "regressionFocus": null,
         "example": {
@@ -190,7 +272,7 @@
           "note": "reference row; not applicable (this IS the reference)"
         },
         "benefit": {
-          "fit": "runs on the 128 GB production box",
+          "fit": "runs on a 128 GB Mac",
           "speedX": null,
           "speedXStatus": "reference"
         }
@@ -201,7 +283,7 @@
       "provenance": {
         "source": "fast-mlx-measured",
         "vendor": null,
-        "method": "reference config (production default)",
+        "method": "reference config (8-bit reference build)",
         "confound": null,
         "hardware": "Apple M3 Ultra / macOS 26.6.2",
         "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
