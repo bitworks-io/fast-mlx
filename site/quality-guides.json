@@ -1,20 +1,20 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-18T15:00:00Z",
+  "generatedAt": "2026-09-18T22:45:00Z",
   "cards": [
     {
-      "id": "qwen38-flash-next-iq-3p3bpw@m3ultra",
+      "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
       "model": {
         "family": "Qwen3.8-Flash-Next",
         "repo": null,
-        "hfPin": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64"
+        "hfPin": "ef5b919d31534faa1997666f1a22d362cd6383cd"
       },
       "config": {
         "quant": {
-          "bits": 3,
+          "bits": 4,
           "groupSize": null,
           "mixedBit": true,
-          "note": "community ~3.3 bits-per-weight mixed pack, compared against the same model's mixed 4/8-bit pack"
+          "note": "community mixed pack: 4-bit routed experts, 8-bit other projections"
         },
         "enhancement": "none",
         "hardwareClass": "apple-m3-ultra"
@@ -23,16 +23,16 @@
       "admission": {
         "default": false,
         "optIn": true,
-        "reason": "picks a different next token than the mixed 4/8-bit pack 6.2% of the time; not a silent substitute for it"
+        "reason": "differs from the 8-bit reference on 2.6% of next tokens; not a silent substitute for it"
       },
       "legible": {
         "tier": "Noticeable",
-        "headline": "Qwen3.8-Flash-Next, 3.3-bit pack: about 1 next word in 16 differs from the mixed 4/8-bit pack. This is a peer comparison; neither pack is ground truth.",
+        "headline": "Qwen3.8-Flash-Next, mixed 4/8-bit pack: about 1 next word in 39 differs from an 8-bit conversion of the official weights.",
         "nextWordDrift": {
-          "oneInK": 16,
-          "top1AgreementPct": 93.83
+          "oneInK": 39,
+          "top1AgreementPct": 97.44
         },
-        "regressionFocus": "not localized: a peer comparison shows where the packs differ, not which one is right",
+        "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows this pack is closer to the 8-bit reference than the 3.3-bit pack (p = 2.2e-14)",
         "example": {
           "status": "pending",
           "prompt": null,
@@ -47,37 +47,119 @@
         }
       },
       "rawMetrics": {
-        "top1Disagreement": "150/2432 = 6.17%",
+        "top1Disagreement": "64/2496 = 2.56%",
         "top1DisagreementWilson95": [
-          0.0528,
-          0.0719
+          0.0201,
+          0.0326
         ],
-        "tvLowerBoundMedian": 0.0166,
-        "tvLowerBoundP95": 0.2519,
-        "klLowerBoundMedianNats": 0.0061,
-        "klLowerBoundP95Nats": 0.1929,
-        "boundsWeakenedPositions": "1544/2432 = 63.5%",
+        "tvLowerBoundMedian": 0.0047,
+        "tvLowerBoundP95": 0.1077,
+        "klLowerBoundMedianNats": 0.0015,
+        "klLowerBoundP95Nats": 0.0348,
+        "boundsWeakenedPositions": "1557/2496 = 62.4%",
         "logprobTopK": 20,
-        "promptsSkipped": "2/40",
+        "promptsSkipped": "1/40",
         "contextRegime": "native 262,144-token window, no YaRN"
       },
       "provenance": {
         "source": "fast-mlx-measured",
         "vendor": null,
-        "method": "peer divergence: greedy forced trajectory from the mixed 4/8-bit pack; the 3.3-bit pack's own top-1 compared by token text, resynced at each disagreement; top-20 logprobs; same server binary and flags on both arms",
-        "confound": "peer comparison: neither pack is ground truth and no full-precision reference fits the host, so this shows the packs differ, not which is better; TV/KL are lower bounds, weakened at 63.5% of positions, so a small value is a floor, not closeness",
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 62.4% of positions here, so a small value is a floor, not closeness. Controls: self-replay 0/2560, a perturbation control 1/2560 at the perturbed position, and a paired-vs-sequential bridge that reproduced 150/2432 exactly.",
         "hardware": "Apple M3 Ultra / macOS 26.6.2",
-        "harnessGitSHA": "3fda382e0ed1525450e83313f9c165469626e7c1",
+        "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
         "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
-        "sourceVerdict": "peer-divergence-cell-a1-2026-09-17",
-        "measuredAt": "2026-09-17T19:04:36Z"
+        "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
+        "measuredAt": "2026-09-18T22:30:43Z"
       },
       "boundary": {
-        "scope": "peer comparison of two packs of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
         "unmeasured": [
+          "closeness to the full-precision (BF16) model",
           "context beyond the native 262,144-token window (YaRN)",
-          "which pack is closer to the full-precision model",
-          "comparison against an 8-bit pack",
+          "other serving engines",
+          "decode throughput (speedX)",
+          "tool-call quality",
+          "other revisions of the repository (the weights at main 7eaef0fa are byte-identical but the card is pinned to ef5b919d)"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-flash-next-iq-3p3bpw@m3ultra",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64"
+      },
+      "config": {
+        "quant": {
+          "bits": 3,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community ~3.3 bits-per-weight mixed pack, compared against an 8-bit conversion of the official BF16 weights (the reference)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "differs from the 8-bit reference on 6.5% of next tokens; not a silent substitute for it"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "Qwen3.8-Flash-Next, 3.3-bit pack: about 1 next word in 15 differs from an 8-bit conversion of the official weights.",
+        "nextWordDrift": {
+          "oneInK": 15,
+          "top1AgreementPct": 93.50
+        },
+        "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows the mixed 4/8-bit pack is closer to this reference (p = 2.2e-14); an earlier peer-vs-peer comparison (this pack vs. the mixed 4/8-bit pack directly, not vs. this 8-bit reference) found 6.2% (150/2432) disagreement, superseded by this reference-based measurement",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real disagreeing position from the cell's observations"
+        },
+        "benefit": {
+          "fit": null,
+          "speedX": null,
+          "speedXStatus": "not-measured"
+        }
+      },
+      "rawMetrics": {
+        "top1Disagreement": "158/2432 = 6.50%",
+        "top1DisagreementWilson95": [
+          0.0558,
+          0.0755
+        ],
+        "tvLowerBoundMedian": 0.0164,
+        "tvLowerBoundP95": 0.2443,
+        "klLowerBoundMedianNats": 0.0060,
+        "klLowerBoundP95Nats": 0.1754,
+        "boundsWeakenedPositions": "1526/2432 = 62.7%",
+        "logprobTopK": 20,
+        "promptsSkipped": "2/40",
+        "contextRegime": "native 262,144-token window, no YaRN",
+        "peerDisagreementVsMixed48Pack": "150/2432 = 6.17% (earlier peer-vs-peer comparison against the mixed 4/8-bit pack, superseded by this 8-bit-reference measurement)"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 62.7% of positions here, so a small value is a floor, not closeness. Controls: self-replay 0/2560, a perturbation control 1/2560 at the perturbed position, and a paired-vs-sequential bridge that reproduced 150/2432 exactly.",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
+        "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
+        "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
+        "measuredAt": "2026-09-18T22:37:29Z"
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
+        "unmeasured": [
+          "closeness to the full-precision (BF16) model",
+          "context beyond the native 262,144-token window (YaRN)",
           "other serving engines",
           "decode throughput (speedX)",
           "tool-call quality"
