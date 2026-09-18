@@ -200,9 +200,25 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # fastmlx-serve/fastmlx-capacity binary names via the same concatenation trick
 # fastmlx_launch.py already uses, never as a bare literal; its 17 tests are self-contained (no
 # network, no unprojected fixtures, os.execv mocked rather than actually exec'd).
+# 2026-09-18, 984 -> 986: adds scripts/package-release.sh (stages the arm64-macos release
+# tarball: bin/{fastmlx shim, fastmlx-serve, fastmlx-capacity, mlx.metallib}, libexec/scripts/*.py,
+# libexec/site/quality-guides.json, LICENSE/NOTICE/README/provenance.json) and its test module,
+# scripts/tests/test_release_package.py, so the v0.1.0 release artifact can be built and verified
+# from a fresh clone of the public repository, not only from this development checkout. Conscious
+# decision to publish: both files were read in full and contain no private host, IP, username,
+# absolute machine-local path, competitor name, or credential; the one internal-deployment-name
+# tripwire this test module carries (a contiguous, case-sensitive internal-model-family marker
+# match, which would trip validate_public_repository.py's own validate_no_internal_family_marker
+# scan of THIS file) is assembled by concatenation, the same pattern this script's own
+# INTERNAL_FAMILY_MARKER constant uses, so no forbidden marker appears as a contiguous literal in
+# the projected source text. The
+# packaging tests exercise `shasum`, an arm64-macos tarball name, and injected fake binaries only
+# (never a real `swift build`), so they skip off macOS and public CI runs them in its macOS job
+# instead, mirroring the existing acquisition-tests skip pattern; the module's one platform-neutral
+# test (that the same tripwire strings are absent from package-release.sh) still runs everywhere.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 984,
-    "pathModeSha256": "44b998f5e737e7093b9c0e389ade17e9ca6fc96cf8cdc27999bf73e2f347a330",
+    "pathCount": 986,
+    "pathModeSha256": "ea08a9a5f0aceee90defa8b3f4e9f6e55946b6b4aa6e3fef831db9944972619c",
 }
 
 

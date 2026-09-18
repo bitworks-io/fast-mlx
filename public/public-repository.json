@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 984,
-    "pathModeSha256": "44b998f5e737e7093b9c0e389ade17e9ca6fc96cf8cdc27999bf73e2f347a330"
+    "pathCount": 986,
+    "pathModeSha256": "ea08a9a5f0aceee90defa8b3f4e9f6e55946b6b4aa6e3fef831db9944972619c"
   },
   "files": [
     {
@@ -80,6 +80,10 @@
     {
       "source": "scripts/hf_pinned_snapshot_download.py",
       "destination": "scripts/hf_pinned_snapshot_download.py"
+    },
+    {
+      "source": "scripts/package-release.sh",
+      "destination": "scripts/package-release.sh"
     },
     {
       "source": "scripts/run_projected_test_suites.py",
@@ -164,6 +168,10 @@
     {
       "source": "scripts/tests/test_hf_pinned_snapshot_download.py",
       "destination": "scripts/tests/test_hf_pinned_snapshot_download.py"
+    },
+    {
+      "source": "scripts/tests/test_release_package.py",
+      "destination": "scripts/tests/test_release_package.py"
     },
     {
       "source": "spike/Package.swift",

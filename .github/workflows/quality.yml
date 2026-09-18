@@ -103,6 +103,22 @@ jobs:
             exit 1
           fi
 
+      # package-release.sh's own packaging step shells out to `shasum` and stages an
+      # "arm64-macos" tarball, so its tests skip on the Linux job and run here instead. A
+      # skip on macOS would mean they silently stopped running, so it fails the job.
+      - name: Run the macOS-only release packaging tests
+        run: |
+          log="$RUNNER_TEMP/release-packaging-tests.log"
+          if ! python3 -B -m unittest scripts.tests.test_release_package -v > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          if grep -q "skipped" "$log"; then
+            echo "release packaging tests skipped on macOS" >&2
+            exit 1
+          fi
+
       - name: Upload per-target test output
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

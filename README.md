@@ -212,6 +212,43 @@ a model that does not fit unless you pass `--force`, and it refuses outright if 
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
 repository's `fastmlx-serve`.
 
+### Install a prebuilt release (v0.1.0)
+
+Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
+checksum file, verify, then extract:
+
+```sh
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.0/fastmlx-0.1.0-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.0/fastmlx-0.1.0-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.0-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.0-arm64-macos.tar.gz
+```
+
+The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
+nothing further is needed; a browser download does, and macOS will refuse to run anything inside
+the tarball until you clear it:
+
+```sh
+xattr -dr com.apple.quarantine fastmlx-0.1.0-arm64-macos
+```
+
+Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
+it), then run it:
+
+```sh
+export PATH="$PWD/fastmlx-0.1.0-arm64-macos/bin:$PATH"
+fastmlx --help
+fastmlx capacity --help
+```
+
+`fastmlx` is a Python 3 dispatcher and needs `python3` on `PATH` — the `python3` that ships with
+Apple's Command Line Tools is enough; nothing further to install. The tarball also ships
+`fastmlx-serve`, this repository's bundled fit checker and research engine: it is what `fastmlx`'s
+pre-load fit check and default `serve` target run against, exactly as described above.
+`fastmlx serve --engine-profile <path>` can front a different OpenAI-compatible engine instead of
+the bundled one, by pointing at a profile document that names that engine's binary and argv
+template (see `scripts/fastmlx_launch.py` for the profile schema).
+
 ### Transport-only (no model)
 
 ```sh
