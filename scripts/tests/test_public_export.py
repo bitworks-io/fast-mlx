@@ -178,9 +178,20 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # projected) and the already-public fastmlx-serve binary. mlx.metallib is a build artifact of the
 # pinned, MIT-licensed mlx-swift Metal kernels (spike/Package.swift's mlx-swift pin), not fast-mlx
 # source; it carries no private data and regenerating it is exactly what build-metallib.sh does.
+# 2026-09-18, 974 -> 982: relocates the engine-agnostic fastmlx tooling (fastmlx_launch.py,
+# fastmlx_pull.py, fastmlx_recommend.py, hf_pinned_snapshot_download.py, and their four test
+# modules) out of the private fleet-scripts boundary under spike/ into scripts/ and
+# scripts/tests/, then projects the eight moved paths. That private boundary remains a strict
+# forbidden path for the fleet-only scripts still under it; this is a relocation of public-safe
+# tooling out of it, not a weakening of the boundary. Conscious decision to publish: all eight
+# files were re-read in full
+# after the move and contain no private host, IP, username, absolute machine-local path,
+# competitor name, or credential; only path-resolution constants changed (fastmlx_launch.py's
+# REPO_ROOT now walks one fewer parent to land on the new, shallower location), no behavior
+# changed, and their 89 tests are self-contained (no network, no unprojected fixtures).
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 974,
-    "pathModeSha256": "f3d5e6ab7efaeeb5611e24d1b36add05a29e20e06e0088949734e91eaddb43f2",
+    "pathCount": 982,
+    "pathModeSha256": "2feba435f5c86f41f271a26c298cfb9c55e34a3255752e766078d4c04eb61e5e",
 }
 
 
