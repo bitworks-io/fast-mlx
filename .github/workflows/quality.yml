@@ -69,17 +69,14 @@ jobs:
   # a matrix here. Per-target attribution comes from the gate's own result table, and
   # each target's full raw output is uploaded as an artifact on success or failure.
   #
-  # NOT in the `pages` job's `needs:` YET, and that is a measured decision rather than
-  # timidity. The gate builds each test target individually, and whether that produces
-  # a runnable .xctest bundle is toolchain-dependent: measured on two machines, Swift
-  # 6.4 (Xcode 27) assembles a complete bundle, while Swift 6.3.3 (Xcode 26.6) reports
-  # the same build as successful and assembles no bundle at all. Which toolchain a
-  # macos-26 runner selects cannot be verified from outside CI, and a red caused by
-  # that would block the Pages deploy for a reason unrelated to test health. So this
-  # job's first runs are the measurement. PROMOTION CRITERION: once a run here shows
-  # the gate resolving and running its bundles (8/8 OK, not REFUSED), add this job to
-  # `pages`' `needs:` and drop `pure-swift-targets`, which building the test targets
-  # already subsumes.
+  # NOT in the `pages` job's `needs:` YET. This runner is Swift 6.3.3 (Xcode 26.6), and
+  # the gate's earlier per-target build assembled no runnable .xctest bundle on that
+  # toolchain, so every target was refused here. The gate now builds the whole package
+  # once with `swift build --build-tests` and, on 6.3.3, runs each target's classes from
+  # the one combined bundle that build produces. That was measured 8/8 OK on a 6.3.3
+  # machine outside CI (133 s clean build); a run on this runner has not happened yet.
+  # PROMOTION CRITERION: once a run here shows 8/8 OK, add this job to `pages`'
+  # `needs:` and drop `pure-swift-targets`, which building the test targets subsumes.
   projected-test-suites:
     runs-on: macos-26
     timeout-minutes: 90

@@ -9,30 +9,90 @@ override it exercised was missing a safety requirement (an `XCTAssertThrowsError
 throw). A compile-only check would have stayed green through that defect; only actually running the
 suite catches it, which is why this gate runs bundles instead of stopping at a successful build.
 
-This gate exports (or reuses) a public projection, builds each named test target INDIVIDUALLY with
-`swift build --package-path spike --target <Target>` -- this compiles only that target's dependency
-closure, not the whole package (measured: 2.28s warm for one target, versus minutes for the full
-package with MLX/Metal) -- then runs the resulting `.xctest` bundle DIRECTLY with `xcrun xctest
-<bundle>`, and compares the parsed result against a PINNED baseline in
+This gate exports (or reuses) a public projection, builds the package's tests ONCE with `swift build
+--package-path spike --build-tests`, then resolves and runs each named test target's `.xctest`
+bundle, and compares the parsed result against a PINNED baseline in
 `scripts/projected_test_expectations.json`.
 
-Both of those choices matter and are not incidental:
+TWO RUN MODES, AND WHY BOTH EXIST: a per-target `swift build --package-path spike --target <T>`
+build was measured, on this project's original toolchain, to produce a runnable,
+individually-attributable `<T>.xctest` bundle. It produces no runnable bundle at all on Swift 6.3.3 /
+Xcode 26.6 (the GitHub macos-26 CI runner) -- an eight-target REFUSED gate in CI, not a build failure
+the runner could retry past. Measured 2026-09-17 on an Apple M5 24 GiB consumer host on
+that same 6.3.3 toolchain, fresh projection with no `.build`: `swift build --package-path spike
+--build-tests` -- the whole package, every target together -- is a clean 133 s wall time / 2.1 GB max
+RSS build, and it produces exactly ONE combined bundle,
+`spike/.build/arm64-apple-macosx/debug/fast-mlx-spikePackageTests.xctest`, with a single executable
+inside it covering every target; there are no per-target bundles alongside it on this toolchain. That
+measurement made the per-target design's original rationale -- avoiding paying for the MLX/Metal
+build on every run -- moot: the whole package already builds in about two minutes on ordinary
+consumer hardware, so this gate now always builds the whole package exactly once per run instead of
+maintaining a separate cheap-but-toolchain-fragile per-target build path.
 
-- Building per-target, not `swift build --package-path spike --build-tests`, keeps this gate usable
-  without paying for the MLX/Metal targets every run, and lets one target's build failure be
-  attributed precisely instead of stopping the whole package build at the first broken target.
-- Running the bundle directly, not `swift test --package-path spike --filter '<Target>\\.'`, matters
-  because a `--filter` run still walks EVERY `.xctest` bundle in the package: each non-matching
-  bundle prints its own `Executed 0 tests, ...` summary alongside the target's real one, and a
-  parser that is not careful about which summary line belongs to which bundle will silently read
-  the wrong one. Running one bundle at a time removes that ambiguity by construction.
+MEASURED PER-TOOLCHAIN LAYOUTS, AND THE MIXED-TREE REFUSAL: `swift build --package-path spike
+--build-tests` was measured to produce two mutually exclusive shapes depending on the active
+toolchain, each written under a different `.build` subdirectory. Swift 6.4 / Xcode 27 produces ONLY
+per-target bundles, `spike/.build/out/Products/Debug/<Target>.xctest`, and NO combined bundle at all.
+Swift 6.3.3 / Xcode 26.6 produces ONLY the one combined bundle,
+`spike/.build/arm64-apple-macosx/debug/fast-mlx-spikePackageTests.xctest`, and NO per-target bundles.
+Because the two shapes live in different directories, neither toolchain's build ever deletes the
+other's leftovers: a `.build` tree that was built once by each toolchain -- most commonly by
+switching Xcode versions locally without removing `spike/.build` in between -- can hold a stale
+bundle of one kind sitting right next to a fresh one of the other, and nothing on disk marks which is
+stale. If this gate found a per-target bundle with a runnable executable AND a combined bundle with a
+runnable executable at the same time, it refuses (REFUSED) rather than silently preferring mode 1 and
+possibly running the stale bundle; the detail names both paths and the active toolchain, and neither
+`xcrun xctest` nor `swift test list` is invoked. Removing `spike/.build` and re-running clears it.
+
+Per target, this gate resolves a bundle to run in this order:
+
+1. Per-target bundle: if a runnable `<T>.xctest` with `Contents/MacOS/<T>` already exists under
+   `spike/.build` -- the shape a per-target `swift build --target <T>` build used to produce, and
+   which some toolchains may still leave behind from `--build-tests` or a prior incremental build --
+   this gate first checks that no combined bundle with a runnable executable also exists (see the
+   mixed-tree refusal above); if none does, it runs the per-target bundle directly with
+   `xcrun xctest <bundle>`, exactly as before. This gate no longer runs a per-target
+   `swift build --target` itself; it only checks whether one is already sitting there.
+2. Combined bundle + class selectors: otherwise, locate the combined `*PackageTests.xctest` bundle
+   `--build-tests` produced and run `xcrun xctest -XCTest <selectors> <bundle>`, where `<selectors>`
+   is a comma-joined, sorted, deduped list of `Module.Class` names belonging to exactly this target.
+   Selectors are derived from `swift test list --skip-build --package-path spike` (exact
+   module-prefix match, e.g. `ServingCoreTests.` never matches a sibling like
+   `ServingCoreTestsExtra.x/y`); that listing command is run at MOST once per gate invocation and its
+   result is shared across every target that needs it, not repeated per target. Per-target
+   attribution, which used to come from building and running one target in isolation, now comes from
+   this class-selector filter applied to the one shared combined bundle instead.
+3. Neither: REFUSED, naming both the per-target and combined-bundle absence (mentioning a skeleton
+   per-target bundle with no executable, if one was found) and the active Swift/Xcode version.
+
+Because the whole package now builds once, up front, a compile error ANYWHERE in `spike/Tests` or
+`spike/Sources` now refuses every selected target for this run, not just the target whose source
+broke it -- the `_package-build.log` this gate writes (when `--log-dir` is given) is what attributes
+which target's source actually caused it.
+
+SWIFT TESTING (`@Test`) CASES ARE NOT RUN BY THIS GATE, IN EITHER MODE: `swift test list` also
+enumerates Swift Testing suites/cases -- 49 of them in HarnessCoreTests as of 2026-09-17, e.g.
+`ForcedScoringPlanTests`, `SystemProfileOperatorBudgetTests`, `TailStatisticTests`,
+`WiredCeilingOvercommitGuardTests` -- that neither a direct `xcrun xctest <bundle>` run nor an
+`-XCTest <selectors>` run executes: XCTest only ever runs `XCTestCase` subclasses, in both modes.
+Passing a Swift Testing suite name through as a selector is harmless (`xcrun xctest` ignores a
+selector that names nothing it recognizes as an `XCTestCase`) but this gate makes no attempt to run
+those cases either way. Every pinned count in `projected_test_expectations.json` is an XCTest case
+count only.
+
+Running the bundle by name/selector, not `swift test --package-path spike --filter '<Target>\\.'`,
+still matters because a `--filter` run walks EVERY `.xctest` bundle in the package: a non-matching
+bundle prints its own `Executed 0 tests, ...` summary alongside the target's real one, and a parser
+that is not careful about which summary line belongs to which bundle will silently read the wrong
+one. `parse_summary` anchors on an exact `Test Suite '<name>'` marker -- `'<target>.xctest'` for mode
+1, or `'Selected tests'` for mode 2 -- to remove that ambiguity by construction.
 
 WHAT THIS GATE PROVES, AND WHAT IT DOES NOT: a passing run proves the named projected suites still
-RUN and still match a recorded test/failure count on the host that ran them. It does NOT prove that
-recorded baseline is CORRECT. Every target is currently pinned at 0 failures; that was not always
-true, and it does not need to stay true for this gate to still be doing its job. The gate's only job
-is to notice when a target's test count or failure count moves, in either direction, so the move gets
-a conscious decision (via `--update-expectations`) instead of silently drifting.
+RUN and still match a recorded XCTest test/failure count on the host that ran them. It does NOT prove
+that recorded baseline is CORRECT. Every target is currently pinned at 0 failures; that was not
+always true, and it does not need to stay true for this gate to still be doing its job. The gate's
+only job is to notice when a target's test count or failure count moves, in either direction, so the
+move gets a conscious decision (via `--update-expectations`) instead of silently drifting.
 
 ANTI-VACUITY RULES -- every one of these exists because this project has been burned by exactly this
 shape of false-green before, and every one of them is a hard FAIL (non-zero exit), never a skip:
@@ -43,21 +103,28 @@ shape of false-green before, and every one of them is a hard FAIL (non-zero exit
   so a silently-broken test discovery would otherwise look identical to success.
 - Executed test count does not equal the pinned expectation, in EITHER direction -> FAIL. Lower
   catches "green by deletion" (quietly removing a failing test); higher catches an unrecorded
-  addition and forces the baseline to be updated on purpose, with review, via
-  --update-expectations, rather than by drifting.
+  addition and forces the baseline to be updated on purpose, with review, via --update-expectations,
+  rather than by drifting.
 - Failure count does not equal the pinned expectation, in EITHER direction -> FAIL. The pinned number
   is whatever was last measured and consciously recorded, whether that is zero or not; a target that
   silently starts passing must ALSO trip this gate, so the improvement gets recorded on purpose
   instead of going unnoticed, the same as a regression would.
-- A build that reports success but produces no `.xctest` bundle, and a bundle that exists but
-  contains no executable to run, are reported as two DISTINCT refusals, not folded into one vague
-  "bundle missing" message -- they are the same measured toolchain gap surfacing at two different
-  resolution stages (a toolchain that does not assemble a runnable bundle for a single-target build
-  can either skip producing the bundle directory entirely, or leave a skeleton bundle from an
-  incremental build with an empty `Contents/MacOS/`), and telling them apart is what pointed at the
-  toolchain instead of a phantom crash. A build failure or an unavailable `swift`/`xcrun` toolchain
-  are their own FAILs, reported as REFUSED. There is deliberately no "toolchain unavailable, skip
-  and return success" branch anywhere in this file.
+- Zero class selectors resolved for a target that needs combined mode -> FAIL, reported as REFUSED,
+  and `xcrun xctest` is never invoked for it: an empty `-XCTest` selector list is not the same
+  request as "run nothing" to XCTest on every toolchain -- it can be read as "run everything" -- so
+  this gate refuses before running it rather than guess which behaviour it would get.
+- More than one combined `*PackageTests.xctest` bundle with a runnable executable exists under
+  `spike/.build` -> FAIL, reported as REFUSED: this gate does not guess which one to run.
+- A per-target bundle with a runnable executable AND a combined bundle with a runnable executable
+  both exist under `spike/.build` for the same run -> FAIL, reported as REFUSED, naming both paths
+  and the active toolchain, with NEITHER `xcrun xctest` nor `swift test list` invoked: this is a
+  build tree touched by two different Swift toolchains (see the measured layouts above), and one of
+  the two bundles is stale -- this gate does not guess which.
+- A package build that reports success but leaves no runnable bundle for a target in EITHER mode is
+  its own REFUSED, naming both the per-target and combined-bundle absence in one detail. A package
+  build failure, or an unavailable `swift`/`xcrun` toolchain, are their own FAILs, reported as
+  REFUSED. There is deliberately no "toolchain unavailable, skip and return success" branch anywhere
+  in this file.
 
 This gate runs in CI on every push and pull request, as its own job. It is deliberately kept out of
 the fast `scripts/tests` Python suite (`python3 -m unittest discover -s scripts/tests`): exporting
@@ -87,8 +154,8 @@ import tempfile
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT_EXPECTATIONS = REPO_ROOT / "scripts" / "projected_test_expectations.json"
 
-# Matches the counts line XCTest prints immediately after a `Test Suite '<name>.xctest' passed|failed
-# at <date>.` line, e.g. "Executed 721 tests, with 2 tests skipped and 0 failures (0 unexpected) in
+# Matches the counts line XCTest prints immediately after a `Test Suite '<name>' passed|failed at
+# <date>.` line, e.g. "Executed 721 tests, with 2 tests skipped and 0 failures (0 unexpected) in
 # 21.170 (21.351) seconds". The "with N test(s) skipped and" clause is optional because older/plain
 # XCTest output omits it entirely when there is nothing to report there; making it optional handles
 # both shapes with one pattern instead of guessing which one a given toolchain will print.
@@ -100,6 +167,9 @@ EXECUTED_LINE = re.compile(
 OK = "OK"
 MISMATCH = "MISMATCH"
 REFUSED = "REFUSED"
+
+MODE_PER_TARGET = "per-target bundle"
+MODE_COMBINED = "combined bundle + class selectors"
 
 
 @dataclasses.dataclass
@@ -119,17 +189,20 @@ def run(command: list[str], cwd: pathlib.Path) -> subprocess.CompletedProcess[st
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
 
 
-def parse_summary(output: str, target: str) -> tuple[int, int, int] | None:
-    """Return (tests, skipped, failures) parsed from the summary for exactly this target's bundle,
-    or None if no usable summary was found.
+def parse_summary(output: str, target: str, anchor: str | None = None) -> tuple[int, int, int] | None:
+    """Return (tests, skipped, failures) parsed from one summary block, or None if no usable
+    summary was found.
 
-    A single-bundle `xcrun xctest` run prints a `Test Suite '<ClassName>'` line per test class, plus
-    an aggregate `Test Suite 'All tests'` summary, in addition to the bundle-level
-    `Test Suite '<Target>.xctest'` line this function anchors on. Scanning the whole output for the
-    first "Executed N tests" line would risk reading one of those other summaries instead of this
-    target's own -- anchoring to the exact `'<target>.xctest'` marker removes that ambiguity.
+    `anchor` selects which `Test Suite '<name>'` marker to read: the default (None) anchors on
+    `'<target>.xctest'`, the per-target bundle's own bundle-level summary line, the same behaviour
+    this function has always had. Passing `anchor="Selected tests"` instead anchors on the
+    `Test Suite 'Selected tests'` block `xcrun xctest -XCTest <selectors> <bundle>` prints last,
+    after the individual class summaries and the whole-bundle
+    `Test Suite '<combined-bundle-name>.xctest'` summary -- reading any of those other blocks
+    instead would silently report the WRONG target's counts (or the whole combined bundle's
+    counts, covering every target at once) rather than the selected classes' own counts.
     """
-    marker = f"Test Suite '{target}.xctest'"
+    marker = f"Test Suite '{anchor}'" if anchor is not None else f"Test Suite '{target}.xctest'"
     lines = output.splitlines()
     for index, line in enumerate(lines):
         stripped = line.strip()
@@ -155,22 +228,78 @@ def parse_summary(output: str, target: str) -> tuple[int, int, int] | None:
     return None
 
 
+def class_selectors(listing: str, target: str) -> list[str]:
+    """Derive the sorted, deduped `Module.Class` selector list for one target from a
+    `swift test list --skip-build` listing. Pure function; no subprocess, no filesystem.
+
+    Each XCTest line in that listing has shape `Module.Class/method` (occasionally with a
+    trailing `()` on the method). This keeps only lines that contain a '/', splits on the FIRST
+    '/', and requires the part before it to start with the exact module prefix `f"{target}."` --
+    an exact prefix match with the trailing dot, so `ServingCoreTests.` never matches a sibling
+    module like `ServingCoreTestsExtra.x/y` just because it shares a string prefix. Matches are
+    deduped and sorted for a stable, reproducible selector list and log line. Returns an empty
+    list, never raises, when the target has no matching lines (an unknown target, or one whose
+    listing lines were all filtered out) -- the caller is responsible for treating an empty list
+    as its own REFUSED case rather than passing it to `xcrun xctest` as an empty selector.
+    """
+    prefix = f"{target}."
+    selectors: set[str] = set()
+    for raw_line in listing.splitlines():
+        line = raw_line.strip()
+        if "/" not in line:
+            continue
+        selector = line.split("/", 1)[0].strip().rstrip("()").strip()
+        if selector.startswith(prefix):
+            selectors.add(selector)
+    return sorted(selectors)
+
+
+def swift_test_listing(destination: pathlib.Path, cache: dict) -> tuple[str | None, str | None]:
+    """Run `swift test list --skip-build --package-path spike` at most once per gate invocation,
+    caching the result (and its raw stdout/stderr, for per-target logging) in `cache`, a plain
+    dict the caller owns and shares across every target evaluated in one `run_gate` call. Every
+    target that needs combined-mode selectors would otherwise repeat an identical, non-trivial
+    subprocess call for no new information -- this makes that call idempotent for the run.
+
+    Returns (listing_text, error_detail); exactly one of the two is not None.
+    """
+    if "done" not in cache:
+        result = run(
+            ["swift", "test", "list", "--skip-build", "--package-path", "spike"], cwd=destination
+        )
+        cache["done"] = True
+        cache["listing_stdout"] = result.stdout
+        cache["listing_stderr"] = result.stderr
+        if result.returncode != 0:
+            cache["listing"] = None
+            cache["error"] = (
+                f"`swift test list --skip-build --package-path spike` failed (exit "
+                f"{result.returncode})"
+            )
+        else:
+            cache["listing"] = result.stdout
+            cache["error"] = None
+    return cache.get("listing"), cache.get("error")
+
+
 def primary_bundle_path(destination: pathlib.Path, target: str) -> pathlib.Path:
-    """The bundle path a per-target `swift build --package-path spike --target <Target>` has been
-    observed to produce on this project's toolchain. Factored out of `resolve_bundle` so a refusal
-    message can name the exact path this gate looked for, even when nothing was found there."""
+    """The bundle path a per-target `swift build --package-path spike --target <Target>` build has
+    been observed to produce on a Swift 6.4 toolchain. Factored out of `resolve_bundle` so a
+    refusal message can name the exact path this gate looked for, even when nothing was found
+    there. This gate no longer runs that build command itself (see the module docstring); this is
+    only where it checks for a bundle that may already be sitting there."""
     return destination / "spike" / ".build" / "out" / "Products" / "Debug" / f"{target}.xctest"
 
 
 def resolve_bundle(destination: pathlib.Path, target: str) -> pathlib.Path | None:
-    """Locate the built `.xctest` bundle for one target.
+    """Locate a built per-target `.xctest` bundle for one target, if one already exists.
 
-    The primary path is where a per-target `swift build --package-path spike --target <Target>` has
-    been observed to place the bundle on this project's toolchain. The recursive fallback exists
-    because that exact layout is a build-system implementation detail this gate does not control;
-    it should not hard-refuse on that detail alone if a different toolchain places the bundle
-    somewhere else under the same `.build` tree. Returning None either way is a REFUSAL upstream,
-    never a silent pass.
+    The primary path is where a per-target `swift build --package-path spike --target <Target>`
+    build has been observed to place the bundle. The recursive fallback exists because that exact
+    layout is a build-system implementation detail this gate does not control; it should not
+    hard-refuse on that detail alone if a different toolchain places the bundle somewhere else
+    under the same `.build` tree. Returning None is not itself a refusal -- the caller falls back
+    to combined-bundle mode next.
     """
     primary = primary_bundle_path(destination, target)
     if primary.exists():
@@ -183,21 +312,55 @@ def resolve_bundle(destination: pathlib.Path, target: str) -> pathlib.Path | Non
 
 
 def bundle_executable_path(bundle: pathlib.Path, target: str) -> pathlib.Path:
-    """The path an already-resolved `.xctest` bundle's runnable executable is expected at."""
+    """The path an already-resolved per-target `.xctest` bundle's runnable executable is expected
+    at."""
     return bundle / "Contents" / "MacOS" / target
 
 
 def bundle_has_executable(bundle: pathlib.Path, target: str) -> bool:
-    """Whether an already-resolved `.xctest` bundle actually contains a runnable executable.
+    """Whether an already-resolved per-target `.xctest` bundle actually contains a runnable
+    executable.
 
-    A bundle directory existing is not sufficient on its own: an incremental build tree, on a
-    toolchain that does not assemble runnable single-target test bundles (measured: Swift 6.3.3),
-    can leave a skeleton `<Target>.xctest/Contents/MacOS/` directory with nothing inside it, or
-    with `Contents/MacOS/` missing entirely. This is the same underlying toolchain gap as a wholly
-    missing bundle, caught at a later resolution stage, so it needs its own check rather than being
-    assumed away once `resolve_bundle` finds a directory.
+    A bundle directory existing is not sufficient on its own: an incremental build tree can leave
+    a skeleton `<Target>.xctest/Contents/MacOS/` directory with nothing inside it, or with
+    `Contents/MacOS/` missing entirely. When that happens this gate falls back to combined-bundle
+    mode rather than refusing immediately -- see `evaluate_target`.
     """
     return bundle_executable_path(bundle, target).is_file()
+
+
+def combined_bundle_candidates(destination: pathlib.Path) -> list[pathlib.Path]:
+    """Every `*PackageTests.xctest` bundle directory under `spike/.build`, sorted for a stable
+    order. `swift build --package-path spike --build-tests` was measured (2026-09-17, Swift
+    6.3.3) to produce exactly one such bundle,
+    `arm64-apple-macosx/debug/fast-mlx-spikePackageTests.xctest`, but this globs the whole
+    `.build` tree rather than hard-coding that path, the same reasoning as `resolve_bundle`'s
+    fallback: the exact location is a build-system detail this gate does not control."""
+    build_root = destination / "spike" / ".build"
+    if not build_root.exists():
+        return []
+    return sorted(build_root.rglob("*PackageTests.xctest"))
+
+
+def resolve_combined_bundle(
+    destination: pathlib.Path,
+) -> tuple[pathlib.Path | None, list[pathlib.Path]]:
+    """Locate the one combined test bundle to run selectors against.
+
+    Returns (bundle_or_None, candidates_with_a_runnable_executable). A bundle is only returned
+    when EXACTLY one candidate has a runnable `Contents/MacOS/<bundle-stem>` executable -- zero
+    candidates is the ordinary "not built yet" case, and more than one is refused by the caller
+    rather than guessed at, since silently picking one could run the wrong package's tests.
+    """
+    candidates = combined_bundle_candidates(destination)
+    with_executable = [
+        candidate
+        for candidate in candidates
+        if (candidate / "Contents" / "MacOS" / candidate.stem).is_file()
+    ]
+    if len(with_executable) == 1:
+        return with_executable[0], with_executable
+    return None, with_executable
 
 
 _SWIFT_TOOLCHAIN_VERSION: str | None = None
@@ -225,12 +388,37 @@ def swift_toolchain_version() -> str:
     return _SWIFT_TOOLCHAIN_VERSION
 
 
+def _classify(
+    parsed: tuple[int, int, int],
+    expected_tests: int,
+    expected_failures: int,
+    finish,
+    mode: str,
+):
+    """Shared OK/MISMATCH classification for both run modes, so the actual-vs-expected comparison
+    lives in exactly one place regardless of which bundle produced the counts. `mode` is recorded
+    in the detail either way, so a reader of the table/log can see which path ran without a
+    separate column."""
+    actual_tests, _actual_skipped, actual_failures = parsed
+    if actual_tests != expected_tests or actual_failures != expected_failures:
+        detail = (
+            f"tests {actual_tests} (expected {expected_tests}), "
+            f"failures {actual_failures} (expected {expected_failures}) [{mode}]"
+        )
+        return finish(parsed, MISMATCH, detail)
+    return finish(parsed, OK, f"[{mode}]")
+
+
 def evaluate_target(
     destination: pathlib.Path,
     target: str,
     expected: dict,
     log_dir: pathlib.Path | None,
+    listing_cache: dict,
 ) -> TargetResult:
+    """Resolve and run one target's tests, assuming the package-wide `--build-tests` build (done
+    once, by the caller, in `run_gate`) already succeeded. See the module docstring for the two
+    resolution modes this tries, in order."""
     expected_tests = int(expected["tests"])
     expected_skipped = int(expected.get("skipped", 0))
     expected_failures = int(expected["failures"])
@@ -257,68 +445,118 @@ def evaluate_target(
             detail=detail,
         )
 
-    build = run(
-        ["swift", "build", "--package-path", "spike", "--target", target], cwd=destination
+    # Mode 1: a per-target bundle already sitting under spike/.build, with a runnable executable.
+    per_target_bundle = resolve_bundle(destination, target)
+    per_target_note: str | None = None
+    if per_target_bundle is not None:
+        if bundle_has_executable(per_target_bundle, target):
+            # Before trusting this per-target bundle, check whether a combined bundle with a
+            # runnable executable ALSO exists under spike/.build. The two shapes were measured to
+            # come from different Swift toolchains (see the module docstring): Swift 6.4 leaves
+            # only per-target bundles, Swift 6.3.3 leaves only the combined one, in different
+            # directories. A tree built once by each toolchain -- e.g. from switching Xcode
+            # versions locally without cleaning `.build` -- can therefore hold a stale bundle of
+            # one kind sitting next to a fresh one of the other, and nothing here can tell which
+            # is which. Refuse rather than silently preferring mode 1, and do not invoke
+            # `xcrun xctest` (either mode) or `swift test list` while refusing.
+            _mixed_combined_bundle, mixed_candidates = resolve_combined_bundle(destination)
+            if mixed_candidates:
+                names = ", ".join(str(candidate) for candidate in mixed_candidates)
+                return finish(
+                    None,
+                    REFUSED,
+                    "build tree holds both a per-target test bundle "
+                    f"({per_target_bundle}) and a combined test bundle ({names}) -- this is a "
+                    "tree built by two different Swift toolchains, so one of the two is stale, "
+                    "and this gate refuses to guess which; remove spike/.build and re-run -- "
+                    f"active toolchain: {swift_toolchain_version()}",
+                )
+            xctest = run(["xcrun", "xctest", str(per_target_bundle)], cwd=destination)
+            log_parts.append(f"$ xcrun xctest {per_target_bundle}\n")
+            log_parts.append(xctest.stdout)
+            log_parts.append(xctest.stderr)
+            # Deliberately not gating on xctest.returncode: XCTest exits non-zero whenever any
+            # test fails, an expected, already-recorded shape for a target like HarnessCoreTests.
+            # The only thing that makes a run unreadable is the absence of a parseable summary
+            # line, checked next.
+            parsed = parse_summary(xctest.stdout + "\n" + xctest.stderr, target)
+            if parsed is None:
+                return finish(
+                    None,
+                    REFUSED,
+                    f"no XCTest summary line found for this target (crash or truncated run) "
+                    f"[{MODE_PER_TARGET}]",
+                )
+            return _classify(parsed, expected_tests, expected_failures, finish, MODE_PER_TARGET)
+        expected_executable = bundle_executable_path(per_target_bundle, target)
+        per_target_note = (
+            f"{target}.xctest bundle exists at {per_target_bundle} but has no executable at "
+            f"{expected_executable} (a skeleton bundle from an incremental build tree) -- falling "
+            "back to the combined bundle"
+        )
+
+    # Mode 2: the combined bundle `--build-tests` produced, filtered to this target's classes.
+    combined_bundle, candidates_with_executable = resolve_combined_bundle(destination)
+    if combined_bundle is None:
+        if len(candidates_with_executable) > 1:
+            names = ", ".join(str(candidate) for candidate in candidates_with_executable)
+            return finish(
+                None,
+                REFUSED,
+                "more than one combined *PackageTests.xctest bundle with a runnable executable "
+                f"found under spike/.build, refusing to guess which one to run: {names}",
+            )
+        reasons = [per_target_note] if per_target_note else [
+            f"no {target}.xctest bundle exists anywhere under spike/.build"
+        ]
+        reasons.append(
+            "no combined *PackageTests.xctest bundle with a runnable executable exists under "
+            "spike/.build after `swift build --package-path spike --build-tests`"
+        )
+        detail = (
+            "; ".join(reasons)
+            + f" -- active toolchain: {swift_toolchain_version()}"
+        )
+        return finish(None, REFUSED, detail)
+
+    listing, listing_error = swift_test_listing(destination, listing_cache)
+    log_parts.append("$ swift test list --skip-build --package-path spike\n")
+    log_parts.append(listing_cache.get("listing_stdout", ""))
+    log_parts.append(listing_cache.get("listing_stderr", ""))
+    if listing_error is not None:
+        return finish(
+            None,
+            REFUSED,
+            f"could not derive class selectors for combined-bundle mode: {listing_error}",
+        )
+
+    selectors = class_selectors(listing or "", target)
+    if not selectors:
+        return finish(
+            None,
+            REFUSED,
+            f"`swift test list` produced zero class selectors for target {target} -- refusing to "
+            "run `xcrun xctest -XCTest` with an empty selector list rather than guess whether an "
+            "empty selector means \"run nothing\" or \"run everything\" on this toolchain",
+        )
+
+    selector_arg = ",".join(selectors)
+    xctest = run(
+        ["xcrun", "xctest", "-XCTest", selector_arg, str(combined_bundle)], cwd=destination
     )
-    log_parts.append(f"$ swift build --package-path spike --target {target}\n")
-    log_parts.append(build.stdout)
-    log_parts.append(build.stderr)
-    if build.returncode != 0:
-        return finish(None, REFUSED, f"build failed (swift build exit {build.returncode})")
-
-    bundle = resolve_bundle(destination, target)
-    if bundle is None:
-        expected_bundle = primary_bundle_path(destination, target)
-        return finish(
-            None,
-            REFUSED,
-            f"build reported success but no {target}.xctest bundle exists at {expected_bundle} (or "
-            "anywhere else under spike/.build) -- likely cause: this toolchain does not "
-            "assemble a runnable test bundle for a single-target `swift build --target` build "
-            "(measured: works on Swift 6.4, does not on Swift 6.3.3); check the active "
-            f"Swift/Xcode version ({swift_toolchain_version()})",
-        )
-
-    if not bundle_has_executable(bundle, target):
-        expected_executable = bundle_executable_path(bundle, target)
-        return finish(
-            None,
-            REFUSED,
-            f"{target}.xctest bundle exists but has no executable at {expected_executable} -- "
-            "likely cause: the same toolchain gap as a missing bundle, this time leaving an "
-            "incomplete/empty bundle from an incremental build (measured: works on Swift 6.4, "
-            f"does not on Swift 6.3.3); check the active Swift/Xcode version "
-            f"({swift_toolchain_version()})",
-        )
-
-    xctest = run(["xcrun", "xctest", str(bundle)], cwd=destination)
-    log_parts.append(f"\n$ xcrun xctest {bundle}\n")
+    log_parts.append(f"$ xcrun xctest -XCTest {selector_arg} {combined_bundle}\n")
     log_parts.append(xctest.stdout)
     log_parts.append(xctest.stderr)
 
-    # Deliberately not gating on xctest.returncode here: XCTest exits non-zero whenever any test
-    # fails, which is an expected, already-recorded shape for a target like HarnessCoreTests. The
-    # only thing that makes a run unreadable is the absence of a parseable summary line, checked
-    # next -- that is the actual REFUSAL signal, not the process exit code.
-    parsed = parse_summary(xctest.stdout + "\n" + xctest.stderr, target)
+    parsed = parse_summary(xctest.stdout + "\n" + xctest.stderr, target, anchor="Selected tests")
     if parsed is None:
         return finish(
-            None, REFUSED, "no XCTest summary line found for this target (crash or truncated run)"
+            None,
+            REFUSED,
+            f"no XCTest summary line found for this target (crash or truncated run) "
+            f"[{MODE_COMBINED}]",
         )
-
-    actual_tests, actual_skipped, actual_failures = parsed
-    # A zero-test run needs no separate branch: every pinned expectation has tests > 0, so
-    # actual_tests == 0 always trips the mismatch check below. It is called out here in comments,
-    # not code, because it is exactly the failure shape this gate exists to catch -- a run that
-    # silently found nothing to execute, exited 0, and would otherwise look identical to success.
-    if actual_tests != expected_tests or actual_failures != expected_failures:
-        detail = (
-            f"tests {actual_tests} (expected {expected_tests}), "
-            f"failures {actual_failures} (expected {expected_failures})"
-        )
-        return finish(parsed, MISMATCH, detail)
-
-    return finish(parsed, OK, "")
+    return _classify(parsed, expected_tests, expected_failures, finish, MODE_COMBINED)
 
 
 def print_table(results: list[TargetResult]) -> None:
@@ -398,8 +636,49 @@ def run_gate(
     if log_dir is not None:
         log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build the whole package's tests exactly once, before evaluating any target -- see the module
+    # docstring for why this replaced a per-target `swift build --target` step.
+    package_build = run(
+        ["swift", "build", "--package-path", "spike", "--build-tests"], cwd=destination
+    )
+    if log_dir is not None:
+        (log_dir / "_package-build.log").write_text(
+            "$ swift build --package-path spike --build-tests\n"
+            + package_build.stdout
+            + package_build.stderr,
+            encoding="utf-8",
+        )
+
+    if package_build.returncode != 0:
+        detail = (
+            "package test build failed before any target could be evaluated (`swift build "
+            f"--package-path spike --build-tests` exit {package_build.returncode})"
+        )
+        if log_dir is not None:
+            detail += f" -- see {log_dir / '_package-build.log'}"
+        results = [
+            TargetResult(
+                target=target,
+                expected_tests=int(all_targets[target]["tests"]),
+                expected_skipped=int(all_targets[target].get("skipped", 0)),
+                expected_failures=int(all_targets[target]["failures"]),
+                actual_tests=None,
+                actual_skipped=None,
+                actual_failures=None,
+                verdict=REFUSED,
+                detail=detail,
+            )
+            for target in selected
+        ]
+        print_table(results)
+        if update:
+            update_expectations(expectations_path, expectations_data, results)
+        return 1
+
+    listing_cache: dict = {}
     results = [
-        evaluate_target(destination, target, all_targets[target], log_dir) for target in selected
+        evaluate_target(destination, target, all_targets[target], log_dir, listing_cache)
+        for target in selected
     ]
     print_table(results)
 
@@ -438,8 +717,9 @@ def main() -> int:
         "--log-dir",
         type=pathlib.Path,
         default=None,
-        help="Write each target's full raw build+test output to <log-dir>/<Target>.log. Logs are "
-        "never truncated -- a failure's detail is usually at the tail.",
+        help="Write each target's full raw build+test output to <log-dir>/<Target>.log, plus the "
+        "shared package build output to <log-dir>/_package-build.log. Logs are never truncated -- "
+        "a failure's detail is usually at the tail.",
     )
     parser.add_argument(
         "--update-expectations",
