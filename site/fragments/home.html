@@ -1,8 +1,9 @@
 <section class="hero shell">
-  <p class="eyebrow">Swift 6 · Apple Silicon · MLX · Autonomous improvement loop</p>
-  <h1>A self-improving inference engine that runs its own research loop.</h1>
+  <p class="eyebrow">Apple Silicon · MLX · Measured quality · Autonomous improvement loop</p>
+  <h1>Know what your speed setting costs before you serve it.</h1>
   <p class="lede">
-    fast-mlx is an automated development-and-testing loop for Apple-Silicon inference. With little
+    fast-mlx measures the quality cost of quantization and speed settings for MLX models, sizes
+    models before they load, and publishes the evidence from an automated research loop. With little
     human intervention it researches performance and efficiency ideas on a schedule, implements each
     as a bounded candidate behind a failing contract, tests it against exact baselines, and then
     reviews, updates, and publishes itself—promoting what wins, shelving what doesn't, and recording
@@ -44,12 +45,12 @@
 <section class="section shell split" aria-labelledby="capabilities-heading">
   <div>
     <p class="eyebrow">Current foundation</p>
-    <h2 id="capabilities-heading">The public site shows performance, feature set, and value at a glance.</h2>
+    <h2 id="capabilities-heading">Quality, fit, and exactness evidence, with the performance record beside it.</h2>
     <p>
       The codebase combines an OpenAI-compatible HTTP/SSE server, continuous batching, exact
       cache controls, capacity planning, and a harness that measures output parity, distribution
       drift, task behavior, throughput, memory, and long-running service health so the public site
-      can explain what is fast, what is shipped, and what remains gated.
+      can explain what each setting costs, what is shipped, and what remains gated.
     </p>
     <a class="text-link" href="{{root}}capabilities/">See feature states and measured evidence →</a>
   </div>

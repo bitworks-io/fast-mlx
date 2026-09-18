@@ -2648,8 +2648,8 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "index.html",
         render_page(
             template,
-            "fast-mlx — a self-improving MLX inference engine",
-            "A self-improving MLX inference engine for Apple Silicon: an automated loop that researches, tests candidates against exact baselines, and publishes its own results with little human intervention.",
+            "fast-mlx — measured quality for MLX on Apple Silicon",
+            "Measures what speed and memory settings cost in output quality for MLX models on Apple Silicon, sizes models before loading, and publishes the evidence from a review-gated research loop.",
             "",
             home,
             public_path="",
@@ -2924,7 +2924,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         output,
         "llms.txt",
         "# fast-mlx\n\n"
-        "Evidence-gated Swift/MLX inference research for Apple Silicon.\n\n"
+        "Measured-quality tooling and evidence-gated Swift/MLX inference research for Apple Silicon.\n\n"
         "## Core pages\n"
         "- /quickstart/: model-free HTTP/SSE operator quickstart\n"
         "- /license/: Apache-2.0 commercial-use and redistribution orientation\n"

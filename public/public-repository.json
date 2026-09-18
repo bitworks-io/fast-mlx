@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 970,
-    "pathModeSha256": "52666d0caffd1561fc842e1a217f4d5c5203559293bdc30094cfbee7b5ae84f6"
+    "pathCount": 974,
+    "pathModeSha256": "f3d5e6ab7efaeeb5611e24d1b36add05a29e20e06e0088949734e91eaddb43f2"
   },
   "files": [
     {
@@ -48,6 +48,18 @@
     {
       "source": "scripts/export_public_repository.py",
       "destination": "scripts/export_public_repository.py"
+    },
+    {
+      "source": "scripts/serve.sh",
+      "destination": "scripts/serve.sh"
+    },
+    {
+      "source": "scripts/quant-prefetch.py",
+      "destination": "scripts/quant-prefetch.py"
+    },
+    {
+      "source": "scripts/build-metallib.sh",
+      "destination": "scripts/build-metallib.sh"
     },
     {
       "source": "scripts/run_projected_test_suites.py",
@@ -120,6 +132,10 @@
     {
       "source": "spike/Package.resolved",
       "destination": "spike/Package.resolved"
+    },
+    {
+      "source": "spike/prebuilt/mlx.metallib",
+      "destination": "spike/prebuilt/mlx.metallib"
     }
   ],
   "trees": [

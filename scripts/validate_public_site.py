@@ -180,9 +180,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_392
+REVIEWED_HOME_PAGE_BYTES = 10_495
 REVIEWED_HOME_PAGE_SHA256 = (
-    "771202d9711870dba4f4b04b61fcfbb06a458f85f5119cfdce224d6ede83919f"
+    "defd6fb762f586b37e372971edd66a4cd02011db1e589be7969b08e68b70d75b"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -725,8 +725,8 @@ REVIEWED_PAGE_METADATA: Dict[
     str, Tuple[str, str, str, Optional[str]]
 ] = {
     "": (
-        "fast-mlx — a self-improving MLX inference engine",
-        "A self-improving MLX inference engine for Apple Silicon: an automated loop that researches, tests candidates against exact baselines, and publishes its own results with little human intervention.",
+        "fast-mlx — measured quality for MLX on Apple Silicon",
+        "Measures what speed and memory settings cost in output quality for MLX models on Apple Silicon, sizes models before loading, and publishes the evidence from a review-gated research loop.",
         "website",
         None,
     ),

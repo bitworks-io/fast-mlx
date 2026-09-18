@@ -535,11 +535,11 @@ class PublicSiteTests(unittest.TestCase):
                 f'{len(releases["releases"])} reviewed releases', page
             )
             self.assertIn(
-                "The public site shows performance, feature set, and value at a glance.",
+                "Quality, fit, and exactness evidence, with the performance record beside it.",
                 page,
             )
             self.assertIn(
-                "what is fast, what is shipped, and what remains gated.",
+                "what each setting costs, what is shipped, and what remains gated.",
                 page,
             )
             self.assertIn(
@@ -2030,11 +2030,10 @@ class PublicSiteTests(unittest.TestCase):
 
             expected: dict[str, tuple[str, str, str, str | None]] = {
                 "": (
-                    "fast-mlx — a self-improving MLX inference engine",
-                    "A self-improving MLX inference engine for Apple Silicon: an "
-                    "automated loop that researches, tests candidates against exact "
-                    "baselines, and publishes its own results with little human "
-                    "intervention.",
+                    "fast-mlx — measured quality for MLX on Apple Silicon",
+                    "Measures what speed and memory settings cost in output quality "
+                    "for MLX models on Apple Silicon, sizes models before loading, "
+                    "and publishes the evidence from a review-gated research loop.",
                     "website",
                     None,
                 ),

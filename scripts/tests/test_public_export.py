@@ -167,9 +167,20 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # discriminating (replacing the gate with an unconditional admit fails all four assertions).
 # Conscious decision to publish: family-neutral serving/harness tests, no host, credential,
 # competitor or machine-local path.
+# 2026-09-18, 970 -> 974: adds scripts/serve.sh, scripts/quant-prefetch.py,
+# scripts/build-metallib.sh and spike/prebuilt/mlx.metallib. The public README's "First run"
+# quickstart names all four paths (the one-command server wrapper, the shared HF metadata/full
+# download helper it calls, the maintainer-only Metal-kernel rebuild script it points operators to
+# on a missing metallib, and the prebuilt MetalLib itself) but none was previously projected, so a
+# fresh public clone could not follow its own documented quickstart. Conscious decision to publish:
+# all three scripts were read in full and contain no private host, IP, username, absolute
+# machine-local path, competitor name, or credential; serve.sh calls only quant-prefetch.py (also
+# projected) and the already-public fastmlx-serve binary. mlx.metallib is a build artifact of the
+# pinned, MIT-licensed mlx-swift Metal kernels (spike/Package.swift's mlx-swift pin), not fast-mlx
+# source; it carries no private data and regenerating it is exactly what build-metallib.sh does.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 970,
-    "pathModeSha256": "52666d0caffd1561fc842e1a217f4d5c5203559293bdc30094cfbee7b5ae84f6",
+    "pathCount": 974,
+    "pathModeSha256": "f3d5e6ab7efaeeb5611e24d1b36add05a29e20e06e0088949734e91eaddb43f2",
 }
 
 

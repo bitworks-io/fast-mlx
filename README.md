@@ -1,8 +1,11 @@
 # fast-mlx
 
-`fast-mlx` is an experimental Swift 6 inference engine and evaluation system for Apple Silicon.
-It uses Apple's MLX framework to test inference ideas, measure their real quality and performance
-effects, and keep only the capabilities that survive explicit correctness and operational gates.
+`fast-mlx` measures what a speed or memory setting costs in output quality for LLMs on Apple
+Silicon (MLX). It sizes a model against your machine before loading and refuses rather than
+degrades, publishes per-model quality cards (teacher-forced KL mean/p95, top-1 agreement, task
+checks) that can gate serving admission as an opt-in, and keeps exactness evidence for every
+claim. It includes an experimental Swift 6 serving engine that is a research platform, not a
+production or fastest-available server.
 
 **Website:** [improvement loop](https://bitworks-io.github.io/fast-mlx/) ·
 [operator quickstart](https://bitworks-io.github.io/fast-mlx/quickstart/) ·
@@ -28,7 +31,10 @@ are published.
 
 ## What exists today
 
-- an OpenAI-compatible chat-completions HTTP/SSE server;
+- a pre-load fit-check that sizes a model against the host and refuses rather than degrades;
+- per-model quality cards (teacher-forced KL mean/p95, top-1 agreement, task checks) that can gate
+  serving admission as an opt-in;
+- a research OpenAI-compatible chat-completions HTTP/SSE server;
 - an explicit continuous-batching route for supported dense models;
 - exact prefix/session-cache and serving lifecycle controls;
 - a measurement harness for exactness, quality drift, throughput, capacity, and soak behavior;
