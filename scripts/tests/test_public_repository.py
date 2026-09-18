@@ -572,7 +572,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             '            "$RUNNER_TEMP/fast-mlx-public"'
         )
         public_boundary = workflow.split("\n  public-boundary:\n", 1)[1].split(
-            "\n  pure-swift-targets:\n", 1
+            "\n  projected-test-suites:\n", 1
         )[0]
 
         self.assertIn(
@@ -620,7 +620,7 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
         self.assertIn("group: public-source-quality-${{ github.ref }}", quality)
         self.assertIn("cancel-in-progress: true", quality)
         pages_job = quality.split("\n  pages:\n", 1)[1]
-        self.assertIn("needs: [public-boundary, pure-swift-targets]", pages_job)
+        self.assertIn("needs: [public-boundary, projected-test-suites]", pages_job)
         self.assertIn("github.event_name == 'push'", pages_job)
         self.assertIn("github.ref == 'refs/heads/main'", pages_job)
         self.assertIn("uses: ./.github/workflows/pages.yml", pages_job)

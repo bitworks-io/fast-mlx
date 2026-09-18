@@ -42,22 +42,6 @@ jobs:
           python3 scripts/validate_public_repository.py \
             "$RUNNER_TEMP/fast-mlx-public"
 
-  pure-swift-targets:
-    runs-on: macos-26
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [ServingCore, HarnessCore, ProofControl]
-    steps:
-      - name: Check out source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Report Swift toolchain
-        run: swift --version
-
-      - name: Build dependency-free target
-        run: swift build --package-path spike --target "${{ matrix.target }}"
-
   # Runs this repository's own test suite: the 8 dependency-free targets, built and
   # EXECUTED, against the counts pinned in scripts/projected_test_expectations.json.
   # Building a suite is not running it, and until this job existed nothing here ran
@@ -69,14 +53,11 @@ jobs:
   # a matrix here. Per-target attribution comes from the gate's own result table, and
   # each target's full raw output is uploaded as an artifact on success or failure.
   #
-  # NOT in the `pages` job's `needs:` YET. This runner is Swift 6.3.3 (Xcode 26.6), and
-  # the gate's earlier per-target build assembled no runnable .xctest bundle on that
-  # toolchain, so every target was refused here. The gate now builds the whole package
-  # once with `swift build --build-tests` and, on 6.3.3, runs each target's classes from
-  # the one combined bundle that build produces. That was measured 8/8 OK on a 6.3.3
-  # machine outside CI (133 s clean build); a run on this runner has not happened yet.
-  # PROMOTION CRITERION: once a run here shows 8/8 OK, add this job to `pages`'
-  # `needs:` and drop `pure-swift-targets`, which building the test targets subsumes.
+  # This job gates the `pages` deploy. The runner is Swift 6.3.3 (Xcode 26.6), where
+  # the gate builds the whole package once with `swift build --build-tests` and runs
+  # each target's classes from the one combined bundle that build produces. Promoted
+  # after its first run on this runner showed 8/8 OK. It replaced a job that only
+  # built three library targets; building the test targets builds those too.
   projected-test-suites:
     runs-on: macos-26
     timeout-minutes: 90
@@ -117,7 +98,7 @@ jobs:
 
   pages:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [public-boundary, pure-swift-targets]
+    needs: [public-boundary, projected-test-suites]
     permissions:
       contents: read
       pages: write
