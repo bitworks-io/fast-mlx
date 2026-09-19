@@ -32,10 +32,10 @@
       "swift_testing": {"tests": 0, "failures": 0}
     },
     "HarnessCoreTests": {
-      "tests": 1261,
+      "tests": 1270,
       "skipped": 0,
       "failures": 0,
-      "note": "Re-baselined 2026-09-17 after the projected suite was made green. Was 1307 tests / 75 failures: 47 projected cases depended on assets the projection does not ship, so they are now excluded from the public projection. One new case was added in their place, pinning a refusal branch that the exclusion made newly reachable to test with only projected assets. Net -46 = -47 excluded +1 new. MEASURED by this gate, not derived.",
+      "note": "Re-baselined 2026-09-17 after the projected suite was made green. Was 1307 tests / 75 failures: 47 projected cases depended on assets the projection does not ship, so they are now excluded from the public projection. One new case was added in their place, pinning a refusal branch that the exclusion made newly reachable to test with only projected assets. Net -46 = -47 excluded +1 new. MEASURED by this gate, not derived. 2026-09-19: +9 residency-admission cases in QualityAdmissionTests (31 -> 40 test methods by source count); public CI run 35425151339 MEASURED 1270 tests, 0 failures, before this pin moved.",
       "swift_testing": {
         "tests": 49,
         "failures": 0,
