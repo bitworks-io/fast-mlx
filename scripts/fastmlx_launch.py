@@ -49,6 +49,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1822,6 +1823,26 @@ def _run_serve(args, passthrough_args: list) -> int:
     return 0  # pragma: no cover - unreachable, os.execv never returns on success
 
 
+def _engine_port_has_listener(host: str, port: int, timeout: float = 1.0) -> bool:
+    """Probe ``host:port`` with a TCP CONNECT (never a bind): a successful
+    connect proves a listener is already there; loopback promptly REFUSES a
+    connect to a free port, so anything other than success (refused, timed
+    out, unreachable) is treated as free. A bind-based probe would falsely
+    report "busy" on a port sitting in TIME_WAIT on macOS, and a timeout
+    treated as "busy" would wedge a launch on a merely slow/firewalled probe
+    instead of a real listener -- only an accepted connection counts.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(timeout)
+        probe.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int:
     """Front mode's orchestration: bind the proxy, THEN start the engine as
     a CHILD process (never exec'd -- this process must stay alive to run
@@ -1832,12 +1853,17 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
 
     The proxy is bound BEFORE the engine is started: a bind failure (a busy
     --front-port) must never start -- and then have to kill -- a large
-    model load that was never going to be reachable anyway. Signal
-    forwarding is installed before ``popen`` too, via a holder this
-    function's own signal handler reads: a SIGTERM/SIGINT that arrives in
-    the (short) window between installing the handler and the child
-    existing is remembered and forwarded the instant the child does exist,
-    rather than being silently dropped.
+    model load that was never going to be reachable anyway. Right after that
+    bind, and still before the engine is spawned, the engine's OWN loopback
+    port is probed with a TCP connect: an orphaned engine left listening
+    there (e.g. by a SIGKILLed earlier launcher) would otherwise have this
+    new launch's proxy silently forward to that OLD process during the new
+    model's load, stamping this launch's provenance headers on someone
+    else's replies. Signal forwarding is installed before ``popen`` too, via
+    a holder this function's own signal handler reads: a SIGTERM/SIGINT that
+    arrives in the (short) window between installing the handler and the
+    child existing is remembered and forwarded the instant the child does
+    exist, rather than being silently dropped.
     """
     front = plan["front"]
     front_host = front["host"]
@@ -1858,10 +1884,24 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
         )
         return 3
 
+    if _engine_port_has_listener(upstream_host, upstream_port):
+        print(
+            f"fastmlx serve: refusing: {upstream_host}:{upstream_port} already has a listener; "
+            "an engine from an earlier launch may still be running",
+            file=sys.stderr,
+        )
+        server.server_close()
+        return 3
+
     child_holder: dict = {"child": None}
     pending_signal: dict = {"signum": None}
+    # The first stop signal this launcher received, forwarded or pending: it
+    # decides the exit code once the engine has exited (see below).
+    requested_stop: dict = {"signum": None}
 
     def _forward_signal(signum, _frame):
+        if requested_stop["signum"] is None:
+            requested_stop["signum"] = signum
         child = child_holder["child"]
         if child is None:
             # No child yet: remember the signal: the code right after
@@ -1904,6 +1944,13 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
     child_code = child.wait()
     server.shutdown()
     server.server_close()
+    stop_signum = requested_stop["signum"]
+    if stop_signum is not None and child_code in (0, -stop_signum):
+        # A stop the operator asked for: the served engine traps SIGTERM and
+        # exits 0, which must still read as 128+signum (SIGTERM -> 143), not
+        # as an engine that quit on its own. Any other code after the stop
+        # (a crash while shutting down) falls through unchanged below.
+        return 128 + stop_signum
     if child_code == 0:
         # Front mode never attests to a "success" exit -- see docstring.
         return 1

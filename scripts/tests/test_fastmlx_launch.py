@@ -1410,6 +1410,10 @@ STUB_ENGINE_BODY = (
     "        self.end_headers()\n"
     "        self.wfile.write(payload)\n"
     "\n"
+    "if os.environ.get('STUB_ENGINE_GRACEFUL') == '1':\n"
+    "    import signal\n"
+    "    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))\n"
+    "\n"
     "server = http.server.ThreadingHTTPServer((host, port), Handler)\n"
     "server.serve_forever()\n"
 )
@@ -1710,6 +1714,77 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
         self.assertEqual(popen_calls, [], "a bind failure must never invoke Popen")
 
     # ------------------------------------------------------------------
+    # Orphan-engine guard: a listener already on the engine's loopback port
+    # (e.g. left behind by a SIGKILLed earlier launcher) must refuse the
+    # NEW launch before the engine is spawned, rather than silently proxy
+    # to the old process during the new model's load.
+    # ------------------------------------------------------------------
+    def test_busy_engine_port_never_starts_the_engine(self):
+        front_port = _free_tcp_port()
+        engine_port = _free_tcp_port()
+        busy_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        busy_listener.bind(("127.0.0.1", engine_port))
+        busy_listener.listen(1)
+        self.addCleanup(busy_listener.close)
+
+        plan = _minimal_front_plan(front_port, engine_port)
+        popen_calls = []
+
+        def recording_popen(argv, **kwargs):
+            popen_calls.append(argv)
+            return _FakeChild(0)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = FASTMLX_LAUNCH._run_front_mode([], plan, popen=recording_popen)
+
+        self.assertEqual(result, 3)
+        self.assertEqual(popen_calls, [], "a busy engine port must never invoke Popen")
+        self.assertIn(str(engine_port), stderr.getvalue())
+
+        # The front socket must have been released on refusal: rebindable.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", front_port))
+        except OSError as exc:  # pragma: no cover - failure path itself is the assertion
+            self.fail(f"proxy socket on {front_port} was never closed: {exc}")
+        finally:
+            probe.close()
+
+    # ------------------------------------------------------------------
+    # A port that was recently used (bound, connected to, then closed --
+    # leaving it in a TIME_WAIT-ish state) but has no live listener must
+    # NOT be mistaken for busy: front mode should proceed normally.
+    # ------------------------------------------------------------------
+    def test_recently_closed_engine_port_is_accepted(self):
+        front_port = _free_tcp_port()
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        engine_port = listener.getsockname()[1]
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.connect(("127.0.0.1", engine_port))
+        accepted, _ = listener.accept()
+        accepted.close()
+        client.close()
+        listener.close()
+
+        plan = _minimal_front_plan(front_port, engine_port)
+        popen_calls = []
+
+        def recording_popen(argv, **kwargs):
+            popen_calls.append(argv)
+            return _FakeChild(0)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            FASTMLX_LAUNCH._run_front_mode([], plan, popen=recording_popen)
+
+        self.assertEqual(len(popen_calls), 1, "a free (recently closed) engine port must proceed")
+
+    # ------------------------------------------------------------------
     # Ordering: if Popen raises AFTER a successful bind, the bound proxy
     # socket must be closed (not leaked) -- proven by re-binding the same
     # port immediately after.
@@ -1756,6 +1831,48 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
                 self.assertEqual(result, expected)
 
     # ------------------------------------------------------------------
+    # A stop the launcher was asked for maps to 128+signum even when the
+    # engine handles the forwarded signal and exits 0 (the served engine
+    # shuts down gracefully; cycle-102 live run E8 saw exit 1). A different
+    # engine code after the stop passes through, so a crash while shutting
+    # down stays visible.
+    # ------------------------------------------------------------------
+    def test_requested_stop_with_graceful_engine_exit_maps_to_128_plus_signal(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        original_term = signal.getsignal(signal.SIGTERM)
+        original_int = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGTERM, original_term)
+        self.addCleanup(signal.signal, signal.SIGINT, original_int)
+
+        class _StoppedChild(_FakeChild):
+            def __init__(self, wait_return, signum):
+                super().__init__(wait_return)
+                self._signum = signum
+
+            def wait(self):
+                # Deliver the stop through the handler _run_front_mode
+                # installed, exactly as the OS would, then "exit".
+                signal.getsignal(self._signum)(self._signum, None)
+                return self._wait_return
+
+        cases = (
+            (signal.SIGTERM, 0, 143),
+            (signal.SIGINT, 0, 130),
+            (signal.SIGTERM, -signal.SIGTERM, 143),
+            (signal.SIGTERM, 7, 7),
+        )
+        for signum, wait_return, expected in cases:
+            with self.subTest(signum=signum, wait_return=wait_return):
+                plan = _minimal_front_plan(front_port, upstream_port)
+                child = _StoppedChild(wait_return, signum)
+                result = FASTMLX_LAUNCH._run_front_mode(
+                    [], plan, popen=lambda argv, child=child, **kwargs: child
+                )
+                self.assertEqual(child.signals_received, [signum])
+                self.assertEqual(result, expected)
+
+    # ------------------------------------------------------------------
     # L7: the engine child is started in its OWN session (start_new_session
     # =True), not the launcher's process group -- a terminal Ctrl-C (which
     # sends SIGINT to the whole foreground process group) must reach the
@@ -1781,10 +1898,20 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
     # the launcher and the engine child within a bound.
     # ------------------------------------------------------------------
     def test_front_mode_e2e_proxies_and_forwards_sigterm(self):
+        self._front_mode_e2e_sigterm(graceful_engine=False)
+
+    def test_front_mode_e2e_graceful_engine_stop_exits_143(self):
+        # The served engine traps SIGTERM and exits 0 (cycle-102 E8). An
+        # operator stop must still exit 128+SIGTERM, not front mode's 1.
+        self._front_mode_e2e_sigterm(graceful_engine=True)
+
+    def _front_mode_e2e_sigterm(self, graceful_engine: bool):
         stub_bin = write_script(self.root / "stub-engine.py", STUB_ENGINE_BODY)
         pid_path = self.root / "stub-engine.pid"
         env = dict(os.environ)
         env["STUB_ENGINE_PID_PATH"] = str(pid_path)
+        if graceful_engine:
+            env["STUB_ENGINE_GRACEFUL"] = "1"
 
         front_port = _free_tcp_port()
         backend_port = _free_tcp_port()
@@ -1853,17 +1980,17 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
                 proc.kill()
                 self.fail("launcher did not exit within 10s of SIGTERM")
 
-            # The stub engine (STUB_ENGINE_BODY) installs no SIGTERM handler
-            # of its own, so the launcher's forwarded SIGTERM kills it by
-            # signal (os.waitpid reports a NEGATIVE code, -15) -- mapped by
-            # _run_front_mode to 128+15 = 143, never the raw negative code
-            # (which would make the process's own exit status a nonsensical
-            # 241) and never the unmapped 0 front mode always avoids.
+            # Without STUB_ENGINE_GRACEFUL the stub installs no SIGTERM
+            # handler, so the forwarded SIGTERM kills it by signal (wait()
+            # reports -15). With it, the stub exits 0 like the served engine.
+            # Either way the requested stop maps to 128+15 = 143: never the
+            # raw negative code (which would wrap to 241) and never the 1 a
+            # zero exit gives when nobody asked the engine to stop.
             self.assertEqual(
                 proc.returncode,
                 143,
-                "launcher must exit 143 (128+SIGTERM) when its forwarded "
-                "SIGTERM kills the unhandled-signal stub engine",
+                "launcher must exit 143 (128+SIGTERM) after a forwarded SIGTERM "
+                f"(graceful_engine={graceful_engine})",
             )
 
             deadline = time.time() + 5

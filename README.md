@@ -399,6 +399,19 @@ card's `--mtp` transfer status. They do not prove that a particular response mat
 measurement. Any `X-FastMLX-*` header the engine itself sends back is dropped before the proxy adds
 its own, so the engine can never spoof or duplicate them.
 
+Measured cost (2026-09-19, one M3 Ultra 256 GB host, in front of the served engine with the
+`qwen38-flash-next-mixed-4-8bit@m3ultra` pack, greedy, streaming, 128-token replies, 20 prompts, each
+sampled direct–proxy–proxy–direct; the engine's prefix cache was off so every sample was a cold
+prefill):
+- Output through the proxy was byte-identical to direct on 20/20 prompts, all four samples.
+- Time to first token: median change −0.6 ms (median direct TTFT 140 ms), p95 change +1.9 ms.
+- Decode rate: median proxy/direct ratio 0.9999. Streaming cadence: p95 gap between chunks 15.35 ms
+  through the proxy vs 15.36 ms direct.
+- Four concurrent streams: median aggregate-throughput ratio 1.002.
+- A 50 s, 3072-token streamed request completed normally through the proxy.
+- These numbers are for one host, one pack and one engine build. They show the proxy hop is negligible
+  there. They are not a guarantee for other setups.
+
 Behaviour to know:
 - Streamed responses (Server-Sent Events, chunked or close-delimited bodies) are relayed as they
   arrive. A client that disconnects mid-stream closes the upstream connection. If the UPSTREAM
@@ -421,11 +434,17 @@ Behaviour to know:
 - The proxy binds its port before starting the engine. If the port is busy, the engine never starts
   (exit 3). The engine child runs in its own session, so a terminal Ctrl-C reaches it only once, via
   this launcher's own signal forwarding.
+- Before starting the engine, the launcher also refuses (exit 3) if the engine's own port already
+  has a listener, for example an engine orphaned by a SIGKILLed earlier launcher. A new launch then
+  never proxies to a stale process while the new model loads. This only catches a listener that is
+  already there at launch; a process that binds the port during the model load is not caught.
 - SIGTERM or SIGINT is forwarded to the engine. The launcher exits once the engine exits, and never
-  with 0: a signal-killed engine gives `128 + signal` (SIGTERM → 143), and a clean engine exit gives 1.
-  A SIGKILL of the launcher itself cannot be forwarded (the process never runs again to do it) and
-  leaves the engine running, still bound to its loopback port with nothing in front of it any more --
-  stop it directly by that port or its pid.
+  with 0. After a forwarded signal it exits `128 + signal` (SIGTERM → 143), whether the engine shuts
+  down cleanly or is killed by the signal; any other engine code after the stop is passed through. An
+  engine that exits cleanly without being asked to stop gives 1. A SIGKILL of the launcher itself
+  cannot be forwarded (the process never runs again to do it) and leaves the engine running, still
+  bound to its loopback port with nothing in front of it any more -- stop it directly by that port or
+  its pid. A new launch on that engine port then refuses (see above) until you do.
 - One JSON line per request goes to stderr (request id, method, path without query, status, bytes,
   whether streamed, and an `error` field when the upstream failed mid-response), written as a single
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
