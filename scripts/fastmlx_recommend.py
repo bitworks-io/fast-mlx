@@ -92,11 +92,12 @@ _CARD_VERDICT_RANK = {"REFERENCE": 0, "EXACT": 0, "PASS": 1}
 # ---------------------------------------------------------------------
 def discover_candidates(model_paths: list, models_dir_paths: list) -> list:
     """The deduplicated candidate set: every explicit ``--model-path``, plus
-    every immediate subdirectory of each ``--models-dir`` that contains a
-    ``config.json``. Deduplicated by resolved path; order is preserved
-    (explicit paths first, then each ``--models-dir``'s children in sorted
-    order), since that order is this script's only stable tie-break for
-    otherwise-equal rows.
+    every immediate subdirectory of each ``--models-dir`` that looks like a
+    model pack (``launch.is_model_dir``: a ``config.json`` MLX layout, or a
+    GGUF pack with at least one top-level ``*.gguf`` file). Deduplicated by
+    resolved path; order is preserved (explicit paths first, then each
+    ``--models-dir``'s children in sorted order), since that order is this
+    script's only stable tie-break for otherwise-equal rows.
     """
     seen: dict = {}
     ordered: list = []
@@ -116,7 +117,7 @@ def discover_candidates(model_paths: list, models_dir_paths: list) -> list:
         if not models_dir.is_dir():
             continue
         for child in sorted(models_dir.iterdir()):
-            if child.is_dir() and (child / "config.json").is_file():
+            if child.is_dir() and launch.is_model_dir(child):
                 add(child)
 
     return [seen[key] for key in ordered]
@@ -181,9 +182,11 @@ def build_row(
         row["status"] = STATUS_ERROR
         row["message"] = f"model path {model_path} does not exist or is not a directory"
         return row
-    if not (model_path / "config.json").is_file():
+    if not launch.is_model_dir(model_path):
         row["status"] = STATUS_ERROR
-        row["message"] = f"model path {model_path} does not contain config.json"
+        row["message"] = (
+            f"model path {model_path} {launch.MODEL_DIR_REFUSAL_MESSAGE_SUFFIX}"
+        )
         return row
 
     receipt = launch._load_pull_receipt(model_path)

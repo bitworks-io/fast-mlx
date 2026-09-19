@@ -217,8 +217,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # instead, mirroring the existing acquisition-tests skip pattern; the module's one platform-neutral
 # test (that the same tripwire strings are absent from package-release.sh) still runs everywhere.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 986,
-    "pathModeSha256": "ea08a9a5f0aceee90defa8b3f4e9f6e55946b6b4aa6e3fef831db9944972619c",
+    "pathCount": 988,
+    "pathModeSha256": "20e6be4724486c05c1a611b54a5e1430371df4fe6c894cf4bb9b070fe6f8377b",
 }
 
 

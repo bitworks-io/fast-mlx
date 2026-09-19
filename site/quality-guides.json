@@ -34,11 +34,11 @@
         },
         "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows this pack is closer to the 8-bit reference than the 3.3-bit pack (p = 2.2e-14)",
         "example": {
-          "status": "pending",
-          "prompt": null,
-          "referenceOutput": null,
-          "configOutput": null,
-          "note": "extract a real disagreeing position from the cell's observations"
+          "status": "measured",
+          "prompt": "A hash table achieves average constant-time",
+          "referenceOutput": " look",
+          "configOutput": " (",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026A hash table achieves average constant-time', the reference picks ' look' and this pack picks ' ('."
         },
         "benefit": {
           "fit": null,
@@ -116,11 +116,11 @@
         },
         "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows the mixed 4/8-bit pack is closer to this reference (p = 2.2e-14); an earlier peer-vs-peer comparison (this pack vs. the mixed 4/8-bit pack directly, not vs. this 8-bit reference) found 6.2% (150/2432) disagreement, superseded by this reference-based measurement",
         "example": {
-          "status": "pending",
-          "prompt": null,
-          "referenceOutput": null,
-          "configOutput": null,
-          "note": "extract a real disagreeing position from the cell's observations"
+          "status": "measured",
+          "prompt": "a combination of direct indexing and efficient collision resolution. The process",
+          "referenceOutput": " works",
+          "configOutput": " begins",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026a combination of direct indexing and efficient collision resolution. The process', the reference picks ' works' and this pack picks ' begins'."
         },
         "benefit": {
           "fit": null,

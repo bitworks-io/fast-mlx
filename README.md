@@ -212,6 +212,20 @@ a model that does not fit unless you pass `--force`, and it refuses outright if 
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
 repository's `fastmlx-serve`.
 
+`serve` and `recommend` also accept a GGUF pack directory (one or more top-level `*.gguf` shards, no
+`config.json`) as a model path. `scripts/fastmlx_gguf_fit.py` sizes it from its GGUF headers alone
+(no weight bytes are read) against the GPU wired-memory limit — read live from `iogpu.wired_limit_mb`,
+or 75% of RAM if that sysctl is unavailable — minus an 8 GiB margin by default, plus a KV-cache
+reserve you must supply. `--residency expert-stream` sizes only the non-expert tensors and labels the
+result a lower bound, for an engine that streams experts from SSD instead of holding them resident.
+It does not derive a context ceiling, so pass `--context` yourself and size the KV reserve for it:
+
+```sh
+python3 scripts/fastmlx.py serve --model-path ./models/some-gguf-pack --context 32768 \
+  --fit-check-bin scripts/fastmlx_gguf_fit.py --fit-check-arg=--kv-reserve-gib --fit-check-arg=16 \
+  --engine-profile <your engine profile>
+```
+
 ### Install a prebuilt release (v0.1.0)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its

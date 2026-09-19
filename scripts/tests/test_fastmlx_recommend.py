@@ -437,6 +437,57 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertEqual(len(doc["rows"]), 1)
         self.assertEqual(doc["rows"][0]["name"], "pass-model")
 
+    # ------------------------------------------------------------------
+    # --models-dir discovery must also pick up a GGUF-only subdir (no
+    # config.json, at least one top-level *.gguf file) -- the same
+    # accepted-layout fix fastmlx serve's precondition gets.
+    # ------------------------------------------------------------------
+    def test_models_dir_discovers_gguf_only_subdirs(self):
+        models_root = self.root / "models"
+        models_root.mkdir()
+        gguf_dir = models_root / "gguf-model"
+        gguf_dir.mkdir()
+        (gguf_dir / "pack.gguf").write_bytes(b"not a real gguf file, just a marker")
+        no_model_dir = models_root / "not-a-model"
+        no_model_dir.mkdir()  # neither config.json nor .gguf: must not be discovered
+
+        argv = [
+            "recommend",
+            "--quality-cards",
+            str(self.manifest_path),
+            "--models-dir",
+            str(models_root),
+            "--fit-check-bin",
+            str(self.green_fit_bin),
+            "--json",
+        ]
+        code, stdout, _ = self.run_main(argv)
+        doc = json.loads(stdout)
+        self.assertEqual(code, 1)  # no card for this pack: uncarded, not recommended
+        self.assertEqual(len(doc["rows"]), 1)
+        self.assertEqual(doc["rows"][0]["name"], "gguf-model")
+        self.assertEqual(doc["rows"][0]["status"], "uncarded")
+
+    # ------------------------------------------------------------------
+    # A GGUF-only model directory's row still runs the fit check and is
+    # classified exactly like a config.json-layout row: identity resolved
+    # from its sibling pull receipt, fit check run, card matched.
+    # ------------------------------------------------------------------
+    def test_gguf_only_model_dir_row_runs_fit_check_and_is_classified(self):
+        gguf_dir = self.root / "gguf-pack"
+        gguf_dir.mkdir()
+        (gguf_dir / "shard-00001-of-00001.gguf").write_bytes(b"marker")
+        write_pull_receipt(gguf_dir, repo_id=PASS_REPO, revision="e" * 40)
+
+        code, doc, _ = self.run_json(self.base_argv([gguf_dir]))
+        self.assertEqual(code, 0)
+        rows = doc["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "gguf-pack")
+        self.assertEqual(rows[0]["status"], "recommended")
+        self.assertEqual(rows[0]["card"]["id"], PASS_CARD_ID)
+        self.assertEqual(rows[0]["fit"]["verdict"], "GREEN")
+
     def test_model_path_and_models_dir_dedupe_the_same_directory(self):
         models_root = self.root / "models"
         models_root.mkdir()

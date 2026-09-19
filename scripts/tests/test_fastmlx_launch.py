@@ -9,6 +9,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
 
 
 LAUNCH_PATH = Path(__file__).resolve().parents[1] / "fastmlx_launch.py"
@@ -16,6 +19,8 @@ _SPEC = importlib.util.spec_from_file_location("fastmlx_launch", LAUNCH_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 FASTMLX_LAUNCH = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(FASTMLX_LAUNCH)
+
+GGUF_FIT_CHECK_PATH = Path(__file__).resolve().parents[1] / "fastmlx_gguf_fit.py"
 
 
 NO_GO_CARD_ID = "fixture-no-go@test"
@@ -432,6 +437,49 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("config.json", stderr)
 
+    # ------------------------------------------------------------------
+    # A GGUF pack (no config.json, at least one top-level *.gguf file) is
+    # an accepted model-directory layout: the precondition no longer
+    # refuses it. (The stub fit-check binary used here ignores
+    # --model-path entirely, so this isolates the precondition change from
+    # the real GGUF fit checker, which is covered separately below.)
+    # ------------------------------------------------------------------
+    def test_gguf_only_model_dir_is_not_refused_at_the_precondition(self):
+        gguf_dir = self.root / "gguf-model"
+        gguf_dir.mkdir()
+        (gguf_dir / "pack.gguf").write_bytes(b"not a real gguf file, just a marker")
+        argv = self.base_args(**{"--model-path": str(gguf_dir), "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("config.json", stderr)
+        plan = json.loads(stdout)
+        self.assertIn("argv", plan)
+
+    def test_model_dir_with_neither_config_json_nor_gguf_is_refused_naming_both_layouts(self):
+        bare_dir = self.root / "bare-model"
+        bare_dir.mkdir()
+        argv = self.base_args(**{"--model-path": str(bare_dir), "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("does not contain config.json or any .gguf file", stderr)
+
+    def test_model_dir_with_only_a_gguf_named_directory_is_refused(self):
+        # A directory named like a GGUF shard is not a GGUF shard: the
+        # precondition only accepts a top-level .gguf REGULAR FILE.
+        gguf_dir_trap = self.root / "gguf-dir-trap"
+        gguf_dir_trap.mkdir()
+        (gguf_dir_trap / "shard.gguf").mkdir()
+        argv = self.base_args(**{"--model-path": str(gguf_dir_trap), "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("does not contain config.json or any .gguf file", stderr)
+
     def test_missing_model_directory_is_refused(self):
         argv = self.base_args(
             **{"--model-path": str(self.root / "does-not-exist"), "--context": "2048"}
@@ -831,6 +879,100 @@ class CardMatchingHelperTests(unittest.TestCase):
         self.assertIsNone(
             FASTMLX_LAUNCH.find_card_by_pin(cards, "a" * 40)
         )
+
+
+class GgufFitCheckCallSiteTests(unittest.TestCase):
+    """CALL-SITE coverage for the GGUF-pack admission fix: drives the real
+    ``scripts/fastmlx_gguf_fit.py`` binary through the launcher's CLI entry
+    point (``fastmlx serve``, i.e. ``FASTMLX_LAUNCH.main``), not through
+    ``run_fit_check`` directly -- proving a GGUF-only model directory can
+    reach and be classified by the fit check at all, now that the
+    ``config.json`` precondition no longer refuses it first.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.assertTrue(
+            GGUF_FIT_CHECK_PATH.is_file(), f"missing {GGUF_FIT_CHECK_PATH}"
+        )
+        GGUF_FIT_CHECK_PATH.chmod(
+            GGUF_FIT_CHECK_PATH.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+
+        self.gguf_dir = self.root / "gguf-pack"
+        self.gguf_dir.mkdir()
+        tensors = [
+            {"name": "token_embd.weight", "dims": [4], "type": 0, "offset": 0}  # F32
+        ]
+        blob = build_gguf_bytes(tensors=tensors, data_section=bytes(16))
+        (self.gguf_dir / "pack.gguf").write_bytes(blob)
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def _argv(self, fit_check_args: list) -> list:
+        argv = [
+            "serve",
+            "--model-path", str(self.gguf_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--engine-bin", str(self.fake_engine_bin),
+            "--fit-check-bin", str(GGUF_FIT_CHECK_PATH),
+            "--context", "2048",
+        ]
+        for value in fit_check_args:
+            # "=" form on purpose: a bare "--fit-check-arg VALUE" pair makes
+            # argparse treat a VALUE that itself starts with "--" (e.g.
+            # "--kv-reserve-gib") as a new option rather than this flag's
+            # argument.
+            argv.append(f"--fit-check-arg={value}")
+        argv.append("--dry-run")
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def _env_without_stray_fastmlx_vars() -> dict:
+        # Isolate the run from any FASTMLX_* variable already present in the
+        # test process's environment (e.g. FASTMLX_WIRED_LIMIT_MIB,
+        # FASTMLX_WIRED_MARGIN_GIB): the fit-check subprocess inherits
+        # os.environ, and a stray value there would make the ceiling
+        # computed below nondeterministic.
+        return {k: v for k, v in os.environ.items() if not k.startswith("FASTMLX_")}
+
+    def test_gguf_pack_that_fits_admits_and_would_exec_the_engine(self):
+        # A wired-limit comfortably above the default 8 GiB margin and a
+        # zero KV reserve: the 16-byte fixture pack fits easily -> GREEN.
+        argv = self._argv(
+            ["--kv-reserve-gib", "0", "--wired-limit-mib", "16384"]
+        )
+        with patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.splitlines()[-1])
+        self.assertEqual(plan["fit"]["fields"].get("fit"), "green")
+        self.assertEqual(plan["argv"][0], str(self.fake_engine_bin.resolve()))
+
+    def test_gguf_pack_with_overflowing_kv_reserve_is_refused_as_does_not_fit(self):
+        # A wired-limit just above the default 8 GiB margin (ceiling is
+        # only 1 MiB) plus a 1 GiB KV reserve: legitimately exceeds the
+        # ceiling -> RED, refused without --force at the launcher's own
+        # RED exit code (2).
+        argv = self._argv(
+            ["--kv-reserve-gib", "1", "--wired-limit-mib", "8193"]
+        )
+        with patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("fit_check=RED", stderr)
+        self.assertIn("exceeds ceiling", stderr)
 
 
 if __name__ == "__main__":

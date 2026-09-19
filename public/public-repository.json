@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 986,
-    "pathModeSha256": "ea08a9a5f0aceee90defa8b3f4e9f6e55946b6b4aa6e3fef831db9944972619c"
+    "pathCount": 988,
+    "pathModeSha256": "20e6be4724486c05c1a611b54a5e1430371df4fe6c894cf4bb9b070fe6f8377b"
   },
   "files": [
     {
@@ -76,6 +76,10 @@
     {
       "source": "scripts/fastmlx_recommend.py",
       "destination": "scripts/fastmlx_recommend.py"
+    },
+    {
+      "source": "scripts/fastmlx_gguf_fit.py",
+      "destination": "scripts/fastmlx_gguf_fit.py"
     },
     {
       "source": "scripts/hf_pinned_snapshot_download.py",
@@ -164,6 +168,10 @@
     {
       "source": "scripts/tests/test_fastmlx_recommend.py",
       "destination": "scripts/tests/test_fastmlx_recommend.py"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx_gguf_fit.py",
+      "destination": "scripts/tests/test_fastmlx_gguf_fit.py"
     },
     {
       "source": "scripts/tests/test_hf_pinned_snapshot_download.py",

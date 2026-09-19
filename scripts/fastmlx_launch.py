@@ -104,6 +104,28 @@ class LaunchRefusal(Exception):
 
 
 # ---------------------------------------------------------------------
+# 0. Model-directory layout: MLX weights (config.json) or a GGUF pack
+#    (one or more top-level *.gguf shards, admitted only through a
+#    GGUF-aware ``--fit-check-bin`` such as scripts/fastmlx_gguf_fit.py).
+# ---------------------------------------------------------------------
+MODEL_DIR_REFUSAL_MESSAGE_SUFFIX = "does not contain config.json or any .gguf file"
+
+
+def is_model_dir(path: Path) -> bool:
+    """Whether ``path`` (already known to be a directory) looks like a model
+    pack this launcher can hand off to a fit check: an MLX weights
+    directory (``config.json`` present) or a GGUF pack (at least one
+    top-level ``*.gguf`` REGULAR FILE -- a same-named directory does not
+    count). This check does not itself parse or validate GGUF headers; it
+    only recognizes the layout so the right ``--fit-check-bin`` can be
+    tried.
+    """
+    if (path / "config.json").is_file():
+        return True
+    return any(child.is_file() and child.suffix == ".gguf" for child in path.iterdir())
+
+
+# ---------------------------------------------------------------------
 # 1. Fit check: run the fit binary, classify GREEN / RED / unknown.
 # ---------------------------------------------------------------------
 class FitCheckResult:
@@ -551,8 +573,8 @@ def _run_serve(args, passthrough_args: list) -> int:
     model_path: Path = args.model_path
     if not model_path.is_dir():
         raise LaunchRefusal(2, f"model path {model_path} does not exist or is not a directory")
-    if not (model_path / "config.json").is_file():
-        raise LaunchRefusal(2, f"model path {model_path} does not contain config.json")
+    if not is_model_dir(model_path):
+        raise LaunchRefusal(2, f"model path {model_path} {MODEL_DIR_REFUSAL_MESSAGE_SUFFIX}")
 
     model_id = args.model_id or model_path.resolve().name
     model_repo = _resolve_model_repo(args, model_path)
