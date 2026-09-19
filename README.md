@@ -197,6 +197,11 @@ itself runs `fastmlx-serve --fit-check-only`, so build that first
 # Pull an exact Hugging Face revision: every file is hash-checked, and an interrupted pull resumes.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b
 
+# Adopt a directory that was staged by hand (rsync, a copy from another host, ...) instead of by
+# `fastmlx pull`: verifies every manifest file already there against the pinned revision (size +
+# content hash) and writes the same receipt a real pull would, instead of downloading anything.
+python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b --adopt
+
 # Rank the local packs that fit this Mac, with each one's measured quality card.
 python3 scripts/fastmlx.py recommend --models-dir ./models
 
@@ -210,7 +215,13 @@ you opt in with `--accept-quality <card-id>`, so a measured quality cost is neve
 pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
-repository's `fastmlx-serve`.
+repository's `fastmlx-serve`. A model directory with no receipt and no `--model-revision` has no
+resolved identity, so no quality card can ever match it; `serve` prints one stderr line saying so
+(admission still proceeds as unmeasured) -- `pull ... --adopt` is how you give a hand-staged directory
+that identity without re-downloading it. `--adopt` also walks the whole directory tree (not just the
+top level): any file that is not an exact manifest entry, at any depth, is a refusal, and so is an
+unlisted symlink; only a dot-prefixed path (`.cache/`, a dotfile, ...) is ignored, so a hand-staged
+directory must not carry any extra file the pinned revision does not itself name.
 
 `serve` and `recommend` also accept a GGUF pack directory (one or more top-level `*.gguf` shards, no
 `config.json`) as a model path. `scripts/fastmlx_gguf_fit.py` sizes it from its GGUF headers alone
@@ -223,6 +234,27 @@ It does not derive a context ceiling, so pass `--context` yourself and size the 
 ```sh
 python3 scripts/fastmlx.py serve --model-path ./models/some-gguf-pack --context 32768 \
   --fit-check-bin scripts/fastmlx_gguf_fit.py --fit-check-arg=--kv-reserve-gib --fit-check-arg=16 \
+  --engine-profile <your engine profile>
+```
+
+For an MLX safetensors pack served by another engine, `scripts/fastmlx_safetensors_fit.py` applies
+the same ceiling rule (wired limit minus margin, plus your KV reserve) to the pack's `*.safetensors`
+bytes, after checking each shard's header against its file size; shards are counted recursively (any
+subdirectory, skipping only a dot-prefixed one), and if a top-level `model.safetensors.index.json` is
+present, every shard it names must actually be among the counted files. The default fit check models
+this repository's own engine; use this one when the engine you serve with holds only the safetensors
+resident. `--wired-limit-mib`, `--wired-margin-gib`, and `--kv-reserve-gib` also accept the same
+`FASTMLX_WIRED_LIMIT_MIB`, `FASTMLX_WIRED_MARGIN_GIB`, and `FASTMLX_GGUF_KV_RESERVE_GIB` environment
+fallbacks as the GGUF fit check above. A large non-safetensors file in the pack (for example an
+n-gram table the engine memory-maps) must be named explicitly with a repeatable `--mmap-side-file`
+flag to be excluded from resident bytes and reported instead of counted; an unnamed file of at least
+1 GiB is refused as a configuration error rather than silently excluded, since that is an assumption
+about the engine you should confirm against a measured peak before relying on it:
+
+```sh
+python3 scripts/fastmlx.py serve --model-path ./models/some-mlx-pack --context 262144 \
+  --fit-check-bin scripts/fastmlx_safetensors_fit.py --fit-check-arg=--kv-reserve-gib --fit-check-arg=8 \
+  --fit-check-arg=--mmap-side-file --fit-check-arg=ngram_table.bin \
   --engine-profile <your engine profile>
 ```
 

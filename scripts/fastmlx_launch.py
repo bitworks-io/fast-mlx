@@ -882,6 +882,20 @@ def _run_serve(args, passthrough_args: list) -> int:
                 f"but this launch is --residency {residency!r}",
             )
     else:
+        # No repo and no pinned revision at all (no --model-repo/
+        # --model-revision, and no usable sibling pull receipt) means no
+        # card could ever match this launch by repo or by hfPin -- a
+        # hand-staged pack (rsync'd or copied in, never `fastmlx pull`ed)
+        # silently falls through to admit_unmeasured otherwise. Made
+        # visible here; the admission OUTCOME is unchanged either way.
+        if model_repo is None and model_revision is None:
+            print(
+                "fastmlx serve: no model identity (no pull receipt, no "
+                "--model-revision); no quality card was consulted -- run "
+                "'fastmlx pull <repo>@<revision> --dest <dir> --adopt' to "
+                "pin a hand-staged pack",
+                file=sys.stderr,
+            )
         card = resolve_card(cards, model_repo, model_revision, residency=residency)
 
     opt_in_ids = set(args.accept_quality)

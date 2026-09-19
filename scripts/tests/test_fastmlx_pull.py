@@ -191,6 +191,22 @@ class SyntheticRepo:
         return json.dumps(self.document, sort_keys=True).encode()
 
 
+class NestedRepo(SyntheticRepo):
+    """A repo fixture whose manifest names files inside a subdirectory, to
+    exercise a manifest-named subdirectory that also contains an unlisted
+    extra file."""
+
+    def __init__(self):
+        self.repo_id = REPO_ID
+        self.revision = REVISION
+        self.content_by_name = {
+            "weights/config.json": b'{"hello":"world"}',
+            "weights/model.safetensors": (b"synthetic-shard-bytes-" * 50),
+        }
+        self.document = self._build_document()
+        self.api_bytes = self._serialize()
+
+
 class TwoFileRepo(SyntheticRepo):
     """A minimal 2-file public-repo fixture for staging-dir resume tests."""
 
@@ -609,6 +625,367 @@ class PullSupervisorTests(unittest.TestCase):
             self.assertIn("existing pull receipt", str(ctx.exception))
             self.assertFalse(dest.exists())
             self.assertEqual(opener.resolve_calls, [])
+
+
+class AdoptTests(unittest.TestCase):
+    """``fastmlx pull --adopt``: verify an already-staged directory against
+    a pinned revision's manifest instead of downloading it.
+    """
+
+    def opener_for(self, repo: SyntheticRepo) -> FakeOpener:
+        return FakeOpener(repo.api_bytes, dict(repo.content_by_name))
+
+    def stage_correctly(self, dest: Path, repo: SyntheticRepo) -> None:
+        dest.mkdir(parents=True, exist_ok=True)
+        for name, data in repo.content_by_name.items():
+            path = dest / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+
+    # ------------------------------------------------------------------
+    # Happy path: a correctly hand-staged directory is adopted, and the
+    # resulting receipt is what the launcher actually reads.
+    # ------------------------------------------------------------------
+    def test_adopt_success_writes_a_receipt_with_acquisition_adopted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                receipt_path = FASTMLX_PULL.adopt(
+                    repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                )
+
+            # Adopt never fetches file bytes over the network -- only the
+            # source-API manifest request is made (served by FakeOpener's
+            # api-bytes branch); no /resolve/ URL is ever hit.
+            self.assertEqual(opener.resolve_calls, [])
+
+            self.assertEqual(receipt_path, FASTMLX_PULL.receipt_path_for(dest))
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["repo_id"], repo.repo_id)
+            self.assertEqual(receipt["revision"], repo.revision)
+            self.assertEqual(receipt["acquisition"], "adopted")
+            self.assertEqual(receipt["dest"], str(dest.absolute()))
+            self.assertEqual(receipt["total_files"], 3)
+            self.assertEqual(receipt["ignored_local_paths"], [])
+            for name, data in repo.content_by_name.items():
+                self.assertEqual(
+                    receipt["files"][name]["sha256"],
+                    hashlib.sha256(data).hexdigest(),
+                )
+                self.assertEqual(receipt["files"][name]["size"], len(data))
+                self.assertIn(
+                    receipt["files"][name]["verified"],
+                    ("lfs-sha256", "git-blob-sha1"),
+                )
+            # The LFS entry (model.safetensors) is verified by streamed
+            # sha256; the two small non-LFS entries are verified by the
+            # downloader's own git-blob-sha1 identity.
+            self.assertEqual(
+                receipt["files"]["model.safetensors"]["verified"], "lfs-sha256"
+            )
+            self.assertEqual(
+                receipt["files"]["config.json"]["verified"], "git-blob-sha1"
+            )
+
+            # End-to-end: the launcher resolves this receipt's pinned
+            # revision exactly the way a real pull's receipt is resolved.
+            launch_spec = importlib.util.spec_from_file_location(
+                "fastmlx_launch",
+                Path(__file__).resolve().parents[1] / "fastmlx_launch.py",
+            )
+            assert launch_spec is not None and launch_spec.loader is not None
+            launch_module = importlib.util.module_from_spec(launch_spec)
+            launch_spec.loader.exec_module(launch_module)
+            args = argparse.Namespace(model_revision=None)
+            self.assertEqual(
+                launch_module._resolve_model_revision(args, dest), repo.revision
+            )
+
+    # ------------------------------------------------------------------
+    # Refusals: missing file, size mismatch, sha mismatch, symlink.
+    # ------------------------------------------------------------------
+    def test_refuses_a_missing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "README.md").unlink()
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("missing file", str(ctx.exception))
+            self.assertIn("README.md", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_refuses_a_size_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "config.json").write_bytes(b"{}")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("size mismatch", str(ctx.exception))
+            self.assertIn("config.json", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_refuses_a_sha_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            original = repo.content_by_name["model.safetensors"]
+            corrupted = bytearray(original)
+            corrupted[0] ^= 0xFF
+            (dest / "model.safetensors").write_bytes(bytes(corrupted))
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("content mismatch", str(ctx.exception))
+            self.assertIn("model.safetensors", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
+    def test_refuses_a_symlinked_file_even_if_content_is_correct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            real_target = root / "real-config.json"
+            real_target.write_bytes(repo.content_by_name["config.json"])
+            (dest / "config.json").unlink()
+            (dest / "config.json").symlink_to(real_target)
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("not a regular file", str(ctx.exception))
+            self.assertIn("config.json", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    # ------------------------------------------------------------------
+    # An extra file not in the manifest is refused, at any depth; a
+    # harmless extra (dotfile / dot-directory) is ignored and recorded.
+    # ------------------------------------------------------------------
+    def test_refuses_an_extra_top_level_safetensors_file_not_in_the_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "extra-shard.safetensors").write_bytes(b"unverified-bytes")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("extra-shard.safetensors", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_refuses_an_unlisted_non_loadable_top_level_file(self):
+        # Not a *.safetensors/*.gguf/*.bin file -- under the old top-level
+        # suffix-based check this was silently ignored; it must now be
+        # refused like any other unlisted file.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "chat_template.jinja").write_bytes(b"{{ messages }}")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("chat_template.jinja", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_refuses_an_unlisted_file_nested_in_a_manifest_named_subdirectory(self):
+        # Under the old top-level-component skip, an entire manifest-named
+        # subdirectory was never looked into again once its top component
+        # matched; an extra file hidden inside it was silently ignored.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = NestedRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "weights" / "extra.bin").write_bytes(b"unverified-bytes")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("weights/extra.bin", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_refuses_an_unlisted_file_in_a_non_manifest_subdirectory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / "extra_dir").mkdir()
+            (dest / "extra_dir" / "notes.txt").write_bytes(b"notes")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("extra_dir/notes.txt", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_ignores_and_records_a_nested_dot_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            cache_dir = dest / ".cache" / "x"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "y").write_bytes(b"cache-data")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                receipt_path = FASTMLX_PULL.adopt(
+                    repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            # The walk never descends past the dot-directory itself, so
+            # only ".cache" is recorded -- not the file inside it.
+            self.assertEqual(receipt["ignored_local_paths"], [".cache"])
+
+    @REQUIRES_MACOS_EXCLUSIVE_RENAME
+    def test_refuses_an_unlisted_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            real_target = root / "real-extra.bin"
+            real_target.write_bytes(b"extra-content")
+            (dest / "extra-link").symlink_to(real_target)
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("extra-link", str(ctx.exception))
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+
+    def test_ignores_and_records_a_harmless_extra_dotfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            (dest / ".DS_Store").write_bytes(b"junk")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                receipt_path = FASTMLX_PULL.adopt(
+                    repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["ignored_local_paths"], [".DS_Store"])
+
+    # ------------------------------------------------------------------
+    # An existing receipt is never overwritten by --adopt either.
+    # ------------------------------------------------------------------
+    def test_refuses_to_overwrite_an_existing_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            receipt_path = FASTMLX_PULL.receipt_path_for(dest)
+            receipt_path.write_text("{}", encoding="utf-8")
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("existing pull receipt", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # A non-existent directory cannot be adopted (--adopt is for a
+    # directory that is already there, never a fresh download destination).
+    # ------------------------------------------------------------------
+    def test_refuses_a_dest_that_does_not_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "not-there"
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.adopt(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+            self.assertIn("existing directory", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # CLI wiring: --adopt routes through fastmlx_pull.main to adopt(), not
+    # pull().
+    # ------------------------------------------------------------------
+    def test_cli_adopt_flag_calls_adopt_not_pull(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            self.stage_correctly(dest, repo)
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                FASTMLX_PULL.main(
+                    [
+                        f"{repo.repo_id}@{repo.revision}",
+                        "--dest",
+                        str(dest),
+                        "--adopt",
+                    ]
+                )
+            receipt = json.loads(
+                FASTMLX_PULL.receipt_path_for(dest).read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["acquisition"], "adopted")
 
 
 if __name__ == "__main__":

@@ -599,6 +599,54 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(plan["card"]["id"], PIN_ONLY_NO_GO_CARD_ID)
 
     # ------------------------------------------------------------------
+    # W2 part B: a hand-staged pack with NO resolved model identity at all
+    # (no --model-repo, no --model-revision, no sibling pull receipt) means
+    # no card could ever match this launch -- made visible with one stderr
+    # line, without changing the (still admit_unmeasured) outcome.
+    # ------------------------------------------------------------------
+    def test_no_identity_prints_visible_line_and_still_admits_unmeasured(self):
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertIsNone(plan["card"])
+        self.assertIn("no model identity", stderr)
+        self.assertIn("no pull receipt", stderr)
+        self.assertIn("--model-revision", stderr)
+        self.assertIn("fastmlx pull", stderr)
+        self.assertIn("--adopt", stderr)
+
+    def test_no_identity_line_is_absent_when_model_revision_is_given(self):
+        argv = self.base_args(
+            **{"--model-revision": "e" * 40, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertNotIn("no model identity", stderr)
+
+    def test_no_identity_line_is_absent_when_a_card_resolves_by_repo(self):
+        argv = self.base_args(
+            **{"--model-repo": PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("no model identity", stderr)
+
+    def test_no_identity_line_is_absent_when_sibling_receipt_supplies_identity(self):
+        write_pull_receipt(self.model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("no model identity", stderr)
+
+    # ------------------------------------------------------------------
     # --context omitted: use the fit check's context ceiling.
     # ------------------------------------------------------------------
     def test_context_defaults_from_fit_ceiling_when_omitted(self):

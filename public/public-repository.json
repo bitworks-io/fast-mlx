@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 989,
-    "pathModeSha256": "ebfefee12ac2b6729e68943cb765a6af35f1b83594693e05be1ce6e19d5dd98a"
+    "pathCount": 991,
+    "pathModeSha256": "0c2565bc65dbd83c8f123b5a8544ffb5fa36402b56b04a2141b20a1fee1d6983"
   },
   "files": [
     {
@@ -80,6 +80,10 @@
     {
       "source": "scripts/fastmlx_gguf_fit.py",
       "destination": "scripts/fastmlx_gguf_fit.py"
+    },
+    {
+      "source": "scripts/fastmlx_safetensors_fit.py",
+      "destination": "scripts/fastmlx_safetensors_fit.py"
     },
     {
       "source": "scripts/hf_pinned_snapshot_download.py",
@@ -172,6 +176,10 @@
     {
       "source": "scripts/tests/test_fastmlx_gguf_fit.py",
       "destination": "scripts/tests/test_fastmlx_gguf_fit.py"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx_safetensors_fit.py",
+      "destination": "scripts/tests/test_fastmlx_safetensors_fit.py"
     },
     {
       "source": "scripts/tests/test_hf_pinned_snapshot_download.py",

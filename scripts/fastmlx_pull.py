@@ -24,6 +24,31 @@ the resume behavior lives here, one layer up:
   (so the receipt is pinned to the code that produced it). An existing
   receipt at that path is never overwritten.
 
+``--adopt`` (2026-09-19): a second way to end up with a receipt, for a
+directory that was staged by hand (rsync, a copy from another host, etc.)
+rather than by this script. Given the same ``<repo>@<revision>`` pinned
+reference and ``--dest`` pointing at an EXISTING directory, it fetches the
+same revision-API file manifest ``pull()`` does (``downloader.fetch_api`` /
+``downloader.validated_entries`` -- no separate HTTP path), verifies every
+manifest file is present as a real regular file of the exact size and
+content identity the manifest declares (LFS files by streamed sha256,
+non-LFS files by the same git-blob-sha1 identity ``downloader.hash_file``
+already checks for a fresh download or a resumed one), and refuses with no
+receipt written on the first mismatch. ``dest`` is then walked recursively:
+any regular file, at any depth, whose relative path is not an exact
+manifest entry is a refusal (it could be loaded even though it was never
+verified -- a pinned revision's manifest can vouch only for the bytes it
+actually names, so a receipt must never vouch for more than that). An
+unlisted symlink, or any other non-regular path, is refused the same way.
+The only paths this walk does not refuse on are directories themselves and
+anything whose relative path has a component starting with ``.`` (a
+``.cache/`` directory, ``.gitattributes``, a dotfile, ...) -- those are
+never descended into and are instead recorded in the receipt's
+``ignored_local_paths``. The receipt this writes has the same shape and the
+same exclusive, never-overwritten write as a normal pull, plus
+``"acquisition": "adopted"`` (a normal ``pull()`` receipt now carries
+``"acquisition": "downloaded"`` for the same reason).
+
 This script never executes or imports anything from the pulled repository,
 and it does not add any new token/credential handling.
 """
@@ -34,6 +59,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import stat
 import sys
@@ -310,10 +336,199 @@ def pull(
         "reused_bytes": reused_bytes,
         "downloader_script_sha256": downloader_script_sha256(),
         "files": files_receipt,
+        "acquisition": "downloaded",
     }
     receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
     downloader.write_exclusive(receipt_path, receipt_bytes)
     print(f"pull complete: {receipt_path}", flush=True)
+    return receipt_path
+
+
+# ---------------------------------------------------------------------
+# 2b. Adopt: verify an already-staged directory against a pinned revision's
+#     manifest instead of downloading it, then write the same receipt shape.
+# ---------------------------------------------------------------------
+def _verify_adopted_entry(dest: Path, entry: dict) -> dict:
+    """Verify one manifest ``entry`` against the file already on disk at
+    ``dest / entry['name']``, returning the receipt fragment for it.
+
+    Refuses (``PullError``, naming the file) on: a missing file, a path that
+    is not a regular file (a symlink is refused even if it targets a regular
+    file -- ``lstat`` is used, never ``stat``, so a symlink escape is never
+    silently followed), a size mismatch, or a content-identity mismatch.
+    Content identity reuses ``downloader.hash_file`` -- the exact function
+    the downloader itself uses to verify a fresh download and a
+    ``--reuse-verified-from`` candidate -- so an LFS entry is checked by
+    streamed sha256 and a non-LFS entry by the same git-blob-sha1 identity a
+    real pull checks; no new verification algorithm is introduced here. Only
+    an entry with neither identity (never produced by
+    ``downloader.validated_entries`` today, which always requires a valid
+    ``blob_id``) falls back to a recorded ``"verified": "size-only"``.
+    """
+    name = entry["name"]
+    file_path = dest / name
+    try:
+        info = file_path.lstat()
+    except OSError as error:
+        raise PullError(f"--adopt refused: missing file in {dest}: {name}") from error
+    if not stat.S_ISREG(info.st_mode):
+        raise PullError(
+            f"--adopt refused: {name} in {dest} is not a regular file "
+            "(symlink, directory, or device); it is refused even if it "
+            "targets correct content"
+        )
+    if info.st_size != entry["size"]:
+        raise PullError(
+            f"--adopt refused: size mismatch for {name}: the pinned revision "
+            f"declares {entry['size']} bytes, {dest} has {info.st_size} bytes"
+        )
+
+    expected_identity = entry["lfs_sha256"] or entry["blob_id"]
+    if expected_identity is None:
+        return {
+            "sha256": _stream_sha256(file_path),
+            "size": entry["size"],
+            "verified": "size-only",
+        }
+    try:
+        observed_identity = downloader.hash_file(
+            file_path, entry["size"], entry["lfs_sha256"]
+        )
+    except downloader.AcquisitionError as error:
+        raise PullError(
+            f"--adopt refused: could not verify {name} in {dest}: {error}"
+        ) from error
+    if observed_identity != expected_identity:
+        raise PullError(
+            f"--adopt refused: content mismatch for {name}: {dest} does not "
+            "hold the bytes the pinned revision declares"
+        )
+    # An LFS identity IS the plain file sha256, so reuse it rather than read
+    # a multi-GB file a second time; a non-LFS identity is a git blob sha1,
+    # so the receipt's plain sha256 still needs its own (small-file) pass.
+    if entry["lfs_sha256"] is not None:
+        return {"sha256": observed_identity, "size": entry["size"], "verified": "lfs-sha256"}
+    return {
+        "sha256": _stream_sha256(file_path),
+        "size": entry["size"],
+        "verified": "git-blob-sha1",
+    }
+
+
+def _refuse_unmanifested_loadable_extras(dest: Path, entries: list) -> list:
+    """Recursively walk ``dest`` and refuse any regular file, at any depth,
+    whose relative path is not an exact manifest entry (it could be loaded
+    even though it was never verified against the pinned revision); an
+    unlisted symlink or other non-regular path is refused the same way.
+    Directories themselves are never refused on, and a path with any
+    component starting with ``.`` (a ``.cache/`` directory, a dotfile, a
+    hand-copied README someone renamed to start with a dot, ...) is never
+    descended into and is returned as ``ignored_local_paths`` for the
+    receipt instead -- the only paths this function treats as harmless.
+
+    A top-level-only, suffix-based check (the previous behavior: only
+    unlisted ``*.safetensors``/``*.gguf``/``*.bin`` files were refused, and
+    subdirectories were never even looked into) let a receipt vouch for
+    content the pinned revision never had -- an edited config file, a
+    hand-copied script, or any file nested in a manifest-named
+    subdirectory. Every non-dot, non-manifest path is now refused,
+    regardless of name or depth.
+    """
+    manifest_names = {entry["name"] for entry in entries}
+    ignored_local_paths: list = []
+
+    def _walk(directory: Path) -> None:
+        try:
+            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise PullError(f"--adopt refused: could not list {directory}: {error}") from error
+        for child in children:
+            relative = Path(child.path).relative_to(dest).as_posix()
+            if child.name.startswith("."):
+                ignored_local_paths.append(relative)
+                continue
+            if child.is_symlink():
+                raise PullError(
+                    f"--adopt refused: {dest} contains a path that is not "
+                    f"part of the pinned revision's manifest: {relative} "
+                    "(a symlink); it could be loaded even though it was "
+                    "never verified -- remove it or use a clean directory"
+                )
+            if child.is_dir(follow_symlinks=False):
+                _walk(Path(child.path))
+                continue
+            if child.is_file(follow_symlinks=False):
+                if relative in manifest_names:
+                    continue
+                raise PullError(
+                    f"--adopt refused: {dest} contains a file that is not "
+                    f"part of the pinned revision's manifest: {relative}; "
+                    "it could be loaded even though it was never verified "
+                    "-- remove it or use a clean directory"
+                )
+            raise PullError(
+                f"--adopt refused: {dest} contains a path that is not part "
+                f"of the pinned revision's manifest: {relative} (not a "
+                "regular file or directory); remove it or use a clean "
+                "directory"
+            )
+
+    _walk(dest)
+    return ignored_local_paths
+
+
+def adopt(repo_id: str, revision: str, dest: Path) -> Path:
+    """Verify an already-staged ``dest`` against the pinned revision's file
+    manifest and write the same receipt a real ``pull()`` would, marked
+    ``"acquisition": "adopted"``. Nothing is downloaded; every file must
+    already be present and correct. Writes nothing on any refusal.
+    """
+    dest = dest.expanduser().absolute()
+    receipt_path = receipt_path_for(dest)
+    if receipt_path.exists() or receipt_path.is_symlink():
+        raise PullError(
+            f"refusing to overwrite an existing pull receipt: {receipt_path}"
+        )
+    if dest.is_symlink() or not dest.is_dir():
+        raise PullError(
+            f"--adopt requires an existing directory to verify (not a fresh "
+            f"download destination): {dest}"
+        )
+
+    document, _api_data = downloader.fetch_api(repo_id, revision)
+    entries = downloader.validated_entries(document, repo_id, revision)
+
+    files_receipt: dict[str, dict[str, object]] = {}
+    for index, entry in enumerate(entries, start=1):
+        print(
+            f"adopt verify file={index}/{len(entries)} name={entry['name']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        files_receipt[entry["name"]] = _verify_adopted_entry(dest, entry)
+
+    ignored_local_paths = _refuse_unmanifested_loadable_extras(dest, entries)
+
+    total_bytes = sum(entry["size"] for entry in entries)
+    receipt = {
+        "format_version": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "dest": str(dest),
+        "attempts": 1,
+        "max_attempts": 1,
+        "total_files": len(entries),
+        "total_bytes": total_bytes,
+        "reused_files": 0,
+        "reused_bytes": 0,
+        "downloader_script_sha256": downloader_script_sha256(),
+        "files": files_receipt,
+        "acquisition": "adopted",
+        "ignored_local_paths": ignored_local_paths,
+    }
+    receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
+    downloader.write_exclusive(receipt_path, receipt_bytes)
+    print(f"adopt complete: {receipt_path}", flush=True)
     return receipt_path
 
 
@@ -337,6 +552,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS
     )
     parser.add_argument("--min-free-bytes", type=int, default=None)
+    parser.add_argument(
+        "--adopt",
+        action="store_true",
+        help=(
+            "verify an EXISTING directory at --dest against the pinned "
+            "revision's file manifest instead of downloading it, then "
+            "write the same .pull-receipt.json a download would (marked "
+            "acquisition: adopted); refuses on any missing, wrong-size, "
+            "wrong-content, or unverified-but-loadable file"
+        ),
+    )
     return parser
 
 
@@ -349,13 +575,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         print(f"fastmlx pull refused: {error}", file=sys.stderr)
         raise SystemExit(1)
     try:
-        pull(
-            repo_id=repo_id,
-            revision=revision,
-            dest=args.dest,
-            max_attempts=args.max_attempts,
-            min_free_bytes=args.min_free_bytes,
-        )
+        if args.adopt:
+            adopt(repo_id=repo_id, revision=revision, dest=args.dest)
+        else:
+            pull(
+                repo_id=repo_id,
+                revision=revision,
+                dest=args.dest,
+                max_attempts=args.max_attempts,
+                min_free_bytes=args.min_free_bytes,
+            )
     except PullError as error:
         print(f"fastmlx pull failed: {error}", file=sys.stderr)
         raise SystemExit(1)

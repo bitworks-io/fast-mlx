@@ -223,8 +223,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # machine-local path, and describes only fast-mlx's own measured evidence that SSD expert streaming
 # changed greedy output on a third-party serving engine.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 989,
-    "pathModeSha256": "ebfefee12ac2b6729e68943cb765a6af35f1b83594693e05be1ce6e19d5dd98a",
+    "pathCount": 991,
+    "pathModeSha256": "0c2565bc65dbd83c8f123b5a8544ffb5fa36402b56b04a2141b20a1fee1d6983",
 }
 
 
