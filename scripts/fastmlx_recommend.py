@@ -134,10 +134,22 @@ def discover_candidates(model_paths: list, models_dir_paths: list) -> list:
 # ---------------------------------------------------------------------
 # Per-candidate row.
 # ---------------------------------------------------------------------
-def _resolve_fit_check_bin(explicit: Optional[str]) -> Optional[str]:
+def _resolve_fit_check_bin(explicit: Optional[str], profile_fit_check: Optional[dict]) -> tuple:
+    """The fit-check binary and its profile-supplied leading extra args.
+
+    Precedence mirrors ``fastmlx serve``'s (see ``_run_serve``), minus the
+    ``FASTMLX_FIT_CHECK_BIN`` environment fallback -- this script never
+    reads environment values at all: ``--fit-check-bin`` (explicit) >
+    the engine profile's own ``fitCheck.bin`` > the built-in engine.
+    Returns ``(fit_check_bin, profile_extra_args, overridden)`` where
+    ``overridden`` is true exactly when an explicit ``--fit-check-bin``
+    silently dropped a profile's own ``fitCheck.args``.
+    """
     if explicit:
-        return explicit
-    return shutil.which(launch._BUILT_IN_ENGINE_BINARY_NAME)
+        return explicit, [], profile_fit_check is not None
+    if profile_fit_check is not None:
+        return profile_fit_check["bin"], list(profile_fit_check["args"]), False
+    return shutil.which(launch._BUILT_IN_ENGINE_BINARY_NAME), [], False
 
 
 def _card_summary(card: Optional[dict]) -> Optional[dict]:
@@ -207,6 +219,14 @@ def build_row(
     row["repo"] = model_repo
     row["revision"] = model_revision
 
+    # No repo and no pinned revision at all means no card could ever match
+    # this candidate by repo or by hfPin -- made visible here exactly like
+    # `fastmlx serve` makes it visible for the same reason (see
+    # `launch.print_no_model_identity_hint`); the row's classification is
+    # unchanged either way.
+    if model_repo is None and model_revision is None:
+        launch.print_no_model_identity_hint("fastmlx recommend", str(model_path))
+
     try:
         card = launch.resolve_card(cards, model_repo, model_revision, residency=residency)
     except launch.LaunchRefusal as refusal:
@@ -249,6 +269,22 @@ def build_row(
     # YELLOW are both a pass (mirrors fastmlx serve, which admits either
     # without --force; only RED is a refusal).
     fields = fit_result.fields
+
+    # A GREEN attestation carrying its own residency= field must agree
+    # with the requested --residency, exactly like fastmlx serve's
+    # fail-closed check: a sizer that sized the wrong residency must never
+    # be reported as a recommended/fitting row for THIS residency. A
+    # binary that omits the field (e.g. the Swift built-in binary) is not
+    # checked.
+    attested_residency = fields.get("residency")
+    if attested_residency is not None and attested_residency != residency:
+        row["status"] = STATUS_ERROR
+        row["message"] = (
+            f"fit check attested residency={attested_residency!r}, which "
+            f"differs from the requested --residency {residency!r}"
+        )
+        return row
+
     fit_label = str(fields.get("fit_check", "green")).upper()
     reported_context = fields.get("fit_served_context") or (
         context if context is not None else fields.get("fit_context_ceiling")
@@ -375,6 +411,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     recommend.add_argument("--fit-check-bin", default=None)
     recommend.add_argument("--fit-check-arg", action="append", default=[])
+    recommend.add_argument("--engine-profile", default=None)
     recommend.add_argument("--json", action="store_true")
     return parser
 
@@ -389,11 +426,33 @@ def _run_recommend(args) -> int:
         )
         return 2
 
-    fit_check_arg_residency = launch._residency_in_fit_check_args(args.fit_check_arg)
-    if fit_check_arg_residency is not None and fit_check_arg_residency != args.residency:
+    try:
+        profile, _ = launch.load_engine_profile(args.engine_profile)
+    except launch.LaunchRefusal as refusal:
+        print(f"fastmlx recommend: {refusal.message}", file=sys.stderr)
+        return refusal.exit_code
+
+    fit_check_bin, profile_extra_args, overridden = _resolve_fit_check_bin(
+        args.fit_check_bin, profile.get("fitCheck")
+    )
+    if overridden:
         print(
-            f"fastmlx recommend: --fit-check-arg specifies --residency "
-            f"{fit_check_arg_residency!r}, which differs from --residency "
+            f"fastmlx recommend: --fit-check-bin overrides engine profile "
+            f"{profile['name']!r}'s own fitCheck; its fitCheck.args are not "
+            "applied",
+            file=sys.stderr,
+        )
+    combined_fit_check_args = profile_extra_args + args.fit_check_arg
+
+    residency_conflict = launch._residency_conflict_source_and_value(
+        profile_extra_args, args.fit_check_arg, args.residency
+    )
+    if residency_conflict is not None:
+        source_label, item, value = residency_conflict
+        value_desc = "no value" if value is None else repr(value)
+        print(
+            f"fastmlx recommend: {source_label} specifies {item!r} "
+            f"({value_desc}), which differs from --residency "
             f"{args.residency!r}",
             file=sys.stderr,
         )
@@ -413,8 +472,6 @@ def _run_recommend(args) -> int:
         )
         return 2
 
-    fit_check_bin = _resolve_fit_check_bin(args.fit_check_bin)
-
     rows = [
         build_row(
             model_path=candidate,
@@ -422,7 +479,7 @@ def _run_recommend(args) -> int:
             fit_check_bin=fit_check_bin,
             host_use=args.host_use,
             context=args.context,
-            fit_check_args=args.fit_check_arg,
+            fit_check_args=combined_fit_check_args,
             residency=args.residency,
         )
         for candidate in candidates

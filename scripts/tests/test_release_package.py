@@ -27,6 +27,15 @@ _TOOLING_SCRIPT_NAMES = (
     "fastmlx_launch.py",
     "fastmlx_recommend.py",
     "hf_pinned_snapshot_download.py",
+    "fastmlx_gguf_fit.py",
+    "fastmlx_safetensors_fit.py",
+)
+
+# The two fit sizers must keep their executable bit in the staged tree/tarball: the launcher execs
+# `--fit-check-bin` directly (see fastmlx_launch.py), never through `python3 <path>`.
+_EXECUTABLE_SIZER_NAMES = (
+    "fastmlx_gguf_fit.py",
+    "fastmlx_safetensors_fit.py",
 )
 
 # Forbidden internal-deployment strings: package-release.sh is generic product-release tooling
@@ -105,9 +114,16 @@ def _populate_release_tree(root: Path) -> None:
     package_script_dst.chmod(0o755)
 
     for name in _TOOLING_SCRIPT_NAMES:
-        (root / "scripts" / name).write_bytes(
-            (REPOSITORY_ROOT / "scripts" / name).read_bytes()
-        )
+        dst = root / "scripts" / name
+        dst.write_bytes((REPOSITORY_ROOT / "scripts" / name).read_bytes())
+        if name in _EXECUTABLE_SIZER_NAMES:
+            # Deliberately NON-executable (0644) in the fixture source tree: package-release.sh
+            # itself must set the executable bit during staging (see its `chmod 0755` on these
+            # two sizers). Writing the fixture pre-chmod'd to 0755 would make
+            # test_fit_sizers_are_executable_in_the_tarball pass even if that chmod line were
+            # ever removed from the script -- this mode proves the SCRIPT does the chmod, not
+            # that the source happened to carry the bit already.
+            dst.chmod(0o644)
 
     (root / "site" / "quality-guides.json").write_bytes(
         (REPOSITORY_ROOT / "site" / "quality-guides.json").read_bytes()
@@ -246,6 +262,8 @@ class ReleasePackageTests(unittest.TestCase):
                     "libexec/scripts/fastmlx_launch.py",
                     "libexec/scripts/fastmlx_recommend.py",
                     "libexec/scripts/hf_pinned_snapshot_download.py",
+                    "libexec/scripts/fastmlx_gguf_fit.py",
+                    "libexec/scripts/fastmlx_safetensors_fit.py",
                     "libexec/site/quality-guides.json",
                     "LICENSE",
                     "NOTICE",
@@ -295,6 +313,100 @@ class ReleasePackageTests(unittest.TestCase):
             # (shutil.which("fastmlx-serve")), with no sibling-bin fallback of their own.
             self.assertIn("PATH=", body)
             self.assertIn("BIN_DIR", body)
+
+    def test_fit_sizers_are_executable_in_the_tarball(self) -> None:
+        # Acceptance: the launcher execs `--fit-check-bin` directly (see fastmlx_launch.py), so
+        # both fit sizers must keep their executable bit through staging into the tarball.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(stage_dir, out_dir)
+            tarball, _ = self._tarball_paths(out_dir)
+
+            with tarfile.open(tarball, "r:gz") as tar:
+                for name in _EXECUTABLE_SIZER_NAMES:
+                    member = tar.getmember(
+                        f"fastmlx-testver-arm64-macos/libexec/scripts/{name}"
+                    )
+                    self.assertTrue(
+                        member.mode & 0o100,
+                        f"{name} must be executable in the tarball (mode={oct(member.mode)})",
+                    )
+
+    def test_fit_sizers_executable_bit_comes_from_the_scripts_own_chmod(self) -> None:
+        # test_fit_sizers_are_executable_in_the_tarball above sources from THIS repository's own
+        # checkout, where both sizers are already git-mode 100755 -- so that test alone cannot
+        # tell whether package-release.sh's own `chmod 0755` line is doing anything at all (`cp`
+        # on macOS preserves the source's existing executable bit either way). This test instead
+        # stages from a fixture source tree whose sizers are committed NON-executable (0644; see
+        # _populate_release_tree), so the tarball's executable sizers can only be explained by
+        # the script's own explicit chmod.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+            for name in _EXECUTABLE_SIZER_NAMES:
+                source_mode = (fixture_root / "scripts" / name).stat().st_mode
+                self.assertFalse(
+                    source_mode & 0o111,
+                    f"fixture source {name} must be non-executable for this test to be "
+                    "discriminating",
+                )
+
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(
+                stage_dir,
+                out_dir,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+            )
+            tarball, _ = self._tarball_paths(out_dir)
+
+            with tarfile.open(tarball, "r:gz") as tar:
+                for name in _EXECUTABLE_SIZER_NAMES:
+                    member = tar.getmember(
+                        f"fastmlx-testver-arm64-macos/libexec/scripts/{name}"
+                    )
+                    self.assertTrue(
+                        member.mode & 0o100,
+                        f"{name} must be executable in the tarball (mode={oct(member.mode)}), "
+                        "even though the fixture source tree it was staged from is not -- proves "
+                        "package-release.sh's own chmod, not an inherited source bit",
+                    )
+
+    def test_staged_safetensors_fit_help_runs_from_libexec_scripts(self) -> None:
+        # Acceptance: fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py by sibling path
+        # (importlib, Path(__file__).resolve().parent), so both must land in the same
+        # libexec/scripts dir in the tarball layout, and the staged copy must actually run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(stage_dir, out_dir)
+            tarball, _ = self._tarball_paths(out_dir)
+
+            extract_dir = root / "extracted"
+            extract_dir.mkdir()
+            with tarfile.open(tarball, "r:gz") as tar:
+                tar.extractall(extract_dir, filter="data")
+
+            staged_sizer = (
+                extract_dir
+                / "fastmlx-testver-arm64-macos"
+                / "libexec"
+                / "scripts"
+                / "fastmlx_safetensors_fit.py"
+            )
+            self.assertTrue(staged_sizer.is_file())
+            self.assertTrue(os.access(staged_sizer, os.X_OK))
+
+            help_result = subprocess.run(
+                [str(staged_sizer), "--help"], capture_output=True, text=True
+            )
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
 
     def test_summary_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -469,6 +581,8 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn('"scripts/fastmlx_launch.py"', body)
             self.assertIn('"scripts/fastmlx_recommend.py"', body)
             self.assertIn('"scripts/hf_pinned_snapshot_download.py"', body)
+            self.assertIn('"scripts/fastmlx_gguf_fit.py"', body)
+            self.assertIn('"scripts/fastmlx_safetensors_fit.py"', body)
             self.assertIn('(libexec/"site").install "site/quality-guides.json"', body)
 
     def test_formula_wrapper_execs_the_python_dispatcher_and_extends_path(

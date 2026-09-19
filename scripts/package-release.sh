@@ -183,13 +183,18 @@ cp -f "$METALLIB" "$STAGE_ROOT/bin/mlx.metallib"
 chmod +x "$STAGE_ROOT/bin/fastmlx-serve" "$STAGE_ROOT/bin/fastmlx-capacity"
 
 # The `fastmlx` tooling: a thin Python dispatcher (fastmlx.py) plus the sibling modules it loads
-# by file path (pull/launch/recommend/the HF downloader). All five must stay siblings in the same
-# directory -- fastmlx_launch.py loads fastmlx_pull.py, fastmlx_recommend.py loads
-# fastmlx_launch.py, and fastmlx_pull.py loads hf_pinned_snapshot_download.py, each resolving the
-# sibling path relative to its own __file__.
-for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_recommend hf_pinned_snapshot_download; do
+# by file path (pull/launch/recommend/the HF downloader/the two fit sizers). All seven must stay
+# siblings in the same directory -- fastmlx_launch.py loads fastmlx_pull.py, fastmlx_recommend.py
+# loads fastmlx_launch.py, fastmlx_pull.py loads hf_pinned_snapshot_download.py, and
+# fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py (via importlib, resolving
+# Path(__file__).resolve().parent), each resolving the sibling path relative to its own __file__.
+for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_recommend hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
   cp -f "$REPO_ROOT/scripts/${name}.py" "$STAGE_ROOT/libexec/scripts/${name}.py"
 done
+# The two fit sizers are exec'd directly (fastmlx_launch.py's --fit-check-bin), unlike the other
+# five tooling modules above which are only ever invoked via `python3 <path>` -- so, unlike them,
+# these two need their executable bit set explicitly rather than relying on cp to preserve it.
+chmod 0755 "$STAGE_ROOT/libexec/scripts/fastmlx_gguf_fit.py" "$STAGE_ROOT/libexec/scripts/fastmlx_safetensors_fit.py"
 # fastmlx_launch.py's REPO_ROOT resolves one parent up from its own scripts/ dir, so its default
 # quality-cards path lands on <that parent>/site/quality-guides.json -- libexec/site here, mirroring
 # this repository's own scripts/ + site/ layout.
@@ -307,6 +312,8 @@ class Fastmlx < Formula
     (libexec/"scripts").install "scripts/fastmlx_launch.py"
     (libexec/"scripts").install "scripts/fastmlx_recommend.py"
     (libexec/"scripts").install "scripts/hf_pinned_snapshot_download.py"
+    (libexec/"scripts").install "scripts/fastmlx_gguf_fit.py"
+    (libexec/"scripts").install "scripts/fastmlx_safetensors_fit.py"
     (libexec/"site").install "site/quality-guides.json"
 
     (bin/"fastmlx").write <<~EOS

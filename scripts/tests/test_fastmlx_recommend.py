@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import stat
 import sys
 import tempfile
@@ -9,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from scripts.tests.test_fastmlx_launch import (
+    CAPTURING_FIT_CHECK_BODY,
+    GREEN_ATTESTATION_WITH_RESIDENCY_BODY,
     SYNTHETIC_CARD_ID,
     SYNTHETIC_CARD_REPO,
     SYNTHETIC_CARD_REVISION,
@@ -584,6 +587,118 @@ class FastmlxRecommendTestCase(unittest.TestCase):
             [row["status"] for row in doc["rows"]], ["does-not-fit", "error"]
         )
 
+    # ------------------------------------------------------------------
+    # `--engine-profile`: recommend reuses the profile's own `fitCheck`
+    # exactly like `fastmlx serve` does (CLI `--fit-check-bin` still wins).
+    # ------------------------------------------------------------------
+    def _write_fit_check_profile(self, fit_check: dict, name: str = "served-engine") -> Path:
+        profile_path = self.root / "fit-check-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": name,
+                    "argv": ["{engine_bin}"],
+                    "fitCheck": fit_check,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return profile_path
+
+    def test_recommend_honors_engine_profile_fit_check(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        capture_path = self.root / "captured-fit-argv.json"
+        capturing_bin = write_script(self.root / "fit-capture.py", CAPTURING_FIT_CHECK_BODY)
+        profile_path = self._write_fit_check_profile(
+            {"bin": str(capturing_bin.resolve()), "args": ["--kv-reserve-gib", "8"]}
+        )
+        os.environ["FIT_CHECK_CAPTURE_PATH"] = str(capture_path)
+        try:
+            argv = [
+                "recommend",
+                "--quality-cards",
+                str(self.manifest_path),
+                "--model-path",
+                str(model_dir),
+                "--engine-profile",
+                str(profile_path),
+                "--json",
+            ]
+            code, stdout, _ = self.run_main(argv)
+        finally:
+            del os.environ["FIT_CHECK_CAPTURE_PATH"]
+        doc = json.loads(stdout)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["rows"][0]["status"], "recommended")
+        captured_argv = json.loads(capture_path.read_text(encoding="utf-8"))
+        self.assertEqual(captured_argv[0], str(capturing_bin.resolve()))
+        self.assertIn("--kv-reserve-gib", captured_argv)
+
+    def test_recommend_cli_fit_check_bin_overrides_profile_fit_check(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:safetensors", "args": ["--kv-reserve-gib", "8"]}
+        )
+        argv = [
+            "recommend",
+            "--quality-cards",
+            str(self.manifest_path),
+            "--model-path",
+            str(model_dir),
+            "--engine-profile",
+            str(profile_path),
+            "--fit-check-bin",
+            str(self.green_fit_bin),
+            "--json",
+        ]
+        code, stdout, stderr = self.run_main(argv)
+        doc = json.loads(stdout)
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["rows"][0]["status"], "recommended")
+
+    def test_recommend_malformed_engine_profile_exits_3_with_reason(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        profile_path = self.root / "bad-profile.json"
+        profile_path.write_text(
+            json.dumps({"schema": "fastmlx-engine-profile-v1", "name": "x"}),
+            encoding="utf-8",
+        )
+        argv = [
+            "recommend",
+            "--quality-cards",
+            str(self.manifest_path),
+            "--model-path",
+            str(model_dir),
+            "--engine-profile",
+            str(profile_path),
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("argv", stderr)
+
+    # ------------------------------------------------------------------
+    # No-identity hint: recommend prints the same one-line hint `fastmlx
+    # serve` does, prefixed for recommend, when a pack has no resolvable
+    # identity at all (no pull receipt, no revision).
+    # ------------------------------------------------------------------
+    def test_recommend_prints_no_identity_hint_when_pack_has_no_identity(self):
+        model_dir = self.root / "no-identity-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        argv = self.base_argv([model_dir])
+        _, _, stderr = self.run_main(argv)
+        self.assertIn("fastmlx recommend:", stderr)
+        self.assertIn("no model identity", stderr)
+        # recommend walks many candidates, so each hint must say which one.
+        self.assertIn(f"fastmlx recommend: {model_dir}: no model identity", stderr)
+
+    def test_recommend_no_identity_hint_absent_when_identity_resolves(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        argv = self.base_argv([model_dir])
+        _, _, stderr = self.run_main(argv)
+        self.assertNotIn("no model identity", stderr)
+
 
 class RecommendResidencyTestCase(unittest.TestCase):
     """Residency-aware card matching (fast-mlx-quality-card-v1's
@@ -686,6 +801,99 @@ class RecommendResidencyTestCase(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("resident", stderr)
         self.assertIn("expert-stream", stderr)
+        # Fix #3: names the actual source of the conflict.
+        self.assertIn("--fit-check-arg", stderr)
+        self.assertNotIn("engine profile", stderr.lower())
+
+    def test_fit_check_arg_residency_mismatch_from_profile_names_profile_as_source(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        profile_path = self.root / "fit-check-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "served-engine",
+                    "argv": ["{engine_bin}"],
+                    "fitCheck": {
+                        "bin": "builtin:gguf",
+                        "args": ["--residency", "expert-stream"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+                "--engine-profile": str(profile_path),
+                "--fit-check-bin": None,
+            },
+        )
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+        self.assertIn("engine profile", stderr.lower())
+        self.assertIn("fitcheck.args", stderr.lower())
+
+    def test_fit_check_arg_residency_mismatch_scans_every_occurrence(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+            },
+        ) + [
+            "--fit-check-arg=--residency",
+            "--fit-check-arg=resident",
+            "--fit-check-arg=--residency=expert-stream",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+
+    def test_fit_check_arg_residency_mismatch_via_abbreviation_is_refused(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+            },
+        ) + ["--fit-check-arg=--resid=expert-stream"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("expert-stream", stderr)
+
+    # ------------------------------------------------------------------
+    # Fix #2(b): a GREEN attestation's own residency= field must agree
+    # with the requested --residency; a row whose attestation disagrees
+    # must never come out recommended/green.
+    # ------------------------------------------------------------------
+    def test_attestation_residency_mismatch_row_is_an_error_not_recommended(self):
+        model_dir = self.make_model_dir("pass-model", repo=SYNTHETIC_CARD_REPO)
+        mismatched_bin = write_script(
+            self.root / "fit-residency-mismatch.py",
+            GREEN_ATTESTATION_WITH_RESIDENCY_BODY("expert-stream"),
+        )
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+                "--fit-check-bin": str(mismatched_bin),
+            },
+        )
+        code, doc, stderr = self.run_json(argv)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("resident", row["message"])
+        self.assertIn("expert-stream", row["message"])
+        self.assertNotEqual(code, 0)
 
 
 class RankingHelperTests(unittest.TestCase):

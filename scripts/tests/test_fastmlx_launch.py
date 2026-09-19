@@ -178,6 +178,25 @@ sys.stderr.write("fit refused: requested context exceeds the computed ceiling\\n
 sys.exit(2)
 """
 
+
+def GREEN_ATTESTATION_WITH_RESIDENCY_BODY(residency: str) -> str:
+    """A GREEN fit-check stub whose attestation line carries its own
+    ``residency=`` field (both real sizers do this) -- used to exercise the
+    attestation-residency-mismatch fail-closed check.
+    """
+    return f"""#!{sys.executable}
+import sys
+print(
+    "fit_check_only=complete weights_loaded=false route=scalar "
+    "model=stub max_context_tokens=4096 memory_limit_bytes=1000 "
+    "cache_limit_bytes=100 fit_check=green fit_binding=none "
+    "weights_measured=True wired_limit_measured=True fit_estimate_measured=True "
+    "fit_quant_bits=none fit_served_context=4096 fit_context_ceiling=4096 "
+    "fit_context_capped=False residency={residency}"
+)
+sys.exit(0)
+"""
+
 UNKNOWN_EXIT_FIT_CHECK_BODY = f"""#!{sys.executable}
 import sys
 sys.stderr.write("unexpected crash\\n")
@@ -198,6 +217,31 @@ import sys
 capture_path = os.environ["FAKE_ENGINE_CAPTURE_PATH"]
 with open(capture_path, "w", encoding="utf-8") as handle:
     json.dump(sys.argv, handle)
+sys.exit(0)
+"""
+
+# A fit-check stub that captures its own argv (to the path named by
+# FIT_CHECK_CAPTURE_PATH) before emitting the same GREEN attestation line
+# GREEN_FIT_CHECK_BODY does -- used to verify exactly which binary and argv
+# an engine profile's `fitCheck` produced, without needing the real
+# fastmlx_safetensors_fit.py/fastmlx_gguf_fit.py sizers to succeed against a
+# fixture model directory that carries no real weights.
+CAPTURING_FIT_CHECK_BODY = f"""#!{sys.executable}
+import json
+import os
+import sys
+
+capture_path = os.environ["FIT_CHECK_CAPTURE_PATH"]
+with open(capture_path, "w", encoding="utf-8") as handle:
+    json.dump(sys.argv, handle)
+print(
+    "fit_check_only=complete weights_loaded=false route=scalar "
+    "model=stub max_context_tokens=4096 memory_limit_bytes=1000 "
+    "cache_limit_bytes=100 fit_check=green fit_binding=none "
+    "weights_measured=True wired_limit_measured=True fit_estimate_measured=True "
+    "fit_quant_bits=none fit_served_context=4096 fit_context_ceiling=4096 "
+    "fit_context_capped=False"
+)
 sys.exit(0)
 """
 
@@ -701,6 +745,353 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertIn("fastmlx-engine-profile-v1", stderr)
 
     # ------------------------------------------------------------------
+    # Engine profile `fitCheck`: an optional pointer to the sizer this
+    # profile's own engine needs, resolved either from a `builtin:` name
+    # (a sibling of fastmlx_launch.py) or an absolute path.
+    # ------------------------------------------------------------------
+    def _write_fit_check_profile(self, fit_check: dict, name: str = "served-engine") -> Path:
+        profile_path = self.root / "fit-check-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": name,
+                    "argv": list(FASTMLX_LAUNCH.BUILT_IN_ENGINE_PROFILE["argv"]),
+                    "fitCheck": fit_check,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return profile_path
+
+    def test_builtin_safetensors_fit_check_resolves_to_sibling_and_runs_profile_args_before_cli_args(
+        self,
+    ):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:safetensors", "args": ["--kv-reserve-gib", "8"]}
+        )
+        captured: dict = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=(
+                    "fit_check_only=complete fit_check=green "
+                    "fit_context_ceiling=4096 fit_served_context=4096"
+                ),
+                stderr="",
+            )
+
+        argv = self.base_args(
+            **{
+                "--engine-profile": str(profile_path),
+                "--fit-check-bin": None,
+                "--context": "2048",
+            }
+        ) + ["--fit-check-arg=--mmap-side-file", "--dry-run"]
+        with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        expected_bin = str(
+            (LAUNCH_PATH.parent / "fastmlx_safetensors_fit.py").resolve()
+        )
+        self.assertEqual(captured["argv"][0], expected_bin)
+        # Profile args come before the CLI's own --fit-check-arg.
+        self.assertEqual(
+            captured["argv"][-3:], ["--kv-reserve-gib", "8", "--mmap-side-file"]
+        )
+
+    def test_cli_fit_check_bin_overrides_profile_fit_check_and_drops_profile_args(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:safetensors", "args": ["--kv-reserve-gib", "8"]}
+        )
+        capture_path = self.root / "captured-fit-argv.json"
+        capturing_bin = write_script(self.root / "fit-capture.py", CAPTURING_FIT_CHECK_BODY)
+        os.environ["FIT_CHECK_CAPTURE_PATH"] = str(capture_path)
+        try:
+            argv = self.base_args(
+                **{
+                    "--engine-profile": str(profile_path),
+                    "--fit-check-bin": str(capturing_bin),
+                    "--context": "2048",
+                }
+            ) + ["--dry-run"]
+            code, stdout, stderr = self.run_main(argv)
+        finally:
+            del os.environ["FIT_CHECK_CAPTURE_PATH"]
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("overrides", stderr)
+        self.assertIn("served-engine", stderr)
+        captured_argv = json.loads(capture_path.read_text(encoding="utf-8"))
+        self.assertNotIn("--kv-reserve-gib", captured_argv)
+
+    def test_env_fit_check_bin_overrides_profile_fit_check_and_drops_profile_args(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:safetensors", "args": ["--kv-reserve-gib", "8"]}
+        )
+        capture_path = self.root / "captured-fit-argv.json"
+        capturing_bin = write_script(self.root / "fit-capture.py", CAPTURING_FIT_CHECK_BODY)
+        env_patch = {"FASTMLX_FIT_CHECK_BIN": str(capturing_bin), "FIT_CHECK_CAPTURE_PATH": str(capture_path)}
+        argv = self.base_args(
+            **{
+                "--engine-profile": str(profile_path),
+                "--fit-check-bin": None,
+                "--context": "2048",
+            }
+        ) + ["--dry-run"]
+        with patch.dict(os.environ, env_patch):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("overrides", stderr)
+        captured_argv = json.loads(capture_path.read_text(encoding="utf-8"))
+        self.assertNotIn("--kv-reserve-gib", captured_argv)
+
+    def test_fit_check_unknown_builtin_name_is_refused(self):
+        profile_path = self._write_fit_check_profile({"bin": "builtin:bogus"})
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("builtin:bogus", stderr)
+        self.assertIn("unknown", stderr.lower())
+
+    def test_fit_check_relative_path_bin_is_refused(self):
+        profile_path = self._write_fit_check_profile({"bin": "relative/fit.py"})
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("relative/fit.py", stderr)
+        self.assertIn("absolute", stderr.lower())
+
+    def test_fit_check_reserved_arg_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--model"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--model", stderr)
+
+    def test_fit_check_unknown_key_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "bogusKey": True}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("bogusKey", stderr)
+
+    def test_fit_check_empty_arg_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": [""]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("empty", stderr.lower())
+
+    def test_fit_check_reserved_arg_with_equals_form_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--context=1024"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--context=1024", stderr)
+        self.assertIn("--context", stderr)
+
+    def test_fit_check_reserved_arg_host_use_with_equals_form_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--host-use=dedicated-serving"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--host-use", stderr)
+
+    def test_fit_check_reserved_arg_abbreviation_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--cont", "1024"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--cont", stderr)
+        self.assertIn("--context", stderr)
+
+    def test_fit_check_reserved_arg_model_path_abbreviation_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--model-p", "/x"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--model-p", stderr)
+        self.assertIn("--model-path", stderr)
+
+    def test_fit_check_reserved_arg_host_use_abbreviation_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--host", "dedicated-serving"]}
+        )
+        argv = self.base_args(
+            **{"--engine-profile": str(profile_path), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("--host", stderr)
+        self.assertIn("--host-use", stderr)
+
+    def test_fit_check_arg_residency_conflict_from_profile_args_is_refused(self):
+        profile_path = self._write_fit_check_profile(
+            {"bin": "builtin:gguf", "args": ["--residency", "expert-stream"]}
+        )
+        argv = self.base_args(
+            **{
+                "--engine-profile": str(profile_path),
+                "--fit-check-bin": None,
+                "--context": "2048",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+        # Fix #3: the refusal must name the ACTUAL source of the conflicting
+        # value (the engine profile's own fitCheck.args), never blame
+        # --fit-check-arg for a conflict that came from the profile.
+        self.assertIn("engine profile", stderr.lower())
+        self.assertIn("fitcheck.args", stderr.lower())
+
+    def test_fit_check_arg_residency_conflict_from_cli_names_cli_as_source(self):
+        argv = self.base_args(
+            **{
+                "--residency": "resident",
+                "--fit-check-arg": "--residency=expert-stream",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--fit-check-arg", stderr)
+        self.assertNotIn("engine profile", stderr.lower())
+
+    def test_fit_check_arg_residency_conflict_scans_every_occurrence_not_just_first(self):
+        # A first occurrence that agrees, followed by a later conflicting
+        # one, must still be caught -- the old guard only checked the first.
+        # "=" form throughout on purpose: a bare "--fit-check-arg VALUE"
+        # pair makes argparse treat a VALUE that itself starts with "--" as
+        # a new option rather than this flag's argument.
+        argv = self.base_args(**{"--residency": "resident"}) + [
+            "--fit-check-arg=--residency",
+            "--fit-check-arg=resident",
+            "--fit-check-arg=--residency=expert-stream",
+            "--dry-run",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+
+    def test_fit_check_arg_residency_conflict_via_abbreviation_is_refused(self):
+        # "=" form on purpose: a bare "--fit-check-arg VALUE" pair makes
+        # argparse treat a VALUE that itself starts with "--" as a new
+        # option rather than this flag's argument.
+        argv = self.base_args(**{"--residency": "resident"}) + [
+            "--fit-check-arg=--resid=expert-stream",
+            "--dry-run",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--resid=expert-stream", stderr)
+        self.assertIn("expert-stream", stderr)
+
+    def test_fit_check_arg_residency_short_abbreviation_is_not_treated_as_residency(self):
+        # "--res" (5 chars) is deliberately the shortest abbreviation this
+        # guard recognizes; a 4-char-or-shorter prefix like "--re" must NOT
+        # be misread as a residency assertion at all.
+        argv = self.base_args(**{"--residency": "resident"}) + [
+            "--fit-check-arg=--re",
+            "--dry-run",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+
+    # ------------------------------------------------------------------
+    # Fix #2(b): a GREEN attestation's own residency= field must agree
+    # with the launch's own --residency; a mismatch fails closed, even
+    # under --force.
+    # ------------------------------------------------------------------
+    def test_attestation_residency_mismatch_is_refused(self):
+        mismatched_bin = write_script(
+            self.root / "fit-residency-mismatch.py",
+            GREEN_ATTESTATION_WITH_RESIDENCY_BODY("expert-stream"),
+        )
+        argv = self.base_args(
+            **{"--fit-check-bin": str(mismatched_bin), "--residency": "resident", "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+
+    def test_attestation_residency_mismatch_not_overridable_by_force(self):
+        # --force only overrides a RED verdict; a mismatched-residency
+        # attestation is a distinct, unconditional refusal.
+        mismatched_bin = write_script(
+            self.root / "fit-residency-mismatch-force.py",
+            GREEN_ATTESTATION_WITH_RESIDENCY_BODY("expert-stream"),
+        )
+        argv = self.base_args(
+            **{
+                "--fit-check-bin": str(mismatched_bin),
+                "--residency": "resident",
+                "--context": "2048",
+                "--force": "",
+            }
+        )
+        argv = [a for a in argv if a != ""] + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+
+    def test_attestation_matching_residency_admits(self):
+        matching_bin = write_script(
+            self.root / "fit-residency-match.py",
+            GREEN_ATTESTATION_WITH_RESIDENCY_BODY("resident"),
+        )
+        argv = self.base_args(
+            **{"--fit-check-bin": str(matching_bin), "--residency": "resident", "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+
+    def test_attestation_without_residency_field_is_not_checked(self):
+        # GREEN_FIT_CHECK_BODY prints no residency= field at all -- absence
+        # must never be treated as a mismatch.
+        argv = self.base_args(**{"--residency": "resident", "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+
+    # ------------------------------------------------------------------
     # `--` passthrough args are appended to the exec'd argv.
     # ------------------------------------------------------------------
     def test_passthrough_args_after_double_dash_are_appended(self):
@@ -1021,6 +1412,45 @@ class GgufFitCheckCallSiteTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("fit_check=RED", stderr)
         self.assertIn("exceeds ceiling", stderr)
+
+    def test_engine_profile_builtin_gguf_resolves_to_sibling_and_runs(self):
+        # SUCCESS path: an engine profile naming fitCheck.bin="builtin:gguf"
+        # (no --fit-check-bin at all) resolves to the real, SIBLING
+        # fastmlx_gguf_fit.py and actually runs it against a real GGUF pack.
+        profile_path = self.root / "gguf-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "gguf-served-engine",
+                    "argv": list(FASTMLX_LAUNCH.BUILT_IN_ENGINE_PROFILE["argv"]),
+                    "fitCheck": {"bin": "builtin:gguf"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        argv = [
+            "serve",
+            "--model-path", str(self.gguf_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--engine-bin", str(self.fake_engine_bin),
+            "--engine-profile", str(profile_path),
+            "--fit-check-arg=--kv-reserve-gib",
+            "--fit-check-arg=0",
+            "--fit-check-arg=--wired-limit-mib",
+            "--fit-check-arg=16384",
+            "--context", "2048",
+            "--dry-run",
+        ]
+        with patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.splitlines()[-1])
+        self.assertEqual(plan["fit"]["fields"].get("fit"), "green")
+        expected_bin = str(
+            (LAUNCH_PATH.parent / "fastmlx_gguf_fit.py").resolve()
+        )
+        self.assertTrue(GGUF_FIT_CHECK_PATH.samefile(expected_bin))
 
 
 # ---------------------------------------------------------------------

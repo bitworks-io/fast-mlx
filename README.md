@@ -258,6 +258,53 @@ python3 scripts/fastmlx.py serve --model-path ./models/some-mlx-pack --context 2
   --engine-profile <your engine profile>
 ```
 
+An engine profile can name that sizer itself instead of making every invocation repeat
+`--fit-check-bin`/`--fit-check-arg`: its optional `fitCheck` object carries `bin` (either of the
+symbolic names `builtin:safetensors`/`builtin:gguf`, resolved to this repository's own sizer
+scripts, or an absolute path to a sizer of your own) and an optional `args` list applied before any
+`--fit-check-arg` the invocation itself adds. For example, a profile fronting the served engine with
+the safetensors sizer and its own KV reserve and n-gram side file:
+
+```json
+{
+  "schema": "fastmlx-engine-profile-v1",
+  "name": "the-served-engine",
+  "argv": ["{engine_bin}", "--model", "{model_id}", "--model-path", "{model_path}",
+           "--host", "{host}", "--port", "{port}", "--context", "{context}"],
+  "fitCheck": {
+    "bin": "builtin:safetensors",
+    "args": ["--kv-reserve-gib", "8", "--mmap-side-file", "ngram_table.bin"]
+  }
+}
+```
+
+```sh
+python3 scripts/fastmlx.py serve --model-path ./models/some-mlx-pack --context 262144 \
+  --engine-profile served-engine-profile.json
+```
+
+Precedence when more than one source names a fit-check binary: `--fit-check-bin` (the invocation's
+own flag) beats `FASTMLX_FIT_CHECK_BIN` (environment) beats the profile's own `fitCheck.bin` beats
+the built-in engine. Overriding a profile's `fitCheck.bin` from the CLI or the environment also drops
+that profile's `fitCheck.args` (they are sized for the profile's own sizer, not whatever overrode
+it), and one stderr line names the override so it is never silent. `fastmlx recommend` accepts the
+same `--engine-profile` flag and reuses only its `fitCheck` (it never execs an engine), so a single
+profile document is the one place a pack's own sizer and args need to be declared for both commands.
+`fastmlx recommend` does NOT read `FASTMLX_FIT_CHECK_BIN`: with that environment variable set,
+`fastmlx serve` and `fastmlx recommend` can end up sizing with different binaries unless both are
+also given the same explicit `--fit-check-bin`.
+
+A sizer's own args are never automatically residency-aware: an engine profile's `fitCheck.args`
+sizes whatever residency it names (or resident, if none), regardless of the launch's own
+`--residency`. So a `--residency expert-stream` launch against a profile whose `fitCheck` names no
+residency sizes resident memory use, not streaming — pass `--fit-check-arg --residency
+--fit-check-arg expert-stream` on that invocation to size the residency actually being launched.
+Both sizers attest their own `residency=` in the GREEN output line; if that attested value ever
+disagrees with the launch's own `--residency` (from a fit-check-arg conflict, a profile's own
+`fitCheck.args`, or any other source), `fastmlx serve` refuses (exit 3, not overridable by
+`--force`) and `fastmlx recommend` reports that candidate as an error row rather than
+recommending it.
+
 ### Install a prebuilt release (v0.1.0)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its

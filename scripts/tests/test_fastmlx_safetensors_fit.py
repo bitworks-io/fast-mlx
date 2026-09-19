@@ -588,6 +588,17 @@ class ArgparseUsageErrorExitCodeTests(unittest.TestCase):
     def test_missing_model_path_exits_64(self):
         self._assert_usage_exit(["--kv-reserve-gib", "0"])
 
+    def test_abbreviated_flag_is_a_usage_error(self):
+        # allow_abbrev=False, inherited from the shared
+        # _GGUF._UsageErrorArgumentParser (defense in depth for the
+        # reserved-fit-check-arg guard in fastmlx_launch.py): an abbreviated
+        # flag like --kv-res must be refused as unrecognized, never silently
+        # resolved to --kv-reserve-gib the way argparse's default
+        # abbreviation-matching would.
+        self._assert_usage_exit(
+            ["--model-path", "/does-not-matter", "--kv-res", "8"]
+        )
+
 
 class MalformedInputTests(unittest.TestCase):
     """Bad-input scenarios must never exit 0 or 2, and must never print

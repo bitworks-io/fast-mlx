@@ -93,6 +93,29 @@ ALLOWED_ENGINE_PROFILE_PLACEHOLDERS = {
 RESIDENCIES = ("resident", "expert-stream")
 ALLOWED_RESIDENCY_ARGS_KEYS = {"expert-stream"}
 
+# An engine profile's OPTIONAL `fitCheck` object names the sizer this
+# profile's own engine needs -- see `_validate_fit_check` for the full
+# validation rule. `bin` is either one of these two symbolic names
+# (resolved to a sibling of this file, so it works both in the repo and in
+# a release tarball's libexec/scripts) or an absolute path.
+_BUILTIN_FIT_CHECK_FILENAMES = {
+    "builtin:safetensors": "fastmlx_safetensors_fit.py",
+    "builtin:gguf": "fastmlx_gguf_fit.py",
+}
+ALLOWED_FIT_CHECK_KEYS = {"bin", "args"}
+
+# The flags `run_fit_check` itself always supplies; a profile's own
+# `fitCheck.args` must never repeat one of these, since the launcher -- not
+# the profile -- owns the model identity/host/context this fit check runs
+# against.
+RESERVED_FIT_CHECK_ARGS = {
+    "--fit-check-only",
+    "--model",
+    "--model-path",
+    "--host-use",
+    "--context",
+}
+
 BUILT_IN_ENGINE_PROFILE = {
     "schema": "fastmlx-engine-profile-v1",
     "name": _BUILT_IN_ENGINE_BINARY_NAME,
@@ -501,21 +524,140 @@ def _validate_residency_args(document: dict, path: str) -> dict:
     return validated
 
 
+def _resolve_fit_check_bin_value(bin_value: str, path: str) -> str:
+    """Resolve a `fitCheck.bin` value to an argv[0] string.
+
+    A `builtin:` name resolves to the named sizer script SIBLING of this
+    file (`Path(__file__).resolve().parent`), so it resolves correctly both
+    in this repository and inside a release tarball's `libexec/scripts`.
+    Any other `builtin:` name is refused. A non-`builtin:` value must be an
+    absolute path -- a relative path would resolve differently depending on
+    the operator's current working directory, which this launcher never
+    depends on for any other input.
+    """
+    if bin_value in _BUILTIN_FIT_CHECK_FILENAMES:
+        return str(Path(__file__).resolve().parent / _BUILTIN_FIT_CHECK_FILENAMES[bin_value])
+    if bin_value.startswith("builtin:"):
+        known = ", ".join(sorted(_BUILTIN_FIT_CHECK_FILENAMES))
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} fitCheck.bin names unknown builtin "
+            f"{bin_value!r}; known builtins are: {known}",
+        )
+    if not Path(bin_value).is_absolute():
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} fitCheck.bin {bin_value!r} must be an "
+            "absolute path or one of the 'builtin:' names",
+        )
+    return bin_value
+
+
+def _reserved_fit_check_arg_collision(args: list) -> Optional[tuple]:
+    """The first ``args`` entry that collides with one of
+    ``RESERVED_FIT_CHECK_ARGS``, and the specific reserved flag it collides
+    with -- or ``None`` if no entry collides.
+
+    An item collides when its flag name (``item.split("=", 1)[0]``, so
+    ``--context=1024`` is checked the same as ``--context 1024``) either
+    equals a reserved flag exactly, OR is a strict prefix of a reserved
+    flag with more than 2 characters (``--cont`` is a prefix of
+    ``--context``; ``--h`` is too short to count). The sizers this
+    launcher exec's build their argument parsers with
+    ``argparse.ArgumentParser`` (abbreviations enabled by default until
+    ``allow_abbrev=False`` is set -- also done as defense in depth), so an
+    abbreviated flag in a profile's own ``fitCheck.args`` resolves to
+    whichever reserved flag it uniquely prefixes just as surely as the
+    exact spelling would, and must be refused the same way: this launcher,
+    not the profile, owns the model identity/host/context a fit check runs
+    against.
+    """
+    for item in args:
+        if not item.startswith("--"):
+            continue
+        name = item.split("=", 1)[0]
+        if name in RESERVED_FIT_CHECK_ARGS:
+            return item, name
+        if len(name) > 2:
+            for reserved in RESERVED_FIT_CHECK_ARGS:
+                if reserved != name and reserved.startswith(name):
+                    return item, reserved
+    return None
+
+
+def _validate_fit_check(document: dict, path: str) -> Optional[dict]:
+    """Validate the OPTIONAL `fitCheck` key of an engine profile.
+
+    Returns ``None`` when the key is absent (the built-in profile always
+    carries no ``fitCheck``: this is a launcher-owned distinction, never a
+    heuristic against a document that merely omits the key by accident).
+    Returns ``{"bin": <resolved argv[0]>, "args": [...]}`` otherwise --
+    ``args`` defaults to ``[]``. Refuses on any unrecognized shape: a
+    non-object ``fitCheck``, an unknown key inside it, a non-string/empty
+    ``bin``, an unresolvable ``bin`` (see ``_resolve_fit_check_bin_value``),
+    a non-list/non-string/empty ``args``, or an ``args`` entry that
+    duplicates a flag this launcher itself always supplies
+    (``RESERVED_FIT_CHECK_ARGS``) -- a malformed ``fitCheck`` must never
+    silently fall back to running the wrong sizer or a mis-shaped argv.
+    """
+    if "fitCheck" not in document:
+        return None
+    raw = document["fitCheck"]
+    if not isinstance(raw, dict):
+        raise LaunchRefusal(3, f"engine profile at {path} fitCheck must be an object")
+    extra_keys = sorted(set(raw) - ALLOWED_FIT_CHECK_KEYS)
+    if extra_keys:
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} fitCheck has unknown key(s) {extra_keys}; "
+            "the only allowed keys are 'bin' and 'args'",
+        )
+    bin_value = raw.get("bin")
+    if not isinstance(bin_value, str) or not bin_value:
+        raise LaunchRefusal(
+            3, f"engine profile at {path} fitCheck.bin must be a non-empty string"
+        )
+    resolved_bin = _resolve_fit_check_bin_value(bin_value, path)
+    args = raw.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(item, str) and item for item in args):
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} fitCheck.args must be a list of non-empty "
+            "strings",
+        )
+    collision = _reserved_fit_check_arg_collision(args)
+    if collision is not None:
+        item, reserved = collision
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} fitCheck.args contains {item!r}, which "
+            f"collides with the reserved flag {reserved!r} this launcher "
+            "itself always supplies (either the exact flag or an argparse "
+            "abbreviation of it that the sizer's own argument parser would "
+            "resolve to it)",
+        )
+    return {"bin": resolved_bin, "args": list(args)}
+
+
 def load_engine_profile(path: Optional[str]) -> tuple:
     """Load and validate an engine profile.
 
     Returns ``(profile, is_built_in)``. ``path`` of ``None`` selects the
-    built-in profile (which carries no ``residencyArgs``: it cannot stream).
-    Refuses (``LaunchRefusal(3, ...)``) on a missing/unreadable/malformed
-    file, a schema mismatch, an argv element using any ``{...}`` placeholder
-    outside the allowed set, or an invalid ``residencyArgs`` -- a malformed
-    profile must never silently drop or mis-render a token in the exec'd
-    command line. The returned profile dict always carries a
-    ``residencyArgs`` key (an empty dict when the profile declares none).
+    built-in profile (which carries no ``residencyArgs``: it cannot stream,
+    and no ``fitCheck``: it names no sizer of its own). Refuses
+    (``LaunchRefusal(3, ...)``) on a missing/unreadable/malformed file, a
+    schema mismatch, an argv element using any ``{...}`` placeholder outside
+    the allowed set, an invalid ``residencyArgs``, or an invalid
+    ``fitCheck`` -- a malformed profile must never silently drop or
+    mis-render a token in the exec'd command line, or run the wrong sizer.
+    The returned profile dict always carries a ``residencyArgs`` key (an
+    empty dict when the profile declares none) and a ``fitCheck`` key
+    (``None`` when the profile declares none).
     """
     if path is None:
         profile = dict(BUILT_IN_ENGINE_PROFILE)
         profile["residencyArgs"] = {}
+        profile["fitCheck"] = None
         return profile, True
 
     try:
@@ -550,7 +692,11 @@ def load_engine_profile(path: Optional[str]) -> tuple:
                     f"placeholder {token}; allowed placeholders are: {allowed}",
                 )
     residency_args = _validate_residency_args(document, path)
-    return {"name": name, "argv": argv, "residencyArgs": residency_args}, False
+    fit_check = _validate_fit_check(document, path)
+    return (
+        {"name": name, "argv": argv, "residencyArgs": residency_args, "fitCheck": fit_check},
+        False,
+    )
 
 
 def _substitute_placeholders(item: str, substitutions: dict) -> str:
@@ -570,22 +716,87 @@ def _resolve_executable(value: str) -> Optional[str]:
     return shutil.which(value)
 
 
-def _residency_in_fit_check_args(fit_check_args: list) -> Optional[str]:
-    """The value ``--residency`` names inside a caller-supplied list of
-    fit-check args (``--residency VALUE`` or ``--residency=VALUE``), or
-    ``None`` if the flag is absent or has no value -- used to catch a
-    fit-check-arg residency that disagrees with the launch's own
-    ``--residency`` before the fit check runs. This never adds
-    ``--residency`` to the fit-check argv itself: the fit-check protocol is
-    shared with a Swift binary that does not accept it.
+_RESIDENCY_FLAG = "--residency"
+# The shortest argparse abbreviation of --residency this guard treats as a
+# residency assertion. Chosen conservatively (5 chars: "--res") so the
+# guard reads unambiguously as "residency" to an operator and does not
+# fire on some unrelated, shorter --res*-prefixed flag a future sizer
+# might add.
+_RESIDENCY_ABBREV_MIN_LEN = 5
+
+
+def _is_residency_flag_name(name: str) -> bool:
+    """Whether ``name`` (a fit-check-arg token's flag part, before any
+    ``=value``) is ``--residency`` itself or a qualifying argparse
+    abbreviation of it -- see ``_RESIDENCY_ABBREV_MIN_LEN``.
     """
-    for index, token in enumerate(fit_check_args):
-        if token == "--residency":
-            if index + 1 < len(fit_check_args):
-                return fit_check_args[index + 1]
-            return None
-        if token.startswith("--residency="):
-            return token.partition("=")[2]
+    return name == _RESIDENCY_FLAG or (
+        len(name) >= _RESIDENCY_ABBREV_MIN_LEN and _RESIDENCY_FLAG.startswith(name)
+    )
+
+
+def _residency_assertions_in_fit_check_args(fit_check_args: list) -> list:
+    """Every ``--residency`` (or qualifying abbreviation) assertion inside a
+    caller-supplied list of fit-check args, across ALL occurrences -- not
+    just the first -- as a list of ``(item, value)`` tuples in argv order.
+    ``value`` is ``None`` when the flag carries no following value (its
+    last argv element). Both ``--residency VALUE`` and ``--residency=VALUE``
+    forms are recognized, matching what the sizers' own
+    ``argparse.ArgumentParser`` (abbreviations enabled) would resolve. This
+    never adds ``--residency`` to the fit-check argv itself: the fit-check
+    protocol is shared with a Swift binary that does not accept it.
+    """
+    assertions: list = []
+    index = 0
+    while index < len(fit_check_args):
+        token = fit_check_args[index]
+        if token.startswith("--"):
+            name, sep, inline_value = token.partition("=")
+            if _is_residency_flag_name(name):
+                if sep:
+                    assertions.append((token, inline_value))
+                elif index + 1 < len(fit_check_args):
+                    assertions.append((token, fit_check_args[index + 1]))
+                    index += 1
+                else:
+                    assertions.append((token, None))
+        index += 1
+    return assertions
+
+
+def _residency_conflict_in_fit_check_args(
+    fit_check_args: list, residency: str
+) -> Optional[tuple]:
+    """The first ``(item, value)`` residency assertion in ``fit_check_args``
+    whose value is missing or differs from ``residency`` (the launch's own
+    value), or ``None`` if every assertion agrees (including the "no
+    assertion at all" case).
+    """
+    for item, value in _residency_assertions_in_fit_check_args(fit_check_args):
+        if value != residency:
+            return item, value
+    return None
+
+
+def _residency_conflict_source_and_value(
+    profile_args: list, cli_args: list, residency: str
+) -> Optional[tuple]:
+    """Refuse-worthy residency disagreement between EITHER arg source and
+    ``residency``, attributed to its actual source -- an engine profile's
+    own ``fitCheck.args`` or the CLI/env's ``--fit-check-arg`` -- so the
+    refusal message never blames one source for a conflict that came from
+    the other. Checked as two independent scans over the two lists
+    separately (never the concatenated list), specifically so attribution
+    is correct. Returns ``(source_label, item, value)`` or ``None``.
+    """
+    for source_label, arg_list in (
+        ("the engine profile's fitCheck.args", profile_args),
+        ("--fit-check-arg", cli_args),
+    ):
+        conflict = _residency_conflict_in_fit_check_args(arg_list, residency)
+        if conflict is not None:
+            item, value = conflict
+            return source_label, item, value
     return None
 
 
@@ -643,6 +854,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     serve.add_argument("--engine-bin", default=None)
     serve.add_argument("--dry-run", action="store_true")
     return parser
+
+
+# The one-line hint printed (to stderr) whenever a model pack resolves no
+# identity at all (no sibling pull receipt, no --model-revision): shared
+# verbatim by `fastmlx serve` and `fastmlx recommend` (which prefixes it
+# with its own program name) so the two front doors can never drift on this
+# wording.
+NO_MODEL_IDENTITY_HINT = (
+    "no model identity (no pull receipt, no --model-revision); no quality "
+    "card was consulted -- run 'fastmlx pull <repo>@<revision> --dest <dir> "
+    "--adopt' to pin a hand-staged pack"
+)
+
+
+def print_no_model_identity_hint(prefix: str, subject: Optional[str] = None) -> None:
+    # ``subject`` names the pack when one invocation may print several hints.
+    lead = f"{prefix}: {subject}" if subject is not None else prefix
+    print(f"{lead}: {NO_MODEL_IDENTITY_HINT}", file=sys.stderr)
 
 
 def _load_pull_receipt(model_path: Path) -> Optional[dict]:
@@ -757,11 +986,36 @@ def _run_serve(args, passthrough_args: list) -> int:
                 )
 
     # --- fit-check ---------------------------------------------------
-    fit_check_bin = (
-        args.fit_check_bin
-        or os.environ.get("FASTMLX_FIT_CHECK_BIN")
-        or shutil.which(_BUILT_IN_ENGINE_BINARY_NAME)
-    )
+    # Precedence: --fit-check-bin (CLI) > FASTMLX_FIT_CHECK_BIN (env) >
+    # the engine profile's own fitCheck.bin > the built-in engine. An
+    # override from the CLI or the environment drops the profile's
+    # fitCheck.args entirely -- those args are sized for the profile's own
+    # sizer, never for whatever binary overrode it -- and is announced on
+    # stderr so an operator does not wonder why a profile's fitCheck.args
+    # were silently ignored.
+    profile_fit_check = profile.get("fitCheck")
+    cli_or_env_fit_check_bin = args.fit_check_bin or os.environ.get("FASTMLX_FIT_CHECK_BIN")
+    profile_fit_check_args: list = []
+    cli_fit_check_args = list(args.fit_check_arg)
+    if cli_or_env_fit_check_bin:
+        fit_check_bin = cli_or_env_fit_check_bin
+        fit_check_extra_args = list(cli_fit_check_args)
+        if profile_fit_check is not None:
+            override_source = "--fit-check-bin" if args.fit_check_bin else "FASTMLX_FIT_CHECK_BIN"
+            print(
+                f"fastmlx serve: {override_source} overrides engine profile "
+                f"{profile['name']!r}'s own fitCheck; its fitCheck.args are not "
+                "applied",
+                file=sys.stderr,
+            )
+    elif profile_fit_check is not None:
+        fit_check_bin = profile_fit_check["bin"]
+        profile_fit_check_args = list(profile_fit_check["args"])
+        fit_check_extra_args = profile_fit_check_args + cli_fit_check_args
+    else:
+        fit_check_bin = shutil.which(_BUILT_IN_ENGINE_BINARY_NAME)
+        fit_check_extra_args = list(cli_fit_check_args)
+
     if not fit_check_bin:
         raise LaunchRefusal(
             3,
@@ -769,16 +1023,24 @@ def _run_serve(args, passthrough_args: list) -> int:
             "FASTMLX_FIT_CHECK_BIN",
         )
 
-    # A --fit-check-arg that itself names a conflicting --residency is
-    # refused before the fit check runs; --residency is never auto-added to
-    # the fit-check args (the fit-check protocol is shared with a Swift
-    # binary that does not accept it).
-    fit_check_arg_residency = _residency_in_fit_check_args(args.fit_check_arg)
-    if fit_check_arg_residency is not None and fit_check_arg_residency != residency:
+    # A fit-check-arg (either the engine profile's own fitCheck.args, or a
+    # CLI/env --fit-check-arg) that itself names a conflicting --residency
+    # is refused before the fit check runs; each source is scanned
+    # separately so the refusal names its actual origin. Every occurrence
+    # (not just the first) and every argparse abbreviation of --residency
+    # are checked -- see _residency_conflict_source_and_value. --residency
+    # is never auto-added to the fit-check args (the fit-check protocol is
+    # shared with a Swift binary that does not accept it).
+    residency_conflict = _residency_conflict_source_and_value(
+        profile_fit_check_args, cli_fit_check_args, residency
+    )
+    if residency_conflict is not None:
+        source_label, item, value = residency_conflict
+        value_desc = "no value" if value is None else repr(value)
         raise LaunchRefusal(
             2,
-            f"--fit-check-arg specifies --residency {fit_check_arg_residency!r}, "
-            f"which differs from the launch's own --residency {residency!r}",
+            f"{source_label} specifies {item!r} ({value_desc}), which differs "
+            f"from the launch's own --residency {residency!r}",
         )
 
     fit_result = run_fit_check(
@@ -787,7 +1049,7 @@ def _run_serve(args, passthrough_args: list) -> int:
         model_path=model_path,
         host_use=args.host_use,
         context=args.context,
-        extra_args=args.fit_check_arg,
+        extra_args=fit_check_extra_args,
     )
 
     if fit_result.kind == "error":
@@ -807,6 +1069,24 @@ def _run_serve(args, passthrough_args: list) -> int:
         fit_fields = fit_result.fields
         # An exit-0 verdict may be green or yellow; report the binary's own word.
         fit_label = str(fit_fields.get("fit_check", "green")).upper()
+
+    # A GREEN attestation carrying its own residency= field must agree with
+    # the launch's own --residency: both sizers print this field, and a
+    # sizer that sized the wrong residency (e.g. because a fit-check-arg
+    # conflict slipped past the guard above, or because an operator's
+    # fitCheck.args hard-codes one) must never be treated as having
+    # attested to THIS launch's configuration. Fail-closed and never
+    # overridable by --force -- unlike the RED path above, this check runs
+    # unconditionally after a GREEN/YELLOW verdict. A binary that omits the
+    # field (e.g. the Swift built-in binary) is not checked.
+    attested_residency = fit_fields.get("residency")
+    if attested_residency is not None and attested_residency != residency:
+        raise LaunchRefusal(
+            3,
+            f"fit check attested residency={attested_residency!r}, which "
+            f"differs from the launch's own --residency {residency!r}; "
+            "refusing (not overridable by --force)",
+        )
 
     context = args.context
     if context is None:
@@ -889,13 +1169,7 @@ def _run_serve(args, passthrough_args: list) -> int:
         # silently falls through to admit_unmeasured otherwise. Made
         # visible here; the admission OUTCOME is unchanged either way.
         if model_repo is None and model_revision is None:
-            print(
-                "fastmlx serve: no model identity (no pull receipt, no "
-                "--model-revision); no quality card was consulted -- run "
-                "'fastmlx pull <repo>@<revision> --dest <dir> --adopt' to "
-                "pin a hand-staged pack",
-                file=sys.stderr,
-            )
+            print_no_model_identity_hint("fastmlx serve")
         card = resolve_card(cards, model_repo, model_revision, residency=residency)
 
     opt_in_ids = set(args.accept_quality)

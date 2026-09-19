@@ -733,7 +733,21 @@ _EXIT_USAGE_ERROR = 64
 
 class _UsageErrorArgumentParser(argparse.ArgumentParser):
     """Same as ``argparse.ArgumentParser``, except a usage error exits 64
-    (EX_USAGE) instead of argparse's default of 2."""
+    (EX_USAGE) instead of argparse's default of 2, and flag abbreviations
+    are disabled (``allow_abbrev=False``). Abbreviations are disabled as
+    defense in depth: fastmlx_launch.py's own reserved-fit-check-arg guard
+    already refuses a profile's fitCheck.args that could resolve as an
+    abbreviation of a launcher-owned flag, but a caller-supplied
+    --fit-check-arg is not guarded the same way, and a sizer that silently
+    accepted ``--cont 1024`` as ``--context 1024`` (last-wins) could size a
+    different context/host-use/pack than the one it attested to. Both
+    fastmlx_gguf_fit.py and fastmlx_safetensors_fit.py (which reuses this
+    class) get this for free.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
 
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
