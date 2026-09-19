@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 991,
-    "pathModeSha256": "0c2565bc65dbd83c8f123b5a8544ffb5fa36402b56b04a2141b20a1fee1d6983"
+    "pathCount": 993,
+    "pathModeSha256": "0c2056fcc60c8e545d158926dac34ddcfa74cd38ddb1a39af619ad1aeb7b6c3d"
   },
   "files": [
     {
@@ -92,6 +92,14 @@
     {
       "source": "scripts/package-release.sh",
       "destination": "scripts/package-release.sh"
+    },
+    {
+      "source": "examples/engine-profiles/served-engine-safetensors.json",
+      "destination": "examples/engine-profiles/served-engine-safetensors.json"
+    },
+    {
+      "source": "examples/engine-profiles/served-engine-safetensors-ngram.json",
+      "destination": "examples/engine-profiles/served-engine-safetensors-ngram.json"
     },
     {
       "source": "scripts/run_projected_test_suites.py",

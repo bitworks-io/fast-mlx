@@ -201,6 +201,27 @@ def _parse_attestation_fields(line: str) -> dict:
     return fields
 
 
+_STDERR_TAIL_MAX_LINES = 5
+_STDERR_TAIL_MAX_CHARS = 800
+
+
+def _bounded_stderr_tail(stderr: Optional[str]) -> str:
+    """The last few non-empty lines of a sizer's stderr, capped in length --
+    included in the "fit check could not run" detail below so an operator
+    sees WHY a sizer exited unexpectedly (e.g. a required side file the
+    profile named is missing) instead of only its exit code. Bounded on
+    both line count and character count so a runaway or binary-garbage
+    stderr can never blow up a refusal message or a recommend error row.
+    """
+    if not stderr:
+        return ""
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    tail = "\n".join(lines[-_STDERR_TAIL_MAX_LINES:])
+    if len(tail) > _STDERR_TAIL_MAX_CHARS:
+        tail = tail[-_STDERR_TAIL_MAX_CHARS:]
+    return tail
+
+
 def run_fit_check(
     fit_check_bin: str,
     model_id: str,
@@ -255,13 +276,14 @@ def run_fit_check(
         return FitCheckResult("green", fields=_parse_attestation_fields(line))
     if proc.returncode == 2:
         return FitCheckResult("red", stderr=proc.stderr or "")
-    return FitCheckResult(
-        "error",
-        detail=(
-            f"fit check exited {proc.returncode} (expected 0 for a passing verdict "
-            "or 2 for a red verdict)"
-        ),
+    detail = (
+        f"fit check exited {proc.returncode} (expected 0 for a passing verdict "
+        "or 2 for a red verdict)"
     )
+    tail = _bounded_stderr_tail(proc.stderr)
+    if tail:
+        detail += f": {tail}"
+    return FitCheckResult("error", detail=detail)
 
 
 # ---------------------------------------------------------------------

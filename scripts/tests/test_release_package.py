@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -36,6 +38,13 @@ _TOOLING_SCRIPT_NAMES = (
 _EXECUTABLE_SIZER_NAMES = (
     "fastmlx_gguf_fit.py",
     "fastmlx_safetensors_fit.py",
+)
+
+# Public-safe example --engine-profile documents package-release.sh stages into
+# share/fastmlx/engine-profiles (mode 0644, never executable -- these are JSON, not scripts).
+_ENGINE_PROFILE_EXAMPLE_NAMES = (
+    "served-engine-safetensors.json",
+    "served-engine-safetensors-ngram.json",
 )
 
 # Forbidden internal-deployment strings: package-release.sh is generic product-release tooling
@@ -128,6 +137,19 @@ def _populate_release_tree(root: Path) -> None:
     (root / "site" / "quality-guides.json").write_bytes(
         (REPOSITORY_ROOT / "site" / "quality-guides.json").read_bytes()
     )
+
+    (root / "examples" / "engine-profiles").mkdir(parents=True, exist_ok=True)
+    for name in _ENGINE_PROFILE_EXAMPLE_NAMES:
+        dst = root / "examples" / "engine-profiles" / name
+        dst.write_bytes((REPOSITORY_ROOT / "examples" / "engine-profiles" / name).read_bytes())
+        # Deliberately wrong mode (0600, not 0644) in the fixture source tree, the same
+        # discriminating-mode trick used for the sizers above: package-release.sh itself must
+        # set 0644 during staging (see its `chmod 0644` on these files). Writing the fixture
+        # pre-chmod'd to 0644 would make a staged-mode test pass even if that chmod line were
+        # ever removed -- this mode proves the SCRIPT does the chmod, not that `cp` merely
+        # preserved a source mode that already happened to be 0644.
+        dst.chmod(0o600)
+
     (root / "LICENSE").write_text("fixture license\n", encoding="utf-8")
     (root / "NOTICE").write_text("fixture notice\n", encoding="utf-8")
     (root / "README.md").write_text("fixture readme\n", encoding="utf-8")
@@ -265,6 +287,8 @@ class ReleasePackageTests(unittest.TestCase):
                     "libexec/scripts/fastmlx_gguf_fit.py",
                     "libexec/scripts/fastmlx_safetensors_fit.py",
                     "libexec/site/quality-guides.json",
+                    "share/fastmlx/engine-profiles/served-engine-safetensors.json",
+                    "share/fastmlx/engine-profiles/served-engine-safetensors-ngram.json",
                     "LICENSE",
                     "NOTICE",
                     "README.md",
@@ -377,6 +401,28 @@ class ReleasePackageTests(unittest.TestCase):
                         "package-release.sh's own chmod, not an inherited source bit",
                     )
 
+    def test_no_engine_profile_examples_fails_loudly(self) -> None:
+        # Acceptance: package-release.sh must refuse (non-zero exit, named reason) rather than
+        # silently ship an empty engine-profiles dir if the source examples are missing.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            shutil.rmtree(fixture_root / "examples" / "engine-profiles")
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            result = self.run_package_script(
+                stage_dir,
+                out_dir,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("engine profile examples", result.stderr)
+
     def test_staged_safetensors_fit_help_runs_from_libexec_scripts(self) -> None:
         # Acceptance: fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py by sibling path
         # (importlib, Path(__file__).resolve().parent), so both must land in the same
@@ -407,6 +453,115 @@ class ReleasePackageTests(unittest.TestCase):
                 [str(staged_sizer), "--help"], capture_output=True, text=True
             )
             self.assertEqual(help_result.returncode, 0, help_result.stderr)
+
+    def test_engine_profile_examples_staged_byte_identical_mode_0644(self) -> None:
+        # Acceptance: the two public-safe example engine profiles land under
+        # share/fastmlx/engine-profiles in the tarball, byte-identical to their repo sources, and
+        # non-executable (JSON, not a script) mode 0644. Stages from a fixture source tree whose
+        # example files are committed mode 0600 (see _populate_release_tree), so a passing 0644
+        # in the tarball can only be explained by package-release.sh's own `chmod 0644` -- staging
+        # from this repo's own checkout (where the files are typically already 0644 via git mode
+        # 100644) would let this test pass even if that chmod line were deleted.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+            for name in _ENGINE_PROFILE_EXAMPLE_NAMES:
+                source_mode = (fixture_root / "examples" / "engine-profiles" / name).stat().st_mode
+                self.assertNotEqual(
+                    source_mode & 0o777,
+                    0o644,
+                    f"fixture source {name} must not already be mode 0644 for this test to be "
+                    "discriminating",
+                )
+
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(
+                stage_dir,
+                out_dir,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+            )
+            tarball, _ = self._tarball_paths(out_dir)
+
+            with tarfile.open(tarball, "r:gz") as tar:
+                for name in _ENGINE_PROFILE_EXAMPLE_NAMES:
+                    member = tar.getmember(
+                        f"fastmlx-testver-arm64-macos/share/fastmlx/engine-profiles/{name}"
+                    )
+                    self.assertEqual(
+                        member.mode & 0o777,
+                        0o644,
+                        f"{name} must be staged mode 0644 (mode={oct(member.mode)}), even "
+                        "though the fixture source tree it was staged from is not -- proves "
+                        "package-release.sh's own chmod, not an inherited source mode",
+                    )
+                    extracted = tar.extractfile(member)
+                    assert extracted is not None
+                    staged_bytes = extracted.read()
+                    source_bytes = (
+                        REPOSITORY_ROOT / "examples" / "engine-profiles" / name
+                    ).read_bytes()
+                    self.assertEqual(
+                        staged_bytes,
+                        source_bytes,
+                        f"{name} must be staged byte-identical to its repo source",
+                    )
+
+    def test_staged_engine_profile_loads_through_staged_launcher_with_builtin_sizer_resolved_to_staged_sizer(
+        self,
+    ) -> None:
+        # Acceptance: an example profile taken from the STAGED tree loads through the STAGED
+        # fastmlx_launch.py (not this repo's own copy), and `builtin:safetensors` resolves to the
+        # STAGED libexec/scripts/fastmlx_safetensors_fit.py -- proving the tarball is internally
+        # self-consistent, not merely that the repo's own copies happen to work together.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(stage_dir, out_dir)
+            tarball, _ = self._tarball_paths(out_dir)
+
+            extract_dir = root / "extracted"
+            extract_dir.mkdir()
+            with tarfile.open(tarball, "r:gz") as tar:
+                tar.extractall(extract_dir, filter="data")
+
+            top = extract_dir / "fastmlx-testver-arm64-macos"
+            staged_launcher = top / "libexec" / "scripts" / "fastmlx_launch.py"
+            staged_sizer = top / "libexec" / "scripts" / "fastmlx_safetensors_fit.py"
+            staged_profile = (
+                top / "share" / "fastmlx" / "engine-profiles" / "served-engine-safetensors-ngram.json"
+            )
+            self.assertTrue(staged_launcher.is_file())
+            self.assertTrue(staged_sizer.is_file())
+            self.assertTrue(staged_profile.is_file())
+
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import importlib.util, json, sys\n"
+                        "spec = importlib.util.spec_from_file_location('fastmlx_launch', sys.argv[1])\n"
+                        "module = importlib.util.module_from_spec(spec)\n"
+                        "spec.loader.exec_module(module)\n"
+                        "profile, is_built_in = module.load_engine_profile(sys.argv[2])\n"
+                        "print(json.dumps({'is_built_in': is_built_in, "
+                        "'fit_check_bin': profile['fitCheck']['bin']}))\n"
+                    ),
+                    str(staged_launcher),
+                    str(staged_profile),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            result = json.loads(probe.stdout.strip())
+            self.assertFalse(result["is_built_in"])
+            self.assertEqual(result["fit_check_bin"], str(staged_sizer.resolve()))
 
     def test_summary_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -584,6 +739,81 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn('"scripts/fastmlx_gguf_fit.py"', body)
             self.assertIn('"scripts/fastmlx_safetensors_fit.py"', body)
             self.assertIn('(libexec/"site").install "site/quality-guides.json"', body)
+
+    def test_formula_installs_the_engine_profile_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            formula_path = root / "fastmlx.rb"
+            self.run_package_script(
+                stage_dir, out_dir, emit_formula=formula_path
+            )
+
+            body = formula_path.read_text(encoding="utf-8")
+            self.assertIn(
+                '(pkgshare/"engine-profiles").install '
+                '"examples/engine-profiles/served-engine-safetensors.json"',
+                body,
+            )
+            self.assertIn(
+                '(pkgshare/"engine-profiles").install '
+                '"examples/engine-profiles/served-engine-safetensors-ngram.json"',
+                body,
+            )
+
+    def test_formula_engine_profile_installs_are_generated_from_the_staged_set_not_hard_coded(
+        self,
+    ) -> None:
+        # Acceptance: the Formula's pkgshare installs must come from the SAME set the tarball
+        # actually stages under share/fastmlx/engine-profiles, not a separately hand-written
+        # list. Proven with a THREE-file fixture (the real repo only ever ships two): a
+        # hard-coded two-line Formula generator would either omit the third file or -- if it
+        # named the third file literally -- pass by coincidence rather than by construction. This
+        # fixture makes both failure modes visible by asserting exact set equality with the
+        # tarball's own staged set.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            third_profile = json.loads(
+                (
+                    fixture_root / "examples" / "engine-profiles" / "served-engine-safetensors.json"
+                ).read_text(encoding="utf-8")
+            )
+            third_profile["name"] = "served-engine-safetensors-third-fixture"
+            (fixture_root / "examples" / "engine-profiles" / "served-engine-safetensors-third.json").write_text(
+                json.dumps(third_profile), encoding="utf-8"
+            )
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            formula_path = root / "fastmlx.rb"
+            self.run_package_script(
+                stage_dir,
+                out_dir,
+                emit_formula=formula_path,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+            )
+            tarball, _ = self._tarball_paths(out_dir)
+
+            with tarfile.open(tarball, "r:gz") as tar:
+                staged_names = {
+                    Path(m.name).name
+                    for m in tar.getmembers()
+                    if m.isfile()
+                    and m.name.startswith("fastmlx-testver-arm64-macos/share/fastmlx/engine-profiles/")
+                }
+
+            body = formula_path.read_text(encoding="utf-8")
+            formula_names = set(
+                re.findall(r'\(pkgshare/"engine-profiles"\)\.install "examples/engine-profiles/([^"]+)"', body)
+            )
+
+            self.assertEqual(len(staged_names), 3, staged_names)
+            self.assertEqual(formula_names, staged_names)
 
     def test_formula_wrapper_execs_the_python_dispatcher_and_extends_path(
         self,

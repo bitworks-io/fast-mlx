@@ -203,6 +203,18 @@ sys.stderr.write("unexpected crash\\n")
 sys.exit(1)
 """
 
+# A distinctive stderr reason an unrunnable sizer might print (e.g. the
+# ngram-table sizer refusing a pack that has no ngram_table.bin) -- used to
+# verify the refusal/error-row detail surfaces the sizer's OWN reason, not
+# just its exit code.
+DISTINCTIVE_UNRUNNABLE_REASON = "distinctive-reason: pack is missing ngram_table.bin"
+
+DISTINCTIVE_REASON_FIT_CHECK_BODY = f"""#!{sys.executable}
+import sys
+sys.stderr.write({DISTINCTIVE_UNRUNNABLE_REASON!r} + "\\n")
+sys.exit(1)
+"""
+
 NO_ATTESTATION_FIT_CHECK_BODY = f"""#!{sys.executable}
 import sys
 print("some_other_line=true")
@@ -263,6 +275,9 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.red_fit_bin = write_script(self.root / "fit-red.py", RED_FIT_CHECK_BODY)
         self.unknown_fit_bin = write_script(
             self.root / "fit-unknown.py", UNKNOWN_EXIT_FIT_CHECK_BODY
+        )
+        self.distinctive_reason_fit_bin = write_script(
+            self.root / "fit-distinctive-reason.py", DISTINCTIVE_REASON_FIT_CHECK_BODY
         )
         self.no_attestation_fit_bin = write_script(
             self.root / "fit-no-attestation.py", NO_ATTESTATION_FIT_CHECK_BODY
@@ -458,6 +473,18 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         code, _, stderr = self.run_main(argv)
         self.assertEqual(code, 3)
         self.assertIn("fit check could not run", stderr)
+
+    def test_unknown_fit_outcome_detail_includes_sizers_own_stderr_reason(self):
+        # A sizer that exits 1 (neither the GREEN 0 nor the RED 2 the fit
+        # check protocol defines) is still fail-closed, but the operator
+        # should see WHY the sizer itself gave up, not only its exit code.
+        argv = self.base_args(
+            **{"--fit-check-bin": str(self.distinctive_reason_fit_bin), "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("fit check could not run", stderr)
+        self.assertIn(DISTINCTIVE_UNRUNNABLE_REASON, stderr)
 
     def test_green_exit_without_attestation_line_is_an_unknown_fit_outcome(self):
         argv = self.base_args(
@@ -1759,6 +1786,142 @@ class ResidencyTestCase(unittest.TestCase):
                 cards, "example/BogusModel", None, residency="expert-stream"
             )
         )
+
+
+REPO_ROOT = LAUNCH_PATH.parents[1]
+EXAMPLE_ENGINE_PROFILES_DIR = REPO_ROOT / "examples" / "engine-profiles"
+README_PATH = REPO_ROOT / "README.md"
+
+# The exact set of example profiles this repo ships. A glob-count assertion below pins this to
+# exactly these two files, so the loader test cannot pass vacuously on an empty/missing directory.
+EXPECTED_EXAMPLE_ENGINE_PROFILE_NAMES = (
+    "served-engine-safetensors-ngram.json",
+    "served-engine-safetensors.json",
+)
+
+# Hard public-safety rule: no shipped example may name a specific served engine product, a
+# private host, or a machine-local path. Each marker is assembled by concatenation, never written
+# as a literal: this test file is itself projected, and a literal would trip the public
+# validator's own private-marker scan (the same convention as validate_public_repository.py).
+_FORBIDDEN_PUBLIC_SAFETY_SUBSTRINGS = (
+    "mlx" + "-serve",
+    "om" + "lx",
+    "MTP" + "LX",
+    "192" + ".168.",
+    "llm" + "bench",
+    "/" + "Users/",
+)
+
+
+def _find_readme_engine_profile_json_block(readme_text: str) -> dict:
+    """Return the parsed JSON of the README's engine-profile example fence -- the one whose body
+    contains a `"schema": "fastmlx-engine-profile-v1"` key, not any other fenced ```json block."""
+    import re
+
+    for match in re.finditer(r"```json\n(.*?)\n```", readme_text, re.DOTALL):
+        block = match.group(1)
+        if '"schema": "fastmlx-engine-profile-v1"' in block:
+            return json.loads(block)
+    raise AssertionError(
+        "README.md has no fenced ```json block containing "
+        '"schema": "fastmlx-engine-profile-v1"'
+    )
+
+
+class EngineProfileExampleFilesTests(unittest.TestCase):
+    """Acceptance: the public-safe example engine profiles this repo ships under
+    examples/engine-profiles/ load through the REAL load_engine_profile(), name the real sizer,
+    stay in sync with the README's own worked example, and carry no forbidden internal-engine or
+    machine-local string."""
+
+    def test_example_profiles_load_and_glob_finds_exactly_the_two_expected_files(self):
+        paths = sorted(EXAMPLE_ENGINE_PROFILES_DIR.glob("*.json"))
+        names = tuple(path.name for path in paths)
+        # Pinning the exact expected set (not just a count) means this test cannot pass
+        # vacuously on an empty directory, and fails loudly if a file is renamed or an extra one
+        # is added without updating this test.
+        self.assertEqual(names, EXPECTED_EXAMPLE_ENGINE_PROFILE_NAMES)
+
+        expected_sizer = str((LAUNCH_PATH.parent / "fastmlx_safetensors_fit.py").resolve())
+        for path in paths:
+            profile, is_built_in = FASTMLX_LAUNCH.load_engine_profile(str(path))
+            self.assertFalse(is_built_in, f"{path.name} must not resolve to the built-in profile")
+            self.assertIsNotNone(profile["fitCheck"], f"{path.name} must declare a fitCheck")
+            self.assertEqual(
+                profile["fitCheck"]["bin"],
+                expected_sizer,
+                f"{path.name} fitCheck.bin must resolve to this repo's real safetensors sizer",
+            )
+            self.assertIn(
+                "{model_path}", profile["argv"], f"{path.name} argv must place the model path"
+            )
+            self.assertIn(
+                "{context}", profile["argv"], f"{path.name} argv must place the context"
+            )
+
+    def test_readme_worked_example_equals_the_ngram_example_file(self):
+        # The README text says "This exact file ships as ...ngram.json" -- so the WHOLE parsed
+        # document (schema, name, argv, fitCheck) must match, not just argv; a drift in `name` or
+        # `fitCheck` would make that sentence false while an argv-only check stayed green.
+        readme_doc = _find_readme_engine_profile_json_block(
+            README_PATH.read_text(encoding="utf-8")
+        )
+        ngram_doc = json.loads(
+            (EXAMPLE_ENGINE_PROFILES_DIR / "served-engine-safetensors-ngram.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            readme_doc,
+            ngram_doc,
+            "README's worked engine-profile example has drifted from "
+            "examples/engine-profiles/served-engine-safetensors-ngram.json -- the README claims "
+            '"This exact file ships as..." so the whole document must match, not just its argv',
+        )
+
+    def test_sibling_profile_equals_the_ngram_profile_minus_the_side_file(self):
+        # served-engine-safetensors.json is documented as "identical argv, no --mmap-side-file in
+        # its fitCheck.args" -- pin that relationship structurally (not just by eyeball) so the two
+        # files can never silently diverge in `argv`, `schema`, or the surviving `--kv-reserve-gib`
+        # pair.
+        ngram_doc = json.loads(
+            (EXAMPLE_ENGINE_PROFILES_DIR / "served-engine-safetensors-ngram.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        sibling_doc = json.loads(
+            (EXAMPLE_ENGINE_PROFILES_DIR / "served-engine-safetensors.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        ngram_args = list(ngram_doc["fitCheck"]["args"])
+        side_file_index = ngram_args.index("--mmap-side-file")
+        del ngram_args[side_file_index : side_file_index + 2]
+
+        expected_sibling = dict(ngram_doc)
+        expected_sibling["name"] = sibling_doc["name"]
+        expected_sibling["fitCheck"] = dict(ngram_doc["fitCheck"], args=ngram_args)
+
+        # The exclusions above must actually exclude something real, or this test would pass
+        # vacuously even if the two files were identical.
+        self.assertNotEqual(sibling_doc["name"], ngram_doc["name"])
+        self.assertIn("--mmap-side-file", ngram_doc["fitCheck"]["args"])
+        self.assertNotIn("--mmap-side-file", sibling_doc["fitCheck"]["args"])
+
+        self.assertEqual(sibling_doc, expected_sibling)
+
+    def test_example_profiles_contain_no_forbidden_public_safety_strings(self):
+        paths = sorted(EXAMPLE_ENGINE_PROFILES_DIR.glob("*.json"))
+        self.assertTrue(paths, "expected at least one example engine profile to scan")
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            for forbidden in _FORBIDDEN_PUBLIC_SAFETY_SUBSTRINGS:
+                self.assertNotIn(
+                    forbidden,
+                    text,
+                    f"{path.name} must not contain the forbidden string {forbidden!r}",
+                )
 
 
 if __name__ == "__main__":

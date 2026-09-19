@@ -222,9 +222,18 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # the serving engine and the pack's repository unnamed, references no host, credential, competitor or
 # machine-local path, and describes only fast-mlx's own measured evidence that SSD expert streaming
 # changed greedy output on a third-party serving engine.
+# 2026-09-19, 991 -> 993: adds examples/engine-profiles/served-engine-safetensors.json and
+# examples/engine-profiles/served-engine-safetensors-ngram.json, the public-safe example
+# --engine-profile documents package-release.sh now stages into share/fastmlx/engine-profiles and
+# the generated Formula now installs into pkgshare/engine-profiles. Conscious decision to publish:
+# both files were read in full and contain only the proven-live argv fronting a served engine plus
+# a builtin:safetensors fitCheck, no private host, IP, username, absolute machine-local path,
+# competitor/engine product name, or credential -- the public-safety forbidden-substring set
+# is asserted absent by scripts/tests/test_fastmlx_launch.py's own
+# EngineProfileExampleFilesTests.test_example_profiles_contain_no_forbidden_public_safety_strings.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 991,
-    "pathModeSha256": "0c2565bc65dbd83c8f123b5a8544ffb5fa36402b56b04a2141b20a1fee1d6983",
+    "pathCount": 993,
+    "pathModeSha256": "0c2056fcc60c8e545d158926dac34ddcfa74cd38ddb1a39af619ad1aeb7b6c3d",
 }
 
 

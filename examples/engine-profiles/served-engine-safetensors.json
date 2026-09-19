@@ -1,0 +1,20 @@
+{
+  "schema": "fastmlx-engine-profile-v1",
+  "name": "served-engine-safetensors",
+  "argv": [
+    "{engine_bin}",
+    "--serve",
+    "--model",
+    "{model_path}",
+    "--host",
+    "{host}",
+    "--port",
+    "{port}",
+    "--ctx-size",
+    "{context}"
+  ],
+  "fitCheck": {
+    "bin": "builtin:safetensors",
+    "args": ["--kv-reserve-gib", "8"]
+  }
+}

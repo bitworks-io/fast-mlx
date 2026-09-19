@@ -262,15 +262,25 @@ An engine profile can name that sizer itself instead of making every invocation 
 `--fit-check-bin`/`--fit-check-arg`: its optional `fitCheck` object carries `bin` (either of the
 symbolic names `builtin:safetensors`/`builtin:gguf`, resolved to this repository's own sizer
 scripts, or an absolute path to a sizer of your own) and an optional `args` list applied before any
-`--fit-check-arg` the invocation itself adds. For example, a profile fronting the served engine with
+`--fit-check-arg` the invocation itself adds. For example, a profile fronting a served engine with
 the safetensors sizer and its own KV reserve and n-gram side file:
 
 ```json
 {
   "schema": "fastmlx-engine-profile-v1",
-  "name": "the-served-engine",
-  "argv": ["{engine_bin}", "--model", "{model_id}", "--model-path", "{model_path}",
-           "--host", "{host}", "--port", "{port}", "--context", "{context}"],
+  "name": "served-engine-safetensors-ngram",
+  "argv": [
+    "{engine_bin}",
+    "--serve",
+    "--model",
+    "{model_path}",
+    "--host",
+    "{host}",
+    "--port",
+    "{port}",
+    "--ctx-size",
+    "{context}"
+  ],
   "fitCheck": {
     "bin": "builtin:safetensors",
     "args": ["--kv-reserve-gib", "8", "--mmap-side-file", "ngram_table.bin"]
@@ -278,10 +288,40 @@ the safetensors sizer and its own KV reserve and n-gram side file:
 }
 ```
 
+This exact file ships as `examples/engine-profiles/served-engine-safetensors-ngram.json` in this
+repository and as `share/fastmlx/engine-profiles/served-engine-safetensors-ngram.json` in the
+release tarball. For a pack that carries no memory-mapped n-gram table, use the sibling
+`examples/engine-profiles/served-engine-safetensors.json` (identical `argv`, no
+`--mmap-side-file` in its `fitCheck.args`).
+
+The `8` in this profile's `--kv-reserve-gib 8` is an example value only, not a default that fits
+every deployment: the sizer adds a flat KV-cache reserve on top of resident weight bytes and does
+no context-length scaling, so you must size it yourself for both the pack you are serving and the
+`--context` you actually serve it at. To override it for one invocation without editing the
+profile file, append `--fit-check-arg=--kv-reserve-gib --fit-check-arg=N` to the `serve`/
+`recommend` command line — the invocation's own `--fit-check-arg`s are appended after the
+profile's `fitCheck.args` (see precedence above), and the sizer keeps only the LAST
+`--kv-reserve-gib` value it sees when the flag is repeated, so your override wins. The
+`FASTMLX_GGUF_KV_RESERVE_GIB` environment fallback does not help here: it is consulted only when
+`--kv-reserve-gib` was never passed at all, so it never overrides a profile — like this one — that
+already passes the flag. Under `fastmlx recommend --models-dir` with the ngram profile, a pack
+that carries no `ngram_table.bin` comes back as an `error` row (the sizer refuses that pack
+outright, and the row's message now names the reason); use the sibling
+`served-engine-safetensors.json` profile for packs that carry no such side file.
+
 ```sh
 python3 scripts/fastmlx.py serve --model-path ./models/some-mlx-pack --context 262144 \
-  --engine-profile served-engine-profile.json
+  --engine-profile examples/engine-profiles/served-engine-safetensors-ngram.json \
+  --engine-bin <path to the served engine>
 ```
+
+`--engine-bin` is required whenever `--engine-profile` names anything other than the built-in
+profile, even though this profile's own `argv` already carries an `{engine_bin}` placeholder:
+`fastmlx serve` refuses (exit 3) with "`--engine-bin is required when --engine-profile is not the
+built-in profile`" if it is omitted -- the placeholder only says where in the argv the resolved
+binary goes, it does not supply the binary itself. That refusal fires only after the fit check and
+quality-card admission have both already passed, so a missing `--engine-bin` never masks an
+earlier fit or quality problem with this pack.
 
 Precedence when more than one source names a fit-check binary: `--fit-check-bin` (the invocation's
 own flag) beats `FASTMLX_FIT_CHECK_BIN` (environment) beats the profile's own `fitCheck.bin` beats
@@ -305,16 +345,16 @@ disagrees with the launch's own `--residency` (from a fit-check-arg conflict, a 
 `--force`) and `fastmlx recommend` reports that candidate as an error row rather than
 recommending it.
 
-### Install a prebuilt release (v0.1.0)
+### Install a prebuilt release (v0.1.1)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
 checksum file, verify, then extract:
 
 ```sh
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.0/fastmlx-0.1.0-arm64-macos.tar.gz
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.0/fastmlx-0.1.0-arm64-macos.tar.gz.sha256
-shasum -a 256 -c fastmlx-0.1.0-arm64-macos.tar.gz.sha256
-tar -xzf fastmlx-0.1.0-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.1/fastmlx-0.1.1-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.1/fastmlx-0.1.1-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.1-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.1-arm64-macos.tar.gz
 ```
 
 The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
@@ -322,14 +362,14 @@ nothing further is needed; a browser download does, and macOS will refuse to run
 the tarball until you clear it:
 
 ```sh
-xattr -dr com.apple.quarantine fastmlx-0.1.0-arm64-macos
+xattr -dr com.apple.quarantine fastmlx-0.1.1-arm64-macos
 ```
 
 Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
 it), then run it:
 
 ```sh
-export PATH="$PWD/fastmlx-0.1.0-arm64-macos/bin:$PATH"
+export PATH="$PWD/fastmlx-0.1.1-arm64-macos/bin:$PATH"
 fastmlx --help
 fastmlx capacity --help
 ```

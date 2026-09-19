@@ -173,6 +173,17 @@ sys.stderr.write("unexpected crash\\n")
 sys.exit(1)
 """
 
+# A distinctive stderr reason an unrunnable sizer might print -- used to
+# verify the error row's message surfaces the sizer's OWN reason, not just
+# its exit code (see the sibling fastmlx_launch fail-closed detail test).
+DISTINCTIVE_UNRUNNABLE_REASON = "distinctive-reason: pack is missing ngram_table.bin"
+
+DISTINCTIVE_REASON_FIT_CHECK_BODY = f"""#!{sys.executable}
+import sys
+sys.stderr.write({DISTINCTIVE_UNRUNNABLE_REASON!r} + "\\n")
+sys.exit(1)
+"""
+
 
 class FastmlxRecommendTestCase(unittest.TestCase):
     def setUp(self):
@@ -187,6 +198,9 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.red_fit_bin = write_script(self.root / "fit-red.py", RED_FIT_CHECK_BODY)
         self.unknown_fit_bin = write_script(
             self.root / "fit-unknown.py", UNKNOWN_EXIT_FIT_CHECK_BODY
+        )
+        self.distinctive_reason_fit_bin = write_script(
+            self.root / "fit-distinctive-reason.py", DISTINCTIVE_REASON_FIT_CHECK_BODY
         )
 
     def make_model_dir(self, name: str, repo: str = None, revision: str = None) -> Path:
@@ -332,6 +346,19 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         row = doc["rows"][0]
         self.assertEqual(row["status"], "error")
         self.assertIn("fit check could not run", row["message"])
+
+    def test_unrunnable_fit_check_error_row_includes_sizers_own_stderr_reason(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, doc, _ = self.run_json(
+            self.base_argv(
+                [model_dir], **{"--fit-check-bin": str(self.distinctive_reason_fit_bin)}
+            )
+        )
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("fit check could not run", row["message"])
+        self.assertIn(DISTINCTIVE_UNRUNNABLE_REASON, row["message"])
 
     def test_missing_fit_check_binary_path_is_an_error_row_not_a_crash(self):
         model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
