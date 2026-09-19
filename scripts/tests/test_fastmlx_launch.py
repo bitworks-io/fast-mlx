@@ -975,5 +975,313 @@ class GgufFitCheckCallSiteTests(unittest.TestCase):
         self.assertIn("exceeds ceiling", stderr)
 
 
+# ---------------------------------------------------------------------
+# Residency-aware quality-card matching (fast-mlx-quality-card-v1's
+# config.residency): expert streaming can change greedy output versus the
+# same pack held resident, so a card measured under one residency must
+# never admit a launch of the other. This exercises that rule with an
+# inline synthetic fixture card shaped like a real measured NO_GO
+# expert-stream card -- no real model, repository, or measurement.
+# ---------------------------------------------------------------------
+SYNTHETIC_CARD_ID = "example-moe-q4-stream@m3ultra"
+SYNTHETIC_CARD_REPO = "example-org/example-moe-gguf"
+SYNTHETIC_CARD_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+def expert_stream_card_manifest() -> dict:
+    """A `fast-mlx-quality-card-v1` fixture manifest holding one NO_GO card
+    for the `expert-stream` residency, shaped like a real measured card but
+    with a synthetic model identity and illustrative-only wording."""
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": SYNTHETIC_CARD_ID,
+                "model": {
+                    "family": "Example-MoE",
+                    "repo": SYNTHETIC_CARD_REPO,
+                    "hfPin": SYNTHETIC_CARD_REVISION,
+                },
+                "config": {
+                    "quant": {
+                        "bits": 4,
+                        "groupSize": None,
+                        "mixedBit": True,
+                        "note": "fixture: quantized routed experts",
+                    },
+                    "enhancement": "none",
+                    "hardwareClass": "example-hardware",
+                    "residency": "expert-stream",
+                },
+                "verdict": "NO_GO",
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "fixture: output differed on 3 of 8 prompts versus the same pack held in memory",
+                },
+                "legible": {
+                    "tier": "Unquantified",
+                    "headline": "fixture: expert-stream residency changed greedy output on 3 of 8 prompts versus the same pack held in memory.",
+                    "nextWordDrift": None,
+                    "regressionFocus": "fixture: illustrative regression focus text",
+                    "example": {
+                        "status": "pending",
+                        "prompt": None,
+                        "referenceOutput": None,
+                        "configOutput": None,
+                        "note": "fixture: illustrative placeholder",
+                    },
+                    "benefit": {
+                        "fit": None,
+                        "speedX": 0.5,
+                        "speedXStatus": "fixture: illustrative only, not a measurement",
+                    },
+                },
+                "rawMetrics": {
+                    "greedyDivergentPrompts": "3/8",
+                    "comparedTokens": 100,
+                    "magnitude": "fixture: not collected",
+                },
+                "provenance": {
+                    "source": "fast-mlx-measured",
+                    "vendor": None,
+                    "method": "fixture: synthetic test data, not a real measurement",
+                    "confound": None,
+                    "hardware": "fixture",
+                    "harnessGitSHA": "0000000000000000000000000000000000000000",
+                    "corpusId": "fixture-corpus",
+                    "sourceVerdict": None,
+                    "measuredAt": "2026-01-01T00:00:00Z",
+                },
+                "boundary": {
+                    "scope": "fixture: serving-admission quality signal for expert-stream residency",
+                    "unmeasured": ["fixture: illustrative unmeasured item"],
+                },
+            }
+        ],
+    }
+
+
+def write_expert_stream_card_manifest(root: Path) -> Path:
+    """Write `expert_stream_card_manifest()` to `root` and return its path."""
+    path = root / "quality-cards.json"
+    path.write_text(json.dumps(expert_stream_card_manifest()), encoding="utf-8")
+    return path
+
+
+class ResidencyTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.quality_cards_path = write_expert_stream_card_manifest(self.root)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+        self.streaming_profile_path = self.root / "streaming-profile.json"
+        self.streaming_profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "streaming-engine",
+                    "argv": [
+                        "{engine_bin}",
+                        "--model",
+                        "{model_id}",
+                        "--model-path",
+                        "{model_path}",
+                        "--host",
+                        "{host}",
+                        "--port",
+                        "{port}",
+                        "--context",
+                        "{context}",
+                    ],
+                    "residencyArgs": {"expert-stream": ["--ssd-streaming"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def base_args(self, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.quality_cards_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--engine-profile": str(self.streaming_profile_path),
+            "--model-repo": SYNTHETIC_CARD_REPO,
+            "--model-revision": SYNTHETIC_CARD_REVISION,
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def last_json_line(stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        return json.loads(lines[-1])
+
+    # (i) expert-stream, no opt-in: refused, names the card id and tier.
+    def test_expert_stream_without_opt_in_is_refused(self):
+        argv = self.base_args(**{"--residency": "expert-stream"}) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn(SYNTHETIC_CARD_ID, stderr)
+        self.assertIn("Unquantified", stderr)
+
+    # (ii) expert-stream + opt-in: admits, streaming argv appended, residency recorded.
+    def test_expert_stream_with_opt_in_admits_and_appends_streaming_argv(self):
+        argv = self.base_args(
+            **{"--residency": "expert-stream", "--accept-quality": SYNTHETIC_CARD_ID}
+        ) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_with_quality_flag")
+        self.assertIn("--ssd-streaming", plan["argv"])
+        self.assertEqual(plan["residency"], "expert-stream")
+
+    # (iii) resident: admits unmeasured (the streaming-only card is invisible
+    # to a resident lookup), no streaming argv appended.
+    def test_resident_launch_admits_unmeasured_with_no_card(self):
+        argv = self.base_args(**{"--residency": "resident"}) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = self.last_json_line(stdout)
+        self.assertIsNone(plan["card"])
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertEqual(plan["residency"], "resident")
+        self.assertNotIn("--ssd-streaming", plan["argv"])
+
+    # (iv) resident + a streaming flag as passthrough: refused (the operator
+    # cannot bypass the residency gate this way).
+    def test_resident_launch_with_streaming_passthrough_is_refused(self):
+        argv = self.base_args(**{"--residency": "resident"}) + [
+            "--dry-run",
+            "--",
+            "--ssd-streaming",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--residency expert-stream", stderr)
+
+    # (v) expert-stream with the built-in profile: refused, exit 3 (the
+    # built-in engine cannot stream).
+    def test_expert_stream_with_built_in_profile_is_refused_exit_3(self):
+        argv = self.base_args(
+            **{"--residency": "expert-stream", "--engine-profile": None}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("cannot stream", stderr)
+
+    # (vi) a fit-check-arg residency mismatch is refused.
+    def test_fit_check_arg_residency_mismatch_is_refused(self):
+        argv = self.base_args(
+            **{
+                "--residency": "resident",
+                "--fit-check-arg": "--residency=expert-stream",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+
+    # (vii) a manifest holding a resident PASS card and a streaming NO_GO
+    # card for the SAME repo resolves by residency with no ambiguity error.
+    def test_resident_and_streaming_cards_for_same_repo_resolve_by_residency(self):
+        repo = "example/DualResidencyModel"
+        manifest = {
+            "schema": "fast-mlx-quality-card-v1",
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "cards": [
+                {
+                    "id": "dual-resident@test",
+                    "model": {"repo": repo, "hfPin": "aaaaaaaa"},
+                    "verdict": "PASS",
+                    "config": {"residency": "resident"},
+                    "admission": {
+                        "default": True,
+                        "optIn": False,
+                        "reason": "measured pass",
+                    },
+                    "legible": {"tier": "Reference", "headline": "Resident pass."},
+                },
+                {
+                    "id": "dual-streaming@test",
+                    "model": {"repo": repo, "hfPin": "bbbbbbbb"},
+                    "verdict": "NO_GO",
+                    "config": {"residency": "expert-stream"},
+                    "admission": {
+                        "default": False,
+                        "optIn": True,
+                        "reason": "streaming drift",
+                    },
+                    "legible": {"tier": "Unquantified", "headline": "Streaming drift."},
+                },
+            ],
+        }
+        manifest_path = self.root / "dual-manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        resident_argv = self.base_args(
+            **{
+                "--quality-cards": str(manifest_path),
+                "--model-repo": repo,
+                "--model-revision": None,
+                "--residency": "resident",
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(resident_argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.last_json_line(stdout)["card"]["id"], "dual-resident@test")
+
+        streaming_argv = self.base_args(
+            **{
+                "--quality-cards": str(manifest_path),
+                "--model-repo": repo,
+                "--model-revision": None,
+                "--residency": "expert-stream",
+                "--accept-quality": "dual-streaming@test",
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(streaming_argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.last_json_line(stdout)["card"]["id"], "dual-streaming@test")
+
+    # (viii) a card with an unrecognized residency never matches, at either
+    # launch residency.
+    def test_unrecognized_card_residency_never_matches(self):
+        cards = [{"id": "bogus@test", "model": {"repo": "example/BogusModel"}, "config": {"residency": "bogus"}}]
+        self.assertIsNone(
+            FASTMLX_LAUNCH.resolve_card(cards, "example/BogusModel", None, residency="resident")
+        )
+        self.assertIsNone(
+            FASTMLX_LAUNCH.resolve_card(
+                cards, "example/BogusModel", None, residency="expert-stream"
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

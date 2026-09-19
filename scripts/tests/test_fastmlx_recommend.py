@@ -8,6 +8,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.tests.test_fastmlx_launch import (
+    SYNTHETIC_CARD_ID,
+    SYNTHETIC_CARD_REPO,
+    SYNTHETIC_CARD_REVISION,
+    write_expert_stream_card_manifest,
+)
+
 
 RECOMMEND_PATH = Path(__file__).resolve().parents[1] / "fastmlx_recommend.py"
 _SPEC = importlib.util.spec_from_file_location("fastmlx_recommend", RECOMMEND_PATH)
@@ -576,6 +583,109 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertEqual(
             [row["status"] for row in doc["rows"]], ["does-not-fit", "error"]
         )
+
+
+class RecommendResidencyTestCase(unittest.TestCase):
+    """Residency-aware card matching (fast-mlx-quality-card-v1's
+    config.residency), driven through a synthetic expert-streaming fixture
+    card (see `test_fastmlx_launch.expert_stream_card_manifest`).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.quality_cards_path = write_expert_stream_card_manifest(self.root)
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def make_model_dir(self, name: str, repo: str = None, revision: str = None) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        if repo is not None or revision is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision=revision or ("e" * 40))
+        return model_dir
+
+    def base_argv(self, model_paths, **overrides) -> list:
+        argv = ["recommend"]
+        for path in model_paths:
+            argv += ["--model-path", str(path)]
+        args = {"--fit-check-bin": str(self.green_fit_bin)}
+        args.update(overrides)
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def run_json(self, argv: list):
+        code, stdout, stderr = self.run_main(argv + ["--json"])
+        return code, json.loads(stdout), stderr
+
+    def make_synthetic_card_model_dir(self) -> Path:
+        return self.make_model_dir(
+            "expert-stream-model", repo=SYNTHETIC_CARD_REPO, revision=SYNTHETIC_CARD_REVISION
+        )
+
+    def test_expert_stream_row_for_synthetic_card_is_opt_in(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "expert-stream",
+            },
+        )
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "opt-in")
+        self.assertEqual(row["residency"], "expert-stream")
+        self.assertEqual(row["accept_quality_flag"], f"--accept-quality {SYNTHETIC_CARD_ID}")
+
+        _, stdout, _ = self.run_main(argv)
+        self.assertIn("residency=expert-stream", stdout)
+
+    def test_resident_row_for_synthetic_card_is_uncarded(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+            },
+        )
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "uncarded")
+        self.assertIsNone(row["card"])
+        self.assertEqual(row["residency"], "resident")
+
+        _, stdout, _ = self.run_main(argv)
+        self.assertNotIn("residency=", stdout)
+
+    def test_fit_check_arg_residency_mismatch_is_a_usage_error(self):
+        model_dir = self.make_synthetic_card_model_dir()
+        argv = self.base_argv(
+            [model_dir],
+            **{
+                "--quality-cards": str(self.quality_cards_path),
+                "--residency": "resident",
+                "--fit-check-arg": "--residency=expert-stream",
+            },
+        )
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
 
 
 class RankingHelperTests(unittest.TestCase):

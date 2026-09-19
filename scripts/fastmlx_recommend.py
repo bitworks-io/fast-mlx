@@ -30,6 +30,14 @@ would elect it for ``fastmlx serve``), ``uncarded`` (fits, no usable card),
 not be resolved: bad path, ambiguous card lookup, or the fit check itself
 could not run).
 
+``--residency {resident,expert-stream}`` (default ``resident``) is forwarded
+to ``resolve_card`` exactly like ``fastmlx serve`` uses it: a card only ever
+matches a candidate when the card's own ``config.residency`` equals this
+value (absent/null on a card means ``resident``). Every row also carries
+its resolved ``residency``. A ``--fit-check-arg`` that itself names a
+conflicting ``--residency`` is a usage error, exactly like ``fastmlx
+serve`` refuses one.
+
 Exit codes: ``0`` if at least one row is ``recommended``; ``1`` if none is
 recommended but at least one row is ``opt-in`` or ``uncarded`` (something
 fits, just nothing measured-good); ``2`` on a usage error (no candidates
@@ -158,6 +166,7 @@ def build_row(
     host_use: str,
     context: Optional[int],
     fit_check_args: list,
+    residency: str = "resident",
 ) -> dict:
     """Resolve one candidate to a fully-classified row. Never raises: an
     ambiguous card lookup (``LaunchRefusal`` from ``resolve_card``) or a fit
@@ -171,6 +180,7 @@ def build_row(
         "name": name,
         "repo": None,
         "revision": None,
+        "residency": residency,
         "status": None,
         "fit": None,
         "card": None,
@@ -198,7 +208,7 @@ def build_row(
     row["revision"] = model_revision
 
     try:
-        card = launch.resolve_card(cards, model_repo, model_revision)
+        card = launch.resolve_card(cards, model_repo, model_revision, residency=residency)
     except launch.LaunchRefusal as refusal:
         row["status"] = STATUS_ERROR
         row["message"] = refusal.message
@@ -310,6 +320,9 @@ def _format_row_text(rank: int, row: dict) -> str:
         ctx_part = f" context={ctx}" if ctx is not None else ""
         head.append(f"fit={fit['verdict']}{ctx_part}")
 
+    if row.get("residency") not in (None, "resident"):
+        head.append(f"residency={row['residency']}")
+
     card = row.get("card")
     if card:
         head.append(f"card={card['id']} verdict={card['verdict']} tier={card.get('tier')}")
@@ -353,6 +366,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     recommend.add_argument("--model-path", action="append", default=[], type=Path)
     recommend.add_argument("--models-dir", action="append", default=[], type=Path)
     recommend.add_argument("--quality-cards", default=None)
+    recommend.add_argument(
+        "--residency", default="resident", choices=list(launch.RESIDENCIES)
+    )
     recommend.add_argument("--context", type=int, default=None)
     recommend.add_argument(
         "--host-use", default="shared", choices=["shared", "dedicated-serving"]
@@ -369,6 +385,16 @@ def _run_recommend(args) -> int:
         print(
             "fastmlx recommend: no model candidates found; pass --model-path "
             "and/or --models-dir",
+            file=sys.stderr,
+        )
+        return 2
+
+    fit_check_arg_residency = launch._residency_in_fit_check_args(args.fit_check_arg)
+    if fit_check_arg_residency is not None and fit_check_arg_residency != args.residency:
+        print(
+            f"fastmlx recommend: --fit-check-arg specifies --residency "
+            f"{fit_check_arg_residency!r}, which differs from --residency "
+            f"{args.residency!r}",
             file=sys.stderr,
         )
         return 2
@@ -397,6 +423,7 @@ def _run_recommend(args) -> int:
             host_use=args.host_use,
             context=args.context,
             fit_check_args=args.fit_check_arg,
+            residency=args.residency,
         )
         for candidate in candidates
     ]

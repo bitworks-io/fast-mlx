@@ -30,7 +30,10 @@ CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelve
 QUALITY_GUIDE_SCHEMA = "fast-mlx-quality-card-v1"
 QUALITY_VERDICTS = {"NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"}
 QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
-QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant"}
+QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant", "Unquantified"}
+QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
+QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
+QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
 QUALITY_CARD_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+)*")
 QUALITY_GUIDE_PUBLIC_FILE = "quality/index.html"
@@ -4646,10 +4649,24 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                     failures.append(f"{label} model.{key} must be a non-empty string or null")
 
         config = card.get("config")
-        failures.extend(
-            key_failures(config, {"quant", "enhancement", "hardwareClass"}, f"{label} config")
-        )
-        if isinstance(config, dict):
+        if not isinstance(config, dict):
+            failures.append(f"{label} config is not an object")
+        else:
+            config_keys = set(config)
+            if not (
+                QUALITY_CARD_CONFIG_REQUIRED_KEYS <= config_keys <= QUALITY_CARD_CONFIG_ALLOWED_KEYS
+            ):
+                missing = sorted(QUALITY_CARD_CONFIG_REQUIRED_KEYS - config_keys)
+                extra = sorted(config_keys - QUALITY_CARD_CONFIG_ALLOWED_KEYS)
+                failures.append(
+                    f"{label} config keys differ from schema; missing={missing} extra={extra}"
+                )
+            # `residency` is OPTIONAL; absence means "resident". When present it must be
+            # one of the two recognized residencies.
+            if "residency" in config and config.get("residency") not in QUALITY_CARD_RESIDENCIES:
+                failures.append(
+                    f"{label} config.residency has unknown value {config.get('residency')!r}"
+                )
             raw_quant = config.get("quant")
             if raw_quant is not None:
                 failures.extend(
@@ -4735,6 +4752,25 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                         failures.append(
                             f"{label} legible.nextWordDrift.top1AgreementPct is not a number"
                         )
+
+            # "Unquantified" means the output differs from the reference but the size of
+            # that difference was never measured: it may ONLY pair with a NO_GO card whose
+            # nextWordDrift is null, and conversely a NO_GO/PASS card with a null
+            # nextWordDrift must be tiered Unquantified.
+            if tier == "Unquantified":
+                if verdict != "NO_GO":
+                    failures.append(
+                        f"{label} legible has tier Unquantified but verdict is not NO_GO"
+                    )
+                if raw_drift is not None:
+                    failures.append(
+                        f"{label} legible has tier Unquantified but nextWordDrift is not null"
+                    )
+            elif raw_drift is None and verdict in {"NO_GO", "PASS"}:
+                failures.append(
+                    f"{label} legible has a null nextWordDrift on verdict {verdict!r} "
+                    "but tier is not Unquantified"
+                )
 
             example = legible.get("example")
             failures.extend(

@@ -24,6 +24,19 @@ inherited by the exec'd engine untouched -- API keys the engine wants live
 in that environment, not on the command line this script constructs, and
 this script never prints or logs environment values. The only variable it
 reads is ``FASTMLX_FIT_CHECK_BIN`` (a fallback for ``--fit-check-bin``).
+
+``--residency {resident,expert-stream}`` (default ``resident``) names how the
+requested model pack is held while serving: fully resident in memory, or
+served with its experts streamed from disk. A quality card only ever
+matches a launch whose residency equals the card's own ``config.residency``
+(absent/null on a card means "resident") -- the same measured drift a
+resident launch produces is not evidence for a streaming launch of the same
+pack, and vice versa, so the two residencies are never cross-admitted by one
+card. ``--residency expert-stream`` additionally requires an
+``--engine-profile`` whose ``residencyArgs.expert-stream`` names the argv
+this build's engine needs to stream experts (the built-in engine has none
+and always refuses); an operator can never bypass that gate by passing the
+streaming flag directly as a passthrough argument.
 """
 
 from __future__ import annotations
@@ -72,6 +85,13 @@ ALLOWED_ENGINE_PROFILE_PLACEHOLDERS = {
     "port",
     "context",
 }
+
+# The two residencies a launch (and a quality card) can carry. "resident"
+# is the historical default -- the whole pack held in memory; a card with
+# no ``config.residency`` at all is treated as "resident" (see
+# ``card_residency``). "expert-stream" is the only other recognized value.
+RESIDENCIES = ("resident", "expert-stream")
+ALLOWED_RESIDENCY_ARGS_KEYS = {"expert-stream"}
 
 BUILT_IN_ENGINE_PROFILE = {
     "schema": "fastmlx-engine-profile-v1",
@@ -308,8 +328,34 @@ def find_card_by_pin(cards: list, model_revision: Optional[str]) -> Optional[dic
     return None
 
 
+def card_residency(card: dict) -> Optional[str]:
+    """The residency ``card`` applies to.
+
+    Returns ``config.residency`` when it is exactly ``"resident"`` or
+    ``"expert-stream"``; returns ``"resident"`` when ``config`` (or
+    ``config.residency``) is absent or null -- the historical card shape,
+    predating this field, always described a resident launch. Returns
+    ``None`` for any other value: an unrecognized residency fails closed to
+    "never matches any launch", the same fail-closed-on-unrecognized-value
+    discipline ``decide_admission``'s verdict handling and the Swift
+    ``QualityVerdict`` decoder both use.
+    """
+    config = card.get("config")
+    if not isinstance(config, dict):
+        return "resident"
+    residency = config.get("residency")
+    if residency is None:
+        return "resident"
+    if residency in RESIDENCIES:
+        return residency
+    return None
+
+
 def resolve_card(
-    cards: Optional[list], model_repo: Optional[str], model_revision: Optional[str]
+    cards: Optional[list],
+    model_repo: Optional[str],
+    model_revision: Optional[str],
+    residency: str = "resident",
 ) -> Optional[dict]:
     """The implicit (no ``--card-id``) lookup: a repo match (Swift semantics)
     OR an hfPin-prefix match against the model's pinned revision. If both
@@ -317,11 +363,21 @@ def resolve_card(
     rather than silently preferring one -- this can only happen with a
     manifest that names the same model twice under two different cards, one
     keyed by repo and the other only by pin.
+
+    Cards are filtered to ``residency`` (``card_residency(card) ==
+    residency``) BEFORE either lookup and before the ambiguity check: a
+    card measured for the other residency is invisible to this lookup, the
+    same way a card for a different model is.
     """
     if cards is None:
         return None
-    repo_card = find_card_by_repo(cards, model_repo)
-    pin_card = find_card_by_pin(cards, model_revision)
+    residency_cards = [
+        card
+        for card in cards
+        if isinstance(card, dict) and card_residency(card) == residency
+    ]
+    repo_card = find_card_by_repo(residency_cards, model_repo)
+    pin_card = find_card_by_pin(residency_cards, model_revision)
     if repo_card is not None and pin_card is not None and repo_card.get("id") != pin_card.get(
         "id"
     ):
@@ -404,18 +460,63 @@ def _placeholder_tokens(text: str) -> list:
     return re.findall(r"\{[^{}]*\}", text)
 
 
+def _validate_residency_args(document: dict, path: str) -> dict:
+    """Validate the OPTIONAL ``residencyArgs`` key of an engine profile.
+
+    Its only allowed key is ``"expert-stream"``; each value must be a
+    non-empty list of non-empty strings, none of which contain a ``{``/``}``
+    placeholder (``residencyArgs`` entries are appended to the exec'd argv
+    verbatim -- never substituted). Returns the validated dict (``{}`` when
+    the key is absent), so every profile this function returns carries a
+    ``residencyArgs`` key regardless of whether the source document did.
+    """
+    raw = document.get("residencyArgs", {})
+    if not isinstance(raw, dict):
+        raise LaunchRefusal(3, f"engine profile at {path} residencyArgs must be an object")
+    extra_keys = sorted(set(raw) - ALLOWED_RESIDENCY_ARGS_KEYS)
+    if extra_keys:
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} residencyArgs has unknown key(s) {extra_keys}; "
+            f"the only allowed key is 'expert-stream'",
+        )
+    validated: dict = {}
+    for key, value in raw.items():
+        if not isinstance(value, list) or not value or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise LaunchRefusal(
+                3,
+                f"engine profile at {path} residencyArgs[{key!r}] must be a "
+                "non-empty list of non-empty strings",
+            )
+        for item in value:
+            if "{" in item or "}" in item:
+                raise LaunchRefusal(
+                    3,
+                    f"engine profile at {path} residencyArgs[{key!r}] element "
+                    f"{item!r} must not contain a {{...}} placeholder",
+                )
+        validated[key] = value
+    return validated
+
+
 def load_engine_profile(path: Optional[str]) -> tuple:
     """Load and validate an engine profile.
 
     Returns ``(profile, is_built_in)``. ``path`` of ``None`` selects the
-    built-in profile. Refuses (``LaunchRefusal(3, ...)``) on a missing/
-    unreadable/malformed file, a schema mismatch, or an argv element using
-    any ``{...}`` placeholder outside the allowed set -- a malformed
+    built-in profile (which carries no ``residencyArgs``: it cannot stream).
+    Refuses (``LaunchRefusal(3, ...)``) on a missing/unreadable/malformed
+    file, a schema mismatch, an argv element using any ``{...}`` placeholder
+    outside the allowed set, or an invalid ``residencyArgs`` -- a malformed
     profile must never silently drop or mis-render a token in the exec'd
-    command line.
+    command line. The returned profile dict always carries a
+    ``residencyArgs`` key (an empty dict when the profile declares none).
     """
     if path is None:
-        return dict(BUILT_IN_ENGINE_PROFILE), True
+        profile = dict(BUILT_IN_ENGINE_PROFILE)
+        profile["residencyArgs"] = {}
+        return profile, True
 
     try:
         document = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -448,7 +549,8 @@ def load_engine_profile(path: Optional[str]) -> tuple:
                     f"engine profile at {path} argv element {item!r} uses unknown "
                     f"placeholder {token}; allowed placeholders are: {allowed}",
                 )
-    return {"name": name, "argv": argv}, False
+    residency_args = _validate_residency_args(document, path)
+    return {"name": name, "argv": argv, "residencyArgs": residency_args}, False
 
 
 def _substitute_placeholders(item: str, substitutions: dict) -> str:
@@ -466,6 +568,41 @@ def _resolve_executable(value: str) -> Optional[str]:
             return str(candidate.resolve())
         return None
     return shutil.which(value)
+
+
+def _residency_in_fit_check_args(fit_check_args: list) -> Optional[str]:
+    """The value ``--residency`` names inside a caller-supplied list of
+    fit-check args (``--residency VALUE`` or ``--residency=VALUE``), or
+    ``None`` if the flag is absent or has no value -- used to catch a
+    fit-check-arg residency that disagrees with the launch's own
+    ``--residency`` before the fit check runs. This never adds
+    ``--residency`` to the fit-check argv itself: the fit-check protocol is
+    shared with a Swift binary that does not accept it.
+    """
+    for index, token in enumerate(fit_check_args):
+        if token == "--residency":
+            if index + 1 < len(fit_check_args):
+                return fit_check_args[index + 1]
+            return None
+        if token.startswith("--residency="):
+            return token.partition("=")[2]
+    return None
+
+
+def _residency_flag_tokens(profile: dict) -> set:
+    """Every ``-``-prefixed token appearing in ANY of ``profile``'s
+    ``residencyArgs`` lists, regardless of which residency the current
+    launch requested -- the passthrough guard refuses these tokens even on
+    a ``resident`` launch, so a streaming flag can never be smuggled in as
+    a passthrough argument instead of going through ``--residency
+    expert-stream``.
+    """
+    tokens: set = set()
+    for arg_list in profile.get("residencyArgs", {}).values():
+        for token in arg_list:
+            if token.startswith("-"):
+                tokens.add(token)
+    return tokens
 
 
 # ---------------------------------------------------------------------
@@ -492,6 +629,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     serve.add_argument("--card-id", default=None)
     serve.add_argument("--quality-cards", default=None)
     serve.add_argument("--accept-quality", action="append", default=[])
+    serve.add_argument("--residency", default="resident", choices=list(RESIDENCIES))
     serve.add_argument("--context", type=int, default=None)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8080)
@@ -579,12 +717,44 @@ def _run_serve(args, passthrough_args: list) -> int:
     model_id = args.model_id or model_path.resolve().name
     model_repo = _resolve_model_repo(args, model_path)
     model_revision = _resolve_model_revision(args, model_path)
+    residency = args.residency
 
     # Engine profile is loaded/validated early: a malformed profile is a
     # configuration error unrelated to the fit check or the quality card,
     # and failing on it before spending time on a fit-check subprocess
     # call keeps the refusal prompt.
     profile, is_built_in_profile = load_engine_profile(args.engine_profile)
+
+    # --- residency validation ------------------------------------------
+    # A non-resident launch requires the profile to declare the argv this
+    # engine needs to stream; the built-in engine never does, so
+    # --residency expert-stream always refuses it.
+    if residency == "expert-stream" and not profile["residencyArgs"].get("expert-stream"):
+        if is_built_in_profile:
+            detail = "the built-in engine cannot stream"
+        else:
+            detail = f"engine profile {profile['name']!r} declares no expert-stream arguments"
+        raise LaunchRefusal(
+            3,
+            f"cannot launch with --residency expert-stream: {detail}; pass an "
+            "--engine-profile whose residencyArgs.expert-stream lists the "
+            "engine's streaming argv",
+        )
+
+    # Passthrough guard, regardless of the chosen residency: a streaming
+    # flag can never be smuggled in as a bare passthrough argument -- an
+    # operator must go through --residency expert-stream, which is what
+    # actually elects the quality card for that residency.
+    residency_flag_tokens = _residency_flag_tokens(profile)
+    for passthrough in passthrough_args:
+        for token in residency_flag_tokens:
+            if passthrough == token or passthrough.startswith(token + "="):
+                raise LaunchRefusal(
+                    2,
+                    f"passthrough argument {passthrough!r} belongs to a residency "
+                    "profile's own argv; use --residency expert-stream instead of "
+                    "passing it directly",
+                )
 
     # --- fit-check ---------------------------------------------------
     fit_check_bin = (
@@ -597,6 +767,18 @@ def _run_serve(args, passthrough_args: list) -> int:
             3,
             "fit check binary not found; pass --fit-check-bin or set "
             "FASTMLX_FIT_CHECK_BIN",
+        )
+
+    # A --fit-check-arg that itself names a conflicting --residency is
+    # refused before the fit check runs; --residency is never auto-added to
+    # the fit-check args (the fit-check protocol is shared with a Swift
+    # binary that does not accept it).
+    fit_check_arg_residency = _residency_in_fit_check_args(args.fit_check_arg)
+    if fit_check_arg_residency is not None and fit_check_arg_residency != residency:
+        raise LaunchRefusal(
+            2,
+            f"--fit-check-arg specifies --residency {fit_check_arg_residency!r}, "
+            f"which differs from the launch's own --residency {residency!r}",
         )
 
     fit_result = run_fit_check(
@@ -687,8 +869,20 @@ def _run_serve(args, passthrough_args: list) -> int:
                 f"model: its repo/hfPin do not match the resolved model "
                 f"identity (repo={model_repo!r}, revision={model_revision!r})",
             )
+        # An explicit --card-id must also carry the launch's own residency:
+        # a resident card is not evidence for a streaming launch of the
+        # same pack, and a streaming card is not evidence for a resident
+        # launch.
+        matched_card_residency = card_residency(card)
+        if matched_card_residency != residency:
+            raise LaunchRefusal(
+                2,
+                f"quality card {args.card_id!r} has residency "
+                f"{matched_card_residency if matched_card_residency is not None else 'unrecognized'!r} "
+                f"but this launch is --residency {residency!r}",
+            )
     else:
-        card = resolve_card(cards, model_repo, model_revision)
+        card = resolve_card(cards, model_repo, model_revision, residency=residency)
 
     opt_in_ids = set(args.accept_quality)
     opted_in = is_opted_in(card, opt_in_ids)
@@ -720,6 +914,8 @@ def _run_serve(args, passthrough_args: list) -> int:
         "context": str(context),
     }
     final_argv = [_substitute_placeholders(item, substitutions) for item in profile["argv"]]
+    if residency == "expert-stream":
+        final_argv += list(profile["residencyArgs"]["expert-stream"])
     final_argv += list(passthrough_args)
 
     plan = {
@@ -727,6 +923,7 @@ def _run_serve(args, passthrough_args: list) -> int:
         "card": card,
         "admission": outcome,
         "argv": final_argv,
+        "residency": residency,
     }
 
     if args.dry_run:
@@ -736,7 +933,7 @@ def _run_serve(args, passthrough_args: list) -> int:
     print(
         "fastmlx_launch=admitted "
         f"engine={profile['name']} card={card.get('id') if card else 'none'} "
-        f"fit={fit_label} context={context}",
+        f"fit={fit_label} context={context} residency={residency}",
         file=sys.stderr,
     )
     os.execv(engine_bin_abs, final_argv)

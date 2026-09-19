@@ -191,6 +191,205 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertEqual(QualityAdmission.decide(card: c, optIn: false), .admit)
     }
 
+    // MARK: - config.residency (a card measured under SSD expert streaming must never gate a
+    // resident Swift `fastmlx-serve` launch — see `QualityCard.matchesResidentLaunch`'s doc comment).
+
+    /// A repo with two cards: an "expert-stream" NO_GO and a resident PASS/NO_GO. `streamingFirst`
+    /// controls list order, so the tests prove filtering (not accidental first-match-wins ordering).
+    private func residencyManifestJSON(
+        streamingFirst: Bool, residentVerdict: String = "PASS"
+    ) -> String {
+        let streamingCard = """
+            {
+              "id": "qwen38-27b-optiq-4bit-stream@m3ultra",
+              "model": { "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit", "hfPin": "b04599de" },
+              "config": { "quant": { "bits": 4 }, "residency": "expert-stream" },
+              "verdict": "NO_GO",
+              "admission": { "default": false, "optIn": true, "reason": "streaming changes greedy output" },
+              "legible": { "tier": "Noticeable", "headline": "Measured under SSD expert streaming." }
+            }
+            """
+        let residentCard = """
+            {
+              "id": "qwen38-27b-optiq-4bit-resident@m3ultra",
+              "model": { "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit", "hfPin": "b04599de" },
+              "config": { "quant": { "bits": 4 } },
+              "verdict": "\(residentVerdict)",
+              "admission": { "default": false, "optIn": true, "reason": "resident fixture" },
+              "legible": { "tier": "Near-lossless", "headline": "Resident measurement." }
+            }
+            """
+        let cards = streamingFirst ? [streamingCard, residentCard] : [residentCard, streamingCard]
+        return """
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-18T00:00:00Z",
+              "cards": [\(cards.joined(separator: ","))]
+            }
+            """
+    }
+
+    func testStoreSkipsStreamingCardListedBeforeResidentCardForSameRepo() {
+        let data = Data(residencyManifestJSON(streamingFirst: true).utf8)
+        let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: data)
+        XCTAssertEqual(
+            c?.id, "qwen38-27b-optiq-4bit-resident@m3ultra",
+            "a streaming card listed BEFORE the resident card must never win the lookup")
+        XCTAssertEqual(c?.verdict, .pass)
+    }
+
+    /// The explicit `--quality-cards` serve path decodes the manifest with `loadManifest` and then
+    /// selects a card itself; it must apply the same residency rule as the data overload.
+    func testLoadedManifestSelectionSkipsStreamingCard() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-residency-\(UUID().uuidString).json")
+        try Data(residencyManifestJSON(streamingFirst: true).utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cards = try QualityCardStore.loadManifest(contentsOf: url)
+        XCTAssertEqual(cards.count, 2, "both cards must decode; only selection filters")
+        let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: cards)
+        XCTAssertEqual(c?.id, "qwen38-27b-optiq-4bit-resident@m3ultra")
+    }
+
+    func testStoreReturnsNilWhenOnlyAStreamingCardExistsForRepo() {
+        let onlyStreaming = """
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-18T00:00:00Z",
+              "cards": [
+                {
+                  "id": "qwen38-27b-optiq-4bit-stream@m3ultra",
+                  "model": { "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit", "hfPin": "b04599de" },
+                  "config": { "quant": { "bits": 4 }, "residency": "expert-stream" },
+                  "verdict": "NO_GO",
+                  "admission": { "default": false, "optIn": true, "reason": "streaming changes greedy output" },
+                  "legible": { "tier": "Noticeable", "headline": "Measured under SSD expert streaming." }
+                }
+              ]
+            }
+            """
+        let data = Data(onlyStreaming.utf8)
+        let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: data)
+        XCTAssertNil(c, "a streaming-only card must never surface to a resident-launch lookup")
+        XCTAssertEqual(
+            QualityAdmission.decide(card: c, optIn: false), .admitUnmeasured,
+            "no resident card found → admit unmeasured, never gated by the streaming card")
+    }
+
+    func testStoreReturnsNilForUnrecognizedResidencyString() {
+        let bogus = """
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-18T00:00:00Z",
+              "cards": [
+                {
+                  "id": "qwen38-27b-optiq-4bit-bogus@m3ultra",
+                  "model": { "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit", "hfPin": "b04599de" },
+                  "config": { "quant": { "bits": 4 }, "residency": "bogus" },
+                  "verdict": "NO_GO",
+                  "admission": { "default": false, "optIn": true, "reason": "t" },
+                  "legible": { "tier": "Noticeable", "headline": "h" }
+                }
+              ]
+            }
+            """
+        let data = Data(bogus.utf8)
+        let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: data)
+        XCTAssertNil(c, "an unrecognized residency string must fail closed, never match a resident launch")
+    }
+
+    func testStoreMatchesCardWithExplicitResidentResidency() {
+        let explicit = """
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-18T00:00:00Z",
+              "cards": [
+                {
+                  "id": "qwen38-27b-optiq-4bit-explicit@m3ultra",
+                  "model": { "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit", "hfPin": "b04599de" },
+                  "config": { "quant": { "bits": 4 }, "residency": "resident" },
+                  "verdict": "PASS",
+                  "admission": { "default": false, "optIn": true, "reason": "t" },
+                  "legible": { "tier": "Near-lossless", "headline": "h" }
+                }
+              ]
+            }
+            """
+        let data = Data(explicit.utf8)
+        let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: data)
+        XCTAssertEqual(c?.id, "qwen38-27b-optiq-4bit-explicit@m3ultra")
+    }
+
+    // MARK: - QualityCard.matchesResidentLaunch / effectiveResidency (decode-level, independent of
+    // QualityCardStore, to isolate decode leniency from the store's filtering).
+
+    private func decodeCard(_ json: String) throws -> QualityCard {
+        try JSONDecoder().decode(QualityCard.self, from: Data(json.utf8))
+    }
+
+    func testMissingConfigKeyDefaultsToResident() throws {
+        let card = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Near-lossless", "headline": "h" }
+            }
+            """)
+        XCTAssertEqual(card.effectiveResidency, "resident")
+        XCTAssertTrue(card.matchesResidentLaunch)
+    }
+
+    func testNullResidencyDefaultsToResident() throws {
+        let card = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": null },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Near-lossless", "headline": "h" }
+            }
+            """)
+        XCTAssertEqual(card.effectiveResidency, "resident")
+        XCTAssertTrue(card.matchesResidentLaunch)
+    }
+
+    func testUnrecognizedResidencyDecodesWithoutThrowingButFailsClosed() throws {
+        let card = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": "bogus" },
+              "verdict": "NO_GO",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """)
+        XCTAssertEqual(card.effectiveResidency, "bogus")
+        XCTAssertFalse(card.matchesResidentLaunch)
+    }
+
+    func testExpertStreamResidencyFailsToMatchResidentLaunch() throws {
+        let card = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": "expert-stream" },
+              "verdict": "NO_GO",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """)
+        XCTAssertEqual(card.effectiveResidency, "expert-stream")
+        XCTAssertFalse(card.matchesResidentLaunch)
+    }
+
     // MARK: - QualityOptIn CLI parser (additive, mirrors QuantPickPreference.validated's idiom)
 
     func testOptInParsesAcceptQualityFlag() {

@@ -96,7 +96,10 @@ HIGHLIGHT_DECISIONS = {"promoted-scoped", "shelved"}
 QUALITY_GUIDE_SCHEMA = "fast-mlx-quality-card-v1"
 QUALITY_VERDICTS = {"NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"}
 QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
-QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant"}
+QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant", "Unquantified"}
+QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
+QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
+QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
 QUALITY_VERDICT_LABELS: Dict[str, str] = {
     "NO_GO": "Opt-in only",
@@ -669,46 +672,36 @@ def load_release_catalog(repository_root: Path) -> Dict[str, object]:
     return catalog
 
 
-def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
-    """Load the optional public quality-card manifest (`fast-mlx-quality-card-v1`).
-
-    The manifest is owned by a separate emitter (`scripts/emit_quality_card.py`).
-    Its absence is not a build failure: the quality-guide page is simply skipped,
-    exactly like an optional section. Presence is validated with a strict,
-    fail-closed schema — an unknown schema, verdict, provenance source, or a
-    card missing a required field refuses the build rather than rendering a
-    partial or fabricated card.
+def validate_quality_card_document(document: object, label: str) -> Dict[str, object]:
+    """Validate a decoded `fast-mlx-quality-card-v1` document against the
+    exact fail-closed schema `load_quality_guides` enforces for
+    `site/quality-guides.json` -- factored out so any OTHER manifest using
+    this schema (e.g. an internal, unpublished card set) can be checked with
+    the identical rule set, without going through the public manifest's own
+    filesystem conventions (path, symlink refusal, "optional/skip if
+    absent"). ``label`` names the document in every failure message.
     """
 
-    manifest_path = repository_root / "site/quality-guides.json"
-    if not manifest_path.exists() and not manifest_path.is_symlink():
-        return None
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        fail("site/quality-guides.json is present but not a regular file")
-    manifest = require_exact_keys(
-        read_json(manifest_path),
-        {"schema", "generatedAt", "cards"},
-        "site/quality-guides.json",
-    )
+    manifest = require_exact_keys(document, {"schema", "generatedAt", "cards"}, label)
     if manifest.get("schema") != QUALITY_GUIDE_SCHEMA:
-        fail(f"site/quality-guides.json must use schema {QUALITY_GUIDE_SCHEMA!r}")
-    require_iso_timestamp(manifest, "generatedAt", "site/quality-guides.json")
+        fail(f"{label} must use schema {QUALITY_GUIDE_SCHEMA!r}")
+    require_iso_timestamp(manifest, "generatedAt", label)
 
     serialized = json.dumps(manifest, ensure_ascii=False)
     for marker in PRIVATE_MARKERS:
         if marker.casefold() in serialized.casefold():
-            fail(f"quality-guide manifest contains private marker {marker!r}")
+            fail(f"{label} contains private marker {marker!r}")
     extended_marker = _quality_guide_private_marker(serialized)
     if extended_marker is not None:
-        fail(f"quality-guide manifest contains private marker {extended_marker!r}")
+        fail(f"{label} contains private marker {extended_marker!r}")
 
     cards = manifest.get("cards")
     if not isinstance(cards, list) or not cards:
-        fail("site/quality-guides.json must contain at least one card")
+        fail(f"{label} must contain at least one card")
     seen_ids: set[str] = set()
     validated_cards: List[Dict[str, object]] = []
     for index, raw_card in enumerate(cards):
-        label = f"quality card entry {index}"
+        card_label = f"{label} card entry {index}"
         card = require_exact_keys(
             raw_card,
             {
@@ -722,77 +715,91 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
                 "provenance",
                 "boundary",
             },
-            label,
+            card_label,
         )
-        identifier = require_text(card, "id", label)
+        identifier = require_text(card, "id", card_label)
         if not QUALITY_CARD_ID.fullmatch(identifier) or identifier in seen_ids:
-            fail(f"{label} has an invalid or duplicate id")
+            fail(f"{card_label} has an invalid or duplicate id")
         seen_ids.add(identifier)
 
-        model = require_exact_keys(card.get("model"), {"family", "repo", "hfPin"}, f"{label} model")
-        require_text(model, "family", f"{label} model")
+        model = require_exact_keys(card.get("model"), {"family", "repo", "hfPin"}, f"{card_label} model")
+        require_text(model, "family", f"{card_label} model")
         # repo/hfPin may be null for a card that has no distinct HF-hosted checkpoint
         # (an internal reference build, or an enhancement layered on an already-covered repo).
         for key in ("repo", "hfPin"):
             value = model.get(key)
             if value is not None and (not isinstance(value, str) or not value.strip()):
-                fail(f"{label} model.{key} must be a non-empty string or null")
+                fail(f"{card_label} model.{key} must be a non-empty string or null")
 
-        config = require_exact_keys(
-            card.get("config"), {"quant", "enhancement", "hardwareClass"}, f"{label} config"
-        )
+        raw_config = card.get("config")
+        if not isinstance(raw_config, dict):
+            fail(f"{card_label} config is not an object")
+        config_keys = set(raw_config)
+        if not (
+            QUALITY_CARD_CONFIG_REQUIRED_KEYS <= config_keys <= QUALITY_CARD_CONFIG_ALLOWED_KEYS
+        ):
+            missing = sorted(QUALITY_CARD_CONFIG_REQUIRED_KEYS - config_keys)
+            extra = sorted(config_keys - QUALITY_CARD_CONFIG_ALLOWED_KEYS)
+            fail(f"{card_label} config keys differ from schema; missing={missing} extra={extra}")
+        config = raw_config
+        # `residency` is OPTIONAL and absent on every card predating it; absence means
+        # "resident" (see fastmlx_launch.card_residency). When present it must be one
+        # of the two recognized residencies -- an unrecognized value would silently
+        # never match any launch, which a card author should never do unnoticed.
+        if "residency" in config and config.get("residency") not in QUALITY_CARD_RESIDENCIES:
+            fail(f"{card_label} config.residency has unknown value {config.get('residency')!r}")
         # `quant` is null for a pure enhancement card (e.g. MTP) that carries no distinct
         # quantization variant; `groupSize` is null for a quant format (e.g. mxfp8) that has
         # no blockwise/affine group concept.
         raw_quant = config.get("quant")
         if raw_quant is not None:
             quant = require_exact_keys(
-                raw_quant, {"bits", "groupSize", "mixedBit", "note"}, f"{label} config.quant"
+                raw_quant, {"bits", "groupSize", "mixedBit", "note"}, f"{card_label} config.quant"
             )
             if not isinstance(quant.get("bits"), int) or isinstance(quant.get("bits"), bool):
-                fail(f"{label} config.quant.bits is not an int")
+                fail(f"{card_label} config.quant.bits is not an int")
             group_size = quant.get("groupSize")
             if group_size is not None and (
                 not isinstance(group_size, int) or isinstance(group_size, bool)
             ):
-                fail(f"{label} config.quant.groupSize must be an int or null")
+                fail(f"{card_label} config.quant.groupSize must be an int or null")
             if not isinstance(quant.get("mixedBit"), bool):
-                fail(f"{label} config.quant.mixedBit is not a bool")
+                fail(f"{card_label} config.quant.mixedBit is not a bool")
             note = quant.get("note")
             if note is not None and (not isinstance(note, str) or not note.strip()):
-                fail(f"{label} config.quant.note must be a non-empty string or null")
-        require_text(config, "enhancement", f"{label} config")
-        require_text(config, "hardwareClass", f"{label} config")
+                fail(f"{card_label} config.quant.note must be a non-empty string or null")
+        require_text(config, "enhancement", f"{card_label} config")
+        require_text(config, "hardwareClass", f"{card_label} config")
 
-        verdict = require_text(card, "verdict", label)
+        verdict = require_text(card, "verdict", card_label)
         if verdict not in QUALITY_VERDICTS:
-            fail(f"{label} has unknown verdict {verdict!r}")
+            fail(f"{card_label} has unknown verdict {verdict!r}")
 
         admission = require_exact_keys(
-            card.get("admission"), {"default", "optIn", "reason"}, f"{label} admission"
+            card.get("admission"), {"default", "optIn", "reason"}, f"{card_label} admission"
         )
         if not isinstance(admission.get("default"), bool):
-            fail(f"{label} admission.default is not a bool")
+            fail(f"{card_label} admission.default is not a bool")
         if not isinstance(admission.get("optIn"), bool):
-            fail(f"{label} admission.optIn is not a bool")
-        require_text(admission, "reason", f"{label} admission")
+            fail(f"{card_label} admission.optIn is not a bool")
+        require_text(admission, "reason", f"{card_label} admission")
 
         legible = require_exact_keys(
             card.get("legible"),
             {"tier", "headline", "nextWordDrift", "regressionFocus", "example", "benefit"},
-            f"{label} legible",
+            f"{card_label} legible",
         )
-        tier = require_text(legible, "tier", f"{label} legible")
+        tier = require_text(legible, "tier", f"{card_label} legible")
         if tier not in QUALITY_TIERS:
-            fail(f"{label} legible has unknown tier {tier!r}")
-        require_text(legible, "headline", f"{label} legible")
+            fail(f"{card_label} legible has unknown tier {tier!r}")
+        require_text(legible, "headline", f"{card_label} legible")
         # regressionFocus is only meaningful for a card that admits a quality trade
         # (NO_GO/PASS); REFERENCE (the reference itself) and EXACT (identical output)
         # have no regression to report and may leave it null.
         if verdict in {"NO_GO", "PASS"}:
-            require_text(legible, "regressionFocus", f"{label} legible")
+            require_text(legible, "regressionFocus", f"{card_label} legible")
         else:
-            require_nullable_text(legible, "regressionFocus", f"{label} legible")
+            require_nullable_text(legible, "regressionFocus", f"{card_label} legible")
 
         # nextWordDrift itself is null for REFERENCE (no drift concept vs itself).
         raw_next_word_drift = legible.get("nextWordDrift")
@@ -800,44 +807,60 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
             next_word_drift = require_exact_keys(
                 raw_next_word_drift,
                 {"oneInK", "top1AgreementPct"},
-                f"{label} legible.nextWordDrift",
+                f"{card_label} legible.nextWordDrift",
             )
             # oneInK is null for EXACT (identical output, so there is no "1 in K" to state).
             one_in_k = next_word_drift.get("oneInK")
             if one_in_k is not None and (
                 not isinstance(one_in_k, int) or isinstance(one_in_k, bool)
             ):
-                fail(f"{label} legible.nextWordDrift.oneInK must be an int or null")
+                fail(f"{card_label} legible.nextWordDrift.oneInK must be an int or null")
             top1 = next_word_drift.get("top1AgreementPct")
             if not isinstance(top1, (int, float)) or isinstance(top1, bool):
-                fail(f"{label} legible.nextWordDrift.top1AgreementPct is not a number")
+                fail(f"{card_label} legible.nextWordDrift.top1AgreementPct is not a number")
+
+        # "Unquantified" means the output differs from the reference but the size of
+        # that difference was never measured: it may ONLY pair with a NO_GO card whose
+        # nextWordDrift is null (there is no honest "1 in K" to report), and conversely
+        # a NO_GO/PASS card with a null nextWordDrift must be tiered Unquantified --
+        # PASS can therefore never carry a null nextWordDrift.
+        if tier == "Unquantified":
+            if verdict != "NO_GO":
+                fail(f"{card_label} legible has tier Unquantified but verdict is not NO_GO")
+            if raw_next_word_drift is not None:
+                fail(f"{card_label} legible has tier Unquantified but nextWordDrift is not null")
+        elif raw_next_word_drift is None and verdict in {"NO_GO", "PASS"}:
+            fail(
+                f"{card_label} legible has a null nextWordDrift on verdict {verdict!r} "
+                "but tier is not Unquantified"
+            )
 
         example = require_exact_keys(
             legible.get("example"),
             {"status", "prompt", "referenceOutput", "configOutput", "note"},
-            f"{label} legible.example",
+            f"{card_label} legible.example",
         )
         example_status = example.get("status")
         if example_status not in QUALITY_EXAMPLE_STATUSES:
-            fail(f"{label} legible.example has unknown status {example_status!r}")
+            fail(f"{card_label} legible.example has unknown status {example_status!r}")
 
         benefit = require_exact_keys(
-            legible.get("benefit"), {"fit", "speedX", "speedXStatus"}, f"{label} legible.benefit"
+            legible.get("benefit"), {"fit", "speedX", "speedXStatus"}, f"{card_label} legible.benefit"
         )
         # fit is null for an enhancement card with no footprint of its own (e.g. MTP).
-        require_nullable_text(benefit, "fit", f"{label} legible.benefit")
+        require_nullable_text(benefit, "fit", f"{card_label} legible.benefit")
         speed_x = benefit.get("speedX")
         if speed_x is not None and (not isinstance(speed_x, (int, float)) or isinstance(speed_x, bool)):
-            fail(f"{label} legible.benefit.speedX must be a number or null")
-        require_text(benefit, "speedXStatus", f"{label} legible.benefit")
+            fail(f"{card_label} legible.benefit.speedX must be a number or null")
+        require_text(benefit, "speedXStatus", f"{card_label} legible.benefit")
 
         # rawMetrics is always an object; it may be empty only for EXACT (identical
         # output has no per-config metric of its own to show).
         raw_metrics = card.get("rawMetrics")
         if not isinstance(raw_metrics, dict):
-            fail(f"{label} rawMetrics must be an object")
+            fail(f"{card_label} rawMetrics must be an object")
         if not raw_metrics and verdict != "EXACT":
-            fail(f"{label} rawMetrics must be a non-empty object")
+            fail(f"{card_label} rawMetrics must be a non-empty object")
 
         provenance = require_exact_keys(
             card.get("provenance"),
@@ -852,43 +875,62 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
                 "sourceVerdict",
                 "measuredAt",
             },
-            f"{label} provenance",
+            f"{card_label} provenance",
         )
-        source = require_text(provenance, "source", f"{label} provenance")
+        source = require_text(provenance, "source", f"{card_label} provenance")
         if source not in QUALITY_PROVENANCE_SOURCES:
-            fail(f"{label} provenance has unknown source {source!r}")
+            fail(f"{card_label} provenance has unknown source {source!r}")
         vendor = provenance.get("vendor")
         if source == "vendor-reported":
             if not isinstance(vendor, str) or not vendor.strip():
-                fail(f"{label} provenance.vendor is required when source is vendor-reported")
+                fail(f"{card_label} provenance.vendor is required when source is vendor-reported")
         elif vendor is not None:
-            fail(f"{label} provenance.vendor must be null unless source is vendor-reported")
+            fail(f"{card_label} provenance.vendor must be null unless source is vendor-reported")
         for key in ("method", "hardware"):
-            require_text(provenance, key, f"{label} provenance")
+            require_text(provenance, key, f"{card_label} provenance")
         # harnessGitSHA/corpusId/sourceVerdict/measuredAt are null for a curated card not
         # sourced from a dated gate verdict (e.g. the MTP exactness card).
         for key in ("harnessGitSHA", "corpusId", "sourceVerdict"):
-            require_nullable_text(provenance, key, f"{label} provenance")
+            require_nullable_text(provenance, key, f"{card_label} provenance")
         if provenance.get("measuredAt") is not None:
-            require_iso_timestamp(provenance, "measuredAt", f"{label} provenance")
+            require_iso_timestamp(provenance, "measuredAt", f"{card_label} provenance")
         confound = provenance.get("confound")
         if confound is not None and (not isinstance(confound, str) or not confound.strip()):
-            fail(f"{label} provenance.confound must be a non-empty string or null")
+            fail(f"{card_label} provenance.confound must be a non-empty string or null")
 
         boundary = require_exact_keys(
-            card.get("boundary"), {"scope", "unmeasured"}, f"{label} boundary"
+            card.get("boundary"), {"scope", "unmeasured"}, f"{card_label} boundary"
         )
-        require_text(boundary, "scope", f"{label} boundary")
+        require_text(boundary, "scope", f"{card_label} boundary")
         unmeasured = boundary.get("unmeasured")
         if not isinstance(unmeasured, list) or any(
             not isinstance(item, str) or not item.strip() for item in unmeasured
         ):
-            fail(f"{label} boundary.unmeasured must be a list of non-empty strings")
+            fail(f"{card_label} boundary.unmeasured must be a list of non-empty strings")
 
         validated_cards.append(card)
 
     manifest["cards"] = validated_cards
     return manifest
+
+
+def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
+    """Load the optional public quality-card manifest (`fast-mlx-quality-card-v1`).
+
+    The manifest is owned by a separate emitter (`scripts/emit_quality_card.py`).
+    Its absence is not a build failure: the quality-guide page is simply skipped,
+    exactly like an optional section. Presence is validated with a strict,
+    fail-closed schema (`validate_quality_card_document`) — an unknown schema,
+    verdict, provenance source, or a card missing a required field refuses the
+    build rather than rendering a partial or fabricated card.
+    """
+
+    manifest_path = repository_root / "site/quality-guides.json"
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        return None
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        fail("site/quality-guides.json is present but not a regular file")
+    return validate_quality_card_document(read_json(manifest_path), "site/quality-guides.json")
 
 
 def load_articles(repository_root: Path) -> List[Article]:
@@ -2130,7 +2172,11 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
             ]
         )
         # nextWordDrift is null for REFERENCE (no drift vs itself); oneInK is null for
-        # EXACT (identical output, so there is no "1 in K" to state).
+        # EXACT (identical output, so there is no "1 in K" to state). Tier
+        # "Unquantified" is the third null-drift case: a NO_GO card whose output
+        # differed from the reference, but whose difference was never sized -- render
+        # that honestly (no fabricated "1 in K" line) instead of silently saying
+        # nothing, which would read as "no drift" like the REFERENCE case above.
         if drift is not None:
             one_in_k = drift.get("oneInK")
             top1 = drift["top1AgreementPct"]
@@ -2145,6 +2191,11 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
                     f'{html.escape(str(one_in_k))} '
                     f'(top-1 agreement {html.escape(str(top1))}%).</p>'
                 )
+        elif tier == "Unquantified":
+            body.append(
+                '<p class="quality-drift">Output differed from the reference; the '
+                'size of that difference was not measured.</p>'
+            )
         if regression_focus is not None:
             body.append(
                 f'<p class="quality-regression"><strong>Regression focus:</strong> {html.escape(str(regression_focus))}</p>'

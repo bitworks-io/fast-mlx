@@ -632,7 +632,7 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         return "quality_cards=none"
     }
 
-    let card = cards.first { $0.model.repo == model }
+    let card = QualityCardStore.card(forRepo: model, in: cards)
     let optIn = QualityOptIn.parse(rawArguments)
     let outcome = QualityAdmission.decide(
         card: card, optIn: optIn.isElected(cardID: card?.id, repoID: card?.model.repo))

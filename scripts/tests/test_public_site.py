@@ -4273,6 +4273,82 @@ class PublicSiteTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
+    @staticmethod
+    def expert_stream_card_manifest_document() -> dict[str, object]:
+        """A `fast-mlx-quality-card-v1` fixture document holding one NO_GO
+        card for the `expert-stream` residency, shaped like a real internal
+        measured card but with a synthetic model identity and
+        illustrative-only wording."""
+        return {
+            "schema": "fast-mlx-quality-card-v1",
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "cards": [
+                {
+                    "id": "example-moe-q4-stream@m3ultra",
+                    "model": {
+                        "family": "Example-MoE",
+                        "repo": "example-org/example-moe-gguf",
+                        "hfPin": "0123456789abcdef0123456789abcdef01234567",
+                    },
+                    "config": {
+                        "quant": {
+                            "bits": 4,
+                            "groupSize": None,
+                            "mixedBit": True,
+                            "note": "fixture: quantized routed experts",
+                        },
+                        "enhancement": "none",
+                        "hardwareClass": "example-hardware",
+                        "residency": "expert-stream",
+                    },
+                    "verdict": "NO_GO",
+                    "admission": {
+                        "default": False,
+                        "optIn": True,
+                        "reason": "fixture: output differed on 3 of 8 prompts versus the same pack held in memory",
+                    },
+                    "legible": {
+                        "tier": "Unquantified",
+                        "headline": "fixture: expert-stream residency changed greedy output on 3 of 8 prompts versus the same pack held in memory.",
+                        "nextWordDrift": None,
+                        "regressionFocus": "fixture: illustrative regression focus text",
+                        "example": {
+                            "status": "pending",
+                            "prompt": None,
+                            "referenceOutput": None,
+                            "configOutput": None,
+                            "note": "fixture: illustrative placeholder",
+                        },
+                        "benefit": {
+                            "fit": None,
+                            "speedX": 0.5,
+                            "speedXStatus": "fixture: illustrative only, not a measurement",
+                        },
+                    },
+                    "rawMetrics": {
+                        "greedyDivergentPrompts": "3/8",
+                        "comparedTokens": 100,
+                        "magnitude": "fixture: not collected",
+                    },
+                    "provenance": {
+                        "source": "fast-mlx-measured",
+                        "vendor": None,
+                        "method": "fixture: synthetic test data, not a real measurement",
+                        "confound": None,
+                        "hardware": "fixture",
+                        "harnessGitSHA": "0000000000000000000000000000000000000000",
+                        "corpusId": "fixture-corpus",
+                        "sourceVerdict": None,
+                        "measuredAt": "2026-01-01T00:00:00Z",
+                    },
+                    "boundary": {
+                        "scope": "fixture: serving-admission quality signal for expert-stream residency",
+                        "unmeasured": ["fixture: illustrative unmeasured item"],
+                    },
+                }
+            ],
+        }
+
     def test_quality_guide_is_skipped_gracefully_when_manifest_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4494,6 +4570,201 @@ class PublicSiteTests(unittest.TestCase):
             self.write_quality_guide_manifest(root, unknown_verdict)
             with self.assertRaises(SystemExit):
                 build_public_site.load_quality_guides(root)
+
+    # ------------------------------------------------------------------
+    # config.residency: optional; "resident" | "expert-stream" when present;
+    # unknown values refuse. Existing cards (no residency key) still pass.
+    # ------------------------------------------------------------------
+    def test_quality_guide_config_accepts_optional_residency(self):
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["config"]["residency"] = "expert-stream"
+        manifest["cards"][1]["config"]["residency"] = "resident"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["cards"][0]["config"]["residency"], "expert-stream")
+        self.assertEqual(loaded["cards"][1]["config"]["residency"], "resident")
+
+    def test_quality_guide_config_rejects_unknown_residency(self):
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["config"]["residency"] = "bogus"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
+    # ------------------------------------------------------------------
+    # "Unquantified" tier: only a NO_GO card with a null nextWordDrift; and
+    # a NO_GO/PASS card with a null nextWordDrift must be tiered Unquantified
+    # (so PASS can never carry a null nextWordDrift).
+    # ------------------------------------------------------------------
+    def test_quality_guide_unquantified_tier_requires_no_go_verdict(self):
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["legible"]["tier"] = "Unquantified"
+        pass_card["legible"]["nextWordDrift"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
+    def test_quality_guide_unquantified_tier_requires_null_drift(self):
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        self.assertEqual(no_go_card["verdict"], "NO_GO")
+        self.assertIsNotNone(no_go_card["legible"]["nextWordDrift"])
+        no_go_card["legible"]["tier"] = "Unquantified"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
+    def test_quality_guide_null_drift_on_no_go_or_pass_requires_unquantified_tier(self):
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        no_go_card["legible"]["nextWordDrift"] = None
+        # tier stays "Noticeable" -- a null drift with a non-Unquantified tier refuses.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
+        manifest2 = self.quality_guide_manifest()
+        manifest2["cards"][2]["legible"]["nextWordDrift"] = None
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest2)
+            with self.assertRaises(SystemExit):
+                build_public_site.load_quality_guides(root)
+
+    def test_quality_guide_unquantified_no_go_card_loads_and_renders_honestly(self):
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        no_go_card["legible"]["tier"] = "Unquantified"
+        no_go_card["legible"]["nextWordDrift"] = None
+        # The fixture's stock headline literally says "1 word in 6"; replace it so
+        # the "no fabricated 1-in-K line" assertion below tests the drift
+        # paragraph, not leftover fixture prose.
+        no_go_card["legible"]["headline"] = (
+            "Output differed from the reference on SSD expert streaming."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+        self.assertIsNotNone(loaded)
+
+        page = build_public_site.render_quality_guide(loaded["cards"])
+        match = re.search(
+            r'<article class="quality-card" data-quality-card="'
+            + re.escape(str(no_go_card["id"]))
+            + r'"[^>]*>(.*?)</article>',
+            page,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        card_html = match.group(1)
+        self.assertIn("UNQUANTIFIED", card_html)
+        self.assertNotIn("1 word in", card_html)
+        self.assertIn("not measured", card_html)
+        self.assertNotIn("None", card_html)
+        # `validate_public_site.validate_quality_guide_manifest` is a separate
+        # mirror (scripts/validate_public_site.py) used to check an
+        # already-built `site/quality-guides.json`; it now enforces the same
+        # "Unquantified" tier and `config.residency` rules (see the
+        # test_secondary_validator_* cases below) so a card of this shape
+        # passes both validators identically.
+        manifest_failures = validate_public_site.validate_quality_guide_manifest(loaded)
+        self.assertEqual(manifest_failures, [])
+
+    # ------------------------------------------------------------------
+    # Internal (unpublished) quality-card manifest: item 7's factored card
+    # validation must accept it under the exact same rule set the public
+    # site manifest uses. Driven by an inline synthetic fixture shaped like
+    # a real internal expert-stream card (see
+    # `expert_stream_card_manifest_document` above).
+    # ------------------------------------------------------------------
+    def test_internal_expert_stream_card_manifest_passes_validation(self):
+        document = self.expert_stream_card_manifest_document()
+        validated = build_public_site.validate_quality_card_document(
+            document, "fixture quality-card manifest"
+        )
+        self.assertEqual(len(validated["cards"]), 1)
+        card = validated["cards"][0]
+        self.assertEqual(card["id"], "example-moe-q4-stream@m3ultra")
+        self.assertEqual(card["config"]["residency"], "expert-stream")
+        self.assertEqual(card["legible"]["tier"], "Unquantified")
+        self.assertIsNone(card["legible"]["nextWordDrift"])
+        self.assertEqual(card["verdict"], "NO_GO")
+
+    # ------------------------------------------------------------------
+    # validate_public_site.validate_quality_guide_manifest is an independent
+    # mirror of build_public_site's schema (it accumulates failures instead
+    # of raising, to check an already-built quality/index.json). It must
+    # enforce the same config.residency / "Unquantified" tier rules.
+    # ------------------------------------------------------------------
+    def test_secondary_validator_accepts_internal_expert_stream_card(self) -> None:
+        document = self.expert_stream_card_manifest_document()
+        failures = validate_public_site.validate_quality_guide_manifest(document)
+        self.assertEqual(failures, [])
+
+    def test_secondary_validator_rejects_unknown_residency(self) -> None:
+        document = self.expert_stream_card_manifest_document()
+        document["cards"][0]["config"]["residency"] = "bogus"
+        failures = validate_public_site.validate_quality_guide_manifest(document)
+        self.assertTrue(
+            any("config.residency has unknown value" in f for f in failures), failures
+        )
+
+    def test_secondary_validator_rejects_unquantified_tier_on_pass_card(self) -> None:
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["legible"]["tier"] = "Unquantified"
+        pass_card["legible"]["nextWordDrift"] = None
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("tier Unquantified but verdict is not NO_GO" in f for f in failures), failures
+        )
+
+    def test_secondary_validator_rejects_null_drift_no_go_with_noticeable_tier(self) -> None:
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        self.assertEqual(no_go_card["verdict"], "NO_GO")
+        self.assertEqual(no_go_card["legible"]["tier"], "Noticeable")
+        no_go_card["legible"]["nextWordDrift"] = None
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any(
+                "null nextWordDrift on verdict 'NO_GO' but tier is not Unquantified" in f
+                for f in failures
+            ),
+            failures,
+        )
+
+    def test_secondary_validator_rejects_unquantified_tier_with_non_null_drift(self) -> None:
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        self.assertIsNotNone(no_go_card["legible"]["nextWordDrift"])
+        no_go_card["legible"]["tier"] = "Unquantified"
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("tier Unquantified but nextWordDrift is not null" in f for f in failures),
+            failures,
+        )
+
+    def test_secondary_validator_accepts_real_quality_guide_manifest(self) -> None:
+        loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
+        self.assertIsNotNone(loaded)
+        failures = validate_public_site.validate_quality_guide_manifest(loaded)
+        self.assertEqual(failures, [])
 
 
 if __name__ == "__main__":

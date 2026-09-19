@@ -62,20 +62,56 @@ public struct QualityCard: Sendable, Decodable, Equatable {
         }
     }
 
+    /// The slice of `config` this gate consults: `residency`, the only field that changes whether a
+    /// card is even ELIGIBLE to gate a resident Swift launch. Decoded leniently — a missing or `null`
+    /// `residency` is `nil` here (→ "resident" via `QualityCard.effectiveResidency`), and any other
+    /// emitter-side `config` field (`quant`, `enhancement`, `hardwareClass`, …) is ignored, never
+    /// failing this decode.
+    public struct Config: Sendable, Decodable, Equatable {
+        public let residency: String?
+
+        public init(residency: String? = nil) {
+            self.residency = residency
+        }
+    }
+
     public let id: String
     public let model: Model
     public let verdict: QualityVerdict
     public let admission: Admission
     public let legible: Legible
+    /// `nil` when the card predates the `config.residency` field, or when its `config` object omits
+    /// `residency` — both mean "measured resident" per `effectiveResidency` below.
+    public let config: Config?
 
     public init(
-        id: String, model: Model, verdict: QualityVerdict, admission: Admission, legible: Legible
+        id: String, model: Model, verdict: QualityVerdict, admission: Admission, legible: Legible,
+        config: Config? = nil
     ) {
         self.id = id
         self.model = model
         self.verdict = verdict
         self.admission = admission
         self.legible = legible
+        self.config = config
+    }
+
+    /// The residency this card was measured under: `config.residency` verbatim, or `"resident"` when
+    /// `config` or `config.residency` is absent/null. Kept verbatim (never normalized/validated) so an
+    /// unrecognized future value is visible in logs/tests rather than silently coerced.
+    public var effectiveResidency: String {
+        config?.residency ?? "resident"
+    }
+
+    /// `true` only when this card was measured under resident weights — the ONLY residency the Swift
+    /// `fastmlx-serve` engine can serve (it cannot stream experts from SSD). A card measured under SSD
+    /// expert streaming changes greedy-decode output relative to a resident load, so an
+    /// `"expert-stream"` card must never gate a resident launch. Fail-closed: any residency string
+    /// other than exactly `"resident"` — including an unrecognized future value — never matches, so a
+    /// typo'd or forward-incompatible `config.residency` can only ever make a card LESS eligible to
+    /// gate, never silently trusted as resident.
+    public var matchesResidentLaunch: Bool {
+        effectiveResidency == "resident"
     }
 }
 
@@ -133,13 +169,26 @@ struct QualityCardManifest: Decodable {
 /// parse behaves EXACTLY as today — never a refusal caused by a broken loader.
 public enum QualityCardStore {
     /// Pure core: decode `manifestData` as a `fast-mlx-quality-card-v1` manifest and return the first
-    /// card whose `model.repo` matches `repoID`. `nil` on an unknown repo or a decode failure.
+    /// card whose `model.repo` matches `repoID` AND whose `effectiveResidency` is `"resident"`
+    /// (`QualityCard.matchesResidentLaunch`). This engine only serves resident weights — it cannot
+    /// stream experts from SSD — and streaming a model changes its greedy-decode output relative to a
+    /// resident load, so a card measured under `"expert-stream"` (or any unrecognized residency
+    /// string) must never match here, however it is ordered in the manifest: it is treated exactly
+    /// like "no card for this repo", i.e. `.admitUnmeasured`, never as a resident admission input.
+    /// `nil` on an unknown repo, a repo with only non-resident cards, or a decode failure.
     public static func card(forRepo repoID: String, in manifestData: Data) -> QualityCard? {
         guard let manifest = try? JSONDecoder().decode(QualityCardManifest.self, from: manifestData)
         else {
             return nil
         }
-        return manifest.cards.first { $0.model.repo == repoID }
+        return card(forRepo: repoID, in: manifest.cards)
+    }
+
+    /// The single card-selection rule over already-decoded cards: the first card for `repoID` that
+    /// was measured resident. Every Swift call site that picks a card by identity goes through here,
+    /// so the residency filter cannot be bypassed by a caller that loaded the manifest itself.
+    public static func card(forRepo repoID: String, in cards: [QualityCard]) -> QualityCard? {
+        cards.first { $0.model.repo == repoID && $0.matchesResidentLaunch }
     }
 
     /// Convenience: read `manifestURL` and decode it. Returns `nil` (never throws) when the file is
