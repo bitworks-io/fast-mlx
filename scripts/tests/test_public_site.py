@@ -4766,6 +4766,79 @@ class PublicSiteTests(unittest.TestCase):
         failures = validate_public_site.validate_quality_guide_manifest(loaded)
         self.assertEqual(failures, [])
 
+    # ------------------------------------------------------------------
+    # provenance.engineBuild (docs/quality-card-schema-v1.md "Engine
+    # build"): OPTIONAL {"commit": <lowercase 40-hex>}, no other keys.
+    # Both validators (build_public_site.validate_quality_card_document and
+    # validate_public_site.validate_quality_guide_manifest) must agree.
+    # ------------------------------------------------------------------
+    ENGINE_BUILD_VALID_COMMIT = "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6"
+
+    def test_provenance_engine_build_valid_is_accepted_by_both_validators(self) -> None:
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["provenance"]["engineBuild"] = {
+            "commit": self.ENGINE_BUILD_VALID_COMMIT
+        }
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(
+            validated["cards"][0]["provenance"]["engineBuild"],
+            {"commit": self.ENGINE_BUILD_VALID_COMMIT},
+        )
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
+    def test_provenance_engine_build_invalid_variants_rejected_by_both_validators(self) -> None:
+        variants = {
+            "non-object": "not-an-object",
+            "extra-key": {"commit": self.ENGINE_BUILD_VALID_COMMIT, "extra": "x"},
+            "uppercase-commit": {"commit": self.ENGINE_BUILD_VALID_COMMIT.upper()},
+            "short-commit": {"commit": self.ENGINE_BUILD_VALID_COMMIT[:10]},
+            "non-hex-commit": {"commit": "z" * 40},
+            "missing-commit": {},
+        }
+        for label, value in variants.items():
+            with self.subTest(label=label):
+                manifest = self.quality_guide_manifest()
+                manifest["cards"][0]["provenance"]["engineBuild"] = value
+                with self.assertRaises(SystemExit):
+                    build_public_site.validate_quality_card_document(manifest, "test manifest")
+                failures = validate_public_site.validate_quality_guide_manifest(manifest)
+                self.assertTrue(failures, f"{label}: expected at least one failure")
+
+    def test_duplicate_identity_residency_engine_build_is_rejected_by_both_validators(
+        self,
+    ) -> None:
+        manifest = self.quality_guide_manifest()
+        duplicate = json.loads(json.dumps(manifest["cards"][0]))
+        duplicate["id"] = "qwen38-27b-optiq-4bit-dup@m3ultra"
+        manifest["cards"].append(duplicate)
+        with self.assertRaises(SystemExit):
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("duplicates another card" in f for f in failures), failures
+        )
+
+    def test_real_manifest_flash_next_cards_carry_expected_engine_build_sha(self) -> None:
+        loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
+        self.assertIsNotNone(loaded)
+        flash_next_cards = [
+            card for card in loaded["cards"] if card["model"]["family"] == "Qwen3.8-Flash-Next"
+        ]
+        self.assertTrue(flash_next_cards, "expected at least one Qwen3.8-Flash-Next card")
+        for card in flash_next_cards:
+            self.assertEqual(
+                card["provenance"].get("engineBuild"),
+                {"commit": self.ENGINE_BUILD_VALID_COMMIT},
+                card["id"],
+            )
+        other_family_cards = [
+            card for card in loaded["cards"] if card["model"]["family"] != "Qwen3.8-Flash-Next"
+        ]
+        self.assertTrue(other_family_cards, "expected at least one non-Flash-Next card")
+        for card in other_family_cards:
+            self.assertNotIn("engineBuild", card["provenance"], card["id"])
+
 
 if __name__ == "__main__":
     unittest.main()

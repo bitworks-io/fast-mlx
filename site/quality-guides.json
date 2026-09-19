@@ -70,7 +70,10 @@
         "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
         "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
         "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
-        "measuredAt": "2026-09-18T22:30:43Z"
+        "measuredAt": "2026-09-18T22:30:43Z",
+        "engineBuild": {
+          "commit": "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6"
+        }
       },
       "boundary": {
         "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
@@ -153,7 +156,10 @@
         "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
         "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
         "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
-        "measuredAt": "2026-09-18T22:37:29Z"
+        "measuredAt": "2026-09-18T22:37:29Z",
+        "engineBuild": {
+          "commit": "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6"
+        }
       },
       "boundary": {
         "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",

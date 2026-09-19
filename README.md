@@ -345,6 +345,17 @@ disagrees with the launch's own `--residency` (from a fit-check-arg conflict, a 
 `--force`) and `fastmlx recommend` reports that candidate as an error row rather than
 recommending it.
 
+An engine profile also accepts an OPTIONAL `engineBuild` object naming the build THIS profile
+launches: `{"commit": "<40-hex git sha>", "binarySha256": "<64-hex sha256>"}`, both sub-keys
+optional. `commit` is operator-asserted only — never checked against anything, just compared
+against a quality card's own `provenance.engineBuild.commit` (see
+`docs/quality-card-schema-v1.md` "Engine build") so `serve`/`recommend` can tell you when a card's
+measurement and this launch's engine build differ. `binarySha256`, when given, IS verified:
+`fastmlx serve` hashes the resolved engine binary before exec'ing it and refuses (exit 3, not
+overridable by `--force`) on a mismatch. The example profiles under `examples/engine-profiles/`
+intentionally omit `engineBuild` — an asserted commit there would be false for every operator's
+own build of the engine they front.
+
 ### Install a prebuilt release (v0.1.1)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its

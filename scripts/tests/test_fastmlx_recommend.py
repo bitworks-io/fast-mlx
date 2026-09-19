@@ -950,5 +950,122 @@ class RankingHelperTests(unittest.TestCase):
         self.assertEqual(FASTMLX_RECOMMEND.exit_code_for(rows), 2)
 
 
+# ---------------------------------------------------------------------
+# provenance.engineBuild: a recommend row carries the same status/notice
+# fastmlx serve computes (docs/quality-card-schema-v1.md "Engine build"),
+# never gating the row's status/verdict.
+# ---------------------------------------------------------------------
+EB_PASS_REPO_RECOMMEND = "example/EbRecommendPassModel"
+EB_PASS_CARD_ID_RECOMMEND = "eb-recommend-pass@test"
+EB_CARD_COMMIT_RECOMMEND = "5555555555555555555555555555555555555555"
+EB_OTHER_COMMIT_RECOMMEND = "6666666666666666666666666666666666666666"
+
+
+def engine_build_manifest_for_recommend() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": EB_PASS_CARD_ID_RECOMMEND,
+                "model": {"repo": EB_PASS_REPO_RECOMMEND, "hfPin": "eeeeeeee"},
+                "verdict": "PASS",
+                "legible": {"tier": "Reference", "headline": "eb recommend pass headline"},
+                "provenance": {"engineBuild": {"commit": EB_CARD_COMMIT_RECOMMEND}},
+            }
+        ],
+    }
+
+
+class EngineBuildRecommendTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "eb-quality-guides.json"
+        self.manifest_path.write_text(
+            json.dumps(engine_build_manifest_for_recommend()), encoding="utf-8"
+        )
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def make_model_dir(self, name: str, repo: str = None) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        if repo is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision="e" * 40)
+        return model_dir
+
+    def _write_profile(self, commit: str = None) -> Path:
+        document = {
+            "schema": "fastmlx-engine-profile-v1",
+            "name": "eb-profile",
+            "argv": ["{engine_bin}"],
+        }
+        if commit is not None:
+            document["engineBuild"] = {"commit": commit}
+        path = self.root / "eb-profile.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def test_recommend_row_carries_engine_build_object_and_text_line(self):
+        model_dir = self.make_model_dir("eb-pass-model", repo=EB_PASS_REPO_RECOMMEND)
+        profile_path = self._write_profile(commit=EB_OTHER_COMMIT_RECOMMEND)
+        argv = [
+            "recommend",
+            "--quality-cards",
+            str(self.manifest_path),
+            "--model-path",
+            str(model_dir),
+            "--fit-check-bin",
+            str(self.green_fit_bin),
+            "--engine-profile",
+            str(profile_path),
+            "--json",
+        ]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "mismatch")
+        self.assertEqual(row["engineBuild"]["card"], EB_CARD_COMMIT_RECOMMEND)
+        self.assertEqual(row["engineBuild"]["launch"], EB_OTHER_COMMIT_RECOMMEND)
+        self.assertIsNotNone(row["engineBuild"]["message"])
+        self.assertIn(EB_CARD_COMMIT_RECOMMEND[:12], row["engineBuild"]["message"])
+
+        argv_text = [a for a in argv if a != "--json"]
+        _, stdout_text, _ = self.run_main(argv_text)
+        self.assertIn("transfer unmeasured", stdout_text)
+
+    def test_recommend_row_match_has_no_message(self):
+        model_dir = self.make_model_dir("eb-pass-model", repo=EB_PASS_REPO_RECOMMEND)
+        profile_path = self._write_profile(commit=EB_CARD_COMMIT_RECOMMEND)
+        argv = [
+            "recommend",
+            "--quality-cards",
+            str(self.manifest_path),
+            "--model-path",
+            str(model_dir),
+            "--fit-check-bin",
+            str(self.green_fit_bin),
+            "--engine-profile",
+            str(profile_path),
+            "--json",
+        ]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "match")
+        self.assertIsNone(row["engineBuild"]["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

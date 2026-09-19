@@ -179,6 +179,7 @@ def build_row(
     context: Optional[int],
     fit_check_args: list,
     residency: str = "resident",
+    engine_build_commit: Optional[str] = None,
 ) -> dict:
     """Resolve one candidate to a fully-classified row. Never raises: an
     ambiguous card lookup (``LaunchRefusal`` from ``resolve_card``) or a fit
@@ -198,6 +199,7 @@ def build_row(
         "card": None,
         "message": None,
         "accept_quality_flag": None,
+        "engineBuild": None,
     }
 
     if not model_path.is_dir():
@@ -228,11 +230,38 @@ def build_row(
         launch.print_no_model_identity_hint("fastmlx recommend", str(model_path))
 
     try:
-        card = launch.resolve_card(cards, model_repo, model_revision, residency=residency)
+        card = launch.resolve_card(
+            cards,
+            model_repo,
+            model_revision,
+            residency=residency,
+            engine_build_commit=engine_build_commit,
+        )
     except launch.LaunchRefusal as refusal:
         row["status"] = STATUS_ERROR
         row["message"] = refusal.message
         return row
+
+    # Engine-build status/notice: informational only, never gates a row's
+    # status/verdict (mirrors fastmlx serve -- see docs/quality-card-schema-v1.md
+    # "Engine build"). Computed as soon as the card is known, regardless of
+    # what the fit check below decides.
+    card_build_commit = launch.card_engine_build_commit(card)
+    build_status = launch.engine_build_status(card_build_commit, engine_build_commit)
+    build_message = None
+    if build_status in (
+        launch.ENGINE_BUILD_STATUS_UNDECLARED,
+        launch.ENGINE_BUILD_STATUS_MISMATCH,
+    ):
+        build_message = launch.engine_build_notice_text(
+            card.get("id") if card else None, card_build_commit, engine_build_commit
+        )
+    row["engineBuild"] = {
+        "status": build_status,
+        "card": card_build_commit,
+        "launch": engine_build_commit,
+        "message": build_message,
+    }
 
     resolved_model_id = model_path.resolve().name
     fit_result = (
@@ -374,6 +403,10 @@ def _format_row_text(rank: int, row: dict) -> str:
     flag = row.get("accept_quality_flag")
     if flag and flag not in (row.get("message") or ""):
         tail += f" ({flag})"
+    engine_build = row.get("engineBuild")
+    build_message = engine_build.get("message") if engine_build else None
+    if build_message and build_message not in (row.get("message") or ""):
+        tail += f" {build_message}"
     lines.append(tail)
     return "\n".join(lines)
 
@@ -432,6 +465,11 @@ def _run_recommend(args) -> int:
         print(f"fastmlx recommend: {refusal.message}", file=sys.stderr)
         return refusal.exit_code
 
+    # Read only for engine-build status/notice (see build_row); this script
+    # never execs anything, so a profile's engineBuild.binarySha256 is never
+    # verified here.
+    engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
+
     fit_check_bin, profile_extra_args, overridden = _resolve_fit_check_bin(
         args.fit_check_bin, profile.get("fitCheck")
     )
@@ -481,6 +519,7 @@ def _run_recommend(args) -> int:
             context=args.context,
             fit_check_args=combined_fit_check_args,
             residency=args.residency,
+            engine_build_commit=engine_build_commit,
         )
         for candidate in candidates
     ]

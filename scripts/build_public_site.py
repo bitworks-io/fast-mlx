@@ -101,6 +101,22 @@ QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
 QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
 QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
+QUALITY_CARD_PROVENANCE_REQUIRED_KEYS = {
+    "source",
+    "vendor",
+    "method",
+    "confound",
+    "hardware",
+    "harnessGitSHA",
+    "corpusId",
+    "sourceVerdict",
+    "measuredAt",
+}
+# `engineBuild` is OPTIONAL: the served-engine build a card's measurement ran
+# on (see docs/quality-card-schema-v1.md "Engine build"). Absent means
+# "unrecorded" -- never inferred, never defaulted to a fabricated commit.
+QUALITY_CARD_PROVENANCE_ALLOWED_KEYS = QUALITY_CARD_PROVENANCE_REQUIRED_KEYS | {"engineBuild"}
+QUALITY_CARD_ENGINE_BUILD_COMMIT = re.compile(r"[0-9a-f]{40}")
 QUALITY_VERDICT_LABELS: Dict[str, str] = {
     "NO_GO": "Opt-in only",
     "PASS": "Passes review",
@@ -699,6 +715,13 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
     if not isinstance(cards, list) or not cards:
         fail(f"{label} must contain at least one card")
     seen_ids: set[str] = set()
+    # Identity for the (identity, residency, engineBuild) duplicate check
+    # below: (model.repo if non-null else model.hfPin, normalized residency,
+    # provenance.engineBuild.commit or None). Two cards sharing all three
+    # would be indistinguishable to fastmlx_launch.resolve_card's
+    # engine-build disambiguation (see docs/quality-card-schema-v1.md
+    # "Engine build") -- refused here instead of silently tying at runtime.
+    seen_identity_engine_builds: set[tuple] = set()
     validated_cards: List[Dict[str, object]] = []
     for index, raw_card in enumerate(cards):
         card_label = f"{label} card entry {index}"
@@ -862,21 +885,36 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
         if not raw_metrics and verdict != "EXACT":
             fail(f"{card_label} rawMetrics must be a non-empty object")
 
-        provenance = require_exact_keys(
-            card.get("provenance"),
-            {
-                "source",
-                "vendor",
-                "method",
-                "confound",
-                "hardware",
-                "harnessGitSHA",
-                "corpusId",
-                "sourceVerdict",
-                "measuredAt",
-            },
-            f"{card_label} provenance",
-        )
+        raw_provenance = card.get("provenance")
+        if not isinstance(raw_provenance, dict):
+            fail(f"{card_label} provenance is not an object")
+        provenance_keys = set(raw_provenance)
+        if not (
+            QUALITY_CARD_PROVENANCE_REQUIRED_KEYS
+            <= provenance_keys
+            <= QUALITY_CARD_PROVENANCE_ALLOWED_KEYS
+        ):
+            missing = sorted(QUALITY_CARD_PROVENANCE_REQUIRED_KEYS - provenance_keys)
+            extra = sorted(provenance_keys - QUALITY_CARD_PROVENANCE_ALLOWED_KEYS)
+            fail(f"{card_label} provenance keys differ from schema; missing={missing} extra={extra}")
+        provenance = raw_provenance
+        # `engineBuild` is OPTIONAL; when present its only allowed key is
+        # `commit`, a lowercase 40-hex git sha.
+        raw_engine_build = provenance.get("engineBuild")
+        engine_build_commit: Optional[str] = None
+        if raw_engine_build is not None:
+            engine_build = require_exact_keys(
+                raw_engine_build, {"commit"}, f"{card_label} provenance.engineBuild"
+            )
+            commit = engine_build.get("commit")
+            if not isinstance(commit, str) or not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(
+                commit
+            ):
+                fail(
+                    f"{card_label} provenance.engineBuild.commit must be a lowercase "
+                    "40-hex string"
+                )
+            engine_build_commit = commit
         source = require_text(provenance, "source", f"{card_label} provenance")
         if source not in QUALITY_PROVENANCE_SOURCES:
             fail(f"{card_label} provenance has unknown source {source!r}")
@@ -907,6 +945,17 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
             not isinstance(item, str) or not item.strip() for item in unmeasured
         ):
             fail(f"{card_label} boundary.unmeasured must be a list of non-empty strings")
+
+        repo_value = model.get("repo")
+        identity = repo_value if repo_value is not None else model.get("hfPin")
+        residency_value = config.get("residency") if isinstance(config, dict) else None
+        identity_key = (identity, residency_value or "resident", engine_build_commit)
+        if identity_key in seen_identity_engine_builds:
+            fail(
+                f"{card_label} duplicates another card's (identity, residency, "
+                f"engineBuild) combination {identity_key!r}"
+            )
+        seen_identity_engine_builds.add(identity_key)
 
         validated_cards.append(card)
 

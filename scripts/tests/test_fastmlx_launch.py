@@ -1575,6 +1575,382 @@ def write_expert_stream_card_manifest(root: Path) -> Path:
     return path
 
 
+# ---------------------------------------------------------------------
+# provenance.engineBuild / engine profile engineBuild: fastmlx serve reports
+# whether the engine build a launch runs matches the one a quality card was
+# measured on (docs/quality-card-schema-v1.md "Engine build"). NEVER used to
+# filter card admission -- only to classify a status and surface a stderr
+# notice / refusal-message addendum.
+# ---------------------------------------------------------------------
+EB_CARD_COMMIT = "a1" * 20
+EB_OTHER_COMMIT = "b2" * 20
+
+EB_NO_GO_CARD_ID = "eb-no-go@test"
+EB_NO_GO_REPO = "example/EbNoGoModel"
+
+EB_PASS_CARD_ID = "eb-pass@test"
+EB_PASS_REPO = "example/EbPassModel"
+
+EB_UNRECORDED_CARD_ID = "eb-unrecorded@test"
+EB_UNRECORDED_REPO = "example/EbUnrecordedModel"
+
+
+def engine_build_card_manifest() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": EB_NO_GO_CARD_ID,
+                "model": {"repo": EB_NO_GO_REPO, "hfPin": "deadbee1"},
+                "verdict": "NO_GO",
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "quality-degraded vs reference",
+                },
+                "legible": {"tier": "Noticeable", "headline": "eb no-go headline"},
+                "provenance": {"engineBuild": {"commit": EB_CARD_COMMIT}},
+            },
+            {
+                "id": EB_PASS_CARD_ID,
+                "model": {"repo": EB_PASS_REPO, "hfPin": "cafebab1"},
+                "verdict": "PASS",
+                "admission": {"default": True, "optIn": False, "reason": "measured pass"},
+                "legible": {"tier": "Reference", "headline": "eb pass headline"},
+                "provenance": {"engineBuild": {"commit": EB_CARD_COMMIT}},
+            },
+            {
+                "id": EB_UNRECORDED_CARD_ID,
+                "model": {"repo": EB_UNRECORDED_REPO, "hfPin": "0badc0d1"},
+                "verdict": "PASS",
+                "admission": {"default": True, "optIn": False, "reason": "measured pass"},
+                "legible": {"tier": "Reference", "headline": "eb unrecorded headline"},
+                # No provenance at all: engine build "unrecorded".
+            },
+        ],
+    }
+
+
+def write_engine_build_card_manifest(root: Path) -> Path:
+    path = root / "eb-quality-cards.json"
+    path.write_text(json.dumps(engine_build_card_manifest()), encoding="utf-8")
+    return path
+
+
+DUAL_BUILD_REPO = "example/DualBuildModel"
+DUAL_BUILD_CARD_A_ID = "dual-build-a@test"
+DUAL_BUILD_CARD_B_ID = "dual-build-b@test"
+DUAL_BUILD_COMMIT_A = "c3" * 20
+DUAL_BUILD_COMMIT_B = "d4" * 20
+
+
+def dual_engine_build_card_manifest() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": DUAL_BUILD_CARD_A_ID,
+                "model": {"repo": DUAL_BUILD_REPO, "hfPin": "aaaaaaaa"},
+                "verdict": "PASS",
+                "admission": {"default": True, "optIn": False, "reason": "pass build A"},
+                "legible": {"tier": "Reference", "headline": "Build A pass."},
+                "provenance": {"engineBuild": {"commit": DUAL_BUILD_COMMIT_A}},
+            },
+            {
+                "id": DUAL_BUILD_CARD_B_ID,
+                "model": {"repo": DUAL_BUILD_REPO, "hfPin": "bbbbbbbb"},
+                "verdict": "PASS",
+                "admission": {"default": True, "optIn": False, "reason": "pass build B"},
+                "legible": {"tier": "Reference", "headline": "Build B pass."},
+                "provenance": {"engineBuild": {"commit": DUAL_BUILD_COMMIT_B}},
+            },
+        ],
+    }
+
+
+def write_dual_engine_build_card_manifest(root: Path) -> Path:
+    path = root / "dual-eb-quality-cards.json"
+    path.write_text(json.dumps(dual_engine_build_card_manifest()), encoding="utf-8")
+    return path
+
+
+def write_engine_build_profile(
+    root: Path, name: str, commit: str = None, binary_sha256: str = None
+) -> Path:
+    document = {
+        "schema": "fastmlx-engine-profile-v1",
+        "name": name,
+        "argv": list(FASTMLX_LAUNCH.BUILT_IN_ENGINE_PROFILE["argv"]),
+    }
+    engine_build = {}
+    if commit is not None:
+        engine_build["commit"] = commit
+    if binary_sha256 is not None:
+        engine_build["binarySha256"] = binary_sha256
+    if engine_build:
+        document["engineBuild"] = engine_build
+    path = root / f"{name}.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+class EngineBuildTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.manifest_path = write_engine_build_card_manifest(self.root)
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def base_args(self, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def last_json_line(stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        return json.loads(lines[-1])
+
+    # (i) NO_GO + mismatch, no opt-in: refuses exit 2 AND the refusal
+    # message itself carries the engine-build notice -- engine build never
+    # filters a card the way residency does.
+    def test_no_go_card_mismatch_refuses_with_notice_in_message(self):
+        profile_path = write_engine_build_profile(
+            self.root, "mismatch-profile", commit=EB_OTHER_COMMIT
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": EB_NO_GO_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn(EB_CARD_COMMIT[:12], stderr)
+        self.assertIn(EB_OTHER_COMMIT[:12], stderr)
+        self.assertIn("transfer unmeasured", stderr)
+
+    # (ii) default-admit (PASS) card + mismatch: admits; stderr has both
+    # 12-char shas; dry-run plan status is "mismatch".
+    def test_pass_card_mismatch_admits_with_notice_and_plan_status(self):
+        profile_path = write_engine_build_profile(
+            self.root, "mismatch-profile", commit=EB_OTHER_COMMIT
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": EB_PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(EB_CARD_COMMIT[:12], stderr)
+        self.assertIn(EB_OTHER_COMMIT[:12], stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "mismatch")
+        self.assertEqual(plan["engineBuild"]["card"], EB_CARD_COMMIT)
+        self.assertEqual(plan["engineBuild"]["launch"], EB_OTHER_COMMIT)
+
+    # (iii) match: no notice on stderr; plan status "match".
+    def test_pass_card_match_admits_with_no_notice(self):
+        profile_path = write_engine_build_profile(self.root, "match-profile", commit=EB_CARD_COMMIT)
+        argv = self.base_args(
+            **{
+                "--model-repo": EB_PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "match")
+
+    # (iv) undeclared: card has a build, launch (built-in profile) does not.
+    def test_pass_card_undeclared_admits_with_notice(self):
+        argv = self.base_args(**{"--model-repo": EB_PASS_REPO, "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("undeclared", stderr)
+        self.assertIn(EB_CARD_COMMIT[:12], stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+        self.assertIsNone(plan["engineBuild"]["launch"])
+
+    # (v) unrecorded: card has no engineBuild at all -- no notice regardless
+    # of the launch's own build.
+    def test_unrecorded_card_never_prints_notice(self):
+        profile_path = write_engine_build_profile(
+            self.root, "some-profile", commit=EB_OTHER_COMMIT
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": EB_UNRECORDED_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "unrecorded")
+
+    # (vi) explicit --card-id gets the same status/notice, and never
+    # refuses due to build.
+    def test_explicit_card_id_gets_same_status_and_never_refuses_on_build(self):
+        profile_path = write_engine_build_profile(
+            self.root, "mismatch-profile", commit=EB_OTHER_COMMIT
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": EB_PASS_REPO,
+                "--card-id": EB_PASS_CARD_ID,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "mismatch")
+
+    # (vii) invalid profile engineBuild variants: refused exit 3.
+    def test_invalid_engine_build_variants_refuse_exit_3(self):
+        variants = [
+            {"engineBuild": "not-an-object"},
+            {"engineBuild": {"commit": EB_CARD_COMMIT, "unknown": "x"}},
+            {"engineBuild": {"commit": "TOOSHORTORUPPERCASE"}},
+            {"engineBuild": {"commit": EB_CARD_COMMIT.upper()}},
+            {"engineBuild": {"binarySha256": "not-64-hex"}},
+        ]
+        for extra in variants:
+            with self.subTest(extra=extra):
+                document = {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "bad-profile",
+                    "argv": list(FASTMLX_LAUNCH.BUILT_IN_ENGINE_PROFILE["argv"]),
+                }
+                document.update(extra)
+                profile_path = self.root / "bad-profile.json"
+                profile_path.write_text(json.dumps(document), encoding="utf-8")
+                argv = self.base_args(
+                    **{"--context": "2048", "--engine-profile": str(profile_path)}
+                ) + ["--dry-run"]
+                code, _, stderr = self.run_main(argv)
+                self.assertEqual(code, 3, stderr)
+                self.assertIn("engineBuild", stderr)
+
+    # (viii) binarySha256: wrong hash refuses exit 3 EVEN with --force;
+    # correct hash admits.
+    def test_binary_sha256_mismatch_refuses_even_with_force(self):
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(self.fake_engine_bin))
+        wrong_sha256 = ("0" if actual_sha256[0] != "0" else "1") + actual_sha256[1:]
+        profile_path = write_engine_build_profile(
+            self.root, "sha-profile", binary_sha256=wrong_sha256
+        )
+        argv = self.base_args(
+            **{"--context": "2048", "--engine-profile": str(profile_path), "--force": ""}
+        )
+        argv = [a for a in argv if a != ""] + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("binarySha256", stderr)
+
+    def test_binary_sha256_match_admits(self):
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(self.fake_engine_bin))
+        profile_path = write_engine_build_profile(
+            self.root, "sha-profile", binary_sha256=actual_sha256
+        )
+        argv = self.base_args(
+            **{"--context": "2048", "--engine-profile": str(profile_path)}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+
+    # (ix) two cards for the same pack (same repo/residency, different
+    # engine builds): the launch whose engineBuild.commit matches one
+    # exactly is picked; an undeclared launch refuses exit 3.
+    def test_two_cards_same_pack_picks_exact_build_match(self):
+        manifest_path = write_dual_engine_build_card_manifest(self.root)
+        profile_path = write_engine_build_profile(
+            self.root, "dual-a-profile", commit=DUAL_BUILD_COMMIT_A
+        )
+        argv = self.base_args(
+            **{
+                "--quality-cards": str(manifest_path),
+                "--model-repo": DUAL_BUILD_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            }
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["card"]["id"], DUAL_BUILD_CARD_A_ID)
+
+    def test_two_cards_same_pack_undeclared_launch_refuses_exit_3(self):
+        manifest_path = write_dual_engine_build_card_manifest(self.root)
+        argv = self.base_args(
+            **{
+                "--quality-cards": str(manifest_path),
+                "--model-repo": DUAL_BUILD_REPO,
+                "--context": "2048",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("cards for this pack", stderr)
+        self.assertIn("--card-id", stderr)
+
+    def test_two_cards_same_pack_picks_the_second_listed_build(self):
+        # Build B is listed second, so a first-wins lookup would return A.
+        cards = dual_engine_build_card_manifest()["cards"]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, DUAL_BUILD_REPO, None, engine_build_commit=DUAL_BUILD_COMMIT_B
+        )
+        self.assertEqual(card["id"], DUAL_BUILD_CARD_B_ID)
+
+    def test_undeclared_launch_never_picks_the_unrecorded_card_of_several(self):
+        cards = dual_engine_build_card_manifest()["cards"]
+        del cards[1]["provenance"]["engineBuild"]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(cards, DUAL_BUILD_REPO, None)
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("undeclared", ctx.exception.message)
+
+
 class ResidencyTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

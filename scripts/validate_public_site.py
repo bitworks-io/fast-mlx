@@ -35,6 +35,19 @@ QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
 QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
 QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
+QUALITY_CARD_PROVENANCE_REQUIRED_KEYS = {
+    "source",
+    "vendor",
+    "method",
+    "confound",
+    "hardware",
+    "harnessGitSHA",
+    "corpusId",
+    "sourceVerdict",
+    "measuredAt",
+}
+QUALITY_CARD_PROVENANCE_ALLOWED_KEYS = QUALITY_CARD_PROVENANCE_REQUIRED_KEYS | {"engineBuild"}
+QUALITY_CARD_ENGINE_BUILD_COMMIT = re.compile(r"[0-9a-f]{40}")
 QUALITY_CARD_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+)*")
 QUALITY_GUIDE_PUBLIC_FILE = "quality/index.html"
 CAPABILITY_STATUS_LABELS = {
@@ -4609,6 +4622,9 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
         return failures
 
     seen_ids: set[str] = set()
+    # See build_public_site.validate_quality_card_document's identical
+    # tracking set for the rule this enforces.
+    seen_identity_engine_builds: set[tuple] = set()
     for index, raw_card in enumerate(cards):
         label = f"quality card entry {index}"
         failures.extend(
@@ -4803,23 +4819,39 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
             failures.append(f"{label} rawMetrics must be a non-empty object")
 
         provenance = card.get("provenance")
-        failures.extend(
-            key_failures(
-                provenance,
-                {
-                    "source",
-                    "vendor",
-                    "method",
-                    "confound",
-                    "hardware",
-                    "harnessGitSHA",
-                    "corpusId",
-                    "sourceVerdict",
-                    "measuredAt",
-                },
-                f"{label} provenance",
-            )
-        )
+        engine_build_commit: Optional[str] = None
+        if not isinstance(provenance, dict):
+            failures.append(f"{label} provenance is not an object")
+        else:
+            provenance_keys = set(provenance)
+            if not (
+                QUALITY_CARD_PROVENANCE_REQUIRED_KEYS
+                <= provenance_keys
+                <= QUALITY_CARD_PROVENANCE_ALLOWED_KEYS
+            ):
+                missing = sorted(QUALITY_CARD_PROVENANCE_REQUIRED_KEYS - provenance_keys)
+                extra = sorted(provenance_keys - QUALITY_CARD_PROVENANCE_ALLOWED_KEYS)
+                failures.append(
+                    f"{label} provenance keys differ from schema; missing={missing} extra={extra}"
+                )
+            raw_engine_build = provenance.get("engineBuild")
+            if raw_engine_build is not None:
+                failures.extend(
+                    key_failures(
+                        raw_engine_build, {"commit"}, f"{label} provenance.engineBuild"
+                    )
+                )
+                if isinstance(raw_engine_build, dict):
+                    commit = raw_engine_build.get("commit")
+                    if not isinstance(
+                        commit, str
+                    ) or not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(commit):
+                        failures.append(
+                            f"{label} provenance.engineBuild.commit must be a lowercase "
+                            "40-hex string"
+                        )
+                    else:
+                        engine_build_commit = commit
         if isinstance(provenance, dict):
             source = require_str(provenance, "source", f"{label} provenance", failures)
             if source is not None and source not in QUALITY_PROVENANCE_SOURCES:
@@ -4856,6 +4888,20 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                 not isinstance(item, str) or not item.strip() for item in unmeasured
             ):
                 failures.append(f"{label} boundary.unmeasured must be a list of non-empty strings")
+
+        repo_value = model.get("repo") if isinstance(model, dict) else None
+        identity = repo_value if repo_value is not None else (
+            model.get("hfPin") if isinstance(model, dict) else None
+        )
+        residency_value = config.get("residency") if isinstance(config, dict) else None
+        identity_key = (identity, residency_value or "resident", engine_build_commit)
+        if identity_key in seen_identity_engine_builds:
+            failures.append(
+                f"{label} duplicates another card's (identity, residency, engineBuild) "
+                f"combination {identity_key!r}"
+            )
+        else:
+            seen_identity_engine_builds.add(identity_key)
     return failures
 
 

@@ -58,7 +58,8 @@
         "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
         "corpusId": "measurement-corpus-v2",
         "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
-        "measuredAt": "2026-09-02T20:35:47Z"
+        "measuredAt": "2026-09-02T20:35:47Z",
+        "engineBuild": { "commit": "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6" }
       },
       "boundary": {
         "scope": "serving-admission quality signal for THIS build on THIS hardware class",

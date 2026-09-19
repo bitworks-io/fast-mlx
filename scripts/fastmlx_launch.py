@@ -42,6 +42,7 @@ streaming flag directly as a passthrough argument.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -92,6 +93,21 @@ ALLOWED_ENGINE_PROFILE_PLACEHOLDERS = {
 # ``card_residency``). "expert-stream" is the only other recognized value.
 RESIDENCIES = ("resident", "expert-stream")
 ALLOWED_RESIDENCY_ARGS_KEYS = {"expert-stream"}
+
+# An engine profile's OPTIONAL `engineBuild` names the engine build this
+# profile launches: `commit` (a lowercase 40-hex git sha, operator-asserted)
+# and/or `binarySha256` (a lowercase 64-hex sha256 of the resolved engine
+# binary, VERIFIED by this launcher before exec -- see the binarySha256
+# check in `_run_serve`). Both sub-keys are optional; no other key is
+# allowed. See `docs/quality-card-schema-v1.md` "Engine build".
+ALLOWED_ENGINE_BUILD_PROFILE_KEYS = {"commit", "binarySha256"}
+_LOWERCASE_HEX40_RE = re.compile(r"[0-9a-f]{40}")
+_LOWERCASE_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+
+ENGINE_BUILD_STATUS_UNRECORDED = "unrecorded"
+ENGINE_BUILD_STATUS_MATCH = "match"
+ENGINE_BUILD_STATUS_UNDECLARED = "undeclared"
+ENGINE_BUILD_STATUS_MISMATCH = "mismatch"
 
 # An engine profile's OPTIONAL `fitCheck` object names the sizer this
 # profile's own engine needs -- see `_validate_fit_check` for the full
@@ -316,13 +332,24 @@ def find_card_by_id(cards: list, card_id: str) -> Optional[dict]:
     return None
 
 
-def find_card_by_repo(cards: list, repo: Optional[str]) -> Optional[dict]:
+def find_cards_by_repo(cards: list, repo: Optional[str]) -> list:
+    """Every card matching ``repo`` exactly, in list order -- the plural form
+    ``resolve_card`` uses to detect when a repo names MORE than one card
+    (the "multiple cards for one pack" engine-build-disambiguation case; see
+    ``docs/quality-card-schema-v1.md`` "Engine build").
+    """
     if repo is None:
-        return None
-    for card in cards:
-        if isinstance(card, dict) and card.get("model", {}).get("repo") == repo:
-            return card
-    return None
+        return []
+    return [
+        card
+        for card in cards
+        if isinstance(card, dict) and card.get("model", {}).get("repo") == repo
+    ]
+
+
+def find_card_by_repo(cards: list, repo: Optional[str]) -> Optional[dict]:
+    matches = find_cards_by_repo(cards, repo)
+    return matches[0] if matches else None
 
 
 _HEX_DIGITS_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -361,16 +388,26 @@ def _hf_pin_matches_revision(hf_pin: Optional[str], model_revision: Optional[str
     return model_revision.lower().startswith(hf_pin.lower())
 
 
-def find_card_by_pin(cards: list, model_revision: Optional[str]) -> Optional[dict]:
+def find_cards_by_pin(cards: list, model_revision: Optional[str]) -> list:
+    """Every card whose hfPin prefix-matches ``model_revision``, in list
+    order -- the plural counterpart to ``find_card_by_pin`` (see
+    ``find_cards_by_repo``).
+    """
     if not _is_full_hex_revision(model_revision):
-        return None
+        return []
+    matches = []
     for card in cards:
         if not isinstance(card, dict):
             continue
         hf_pin = (card.get("model") or {}).get("hfPin")
         if _hf_pin_matches_revision(hf_pin, model_revision):
-            return card
-    return None
+            matches.append(card)
+    return matches
+
+
+def find_card_by_pin(cards: list, model_revision: Optional[str]) -> Optional[dict]:
+    matches = find_cards_by_pin(cards, model_revision)
+    return matches[0] if matches else None
 
 
 def card_residency(card: dict) -> Optional[str]:
@@ -396,15 +433,72 @@ def card_residency(card: dict) -> Optional[str]:
     return None
 
 
+def card_engine_build_commit(card: Optional[dict]) -> Optional[str]:
+    """The measured engine-build commit ``card`` records
+    (``provenance.engineBuild.commit``), or ``None`` when the card carries
+    no ``provenance``, no ``engineBuild``, or a malformed one -- fails open
+    to "unrecorded" rather than raising, since a fixture/hand-added card is
+    never required to carry this OPTIONAL field.
+    """
+    if card is None:
+        return None
+    provenance = card.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    engine_build = provenance.get("engineBuild")
+    if not isinstance(engine_build, dict):
+        return None
+    commit = engine_build.get("commit")
+    return commit if isinstance(commit, str) else None
+
+
+def engine_build_status(card_commit: Optional[str], launch_commit: Optional[str]) -> str:
+    """Classify a card's measured engine build against a launch's own, per
+    ``docs/quality-card-schema-v1.md`` "Engine build":
+
+    - ``unrecorded``: the card never recorded a build (``card_commit is None``).
+    - ``undeclared``: the card recorded a build but this launch's engine
+      profile did not (``launch_commit is None``).
+    - ``match`` / ``mismatch``: both are recorded; equal or not.
+
+    NEVER used to filter card admission -- only to classify it for the
+    notice/message this module's callers surface.
+    """
+    if card_commit is None:
+        return ENGINE_BUILD_STATUS_UNRECORDED
+    if launch_commit is None:
+        return ENGINE_BUILD_STATUS_UNDECLARED
+    if card_commit == launch_commit:
+        return ENGINE_BUILD_STATUS_MATCH
+    return ENGINE_BUILD_STATUS_MISMATCH
+
+
+def engine_build_notice_text(
+    card_id: Optional[str], card_commit: str, launch_commit: Optional[str]
+) -> str:
+    """The one-line "transfer unmeasured" notice body for an
+    ``undeclared``/``mismatch`` engine-build status -- shared by
+    ``fastmlx_launch`` (prefixed ``"fastmlx serve: "`` on stderr, and
+    appended to a NO_GO refusal message) and ``fastmlx_recommend`` (surfaced
+    as a row's own ``message``).
+    """
+    launch_desc = launch_commit[:12] if launch_commit else "undeclared"
+    return (
+        f"card {card_id} was measured on engine build {card_commit[:12]}; "
+        f"this launch is {launch_desc} — transfer unmeasured"
+    )
+
+
 def resolve_card(
     cards: Optional[list],
     model_repo: Optional[str],
     model_revision: Optional[str],
     residency: str = "resident",
+    engine_build_commit: Optional[str] = None,
 ) -> Optional[dict]:
     """The implicit (no ``--card-id``) lookup: a repo match (Swift semantics)
     OR an hfPin-prefix match against the model's pinned revision. If both
-    exist and name two DIFFERENT cards, the lookup is ambiguous and refuses
+    exist and name DIFFERENT card(s), the lookup is ambiguous and refuses
     rather than silently preferring one -- this can only happen with a
     manifest that names the same model twice under two different cards, one
     keyed by repo and the other only by pin.
@@ -413,6 +507,15 @@ def resolve_card(
     residency``) BEFORE either lookup and before the ambiguity check: a
     card measured for the other residency is invisible to this lookup, the
     same way a card for a different model is.
+
+    A repo or pin match can now name MORE THAN ONE card -- the same pack
+    measured on more than one engine build. When it does, the single card
+    whose ``provenance.engineBuild.commit`` equals ``engine_build_commit``
+    (this launch's own engine build) is selected. An undeclared launch
+    (``None``) selects none of them, not even an unrecorded card; anything else (no exact match, or more than one) refuses
+    (exit 3) rather than silently picking one -- engine build is never used
+    to FILTER a card the way residency does, only to disambiguate an
+    otherwise-tied identity match.
     """
     if cards is None:
         return None
@@ -421,19 +524,43 @@ def resolve_card(
         for card in cards
         if isinstance(card, dict) and card_residency(card) == residency
     ]
-    repo_card = find_card_by_repo(residency_cards, model_repo)
-    pin_card = find_card_by_pin(residency_cards, model_revision)
-    if repo_card is not None and pin_card is not None and repo_card.get("id") != pin_card.get(
-        "id"
-    ):
+    repo_cards = find_cards_by_repo(residency_cards, model_repo)
+    pin_cards = find_cards_by_pin(residency_cards, model_revision)
+    repo_ids = {card.get("id") for card in repo_cards}
+    pin_ids = {card.get("id") for card in pin_cards}
+    if repo_ids and pin_ids and repo_ids != pin_ids:
         raise LaunchRefusal(
             3,
             "quality card lookup is ambiguous: repo "
-            f"{model_repo!r} matches card {repo_card.get('id')!r} but pinned "
-            f"revision {model_revision!r} matches a different card "
-            f"{pin_card.get('id')!r}",
+            f"{model_repo!r} matches card(s) {sorted(repo_ids)} but pinned "
+            f"revision {model_revision!r} matches different card(s) "
+            f"{sorted(pin_ids)}",
         )
-    return repo_card if repo_card is not None else pin_card
+    candidates = repo_cards if repo_cards else pin_cards
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # An undeclared launch never picks among several cards, not even the one
+    # whose build is also unrecorded: that would let an unrecorded card
+    # silently shadow a measured one.
+    exact_matches = [
+        card
+        for card in candidates
+        if engine_build_commit is not None
+        and card_engine_build_commit(card) == engine_build_commit
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    build_labels = sorted(
+        (card_engine_build_commit(card) or "undeclared")[:12] for card in candidates
+    )
+    raise LaunchRefusal(
+        3,
+        f"{len(candidates)} cards for this pack at builds {','.join(build_labels)}; "
+        "declare engineBuild.commit in the engine profile or pass --card-id",
+    )
 
 
 def card_matches_model_identity(
@@ -544,6 +671,60 @@ def _validate_residency_args(document: dict, path: str) -> dict:
                 )
         validated[key] = value
     return validated
+
+
+def _validate_engine_build_profile(document: dict, path: str) -> Optional[dict]:
+    """Validate the OPTIONAL ``engineBuild`` key of an engine profile.
+
+    Its only allowed keys are ``commit`` (a lowercase 40-hex git sha) and
+    ``binarySha256`` (a lowercase 64-hex sha256), both optional. Returns
+    ``None`` when the key is absent; otherwise a dict always carrying both
+    keys (``None`` for whichever sub-key was not given). Refuses
+    (``LaunchRefusal(3, ...)``) on any unrecognized shape -- a malformed
+    ``engineBuild`` must never be silently treated as absent.
+    """
+    if "engineBuild" not in document:
+        return None
+    raw = document["engineBuild"]
+    if not isinstance(raw, dict):
+        raise LaunchRefusal(3, f"engine profile at {path} engineBuild must be an object")
+    extra_keys = sorted(set(raw) - ALLOWED_ENGINE_BUILD_PROFILE_KEYS)
+    if extra_keys:
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} engineBuild has unknown key(s) {extra_keys}; "
+            "the only allowed keys are 'commit' and 'binarySha256'",
+        )
+    commit = raw.get("commit")
+    if commit is not None and (
+        not isinstance(commit, str) or not _LOWERCASE_HEX40_RE.fullmatch(commit)
+    ):
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} engineBuild.commit must be a lowercase 40-hex string",
+        )
+    binary_sha256 = raw.get("binarySha256")
+    if binary_sha256 is not None and (
+        not isinstance(binary_sha256, str) or not _LOWERCASE_HEX64_RE.fullmatch(binary_sha256)
+    ):
+        raise LaunchRefusal(
+            3,
+            f"engine profile at {path} engineBuild.binarySha256 must be a lowercase "
+            "64-hex string",
+        )
+    return {"commit": commit, "binarySha256": binary_sha256}
+
+
+def _sha256_file(path: str) -> str:
+    """The lowercase hex sha256 of the file at ``path``, read in bounded
+    chunks so an arbitrarily large engine binary never has to be held in
+    memory at once.
+    """
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def _resolve_fit_check_bin_value(bin_value: str, path: str) -> str:
@@ -680,6 +861,7 @@ def load_engine_profile(path: Optional[str]) -> tuple:
         profile = dict(BUILT_IN_ENGINE_PROFILE)
         profile["residencyArgs"] = {}
         profile["fitCheck"] = None
+        profile["engineBuild"] = None
         return profile, True
 
     try:
@@ -715,8 +897,15 @@ def load_engine_profile(path: Optional[str]) -> tuple:
                 )
     residency_args = _validate_residency_args(document, path)
     fit_check = _validate_fit_check(document, path)
+    engine_build = _validate_engine_build_profile(document, path)
     return (
-        {"name": name, "argv": argv, "residencyArgs": residency_args, "fitCheck": fit_check},
+        {
+            "name": name,
+            "argv": argv,
+            "residencyArgs": residency_args,
+            "fitCheck": fit_check,
+            "engineBuild": engine_build,
+        },
         False,
     )
 
@@ -975,6 +1164,11 @@ def _run_serve(args, passthrough_args: list) -> int:
     # and failing on it before spending time on a fit-check subprocess
     # call keeps the refusal prompt.
     profile, is_built_in_profile = load_engine_profile(args.engine_profile)
+    # This launch's own engine build (absent for the built-in profile and
+    # for any profile that does not declare one) -- resolved this early
+    # because the quality-card lookup below (`resolve_card`) needs it to
+    # disambiguate a pack with more than one card, never to filter one.
+    launch_engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
 
     # --- residency validation ------------------------------------------
     # A non-resident launch requires the profile to declare the argv this
@@ -1192,15 +1386,34 @@ def _run_serve(args, passthrough_args: list) -> int:
         # visible here; the admission OUTCOME is unchanged either way.
         if model_repo is None and model_revision is None:
             print_no_model_identity_hint("fastmlx serve")
-        card = resolve_card(cards, model_repo, model_revision, residency=residency)
+        card = resolve_card(
+            cards,
+            model_repo,
+            model_revision,
+            residency=residency,
+            engine_build_commit=launch_engine_build_commit,
+        )
+
+    # --- engine-build status (never gates admission; see decide_admission
+    # below) ------------------------------------------------------------
+    card_build_commit = card_engine_build_commit(card)
+    build_status = engine_build_status(card_build_commit, launch_engine_build_commit)
+    build_notice: Optional[str] = None
+    if build_status in (ENGINE_BUILD_STATUS_UNDECLARED, ENGINE_BUILD_STATUS_MISMATCH):
+        build_notice = engine_build_notice_text(
+            card.get("id") if card else None, card_build_commit, launch_engine_build_commit
+        )
 
     opt_in_ids = set(args.accept_quality)
     opted_in = is_opted_in(card, opt_in_ids)
     outcome, message = decide_admission(card, opted_in)
     if outcome == "refuse_quality_flagged":
-        raise LaunchRefusal(2, message)
+        full_message = f"{message} {build_notice}" if build_notice else message
+        raise LaunchRefusal(2, full_message)
     if outcome == "admit_with_quality_flag":
         print(message)
+    if build_notice:
+        print(f"fastmlx serve: {build_notice}", file=sys.stderr)
 
     # --- engine argv ---------------------------------------------------
     engine_bin_value = args.engine_bin
@@ -1214,6 +1427,26 @@ def _run_serve(args, passthrough_args: list) -> int:
     engine_bin_abs = _resolve_executable(engine_bin_value)
     if engine_bin_abs is None:
         raise LaunchRefusal(3, f"engine binary not found: {engine_bin_value}")
+
+    # A profile's engineBuild.binarySha256, when given, is VERIFIED against
+    # the resolved engine binary -- an operator-asserted commit alone
+    # (engineBuild.commit) is never checked this way, only this sha256.
+    # Unconditional: --force never reaches this check (it is only consulted
+    # on the fit-check RED path above), so a binary mismatch can never be
+    # forced through.
+    profile_engine_build = profile.get("engineBuild")
+    expected_binary_sha256 = (
+        profile_engine_build.get("binarySha256") if profile_engine_build else None
+    )
+    if expected_binary_sha256:
+        actual_binary_sha256 = _sha256_file(engine_bin_abs)
+        if actual_binary_sha256 != expected_binary_sha256:
+            raise LaunchRefusal(
+                3,
+                "engine profile engineBuild.binarySha256 "
+                f"{expected_binary_sha256} does not match the resolved engine "
+                f"binary's actual sha256 {actual_binary_sha256} ({engine_bin_abs})",
+            )
 
     substitutions = {
         "engine_bin": engine_bin_abs,
@@ -1234,6 +1467,11 @@ def _run_serve(args, passthrough_args: list) -> int:
         "admission": outcome,
         "argv": final_argv,
         "residency": residency,
+        "engineBuild": {
+            "status": build_status,
+            "card": card_build_commit,
+            "launch": launch_engine_build_commit,
+        },
     }
 
     if args.dry_run:
@@ -1243,7 +1481,8 @@ def _run_serve(args, passthrough_args: list) -> int:
     print(
         "fastmlx_launch=admitted "
         f"engine={profile['name']} card={card.get('id') if card else 'none'} "
-        f"fit={fit_label} context={context} residency={residency}",
+        f"fit={fit_label} context={context} residency={residency} "
+        f"engine_build={build_status}",
         file=sys.stderr,
     )
     os.execv(engine_bin_abs, final_argv)
