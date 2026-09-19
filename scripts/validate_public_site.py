@@ -5103,7 +5103,7 @@ def validate_quality_guide_page(site: Path) -> List[str]:
             if vendor not in text:
                 failures.append(f"quality card {card_id!r} does not render its vendor")
         benefit = legible["benefit"]
-        if benefit.get("speedX") is None and str(benefit["speedXStatus"]) not in text:
+        if str(benefit["speedXStatus"]) not in text:
             failures.append(
                 f"quality card {card_id!r} does not render its speedXStatus text"
             )

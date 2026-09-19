@@ -2230,9 +2230,22 @@ def quality_provenance_label(provenance: Dict[str, object]) -> str:
 
 def quality_speed_line(benefit: Dict[str, object]) -> str:
     speed_x = benefit.get("speedX")
+    status = str(benefit["speedXStatus"])
     if speed_x is None:
-        return str(benefit["speedXStatus"])
-    return f'{speed_x}x faster on this engine (measured)'
+        return status
+    # speedXStatus carries the only measurement boundary (host, engine build,
+    # flags, prompt count) fast-mlx has for a numeric speedX, so it must stay
+    # attached to the number, not disappear once a measurement lands.
+    if speed_x > 1.0:
+        direction = f'{speed_x}x faster on this engine (measured)'
+    elif speed_x < 1.0:
+        # Not "{n}x slower": for a ratio below 1 that phrasing reads as a
+        # factor of slowdown and inverts the meaning. State the ratio, then
+        # name the direction separately.
+        direction = f'{speed_x}x the reference speed on this engine — a slowdown (measured)'
+    else:
+        direction = 'no measured speed difference on this engine (measured)'
+    return f'{direction} — {status}'
 
 
 def quality_admission_framing(verdict: str, admission: Dict[str, object]) -> str:

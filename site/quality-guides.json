@@ -50,9 +50,9 @@
           "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026A hash table achieves average constant-time', the reference picks ' look' and this pack picks ' ('."
         },
         "benefit": {
-          "fit": null,
-          "speedX": null,
-          "speedXStatus": "not-measured"
+          "fit": "70.1 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context (86.1 GiB needed with a 16 GiB KV reserve, against an 88 GiB shared-host ceiling). RED on a 96 GB Mac at any context \u2014 the weights alone exceed that machine's 64 GiB ceiling.",
+          "speedX": 1.19,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build fa76a4b5: median 65.4 vs 54.9 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts x 256 tokens, one warmup pass discarded, median of 3 passes; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
         }
       },
       "rawMetrics": {
@@ -90,7 +90,6 @@
           "closeness to the full-precision (BF16) model",
           "context beyond the native 262,144-token window (YaRN)",
           "other serving engines",
-          "decode throughput (speedX)",
           "tool-call quality",
           "other revisions of the repository (the weights at main 7eaef0fa are byte-identical but the card is pinned to ef5b919d)"
         ]
@@ -135,9 +134,9 @@
           "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026a combination of direct indexing and efficient collision resolution. The process', the reference picks ' works' and this pack picks ' begins'."
         },
         "benefit": {
-          "fit": null,
-          "speedX": null,
-          "speedXStatus": "not-measured"
+          "fit": "50.6 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context, and GREEN on a 96 GB Mac at 65,536 context (58.6 GiB needed with an 8 GiB KV reserve, against a 64 GiB shared-host ceiling) \u2014 where the mixed 4/8-bit pack is RED. This smaller footprint, not speed, is what the 3.3-bit pack buys.",
+          "speedX": 1.07,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build fa76a4b5: median 59.0 vs 54.9 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts x 256 tokens, one warmup pass discarded, median of 3 passes; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
         }
       },
       "rawMetrics": {
@@ -176,7 +175,6 @@
           "closeness to the full-precision (BF16) model",
           "context beyond the native 262,144-token window (YaRN)",
           "other serving engines",
-          "decode throughput (speedX)",
           "tool-call quality"
         ]
       }

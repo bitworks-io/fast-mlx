@@ -4274,6 +4274,20 @@ class PublicSiteTests(unittest.TestCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
 
     @staticmethod
+    def quality_card_fragment(page: str, card_id: str) -> str:
+        """Isolate one rendered `<article data-quality-card="...">` block so a
+        speed-line assertion cannot pass or fail on a different card's copy."""
+        match = re.search(
+            r'<article class="quality-card" data-quality-card="'
+            + re.escape(card_id)
+            + r'"[^>]*>(.*?)</article>',
+            page,
+            re.S,
+        )
+        assert match is not None, f"card {card_id!r} not found in rendered page"
+        return match.group(1)
+
+    @staticmethod
     def expert_stream_card_manifest_document() -> dict[str, object]:
         """A `fast-mlx-quality-card-v1` fixture document holding one NO_GO
         card for the `expert-stream` residency, shaped like a real internal
@@ -4443,6 +4457,89 @@ class PublicSiteTests(unittest.TestCase):
             self.assertIn(card["boundary"]["scope"], page)
 
         self.assertIn(reference_card["legible"]["headline"], page)
+
+    def test_quality_speed_line_below_one_never_says_faster(self) -> None:
+        """A measured speedX below 1.0 is a slowdown. Rendering it with the
+        word "faster" would publish a falsehood — the reader would read a
+        regression as a gain."""
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][0]
+        card["legible"]["benefit"]["speedX"] = 0.485
+        card["legible"]["benefit"]["speedXStatus"] = (
+            "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+
+        page = build_public_site.render_quality_guide(loaded["cards"])
+        fragment = self.quality_card_fragment(page, str(card["id"]))
+        self.assertNotIn("faster", fragment.lower())
+
+    def test_quality_speed_line_always_carries_speedxstatus(self) -> None:
+        """speedXStatus is the only place the measurement boundary (host,
+        engine build, flags, prompt count) lives. It must render even once a
+        numeric speedX lands, not only in the null/not-measured case."""
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][0]
+        card["legible"]["benefit"]["speedX"] = 1.6
+        card["legible"]["benefit"]["speedXStatus"] = (
+            "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+
+        page = build_public_site.render_quality_guide(loaded["cards"])
+        fragment = self.quality_card_fragment(page, str(card["id"]))
+        self.assertIn(card["legible"]["benefit"]["speedXStatus"], fragment)
+
+    def test_validator_rejects_quality_page_missing_speedxstatus_even_when_measured(
+        self,
+    ) -> None:
+        """Mirrors the speedXStatus rendering check but for the measured case:
+        the validator must not skip the speedXStatus requirement just because
+        speedX is a number — that is exactly the gap that let the boundary
+        vanish once a real measurement lands."""
+        manifest = self.quality_guide_manifest()
+        target_id = str(manifest["cards"][0]["id"])
+        manifest["cards"][0]["legible"]["benefit"]["speedX"] = 1.6
+        manifest["cards"][0]["legible"]["benefit"]["speedXStatus"] = (
+            "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
+        )
+        original_render_quality_guide = build_public_site.render_quality_guide
+
+        def render_without_speed_dd(cards: object) -> str:
+            # Strip the Speed <dd> from ONLY the measured (speedX=1.6) card so
+            # a pass here cannot be explained by one of the other, still-null
+            # cards tripping the existing null-case check instead.
+            page = original_render_quality_guide(cards)  # type: ignore[arg-type]
+            fragment = self.quality_card_fragment(page, target_id)
+            stripped = re.sub(r"<div><dt>Speed</dt><dd>.*?</dd></div>", "", fragment)
+            return page.replace(fragment, stripped, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            with mock.patch.object(
+                build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "render_quality_guide",
+                side_effect=render_without_speed_dd,
+            ):
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            failures = validate_public_site.validate_quality_guide_page(output)
+            self.assertTrue(
+                any(
+                    target_id in f and "does not render its speedXStatus text" in f
+                    for f in failures
+                ),
+                failures,
+            )
 
     def test_quality_guide_reference_and_exact_cards_render_null_safely(self) -> None:
         """REFERENCE (null drift/regression) and EXACT/MTP (mostly-null card) render
@@ -4683,6 +4780,29 @@ class PublicSiteTests(unittest.TestCase):
         # passes both validators identically.
         manifest_failures = validate_public_site.validate_quality_guide_manifest(loaded)
         self.assertEqual(manifest_failures, [])
+
+    def test_shipped_flash_next_cards_state_a_measured_speed_benefit(self) -> None:
+        """The two served-model cards must pair their stated quality COST with a
+        measured benefit. A card that carries a numeric speedX must also carry a
+        boundary naming the engine build it was measured on, and must not still
+        list decode throughput as unmeasured -- that combination is a card
+        contradicting itself."""
+        manifest = json.loads(
+            (REPOSITORY_ROOT / "site/quality-guides.json").read_text(encoding="utf-8")
+        )
+        cards = {card["id"]: card for card in manifest["cards"]}
+        for card_id in (
+            "qwen38-flash-next-mixed-4-8bit@m3ultra",
+            "qwen38-flash-next-iq-3p3bpw@m3ultra",
+        ):
+            with self.subTest(card=card_id):
+                benefit = cards[card_id]["legible"]["benefit"]
+                self.assertIsInstance(benefit["speedX"], float)
+                self.assertGreater(benefit["speedX"], 0)
+                self.assertIn("fa76a4b5", benefit["speedXStatus"])
+                self.assertIsNotNone(benefit["fit"])
+                unmeasured = cards[card_id]["boundary"]["unmeasured"]
+                self.assertNotIn("decode throughput (speedX)", unmeasured)
 
     # ------------------------------------------------------------------
     # Internal (unpublished) quality-card manifest: item 7's factored card
