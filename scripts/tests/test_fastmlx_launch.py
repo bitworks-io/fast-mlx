@@ -1419,6 +1419,35 @@ STUB_ENGINE_BODY = (
 )
 
 
+# A generic stub engine for the --internal-engine-guard tests below: driven
+# entirely by environment variables (never its own argv, which in front mode
+# carries --host/--port/... it does not need to parse) so one script covers
+# "exit with code N", "sleep and ignore SIGTERM", and "sleep and honor the
+# default SIGTERM disposition" -- optionally recording its own pid first, so
+# a test can confirm the guard actually reached (or killed) this exact
+# process.
+GUARD_TEST_ENGINE_BODY = (
+    "#!" + sys.executable + "\n"
+    "import os\n"
+    "import signal\n"
+    "import sys\n"
+    "import time\n"
+    "\n"
+    "mode = os.environ.get('GUARD_TEST_ENGINE_MODE', '0')\n"
+    "pid_path = os.environ.get('GUARD_TEST_ENGINE_PID_PATH')\n"
+    "if pid_path:\n"
+    "    with open(pid_path, 'w', encoding='utf-8') as handle:\n"
+    "        handle.write(str(os.getpid()))\n"
+    "if mode == 'ignore-sigterm':\n"
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "    time.sleep(30)\n"
+    "elif mode == 'sleep':\n"
+    "    time.sleep(30)\n"
+    "else:\n"
+    "    sys.exit(int(mode))\n"
+)
+
+
 class FrontProxyModeTests(FastmlxLaunchTestCase):
     """``--front-port``: opt-in provenance proxy in front of the engine.
 
@@ -2009,6 +2038,317 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
+
+    # ------------------------------------------------------------------
+    # (a) e2e: SIGKILL the launcher process itself (spawned directly with
+    # Popen, never through a shell or `&`) and confirm the orphaned engine
+    # is gone within grace+2s. Uses a short grace override (internal env
+    # var) so the test does not have to wait out the real 30s default.
+    # ------------------------------------------------------------------
+    def test_e2e_launcher_sigkill_stops_orphaned_engine(self):
+        engine_bin = write_script(self.root / "guard-test-engine.py", GUARD_TEST_ENGINE_BODY)
+        pid_path = self.root / "engine.pid"
+        env = dict(os.environ)
+        env["GUARD_TEST_ENGINE_MODE"] = "sleep"
+        env["GUARD_TEST_ENGINE_PID_PATH"] = str(pid_path)
+        env["_FASTMLX_ENGINE_LIFELINE_GRACE_SECONDS_INTERNAL"] = "1"
+
+        front_port = _free_tcp_port()
+        backend_port = _free_tcp_port()
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+            "serve",
+            "--model-path", str(self.model_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--fit-check-bin", str(self.green_fit_bin),
+            "--engine-bin", str(engine_bin),
+            "--model-repo", PASS_REPO,
+            "--context", "2048",
+            "--port", str(backend_port),
+            "--front-port", str(front_port),
+        ]
+        launcher = subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        try:
+            deadline = time.time() + 10
+            while not pid_path.exists() and time.time() < deadline:
+                if launcher.poll() is not None:
+                    self.fail(
+                        "launcher exited early: "
+                        f"code={launcher.returncode} stderr={launcher.stderr.read()}"
+                    )
+                time.sleep(0.05)
+            self.assertTrue(pid_path.exists(), "engine never recorded its pid")
+            engine_pid = int(pid_path.read_text().strip())
+            self.addCleanup(_kill_pid_if_alive, engine_pid)
+
+            os.kill(launcher.pid, signal.SIGKILL)
+            launcher.wait(timeout=5)
+
+            deadline = time.time() + 3  # grace override (1s) + 2s
+            gone = False
+            while time.time() < deadline:
+                try:
+                    os.kill(engine_pid, 0)
+                except ProcessLookupError:
+                    gone = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(gone, "engine survived the launcher's SIGKILL past grace+2s")
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.wait(timeout=5)
+
+
+    # ------------------------------------------------------------------
+    # A SIGKILL of the GUARD (e.g. `pkill -9 -f fastmlx_launch`, which
+    # matches the guard's argv too) must not orphan the engine either: the
+    # launcher stops whatever is left in the guard's process group, SIGTERM
+    # then SIGKILL after the grace. The engine here ignores SIGTERM, so it
+    # is only gone if the escalation happens.
+    # ------------------------------------------------------------------
+    def test_e2e_guard_sigkill_does_not_orphan_the_engine(self):
+        engine_bin = write_script(self.root / "guard-test-engine.py", GUARD_TEST_ENGINE_BODY)
+        pid_path = self.root / "engine.pid"
+        env = dict(os.environ)
+        env["GUARD_TEST_ENGINE_MODE"] = "ignore-sigterm"
+        env["GUARD_TEST_ENGINE_PID_PATH"] = str(pid_path)
+        env["_FASTMLX_ENGINE_LIFELINE_GRACE_SECONDS_INTERNAL"] = "1"
+
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+            "serve",
+            "--model-path", str(self.model_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--fit-check-bin", str(self.green_fit_bin),
+            "--engine-bin", str(engine_bin),
+            "--model-repo", PASS_REPO,
+            "--context", "2048",
+            "--port", str(_free_tcp_port()),
+            "--front-port", str(_free_tcp_port()),
+        ]
+        launcher = subprocess.Popen(
+            argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        try:
+            deadline = time.time() + 10
+            while not pid_path.exists() and time.time() < deadline:
+                self.assertIsNone(launcher.poll(), "launcher exited early")
+                time.sleep(0.05)
+            self.assertTrue(pid_path.exists(), "engine never recorded its pid")
+            engine_pid = int(pid_path.read_text().strip())
+            self.addCleanup(_kill_pid_if_alive, engine_pid)
+            children = subprocess.run(
+                ["pgrep", "-P", str(launcher.pid)], capture_output=True, text=True
+            ).stdout.split()
+            self.assertEqual(len(children), 1, children)
+            guard_pid = int(children[0])
+            self.assertNotEqual(guard_pid, engine_pid)
+
+            os.kill(guard_pid, signal.SIGKILL)
+
+            # grace override (1s) + 2s for the launcher to escalate and exit
+            self.assertEqual(launcher.wait(timeout=3), 128 + signal.SIGKILL)
+            gone = False
+            try:
+                os.kill(engine_pid, 0)
+            except ProcessLookupError:
+                gone = True
+            self.assertTrue(gone, "engine survived its guard's SIGKILL")
+        finally:
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.wait(timeout=5)
+
+class EngineLifelineGuardTests(unittest.TestCase):
+    """``--internal-engine-guard``: front mode's engine child must not be
+    orphaned by a SIGKILLed launcher (a launchd ExitTimeOut or a memory-
+    pressure kill neither of which the launcher can catch or clean up
+    after). Front mode Popens this guard instead of the engine directly
+    (see the module-level guard section above ``_run_front_mode`` in
+    ``fastmlx_launch.py``); the guard Popens the engine itself and watches
+    a pipe only the launcher's process holds open, so the OS itself signals
+    the guard the instant the launcher dies for any reason.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def _write_guard_test_engine(self) -> Path:
+        return write_script(self.root / "guard-test-engine.py", GUARD_TEST_ENGINE_BODY)
+
+    def test_guard_forwards_a_stop_that_arrives_while_the_engine_is_starting(self):
+        # The guard's handlers must be installed BEFORE it spawns the engine.
+        # Otherwise a SIGTERM forwarded by the launcher right then meets the
+        # default disposition, kills the guard, and orphans the new engine.
+        # The sentinel stands in for that default: with handlers installed
+        # late, it swallows the signal and nothing reaches the engine.
+        received = []
+
+        class FakeEngine:
+            def send_signal(self, signum):
+                received.append(signum)
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        def popen_that_is_interrupted(_argv):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return FakeEngine()
+
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in watched}
+        read_fd, write_fd = os.pipe()
+        try:
+            for sig in watched:
+                signal.signal(sig, lambda *_: None)
+            code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                read_fd, 1.0, ["engine"], popen=popen_that_is_interrupted
+            )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            os.close(write_fd)
+        self.assertEqual(code, 0)
+        self.assertEqual(received, [signal.SIGTERM])
+
+    # ------------------------------------------------------------------
+    # (b) guard run directly, with a stub engine that ignores SIGTERM:
+    # closing the lifeline's write end must still get the engine SIGKILLed
+    # within roughly the guard's own (short, test-supplied) grace window.
+    # ------------------------------------------------------------------
+    def test_guard_sigkills_an_engine_that_ignores_sigterm(self):
+        engine_bin = self._write_guard_test_engine()
+        pid_path = self.root / "engine.pid"
+        env = dict(os.environ)
+        env["GUARD_TEST_ENGINE_MODE"] = "ignore-sigterm"
+        env["GUARD_TEST_ENGINE_PID_PATH"] = str(pid_path)
+
+        lifeline_read_fd, lifeline_write_fd = os.pipe()
+        guard_argv = [
+            sys.executable, str(LAUNCH_PATH), "--internal-engine-guard",
+            "--lifeline-fd", str(lifeline_read_fd), "--grace", "0.5", "--",
+            sys.executable, str(engine_bin),
+        ]
+        guard = subprocess.Popen(guard_argv, env=env, pass_fds=(lifeline_read_fd,))
+        os.close(lifeline_read_fd)
+        self.addCleanup(lambda: guard.poll() is None and guard.kill())
+
+        deadline = time.time() + 5
+        while not pid_path.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pid_path.exists(), "stub engine never recorded its pid")
+        engine_pid = int(pid_path.read_text().strip())
+        self.addCleanup(_kill_pid_if_alive, engine_pid)
+
+        os.close(lifeline_write_fd)  # simulate the launcher dying
+
+        deadline = time.time() + 2
+        gone = False
+        while time.time() < deadline:
+            try:
+                os.kill(engine_pid, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        self.assertTrue(gone, "engine (ignoring SIGTERM) survived the guard's grace+SIGKILL")
+        guard.wait(timeout=3)
+
+    # ------------------------------------------------------------------
+    # (c) exit-status propagation: the guard's own exit mirrors the
+    # engine's exactly, whether a plain exit code or a signal kill.
+    # ------------------------------------------------------------------
+    def test_guard_propagates_plain_engine_exit_codes(self):
+        engine_bin = self._write_guard_test_engine()
+        for mode, expected in (("0", 0), ("7", 7)):
+            with self.subTest(mode=mode):
+                env = dict(os.environ)
+                env["GUARD_TEST_ENGINE_MODE"] = mode
+                lifeline_read_fd, lifeline_write_fd = os.pipe()
+                guard_argv = [
+                    sys.executable, str(LAUNCH_PATH), "--internal-engine-guard",
+                    "--lifeline-fd", str(lifeline_read_fd), "--grace", "5", "--",
+                    sys.executable, str(engine_bin),
+                ]
+                guard = subprocess.Popen(guard_argv, env=env, pass_fds=(lifeline_read_fd,))
+                os.close(lifeline_read_fd)
+                try:
+                    self.assertEqual(guard.wait(timeout=5), expected)
+                finally:
+                    os.close(lifeline_write_fd)
+                    if guard.poll() is None:
+                        guard.kill()
+
+    def test_guard_signal_killed_engine_mirrors_the_signal(self):
+        engine_bin = self._write_guard_test_engine()
+        pid_path = self.root / "engine.pid"
+        env = dict(os.environ)
+        env["GUARD_TEST_ENGINE_MODE"] = "sleep"
+        env["GUARD_TEST_ENGINE_PID_PATH"] = str(pid_path)
+
+        lifeline_read_fd, lifeline_write_fd = os.pipe()
+        guard_argv = [
+            sys.executable, str(LAUNCH_PATH), "--internal-engine-guard",
+            "--lifeline-fd", str(lifeline_read_fd), "--grace", "5", "--",
+            sys.executable, str(engine_bin),
+        ]
+        guard = subprocess.Popen(guard_argv, env=env, pass_fds=(lifeline_read_fd,))
+        os.close(lifeline_read_fd)
+        try:
+            deadline = time.time() + 5
+            while not pid_path.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_path.exists(), "engine never recorded its pid")
+
+            # Signalling the GUARD (not the engine) exercises the launcher
+            # -> guard -> engine forwarding chain, and then the guard's own
+            # exit-status mirroring below.
+            os.kill(guard.pid, signal.SIGTERM)
+            returncode = guard.wait(timeout=5)
+            self.assertEqual(returncode, -signal.SIGTERM)
+        finally:
+            os.close(lifeline_write_fd)
+            if guard.poll() is None:
+                guard.kill()
+
+    # ------------------------------------------------------------------
+    # (d) a missing engine binary is refused through the guard exactly the
+    # way front mode always refused it directly: exit 3, same message.
+    # ------------------------------------------------------------------
+    def test_guard_missing_engine_binary_exits_3_with_message(self):
+        missing_bin = self.root / "does-not-exist-engine"
+        lifeline_read_fd, lifeline_write_fd = os.pipe()
+        guard_argv = [
+            sys.executable, str(LAUNCH_PATH), "--internal-engine-guard",
+            "--lifeline-fd", str(lifeline_read_fd), "--grace", "5", "--",
+            str(missing_bin),
+        ]
+        guard = subprocess.Popen(
+            guard_argv, pass_fds=(lifeline_read_fd,), stderr=subprocess.PIPE, text=True
+        )
+        os.close(lifeline_read_fd)
+        try:
+            _, stderr = guard.communicate(timeout=5)
+            self.assertEqual(guard.returncode, 3)
+            self.assertIn("front mode could not start the engine", stderr)
+        finally:
+            os.close(lifeline_write_fd)
 
 
 class CardMatchingHelperTests(unittest.TestCase):

@@ -53,6 +53,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -1843,6 +1844,218 @@ def _engine_port_has_listener(host: str, port: int, timeout: float = 1.0) -> boo
         probe.close()
 
 
+# ---------------------------------------------------------------------
+# Front-mode engine lifeline guard: an engine a SIGKILLed launcher leaves
+# behind still holds its loopback port (and, for a large pack, tens of GiB
+# of resident memory) with no supervisor left to stop it -- a relaunch then
+# hits the orphan-port refusal above (see `_engine_port_has_listener`)
+# forever, since nothing ever stops the orphan. Front mode never Popens the
+# engine directly; it Popens this small guard process instead (see
+# `_run_front_mode`), which Popens the engine ITSELF and watches a pipe
+# (the "lifeline") whose write end only the launcher's own process holds
+# open. The launcher never writes to that pipe -- its only job is to stay
+# open for exactly as long as the launcher process is alive, so the OS
+# itself closes it (and the guard's read end sees EOF) the instant the
+# launcher dies for ANY reason, including SIGKILL, which a process can
+# never catch or clean up after itself.
+# ---------------------------------------------------------------------
+_INTERNAL_ENGINE_GUARD_FLAG = "--internal-engine-guard"
+ENGINE_LIFELINE_GRACE_SECONDS_DEFAULT = 30.0
+# Internal-only override, read by the LAUNCHER when it computes the grace
+# value it passes the guard via `--grace`: never documented as a public
+# flag or environment variable an operator is expected to set, and never
+# read by the guard itself (the guard only ever trusts its own `--grace`
+# argv value).
+_ENGINE_LIFELINE_GRACE_ENV_VAR = "_FASTMLX_ENGINE_LIFELINE_GRACE_SECONDS_INTERNAL"
+
+
+def _engine_lifeline_grace_seconds() -> float:
+    override = os.environ.get(_ENGINE_LIFELINE_GRACE_ENV_VAR)
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
+    return ENGINE_LIFELINE_GRACE_SECONDS_DEFAULT
+
+
+def _engine_lifeline_guard_argv(
+    engine_argv: list, lifeline_read_fd: int, grace_seconds: float
+) -> list:
+    """The argv `_run_front_mode` Popens instead of the engine directly:
+    this same file, re-invoked with the internal `--internal-engine-guard`
+    flag (handled at the very top of `main`, before argparse even runs, so
+    the normal CLI surface is never affected -- see `main`). The engine's
+    own argv follows a literal `--`, unmodified.
+    """
+    return [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        _INTERNAL_ENGINE_GUARD_FLAG,
+        "--lifeline-fd",
+        str(lifeline_read_fd),
+        "--grace",
+        str(grace_seconds),
+        "--",
+    ] + list(engine_argv)
+
+
+def _engine_lifeline_guard(
+    lifeline_read_fd: int, grace_seconds: float, engine_argv: list, popen=subprocess.Popen
+) -> int:
+    """The guard process's own body (see `_run_engine_lifeline_guard` for
+    argv parsing). Spawns the engine as its OWN child -- no new session, so
+    it shares this guard's process group/session, never the launcher's --
+    forwards SIGTERM/SIGINT/SIGHUP to it, and watches `lifeline_read_fd`
+    for EOF (the launcher's death, by any means including SIGKILL) to stop
+    an otherwise-orphaned engine itself: SIGTERM, a grace window, then
+    SIGKILL.
+
+    Propagates the engine's own exit status exactly: a normal exit code is
+    returned as-is; a signal-killed engine is mirrored by resetting that
+    same signal to its default disposition and delivering it to this guard
+    process itself, so the LAUNCHER's own `wait()` on the guard continues
+    to see a negative signal-encoded return code exactly as it would have
+    watching the engine directly (see the exit-code mapping in
+    `_run_front_mode`, which is otherwise unchanged).
+    """
+    # Handlers go in BEFORE the engine exists: a stop the launcher forwards
+    # while the engine is being spawned would otherwise meet the default
+    # disposition, kill this guard, and orphan the new engine. A signal that
+    # arrives before there is an engine is held and forwarded right after.
+    engine_holder = {"engine": None}
+    pending = []
+
+    def _forward(signum, _frame):
+        engine = engine_holder["engine"]
+        if engine is None:
+            pending.append(signum)
+            return
+        try:
+            engine.send_signal(signum)
+        except OSError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _forward)
+
+    try:
+        engine = popen(engine_argv)
+    except OSError as exc:
+        print(f"fastmlx serve: front mode could not start the engine: {exc}", file=sys.stderr)
+        return 3
+    engine_holder["engine"] = engine
+    for signum in pending:
+        try:
+            engine.send_signal(signum)
+        except OSError:
+            pass
+
+    def _watch_lifeline():
+        try:
+            os.read(lifeline_read_fd, 1)
+        except OSError:
+            return
+        # The launcher's write end just closed (its process died, e.g. was
+        # SIGKILLed): the engine is now orphaned. Stop it ourselves.
+        try:
+            engine.terminate()
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline and engine.poll() is None:
+            time.sleep(0.05)
+        if engine.poll() is None:
+            try:
+                engine.kill()
+            except ProcessLookupError:
+                pass
+
+    threading.Thread(target=_watch_lifeline, daemon=True).start()
+
+    returncode = engine.wait()
+    if returncode >= 0:
+        return returncode
+    sig = -returncode
+    try:
+        # A signal this guard never installed a handler for (e.g. SIGKILL,
+        # which the engine dies to when this guard's own lifeline-watch
+        # SIGKILLs it after the grace window) cannot be given a disposition
+        # at all -- signal.signal(SIGKILL, ...) always raises EINVAL. Only
+        # a signal whose disposition this guard COULD have changed needs
+        # resetting before the self-kill below.
+        signal.signal(sig, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    os.kill(os.getpid(), sig)
+    time.sleep(1.0)  # pragma: no cover - the self-signal above never returns
+    return 1  # pragma: no cover - unreachable if the signal actually killed us
+
+
+def _run_engine_lifeline_guard(argv: list) -> int:
+    """Manually parse the guard's own argv: `--lifeline-fd N --grace G --
+    <engine argv...>`. Never routed through `build_arg_parser`/argparse --
+    this path is reached before that parser even exists (see `main`), and
+    is never a public CLI surface an operator is meant to pass directly.
+    """
+    if "--" not in argv:
+        print(
+            "fastmlx serve: internal engine guard invoked without an engine argv",
+            file=sys.stderr,
+        )
+        return 3
+    split_index = argv.index("--")
+    guard_opts = argv[:split_index]
+    engine_argv = argv[split_index + 1 :]
+
+    lifeline_read_fd: Optional[int] = None
+    grace_seconds = ENGINE_LIFELINE_GRACE_SECONDS_DEFAULT
+    index = 0
+    while index < len(guard_opts):
+        token = guard_opts[index]
+        if token == "--lifeline-fd" and index + 1 < len(guard_opts):
+            lifeline_read_fd = int(guard_opts[index + 1])
+            index += 2
+        elif token == "--grace" and index + 1 < len(guard_opts):
+            grace_seconds = float(guard_opts[index + 1])
+            index += 2
+        else:
+            index += 1
+
+    if lifeline_read_fd is None:
+        print(
+            "fastmlx serve: internal engine guard invoked without --lifeline-fd",
+            file=sys.stderr,
+        )
+        return 3
+
+    return _engine_lifeline_guard(lifeline_read_fd, grace_seconds, engine_argv)
+
+
+def _stop_leftover_engine_group(guard_pid: int, grace_seconds: float) -> None:
+    """Stop whatever is left in the guard's process group once the guard has
+    exited. The guard leads its own session, so that group is the engine's.
+    Normally the group is already empty. It is not when the guard itself was
+    SIGKILLed (`pkill -9 -f fastmlx_launch` matches the guard's argv too): the
+    engine was then never told to stop, and would keep its port and memory.
+    SIGTERM, the same grace as the guard's, then SIGKILL.
+    """
+    try:
+        os.killpg(guard_pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(guard_pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(guard_pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
 def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int:
     """Front mode's orchestration: bind the proxy, THEN start the engine as
     a CHILD process (never exec'd -- this process must stay alive to run
@@ -1917,19 +2130,36 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
         sig: signal.signal(sig, _forward_signal) for sig in (signal.SIGTERM, signal.SIGINT)
     }
 
+    # The engine is never Popened directly any more: this launcher Popens
+    # the engine-lifeline guard instead (see the guard section above), and
+    # the guard Popens the engine itself. `lifeline_write_fd` is kept open
+    # (and never written to) by this process for the rest of this
+    # function's life -- see `os.close` near the bottom -- so the OS itself
+    # closes it, and the guard notices, the instant this process dies for
+    # any reason, including SIGKILL.
+    lifeline_read_fd, lifeline_write_fd = os.pipe()
+    grace_seconds = _engine_lifeline_grace_seconds()
+    guard_argv = _engine_lifeline_guard_argv(final_argv, lifeline_read_fd, grace_seconds)
     try:
-        # start_new_session=True: the engine gets its OWN session/process
+        # start_new_session=True: the GUARD gets its OWN session/process
         # group, never the launcher's -- without this, a terminal Ctrl-C
         # (which sends SIGINT to the whole foreground process group) would
         # reach the engine BOTH directly from the terminal AND a second
-        # time via this function's own signal forwarding below.
-        child = popen(final_argv, start_new_session=True)
+        # time via this function's own signal forwarding below. The engine
+        # itself is the guard's own child (no new session), so it shares
+        # the guard's session/process group, never the launcher's.
+        child = popen(guard_argv, start_new_session=True, pass_fds=(lifeline_read_fd,))
     except OSError as exc:
+        os.close(lifeline_read_fd)
+        os.close(lifeline_write_fd)
         print(f"fastmlx serve: front mode could not start the engine: {exc}", file=sys.stderr)
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
         server.server_close()
         return 3
+    # The launcher's own copy of the read end is never needed -- only the
+    # guard's (inherited via pass_fds above) is.
+    os.close(lifeline_read_fd)
 
     child_holder["child"] = child
     if pending_signal["signum"] is not None:
@@ -1941,7 +2171,18 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    child_code = child.wait()
+    try:
+        child_code = child.wait()
+    finally:
+        # The lifeline's write end has done its job (the guard, and the
+        # engine it supervised, have already exited) -- closed here rather
+        # than left for process teardown so this function never holds it
+        # open longer than front mode is actually running.
+        os.close(lifeline_write_fd)
+    if isinstance(child, subprocess.Popen):
+        # Only a real guard has a process group to clean up; a test double's
+        # made-up pid must never be signalled.
+        _stop_leftover_engine_group(child.pid, grace_seconds)
     server.shutdown()
     server.server_close()
     stop_signum = requested_stop["signum"]
@@ -1967,6 +2208,12 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
 
 def main(argv: Optional[list] = None) -> None:
     raw_argv = sys.argv[1:] if argv is None else list(argv)
+    # Handled BEFORE argparse (manual parsing, see `_run_engine_lifeline_guard`):
+    # this is never a public CLI surface -- an internal re-invocation of this
+    # same file, made only by `_run_front_mode` -- and must never depend on
+    # (or be disturbed by) `build_arg_parser`'s own `serve` subcommand.
+    if raw_argv and raw_argv[0] == _INTERNAL_ENGINE_GUARD_FLAG:
+        raise SystemExit(_run_engine_lifeline_guard(raw_argv[1:]))
     if "--" in raw_argv:
         split_index = raw_argv.index("--")
         parse_argv = raw_argv[:split_index]

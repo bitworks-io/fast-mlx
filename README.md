@@ -435,16 +435,24 @@ Behaviour to know:
   (exit 3). The engine child runs in its own session, so a terminal Ctrl-C reaches it only once, via
   this launcher's own signal forwarding.
 - Before starting the engine, the launcher also refuses (exit 3) if the engine's own port already
-  has a listener, for example an engine orphaned by a SIGKILLed earlier launcher. A new launch then
-  never proxies to a stale process while the new model loads. This only catches a listener that is
-  already there at launch; a process that binds the port during the model load is not caught.
+  has a listener, for example an engine left behind when its guard (below) was SIGKILLed. A new
+  launch then never proxies to a stale process while the new model loads. This only catches a
+  listener that is already there at launch; a process that binds the port during the model load is
+  not caught.
 - SIGTERM or SIGINT is forwarded to the engine. The launcher exits once the engine exits, and never
   with 0. After a forwarded signal it exits `128 + signal` (SIGTERM → 143), whether the engine shuts
   down cleanly or is killed by the signal; any other engine code after the stop is passed through. An
-  engine that exits cleanly without being asked to stop gives 1. A SIGKILL of the launcher itself
-  cannot be forwarded (the process never runs again to do it) and leaves the engine running, still
-  bound to its loopback port with nothing in front of it any more -- stop it directly by that port or
-  its pid. A new launch on that engine port then refuses (see above) until you do.
+  engine that exits cleanly without being asked to stop gives 1.
+- The engine does not outlive the launcher. It runs under a small guard process that holds the read
+  end of a pipe whose write end only the launcher holds. If the launcher dies for any reason,
+  including SIGKILL (a launchd exit timeout, a memory-pressure kill), the pipe closes and the guard
+  stops the engine: SIGTERM, then SIGKILL after 30 s. If the guard is the one SIGKILLed, the launcher
+  stops the engine the same way before it exits (137). Measured on one host with the served Flash
+  Next pack: after `kill -9` on the launcher the engine was gone and its 72 GiB of wired memory
+  released within 3 s. A relaunch that arrives while the engine is still stopping is refused (exit
+  3), so a supervisor such as launchd may need one or two restarts to come back up. Residual: if
+  the launcher and the guard are SIGKILLed together (for example `pkill -9 -f fastmlx`), the engine
+  keeps running; stop it by its port.
 - One JSON line per request goes to stderr (request id, method, path without query, status, bytes,
   whether streamed, and an `error` field when the upstream failed mid-response), written as a single
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
