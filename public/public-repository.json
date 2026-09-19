@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 993,
-    "pathModeSha256": "0c2056fcc60c8e545d158926dac34ddcfa74cd38ddb1a39af619ad1aeb7b6c3d"
+    "pathCount": 996,
+    "pathModeSha256": "1b4dba31b08e784462db6d28ea6a6559b072d57ca17f6e0e80e998ea53f6a182"
   },
   "files": [
     {
@@ -180,6 +180,18 @@
     {
       "source": "scripts/tests/test_fastmlx_recommend.py",
       "destination": "scripts/tests/test_fastmlx_recommend.py"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx_launch_flag_transfer.py",
+      "destination": "scripts/tests/test_fastmlx_launch_flag_transfer.py"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx_recommend_flag_transfer.py",
+      "destination": "scripts/tests/test_fastmlx_recommend_flag_transfer.py"
+    },
+    {
+      "source": "scripts/tests/test_public_site_flag_transfer.py",
+      "destination": "scripts/tests/test_public_site_flag_transfer.py"
     },
     {
       "source": "scripts/tests/test_fastmlx_gguf_fit.py",

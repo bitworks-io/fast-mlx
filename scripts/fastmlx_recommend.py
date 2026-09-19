@@ -180,6 +180,7 @@ def build_row(
     fit_check_args: list,
     residency: str = "resident",
     engine_build_commit: Optional[str] = None,
+    mtp_launch: bool = False,
 ) -> dict:
     """Resolve one candidate to a fully-classified row. Never raises: an
     ambiguous card lookup (``LaunchRefusal`` from ``resolve_card``) or a fit
@@ -200,6 +201,7 @@ def build_row(
         "message": None,
         "accept_quality_flag": None,
         "engineBuild": None,
+        "mtp": None,
     }
 
     if not model_path.is_dir():
@@ -261,6 +263,30 @@ def build_row(
         "card": card_build_commit,
         "launch": engine_build_commit,
         "message": build_message,
+    }
+
+    # `--mtp` flag-transfer status/notice: informational only, never gates
+    # a row's status/verdict (mirrors fastmlx serve -- see
+    # docs/quality-card-schema-v1.md "Flag transfer"). Computed from the
+    # same card/build_status this row already resolved, regardless of what
+    # the fit check below decides.
+    mtp_status, mtp_divergent_prompts, mtp_prompts = launch.mtp_transfer_status(
+        card, build_status, mtp_launch
+    )
+    mtp_message = None
+    if mtp_status not in (launch.MTP_STATUS_OFF, launch.MTP_STATUS_EXACT):
+        mtp_message = launch.mtp_notice_text(
+            card.get("id") if card else None,
+            mtp_status,
+            mtp_divergent_prompts,
+            mtp_prompts,
+            card_build_commit,
+        )
+    row["mtp"] = {
+        "status": mtp_status,
+        "divergentPrompts": mtp_divergent_prompts,
+        "prompts": mtp_prompts,
+        "message": mtp_message,
     }
 
     resolved_model_id = model_path.resolve().name
@@ -407,6 +433,10 @@ def _format_row_text(rank: int, row: dict) -> str:
     build_message = engine_build.get("message") if engine_build else None
     if build_message and build_message not in (row.get("message") or ""):
         tail += f" {build_message}"
+    mtp = row.get("mtp")
+    mtp_message = mtp.get("message") if mtp else None
+    if mtp_message and mtp_message not in (row.get("message") or ""):
+        tail += f" {mtp_message}"
     lines.append(tail)
     return "\n".join(lines)
 
@@ -469,6 +499,11 @@ def _run_recommend(args) -> int:
     # never execs anything, so a profile's engineBuild.binarySha256 is never
     # verified here.
     engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
+    # Whether this run's engine profile carries the exact token `--mtp` --
+    # recommend never execs anything and has no passthrough concept, so
+    # this only ever scans the profile's own (and, for --residency
+    # expert-stream, the streaming) argv.
+    mtp_launch = launch.mtp_launch_requested(profile, args.residency)
 
     fit_check_bin, profile_extra_args, overridden = _resolve_fit_check_bin(
         args.fit_check_bin, profile.get("fitCheck")
@@ -520,6 +555,7 @@ def _run_recommend(args) -> int:
             fit_check_args=combined_fit_check_args,
             residency=args.residency,
             engine_build_commit=engine_build_commit,
+            mtp_launch=mtp_launch,
         )
         for candidate in candidates
     ]

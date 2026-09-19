@@ -356,6 +356,16 @@ overridable by `--force`) on a mismatch. The example profiles under `examples/en
 intentionally omit `engineBuild` — an asserted commit there would be false for every operator's
 own build of the engine they front.
 
+A card is measured with the engine run one way. When the launch's final engine argv adds `--mtp`
+(multi-token prediction), `serve` and `recommend` report whether the card was checked under that flag
+(`mtp=` on the admitted line, `mtp` in the dry-run plan and recommend rows). The status is one of
+`off | exact | not_exact | nondeterministic | unmeasured`, and every status except `off` and `exact`
+prints a one-line notice. It never changes admission: a NO_GO card still needs `--accept-quality`.
+Measured so far: on the Flash Next mixed-4-8 pack, at the engine build its card names, `--mtp`
+changed greedy output on 16 of 40 prompts. Two `--mtp` processes also differed from each other on
+one prompt, so the card records the transfer as `nondeterministic`. The card's quality figures describe
+the launch without `--mtp`.
+
 ### Install a prebuilt release (v0.1.1)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its

@@ -17,7 +17,16 @@
           "note": "community mixed pack: 4-bit routed experts, 8-bit other projections"
         },
         "enhancement": "none",
-        "hardwareClass": "apple-m3-ultra"
+        "hardwareClass": "apple-m3-ultra",
+        "flagTransfer": {
+          "--mtp": {
+            "greedy": "nondeterministic",
+            "divergentPrompts": 16,
+            "prompts": 40,
+            "maxTokens": 64,
+            "evidence": "mtp-flag-transfer-b1-2026-09-19"
+          }
+        }
       },
       "verdict": "NO_GO",
       "admission": {

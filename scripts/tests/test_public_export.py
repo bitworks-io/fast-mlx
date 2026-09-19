@@ -231,9 +231,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # competitor/engine product name, or credential -- the public-safety forbidden-substring set
 # is asserted absent by scripts/tests/test_fastmlx_launch.py's own
 # EngineProfileExampleFilesTests.test_example_profiles_contain_no_forbidden_public_safety_strings.
+# 2026-09-19, 993 -> 996: adds scripts/tests/test_fastmlx_launch_flag_transfer.py,
+# scripts/tests/test_fastmlx_recommend_flag_transfer.py and scripts/tests/test_public_site_flag_transfer.py,
+# the tests for the optional card field
+# config.flagTransfer["--mtp"] and the serve/recommend --mtp notice. Conscious decision to publish:
+# the three files hold only fixture cards and argv lists; a marker scan found no private host, IP,
+# username, machine-local path, competitor/engine product name, or credential.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 993,
-    "pathModeSha256": "0c2056fcc60c8e545d158926dac34ddcfa74cd38ddb1a39af619ad1aeb7b6c3d",
+    "pathCount": 996,
+    "pathModeSha256": "1b4dba31b08e784462db6d28ea6a6559b072d57ca17f6e0e80e998ea53f6a182",
 }
 
 

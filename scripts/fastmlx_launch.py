@@ -109,6 +109,18 @@ ENGINE_BUILD_STATUS_MATCH = "match"
 ENGINE_BUILD_STATUS_UNDECLARED = "undeclared"
 ENGINE_BUILD_STATUS_MISMATCH = "mismatch"
 
+# `config.flagTransfer["--mtp"]` (OPTIONAL card field) / the `--mtp` launch
+# flag itself: whether a card's greedy output was proven to transfer to a
+# launch of the SAME pack made WITH `--mtp`, given the card was measured
+# WITHOUT it (see docs/quality-card-schema-v1.md "Flag transfer"). Never
+# used to filter card admission -- only to classify it for the notice this
+# module's callers surface, exactly like `ENGINE_BUILD_STATUS_*` above.
+MTP_STATUS_OFF = "off"
+MTP_STATUS_UNMEASURED = "unmeasured"
+MTP_STATUS_EXACT = "exact"
+MTP_STATUS_NOT_EXACT = "not_exact"
+MTP_STATUS_NONDETERMINISTIC = "nondeterministic"
+
 # An engine profile's OPTIONAL `fitCheck` object names the sizer this
 # profile's own engine needs -- see `_validate_fit_check` for the full
 # validation rule. `bin` is either one of these two symbolic names
@@ -487,6 +499,140 @@ def engine_build_notice_text(
         f"card {card_id} was measured on engine build {card_commit[:12]}; "
         f"this launch is {launch_desc} — transfer unmeasured"
     )
+
+
+def _final_argv_preview(
+    profile: dict, residency: str, passthrough_args: "Optional[list]" = None
+) -> list:
+    """The token list ``_run_serve`` execs, in the same order, BEFORE
+    placeholder substitution: the profile's own ``argv``, then
+    ``residencyArgs['expert-stream']`` when the launch streams, then any
+    passthrough args after ``--``. Placeholder substitution never turns a
+    literal flag into ``--mtp`` (or vice versa) -- see
+    ``ALLOWED_ENGINE_PROFILE_PLACEHOLDERS`` -- so scanning this
+    pre-substitution list for an exact token is equivalent to scanning the
+    fully-substituted ``final_argv`` ``_run_serve`` actually execs.
+    """
+    tokens = list(profile.get("argv") or [])
+    if residency == "expert-stream":
+        tokens += list((profile.get("residencyArgs") or {}).get("expert-stream") or [])
+    tokens += list(passthrough_args or [])
+    return tokens
+
+
+def mtp_launch_requested(
+    profile: dict, residency: str, passthrough_args: "Optional[list]" = None
+) -> bool:
+    """Whether this launch's final engine argv carries the exact token
+    ``--mtp`` -- the ONLY thing that makes ``config.flagTransfer["--mtp"]``
+    relevant to it (see ``mtp_transfer_status``)."""
+    return "--mtp" in _final_argv_preview(profile, residency, passthrough_args)
+
+
+def card_flag_transfer_mtp(card: Optional[dict]) -> Optional[dict]:
+    """The card's ``config.flagTransfer["--mtp"]`` object, or ``None`` when
+    the card carries no ``config``, no ``flagTransfer``, or no ``--mtp``
+    entry -- fails open to "unmeasured" rather than raising, the same way
+    ``card_engine_build_commit`` fails open to "unrecorded": this field is
+    OPTIONAL, and a card predating it (or a hand-added fixture) is never
+    required to carry it.
+    """
+    if card is None:
+        return None
+    config = card.get("config")
+    if not isinstance(config, dict):
+        return None
+    flag_transfer = config.get("flagTransfer")
+    if not isinstance(flag_transfer, dict):
+        return None
+    mtp = flag_transfer.get("--mtp")
+    return mtp if isinstance(mtp, dict) else None
+
+
+def mtp_transfer_status(
+    card: Optional[dict], build_status: str, mtp_launch: bool
+) -> tuple:
+    """Classify this launch's ``--mtp`` flag transfer against a resolved
+    card's ``config.flagTransfer["--mtp"]``, per
+    ``docs/quality-card-schema-v1.md`` "Flag transfer". Returns
+    ``(status, divergentPrompts, prompts)`` -- the last two ``None`` unless
+    ``status`` is one of exact/not_exact/nondeterministic.
+
+    - ``off``: ``--mtp`` is not in this launch's final argv at all -- the
+      field is irrelevant.
+    - ``unmeasured``: ``--mtp`` IS in the argv, but either the resolved
+      card (or no card at all) carries no ``flagTransfer["--mtp"]``, or the
+      engine-build status (``engine_build_status``) is not ``match`` -- the
+      transfer is valid only at the card's own measured build.
+    - otherwise: the card's own ``greedy`` value (``exact`` / ``not_exact``
+      / ``nondeterministic``).
+
+    NEVER used to filter card admission -- only to classify it for the
+    notice this module's callers surface, exactly like ``engine_build_status``.
+
+    ``load_quality_cards`` never validates a card against the schema, so a
+    resolved card's ``flagTransfer["--mtp"]`` may be hand-edited, stale, or
+    otherwise malformed. This function fails OPEN on malformed data -- any
+    ``greedy`` outside the three known values, or a non-int/bool/negative/
+    inconsistent ``divergentPrompts``/``prompts``, is treated exactly like
+    "no flagTransfer at all" (``unmeasured``, null counts) rather than
+    propagating a bogus status to ``mtp_notice_text`` (which has no notice
+    for an unrecognized status and would raise).
+    """
+    if not mtp_launch:
+        return MTP_STATUS_OFF, None, None
+    transfer = card_flag_transfer_mtp(card)
+    if transfer is None or build_status != ENGINE_BUILD_STATUS_MATCH:
+        return MTP_STATUS_UNMEASURED, None, None
+
+    greedy = transfer.get("greedy")
+    divergent = transfer.get("divergentPrompts")
+    prompts = transfer.get("prompts")
+    valid_greedy = greedy in (MTP_STATUS_EXACT, MTP_STATUS_NOT_EXACT, MTP_STATUS_NONDETERMINISTIC)
+    valid_divergent = (
+        isinstance(divergent, int) and not isinstance(divergent, bool) and divergent >= 0
+    )
+    valid_prompts = isinstance(prompts, int) and not isinstance(prompts, bool) and prompts >= 1
+    if not (valid_greedy and valid_divergent and valid_prompts) or divergent > prompts:
+        return MTP_STATUS_UNMEASURED, None, None
+    return greedy, divergent, prompts
+
+
+def mtp_notice_text(
+    card_id: Optional[str],
+    status: str,
+    divergent_prompts: Optional[int],
+    prompts: Optional[int],
+    card_build_commit: Optional[str],
+) -> str:
+    """The one-line ``--mtp`` transfer notice body for a
+    not_exact/nondeterministic/unmeasured status -- shared by
+    ``fastmlx_launch`` (prefixed ``"fastmlx serve: "`` on stderr, and
+    appended to a NO_GO refusal message, mirroring
+    ``engine_build_notice_text``) and ``fastmlx_recommend`` (surfaced as a
+    row's own ``mtp.message``). Never called for ``off``/``exact``.
+    """
+    if card_id is None:
+        return (
+            "no quality card was resolved for this launch; the --mtp transfer "
+            "is unmeasured"
+        )
+    if status == MTP_STATUS_UNMEASURED:
+        return f"card {card_id} was measured without --mtp; the --mtp transfer is unmeasured"
+    build_desc = card_build_commit[:12] if card_build_commit else "unknown"
+    if status == MTP_STATUS_NOT_EXACT:
+        return (
+            f"card {card_id} was measured without --mtp; with --mtp at build "
+            f"{build_desc}, greedy output differed on {divergent_prompts}/{prompts} prompts"
+        )
+    if status == MTP_STATUS_NONDETERMINISTIC:
+        return (
+            f"card {card_id} was measured without --mtp; with --mtp at build "
+            f"{build_desc}, greedy output differed from the card's path on "
+            f"{divergent_prompts}/{prompts} prompts and was not reproducible "
+            "across processes"
+        )
+    raise ValueError(f"mtp_notice_text: no notice for status {status!r}")
 
 
 def resolve_card(
@@ -1169,6 +1315,11 @@ def _run_serve(args, passthrough_args: list) -> int:
     # because the quality-card lookup below (`resolve_card`) needs it to
     # disambiguate a pack with more than one card, never to filter one.
     launch_engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
+    # Whether this launch's final argv carries the exact token `--mtp` --
+    # resolved this early (pre-substitution; see `_final_argv_preview`) so
+    # the quality-card `--mtp` status below can be computed before the
+    # admission decision, the same reason `launch_engine_build_commit` is.
+    is_mtp_launch = mtp_launch_requested(profile, residency, passthrough_args)
 
     # --- residency validation ------------------------------------------
     # A non-resident launch requires the profile to declare the argv this
@@ -1404,16 +1555,34 @@ def _run_serve(args, passthrough_args: list) -> int:
             card.get("id") if card else None, card_build_commit, launch_engine_build_commit
         )
 
+    # --- `--mtp` flag-transfer status (never gates admission either; see
+    # decide_admission below) -------------------------------------------
+    mtp_status, mtp_divergent_prompts, mtp_prompts = mtp_transfer_status(
+        card, build_status, is_mtp_launch
+    )
+    mtp_notice: Optional[str] = None
+    if mtp_status not in (MTP_STATUS_OFF, MTP_STATUS_EXACT):
+        mtp_notice = mtp_notice_text(
+            card.get("id") if card else None,
+            mtp_status,
+            mtp_divergent_prompts,
+            mtp_prompts,
+            card_build_commit,
+        )
+
     opt_in_ids = set(args.accept_quality)
     opted_in = is_opted_in(card, opt_in_ids)
     outcome, message = decide_admission(card, opted_in)
     if outcome == "refuse_quality_flagged":
-        full_message = f"{message} {build_notice}" if build_notice else message
+        notices = " ".join(notice for notice in (build_notice, mtp_notice) if notice)
+        full_message = f"{message} {notices}" if notices else message
         raise LaunchRefusal(2, full_message)
     if outcome == "admit_with_quality_flag":
         print(message)
     if build_notice:
         print(f"fastmlx serve: {build_notice}", file=sys.stderr)
+    if mtp_notice:
+        print(f"fastmlx serve: {mtp_notice}", file=sys.stderr)
 
     # --- engine argv ---------------------------------------------------
     engine_bin_value = args.engine_bin
@@ -1472,6 +1641,11 @@ def _run_serve(args, passthrough_args: list) -> int:
             "card": card_build_commit,
             "launch": launch_engine_build_commit,
         },
+        "mtp": {
+            "status": mtp_status,
+            "divergentPrompts": mtp_divergent_prompts,
+            "prompts": mtp_prompts,
+        },
     }
 
     if args.dry_run:
@@ -1482,7 +1656,7 @@ def _run_serve(args, passthrough_args: list) -> int:
         "fastmlx_launch=admitted "
         f"engine={profile['name']} card={card.get('id') if card else 'none'} "
         f"fit={fit_label} context={context} residency={residency} "
-        f"engine_build={build_status}",
+        f"engine_build={build_status} mtp={mtp_status}",
         file=sys.stderr,
     )
     os.execv(engine_bin_abs, final_argv)

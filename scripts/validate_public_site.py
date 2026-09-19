@@ -16,16 +16,11 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
+import validate_public_repository
 
-PRIVATE_MARKERS: Tuple[str, ...] = (
-    "/" + "Users/",
-    "/" + "private/",
-    "192" + ".168.",
-    "llm" + "bench",
-    "passwordless" + " sudo",
-    "BEGIN OPENSSH" + " PRIVATE KEY",
-    "BEGIN RSA" + " PRIVATE KEY",
-)
+# Single source of truth for private markers -- see build_public_site.py's
+# identical import for why this must not be a locally duplicated tuple.
+PRIVATE_MARKERS: Tuple[str, ...] = validate_public_repository.PRIVATE_MARKERS
 CAPABILITY_STATUSES = {"implemented", "promoted-scoped", "experimental", "shelved"}
 QUALITY_GUIDE_SCHEMA = "fast-mlx-quality-card-v1"
 QUALITY_VERDICTS = {"NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"}
@@ -33,7 +28,20 @@ QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
 QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant", "Unquantified"}
 QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
 QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
-QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
+# `flagTransfer` is OPTIONAL (see docs/quality-card-schema-v1.md "Flag
+# transfer"); absence means "unmeasured" for any launch that flips the flag.
+QUALITY_CARD_CONFIG_ALLOWED_KEYS = (
+    QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency", "flagTransfer"}
+)
+QUALITY_CARD_FLAG_TRANSFER_KEYS = {"--mtp"}
+QUALITY_CARD_FLAG_TRANSFER_MTP_KEYS = {
+    "greedy",
+    "divergentPrompts",
+    "prompts",
+    "maxTokens",
+    "evidence",
+}
+QUALITY_CARD_FLAG_TRANSFER_MTP_GREEDY_VALUES = {"exact", "not_exact", "nondeterministic"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
 QUALITY_CARD_PROVENANCE_REQUIRED_KEYS = {
     "source",
@@ -4600,6 +4608,68 @@ class QualityCardCollector(html.parser.HTMLParser):
             self._current = None
 
 
+def _flag_transfer_failures(raw_flag_transfer: object, label: str) -> List[str]:
+    """Accumulate-style mirror of
+    `build_public_site._validate_config_flag_transfer` -- see its docstring
+    for the full rule set (docs/quality-card-schema-v1.md "Flag transfer").
+    """
+    failures = key_failures(
+        raw_flag_transfer, QUALITY_CARD_FLAG_TRANSFER_KEYS, f"{label} config.flagTransfer"
+    )
+    if failures or not isinstance(raw_flag_transfer, dict):
+        return failures
+    failures.extend(
+        key_failures(
+            raw_flag_transfer.get("--mtp"),
+            QUALITY_CARD_FLAG_TRANSFER_MTP_KEYS,
+            f"{label} config.flagTransfer['--mtp']",
+        )
+    )
+    mtp = raw_flag_transfer.get("--mtp")
+    if not isinstance(mtp, dict):
+        return failures
+    greedy = mtp.get("greedy")
+    if greedy not in QUALITY_CARD_FLAG_TRANSFER_MTP_GREEDY_VALUES:
+        failures.append(f"{label} config.flagTransfer['--mtp'].greedy has unknown value {greedy!r}")
+    divergent = mtp.get("divergentPrompts")
+    if not isinstance(divergent, int) or isinstance(divergent, bool) or divergent < 0:
+        failures.append(f"{label} config.flagTransfer['--mtp'].divergentPrompts must be an int >= 0")
+    prompts = mtp.get("prompts")
+    if not isinstance(prompts, int) or isinstance(prompts, bool) or prompts < 1:
+        failures.append(f"{label} config.flagTransfer['--mtp'].prompts must be an int >= 1")
+    if (
+        isinstance(divergent, int)
+        and not isinstance(divergent, bool)
+        and isinstance(prompts, int)
+        and not isinstance(prompts, bool)
+        and divergent > prompts
+    ):
+        failures.append(f"{label} config.flagTransfer['--mtp'].divergentPrompts must be <= prompts")
+    divergent_is_valid_int = isinstance(divergent, int) and not isinstance(divergent, bool)
+    if greedy == "exact" and divergent_is_valid_int and divergent != 0:
+        failures.append(
+            f"{label} config.flagTransfer['--mtp'] greedy=exact requires divergentPrompts=0"
+        )
+    if greedy == "not_exact" and divergent_is_valid_int and divergent < 1:
+        failures.append(
+            f"{label} config.flagTransfer['--mtp'] greedy=not_exact requires divergentPrompts>=1"
+        )
+    max_tokens = mtp.get("maxTokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        failures.append(f"{label} config.flagTransfer['--mtp'].maxTokens must be an int >= 1")
+    evidence = mtp.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        failures.append(f"{label} config.flagTransfer['--mtp'].evidence must be a non-empty string")
+    else:
+        evidence_path = Path(evidence)
+        if evidence_path.is_absolute() or ".." in evidence_path.parts:
+            failures.append(
+                f"{label} config.flagTransfer['--mtp'].evidence must be a repo-relative "
+                "path with no absolute path and no '..'"
+            )
+    return failures
+
+
 def validate_quality_guide_manifest(value: object) -> List[str]:
     """Fail-closed schema check for the `fast-mlx-quality-card-v1` manifest.
 
@@ -4615,6 +4685,17 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
     if value.get("schema") != QUALITY_GUIDE_SCHEMA:
         failures.append(f"quality-guide manifest must use schema {QUALITY_GUIDE_SCHEMA!r}")
     require_str(value, "generatedAt", "quality-guide manifest", failures)
+
+    # Whole-document private-marker scan, mirroring
+    # `build_public_site.validate_quality_card_document`'s identical check
+    # -- this validator previously only scanned RENDERED Pages output
+    # (`validate_site`, below) and never the raw manifest object itself, so
+    # a marker inside e.g. `config.flagTransfer["--mtp"].evidence` was
+    # invisible to this entry point.
+    serialized = json.dumps(value, ensure_ascii=False)
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in serialized.casefold():
+            failures.append(f"quality-guide manifest contains private marker {marker!r}")
 
     cards = value.get("cards")
     if not isinstance(cards, list) or not cards:
@@ -4709,6 +4790,12 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                         failures.append(
                             f"{label} config.quant.note must be a non-empty string or null"
                         )
+            # `flagTransfer` is OPTIONAL; absence means every flag's transfer
+            # is unmeasured for this card (see "Flag transfer" above).
+            if "flagTransfer" in config:
+                failures.extend(
+                    _flag_transfer_failures(config.get("flagTransfer"), label)
+                )
             require_str(config, "enhancement", f"{label} config", failures)
             require_str(config, "hardwareClass", f"{label} config", failures)
 
@@ -4852,6 +4939,19 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                         )
                     else:
                         engine_build_commit = commit
+        # `config.flagTransfer` measures how a served-engine flag (e.g.
+        # `--mtp`) behaves on THIS card's exact engine build; without a
+        # recorded `provenance.engineBuild.commit` the measurement has no
+        # build to be true of (see docs/quality-card-schema-v1.md "Flag
+        # transfer").
+        if (
+            isinstance(config, dict)
+            and "flagTransfer" in config
+            and engine_build_commit is None
+        ):
+            failures.append(
+                f"{label} config.flagTransfer requires provenance.engineBuild.commit"
+            )
         if isinstance(provenance, dict):
             source = require_str(provenance, "source", f"{label} provenance", failures)
             if source is not None and source not in QUALITY_PROVENANCE_SOURCES:

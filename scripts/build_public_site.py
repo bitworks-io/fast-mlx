@@ -23,16 +23,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import validate_public_repository
 
-PRIVATE_MARKERS: Tuple[str, ...] = (
-    "/" + "Users/",
-    "/" + "private/",
-    "192" + ".168.",
-    "llm" + "bench",
-    "passwordless" + " sudo",
-    "BEGIN OPENSSH" + " PRIVATE KEY",
-    "BEGIN RSA" + " PRIVATE KEY",
-)
+# Single source of truth for private markers -- this used to be a locally
+# duplicated tuple that (by omission, not by intent) never included two of
+# `validate_public_repository.PRIVATE_MARKERS`' entries, so those two
+# markers could leak into a generated card/site artifact undetected even
+# though `validate_public_repository.py` (the checkout-level gate) already
+# refused them. Importing keeps the two lists from drifting apart again.
+PRIVATE_MARKERS: Tuple[str, ...] = validate_public_repository.PRIVATE_MARKERS
 
 # Extended markers for the quality-guide manifest only (not every PRIVATE_MARKERS
 # consumer): private serving-engine names, EXCEPT when the occurrence is part of
@@ -99,7 +98,20 @@ QUALITY_PROVENANCE_SOURCES = {"fast-mlx-measured", "vendor-reported", "modeled"}
 QUALITY_TIERS = {"Exact", "Near-lossless", "Noticeable", "Significant", "Unquantified"}
 QUALITY_CARD_RESIDENCIES = {"resident", "expert-stream"}
 QUALITY_CARD_CONFIG_REQUIRED_KEYS = {"quant", "enhancement", "hardwareClass"}
-QUALITY_CARD_CONFIG_ALLOWED_KEYS = QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency"}
+# `flagTransfer` is OPTIONAL (see docs/quality-card-schema-v1.md "Flag
+# transfer"); absence means "unmeasured" for any launch that flips the flag.
+QUALITY_CARD_CONFIG_ALLOWED_KEYS = (
+    QUALITY_CARD_CONFIG_REQUIRED_KEYS | {"residency", "flagTransfer"}
+)
+QUALITY_CARD_FLAG_TRANSFER_KEYS = {"--mtp"}
+QUALITY_CARD_FLAG_TRANSFER_MTP_KEYS = {
+    "greedy",
+    "divergentPrompts",
+    "prompts",
+    "maxTokens",
+    "evidence",
+}
+QUALITY_CARD_FLAG_TRANSFER_MTP_GREEDY_VALUES = {"exact", "not_exact", "nondeterministic"}
 QUALITY_EXAMPLE_STATUSES = {"measured", "illustrative", "pending"}
 QUALITY_CARD_PROVENANCE_REQUIRED_KEYS = {
     "source",
@@ -688,6 +700,64 @@ def load_release_catalog(repository_root: Path) -> Dict[str, object]:
     return catalog
 
 
+def _validate_config_flag_transfer(raw_flag_transfer: object, label: str) -> None:
+    """Validate the OPTIONAL `config.flagTransfer` object (see
+    docs/quality-card-schema-v1.md "Flag transfer"). `"--mtp"` is the ONLY
+    allowed (and required, when `flagTransfer` is present at all) key.
+    Enforces every cross-field rule the schema states: `divergentPrompts
+    <= prompts`; `greedy == "exact"` requires `divergentPrompts == 0`;
+    `greedy == "not_exact"` requires `divergentPrompts >= 1`; `evidence` is
+    a non-empty, repo-relative-looking string (no absolute path, no
+    `..`) -- private-marker hygiene is enforced separately, by this
+    function's caller's own whole-document scan, exactly like every other
+    card string.
+    """
+    flag_transfer = require_exact_keys(
+        raw_flag_transfer, QUALITY_CARD_FLAG_TRANSFER_KEYS, f"{label} config.flagTransfer"
+    )
+    mtp = require_exact_keys(
+        flag_transfer["--mtp"],
+        QUALITY_CARD_FLAG_TRANSFER_MTP_KEYS,
+        f"{label} config.flagTransfer['--mtp']",
+    )
+    greedy = mtp.get("greedy")
+    if greedy not in QUALITY_CARD_FLAG_TRANSFER_MTP_GREEDY_VALUES:
+        fail(f"{label} config.flagTransfer['--mtp'].greedy has unknown value {greedy!r}")
+    divergent = mtp.get("divergentPrompts")
+    if not isinstance(divergent, int) or isinstance(divergent, bool) or divergent < 0:
+        fail(f"{label} config.flagTransfer['--mtp'].divergentPrompts must be an int >= 0")
+    prompts = mtp.get("prompts")
+    if not isinstance(prompts, int) or isinstance(prompts, bool) or prompts < 1:
+        fail(f"{label} config.flagTransfer['--mtp'].prompts must be an int >= 1")
+    if divergent > prompts:
+        fail(
+            f"{label} config.flagTransfer['--mtp'].divergentPrompts must be <= "
+            "prompts"
+        )
+    if greedy == "exact" and divergent != 0:
+        fail(
+            f"{label} config.flagTransfer['--mtp'] greedy=exact requires "
+            "divergentPrompts=0"
+        )
+    if greedy == "not_exact" and divergent < 1:
+        fail(
+            f"{label} config.flagTransfer['--mtp'] greedy=not_exact requires "
+            "divergentPrompts>=1"
+        )
+    max_tokens = mtp.get("maxTokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        fail(f"{label} config.flagTransfer['--mtp'].maxTokens must be an int >= 1")
+    evidence = mtp.get("evidence")
+    if not isinstance(evidence, str) or not evidence.strip():
+        fail(f"{label} config.flagTransfer['--mtp'].evidence must be a non-empty string")
+    evidence_path = Path(evidence)
+    if evidence_path.is_absolute() or ".." in evidence_path.parts:
+        fail(
+            f"{label} config.flagTransfer['--mtp'].evidence must be a repo-relative "
+            "path with no absolute path and no '..'"
+        )
+
+
 def validate_quality_card_document(document: object, label: str) -> Dict[str, object]:
     """Validate a decoded `fast-mlx-quality-card-v1` document against the
     exact fail-closed schema `load_quality_guides` enforces for
@@ -791,6 +861,10 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
             note = quant.get("note")
             if note is not None and (not isinstance(note, str) or not note.strip()):
                 fail(f"{card_label} config.quant.note must be a non-empty string or null")
+        # `flagTransfer` is OPTIONAL; absence means every flag's transfer is
+        # unmeasured for this card (see "Flag transfer" above).
+        if "flagTransfer" in config:
+            _validate_config_flag_transfer(config.get("flagTransfer"), card_label)
         require_text(config, "enhancement", f"{card_label} config")
         require_text(config, "hardwareClass", f"{card_label} config")
 
@@ -915,6 +989,16 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
                     "40-hex string"
                 )
             engine_build_commit = commit
+        # `config.flagTransfer` measures how a served-engine flag (e.g.
+        # `--mtp`) behaves on THIS card's exact engine build; without a
+        # recorded `provenance.engineBuild.commit` the measurement has no
+        # build to be true of (see docs/quality-card-schema-v1.md "Flag
+        # transfer").
+        if "flagTransfer" in config and engine_build_commit is None:
+            fail(
+                f"{card_label} config.flagTransfer requires "
+                "provenance.engineBuild.commit"
+            )
         source = require_text(provenance, "source", f"{card_label} provenance")
         if source not in QUALITY_PROVENANCE_SOURCES:
             fail(f"{card_label} provenance has unknown source {source!r}")
