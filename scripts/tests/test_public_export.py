@@ -216,9 +216,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # (never a real `swift build`), so they skip off macOS and public CI runs them in its macOS job
 # instead, mirroring the existing acquisition-tests skip pattern; the module's one platform-neutral
 # test (that the same tripwire strings are absent from package-release.sh) still runs everywhere.
+# 2026-09-18, 988 -> 989: adds
+# docs/content/2026-09-18-streaming-the-experts-changed-the-answers.md, registered via
+# site/publications.json. Conscious decision to publish: the note names only a public model, leaves
+# the serving engine and the pack's repository unnamed, references no host, credential, competitor or
+# machine-local path, and describes only fast-mlx's own measured evidence that SSD expert streaming
+# changed greedy output on a third-party serving engine.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 988,
-    "pathModeSha256": "20e6be4724486c05c1a611b54a5e1430371df4fe6c894cf4bb9b070fe6f8377b",
+    "pathCount": 989,
+    "pathModeSha256": "ebfefee12ac2b6729e68943cb765a6af35f1b83594693e05be1ce6e19d5dd98a",
 }
 
 

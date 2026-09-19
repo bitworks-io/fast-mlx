@@ -122,6 +122,7 @@ _TYPE_F16 = 1
 _TYPE_Q8_0 = 8
 _TYPE_Q4_K = 12
 _TYPE_I8 = 24
+_TYPE_MXFP4 = 39
 _TYPE_UNKNOWN = 12345
 
 
@@ -261,9 +262,13 @@ class ExpertClassificationTests(unittest.TestCase):
         # NOTE for reviewer mutation testing: if is_expert_tensor() is
         # mutated to always return False, expert_bytes collapses to 0 and
         # non_expert_bytes inflates to 80 -- both assertions below catch it.
-        expert_bytes, non_expert_bytes, _shards, _shard_details = FIT.compute_model_bytes(
-            self.path
-        )
+        (
+            expert_bytes,
+            non_expert_bytes,
+            _shards,
+            _shard_details,
+            _expert_bytes_by_type,
+        ) = FIT.compute_model_bytes(self.path)
         self.assertGreater(expert_bytes, 0)
         self.assertEqual(expert_bytes, 48)
         self.assertEqual(non_expert_bytes, 32)
@@ -587,6 +592,67 @@ class JsonShardsFieldTests(unittest.TestCase):
         self.assertEqual(shard["bytes_by_type"]["Q8_0"], 34)
         self.assertEqual(shard["file_size"], shard["data_start"] + 98)
         self.assertLessEqual(shard["header_end"], shard["data_start"])
+
+
+class ExpertBytesByTypeJsonTests(unittest.TestCase):
+    """T15: --json output includes expert_bytes_by_type, a
+    {ggml type name: bytes} breakdown over routed-expert tensors only (an
+    informational field -- the sizer stays engine-agnostic and never
+    refuses on tensor type)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_expert_bytes_by_type_reports_routed_expert_type_only(self):
+        # blk.0.ffn_gate_exps: MXFP4[32] = 1 block * 17 bytes = 17 bytes
+        # (block=32, type_size=17). A non-expert F32[4] tensor (16 bytes)
+        # must not appear in expert_bytes_by_type at all.
+        tensors = [
+            {
+                "name": "blk.0.ffn_gate_exps.weight",
+                "dims": [32],
+                "type": _TYPE_MXFP4,
+                "offset": 0,
+            },
+            {"name": "token_embd.weight", "dims": [4], "type": _TYPE_F32, "offset": 32},
+        ]
+        # t0 (17 bytes) padded to 32; t1 (16 bytes) at 32, ends at 48.
+        blob = build_gguf_bytes(tensors=tensors, data_section=bytes(48))
+        path = write_file(self.root / "expert_typed.gguf", blob)
+
+        result = run_cli([
+            "--model-path", str(path),
+            "--kv-reserve-gib", "0",
+            "--wired-limit-mib", "4096",
+            "--wired-margin-gib", "2",
+            "--json",
+        ])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["expert_bytes_by_type"], {"MXFP4": 17})
+        self.assertNotIn("F32", payload["expert_bytes_by_type"])
+
+    def test_expert_bytes_by_type_empty_when_no_expert_tensors(self):
+        tensors = [
+            {"name": "token_embd.weight", "dims": [4], "type": _TYPE_F32, "offset": 0},
+        ]
+        blob = build_gguf_bytes(tensors=tensors, data_section=bytes(16))
+        path = write_file(self.root / "no_experts.gguf", blob)
+
+        result = run_cli([
+            "--model-path", str(path),
+            "--kv-reserve-gib", "0",
+            "--wired-limit-mib", "4096",
+            "--wired-margin-gib", "2",
+            "--json",
+        ])
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        payload = json.loads(result.stdout)
+
+        self.assertEqual(payload["expert_bytes_by_type"], {})
 
 
 class ContiguousPackingTests(unittest.TestCase):

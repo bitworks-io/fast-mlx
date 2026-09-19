@@ -13,6 +13,19 @@ against a wired-memory ceiling. It is a drop-in ``--fit-check-bin`` for
 other exit code is an error -- never a fit verdict. A ``--json`` mode prints
 the same fields as a JSON object for other consumers.
 
+GREEN is a memory verdict only, not a loadability verdict: this binary
+never inspects, refuses on, or reasons about which tensor types a serving
+engine implements, so a pack can be fit-GREEN here and still fail to load
+under a given engine (for example, if the engine does not implement one of
+the pack's tensor types). Loadability is the engine's own concern, checked
+at load time.
+
+GREEN is not a quality verdict either. In particular, an expert-stream
+GREEN says only that the non-expert weights fit; streaming routed experts
+from SSD is not guaranteed to reproduce the resident output, and on at
+least one measured engine it did not. Quality is stated by a card, not by
+this checker.
+
 This binary knows nothing about the identity of the model it is checking:
 it classifies weight tensors purely by the generic GGUF/ggml tensor-name
 convention used by expert-streaming engines for mixture-of-experts packs
@@ -584,6 +597,7 @@ def compute_model_bytes(model_path: Path) -> tuple:
     total_expert = 0
     total_non_expert = 0
     shard_details = []
+    expert_bytes_by_type: dict = {}
     for shard_path in shard_paths:
         header = parse_gguf_header(shard_path)
         per_tensor = reconcile_shard(header)
@@ -592,9 +606,13 @@ def compute_model_bytes(model_path: Path) -> tuple:
         total_non_expert += non_expert_bytes
 
         bytes_by_type: dict = {}
-        for tensor, (_name, size) in zip(header["tensors"], per_tensor):
+        for tensor, (name, size) in zip(header["tensors"], per_tensor):
             type_name = GGML_TYPES[tensor["type"]][0]
             bytes_by_type[type_name] = bytes_by_type.get(type_name, 0) + size
+            if is_expert_tensor(name):
+                expert_bytes_by_type[type_name] = (
+                    expert_bytes_by_type.get(type_name, 0) + size
+                )
         shard_details.append({
             "name": shard_path.name,
             "data_start": header["data_start"],
@@ -603,7 +621,7 @@ def compute_model_bytes(model_path: Path) -> tuple:
             "tensor_count": len(header["tensors"]),
             "bytes_by_type": bytes_by_type,
         })
-    return total_expert, total_non_expert, shard_paths, shard_details
+    return total_expert, total_non_expert, shard_paths, shard_details, expert_bytes_by_type
 
 
 # ---------------------------------------------------------------------
@@ -752,7 +770,14 @@ def _positive_int_type(flag_name: str):
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = _UsageErrorArgumentParser(
         prog="fastmlx-gguf-fit",
-        description="GGUF-aware, residency-aware pre-load fit checker.",
+        description=(
+            "GGUF-aware, residency-aware pre-load fit checker. GREEN is a "
+            "memory verdict only, not a loadability verdict: a pack can fit "
+            "and still fail to load under a given serving engine (for "
+            "example, an unimplemented tensor type); this checker never "
+            "inspects or refuses on tensor type. GREEN is not a quality "
+            "verdict: streaming experts from SSD may change the output."
+        ),
     )
     # Accepted for drop-in --fit-check-bin compatibility with
     # scripts/fastmlx_launch.py's run_fit_check(); validated where a
@@ -806,8 +831,8 @@ def compute_fit(args: argparse.Namespace) -> dict:
         args.wired_limit_mib, _env_int(ENV_WIRED_LIMIT_MIB)
     )
 
-    expert_bytes, non_expert_bytes, _shard_paths, shard_details = compute_model_bytes(
-        args.model_path
+    expert_bytes, non_expert_bytes, _shard_paths, shard_details, expert_bytes_by_type = (
+        compute_model_bytes(args.model_path)
     )
 
     if residency == "expert-stream":
@@ -857,6 +882,7 @@ def compute_fit(args: argparse.Namespace) -> dict:
         "reason": reason,
         "reason_text": reason_text,
         "shards": shard_details,
+        "expert_bytes_by_type": expert_bytes_by_type,
     }
 
 

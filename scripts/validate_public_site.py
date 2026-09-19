@@ -182,7 +182,7 @@ RESEARCH_EXPLORER_SCRIPT_SHA256 = (
 )
 REVIEWED_HOME_PAGE_BYTES = 10_495
 REVIEWED_HOME_PAGE_SHA256 = (
-    "defd6fb762f586b37e372971edd66a4cd02011db1e589be7969b08e68b70d75b"
+    "0a9a65e598f903233174979fadf0b438738388bc75d80d3f1cf1ca5846445cba"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -208,7 +208,7 @@ REVIEWED_LICENSE_PAGE_SHA256 = (
 )
 REVIEWED_STATUS_PAGE_BYTES = 22_822
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "6a7fc28553df022e3215fe1c1f4ece8469660ad147db85f23815bc3b46d2c950"
+    "46d4a1e2f3d4d24c936082789ae07cc67d90407d43237dcc175bb5811ffd99df"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -396,7 +396,7 @@ REVIEWED_STATUS_TEXT = (
     "does not create new measurement, performance, model, runtime, acquisition, or publication authority",
     "9 reviewed capabilities",
     "3 measured proof points",
-    "31 published research notes",
+    "32 published research notes",
     "22 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
@@ -491,6 +491,7 @@ REVIEWED_BENCHMARK_PATHS = tuple(
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
 )
 REVIEWED_ARTICLE_PATHS = (
+    "research/streaming-the-experts-changed-the-answers/",
     "research/the-lever-was-worth-ten-percent/",
     "research/the-default-nobody-chose/",
     "research/a-ratio-is-not-a-result/",
@@ -524,6 +525,7 @@ REVIEWED_ARTICLE_PATHS = (
     "research/one-formula-wrong-for-a-third-of-the-catalog/",
 )
 REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
+    "research/streaming-the-experts-changed-the-answers/": ("2026-09-18", "2026-09-18"),
     "research/the-lever-was-worth-ten-percent/": ("2026-09-11", "2026-09-11"),
     "research/the-default-nobody-chose/": ("2026-09-10", "2026-09-10"),
     "research/a-ratio-is-not-a-result/": ("2026-09-09", "2026-09-09"),
@@ -822,6 +824,12 @@ REVIEWED_PAGE_METADATA: Dict[
         "Dated fast-mlx investigations and measured negative results.",
         "website",
         None,
+    ),
+    "research/streaming-the-experts-changed-the-answers/": (
+        "Streaming the experts changed the answers — fast-mlx",
+        "A mixture-of-experts model activates only a few of its experts for each token. If the machine cannot hold all of them, a serving engine can keep the rest of the model in memory and read each expert from SSD when the…",
+        "article",
+        "Serving big models on Apple Silicon",
     ),
     "research/the-lever-was-worth-ten-percent/": (
         "The lever was worth ten percent — fast-mlx",
