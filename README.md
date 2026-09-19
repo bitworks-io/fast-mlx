@@ -366,16 +366,81 @@ changed greedy output on 16 of 40 prompts. Two `--mtp` processes also differed f
 one prompt, so the card records the transfer as `nondeterministic`. The card's quality figures describe
 the launch without `--mtp`.
 
-### Install a prebuilt release (v0.1.1)
+### Provenance proxy (`--front-port`)
+
+`fastmlx serve --front-port <PORT>` is opt-in and changes nothing about a plain launch until you
+pass it: the engine still starts exactly the same way, at the same `--host`/`--port`, with the
+same admitted argv. With `--front-port` given, this launcher instead starts the engine as a child
+process bound to loopback only, and runs a small reverse proxy of its own in front of it on
+`--front-host:--front-port` (`--front-host` defaults to `127.0.0.1`). Every method, path, query string
+and body passes through unchanged (only `Host` and hop-by-hop headers are rewritten; see below), and
+every response gains a fixed set of `X-FastMLX-*` headers computed once from the same admission plan `--dry-run`
+prints: `X-FastMLX-Admission`, `X-FastMLX-Card`, `X-FastMLX-Fit`, `X-FastMLX-Residency`,
+`X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, and a per-request `X-FastMLX-Request-Id`. `GET
+/fastmlx/provenance` is answered by the proxy itself with the same plan summary as JSON, never the
+raw argv or a model path.
+
+```sh
+python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b --port 8081 --front-port 8080
+```
+
+In front mode the engine binds `127.0.0.1` whatever `--front-host` says, so other machines reach
+only the proxy. Processes on the same Mac can still reach the engine's loopback port directly.
+`fastmlx serve` refuses (exit 2) if `--front-port` equals `--port`, if a passthrough argument
+(after `--`) sets the engine's host or port (`--host`, `--port`, `--hostname`, `--bind`, `-H`, or
+their `=` forms), or if the resolved engine profile itself could bypass the loopback guarantee: its
+`argv` must carry both a `{host}` and a `{port}` placeholder, and none of those same host/port flags
+may appear anywhere in `argv` (other than immediately before its own placeholder value, the way the
+built-in profile and the shipped examples spell `--host {host} --port {port}`) or in `residencyArgs`.
+
+What the headers mean: they describe the launch, not the individual response. `X-FastMLX-Card` names
+the quality card that admitted this pack, engine build and residency; `X-FastMLX-MTP` repeats the
+card's `--mtp` transfer status. They do not prove that a particular response matches the card's
+measurement. Any `X-FastMLX-*` header the engine itself sends back is dropped before the proxy adds
+its own, so the engine can never spoof or duplicate them.
+
+Behaviour to know:
+- Streamed responses (Server-Sent Events, chunked or close-delimited bodies) are relayed as they
+  arrive. A client that disconnects mid-stream closes the upstream connection. If the UPSTREAM
+  instead fails or closes mid-response, a response still in progress (headers already sent) is
+  aborted with a TCP reset rather than a clean close, so the client never mistakes a truncated body
+  for a complete one; a response that hasn't started yet (a promised `Content-Length` the engine
+  doesn't deliver) gets a 502 JSON error instead.
+- Duplicate request headers (e.g. two `Accept` values) reach the engine as two headers, never
+  collapsed into one. The client's own `Host` header is replaced with the engine's own host:port,
+  never forwarded verbatim. A relayed response keeps the engine's own `Server`/`Date` headers
+  untouched; a response the proxy generates itself (a 502/400/`/fastmlx/provenance` reply) carries
+  `Server: fastmlx-proxy`, never a Python version.
+- The proxy speaks HTTP/1.0 to clients and closes the connection after each response (no keep-alive).
+- A request with a chunked body gets 411; send a `Content-Length` body instead. A negative or
+  non-numeric `Content-Length` gets 400 immediately, without attempting to read it.
+- There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
+  not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
+  JSON error that still carries the headers. Reading the CLIENT's own request (line/headers/body) is
+  bounded to 120 s of idle time.
+- The proxy binds its port before starting the engine. If the port is busy, the engine never starts
+  (exit 3). The engine child runs in its own session, so a terminal Ctrl-C reaches it only once, via
+  this launcher's own signal forwarding.
+- SIGTERM or SIGINT is forwarded to the engine. The launcher exits once the engine exits, and never
+  with 0: a signal-killed engine gives `128 + signal` (SIGTERM → 143), and a clean engine exit gives 1.
+  A SIGKILL of the launcher itself cannot be forwarded (the process never runs again to do it) and
+  leaves the engine running, still bound to its loopback port with nothing in front of it any more --
+  stop it directly by that port or its pid.
+- One JSON line per request goes to stderr (request id, method, path without query, status, bytes,
+  whether streamed, and an `error` field when the upstream failed mid-response), written as a single
+  write so concurrent requests' lines cannot interleave. Headers and bodies, including
+  `Authorization`, are never logged.
+
+### Install a prebuilt release (v0.1.2)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
 checksum file, verify, then extract:
 
 ```sh
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.1/fastmlx-0.1.1-arm64-macos.tar.gz
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.1/fastmlx-0.1.1-arm64-macos.tar.gz.sha256
-shasum -a 256 -c fastmlx-0.1.1-arm64-macos.tar.gz.sha256
-tar -xzf fastmlx-0.1.1-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.2/fastmlx-0.1.2-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.2/fastmlx-0.1.2-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.2-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.2-arm64-macos.tar.gz
 ```
 
 The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
@@ -383,14 +448,14 @@ nothing further is needed; a browser download does, and macOS will refuse to run
 the tarball until you clear it:
 
 ```sh
-xattr -dr com.apple.quarantine fastmlx-0.1.1-arm64-macos
+xattr -dr com.apple.quarantine fastmlx-0.1.2-arm64-macos
 ```
 
 Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
 it), then run it:
 
 ```sh
-export PATH="$PWD/fastmlx-0.1.1-arm64-macos/bin:$PATH"
+export PATH="$PWD/fastmlx-0.1.2-arm64-macos/bin:$PATH"
 fastmlx --help
 fastmlx capacity --help
 ```

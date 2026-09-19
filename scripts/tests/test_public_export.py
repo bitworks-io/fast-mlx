@@ -237,9 +237,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # config.flagTransfer["--mtp"] and the serve/recommend --mtp notice. Conscious decision to publish:
 # the three files hold only fixture cards and argv lists; a marker scan found no private host, IP,
 # username, machine-local path, competitor/engine product name, or credential.
+# 2026-09-19, 996 -> 998: adds scripts/fastmlx_proxy.py (the opt-in `fastmlx serve --front-port`
+# provenance reverse proxy) and scripts/tests/test_fastmlx_proxy.py. Conscious decision to publish:
+# both files were read in full and contain no private host, IP, username, absolute machine-local
+# path, competitor/engine product name, or credential; the proxy is stdlib-only (http.server /
+# http.client), never names a third-party engine, and its tests drive a synthetic fake upstream on
+# an ephemeral loopback port rather than any real deployment.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 996,
-    "pathModeSha256": "1b4dba31b08e784462db6d28ea6a6559b072d57ca17f6e0e80e998ea53f6a182",
+    "pathCount": 998,
+    "pathModeSha256": "c3a07e8821e2f937fb3bb742d62d692424536a842ae6b3b9434f18f6e593844f",
 }
 
 

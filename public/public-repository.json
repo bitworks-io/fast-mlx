@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 996,
-    "pathModeSha256": "1b4dba31b08e784462db6d28ea6a6559b072d57ca17f6e0e80e998ea53f6a182"
+    "pathCount": 998,
+    "pathModeSha256": "c3a07e8821e2f937fb3bb742d62d692424536a842ae6b3b9434f18f6e593844f"
   },
   "files": [
     {
@@ -68,6 +68,10 @@
     {
       "source": "scripts/fastmlx_launch.py",
       "destination": "scripts/fastmlx_launch.py"
+    },
+    {
+      "source": "scripts/fastmlx_proxy.py",
+      "destination": "scripts/fastmlx_proxy.py"
     },
     {
       "source": "scripts/fastmlx_pull.py",
@@ -172,6 +176,10 @@
     {
       "source": "scripts/tests/test_fastmlx_launch.py",
       "destination": "scripts/tests/test_fastmlx_launch.py"
+    },
+    {
+      "source": "scripts/tests/test_fastmlx_proxy.py",
+      "destination": "scripts/tests/test_fastmlx_proxy.py"
     },
     {
       "source": "scripts/tests/test_fastmlx_pull.py",

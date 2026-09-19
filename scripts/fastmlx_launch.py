@@ -48,8 +48,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +68,17 @@ _PULL_SPEC = importlib.util.spec_from_file_location("fastmlx_pull", _PULL_PATH)
 assert _PULL_SPEC is not None and _PULL_SPEC.loader is not None
 pull = importlib.util.module_from_spec(_PULL_SPEC)
 _PULL_SPEC.loader.exec_module(pull)
+
+# The opt-in provenance proxy `--front-port` starts in front of the engine
+# (see `_run_front_mode` below); loaded the same sibling-file way `pull` is,
+# above, so this launcher never depends on `fastmlx_proxy` being importable
+# as a package -- only on it being the file next to this one, exactly like
+# every release tarball ships it (libexec/scripts).
+_PROXY_PATH = Path(__file__).resolve().parent / "fastmlx_proxy.py"
+_PROXY_SPEC = importlib.util.spec_from_file_location("fastmlx_proxy", _PROXY_PATH)
+assert _PROXY_SPEC is not None and _PROXY_SPEC.loader is not None
+fastmlx_proxy = importlib.util.module_from_spec(_PROXY_SPEC)
+_PROXY_SPEC.loader.exec_module(fastmlx_proxy)
 
 # The one Swift binary this repository ships that can both answer a
 # ``--fit-check-only`` pre-load question and serve an OpenAI-compatible API,
@@ -1157,6 +1170,66 @@ def _residency_conflict_source_and_value(
     return None
 
 
+_FRONT_MODE_BYPASS_FLAGS = ("--host", "--port", "--hostname", "--bind", "-H")
+
+
+def _flag_and_inline_value(token: str):
+    """Split a ``--flag=value`` token into ``(flag, value)``; a bare flag
+    (or anything without ``=``) returns ``(token, None)``.
+    """
+    if token.startswith("-") and "=" in token:
+        flag, _, value = token.partition("=")
+        return flag, value
+    return token, None
+
+
+def _is_front_mode_bypass_flag(token: str) -> bool:
+    flag, _ = _flag_and_inline_value(token)
+    return flag in _FRONT_MODE_BYPASS_FLAGS
+
+
+def _placeholder_bearing(value: Optional[str]) -> bool:
+    return bool(value) and ("{host}" in value or "{port}" in value)
+
+
+def _front_mode_profile_argv_bypass_token(argv: list) -> Optional[str]:
+    """The first host/port-bypass-capable flag in a profile's templated
+    ``argv`` that is NOT immediately paired with a ``{host}``/``{port}``
+    placeholder value -- see the front-mode loopback-guarantee review (M1).
+    ``--host {host} --port {port}`` (the shipped example profiles' and the
+    built-in profile's own spelling) is exempted; a literal
+    ``--hostname 0.0.0.0``, a bare flag with no placeholder value, or an
+    ``=``-form whose value carries no placeholder, is not. Returns the
+    offending token, or ``None`` if the whole argv is clean.
+    """
+    for index, token in enumerate(argv):
+        if not _is_front_mode_bypass_flag(token):
+            continue
+        _, inline_value = _flag_and_inline_value(token)
+        if inline_value is not None:
+            if _placeholder_bearing(inline_value):
+                continue
+            return token
+        next_value = argv[index + 1] if index + 1 < len(argv) else None
+        if _placeholder_bearing(next_value):
+            continue
+        return token
+    return None
+
+
+def _literal_bypass_token(tokens) -> Optional[str]:
+    """Same bypass-flag check for a list of already-literal tokens
+    (``residencyArgs`` entries or passthrough args): these can never carry
+    a ``{host}``/``{port}`` placeholder (the schema forbids ``{``/``}`` in
+    ``residencyArgs``, and passthrough args are never templated at all),
+    so any bypass flag among them is refused unconditionally.
+    """
+    for token in tokens:
+        if _is_front_mode_bypass_flag(token):
+            return token
+    return None
+
+
 def _residency_flag_tokens(profile: dict) -> set:
     """Every ``-``-prefixed token appearing in ANY of ``profile``'s
     ``residencyArgs`` lists, regardless of which residency the current
@@ -1210,6 +1283,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     serve.add_argument("--engine-profile", default=None)
     serve.add_argument("--engine-bin", default=None)
     serve.add_argument("--dry-run", action="store_true")
+    # --front-port: opt-in, off by default. When given, the engine's {host}
+    # placeholder is forced to loopback and this launcher runs an
+    # X-FastMLX-*-header-stamping reverse proxy on --front-host:--front-port
+    # in front of it instead of exec'ing the engine directly (see
+    # `_run_front_mode`). --front-host only ever names where the PROXY
+    # binds; the engine itself always binds loopback in front mode.
+    serve.add_argument("--front-port", type=int, default=None)
+    serve.add_argument("--front-host", default="127.0.0.1")
     return parser
 
 
@@ -1584,6 +1665,65 @@ def _run_serve(args, passthrough_args: list) -> int:
     if mtp_notice:
         print(f"fastmlx serve: {mtp_notice}", file=sys.stderr)
 
+    # --- front mode (--front-port) validation ---------------------------
+    # Checked before the final argv is built at all: a refusal here must
+    # never depend on (or leak) the substituted argv, the same reason the
+    # residency passthrough guard above runs before the fit check.
+    front_mode = args.front_port is not None
+    if front_mode and args.front_port == args.port:
+        raise LaunchRefusal(
+            2,
+            f"--front-port {args.front_port} cannot equal --port {args.port}: the "
+            "front proxy and the engine it fronts must bind different ports",
+        )
+    if front_mode:
+        # The loopback guarantee depends on the PROFILE, not only on the
+        # passthrough-args refusal below: a custom --engine-profile whose
+        # argv has no {host}/{port} placeholder at all, has a literal
+        # host/port-bypass flag alongside those placeholders, or puts one
+        # in residencyArgs, would let the engine bind wider than loopback
+        # even though front mode believes it fixed the bind. Refuse all
+        # three before the argv is even substituted (see M1 in the
+        # front-mode review).
+        profile_argv = profile["argv"]
+        has_host_placeholder = any("{host}" in item for item in profile_argv)
+        has_port_placeholder = any("{port}" in item for item in profile_argv)
+        if not (has_host_placeholder and has_port_placeholder):
+            raise LaunchRefusal(
+                2,
+                f"engine profile {profile['name']!r} argv has no {{host}}/{{port}} "
+                "placeholder; front mode cannot guarantee the engine binds "
+                "loopback without both, so it refuses to start",
+            )
+        profile_bypass = _front_mode_profile_argv_bypass_token(profile_argv)
+        if profile_bypass is not None:
+            raise LaunchRefusal(
+                2,
+                f"engine profile {profile['name']!r} argv token {profile_bypass!r} "
+                "would let the engine bind a host/port the --front-port proxy does "
+                "not expect, bypassing it; only a flag immediately followed by a "
+                "{host}/{port} placeholder value is allowed in front mode",
+            )
+        for residency_name, arg_list in (profile.get("residencyArgs") or {}).items():
+            residency_bypass = _literal_bypass_token(arg_list)
+            if residency_bypass is not None:
+                raise LaunchRefusal(
+                    2,
+                    f"engine profile {profile['name']!r} residencyArgs[{residency_name!r}] "
+                    f"token {residency_bypass!r} would let the engine bind a host/port "
+                    "the --front-port proxy does not expect, bypassing it; remove it -- "
+                    "front mode already fixes the engine's host and port",
+                )
+        for passthrough in passthrough_args:
+            if _is_front_mode_bypass_flag(passthrough):
+                raise LaunchRefusal(
+                    2,
+                    f"passthrough argument {passthrough!r} would let the engine bind "
+                    "a host/port the --front-port proxy does not expect, letting a "
+                    "client bypass the proxy entirely; remove it -- front mode "
+                    "already fixes the engine's host and port",
+                )
+
     # --- engine argv ---------------------------------------------------
     engine_bin_value = args.engine_bin
     if engine_bin_value is None:
@@ -1617,11 +1757,16 @@ def _run_serve(args, passthrough_args: list) -> int:
                 f"binary's actual sha256 {actual_binary_sha256} ({engine_bin_abs})",
             )
 
+    # In front mode the engine ALWAYS binds loopback, regardless of
+    # --front-host: --front-host only names where the proxy itself listens,
+    # and the whole point of front mode is that the engine is never
+    # reachable except through it.
+    engine_host = "127.0.0.1" if front_mode else args.host
     substitutions = {
         "engine_bin": engine_bin_abs,
         "model_path": str(model_path.resolve()),
         "model_id": model_id,
-        "host": args.host,
+        "host": engine_host,
         "port": str(args.port),
         "context": str(context),
     }
@@ -1647,20 +1792,130 @@ def _run_serve(args, passthrough_args: list) -> int:
             "prompts": mtp_prompts,
         },
     }
+    # Only in front mode: without --front-port the plan (and dry-run JSON)
+    # is byte-identical to what it was before this feature existed.
+    if front_mode:
+        plan["front"] = {
+            "host": args.front_host,
+            "port": args.front_port,
+            "upstream": f"http://127.0.0.1:{args.port}",
+        }
 
     if args.dry_run:
         print(json.dumps(plan))
         return 0
 
-    print(
+    admitted_line = (
         "fastmlx_launch=admitted "
         f"engine={profile['name']} card={card.get('id') if card else 'none'} "
         f"fit={fit_label} context={context} residency={residency} "
-        f"engine_build={build_status} mtp={mtp_status}",
-        file=sys.stderr,
+        f"engine_build={build_status} mtp={mtp_status}"
     )
+    if front_mode:
+        admitted_line += f" front={args.front_host}:{args.front_port}"
+    print(admitted_line, file=sys.stderr)
+
+    if front_mode:
+        return _run_front_mode(final_argv, plan)
+
     os.execv(engine_bin_abs, final_argv)
     return 0  # pragma: no cover - unreachable, os.execv never returns on success
+
+
+def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int:
+    """Front mode's orchestration: bind the proxy, THEN start the engine as
+    a CHILD process (never exec'd -- this process must stay alive to run
+    the proxy), forward SIGTERM/SIGINT to the child, and exit non-zero once
+    the child exits (fail-closed: front mode never returns 0, since a
+    proxied server process exiting is always either a shutdown request or a
+    crash, never a "success" this launcher can attest to on its own).
+
+    The proxy is bound BEFORE the engine is started: a bind failure (a busy
+    --front-port) must never start -- and then have to kill -- a large
+    model load that was never going to be reachable anyway. Signal
+    forwarding is installed before ``popen`` too, via a holder this
+    function's own signal handler reads: a SIGTERM/SIGINT that arrives in
+    the (short) window between installing the handler and the child
+    existing is remembered and forwarded the instant the child does exist,
+    rather than being silently dropped.
+    """
+    front = plan["front"]
+    front_host = front["host"]
+    front_port = front["port"]
+    # The upstream is always this launcher's own construction (see the
+    # "front" key above: "http://127.0.0.1:<--port>"), so its host/port are
+    # recovered from the plan rather than threading extra parameters
+    # through every caller of this function.
+    upstream_host = "127.0.0.1"
+    upstream_port = int(front["upstream"].rsplit(":", 1)[1])
+
+    try:
+        server = fastmlx_proxy.create_server(front_host, front_port, upstream_host, upstream_port, plan)
+    except OSError as exc:
+        print(
+            f"fastmlx serve: front proxy could not bind {front_host}:{front_port}: {exc}",
+            file=sys.stderr,
+        )
+        return 3
+
+    child_holder: dict = {"child": None}
+    pending_signal: dict = {"signum": None}
+
+    def _forward_signal(signum, _frame):
+        child = child_holder["child"]
+        if child is None:
+            # No child yet: remember the signal: the code right after
+            # ``popen`` below checks this and forwards it immediately.
+            pending_signal["signum"] = signum
+            return
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+    previous_handlers = {
+        sig: signal.signal(sig, _forward_signal) for sig in (signal.SIGTERM, signal.SIGINT)
+    }
+
+    try:
+        # start_new_session=True: the engine gets its OWN session/process
+        # group, never the launcher's -- without this, a terminal Ctrl-C
+        # (which sends SIGINT to the whole foreground process group) would
+        # reach the engine BOTH directly from the terminal AND a second
+        # time via this function's own signal forwarding below.
+        child = popen(final_argv, start_new_session=True)
+    except OSError as exc:
+        print(f"fastmlx serve: front mode could not start the engine: {exc}", file=sys.stderr)
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+        server.server_close()
+        return 3
+
+    child_holder["child"] = child
+    if pending_signal["signum"] is not None:
+        try:
+            child.send_signal(pending_signal["signum"])
+        except OSError:
+            pass
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    child_code = child.wait()
+    server.shutdown()
+    server.server_close()
+    if child_code == 0:
+        # Front mode never attests to a "success" exit -- see docstring.
+        return 1
+    if child_code < 0:
+        # ``subprocess``'s own convention: a negative code from ``wait()``
+        # names the signal that killed the child (os.waitpid's WIFSIGNALED
+        # encoding). The shell/os convention for a signal-killed process's
+        # own exit status is 128+signum (e.g. SIGTERM -> 143) -- returning
+        # the raw negative code instead would make THIS process's own exit
+        # status wrap to a nonsensical 128-|code| (e.g. -15 -> 241).
+        return 128 - child_code
+    return child_code
 
 
 def main(argv: Optional[list] = None) -> None:

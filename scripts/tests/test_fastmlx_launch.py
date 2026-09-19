@@ -1,12 +1,16 @@
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 import os
+import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1312,6 +1316,572 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         plan = self.last_json_line(stdout)
         self.assertEqual(plan["card"]["id"], PIN_ONLY_CARD_ID)
+
+
+def _free_tcp_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _kill_pid_if_alive(pid: int) -> None:
+    """L7 test cleanup: kill a recorded stub-engine pid even when the test
+    that recorded it fails partway through (an ``addCleanup`` callback, not
+    the ``finally`` block that only ever kills the LAUNCHER's own pid) --
+    the launcher's own SIGKILL/crash leaves an unrecoverable, unforwarded
+    engine child behind otherwise.
+    """
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _minimal_front_plan(front_port: int, upstream_port: int) -> dict:
+    """The smallest plan dict ``_run_front_mode``/``fastmlx_proxy.create_server``
+    need: every field ``build_provenance_headers``/``build_provenance_body``
+    read, plus a ``front`` key naming this launch's own (fake) ports.
+    """
+    return {
+        "fit": {"verdict": "GREEN", "fields": {}},
+        "card": None,
+        "admission": "admit_unmeasured",
+        "argv": [],
+        "residency": "resident",
+        "engineBuild": {"status": "unrecorded", "card": None, "launch": None},
+        "mtp": {"status": "off", "divergentPrompts": None, "prompts": None},
+        "front": {
+            "host": "127.0.0.1",
+            "port": front_port,
+            "upstream": f"http://127.0.0.1:{upstream_port}",
+        },
+    }
+
+
+class _FakeChild:
+    """A ``subprocess.Popen``-shaped stand-in for ``_run_front_mode``'s exit-
+    code-mapping and bind/Popen-ordering unit tests: ``wait()`` returns a
+    fixed, caller-chosen code (never actually spawns anything), and
+    ``send_signal``/``kill`` just record/no-op.
+    """
+
+    def __init__(self, wait_return: int):
+        self._wait_return = wait_return
+        self.signals_received: list = []
+
+    def wait(self):
+        return self._wait_return
+
+    def send_signal(self, signum):
+        self.signals_received.append(signum)
+
+    def kill(self):
+        pass
+
+
+# A stub OpenAI-compatible engine, spawned as a real subprocess by the
+# front-mode e2e test below: parses --host/--port off its own argv (the same
+# shape the built-in engine profile substitutes), writes its own pid to
+# STUB_ENGINE_PID_PATH (so the test can confirm the launcher's SIGTERM
+# actually reaches and kills it), then serves one fixed JSON route.
+STUB_ENGINE_BODY = (
+    "#!" + sys.executable + "\n"
+    "import http.server\n"
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "argv = sys.argv[1:]\n"
+    "host = argv[argv.index('--host') + 1]\n"
+    "port = int(argv[argv.index('--port') + 1])\n"
+    "\n"
+    "with open(os.environ['STUB_ENGINE_PID_PATH'], 'w', encoding='utf-8') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    "\n"
+    "class Handler(http.server.BaseHTTPRequestHandler):\n"
+    "    def log_message(self, *a, **k):\n"
+    "        pass\n"
+    "    def do_GET(self):\n"
+    "        payload = b'{\"stub\": true}'\n"
+    "        self.send_response(200)\n"
+    "        self.send_header('Content-Type', 'application/json')\n"
+    "        self.send_header('Content-Length', str(len(payload)))\n"
+    "        self.end_headers()\n"
+    "        self.wfile.write(payload)\n"
+    "\n"
+    "server = http.server.ThreadingHTTPServer((host, port), Handler)\n"
+    "server.serve_forever()\n"
+)
+
+
+class FrontProxyModeTests(FastmlxLaunchTestCase):
+    """``--front-port``: opt-in provenance proxy in front of the engine.
+
+    Reuses ``FastmlxLaunchTestCase.setUp``/``base_args``/``run_main`` so
+    these cases start from exactly the same fixtures (model dir, quality
+    manifest, GREEN fit-check stub) as every other launcher test.
+    """
+
+    # ------------------------------------------------------------------
+    # Without --front-port: nothing changes. The plan carries no "front"
+    # key at all, so every pre-existing dry-run assertion (byte-exact argv,
+    # admission, fit verdict, ...) in FastmlxLaunchTestCase is untouched by
+    # this feature -- this is the regression guard for that claim.
+    # ------------------------------------------------------------------
+    def test_dry_run_without_front_port_carries_no_front_key(self):
+        argv = self.base_args(**{"--model-repo": PASS_REPO, "--context": "2048"}) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = json.loads(stdout)
+        self.assertNotIn("front", plan)
+        self.assertEqual(
+            plan["argv"][plan["argv"].index("--host") + 1],
+            "127.0.0.1",
+            "without --front-port the engine keeps binding the launch's own --host",
+        )
+
+    # ------------------------------------------------------------------
+    # With --front-port: the engine's {host} placeholder becomes 127.0.0.1
+    # (loopback) regardless of --front-host, --port stays the backend port,
+    # and the plan gains a "front" key.
+    # ------------------------------------------------------------------
+    def test_front_mode_dry_run_binds_engine_to_loopback_and_adds_front_key(self):
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--host": "0.0.0.0",
+                "--port": "8080",
+                "--front-port": "9090",
+                "--front-host": "0.0.0.0",
+            }
+        ) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        plan = json.loads(stdout)
+        self.assertEqual(
+            plan["argv"][plan["argv"].index("--host") + 1],
+            "127.0.0.1",
+            "front mode must bind the engine to loopback, never --front-host",
+        )
+        self.assertEqual(plan["argv"][plan["argv"].index("--port") + 1], "8080")
+        self.assertEqual(
+            plan["front"],
+            {"host": "0.0.0.0", "port": 9090, "upstream": "http://127.0.0.1:8080"},
+        )
+
+    # ------------------------------------------------------------------
+    # Refusal: --front-port must not equal --port.
+    # ------------------------------------------------------------------
+    def test_front_port_equal_to_port_is_refused(self):
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--port": "8080",
+                "--front-port": "8080",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--front-port", stderr)
+        self.assertIn("cannot equal", stderr)
+        self.assertIn("--port", stderr)
+
+    # ------------------------------------------------------------------
+    # Refusal: a passthrough argument that would let the engine bind a
+    # different host/port than the proxy expects, bypassing it.
+    # ------------------------------------------------------------------
+    def test_front_mode_passthrough_host_override_is_refused(self):
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run", "--", "--host", "0.0.0.0"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--host", stderr)
+        self.assertIn("bypass", stderr)
+
+    def test_front_mode_passthrough_port_equals_form_is_refused(self):
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run", "--", "--port=9999"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--port=9999", stderr)
+        self.assertIn("bypass", stderr)
+
+    # ------------------------------------------------------------------
+    # M1: the loopback guarantee depends on the PROFILE, not only the
+    # passthrough-args refusal above. A custom engine profile whose argv
+    # has no {host}/{port} placeholder at all, has a literal host/port-
+    # bypass flag alongside the placeholders, or puts one in
+    # residencyArgs, would let the engine bind wider than loopback even
+    # though front mode believes it fixed the bind. Refuse all of these,
+    # and the wider passthrough-flag family (--hostname/--bind/-H), while
+    # still accepting the shipped example profiles and the built-in one.
+    # ------------------------------------------------------------------
+    def _write_profile(self, argv, residency_args=None, name="front-mode-profile"):
+        document = {
+            "schema": "fastmlx-engine-profile-v1",
+            "name": name,
+            "argv": argv,
+        }
+        if residency_args is not None:
+            document["residencyArgs"] = residency_args
+        profile_path = self.root / f"{name}.json"
+        profile_path.write_text(json.dumps(document), encoding="utf-8")
+        return profile_path
+
+    def test_front_mode_refuses_profile_with_no_host_port_placeholder(self):
+        profile_path = self._write_profile(
+            ["{engine_bin}", "--serve", "--model", "{model_path}", "--ctx-size", "{context}"]
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("{host}", stderr)
+        self.assertIn("{port}", stderr)
+
+    def test_front_mode_refuses_profile_argv_literal_hostname_override(self):
+        profile_path = self._write_profile(
+            [
+                "{engine_bin}", "--serve", "--model", "{model_path}",
+                "--host", "{host}", "--port", "{port}",
+                "--hostname", "0.0.0.0",
+            ]
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--hostname", stderr)
+        self.assertIn("bypass", stderr)
+
+    def test_front_mode_refuses_profile_argv_bind_equals_form(self):
+        profile_path = self._write_profile(
+            [
+                "{engine_bin}", "--serve", "--model", "{model_path}",
+                "--host", "{host}", "--port", "{port}",
+                "--bind=0.0.0.0",
+            ]
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("--bind=0.0.0.0", stderr)
+        self.assertIn("bypass", stderr)
+
+    def test_front_mode_refuses_profile_argv_short_h_flag(self):
+        profile_path = self._write_profile(
+            [
+                "{engine_bin}", "--serve", "--model", "{model_path}",
+                "--host", "{host}", "--port", "{port}",
+                "-H", "0.0.0.0",
+            ]
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+                "--front-port": "9090",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("-H", stderr)
+        self.assertIn("bypass", stderr)
+
+    def test_front_mode_refuses_residency_args_host_override(self):
+        profile_path = self._write_profile(
+            [
+                "{engine_bin}", "--serve", "--model", "{model_path}",
+                "--host", "{host}", "--port", "{port}",
+            ],
+            residency_args={"expert-stream": ["--ssd-streaming", "--host", "0.0.0.0"]},
+        )
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+                "--front-port": "9090",
+                "--residency": "expert-stream",
+            }
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("residencyArgs", stderr)
+        self.assertIn("--host", stderr)
+        self.assertIn("bypass", stderr)
+
+    def test_front_mode_passthrough_hostname_and_bind_and_short_h_are_refused(self):
+        cases = [
+            ["--hostname", "0.0.0.0"],
+            ["--hostname=0.0.0.0"],
+            ["--bind", "0.0.0.0"],
+            ["--bind=0.0.0.0"],
+            ["-H", "0.0.0.0"],
+        ]
+        for tokens in cases:
+            with self.subTest(tokens=tokens):
+                argv = self.base_args(
+                    **{
+                        "--model-repo": PASS_REPO,
+                        "--context": "2048",
+                        "--front-port": "9090",
+                    }
+                ) + ["--dry-run", "--"] + tokens
+                code, _, stderr = self.run_main(argv)
+                self.assertEqual(code, 2)
+                self.assertIn(tokens[0], stderr)
+                self.assertIn("bypass", stderr)
+
+    def test_front_mode_accepts_shipped_example_profiles_and_builtin(self):
+        example_dir = Path(__file__).resolve().parents[2] / "examples" / "engine-profiles"
+        example_profiles = sorted(example_dir.glob("*.json"))
+        self.assertTrue(example_profiles, "expected at least one shipped example profile")
+        profile_choices = [None] + example_profiles
+        for profile_path in profile_choices:
+            with self.subTest(profile=profile_path):
+                overrides = {
+                    "--model-repo": PASS_REPO,
+                    "--context": "2048",
+                    "--front-port": "9090",
+                }
+                overrides["--engine-profile"] = str(profile_path) if profile_path else None
+                argv = self.base_args(**overrides) + ["--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 0, stderr)
+                plan = json.loads(stdout)
+                self.assertEqual(plan["front"]["port"], 9090)
+
+    # ------------------------------------------------------------------
+    # Ordering: the proxy must bind FIRST -- a bind failure must never
+    # start (and then have to kill) the engine child at all.
+    # ------------------------------------------------------------------
+    def test_bind_failure_never_starts_the_engine(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        plan = _minimal_front_plan(front_port, upstream_port)
+        popen_calls = []
+
+        def recording_popen(argv, **kwargs):
+            popen_calls.append(argv)
+            return _FakeChild(0)
+
+        with patch.object(
+            FASTMLX_LAUNCH.fastmlx_proxy,
+            "create_server",
+            side_effect=OSError("address already in use"),
+        ):
+            result = FASTMLX_LAUNCH._run_front_mode([], plan, popen=recording_popen)
+
+        self.assertEqual(result, 3)
+        self.assertEqual(popen_calls, [], "a bind failure must never invoke Popen")
+
+    # ------------------------------------------------------------------
+    # Ordering: if Popen raises AFTER a successful bind, the bound proxy
+    # socket must be closed (not leaked) -- proven by re-binding the same
+    # port immediately after.
+    # ------------------------------------------------------------------
+    def test_popen_oserror_after_bind_closes_the_proxy_socket(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        plan = _minimal_front_plan(front_port, upstream_port)
+
+        def failing_popen(argv, **kwargs):
+            raise OSError("engine binary not found")
+
+        result = FASTMLX_LAUNCH._run_front_mode([], plan, popen=failing_popen)
+        self.assertEqual(result, 3)
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", front_port))
+        except OSError as exc:  # pragma: no cover - failure path itself is the assertion
+            self.fail(f"proxy socket on {front_port} was never closed: {exc}")
+        finally:
+            probe.close()
+
+    # ------------------------------------------------------------------
+    # Exit code: a signal-killed child (negative os.waitpid code) maps to
+    # 128+signum; a zero-exit child maps to 1 (front mode never exits 0);
+    # any other positive code passes through unchanged.
+    # ------------------------------------------------------------------
+    def test_exit_code_mapping_for_signal_killed_zero_and_nonzero_child(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        original_term = signal.getsignal(signal.SIGTERM)
+        original_int = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGTERM, original_term)
+        self.addCleanup(signal.signal, signal.SIGINT, original_int)
+
+        for wait_return, expected in ((-15, 143), (0, 1), (7, 7)):
+            with self.subTest(wait_return=wait_return):
+                plan = _minimal_front_plan(front_port, upstream_port)
+                child = _FakeChild(wait_return)
+                result = FASTMLX_LAUNCH._run_front_mode(
+                    [], plan, popen=lambda argv, child=child, **kwargs: child
+                )
+                self.assertEqual(result, expected)
+
+    # ------------------------------------------------------------------
+    # L7: the engine child is started in its OWN session (start_new_session
+    # =True), not the launcher's process group -- a terminal Ctrl-C (which
+    # sends SIGINT to the whole foreground process group) must reach the
+    # engine only ONCE, via this function's own signal forwarding, never a
+    # second time directly from the terminal racing the forwarded signal.
+    # ------------------------------------------------------------------
+    def test_engine_child_starts_in_its_own_session(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        plan = _minimal_front_plan(front_port, upstream_port)
+        popen_kwargs = {}
+
+        def recording_popen(argv, **kwargs):
+            popen_kwargs.update(kwargs)
+            return _FakeChild(0)
+
+        FASTMLX_LAUNCH._run_front_mode([], plan, popen=recording_popen)
+        self.assertTrue(popen_kwargs.get("start_new_session"))
+
+    # ------------------------------------------------------------------
+    # End-to-end: a real subprocess launch in front mode actually proxies
+    # a request to a stub engine, then a SIGTERM to the launcher stops both
+    # the launcher and the engine child within a bound.
+    # ------------------------------------------------------------------
+    def test_front_mode_e2e_proxies_and_forwards_sigterm(self):
+        stub_bin = write_script(self.root / "stub-engine.py", STUB_ENGINE_BODY)
+        pid_path = self.root / "stub-engine.pid"
+        env = dict(os.environ)
+        env["STUB_ENGINE_PID_PATH"] = str(pid_path)
+
+        front_port = _free_tcp_port()
+        backend_port = _free_tcp_port()
+
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+            "serve",
+            "--model-path", str(self.model_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--fit-check-bin", str(self.green_fit_bin),
+            "--engine-bin", str(stub_bin),
+            "--model-repo", PASS_REPO,
+            "--context", "2048",
+            "--port", str(backend_port),
+            "--front-port", str(front_port),
+        ]
+        proc = subprocess.Popen(
+            argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        try:
+            resp = None
+            body = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    self.fail(
+                        "launcher exited early: "
+                        f"code={proc.returncode} stderr={proc.stderr.read()}"
+                    )
+                try:
+                    conn = http.client.HTTPConnection("127.0.0.1", front_port, timeout=2)
+                    conn.request("GET", "/v1/models")
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    conn.close()
+                    if resp.status == 200:
+                        break
+                    # The proxy can come up and answer 502 briefly before the
+                    # stub engine has finished binding its own backend port;
+                    # keep polling until it reports success or time runs out.
+                    resp = None
+                    time.sleep(0.1)
+                except OSError:
+                    time.sleep(0.1)
+            self.assertIsNotNone(resp, "front proxy never came up")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(json.loads(body), {"stub": True})
+            self.assertIsNotNone(resp.getheader("X-FastMLX-Admission"))
+            self.assertIsNotNone(resp.getheader("X-FastMLX-Request-Id"))
+
+            deadline = time.time() + 5
+            while not pid_path.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(pid_path.exists(), "stub engine never recorded its pid")
+            child_pid = int(pid_path.read_text().strip())
+            # Guarantees the stub engine dies even if an assertion below
+            # fails mid-test -- the outer ``finally`` only ever kills the
+            # LAUNCHER's pid (``proc``), never the engine CHILD's.
+            self.addCleanup(_kill_pid_if_alive, child_pid)
+
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                self.fail("launcher did not exit within 10s of SIGTERM")
+
+            # The stub engine (STUB_ENGINE_BODY) installs no SIGTERM handler
+            # of its own, so the launcher's forwarded SIGTERM kills it by
+            # signal (os.waitpid reports a NEGATIVE code, -15) -- mapped by
+            # _run_front_mode to 128+15 = 143, never the raw negative code
+            # (which would make the process's own exit status a nonsensical
+            # 241) and never the unmapped 0 front mode always avoids.
+            self.assertEqual(
+                proc.returncode,
+                143,
+                "launcher must exit 143 (128+SIGTERM) when its forwarded "
+                "SIGTERM kills the unhandled-signal stub engine",
+            )
+
+            deadline = time.time() + 5
+            child_gone = False
+            while time.time() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    child_gone = True
+                    break
+                time.sleep(0.1)
+            self.assertTrue(
+                child_gone, "engine child process survived the launcher's SIGTERM"
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 class CardMatchingHelperTests(unittest.TestCase):
