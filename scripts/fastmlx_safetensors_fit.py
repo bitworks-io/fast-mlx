@@ -495,24 +495,98 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Accepted for drop-in --fit-check-bin compatibility with
     # scripts/fastmlx_launch.py's run_fit_check(); validated where a
     # validation is cheap and meaningful, otherwise stored and unused.
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument(
-        "--host-use", default="shared", choices=["shared", "dedicated-serving"]
+        "--model",
+        default=None,
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility with "
+            "fastmlx_launch.py; not read by this checker"
+        ),
     )
-    parser.add_argument("--fit-check-only", action="store_true")
-    parser.add_argument("--context", type=int, default=None)
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        type=Path,
+        help=(
+            "the pack directory to size, scanned recursively for "
+            "*.safetensors shards (a dot-prefixed directory is never "
+            "scanned)"
+        ),
+    )
+    parser.add_argument(
+        "--host-use",
+        default="shared",
+        choices=["shared", "dedicated-serving"],
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; not read "
+            "by this checker's fit computation"
+        ),
+    )
+    parser.add_argument(
+        "--fit-check-only",
+        action="store_true",
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; this "
+            "checker never loads weights regardless of this flag"
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; recorded "
+            "in the --json result's context field but not read by this "
+            "checker's fit computation"
+        ),
+    )
 
-    parser.add_argument("--residency", choices=["resident", "expert-stream"], default=None)
     parser.add_argument(
-        "--wired-limit-mib", type=_GGUF._positive_int_type("--wired-limit-mib"), default=None
+        "--residency",
+        choices=["resident", "expert-stream"],
+        default=None,
+        help=(
+            "the residency label recorded in the attestation (defaults to "
+            "'resident'); unlike fastmlx-gguf-fit, this checker does not "
+            "vary resident weight bytes by residency. 'expert-stream' is "
+            "accepted by the parser but always REFUSED: safetensors packs "
+            "have no expert-stream sizing"
+        ),
     )
-    parser.add_argument("--wired-margin-gib", type=_GGUF._wired_margin_gib_type, default=None)
+    parser.add_argument(
+        "--wired-limit-mib",
+        type=_GGUF._positive_int_type("--wired-limit-mib"),
+        default=None,
+        help=(
+            "the wired-memory ceiling, in MiB (falls back to "
+            f"{_GGUF.ENV_WIRED_LIMIT_MIB}, then the live "
+            "iogpu.wired_limit_mb sysctl, then 75%% of hw.memsize)"
+        ),
+    )
+    parser.add_argument(
+        "--wired-margin-gib",
+        type=_GGUF._wired_margin_gib_type,
+        default=None,
+        help=(
+            "a safety margin, in GiB, subtracted from the wired-memory "
+            f"ceiling before comparing (integer 2-32; falls back to "
+            f"{_GGUF.ENV_WIRED_MARGIN_GIB}, then 8)"
+        ),
+    )
     # No `required=True`: a flag, then the shared FASTMLX_GGUF_KV_RESERVE_GIB
     # environment variable (see module docstring), then a usage error (exit
     # 64, checked explicitly in main()) -- a KV-cache reserve must never be
     # silently defaulted to zero.
-    parser.add_argument("--kv-reserve-gib", type=float, default=None)
+    parser.add_argument(
+        "--kv-reserve-gib",
+        type=float,
+        default=None,
+        help=(
+            "the KV-cache reserve to add to weight bytes, in GiB (required: "
+            f"pass this flag or set {_GGUF.ENV_KV_RESERVE_GIB}; never "
+            "silently defaults to zero)"
+        ),
+    )
     parser.add_argument(
         "--mmap-side-file",
         action="append",
@@ -528,7 +602,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "configuration error (exit 1)."
         ),
     )
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--json", action="store_true", help="print the fit result as a JSON object"
+    )
     return parser
 
 

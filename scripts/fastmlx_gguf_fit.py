@@ -796,21 +796,94 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Accepted for drop-in --fit-check-bin compatibility with
     # scripts/fastmlx_launch.py's run_fit_check(); validated where a
     # validation is cheap and meaningful, otherwise stored and unused.
-    parser.add_argument("--model", default=None)
-    parser.add_argument("--model-path", required=True, type=Path)
     parser.add_argument(
-        "--host-use", default="shared", choices=["shared", "dedicated-serving"]
+        "--model",
+        default=None,
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility with "
+            "fastmlx_launch.py; not read by this checker"
+        ),
     )
-    parser.add_argument("--fit-check-only", action="store_true")
-    parser.add_argument("--context", type=int, default=None)
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        type=Path,
+        help=(
+            "the GGUF pack to size: a single file, a directory containing "
+            "one, or a split-shard set named <stem>-<idx>-of-<count>.gguf"
+        ),
+    )
+    parser.add_argument(
+        "--host-use",
+        default="shared",
+        choices=["shared", "dedicated-serving"],
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; not read "
+            "by this checker's fit computation"
+        ),
+    )
+    parser.add_argument(
+        "--fit-check-only",
+        action="store_true",
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; this "
+            "checker never loads weights regardless of this flag"
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "accepted for --fit-check-bin drop-in compatibility; not read "
+            "by this checker's fit computation"
+        ),
+    )
 
-    parser.add_argument("--residency", choices=["resident", "expert-stream"], default=None)
     parser.add_argument(
-        "--wired-limit-mib", type=_positive_int_type("--wired-limit-mib"), default=None
+        "--residency",
+        choices=["resident", "expert-stream"],
+        default=None,
+        help=(
+            "how the pack is held while serving: 'resident' sums expert + "
+            "non-expert weight bytes, 'expert-stream' counts only "
+            "non-expert bytes as a lower bound (falls back to "
+            f"{ENV_RESIDENCY}, then 'resident')"
+        ),
     )
-    parser.add_argument("--wired-margin-gib", type=_wired_margin_gib_type, default=None)
-    parser.add_argument("--kv-reserve-gib", type=float, default=None)
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--wired-limit-mib",
+        type=_positive_int_type("--wired-limit-mib"),
+        default=None,
+        help=(
+            "the wired-memory ceiling, in MiB (falls back to "
+            f"{ENV_WIRED_LIMIT_MIB}, then the live iogpu.wired_limit_mb "
+            "sysctl, then 75%% of hw.memsize)"
+        ),
+    )
+    parser.add_argument(
+        "--wired-margin-gib",
+        type=_wired_margin_gib_type,
+        default=None,
+        help=(
+            "a safety margin, in GiB, subtracted from the wired-memory "
+            f"ceiling before comparing (integer 2-32; falls back to "
+            f"{ENV_WIRED_MARGIN_GIB}, then 8)"
+        ),
+    )
+    parser.add_argument(
+        "--kv-reserve-gib",
+        type=float,
+        default=None,
+        help=(
+            "the KV-cache reserve to add to weight bytes, in GiB (required: "
+            f"pass this flag or set {ENV_KV_RESERVE_GIB}; never silently "
+            "defaults to zero)"
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="print the fit result as a JSON object"
+    )
     return parser
 
 

@@ -171,6 +171,40 @@ def make_stalled_then_fast_stream(
     return fn
 
 
+def make_call_indexed_stream(
+    slow_until_call: int,
+    content_chunks: int = 3,
+    completion_tokens: int = 13,
+    slow_sleep: float = 2.0,
+    fast_sleep: float = 0.02,
+):
+    """A responder that counts its OWN calls (1-based, thread-safe) and is
+    deliberately SLOW for the first ``slow_until_call`` of them, then FAST
+    for every call after that -- lets a test tell a discarded warmup pass
+    apart from a kept, measured one purely by its decode rate, and also
+    exposes the raw request count for asserting a warmup pass was actually
+    SENT (not just accounted for). Returns ``(responder, state)`` where
+    ``state["count"]`` is the running, thread-safe request count.
+    """
+    state = {"count": 0}
+    lock = threading.Lock()
+
+    def fn(handler):
+        with lock:
+            state["count"] += 1
+            call_number = state["count"]
+        sleep = slow_sleep if call_number <= slow_until_call else fast_sleep
+        _send_stream_headers(handler)
+        for i in range(content_chunks):
+            _write_sse(handler, _content_event(f"tok{i}"))
+            if i < content_chunks - 1:
+                time.sleep(sleep)
+        _write_sse(handler, _usage_event(completion_tokens))
+        _write_done(handler)
+
+    return fn, state
+
+
 class FastmlxBenchTestCase(unittest.TestCase):
     def setUp(self):
         self.servers = []
@@ -296,6 +330,13 @@ class FastmlxBenchTestCase(unittest.TestCase):
             "--runs", "1",
             "--timeout", "10",
             "--drift-tolerance", "0.05",
+            # This fixture's own bookend logic keys "first bookend" purely
+            # off being the very FIRST call it sees -- warmup defaults to 1
+            # and would otherwise consume that first call itself, shifting
+            # every subsequent call's fast/slow behavior by one and voiding
+            # the test's own premise. Warmup has its own dedicated coverage
+            # elsewhere; disable it here to keep this test about C-drift.
+            "--warmup", "0",
             "--json",
         ]
         code, stdout, stderr = self._run_main(argv)
@@ -576,6 +617,108 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("candidate", stdout)
         self.assertIn("tok/s", stdout)
+
+    # ------------------------------------------------------------------
+    # --warmup: N passes executed and DISCARDED before the measured ones.
+    # Central test -- must assert BOTH halves, or either half alone is
+    # vacuous (see module's own commentary on this):
+    #   (a) the warmup request was actually SENT (request count == warmup
+    #       + runs) -- an implementation that never issues it would still
+    #       pass a test that only checks exclusion.
+    #   (b) the warmup reading is fully EXCLUDED from readings/median -- an
+    #       implementation that sends it but still counts it would still
+    #       pass a test that only checks the request count.
+    # ------------------------------------------------------------------
+    def test_warmup_pass_is_sent_and_excluded_from_measurement(self):
+        warmup = 1
+        runs = 3
+        responder, state = make_call_indexed_stream(
+            slow_until_call=warmup, slow_sleep=2.0, fast_sleep=0.02, completion_tokens=13,
+        )
+        base_url = self.start(responder)
+
+        arm = FASTMLX_BENCH.measure_arm(
+            base_url, "candidate", "hi", 32, runs, None, 10.0, warmup,
+        )
+
+        # (a) the warmup pass was actually sent: total requests == warmup + runs.
+        self.assertEqual(state["count"], warmup + runs)
+
+        # (b) the warmup reading is excluded: exactly `runs` readings kept,
+        # and every one of them reflects a FAST pass -- the slow warmup
+        # pass's rate (~(13-1)/4.0 ~= 3 tok/s even under this sandbox's
+        # sleep overshoot) never appears among them or in the median.
+        self.assertEqual(len(arm.readings), runs)
+        for reading in arm.readings:
+            self.assertGreater(reading.decode_tok_s, 15.0)
+        self.assertGreater(arm.median_decode_tok_s, 15.0)
+        self.assertEqual(arm.warmup_discarded, warmup)
+
+    def test_warmup_zero_sends_exactly_runs_requests(self):
+        runs = 3
+        responder, state = make_call_indexed_stream(slow_until_call=0)
+        base_url = self.start(responder)
+
+        arm = FASTMLX_BENCH.measure_arm(
+            base_url, "candidate", "hi", 32, runs, None, 10.0, 0,
+        )
+
+        self.assertEqual(state["count"], runs)
+        self.assertEqual(len(arm.readings), runs)
+        self.assertEqual(arm.warmup_discarded, 0)
+
+    def test_negative_warmup_exits_64(self):
+        base_url = self.start(make_simple_stream(2, completion_tokens=2))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--warmup", "-1", "--json",
+        ]
+        code, stdout, stderr = self._run_main(argv)
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        self.assertIn("--warmup", stderr)
+
+    def test_boundary_and_json_state_the_warmup_count(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=13, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--warmup", "2", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        self.assertIn("warmup=2", doc["boundary"])
+        candidate_arm = next(arm for arm in doc["arms"] if arm["model"] == "candidate")
+        self.assertEqual(candidate_arm["warmupDiscarded"], 2)
+
+    def test_ratio_mode_each_measure_arm_call_performs_its_own_warmup(self):
+        warmup = 1
+        runs = 1
+        candidate_responder, candidate_state = make_call_indexed_stream(slow_until_call=warmup)
+        reference_responder, reference_state = make_call_indexed_stream(slow_until_call=warmup)
+        behaviors = {"candidate": candidate_responder, "reference": reference_responder}
+        base_url = self.start(make_dispatch_responder(behaviors))
+        argv = [
+            "--base-url", base_url,
+            "--model", "candidate",
+            "--reference-model", "reference",
+            "--runs", str(runs),
+            "--timeout", "10",
+            "--warmup", str(warmup),
+            "--drift-tolerance", "5.0",
+            "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        # The run must actually have SUCCEEDED -- a refusal could leave the
+        # request counts below coincidentally consistent while proving
+        # nothing about warmup, so assert the exit before the counts.
+        self.assertEqual(code, 0)
+        # candidate is measured by ONE measure_arm() call: warmup + runs.
+        self.assertEqual(candidate_state["count"], warmup + runs)
+        # reference is measured by TWO measure_arm() calls (first and last
+        # bookend) -- design decision 1: EACH one performs its own warmup,
+        # so the reference gets 2 * (warmup + runs), not 1 * it.
+        self.assertEqual(reference_state["count"], 2 * (warmup + runs))
 
     # ------------------------------------------------------------------
     def _run_main(self, argv: list):

@@ -547,11 +547,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "pinned_reference",
         help="<org>/<name>@<40-character-lowercase-hex-commit-sha>",
     )
-    parser.add_argument("--dest", required=True, type=Path)
     parser.add_argument(
-        "--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS
+        "--dest",
+        required=True,
+        type=Path,
+        help=(
+            "the destination directory: where a fresh download lands, or "
+            "the existing directory --adopt verifies in place"
+        ),
     )
-    parser.add_argument("--min-free-bytes", type=int, default=None)
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help=(
+            "how many times to invoke the downloader before giving up, "
+            f"resuming from the previous attempt's preserved staging tree "
+            f"each retry (default {DEFAULT_MAX_ATTEMPTS})"
+        ),
+    )
+    parser.add_argument(
+        "--min-free-bytes",
+        type=int,
+        default=None,
+        help=(
+            "override the preflight free-space floor, in bytes (default: "
+            "the revision's total planned size times the downloader's own "
+            "safety multiplier)"
+        ),
+    )
     parser.add_argument(
         "--adopt",
         action="store_true",

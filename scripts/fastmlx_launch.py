@@ -1364,34 +1364,182 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "serve",
         help="fit-check, admit, then exec an OpenAI-compatible serving engine",
     )
-    serve.add_argument("--model-path", required=True, type=Path)
-    serve.add_argument("--model-id", default=None)
-    serve.add_argument("--model-repo", default=None)
-    serve.add_argument("--model-revision", default=None)
-    serve.add_argument("--card-id", default=None)
-    serve.add_argument("--quality-cards", default=None)
-    serve.add_argument("--accept-quality", action="append", default=[])
-    serve.add_argument("--residency", default="resident", choices=list(RESIDENCIES))
-    serve.add_argument("--context", type=int, default=None)
-    serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8080)
     serve.add_argument(
-        "--host-use", default="shared", choices=["shared", "dedicated-serving"]
+        "--model-path",
+        required=True,
+        type=Path,
+        help="the model directory to serve (must be a valid MLX or GGUF pack layout)",
     )
-    serve.add_argument("--fit-check-bin", default=None)
-    serve.add_argument("--fit-check-arg", action="append", default=[])
-    serve.add_argument("--force", action="store_true")
-    serve.add_argument("--engine-profile", default=None)
-    serve.add_argument("--engine-bin", default=None)
-    serve.add_argument("--dry-run", action="store_true")
+    serve.add_argument(
+        "--model-id",
+        default=None,
+        help=(
+            "the model id reported to the fit check and to clients "
+            "(default: the resolved --model-path directory's basename)"
+        ),
+    )
+    serve.add_argument(
+        "--model-repo",
+        default=None,
+        help=(
+            "override the model's Hugging Face repo id used for "
+            "quality-card lookup (default: read from the sibling "
+            ".pull-receipt.json, if one exists)"
+        ),
+    )
+    serve.add_argument(
+        "--model-revision",
+        default=None,
+        help=(
+            "override the model's pinned revision (40-char lowercase hex "
+            "sha) used for hfPin card matching (default: read from the "
+            "sibling .pull-receipt.json, if one exists)"
+        ),
+    )
+    serve.add_argument(
+        "--card-id",
+        default=None,
+        help=(
+            "pin the exact quality card by id instead of automatic "
+            "resolution; refused unless the model's resolved repo/revision "
+            "and residency match that card"
+        ),
+    )
+    serve.add_argument(
+        "--quality-cards",
+        default=None,
+        help=(
+            "path to the quality-card manifest (default: "
+            f"{DEFAULT_QUALITY_CARDS_RELATIVE_PATH} under the repo root; "
+            "an explicitly-named manifest that fails to load refuses "
+            "startup, unlike a missing default path)"
+        ),
+    )
+    serve.add_argument(
+        "--accept-quality",
+        action="append",
+        default=[],
+        help=(
+            "opt in to a quality-flagged card by id, repo, or hfPin "
+            "(repeatable); required to admit a card whose verdict is NO_GO"
+        ),
+    )
+    serve.add_argument(
+        "--residency",
+        default="resident",
+        choices=list(RESIDENCIES),
+        help=(
+            "how the pack is held while serving: 'resident' (whole pack in "
+            "memory) or 'expert-stream' (experts streamed from disk, which "
+            "requires an --engine-profile declaring "
+            "residencyArgs.expert-stream)"
+        ),
+    )
+    serve.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "the context length to request (default: the fit check's own "
+            "reported fit_context_ceiling; startup refuses if neither is "
+            "available)"
+        ),
+    )
+    serve.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help=(
+            "the host the serving engine binds (ignored in --front-port "
+            "mode, where the engine always binds loopback)"
+        ),
+    )
+    serve.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help=(
+            "the port the serving engine binds (default 8080; must differ "
+            "from --front-port when front mode is enabled)"
+        ),
+    )
+    serve.add_argument(
+        "--host-use",
+        default="shared",
+        choices=["shared", "dedicated-serving"],
+        help="the host-sharing mode passed to the fit check (default 'shared')",
+    )
+    serve.add_argument(
+        "--fit-check-bin",
+        default=None,
+        help=(
+            "the fit-check binary to run, overriding both "
+            "FASTMLX_FIT_CHECK_BIN and the engine profile's own "
+            "fitCheck.bin (default: the profile's fitCheck.bin, else the "
+            "built-in engine)"
+        ),
+    )
+    serve.add_argument(
+        "--fit-check-arg",
+        action="append",
+        default=[],
+        help="an extra argv token appended to the fit-check invocation (repeatable)",
+    )
+    serve.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "start anyway after a confirmed RED fit verdict; never "
+            "overrides a fit check that could not be run at all, an "
+            "attested-residency mismatch, or an engine binarySha256 "
+            "mismatch"
+        ),
+    )
+    serve.add_argument(
+        "--engine-profile",
+        default=None,
+        help=(
+            "path to an engine-profile JSON file naming the serving "
+            "engine's argv (default: the built-in in-tree engine profile)"
+        ),
+    )
+    serve.add_argument(
+        "--engine-bin",
+        default=None,
+        help=(
+            "the serving engine binary to exec (required when "
+            "--engine-profile names a non-built-in profile; the built-in "
+            "profile supplies its own default)"
+        ),
+    )
+    serve.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the resolved launch plan as JSON and exit, without exec'ing the engine",
+    )
     # --front-port: opt-in, off by default. When given, the engine's {host}
     # placeholder is forced to loopback and this launcher runs an
     # X-FastMLX-*-header-stamping reverse proxy on --front-host:--front-port
     # in front of it instead of exec'ing the engine directly (see
     # `_run_front_mode`). --front-host only ever names where the PROXY
     # binds; the engine itself always binds loopback in front mode.
-    serve.add_argument("--front-port", type=int, default=None)
-    serve.add_argument("--front-host", default="127.0.0.1")
+    serve.add_argument(
+        "--front-port",
+        type=int,
+        default=None,
+        help=(
+            "enable front mode: run a header-stamping reverse proxy on "
+            "this port in front of the engine, which then always binds "
+            "loopback regardless of --host (default: front mode disabled)"
+        ),
+    )
+    serve.add_argument(
+        "--front-host",
+        default="127.0.0.1",
+        help=(
+            "the host the front-mode proxy itself binds (only meaningful "
+            "with --front-port; never changes where the engine binds)"
+        ),
+    )
     # Deliberately NOT ``type=int``: argparse's own conversion would refuse
     # a non-numeric value with its own "invalid int value" usage error, a
     # different shape than the ``LaunchRefusal`` fail-closed style every
@@ -1399,13 +1547,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # and parsed/validated in `_run_serve` instead, so 0, a negative count,
     # and a non-numeric string all refuse through the SAME named-reason
     # path (see the validation block below `front_mode`).
-    serve.add_argument("--front-max-body-bytes", default=None)
+    serve.add_argument(
+        "--front-max-body-bytes",
+        default=None,
+        help=(
+            "in front mode, the proxy's ceiling on a request's declared "
+            "Content-Length, in bytes (default: the proxy's own default, "
+            f"{fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES} bytes); must "
+            "be a positive integer"
+        ),
+    )
     # Deliberately NOT ``type=int``, for the same reason as
     # --front-max-body-bytes immediately above: parsed/validated in
     # `_run_serve` so 0, a negative count, and a non-numeric string all
     # refuse through the SAME named-reason `LaunchRefusal` path instead of
     # argparse's own "invalid int value" usage error.
-    serve.add_argument("--front-max-concurrent", default=None)
+    serve.add_argument(
+        "--front-max-concurrent",
+        default=None,
+        help=(
+            "in front mode, the proxy's ceiling on in-flight requests "
+            "accepted at once (default: the proxy's own default, "
+            f"{fastmlx_proxy.DEFAULT_MAX_CONCURRENT_REQUESTS}); the real "
+            "aggregate memory ceiling is this times --front-max-body-bytes"
+        ),
+    )
     return parser
 
 

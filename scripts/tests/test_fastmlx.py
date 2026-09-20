@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -184,6 +185,71 @@ class NoShellExecutionTests(unittest.TestCase):
         # This assertion pins the intended reuse (never a re-declared literal in
         # this file) rather than merely checking the runtime string value.
         self.assertIs(FASTMLX.ENGINE_BINARY_NAME, FASTMLX._launch._BUILT_IN_ENGINE_BINARY_NAME)
+
+
+class CLIHelpTextCoverageTests(unittest.TestCase):
+    """``--help`` is this project's onboarding/discoverability surface: a
+    bare flag name with no explanatory text tells an operator nothing.
+
+    This asserts every ``add_argument()`` flag (and positional) on every
+    ``fastmlx*`` CLI parser -- including ones nested under a subcommand,
+    e.g. ``fastmlx serve``/``fastmlx recommend`` -- carries a non-empty
+    ``help=`` string. It never asserts anything about the CONTENT of a
+    help string (accuracy is a human-review concern, not a lint), only
+    that one is present.
+    """
+
+    # Loaded the same sibling-file way ``scripts/fastmlx.py`` loads its own
+    # subcommand modules (see ``FASTMLX._load_sibling_module``), so this
+    # test never depends on any of these modules being importable as a
+    # package. ``_launch``, ``_pull``, ``_recommend``, and ``_bench`` are
+    # reused from the already-loaded dispatcher instead of being loaded a
+    # second time.
+    MODULES = {
+        "fastmlx_bench.py": FASTMLX._bench,
+        "fastmlx_gguf_fit.py": FASTMLX._load_sibling_module(
+            "fastmlx_gguf_fit", "fastmlx_gguf_fit.py"
+        ),
+        "fastmlx_launch.py": FASTMLX._launch,
+        "fastmlx_pull.py": FASTMLX._pull,
+        "fastmlx_recommend.py": FASTMLX._recommend,
+        "fastmlx_safetensors_fit.py": FASTMLX._load_sibling_module(
+            "fastmlx_safetensors_fit", "fastmlx_safetensors_fit.py"
+        ),
+    }
+
+    @staticmethod
+    def _iter_flag_actions(parser: argparse.ArgumentParser):
+        """Every flag/positional action on ``parser``, recursing into any
+        subparser (e.g. ``fastmlx serve``'s ``serve`` subparser) so a flag
+        that only exists one level down is still checked. The auto-added
+        ``-h``/``--help`` action is skipped (argparse supplies its help
+        text, not this project), and the ``add_subparsers()`` action
+        itself is skipped (it is not an ``add_argument()`` flag) -- but
+        its children are still walked.
+        """
+        for action in parser._actions:
+            if isinstance(action, argparse._HelpAction):
+                continue
+            if isinstance(action, argparse._SubParsersAction):
+                for subparser in action.choices.values():
+                    yield from CLIHelpTextCoverageTests._iter_flag_actions(subparser)
+                continue
+            yield action
+
+    def test_every_flag_has_a_nonempty_help_string(self):
+        missing = []
+        for module_name, module in sorted(self.MODULES.items()):
+            parser = module.build_arg_parser()
+            for action in self._iter_flag_actions(parser):
+                if not (action.help and action.help.strip()):
+                    option_strings = action.option_strings or [action.dest]
+                    missing.append(f"{module_name}: {'/'.join(option_strings)}")
+        self.assertEqual(
+            missing,
+            [],
+            "flags with no (or blank) --help text: " + ", ".join(missing),
+        )
 
 
 if __name__ == "__main__":

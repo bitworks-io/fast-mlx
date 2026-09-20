@@ -48,6 +48,27 @@ must depress TTFT, not decodeTokS, or a slow-to-first-token server would
 look like a slow-DECODING one, which is a different (and differently
 actionable) fact.
 
+--warmup N runs N passes per arm measurement and DISCARDS them before
+the measured passes begin. A server's first pass after a cold start can
+read far below its steady rate (a real run of this command read ~260
+tok/s on its first pass against ~400 for the rest), and a median over
+few runs does not fully absorb that. The default is 1 because the
+published quality cards state their method as "one warmup pass
+discarded, median of 3 passes" -- so the command's own default
+reproduces the cards rather than relying on the CALLER having warmed the
+server first. A discarded pass is not a Reading this module keeps: it
+never enters ``readings`` or the median, only a per-arm
+``warmupDiscarded`` count. Warmup is per measure_arm() INVOCATION, so in
+ratio mode all three arm measurements (reference bookend, candidate,
+reference bookend) are identically conditioned -- which is what C-drift
+requires, since a bookend comparison is only meaningful between like and
+like. An exception raised during a warmup pass PROPAGATES: a server that
+fails while warming is real signal, and swallowing it would let the
+instrument report a measurement it did not honestly obtain. Every row's
+``boundary`` records ``warmup=N``, so a row taken with a warmup is
+distinguishable from one taken without; rows published before this flag
+existed were effectively warmup=0.
+
 Five controls, each an independently-failable field (never a boolean the
 command can pass for free):
 
@@ -109,6 +130,10 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAGNITUDE_FLOOR = 25.0
 DEFAULT_MAGNITUDE_CEILING = 2000.0
 DEFAULT_DRIFT_TOLERANCE = 0.05
+# The published quality cards' method is "one warmup pass discarded, median
+# of 3 passes" -- this default is what makes the command's own default
+# reproduce that method without requiring the caller to pass --warmup.
+DEFAULT_WARMUP = 1
 
 # sysexits.h EX_USAGE -- see _UsageErrorArgumentParser and the module
 # docstring for why this must never collide with argparse's own default.
@@ -177,18 +202,29 @@ class Reading:
 class ArmResult:
     """See ``Reading``'s docstring for why this is a plain class."""
 
-    __slots__ = ("model", "readings", "median_decode_tok_s")
+    __slots__ = ("model", "readings", "median_decode_tok_s", "warmup_discarded")
 
-    def __init__(self, model: str, readings: List[Reading], median_decode_tok_s: Optional[float]):
+    def __init__(
+        self,
+        model: str,
+        readings: List[Reading],
+        median_decode_tok_s: Optional[float],
+        warmup_discarded: int = 0,
+    ):
         self.model = model
         self.readings = readings
         self.median_decode_tok_s = median_decode_tok_s
+        # Count of warmup passes discarded before these ``readings`` were
+        # taken -- NOT itself a Reading (see measure_arm): warmup passes
+        # never enter ``readings`` or the median at all.
+        self.warmup_discarded = warmup_discarded
 
     def to_json(self) -> dict:
         return {
             "model": self.model,
             "readings": [reading.to_json() for reading in self.readings],
             "medianDecodeTokS": self.median_decode_tok_s,
+            "warmupDiscarded": self.warmup_discarded,
         }
 
 
@@ -335,7 +371,18 @@ def measure_arm(
     runs: int,
     api_key: Optional[str],
     timeout: float,
+    warmup: int = 0,
 ) -> ArmResult:
+    """Measures one arm: ``warmup`` passes executed and discarded FIRST
+    (each one a full request/response, so a server that fails during
+    warmup raises exactly as it would for a measured pass -- see module
+    docstring's --warmup discussion), then ``runs`` measured passes.
+
+    Warmup readings never enter ``readings`` or the median: a discarded
+    pass is not a Reading this module keeps at all, only a count.
+    """
+    for _ in range(warmup):
+        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout)
     readings = [
         stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout)
         for _ in range(runs)
@@ -347,7 +394,9 @@ def measure_arm(
     # unmeasurable (None), not 0.0.
     measurable_rates = [reading.decode_tok_s for reading in readings if reading.measurable]
     median = statistics.median(measurable_rates) if measurable_rates else None
-    return ArmResult(model=model, readings=readings, median_decode_tok_s=median)
+    return ArmResult(
+        model=model, readings=readings, median_decode_tok_s=median, warmup_discarded=warmup
+    )
 
 
 # ---------------------------------------------------------------------
@@ -625,7 +674,8 @@ def _boundary(args: argparse.Namespace, prompt: str, prompt_is_default: bool) ->
     return (
         f"host={platform.node() or 'unknown'} ({platform.machine()}); "
         f"promptSet={'default-fixed-prompt' if prompt_is_default else 'custom-prompt'} "
-        f"(chars={len(prompt)}); maxTokens={args.max_tokens}; runs={args.runs}"
+        f"(chars={len(prompt)}); maxTokens={args.max_tokens}; runs={args.runs}; "
+        f"warmup={args.warmup}"
     )
 
 
@@ -652,15 +702,15 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             # a stable one (see module docstring).
             first_reference = measure_arm(
                 args.base_url, args.reference_model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout,
+                args.runs, args.api_key, args.timeout, args.warmup,
             )
             candidate = measure_arm(
                 args.base_url, args.model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout,
+                args.runs, args.api_key, args.timeout, args.warmup,
             )
             last_reference = measure_arm(
                 args.base_url, args.reference_model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout,
+                args.runs, args.api_key, args.timeout, args.warmup,
             )
             combined_readings = first_reference.readings + last_reference.readings
             # Same measurable-only filtering as measure_arm (see its
@@ -676,12 +726,17 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
                 model=args.reference_model,
                 readings=combined_readings,
                 median_decode_tok_s=reference_median,
+                # Both bookend measure_arm() calls discarded their own
+                # warmup passes (see design decision 1: every measure_arm
+                # invocation warms up independently) -- the combined arm's
+                # count is their sum, not either one alone.
+                warmup_discarded=first_reference.warmup_discarded + last_reference.warmup_discarded,
             )
             arms = [candidate, reference_arm]
         else:
             candidate = measure_arm(
                 args.base_url, args.model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout,
+                args.runs, args.api_key, args.timeout, args.warmup,
             )
             arms = [candidate]
     except BenchError as error:
@@ -794,25 +849,86 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "speaking OpenAI-compatible /v1/chat/completions over HTTP."
         ),
     )
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--prompt", default=None)
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
-    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
-    parser.add_argument("--reference-model", default=None)
-    parser.add_argument("--api-key", default=None)
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--magnitude-floor", type=float, default=DEFAULT_MAGNITUDE_FLOOR)
-    parser.add_argument("--magnitude-ceiling", type=float, default=DEFAULT_MAGNITUDE_CEILING)
-    parser.add_argument("--drift-tolerance", type=float, default=DEFAULT_DRIFT_TOLERANCE)
-    parser.add_argument("--expect-listener-pid", type=int, default=None)
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--base-url", required=True,
+        help="Base URL of the OpenAI-compatible server to measure (e.g. http://127.0.0.1:8080).",
+    )
+    parser.add_argument(
+        "--model", required=True,
+        help="Model name requested for the measured (candidate) arm.",
+    )
+    parser.add_argument(
+        "--prompt", default=None,
+        help="Custom prompt to send instead of this module's fixed default prompt.",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+        help=f"Maximum completion tokens requested per pass (default: {DEFAULT_MAX_TOKENS}).",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=DEFAULT_RUNS,
+        help=f"Measured passes per arm; the arm's median decode rate is taken over these (default: {DEFAULT_RUNS}).",
+    )
+    parser.add_argument(
+        "--reference-model", default=None,
+        help="Reference model name; when given, runs ratio mode with the candidate sandwiched between two reference-arm measurements.",
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="Bearer token sent in the Authorization header, if the server requires one.",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"Per-request timeout in seconds before a pass is treated as unreachable (default: {DEFAULT_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--magnitude-floor", type=float, default=DEFAULT_MAGNITUDE_FLOOR,
+        help=(
+            f"Median decode rate in tok/s below which a reading is reported as "
+            f"implausibly slow; reported only, never voids a run (default: {DEFAULT_MAGNITUDE_FLOOR})."
+        ),
+    )
+    parser.add_argument(
+        "--magnitude-ceiling", type=float, default=DEFAULT_MAGNITUDE_CEILING,
+        help=(
+            f"Median decode rate in tok/s above which a reading is reported as "
+            f"implausibly fast; reported only, never voids a run (default: {DEFAULT_MAGNITUDE_CEILING})."
+        ),
+    )
+    parser.add_argument(
+        "--drift-tolerance", type=float, default=DEFAULT_DRIFT_TOLERANCE,
+        help=(
+            "Maximum fractional drift allowed between the first and last "
+            f"reference-arm median in ratio mode before the ratio is voided (default: {DEFAULT_DRIFT_TOLERANCE})."
+        ),
+    )
+    parser.add_argument(
+        "--expect-listener-pid", type=int, default=None,
+        help="PID expected to be LISTENing on --base-url's port; a mismatch refuses the run (C-owner).",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit the result row as one line of JSON on stdout instead of human-readable text.",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=DEFAULT_WARMUP,
+        help=(
+            "Passes executed and discarded per arm measurement before the "
+            f"measured passes begin; 0 opts out (default: {DEFAULT_WARMUP})."
+        ),
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.warmup < 0:
+        # argparse's type=int happily accepts a negative value -- this is a
+        # usage error (design decision 4), not a measurement outcome, so it
+        # must route through parser.error()'s exit-64 path (see
+        # _UsageErrorArgumentParser), never a bare ValueError or exit 1.
+        parser.error(f"--warmup must be >= 0 (got {args.warmup})")
     code, row = run_bench(args)
     if row is not None:
         if args.json:

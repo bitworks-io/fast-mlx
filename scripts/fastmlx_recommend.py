@@ -526,20 +526,83 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "recommend",
         help="rank local model packs that fit this host by measured quality",
     )
-    recommend.add_argument("--model-path", action="append", default=[], type=Path)
-    recommend.add_argument("--models-dir", action="append", default=[], type=Path)
-    recommend.add_argument("--quality-cards", default=None)
     recommend.add_argument(
-        "--residency", default="resident", choices=list(launch.RESIDENCIES)
+        "--model-path",
+        action="append",
+        default=[],
+        type=Path,
+        help="a model directory to include as a candidate (repeatable)",
     )
-    recommend.add_argument("--context", type=int, default=None)
     recommend.add_argument(
-        "--host-use", default="shared", choices=["shared", "dedicated-serving"]
+        "--models-dir",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "a directory whose immediate model-pack subdirectories are all "
+            "added as candidates (repeatable)"
+        ),
     )
-    recommend.add_argument("--fit-check-bin", default=None)
-    recommend.add_argument("--fit-check-arg", action="append", default=[])
-    recommend.add_argument("--engine-profile", default=None)
-    recommend.add_argument("--json", action="store_true")
+    recommend.add_argument(
+        "--quality-cards",
+        default=None,
+        help=(
+            "path to the quality-card manifest (default: "
+            f"{launch.DEFAULT_QUALITY_CARDS_RELATIVE_PATH} under the repo "
+            "root; an explicitly-named manifest that fails to load is a "
+            "usage error, unlike the default path)"
+        ),
+    )
+    recommend.add_argument(
+        "--residency", default="resident", choices=list(launch.RESIDENCIES),
+        help=(
+            "the residency each candidate's fit check and card lookup is "
+            "evaluated against (default 'resident')"
+        ),
+    )
+    recommend.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "the context length forwarded to the fit-check binary's own "
+            "--context (omit to use the fit-check binary's default)"
+        ),
+    )
+    recommend.add_argument(
+        "--host-use",
+        default="shared",
+        choices=["shared", "dedicated-serving"],
+        help=(
+            "the host-sharing mode forwarded to the fit check (default "
+            "'shared')"
+        ),
+    )
+    recommend.add_argument(
+        "--fit-check-bin",
+        default=None,
+        help=(
+            "the fit-check binary to run, overriding the engine profile's "
+            "own fitCheck.bin (default: the profile's fitCheck.bin, else "
+            "the built-in engine found on PATH)"
+        ),
+    )
+    recommend.add_argument(
+        "--fit-check-arg",
+        action="append",
+        default=[],
+        help="an extra argv token appended to the fit-check invocation (repeatable)",
+    )
+    recommend.add_argument(
+        "--engine-profile",
+        default=None,
+        help="path to an engine-profile JSON file (default: the built-in engine profile)",
+    )
+    recommend.add_argument(
+        "--json",
+        action="store_true",
+        help="print the ranked rows as a JSON object instead of formatted text",
+    )
     return parser
 
 

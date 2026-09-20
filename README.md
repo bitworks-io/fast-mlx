@@ -185,7 +185,7 @@ successes only). The histograms use fixed buckets from 5 ms to 300 s. Route labe
 bounded set the access log uses, and any unmatched path is labeled `other`, so label cardinality
 stays bounded.
 
-### The `fastmlx` command: pull, recommend, serve
+### The `fastmlx` command: pull, recommend, serve, bench
 
 `scripts/fastmlx.py` puts the fit check and the quality cards in front of whichever
 OpenAI-compatible engine you serve with. It needs only the Python 3 standard library. The fit check
@@ -385,6 +385,46 @@ Measured so far: on the Flash Next mixed-4-8 pack, at the engine build its card 
 changed greedy output on 16 of 40 prompts. Two `--mtp` processes also differed from each other on
 one prompt, so the card records the transfer as `nondeterministic`. The card's quality figures describe
 the launch without `--mtp`.
+
+### Measure decode throughput (`fastmlx bench`)
+
+`fastmlx bench` measures decode throughput against any OpenAI-compatible
+`/v1/chat/completions` endpoint over HTTP. It is engine-agnostic on purpose: it speaks the wire
+protocol, so it measures whatever you are actually serving rather than a model it loaded itself.
+
+```sh
+# One arm: median decode rate for a model, as JSON.
+python3 scripts/fastmlx.py bench --base-url http://127.0.0.1:8080 --model qwen3-8b-4bit --json
+
+# Ratio mode: the candidate is sandwiched between two reference-arm measurements, and the ratio is
+# voided if the reference drifted between them.
+python3 scripts/fastmlx.py bench --base-url http://127.0.0.1:8080 \
+    --model qwen3-8b-4bit --reference-model qwen3-8b-8bit --json
+```
+
+The rate is `(completion_tokens - 1) / (t_last_chunk - t_first_chunk)`. The token count comes from
+the server's own `usage` block, requested via `stream_options.include_usage` — never from counting
+SSE chunks, which counts framing rather than tokens. Time to first token is reported separately and
+is never folded into the decode rate. A completion of fewer than two tokens has no decode interval
+at all, so it is reported as unmeasurable with a reason rather than as `0.0`.
+
+By default one pass per arm is run and discarded before the measured passes begin (`--warmup 1`,
+`--runs 3`), which is the method the published quality cards state. A server's first pass after a
+cold start can read well below its steady rate, so discarding it is what makes a default run
+comparable to a card. `--warmup 0` opts out, and every row's `boundary` string records the warmup
+count it was taken with, so a row is self-describing.
+
+Five controls each carry their own refusal reason: the token source must be the server's `usage`
+and not a chunk count; in ratio mode the reference arm must not have drifted between its two
+bookends (`--drift-tolerance`); a median outside `--magnitude-floor`/`--magnitude-ceiling` is
+reported loudly, though it never voids a run on its own; and `--expect-listener-pid` refuses if the
+process listening on that port is not the one you meant to measure, which is what keeps a row from
+silently describing a server you forgot was running.
+
+Exit status is `0` when the measurement completed, `1` when a control refused (the reason is
+printed), and `64` for a usage error. Run the client on the same host you intend to report: a
+client that does not wake promptly to read its socket timestamps arrivals late and *understates*
+the rate, so a badly-placed client manufactures a regression rather than flattering the result.
 
 ### Provenance proxy (`--front-port`)
 
