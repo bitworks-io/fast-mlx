@@ -751,6 +751,82 @@ def is_opted_in(card: Optional[dict], opt_in_ids: set) -> bool:
     return False
 
 
+def card_benefit_line(card: Optional[dict]) -> Optional[str]:
+    """The measured SPEED benefit ``card`` carries, formatted as one
+    human-readable line for a CLI surface. Returns ``None`` when the card
+    has no ``legible.benefit`` at all, or no ``speedXStatus`` within it --
+    what keeps every card/fixture that predates this benefit sub-object
+    printing byte-identical output.
+
+    This is the speed clause ONLY -- it never includes the separate
+    ``fit`` clause a benefit may also carry (see ``card_fit_line``). A
+    prior version of this function concatenated the two with "; ", and
+    both call sites labelled the combined string "speed: ", presenting a
+    fit fact (a resident size, a host it fits) as if it were a speed
+    fact. Keep the two clauses apart and separately labelled at every
+    call site, exactly like the public site does (``Fit`` / ``Speed`` as
+    two separate ``<dt>``/``<dd>`` pairs in
+    ``build_public_site.render_quality_guide``).
+
+    Mirrors ``build_public_site.quality_speed_line``'s polarity and
+    scope-attachment rule exactly (see that function): a speed ratio is
+    NEVER printed detached from its ``speedXStatus`` -- that status
+    carries the ONLY measurement boundary (host, engine build, flags,
+    prompt count, and the referent the ratio is against) fast-mlx has for
+    the number, so this never synthesizes or paraphrases a referent the
+    status doesn't already state. A ratio below 1.0 is phrased "a
+    slowdown", never "{n}x slower", which would invert the meaning. This
+    is a reimplementation, not an import of ``build_public_site`` -- that
+    module is a build tool, not a CLI dependency; a test pins the two
+    stay in agreement (see ``test_speed_direction_matches_site_renderer``
+    in both ``scripts/tests/test_fastmlx_launch.py`` and
+    ``scripts/tests/test_fastmlx_recommend.py``).
+    """
+    if card is None:
+        return None
+    benefit = (card.get("legible") or {}).get("benefit")
+    if not benefit:
+        return None
+
+    status = benefit.get("speedXStatus")
+    if status is None:
+        return None
+    status_text = str(status)
+    speed_x = benefit.get("speedX")
+    if isinstance(speed_x, (int, float)) and not isinstance(speed_x, bool):
+        if speed_x > 1.0:
+            direction = f'{speed_x}x faster on this engine (measured)'
+        elif speed_x < 1.0:
+            direction = (
+                f'{speed_x}x the reference speed on this engine — a '
+                'slowdown (measured)'
+            )
+        else:
+            direction = 'no measured speed difference on this engine (measured)'
+        return f'{direction} — {status_text}'
+    return status_text
+
+
+def card_fit_line(card: Optional[dict]) -> Optional[str]:
+    """The measured/estimated FIT clause ``card`` carries (a resident
+    size and which hosts it fits), formatted for a CLI surface. Returns
+    ``None`` when the card has no ``legible.benefit`` at all, or no
+    ``fit`` within it -- exactly like ``build_public_site`` only renders
+    a ``Fit`` row ``if fit is not None`` (see
+    ``build_public_site.render_quality_guide``). Kept separate from
+    ``card_benefit_line`` (the speed clause) so a call site can never
+    relabel one as the other -- see that function's docstring for the
+    defect this split repairs.
+    """
+    if card is None:
+        return None
+    benefit = (card.get("legible") or {}).get("benefit")
+    if not benefit:
+        return None
+    fit = benefit.get("fit")
+    return str(fit) if fit is not None else None
+
+
 def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
     """Mirror ``QualityAdmission.decide`` exactly.
 
@@ -777,13 +853,36 @@ def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
 
     legible = card.get("legible") or {}
     summary = f"{legible.get('tier')}: {legible.get('headline')}"
+    # The cost (tier/headline) must never be shown without the benefit it
+    # buys -- the operator deciding whether to opt in is exactly who needs
+    # to see both. Appears on BOTH the opt-in message and the refusal
+    # message below, since both carry this same summary. Speed and fit are
+    # two DISTINCT facts (see card_benefit_line's docstring for the defect
+    # this split repairs) and are always labelled separately -- a fit
+    # clause must never be presented under the "speed: " label.
+    benefit_line = card_benefit_line(card)
+    fit_line = card_fit_line(card)
+    # Clauses are separated by " - " rather than a bare space: a status
+    # enum ("not-measured-on-this-engine") and a fit string ("20.7 GB --
+    # fits a 24 GB Mac") do not end in a period, so space-joining ran
+    # them straight into the next label and into the re-run hint
+    # ("...fits a 24 GB Mac re-run with --accept-quality..."), which
+    # reads as one sentence. Only clauses that actually exist are
+    # joined, so a card with no benefit is unaffected.
+    clauses = [summary]
+    if benefit_line:
+        clauses.append(f"speed: {benefit_line}")
+    if fit_line:
+        clauses.append(f"fit: {fit_line}")
+    summary = " - ".join(clauses)
     card_id = card.get("id")
     if opted_in:
         return ("admit_with_quality_flag", summary)
-    return (
-        "refuse_quality_flagged",
-        summary + f" re-run with --accept-quality {card_id} to elect it.",
-    )
+    hint = f"re-run with --accept-quality {card_id} to elect it."
+    # A card with no benefit clause keeps the historic single-space join,
+    # so its refusal message stays byte-identical to before this change.
+    separator = " - " if len(clauses) > 1 else " "
+    return ("refuse_quality_flagged", summary + separator + hint)
 
 
 # ---------------------------------------------------------------------

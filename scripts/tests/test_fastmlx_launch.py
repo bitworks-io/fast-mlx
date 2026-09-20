@@ -38,6 +38,38 @@ PASS_REPO = "example/PassModel"
 EXACT_CARD_ID = "fixture-exact@test"
 EXACT_REPO = "example/ExactModel"
 
+# A NO_GO card WITH a measured legible.benefit -- the opt-in decision this
+# repository's cycle-104 defect hid the speed upside from (see
+# card_benefit_line). speedXStatus deliberately names a referent that must
+# never be dropped or paraphrased.
+NO_GO_WITH_BENEFIT_CARD_ID = "fixture-no-go-benefit@test"
+NO_GO_WITH_BENEFIT_REPO = "example/NoGoBenefitModel"
+NO_GO_WITH_BENEFIT_TIER = "Noticeable"
+NO_GO_WITH_BENEFIT_HEADLINE = (
+    "About 1 word in 6 differs from the reference model, but it is faster."
+)
+NO_GO_WITH_BENEFIT_REFERENT = "not against the full-precision model"
+
+# A NO_GO card whose legible.benefit carries BOTH a fit clause and a
+# speedXStatus -- the exact shape of the real published cards (e.g.
+# qwen38-flash-next-mixed-4-8bit@m3ultra in site/quality-guides.json) that
+# exposed the mislabeling defect: card_benefit_line used to concatenate the
+# fit clause into the same string as the speed clause, and both call sites
+# prefixed the combined string with "speed: ", presenting a fit fact as a
+# speed fact. FIT_TEXT is deliberately size/host language that could never
+# be mistaken for a speed measurement.
+NO_GO_WITH_FIT_CARD_ID = "fixture-no-go-fit@test"
+NO_GO_WITH_FIT_REPO = "example/NoGoFitModel"
+NO_GO_WITH_FIT_TIER = "Noticeable"
+NO_GO_WITH_FIT_HEADLINE = (
+    "About 1 word in 6 differs from the reference model, but it is faster."
+)
+NO_GO_WITH_FIT_TEXT = (
+    "70.1 GiB resident weights plus a memory-mapped n-gram table. "
+    "GREEN on a 128 GB Mac."
+)
+NO_GO_WITH_FIT_STATUS = "measured on Apple M3 Ultra: ratio against the 8-bit reference pack"
+
 # A public card identifying its pack only by a pinned-revision prefix, with
 # no repo at all -- the pin-based matching path the spec amendment adds.
 PIN_ONLY_CARD_ID = "fixture-pin-only@test"
@@ -92,6 +124,46 @@ def fixture_manifest() -> dict:
                     "reason": "token-exact",
                 },
                 "legible": {"tier": "Exact", "headline": "Token-exact with the reference."},
+            },
+            {
+                "id": NO_GO_WITH_BENEFIT_CARD_ID,
+                "model": {"repo": NO_GO_WITH_BENEFIT_REPO, "hfPin": "beadfeed"},
+                "verdict": "NO_GO",
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "quality-degraded vs reference",
+                },
+                "legible": {
+                    "tier": NO_GO_WITH_BENEFIT_TIER,
+                    "headline": NO_GO_WITH_BENEFIT_HEADLINE,
+                    "benefit": {
+                        "speedX": 1.19,
+                        "speedXStatus": (
+                            "measured on Apple M3 Ultra: ratio against the 8-bit "
+                            "reference pack, " + NO_GO_WITH_BENEFIT_REFERENT + "."
+                        ),
+                    },
+                },
+            },
+            {
+                "id": NO_GO_WITH_FIT_CARD_ID,
+                "model": {"repo": NO_GO_WITH_FIT_REPO, "hfPin": "beadfeed1"},
+                "verdict": "NO_GO",
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "quality-degraded vs reference",
+                },
+                "legible": {
+                    "tier": NO_GO_WITH_FIT_TIER,
+                    "headline": NO_GO_WITH_FIT_HEADLINE,
+                    "benefit": {
+                        "fit": NO_GO_WITH_FIT_TEXT,
+                        "speedX": 1.19,
+                        "speedXStatus": NO_GO_WITH_FIT_STATUS,
+                    },
+                },
             },
             {
                 "id": PIN_ONLY_CARD_ID,
@@ -418,6 +490,126 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         plan = self.last_json_line(stdout)
         self.assertEqual(plan["admission"], "admit_with_quality_flag")
+
+    # ------------------------------------------------------------------
+    # legible.benefit must reach the operator on BOTH the refusal path and
+    # the opt-in path -- the user deciding whether to elect a NO_GO card is
+    # exactly who needs to see what it buys, not only what it costs.
+    # ------------------------------------------------------------------
+    def test_opt_in_admission_states_the_measured_benefit(self):
+        # Refusal path.
+        argv = self.base_args(
+            **{"--model-repo": NO_GO_WITH_BENEFIT_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("faster", stderr)
+        self.assertIn(NO_GO_WITH_BENEFIT_REFERENT, stderr)
+        self.assertIn("--accept-quality", stderr)
+
+        # Opt-in path: the same benefit line still reaches the operator.
+        argv = self.base_args(
+            **{
+                "--model-repo": NO_GO_WITH_BENEFIT_REPO,
+                "--context": "2048",
+                "--accept-quality": NO_GO_WITH_BENEFIT_CARD_ID,
+            }
+        ) + ["--dry-run"]
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        self.assertIn("faster", stdout)
+        self.assertIn(NO_GO_WITH_BENEFIT_REFERENT, stdout)
+
+    # ------------------------------------------------------------------
+    # The defect this task repairs: a card whose legible.benefit carries
+    # BOTH a fit clause and a speedXStatus must never present the fit
+    # clause as if it were a speed fact. The fit clause must appear under
+    # its own "fit: " label, and the "speed: " clause must not contain the
+    # fit text at all. This is specific enough that the old "; "-joined
+    # single string (prefixed once with "speed: ") fails it: that form
+    # places the fit text right after "; " with no "fit: " label.
+    # ------------------------------------------------------------------
+    def test_fit_is_not_labelled_as_speed(self):
+        argv = self.base_args(
+            **{"--model-repo": NO_GO_WITH_FIT_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        # The fit text must appear, under its own "fit: " label.
+        self.assertIn(f"fit: {NO_GO_WITH_FIT_TEXT}", stderr)
+        # The old defect joined speed and fit with "; " into one string --
+        # that exact join must be gone.
+        self.assertNotIn(f"; {NO_GO_WITH_FIT_TEXT}", stderr)
+        # The "speed: " clause itself (everything between "speed: " and
+        # "fit: ") must not contain the fit text.
+        speed_clause = stderr.split("speed: ", 1)[1].split("fit: ", 1)[0]
+        self.assertNotIn(NO_GO_WITH_FIT_TEXT, speed_clause)
+
+    # ------------------------------------------------------------------
+    # Unit-level pin of the same defect: card_benefit_line itself must
+    # never return the fit text -- it is the speed line ONLY.
+    # ------------------------------------------------------------------
+    def test_card_benefit_line_excludes_fit(self):
+        card = {
+            "legible": {
+                "benefit": {
+                    "fit": NO_GO_WITH_FIT_TEXT,
+                    "speedX": 1.19,
+                    "speedXStatus": NO_GO_WITH_FIT_STATUS,
+                }
+            }
+        }
+        line = FASTMLX_LAUNCH.card_benefit_line(card)
+        self.assertIsNotNone(line)
+        self.assertNotIn(NO_GO_WITH_FIT_TEXT, line)
+
+    # ------------------------------------------------------------------
+    # Anti-regression pin: a card with no legible.benefit at all
+    # (NO_GO_CARD_ID has no "benefit" key) must refuse byte-identically to
+    # today -- no "speed:" line appears out of nowhere.
+    # ------------------------------------------------------------------
+    def test_card_without_benefit_renders_unchanged(self):
+        argv = self.base_args(**{"--model-repo": NO_GO_REPO, "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn(NO_GO_TIER, stderr)
+        self.assertIn(NO_GO_HEADLINE, stderr)
+        self.assertNotIn("speed:", stderr)
+
+    # ------------------------------------------------------------------
+    # Structural guard: the CLI helper must agree with the site renderer's
+    # polarity on every direction, so this defect class cannot reappear on
+    # a third surface. Strengthened to EXACT STRING EQUALITY (not merely
+    # polarity agreement) and exercised with a non-null "fit" among the
+    # cases -- exactly the shape that used to diverge, since the old
+    # card_benefit_line concatenated fit into the returned string while
+    # quality_speed_line never does.
+    # ------------------------------------------------------------------
+    def test_speed_direction_matches_site_renderer(self):
+        scripts_dir = str(Path(__file__).resolve().parents[1])
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import build_public_site  # noqa: E402  (test-only; never imported by the CLI)
+
+        cases = (
+            (1.19, None),
+            (1.00, None),
+            (0.485, None),
+            (None, None),
+            (1.19, "20.7 GB — fits a 24 GB Mac"),
+        )
+        for speed_x, fit in cases:
+            benefit = {
+                "speedX": speed_x,
+                "speedXStatus": "measured on Apple M3 Ultra",
+                "fit": fit,
+            }
+            card = {"legible": {"benefit": benefit}}
+            expected = build_public_site.quality_speed_line(benefit)
+            actual = FASTMLX_LAUNCH.card_benefit_line(card)
+            self.assertEqual(actual, expected, msg=f"speedX={speed_x!r} fit={fit!r}")
 
     # ------------------------------------------------------------------
     # EXACT card: admitted silently, same as PASS.

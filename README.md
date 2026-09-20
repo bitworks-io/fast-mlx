@@ -211,8 +211,19 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 
 `pull` writes a receipt next to the model directory that records the exact revision. `serve` and
 `recommend` read it to find the model's quality card. A pack whose card says NO_GO is refused until
-you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently. A
-pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
+you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently.
+
+A card states what a pack **buys**, not only what it costs, and both surfaces say so at the moment
+you choose. Alongside the quality cost, `serve`'s admission message and each `recommend` row carry
+the card's measured benefit as two separately labelled facts -- `speed:` (a decode-throughput ratio)
+and `fit:` (the pack's footprint and which Mac it fits). A speed ratio is never printed on its own:
+it always arrives with the scope that makes it mean something -- the host, the engine build, the
+flags, the prompt count, and the reference it is a ratio *against*. A ratio below 1.0 is named a
+slowdown rather than dressed up as a speedup, and a pack whose speed was never measured on this
+engine says exactly that instead of showing a number. These are the same strings the published
+quality-guide page renders, so the CLI and the site cannot drift apart.
+
+A pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
 repository's `fastmlx-serve`. A model directory with no receipt and no `--model-revision` has no

@@ -165,9 +165,17 @@ def _card_summary(card: Optional[dict]) -> Optional[dict]:
     top1 = (legible.get("nextWordDrift") or {}).get("top1AgreementPct")
     if isinstance(top1, (int, float)) and not isinstance(top1, bool):
         summary["top1AgreementPct"] = top1
-    speed_x = (legible.get("benefit") or {}).get("speedX")
-    if isinstance(speed_x, (int, float)) and not isinstance(speed_x, bool):
-        summary["speedX"] = speed_x
+    benefit = legible.get("benefit") or {}
+    status = benefit.get("speedXStatus")
+    if status is not None:
+        # speedXStatus carries the only measurement boundary fast-mlx has
+        # for a numeric speedX (host, engine build, flags, prompt count,
+        # referent) -- a speedX key must NEVER appear in this summary
+        # without it, so speedX is only ever added inside this branch.
+        speed_x = benefit.get("speedX")
+        if isinstance(speed_x, (int, float)) and not isinstance(speed_x, bool):
+            summary["speedX"] = speed_x
+        summary["speedXStatus"] = status
     return summary
 
 
@@ -415,14 +423,41 @@ def _format_row_text(rank: int, row: dict) -> str:
         head.append(f"residency={row['residency']}")
 
     card = row.get("card")
+    prints_a_quality_number = False
     if card:
         head.append(f"card={card['id']} verdict={card['verdict']} tier={card.get('tier')}")
         if "top1AgreementPct" in card:
             head.append(f"top1={card['top1AgreementPct']}%")
+            prints_a_quality_number = True
         if "speedX" in card:
-            head.append(f"speedX={card['speedX']}x")
+            prints_a_quality_number = True
 
     lines = ["  ".join(head)]
+
+    # The card's one self-contained sentence: printed for any row that
+    # prints a quality number at all, never discarded.
+    if prints_a_quality_number and card.get("headline"):
+        lines.append(f"    {card['headline']}")
+
+    # A speed ratio must NEVER be shown without its speedXStatus scope
+    # (host, engine build, flags, prompt count, and the referent it is a
+    # ratio against) -- see launch.card_benefit_line, which this
+    # reconstructs a minimal pseudo-card for since only the flattened
+    # summary (not the raw card) survives into a row.
+    if card:
+        benefit_line = launch.card_benefit_line(
+            {
+                "legible": {
+                    "benefit": {
+                        "speedX": card.get("speedX"),
+                        "speedXStatus": card.get("speedXStatus"),
+                    }
+                }
+            }
+        )
+        if benefit_line:
+            lines.append(f"    speed: {benefit_line}")
+
     tail = f"    [{row['status']}]"
     if row.get("message"):
         tail += f" {row['message']}"

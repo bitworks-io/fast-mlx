@@ -45,6 +45,20 @@ UNMEASURED_CARD_ID = "fixture-unmeasured@test"
 
 UNCARDED_REPO = "example/NoCardModel"  # no matching card in the manifest at all
 
+# A carded pack with a MEASURED speedX > 1.0 whose speedXStatus names a
+# referent that must never be dropped or paraphrased -- the cycle-104
+# defect this file's new tests pin (see fastmlx_launch.card_benefit_line).
+MIXED_SPEED_REPO = "example/MixedSpeedModel"
+MIXED_SPEED_CARD_ID = "fixture-mixed-speed@test"
+MIXED_SPEED_REFERENT = "not against the full-precision model"
+MIXED_SPEED_HEADLINE = "Mixed 4/8-bit pack; near-lossless drift."
+
+# A carded pack with a MEASURED speedX < 1.0: the polarity case a naive
+# "{n}x slower" phrasing would invert.
+SLOWDOWN_REPO = "example/SlowdownModel"
+SLOWDOWN_CARD_ID = "fixture-slowdown@test"
+SLOWDOWN_HEADLINE = "Slower mixed pack; near-lossless drift."
+
 # An hfPin-only NO_GO card (no repo at all), identifying a pulled pack only
 # through the revision a pull receipt records.
 PIN_ONLY_NO_GO_CARD_ID = "fixture-pin-only-no-go@test"
@@ -109,6 +123,38 @@ def fixture_manifest() -> dict:
                 "legible": {
                     "tier": PIN_ONLY_NO_GO_TIER,
                     "headline": PIN_ONLY_NO_GO_HEADLINE,
+                },
+            },
+            {
+                "id": MIXED_SPEED_CARD_ID,
+                "model": {"repo": MIXED_SPEED_REPO, "hfPin": "1234abcd"},
+                "verdict": "PASS",
+                "legible": {
+                    "tier": "Near-lossless",
+                    "headline": MIXED_SPEED_HEADLINE,
+                    "benefit": {
+                        "speedX": 1.19,
+                        "speedXStatus": (
+                            "measured on Apple M3 Ultra: this is a ratio against "
+                            "the 8-bit reference pack, " + MIXED_SPEED_REFERENT + "."
+                        ),
+                    },
+                },
+            },
+            {
+                "id": SLOWDOWN_CARD_ID,
+                "model": {"repo": SLOWDOWN_REPO, "hfPin": "5678beef"},
+                "verdict": "PASS",
+                "legible": {
+                    "tier": "Near-lossless",
+                    "headline": SLOWDOWN_HEADLINE,
+                    "benefit": {
+                        "speedX": 0.485,
+                        "speedXStatus": (
+                            "measured on Apple M3 Ultra: ratio against the 8-bit "
+                            "reference pack."
+                        ),
+                    },
                 },
             },
         ],
@@ -264,7 +310,79 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(doc["rows"][0]["card"]["speedX"], 1.35)
         _, stdout, _ = self.run_main(self.base_argv([model_dir]))
-        self.assertIn("speedX=1.35x", stdout)
+        # A bare ratio with no referent is exactly the defect this file's
+        # cycle-104 tests pin (see test_speedx_row_never_prints_a_bare_ratio
+        # below); the direction+status line replaces it.
+        self.assertNotIn("speedX=1.35x", stdout)
+        self.assertIn("1.35x faster on this engine (measured)", stdout)
+
+    # ------------------------------------------------------------------
+    # A speed ratio must NEVER be shown without its speedXStatus scope --
+    # the only measurement boundary (host, engine build, flags, prompt
+    # count, and the referent the ratio is against) fast-mlx has for the
+    # number. See docs/agent-handoff.md cycle 104 and
+    # build_public_site.quality_speed_line, which this CLI helper mirrors.
+    # ------------------------------------------------------------------
+    def test_speedx_row_never_prints_a_bare_ratio(self):
+        model_dir = self.make_model_dir("mixed-speed-model", repo=MIXED_SPEED_REPO)
+        _, stdout, _ = self.run_main(self.base_argv([model_dir]))
+        self.assertIn(MIXED_SPEED_REFERENT, stdout)
+        self.assertNotIn("speedX=1.19x", stdout)
+
+    def test_sub_one_speedx_says_slowdown_not_faster(self):
+        model_dir = self.make_model_dir("slowdown-model", repo=SLOWDOWN_REPO)
+        _, stdout, _ = self.run_main(self.base_argv([model_dir]))
+        self.assertIn("slowdown", stdout)
+        self.assertNotIn("faster", stdout)
+
+    def test_json_row_carries_speedx_status_whenever_speedx(self):
+        model_a = self.make_model_dir("mixed-speed-model", repo=MIXED_SPEED_REPO)
+        model_b = self.make_model_dir("reference-model", repo=REFERENCE_REPO)
+        model_c = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, doc, _ = self.run_json(self.base_argv([model_a, model_b, model_c]))
+        self.assertEqual(code, 0)
+        saw_numeric_speedx = False
+        for row in doc["rows"]:
+            card = row.get("card") or {}
+            if "speedX" in card:
+                saw_numeric_speedx = True
+                self.assertIn("speedXStatus", card, msg=card)
+        self.assertTrue(
+            saw_numeric_speedx, "fixture produced no row with a numeric speedX to check"
+        )
+
+    # ------------------------------------------------------------------
+    # Anti-regression pin: a card with no legible.benefit at all (EXACT_CARD_ID
+    # has no "benefit" key) must render byte-identically to today.
+    # ------------------------------------------------------------------
+    def test_card_without_benefit_renders_unchanged(self):
+        model_dir = self.make_model_dir("exact-model", repo=EXACT_REPO)
+        code, doc, _ = self.run_json(self.base_argv([model_dir]))
+        self.assertEqual(code, 0)
+        card = doc["rows"][0]["card"]
+        self.assertNotIn("speedX", card)
+        self.assertNotIn("speedXStatus", card)
+        _, stdout, _ = self.run_main(self.base_argv([model_dir]))
+        self.assertNotIn("speed:", stdout)
+
+    # ------------------------------------------------------------------
+    # Structural guard: the CLI helper must agree with the site renderer's
+    # polarity on every direction (faster / no difference / slowdown /
+    # status-only), so this defect class cannot reappear on a third surface.
+    # ------------------------------------------------------------------
+    def test_speed_direction_matches_site_renderer(self):
+        scripts_dir = str(Path(__file__).resolve().parents[1])
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import build_public_site  # noqa: E402  (test-only; never imported by the CLI)
+
+        launch = FASTMLX_RECOMMEND.launch
+        for speed_x in (1.19, 1.00, 0.485, None):
+            benefit = {"speedX": speed_x, "speedXStatus": "measured on Apple M3 Ultra"}
+            card = {"legible": {"benefit": benefit}}
+            expected = build_public_site.quality_speed_line(benefit)
+            actual = launch.card_benefit_line(card)
+            self.assertEqual(actual, expected, msg=f"speedX={speed_x!r}")
 
     # ------------------------------------------------------------------
     # opt-in: NO_GO card carries the exact accept flag.
