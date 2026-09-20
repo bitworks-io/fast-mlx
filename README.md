@@ -452,9 +452,21 @@ Behaviour to know:
   sent. The default limit is 64 MiB (`fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES`), well above any
   legitimate chat/completions body and well below what threatens a serve host holding tens of GiB of
   wired weights; override it with `--front-max-body-bytes <BYTES>` (`fastmlx serve` refuses at exit 2
-  for 0, a negative value, or a non-numeric one). This bounds a SINGLE request's own buffer, not the
-  aggregate memory many concurrent requests could hold across `ThreadingHTTPServer`'s daemon threads
-  at once, each just under the limit.
+  for 0, a negative value, or a non-numeric one). This bounds a SINGLE request's own buffer.
+- That single-request bound is paired with a concurrency ceiling: requests beyond the limit are
+  refused 503 at accept time, before a handler thread is started and before any body byte is read.
+  The default is 64 (`fastmlx_proxy.DEFAULT_MAX_CONCURRENT_REQUESTS`); override it with
+  `--front-max-concurrent <N>` (`fastmlx serve` refuses at exit 2 for 0, a negative value, or a
+  non-numeric one). The real aggregate memory bound is the PRODUCT of the two limits -- 64 x 64 MiB =
+  4 GiB with both defaults -- not either alone. Two honest limits remain: a streaming/SSE response
+  holds its slot for the WHOLE generation, so the cap sizes plausible concurrency rather than request
+  rate; and `GET /fastmlx/provenance` cannot be exempted, since the path is not known at accept time,
+  so an operator health poll consumes a slot and can be refused under saturation. The refusal itself
+  is handled on the proxy's single accept thread and is therefore serialized -- size the ceiling
+  against that, not against per-request concurrency. Refusals are logged to stderr at most once per
+  second, since an unbounded synchronous write per refused connection would itself be an
+  attacker-driven disk-fill and a cost on that same accept thread; each emitted line carries
+  `suppressed_since_last_log`, so the true refusal rate is still recoverable from the log.
 - There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
   not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
   JSON error that still carries the headers. Reading the CLIENT's own request (line/headers/body) is

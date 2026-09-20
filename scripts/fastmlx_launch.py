@@ -1400,6 +1400,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # and a non-numeric string all refuse through the SAME named-reason
     # path (see the validation block below `front_mode`).
     serve.add_argument("--front-max-body-bytes", default=None)
+    # Deliberately NOT ``type=int``, for the same reason as
+    # --front-max-body-bytes immediately above: parsed/validated in
+    # `_run_serve` so 0, a negative count, and a non-numeric string all
+    # refuse through the SAME named-reason `LaunchRefusal` path instead of
+    # argparse's own "invalid int value" usage error.
+    serve.add_argument("--front-max-concurrent", default=None)
     return parser
 
 
@@ -1784,6 +1790,10 @@ def _run_serve(args, passthrough_args: list) -> int:
     # this function is always defined, never a NameError on a path this
     # variable's own ``if front_mode:`` guard never dropped into.
     max_request_body_bytes = fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES
+    # Same reasoning as ``max_request_body_bytes`` immediately above: set
+    # outside the ``if front_mode:`` guard so the value passed to
+    # ``_run_front_mode`` at the bottom of this function is always defined.
+    max_concurrent_requests = fastmlx_proxy.DEFAULT_MAX_CONCURRENT_REQUESTS
     if front_mode and args.front_port == args.port:
         raise LaunchRefusal(
             2,
@@ -1861,6 +1871,33 @@ def _run_serve(args, passthrough_args: list) -> int:
                     2,
                     "--front-max-body-bytes must be a positive number of bytes, "
                     f"got {max_request_body_bytes}",
+                )
+
+        # --front-max-concurrent: the proxy's own ceiling on the number of
+        # in-flight requests it will accept AT ONCE, enforced at accept
+        # time -- before a handler thread is even started, let alone a
+        # body byte read (see ``fastmlx_proxy.DEFAULT_MAX_CONCURRENT_REQUESTS``
+        # and ``ProvenanceProxyServer``'s 503-at-accept refusal). Validated
+        # here in the SAME LaunchRefusal fail-closed style as
+        # --front-max-body-bytes just above, rather than left for
+        # ``fastmlx_proxy.create_server`` to reject deep inside the bind
+        # call. Note this bounds CONCURRENT REQUEST COUNT, not bytes: the
+        # real aggregate memory ceiling is the PRODUCT of this limit and
+        # --front-max-body-bytes, not either alone.
+        if args.front_max_concurrent is not None:
+            try:
+                max_concurrent_requests = int(args.front_max_concurrent)
+            except ValueError:
+                raise LaunchRefusal(
+                    2,
+                    f"--front-max-concurrent {args.front_max_concurrent!r} is not "
+                    "an integer number of requests",
+                )
+            if max_concurrent_requests <= 0:
+                raise LaunchRefusal(
+                    2,
+                    "--front-max-concurrent must be a positive number of "
+                    f"requests, got {max_concurrent_requests}",
                 )
 
     # --- engine argv ---------------------------------------------------
@@ -1955,7 +1992,12 @@ def _run_serve(args, passthrough_args: list) -> int:
     print(admitted_line, file=sys.stderr)
 
     if front_mode:
-        return _run_front_mode(final_argv, plan, max_request_body_bytes=max_request_body_bytes)
+        return _run_front_mode(
+            final_argv,
+            plan,
+            max_request_body_bytes=max_request_body_bytes,
+            max_concurrent_requests=max_concurrent_requests,
+        )
 
     os.execv(engine_bin_abs, final_argv)
     return 0  # pragma: no cover - unreachable, os.execv never returns on success
@@ -2261,6 +2303,7 @@ def _run_front_mode(
     plan: dict,
     popen=subprocess.Popen,
     max_request_body_bytes: int = fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES,
+    max_concurrent_requests: int = fastmlx_proxy.DEFAULT_MAX_CONCURRENT_REQUESTS,
 ) -> int:
     """Front mode's orchestration: bind the proxy, THEN start the engine as
     a CHILD process (never exec'd -- this process must stay alive to run
@@ -2287,6 +2330,9 @@ def _run_front_mode(
     ``fastmlx_proxy.create_server`` -- ``_run_serve`` has already validated
     it (``--front-max-body-bytes``, 0/negative/non-numeric all refused
     before this function is ever called), so it is trusted as-is here.
+    ``max_concurrent_requests`` is plumbed the same way (``--front-max-
+    concurrent``, 0/negative/non-numeric equally refused before this
+    function is ever called).
     """
     front = plan["front"]
     front_host = front["host"]
@@ -2306,6 +2352,7 @@ def _run_front_mode(
             upstream_port,
             plan,
             max_request_body_bytes=max_request_body_bytes,
+            max_concurrent_requests=max_concurrent_requests,
         )
     except OSError as exc:
         print(

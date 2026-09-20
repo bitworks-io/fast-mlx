@@ -14,6 +14,7 @@ import http.client
 import importlib.util
 import io
 import json
+import os
 import socket
 import sys
 import threading
@@ -1213,6 +1214,727 @@ class ProxyRequestBodySizeLimitTests(unittest.TestCase):
         self.assertEqual(body_json["error"]["type"], "request_body_too_large")
 
         self.assertEqual(requests, ["/v1/chat/completions"], "only the allowed request reached upstream")
+
+
+class ProxyConcurrencyLimitTests(unittest.TestCase):
+    """``ProvenanceProxyServer`` is a ``ThreadingHTTPServer`` with
+    ``daemon_threads = True`` and, before this cap, NO bound at all on
+    concurrent connections: 300 connections produced 300 threads, 1:1, and
+    because ``daemon_threads = True`` makes ``socketserver._Threads.append``
+    return early, the server did not even keep a reference to them. A probe
+    that sends only a partial request and no body still parked a thread for
+    the full 120s client idle timeout, at near-zero cost to the client.
+
+    Every test here injects a SMALL ``max_concurrent_requests`` via
+    ``create_server(...)`` so the suite never approaches the production
+    default of 64 -- the cap itself, not its production magnitude, is what
+    is under test. Synchronization is Event-based throughout (an upstream
+    responder that blocks on a shared ``gate`` Event the test controls, and
+    a per-arrival Event so the test can prove a request reached upstream
+    without ever sleeping/polling for it).
+    """
+
+    def setUp(self):
+        self._servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+            server._test_thread.join(timeout=5)
+
+    def _start_gated_upstream(self, expected_arrivals: int):
+        """An upstream that blocks every request on a single shared
+        ``gate`` Event until the test releases it, records every request
+        that actually arrived (so a test can prove a refused request never
+        reached it), and sets ``arrived[n - 1]`` the moment the n-th
+        request arrives -- one Event per expected arrival, so a test can
+        wait for "exactly N requests are provably in flight" without any
+        sleep-based polling.
+        """
+        requests = []
+        lock = threading.Lock()
+        gate = threading.Event()
+        arrived = [threading.Event() for _ in range(expected_arrivals)]
+
+        def responder(handler):
+            with lock:
+                requests.append(handler.path)
+                n = len(requests)
+            if 0 < n <= expected_arrivals:
+                arrived[n - 1].set()
+            self.assertTrue(gate.wait(timeout=10), "test never released the gate")
+            payload = json.dumps({"n": n}).encode("utf-8")
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        return upstream, requests, gate, arrived
+
+    def _start_proxy(self, upstream, **kwargs):
+        server = start_proxy(FIXTURE_PLAN, "127.0.0.1", upstream.server_address[1], **kwargs)
+        self._servers.append(server)
+        return server
+
+    def _drive_request(self, port: int, results: dict, key) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+        conn.request("POST", "/v1/chat/completions", body=b"{}")
+        resp = conn.getresponse()
+        payload = resp.read()
+        results[key] = (resp.status, payload)
+        conn.close()
+
+    def _send_and_read(self, port: int, raw_request: bytes, timeout: float = 5) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.sendall(raw_request)
+        sock.settimeout(timeout)
+        response = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except socket.timeout:
+            pass
+        sock.close()
+        return response
+
+    # ------------------------------------------------------------------
+    # The load-bearing test: written and confirmed failing BEFORE the cap
+    # was implemented (against the original code, the 3rd connection got
+    # 200, not 503 -- see the implementation report for the exact captured
+    # failure).
+    # ------------------------------------------------------------------
+    def test_concurrency_cap_refuses_the_over_cap_request_while_the_cap_is_held(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        results = {}
+        t1 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 1))
+        t2 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 2))
+        t1.start()
+        t2.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "first request never reached upstream")
+        self.assertTrue(arrived[1].wait(timeout=5), "second request never reached upstream")
+        # Both in-flight requests are still parked on the gate here -- the
+        # cap must be observed as OCCUPIED, not merely "about to free up".
+        self.assertFalse(gate.is_set())
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+
+        self.assertIn(
+            b" 503 ", response,
+            f"expected a 503 refusal while the cap is held; got: {response!r}",
+        )
+        header_bytes, _, body_bytes = response.partition(b"\r\n\r\n")
+        body_json = json.loads(body_bytes)
+        self.assertEqual(body_json["error"]["type"], "too_many_concurrent_requests")
+        for name in (
+            b"X-FastMLX-Admission", b"X-FastMLX-Card", b"X-FastMLX-Fit", b"X-FastMLX-Residency",
+            b"X-FastMLX-Engine-Build", b"X-FastMLX-MTP", b"X-FastMLX-Request-Id",
+        ):
+            self.assertIn(name, header_bytes, f"missing provenance header {name!r}")
+
+        self.assertEqual(len(requests), 2, "the refused request must never reach upstream")
+
+        gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        self.assertEqual(results[1][0], 200)
+        self.assertEqual(results[2][0], 200)
+        self.assertEqual(json.loads(results[1][1])["n"] in (1, 2), True)
+        self.assertEqual(json.loads(results[2][1])["n"] in (1, 2), True)
+
+    # ------------------------------------------------------------------
+    # AC1 (anti-vacuity): the peak in-flight counter must actually REACH
+    # the cap, not merely never exceed it -- ``== N``, not only ``<= N``.
+    # ------------------------------------------------------------------
+    def test_peak_inflight_reaches_and_never_exceeds_the_cap(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=3)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=3)
+
+        results = {}
+        threads = [
+            threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, i))
+            for i in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for ev in arrived:
+            self.assertTrue(ev.wait(timeout=5))
+
+        self.assertLessEqual(proxy.peak_inflight_requests, 3)
+        self.assertEqual(proxy.peak_inflight_requests, 3, "the cap was never actually reached")
+
+        gate.set()
+        for t in threads:
+            t.join(timeout=5)
+        for i in range(3):
+            self.assertEqual(results[i][0], 200)
+
+    # ------------------------------------------------------------------
+    # AC3: the cap is enforced on the DECLARED Content-Length alone, same
+    # as the body-size limit -- an over-cap client that declares a huge
+    # body and sends none of it must still be refused promptly. Kills a
+    # mutation that moves the gate into ``_dispatch`` after the body read.
+    # ------------------------------------------------------------------
+    def test_over_cap_refusal_never_reads_a_declared_body_that_was_never_sent(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        results = {}
+        t1 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 1))
+        t2 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 2))
+        t1.start()
+        t2.start()
+        self.assertTrue(arrived[0].wait(timeout=5))
+        self.assertTrue(arrived[1].wait(timeout=5))
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\n"
+        started = time.monotonic()
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 5, "the cap must be enforced before any body byte is read")
+        self.assertIn(b" 503 ", response)
+        body_json = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body_json["error"]["type"], "too_many_concurrent_requests")
+        self.assertEqual(len(requests), 2)
+
+        gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # AC4: slots actually RELEASE -- after the two held requests complete,
+    # ``cap + 1`` further SEQUENTIAL requests must all be admitted. Kills a
+    # missing/short ``release()`` on either handler-thread exit path.
+    # ------------------------------------------------------------------
+    def test_slots_release_after_completion_and_admit_cap_plus_one_more_sequential_requests(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        results = {}
+        t1 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 1))
+        t2 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 2))
+        t1.start()
+        t2.start()
+        self.assertTrue(arrived[0].wait(timeout=5))
+        self.assertTrue(arrived[1].wait(timeout=5))
+        gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        self.assertEqual(results[1][0], 200)
+        self.assertEqual(results[2][0], 200)
+
+        for i in range(3):  # cap (2) + 1
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("POST", "/v1/chat/completions", body=b"{}")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 200, f"sequential request {i} after release must be admitted")
+
+    # ------------------------------------------------------------------
+    # AC5: fd hygiene -- 50 sequential refusals, while one slot stays held,
+    # must not grow the process's open-fd count at all. Kills a missing
+    # ``shutdown_request`` on the refusal path: a status-only test is blind
+    # to this, and a leaked fd per refusal is a strictly worse DoS than the
+    # one this whole cap exists to fix.
+    # ------------------------------------------------------------------
+    def test_fifty_sequential_refusals_do_not_leak_file_descriptors(self):
+        if not os.path.isdir("/dev/fd"):
+            self.skipTest("/dev/fd not available on this platform")
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(50):
+            response = self._send_and_read(proxy.server_address[1], raw_request)
+            self.assertIn(b" 503 ", response)
+        after = len(os.listdir("/dev/fd"))
+        self.assertEqual(after, before, "each refusal must close its own request socket")
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # Pins the EXPLICIT close on the refusal path, which the fd count above
+    # provably cannot: deleting ``shutdown_request`` from the refusal branch
+    # was measured NOT to leak an fd, because CPython closes the request
+    # socket by refcounting the moment the last reference to it drops (the
+    # locals in ``process_request`` and ``socketserver``'s own
+    # ``_handle_request_noblock``, neither of which outlives a refusal).
+    # That makes the fd assertion above non-discriminating for that one
+    # deletion -- verified, not assumed: a control that leaks one unrelated
+    # fd per refusal moves it 11 -> 61, so the counter itself does fire.
+    # The explicit call still has to be pinned, because the socket closing
+    # at all would then depend on a refcounting implementation detail: any
+    # future change that retains a reference (a log buffer, a pool, a
+    # traceback) silently turns this back into the fd leak the counter was
+    # meant to catch, and a non-refcounting runtime would leak immediately.
+    # ------------------------------------------------------------------
+    def test_refusal_closes_its_socket_explicitly_not_by_refcounting(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        closed = []
+        original = proxy.shutdown_request
+
+        def spy(request):
+            closed.append(request)
+            return original(request)
+
+        proxy.shutdown_request = spy
+
+        holder_results = {}
+        holder = threading.Thread(
+            target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder")
+        )
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(b" 503 ", response)
+
+        # The holder is still parked on the gate, so its own connection has
+        # not been shut down yet -- every call counted here therefore
+        # belongs to the refusal, making ``== 1`` exact rather than a lower
+        # bound that a later completion could satisfy by accident.
+        self.assertFalse(gate.is_set())
+        self.assertEqual(
+            len(closed), 1,
+            "the refusal must close its request socket EXPLICITLY, not leave it to refcounting",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # AC6 (determinism control): the IDENTICAL load that produced a 503 in
+    # the very first test above -- two held connections plus one more --
+    # must produce THREE 200s when the cap is raised to a production-sized
+    # value. Without this control, the earlier 503 could in principle have
+    # come from the listen() backlog or from test timing rather than from
+    # the cap actually under test.
+    # ------------------------------------------------------------------
+    def test_identical_load_under_a_high_cap_yields_zero_refusals(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=3)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=64)
+
+        results = {}
+        threads = [
+            threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, i))
+            for i in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for ev in arrived:
+            self.assertTrue(ev.wait(timeout=5))
+
+        gate.set()
+        for t in threads:
+            t.join(timeout=5)
+        for i in range(3):
+            self.assertEqual(results[i][0], 200, "identical load under a high cap must never be refused")
+        self.assertEqual(len(requests), 3)
+
+    # ------------------------------------------------------------------
+    # Accept-loop liveness: a hostile over-cap client that triggers the
+    # refusal and then never reads its response must not delay a
+    # concurrent, well-behaved connection's own (503) response -- proves
+    # the ``settimeout``/``except OSError`` around the refusal write
+    # keeps the single accept thread from wedging behind it.
+    # ------------------------------------------------------------------
+    def test_hostile_client_that_never_reads_its_refusal_does_not_wedge_the_accept_loop(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        results = {}
+        t1 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 1))
+        t2 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, 2))
+        t1.start()
+        t2.start()
+        self.assertTrue(arrived[0].wait(timeout=5))
+        self.assertTrue(arrived[1].wait(timeout=5))
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        # Sends the request that triggers the 503, then never calls
+        # recv() at all -- if the refusal write ever blocked here without
+        # a timeout, every OTHER connection (including the well-behaved
+        # one below) would wedge behind it on the server's single accept
+        # thread.
+        hostile = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+        hostile.sendall(raw_request)
+
+        started = time.monotonic()
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        elapsed = time.monotonic() - started
+        self.assertLess(
+            elapsed, 3,
+            "a hostile client that never reads its refusal must not delay another connection's refusal",
+        )
+        self.assertIn(b" 503 ", response)
+
+        hostile.close()
+        gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # Accept-loop liveness, paced-dribble shape: the neighbouring hostile-
+    # client test above sends ``Content-Length: 0`` and then goes SILENT,
+    # which only exercises the drain loop's ``except OSError`` (timeout)
+    # exit. A client that instead keeps delivering ~1 byte every 100ms
+    # never lets a per-``recv`` timeout fire and never hits EOF either, so
+    # a drain bounded only by a PER-RECV timeout (rather than a wall-clock
+    # budget) keeps making forward progress on every single ``recv`` and
+    # never gives up -- wedging the one accept thread for as long as the
+    # dribble continues. Proves the drain must not wait for bytes at all,
+    # only take what is already buffered.
+    # ------------------------------------------------------------------
+    def test_paced_dribble_client_cannot_wedge_the_accept_loop(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(
+            target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder")
+        )
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        # Trips the refusal, then keeps dribbling one byte every 100ms
+        # from a background thread instead of closing or going silent --
+        # the paced-dribble shape the neighbouring hostile-client test
+        # does NOT exercise.
+        dribbler = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+        dribbler.sendall(raw_request)
+
+        stop_dribbling = threading.Event()
+
+        def _pace(seconds: float) -> None:
+            # A plain ``Event.wait``/``time.sleep`` for a short duration is
+            # NOT used here: this test's own sandbox floors any syscall-
+            # based sleep/wait to roughly 200-300ms regardless of the
+            # requested duration (measured directly against this
+            # environment during this test's own development), which would
+            # make a 100ms-paced dribble arrive no faster than the drain's
+            # own 0.2s per-``recv`` timeout and turn the very race this
+            # test exists to pin into a coin flip. A busy-wait against
+            # ``time.monotonic()`` is unaffected by that floor and paces
+            # accurately.
+            deadline = time.monotonic() + seconds
+            while not stop_dribbling.is_set() and time.monotonic() < deadline:
+                pass
+
+        def dribble():
+            while not stop_dribbling.is_set():
+                try:
+                    dribbler.sendall(b"x")
+                except OSError:
+                    return
+                _pace(0.1)
+
+        dribble_thread = threading.Thread(target=dribble, daemon=True)
+        dribble_thread.start()
+
+        def _stop_dribbler():
+            stop_dribbling.set()
+            dribble_thread.join(timeout=5)
+            dribbler.close()
+
+        self.addCleanup(_stop_dribbler)
+
+        started = time.monotonic()
+        response = self._send_and_read(proxy.server_address[1], raw_request, timeout=2)
+        elapsed = time.monotonic() - started
+        self.assertLess(
+            elapsed, 1.5,
+            "the single accept thread must not be held by a client that keeps dribbling "
+            "bytes after its refusal",
+        )
+        self.assertIn(
+            b" 503 ", response,
+            "the single accept thread must not be held by a client that keeps dribbling "
+            f"bytes after its refusal; got: {response!r}",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # Accept-loop throughput: an ORDINARY refused client -- one that sends
+    # its request then reads the response, never dribbles and never goes
+    # silent -- must not cost the accept thread a fixed per-refusal delay.
+    # Before this fix, the drain used a per-``recv`` ``settimeout(0.2)``:
+    # since a benign client's request bytes are already sitting in this
+    # proxy's kernel receive buffer before the drain's first ``recv`` even
+    # runs, that ``recv`` still had to wait out the FULL 0.2s timeout for a
+    # FIN that never arrives (the client is reading, not closing) --
+    # measured at ~201ms per ordinary refusal, capping the whole proxy at
+    # roughly 5 accepted connections/second. This proves N SEQUENTIAL
+    # ordinary refusals complete in well under
+    # ``N * _REFUSAL_DRAIN_DEADLINE_SECONDS`` total: on the fixed drain,
+    # the first ``recv`` returns almost immediately (its bytes are already
+    # buffered) and switches to non-blocking for the rest, so an ordinary
+    # refusal costs close to nothing rather than a fixed delay -- see the
+    # drain loop's own comment in ``_refuse_over_capacity`` for the full
+    # reasoning.
+    # ------------------------------------------------------------------
+    def test_ordinary_refusal_does_not_cost_the_accept_thread_a_full_timeout(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(
+            target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder")
+        )
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        deadline = FASTMLX_PROXY._REFUSAL_DRAIN_DEADLINE_SECONDS
+        refusal_count = 20
+        # Half of ``refusal_count * deadline``: generous enough not to flake
+        # in a slow/loaded CI environment, yet far below what
+        # ``refusal_count`` refusals would take if each one paid a fixed
+        # ``deadline``-sized (let alone the original 0.2s) cost -- the
+        # ORIGINAL ``settimeout(0.2)`` code fails this bound by roughly an
+        # order of magnitude (confirmed against a scratch copy of that
+        # code during this test's own development).
+        budget_seconds = (refusal_count * deadline) / 2
+
+        started = time.monotonic()
+        for _ in range(refusal_count):
+            response = self._send_and_read(proxy.server_address[1], raw_request, timeout=5)
+            self.assertIn(b" 503 ", response)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed, budget_seconds,
+            f"{refusal_count} ordinary sequential refusals took {elapsed:.3f}s, not well "
+            f"under the {budget_seconds:.3f}s budget -- the accept thread appears to be "
+            "burning a fixed delay per ordinary refusal instead of returning almost "
+            "immediately once the client's already-buffered bytes are drained",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # AC8: each refusal is observable as exactly one JSONL log line
+    # carrying status 503 and the error type, via the same ``log_hook``
+    # path production logging uses -- lets an operator alert on this the
+    # same way every other proxy-generated error status is already
+    # observable.
+    # ------------------------------------------------------------------
+    def test_refusal_writes_one_jsonl_log_line_with_status_and_error_type(self):
+        logged = []
+        logged_event = threading.Event()
+
+        def log_hook(entry):
+            logged.append(entry)
+            logged_event.set()
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5))
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(b" 503 ", response)
+        self.assertTrue(logged_event.wait(timeout=5), "the refusal was never logged via log_hook")
+
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged[0]["status"], 503)
+        self.assertEqual(logged[0]["error"], "too_many_concurrent_requests")
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # Helpers shared by the rate-limit tests below: refuse ``count`` times
+    # in a tight sequential loop against a server whose sole slot is held,
+    # returning the raw responses so a caller can also assert on the HTTP
+    # side if it wants to.
+    # ------------------------------------------------------------------
+    def _drive_refusal_burst(self, proxy, count: int) -> None:
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        for _ in range(count):
+            response = self._send_and_read(proxy.server_address[1], raw_request)
+            self.assertIn(b" 503 ", response)
+
+    @staticmethod
+    def _stderr_jsonl_lines(stderr_buffer: io.StringIO) -> list:
+        return [json.loads(line) for line in stderr_buffer.getvalue().splitlines() if line]
+
+    # ------------------------------------------------------------------
+    # This is the load-bearing rate-limit test: a burst of refusals well
+    # within a single ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS`` window must
+    # produce exactly ONE JSONL line on ``stderr`` -- proves the accept
+    # thread is no longer paying an unconditional synchronous write per
+    # refusal (see ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS`` in
+    # ``fastmlx_proxy.py`` for the disk-fill/accept-thread-wedge motivation).
+    # ------------------------------------------------------------------
+    def test_refusal_log_burst_is_rate_limited_on_stderr(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            self._drive_refusal_burst(proxy, 20)
+
+        lines = self._stderr_jsonl_lines(stderr_buffer)
+        self.assertEqual(
+            len(lines), 1,
+            f"expected exactly one stderr line for a burst well inside "
+            f"{FASTMLX_PROXY._REFUSAL_LOG_MIN_INTERVAL_SECONDS}s, got {len(lines)}: {lines!r}",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # The rate limit above must not become an observability hole: every
+    # refusal in the same burst still has to reach ``log_hook``, which is
+    # deliberately NOT rate-limited (see ``_log_capacity_refusal``'s own
+    # comment for why the split is load-bearing). Without this test, a
+    # broken implementation that dropped entries instead of merely
+    # suppressing their stderr line would pass the test above for the
+    # wrong reason.
+    # ------------------------------------------------------------------
+    def test_every_refusal_still_reaches_the_log_hook(self):
+        logged = []
+        logged_lock = threading.Lock()
+
+        def log_hook(entry):
+            with logged_lock:
+                logged.append(entry)
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            self._drive_refusal_burst(proxy, 20)
+
+        self.assertEqual(len(self._stderr_jsonl_lines(stderr_buffer)), 1)
+        self.assertEqual(
+            len(logged), 20,
+            "log_hook must fire once per refusal even while stderr is rate-limited",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # The emitted line must carry how many refusals were swallowed since
+    # the previous emitted line, so an operator reading ``stderr`` can
+    # still recover the true refusal count instead of undercounting by
+    # however many were suppressed.
+    # ------------------------------------------------------------------
+    def test_emitted_refusal_log_reports_how_many_it_suppressed(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            # First refusal always emits (see the next test); the other 4
+            # in this burst land inside the same interval and are
+            # suppressed.
+            self._drive_refusal_burst(proxy, 5)
+            lines_before = self._stderr_jsonl_lines(stderr_buffer)
+            self.assertEqual(len(lines_before), 1)
+
+            # Force the NEXT refusal to emit regardless of elapsed time, by
+            # collapsing the module's own rate-limit window to zero --
+            # imported from the module rather than hardcoded, per this
+            # suite's own convention (see ``_REFUSAL_DRAIN_DEADLINE_SECONDS``
+            # usage elsewhere in this file).
+            with unittest.mock.patch.object(FASTMLX_PROXY, "_REFUSAL_LOG_MIN_INTERVAL_SECONDS", 0.0):
+                self._drive_refusal_burst(proxy, 1)
+
+        lines_after = self._stderr_jsonl_lines(stderr_buffer)
+        self.assertEqual(len(lines_after), 2, f"expected exactly 2 emitted lines total: {lines_after!r}")
+        self.assertEqual(
+            lines_after[1]["suppressed_since_last_log"], 4,
+            "the forced emission must report exactly the 4 refusals suppressed since the first line",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # An operator must see the FIRST refusal on a fresh server immediately,
+    # not have it silently suppressed because it happened to land inside
+    # what would otherwise be treated as "since construction" -- this is
+    # why ``_refusal_log_last_emitted_monotonic`` is initialized to
+    # ``None``, not to a timestamp taken at construction time.
+    # ------------------------------------------------------------------
+    def test_first_refusal_is_logged_immediately(self):
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        holder_results = {}
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder"))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            self._drive_refusal_burst(proxy, 1)
+
+        lines = self._stderr_jsonl_lines(stderr_buffer)
+        self.assertEqual(len(lines), 1, "the very first refusal on a fresh server must be logged immediately")
+        self.assertEqual(lines[0]["suppressed_since_last_log"], 0)
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
 
 
 class ProxyExpect100ContinueTests(unittest.TestCase):

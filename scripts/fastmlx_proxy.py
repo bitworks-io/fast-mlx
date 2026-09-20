@@ -24,6 +24,7 @@ import re
 import socket
 import struct
 import sys
+import threading
 import time
 import uuid
 from http import client as http_client
@@ -86,9 +87,58 @@ _PROVENANCE_HEADER_PREFIX = "x-fastmlx-"
 # base64-encoded images stays well under this ceiling too. This bounds ONE
 # request's own buffer, never the AGGREGATE memory many concurrent
 # ``ThreadingHTTPServer`` daemon threads could hold at once each just under
-# the limit -- that is a different, unaddressed threat model (see the
-# README).
+# the limit -- that second, aggregate threat model is what
+# ``DEFAULT_MAX_CONCURRENT_REQUESTS`` below addresses (see the README).
 DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+
+# Default ceiling on the number of requests concurrently in flight through
+# this proxy at once, enforced by ``ProvenanceProxyServer.process_request``
+# BEFORE a handler thread is even started (see that method for why a
+# non-blocking ``BoundedSemaphore``, never a queue). ``ThreadingHTTPServer``
+# has ``daemon_threads = True`` and otherwise starts one thread per accepted
+# connection with no bound at all -- verified empirically: 300 concurrent
+# connections produce 300 threads, and because ``daemon_threads = True``
+# makes ``socketserver._Threads.append`` return early, the server does not
+# even keep a reference to them (``server._threads`` stays at its initial
+# ``_NoThreads()`` sentinel), so there was nothing to bound this on before.
+#
+# The real aggregate memory bound this proxy enforces is the PRODUCT of
+# this and ``DEFAULT_MAX_REQUEST_BODY_BYTES`` -- 64 * 64 MiB = 4 GiB worst
+# case with both defaults -- not either limit alone; an operator tuning
+# only one of the two flags is tuning half the actual number, not the
+# whole thing. A streaming/SSE response (see ``_respond_streamed``) holds
+# its slot for the ENTIRE generation, not just while headers are read, so
+# this is also an effective bound on concurrent generations in progress,
+# not merely concurrent TCP connections.
+DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+
+# Absolute wall-clock ceiling on ``_refuse_over_capacity``'s post-503 drain
+# (see that method): a client that sends nothing at all, or a client that
+# dribbles bytes one at a time forever, both cost the accept thread AT MOST
+# this much, once, no matter how the client paces itself. See the drain
+# loop's own comment for why this must be an absolute deadline rather than
+# a per-``recv`` timeout, and why a well-behaved refused client's cost stays
+# far below this number in practice.
+_REFUSAL_DRAIN_DEADLINE_SECONDS = 0.05
+
+# Minimum spacing, in monotonic seconds, between ``_log_capacity_refusal``
+# ``stderr`` lines. This bounds ONLY the synchronous ``sys.stderr.write`` on
+# ``_refuse_over_capacity``'s single accept thread -- it deliberately does
+# NOT touch ``log_hook``, which still fires once per refusal with zero
+# information lost (see ``_log_capacity_refusal`` below for why that split
+# matters). Before the drain fix in ``_refuse_over_capacity`` removed its own
+# accidental 0.2s-per-refusal cost, refusals -- and therefore these log
+# writes -- could never happen faster than ~5/second, which incidentally
+# capped this write's rate too. With that removed, an attacker who can keep
+# the concurrency cap saturated can drive refusals (and therefore ~230-byte
+# JSONL writes) as fast as the accept loop can refuse connections: a
+# sustained disk-fill vector on the serve host, and, if ``stderr`` is ever a
+# pipe whose reader stalls (not true today -- the launcher inherits rather
+# than pipes ``stderr`` -- but not guaranteed forever), a synchronous write
+# that blocks the ONE accept thread every other connection depends on,
+# reintroducing the exact wedge class the drain fix above was written to
+# remove.
+_REFUSAL_LOG_MIN_INTERVAL_SECONDS = 1.0
 
 
 def _sanitize_header_value(value: object) -> str:
@@ -696,6 +746,7 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         upstream_connect_timeout: float = _UPSTREAM_CONNECT_TIMEOUT_SECONDS,
         upstream_read_timeout: Optional[float] = None,
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+        max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
         log_hook: Optional[Callable[[dict], None]] = None,
     ):
         super().__init__(server_address, handler_cls)
@@ -724,6 +775,283 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         # default: production callers never set this.
         self.log_hook = log_hook
 
+        # See ``DEFAULT_MAX_CONCURRENT_REQUESTS`` above for what this
+        # bounds and why. ``BoundedSemaphore``, not ``Semaphore``: a
+        # mismatched acquire/release across the handler-thread exit paths
+        # in ``process_request``/``process_request_thread`` below would
+        # otherwise silently widen the cap past ``max_concurrent_requests``
+        # forever instead of raising ``ValueError`` at the first
+        # over-release, which is the only way such a bug would ever be
+        # noticed.
+        self.max_concurrent_requests = max_concurrent_requests
+        self._slots = threading.BoundedSemaphore(max_concurrent_requests)
+        # Guards both counters below -- read by tests (``peak_inflight_
+        # requests`` is the anti-vacuity check that the cap was actually
+        # REACHED, not merely never exceeded) and written from whichever
+        # thread currently owns a slot.
+        self._inflight_lock = threading.Lock()
+        self.inflight_requests = 0
+        self.peak_inflight_requests = 0
+
+        # Guards the rate-limit state for ``_log_capacity_refusal``'s
+        # ``stderr`` emission (see ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS``
+        # above). ``_refusal_log_last_emitted_monotonic`` starts at ``None``,
+        # not ``time.monotonic()`` at construction -- an operator must see
+        # the FIRST refusal immediately, not have it silently swallowed
+        # because it happened to land inside the very first interval after
+        # the server came up.
+        self._refusal_log_lock = threading.Lock()
+        self._refusal_log_last_emitted_monotonic: Optional[float] = None
+        self._refusal_log_suppressed_since_last_emit = 0
+
+    def process_request(self, request, client_address) -> None:
+        """Non-blocking admission gate in front of ``ThreadingMixIn``'s own
+        ``process_request``: a ``BoundedSemaphore`` slot must be acquired
+        BEFORE a handler thread is even started, or the request is refused
+        with a 503 right here, on the accept thread, and a handler is
+        never constructed for it at all.
+
+        ``acquire(blocking=False)`` -- never blocking or queueing -- is
+        deliberate: this method runs on ``serve_forever``'s own single
+        accept thread (see ``socketserver.BaseServer.
+        _handle_request_noblock``), so blocking here would stall every
+        OTHER pending connection behind this one request, turning a fast,
+        cheap refusal into an unbounded queue with the same resource-
+        exhaustion shape this cap exists to prevent in the first place.
+        """
+        if not self._slots.acquire(blocking=False):
+            self._refuse_over_capacity(request, client_address)
+            self.shutdown_request(request)
+            return
+        with self._inflight_lock:
+            self.inflight_requests += 1
+            if self.inflight_requests > self.peak_inflight_requests:
+                self.peak_inflight_requests = self.inflight_requests
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # ``ThreadingMixIn.process_request`` starting a new
+            # ``threading.Thread`` can itself raise (``RuntimeError:
+            # can't start new thread`` under thread-count/resource
+            # pressure) BEFORE ``process_request_thread`` ever runs --
+            # which means its own ``finally`` below never fires to
+            # release this slot. A slot leaked here would count against
+            # the cap forever, and the proxy would eventually refuse
+            # EVERY request permanently -- a worse, self-inflicted denial
+            # of service than the unbounded-thread bug this cap exists to
+            # fix. So the slot and the inflight counter are unwound here
+            # and the request is closed the same way a refused request
+            # is, before the exception is re-raised unchanged for
+            # ``_handle_request_noblock``'s own ``handle_error``/
+            # ``shutdown_request`` handling (which is safe to run a
+            # second time; see ``socketserver.TCPServer.shutdown_
+            # request``).
+            self._slots.release()
+            with self._inflight_lock:
+                self.inflight_requests -= 1
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._inflight_lock:
+                self.inflight_requests -= 1
+            self._slots.release()
+
+    def _refuse_over_capacity(self, request, client_address) -> None:
+        """Writes a complete HTTP/1.0 503 response directly on ``request``
+        (the raw accepted socket) and logs it -- there is no
+        ``ProvenanceProxyHandler`` instance for a refused connection at
+        all (that is the point of refusing here, before a handler thread
+        even starts), so this builds the same JSON error shape
+        ``ProvenanceProxyHandler._send_json_error`` would by hand instead
+        of being able to reuse it.
+
+        TRAP this exists to guard against: this write happens on
+        ``serve_forever``'s own single accept thread (see
+        ``process_request`` above), not a per-request handler thread. A
+        client that triggers this refusal and then never reads its
+        response would, without the timeout below, eventually block this
+        ``sendall`` once that client's own TCP receive buffer fills --
+        wedging the ONE accept thread every other client's connection
+        also depends on, which is a strictly worse denial of service than
+        the unbounded-thread bug this whole cap exists to fix. The 2s
+        ``settimeout`` plus ``except OSError: pass`` around the write
+        make a stuck or hostile client's refusal response best-effort,
+        never blocking; the body is kept small enough (a short, fixed
+        JSON error shape) to fit in a single MSS so a healthy client
+        reads it in one packet.
+        """
+        request_id = uuid.uuid4().hex
+        body = json.dumps(
+            {
+                "error": {
+                    "message": (
+                        "too many concurrent requests: the configured limit "
+                        f"of {self.max_concurrent_requests} is already in "
+                        "flight"
+                    ),
+                    "type": "too_many_concurrent_requests",
+                }
+            }
+        ).encode("utf-8")
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+            ("Retry-After", "1"),
+            ("Connection", "close"),
+        ]
+        headers.extend(self.provenance_headers)
+        headers.append(("X-FastMLX-Request-Id", _sanitize_header_value(request_id)))
+        header_bytes = b"".join(f"{name}: {value}\r\n".encode("utf-8") for name, value in headers)
+        response = b"HTTP/1.0 503 Service Unavailable\r\n" + header_bytes + b"\r\n" + body
+        try:
+            request.settimeout(2.0)
+            request.sendall(response)
+        except OSError:
+            pass
+        # Drain whatever the client ALREADY sent (for a refusal, always at
+        # least the request line -- refusing happens before any read at
+        # all, see ``process_request`` above) before closing. Root cause,
+        # confirmed by a minimal repro during this feature's own test-first
+        # development: closing a socket that still has unread bytes
+        # sitting in the kernel receive buffer makes the OS send a TCP RST
+        # instead of an orderly FIN. A ``Content-Length``-aware client
+        # (``http.client``, curl, this proxy's own upstream connections)
+        # never notices, since it stops reading once it has that many
+        # body bytes -- but a close-delimited "read until EOF" reader (the
+        # framing this response's own HTTP/1.0 default falls back to, see
+        # ``ProvenanceProxyHandler.protocol_version``) can see the RST
+        # arrive before -- or instead of -- the clean EOF it is waiting
+        # for, and some strict clients treat that as a lost/corrupted
+        # response even when every declared body byte already arrived.
+        # Bounded by an ABSOLUTE wall-clock deadline
+        # (``_REFUSAL_DRAIN_DEADLINE_SECONDS``), never a per-``recv``
+        # timeout: a per-``recv`` timeout is NOT a wall-clock bound on this
+        # loop (an earlier version of this code used ``settimeout(0.2)``
+        # here, believing it was) -- a client that keeps delivering at
+        # least one byte before each 0.2s per-``recv`` timeout expires
+        # makes every ``recv`` succeed, so the loop never times out and
+        # never hits EOF either, and keeps running for as long as the
+        # client keeps dribbling, on this same single accept thread, where
+        # any wait at all, however short per call, is a denial-of-service
+        # lever. Computing ``deadline`` ONCE up front and re-deriving each
+        # ``settimeout`` call from the REMAINING time left before it is
+        # what turns the timeout into a true budget for the whole loop
+        # instead of a per-call one: no sequence of "just in time" bytes
+        # can push the total past ``_REFUSAL_DRAIN_DEADLINE_SECONDS``.
+        #
+        # That same fixed deadline is also what bounds the two other
+        # shapes this loop must survive: a client that sends nothing at
+        # all (refusal happens before any read at all, see
+        # ``process_request`` above, so this is a live case, not a
+        # hypothetical) blocks on the very first ``recv`` and is cut off
+        # once the deadline passes; a client that closes immediately hits
+        # EOF (empty ``chunk``) well before the deadline and exits for
+        # free.
+        #
+        # A single blocking ``settimeout`` for the FULL loop is not used
+        # instead, because a genuinely well-behaved refused client (one
+        # that sends its request, then reads -- never closes) would then
+        # cost every ordinary refusal the entire deadline: the loop's
+        # ``recv`` would sit waiting for a FIN or more bytes that never
+        # come, on the same single accept thread every other connection
+        # depends on. This loop switches to non-blocking reads
+        # (``setblocking(False)``) the moment the FIRST ``recv`` returns a
+        # non-empty chunk, so an ordinary refusal -- whose request bytes
+        # are essentially always already sitting in the kernel receive
+        # buffer by the time this drain runs -- returns on its first call
+        # and pays close to nothing, while a client whose bytes are merely
+        # still in flight (not yet landed in that buffer) still gets up to
+        # the deadline to arrive rather than an immediate
+        # ``BlockingIOError`` that would drain nothing and leave those
+        # bytes unread when the socket closes (see the RST-vs-FIN
+        # paragraph above for why unread bytes at close time matter).
+        # ``BlockingIOError`` is a subclass of ``OSError``, so the
+        # existing ``except OSError`` below still terminates the loop the
+        # same way once a non-blocking ``recv`` finds nothing left.
+        try:
+            deadline = time.monotonic() + _REFUSAL_DRAIN_DEADLINE_SECONDS
+            drained = 0
+            switched_to_nonblocking = False
+            while drained < 1 << 20:
+                if not switched_to_nonblocking:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    request.settimeout(remaining)
+                chunk = request.recv(65536)
+                if not chunk:
+                    break
+                drained += len(chunk)
+                if not switched_to_nonblocking:
+                    request.setblocking(False)
+                    switched_to_nonblocking = True
+        except OSError:
+            pass
+        self._log_capacity_refusal(request_id, len(body))
+
+    def _log_capacity_refusal(self, request_id: str, bytes_out: int) -> None:
+        # Same JSONL schema ``ProvenanceProxyHandler._log`` writes (see
+        # there) -- NOT reused directly, since that is an instance method
+        # on a handler that is never constructed for a refused connection
+        # (see ``_refuse_over_capacity`` above). ``method``/``path`` are
+        # unknown here: refusing before any handler exists means this
+        # proxy never reads a byte of the request line, by design (see
+        # ``process_request`` above for why that matters).
+        entry = {
+            "ts": time.time(),
+            "request_id": request_id,
+            "method": None,
+            "path": None,
+            "status": 503,
+            "upstream_ms_to_headers": 0.0,
+            "bytes_out": bytes_out,
+            "streamed": False,
+            "error": "too_many_concurrent_requests",
+        }
+        # ``log_hook`` fires UNCONDITIONALLY, once per refusal, exactly as
+        # before -- it is an in-process, optional, test-only observability
+        # callback (see its own docstring in ``__init__``) whose cost is
+        # entirely the caller's choice and which no production caller sets,
+        # so rate-limiting it would silently throw away information a test
+        # or an operator's own hook might depend on. It is the synchronous
+        # ``sys.stderr.write`` below -- unconditional disk I/O on the single
+        # accept thread, with no caller-controlled opt-out -- that is the
+        # unbounded cost being guarded here (see
+        # ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS`` above).
+        if self.log_hook is not None:
+            self.log_hook(entry)
+
+        # Decide whether THIS refusal's line is allowed onto ``stderr``, but
+        # do the actual write/flush OUTSIDE the lock: holding a lock across
+        # a write that can itself block (see ``_REFUSAL_LOG_MIN_INTERVAL_
+        # SECONDS`` above for the pipe-reader-stalls case) would serialize
+        # every refusing thread behind that one write, which is the same
+        # single-accept-thread wedge shape this whole rate limit exists to
+        # prevent -- only now shared across every caller of this method
+        # instead of just this one call.
+        now = time.monotonic()
+        should_emit = False
+        suppressed_since_last_log = 0
+        with self._refusal_log_lock:
+            last = self._refusal_log_last_emitted_monotonic
+            if last is None or (now - last) >= _REFUSAL_LOG_MIN_INTERVAL_SECONDS:
+                should_emit = True
+                suppressed_since_last_log = self._refusal_log_suppressed_since_last_emit
+                self._refusal_log_suppressed_since_last_emit = 0
+                self._refusal_log_last_emitted_monotonic = now
+            else:
+                self._refusal_log_suppressed_since_last_emit += 1
+
+        if should_emit:
+            entry["suppressed_since_last_log"] = suppressed_since_last_log
+            line = json.dumps(entry)
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+
 
 def create_server(
     front_host: str,
@@ -734,6 +1062,7 @@ def create_server(
     upstream_connect_timeout: float = _UPSTREAM_CONNECT_TIMEOUT_SECONDS,
     upstream_read_timeout: Optional[float] = None,
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
+    max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
     log_hook: Optional[Callable[[dict], None]] = None,
 ) -> ProvenanceProxyServer:
     """Construct (bind + listen, not yet serving) the proxy server. Raises
@@ -750,5 +1079,6 @@ def create_server(
         upstream_connect_timeout,
         upstream_read_timeout,
         max_request_body_bytes,
+        max_concurrent_requests,
         log_hook,
     )
