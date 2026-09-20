@@ -26,6 +26,7 @@ import io
 import json
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -1214,6 +1215,67 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(verdict["status"], "withheld_marker_present")
         self.assertEqual(verdict["markerClasses"], ["third-party-engine-name"])
 
+    # The independent expectation below is built with DIFFERENT
+    # concatenation split points than
+    # ``scripts/validate_public_repository.py``'s own
+    # ``THIRD_PARTY_ENGINE_MARKERS`` tuple uses, and is NOT read from that
+    # tuple -- so if the imported tuple ever shrank back down to a single
+    # name, these tests would still independently know five names are
+    # expected and would fail rather than staying green for free.
+    _INDEPENDENT_THIRD_PARTY_ENGINE_MARKERS = (
+        "om" + "lx",
+        "mlx-se" + "rve",
+        "M" + "TPLX",
+        "De" + "epSpec",
+        "DeepSeek-V4-Pro-DS" + "park",
+    )
+
+    def test_publishability_each_third_party_engine_marker_alone_is_withheld(self):
+        for marker in self._INDEPENDENT_THIRD_PARTY_ENGINE_MARKERS:
+            with self.subTest(marker=marker):
+                row = {"controls": {"flags": {"listenerCmdline": f"{marker} --port 8080"}}}
+                verdict = FASTMLX_BENCH.publishability_control(row)
+                self.assertEqual(verdict["status"], "withheld_marker_present")
+                self.assertEqual(verdict["markerClasses"], ["third-party-engine-name"])
+
+    def test_publishability_engine_marker_source_has_exactly_five_and_matches_independent_set(
+        self,
+    ):
+        loaded = FASTMLX_BENCH._load_marker_source()
+        self.assertIsNotNone(loaded)
+        _private_markers, engine_markers, _own_binary_name = loaded
+        self.assertEqual(len(engine_markers), 5)
+        self.assertEqual(
+            {marker.lower() for marker in engine_markers},
+            {marker.lower() for marker in self._INDEPENDENT_THIRD_PARTY_ENGINE_MARKERS},
+        )
+
+    def test_publishability_own_binary_splice_shapes_stay_publishable(self):
+        # D2 regression: stripping the own-binary name with the EMPTY
+        # string (instead of a NUL byte) would splice the fragments either
+        # side of the removed name together into a marker that was never
+        # actually present in the original text. Neither shape below
+        # contains a bare third-party engine name.
+        own_binary = "fastmlx" + "-serve"
+        shape_prefix_suffix = "o" + own_binary + "mlx"
+        shape_infix = "mlx" + "-" + own_binary + "serve"
+        for text in (shape_prefix_suffix, shape_infix):
+            with self.subTest(text=text):
+                row = {"controls": {"flags": {"listenerCmdline": text}}}
+                verdict = FASTMLX_BENCH.publishability_control(row)
+                self.assertEqual(verdict["status"], "publishable")
+                self.assertEqual(verdict["markerClasses"], [])
+
+    def test_publishability_verdict_never_leaks_third_party_engine_marker_text(self):
+        third_party = "mlx" + "-serve"
+        row = {"controls": {"flags": {"listenerCmdline": f"{third_party} --port 8080"}}}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertNotIn(third_party, verdict["reason"] or "")
+        serialized = json.dumps(verdict)
+        self.assertNotIn(third_party, serialized)
+        for marker in self._INDEPENDENT_THIRD_PARTY_ENGINE_MARKERS:
+            self.assertNotIn(marker, serialized)
+
     def test_publishability_unlabeled_upstream_marker_refuses(self):
         # Patched seam: an upstream marker source that carries a marker
         # this module's own class-label map does not know about -- the
@@ -1221,8 +1283,15 @@ class FastmlxBenchTestCase(unittest.TestCase):
         # though the row below has no markers at all.
         unlabeled_marker = "some" + "-new-upstream-marker"
         clean_row = {"baseUrl": "http://127.0.0.1:8080"}
+        own_binary = "fastmlx" + "-serve"
         with mock.patch.object(
-            FASTMLX_BENCH, "_load_private_markers", return_value=(unlabeled_marker,)
+            FASTMLX_BENCH,
+            "_load_marker_source",
+            return_value=(
+                (unlabeled_marker,),
+                self._INDEPENDENT_THIRD_PARTY_ENGINE_MARKERS,
+                own_binary,
+            ),
         ):
             verdict = FASTMLX_BENCH.publishability_control(clean_row)
         self.assertEqual(verdict["status"], "refused_unclassified_marker")
@@ -1234,11 +1303,43 @@ class FastmlxBenchTestCase(unittest.TestCase):
 
     def test_publishability_marker_source_unloadable_refuses(self):
         clean_row = {"baseUrl": "http://127.0.0.1:8080"}
-        with mock.patch.object(FASTMLX_BENCH, "_load_private_markers", return_value=None):
+        with mock.patch.object(FASTMLX_BENCH, "_load_marker_source", return_value=None):
             verdict = FASTMLX_BENCH.publishability_control(clean_row)
         self.assertEqual(verdict["status"], "refused_sweep_unavailable")
         self.assertEqual(verdict["markerClasses"], [])
         self.assertIsNotNone(verdict["reason"])
+
+    def test_publishability_sibling_missing_engine_markers_refuses(self):
+        # A real (not mocked) sibling module load that has PRIVATE_MARKERS
+        # but is MISSING THIRD_PARTY_ENGINE_MARKERS must still refuse --
+        # partial coverage from the imported source is not a clean sweep.
+        clean_row = {"baseUrl": "http://127.0.0.1:8080"}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_validator = Path(tmp_dir) / "validate_public_repository.py"
+            fake_validator.write_text(
+                "PRIVATE_MARKERS = (" + repr("some" + "-marker") + ",)\n"
+            )
+            fake_bench_file = str(Path(tmp_dir) / "fastmlx_bench.py")
+            with mock.patch.object(FASTMLX_BENCH, "__file__", fake_bench_file):
+                verdict = FASTMLX_BENCH.publishability_control(clean_row)
+        self.assertEqual(verdict["status"], "refused_sweep_unavailable")
+        self.assertEqual(verdict["markerClasses"], [])
+
+    def test_publishability_sibling_missing_own_binary_name_refuses(self):
+        # Same as above, but the sibling module has BOTH PRIVATE_MARKERS
+        # and THIRD_PARTY_ENGINE_MARKERS and is only missing OWN_BINARY_NAME.
+        clean_row = {"baseUrl": "http://127.0.0.1:8080"}
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            fake_validator = Path(tmp_dir) / "validate_public_repository.py"
+            fake_validator.write_text(
+                "PRIVATE_MARKERS = (" + repr("some" + "-marker") + ",)\n"
+                "THIRD_PARTY_ENGINE_MARKERS = (" + repr("om" + "lx") + ",)\n"
+            )
+            fake_bench_file = str(Path(tmp_dir) / "fastmlx_bench.py")
+            with mock.patch.object(FASTMLX_BENCH, "__file__", fake_bench_file):
+                verdict = FASTMLX_BENCH.publishability_control(clean_row)
+        self.assertEqual(verdict["status"], "refused_sweep_unavailable")
+        self.assertEqual(verdict["markerClasses"], [])
 
     def test_publishability_verdict_never_leaks_the_matched_marker_text(self):
         private_ip = "192" + ".168.1.99"

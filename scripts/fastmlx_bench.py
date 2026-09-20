@@ -135,27 +135,36 @@ outcomes, and a usage error must never be misread as one.
 Every row also carries a computed ``publishable`` verdict
 (``row["publishable"]``), from ``publishability_control``: it scans the
 row's own serialized JSON (excluding this field itself, computed last and
-attached after) against the public validator's ``PRIVATE_MARKERS``
+attached after) against the public validator's ``PRIVATE_MARKERS``,
+``THIRD_PARTY_ENGINE_MARKERS``, and ``OWN_BINARY_NAME``
 (``scripts/validate_public_repository.py``, loaded by file path at CALL
 time -- never at this module's own import time, so this command stays
-runnable when that sibling is absent; any load failure yields
+runnable when that sibling is absent; any load failure, or a load that
+comes back missing any one of those three attributes, yields
 ``refused_sweep_unavailable``, never a crash or a silent clean sweep).
-Each marker maps to a stable, publishable CLASS label (e.g.
-``private-network-address``), never the matched text itself -- a verdict
-that quoted what it found would republish the very string it is
+Each ``PRIVATE_MARKERS`` entry maps to a stable, publishable CLASS label
+(e.g. ``private-network-address``), never the matched text itself -- a
+verdict that quoted what it found would republish the very string it is
 withholding the row for. A marker the imported source carries that this
 module has no label for makes the verdict REFUSE
 (``refused_unclassified_marker``) rather than report a clean sweep: a
 single source of truth that can silently grow past its consumer is not
-one. One further marker class, a third-party engine name that this
-project's OWN binary name (``fastmlx-serve``) happens to CONTAIN as a
-substring, is handled as a documented exception: occurrences of this
-project's own binary name are stripped from the scanned text FIRST, so a
-row naming only its own binary is still ``publishable``, while a row
-naming the bare third-party name is not. The verdict is metadata and
-NEVER changes the process exit code -- a row measured over the LAN is a
-perfectly valid measurement, only not a publishable one; see the five
-controls above for what can actually void a run.
+one. Every one of the imported ``THIRD_PARTY_ENGINE_MARKERS`` is scanned
+for under one shared class label (``third-party-engine-name``) -- never
+the matched marker itself -- and this project's OWN binary name (the
+imported ``OWN_BINARY_NAME``) is a documented exception: it legitimately
+CONTAINS one of those engine markers as a substring, so occurrences of it
+are neutralised out of the scanned text FIRST, with a NUL byte rather
+than deletion -- deleting it would splice the surviving fragments on
+either side of the removed name together into a match that was never
+actually present, exactly the trap ``scripts/validate_public_repository.py``
+already fixed for the same reason (see its ``_neutralize_own_binary_name``,
+which this mirrors). A row naming only its own binary is still
+``publishable``, while a row naming any bare third-party engine name is
+not. The verdict is metadata and NEVER changes the process exit code --
+a row measured over the LAN is a perfectly valid measurement, only not a
+publishable one; see the five controls above for what can actually void a
+run.
 """
 
 from __future__ import annotations
@@ -870,8 +879,11 @@ def flags_control(expect_pid: Optional[int]) -> dict:
 # this module is itself part of the public projection, so a literal
 # occurrence here would match the very scan it exists to drive (the same
 # convention as ``scripts/validate_public_repository.py``, which this
-# module's marker source is loaded from at call time -- see
-# ``_load_private_markers``).
+# module's ENTIRE marker source -- PRIVATE_MARKERS, THIRD_PARTY_ENGINE_
+# MARKERS, and OWN_BINARY_NAME -- is loaded from at call time -- see
+# ``_load_marker_source``). Nothing under this comment block hardcodes an
+# engine name or the own-binary name any more: both are single-sourced from
+# the sibling validator so this module cannot drift behind it.
 # ---------------------------------------------------------------------
 _MARKER_CLASS_LABELS: dict = {
     marker.lower(): label
@@ -890,39 +902,27 @@ _MARKER_CLASS_LABELS: dict = {
 
 # The third-party engine name is its own marker class, not part of the
 # imported PRIVATE_MARKERS set -- it has a documented exception (the
-# own-binary substring trap below) that no other marker class needs, so it
-# is scanned separately rather than folded into the drift-guarded map.
-_THIRD_PARTY_ENGINE_MARKER = "mlx" + "-serve"
+# own-binary substring trap below) that no other marker class needs, so
+# every marker in the imported THIRD_PARTY_ENGINE_MARKERS tuple is scanned
+# for under this ONE shared label, never the matched marker itself.
 _THIRD_PARTY_ENGINE_CLASS_LABEL = "third-party-engine-name"
 
-# This project's OWN binary name CONTAINS the third-party engine marker
-# above as a proper substring -- prefixing it is all it takes. Occurrences
-# of our own name are stripped from the scanned text before the
-# third-party scan runs -- see publishability_control's own-binary
-# exception.
-#
-# Note both operands below are built by CONCATENATION, and the comment
-# above deliberately does NOT spell either name out. An earlier draft of
-# this very comment illustrated the trap by quoting both names literally,
-# which put the bare third-party name into a publicly projected file --
-# the exact violation a previous cycle spent an increment scrubbing from
-# this file's docstring. The repository gitleaks run and the public
-# validator BOTH passed while it was present, because that name is not in
-# PRIVATE_MARKERS; only the publication sweep caught it. A comment
-# explaining a marker guard is still scanned text.
-_OWN_BINARY_MARKER = "fastmlx" + "-serve"
 
-
-def _load_private_markers() -> "Optional[tuple]":
-    """Loads ``PRIVATE_MARKERS`` from the sibling
+def _load_marker_source() -> "Optional[tuple]":
+    """Loads ``PRIVATE_MARKERS``, ``THIRD_PARTY_ENGINE_MARKERS``, and
+    ``OWN_BINARY_NAME`` from the sibling
     ``scripts/validate_public_repository.py`` by file path, at CALL time --
     never at this module's own import time, so ``fastmlx bench`` stays
     runnable when that sibling script is missing or broken. ANY failure
-    (missing file, import error, a module with no ``PRIVATE_MARKERS``
-    attribute, an OSError reading the file) returns ``None`` rather than
-    raising -- ``publishability_control`` turns that into the fail-closed
+    (missing file, import error, an OSError reading the file, or a loaded
+    module that is missing any ONE of those three attributes or holds an
+    empty value for it) returns ``None`` rather than raising --
+    ``publishability_control`` turns that into the fail-closed
     ``refused_sweep_unavailable`` status, never a crash and never a silent
     clean sweep.
+
+    Returns ``(private_markers, third_party_engine_markers,
+    own_binary_name)`` on success.
     """
     try:
         path = Path(__file__).resolve().parent / "validate_public_repository.py"
@@ -933,10 +933,12 @@ def _load_private_markers() -> "Optional[tuple]":
             return None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        markers = getattr(module, "PRIVATE_MARKERS", None)
-        if not markers:
+        private_markers = getattr(module, "PRIVATE_MARKERS", None)
+        engine_markers = getattr(module, "THIRD_PARTY_ENGINE_MARKERS", None)
+        own_binary_name = getattr(module, "OWN_BINARY_NAME", None)
+        if not private_markers or not engine_markers or not own_binary_name:
             return None
-        return tuple(markers)
+        return tuple(private_markers), tuple(engine_markers), own_binary_name
     except Exception:
         return None
 
@@ -970,16 +972,19 @@ def publishability_control(row: dict) -> dict:
     marker literal -- so neither this dict nor its JSON serialization ever
     republishes the thing it is withholding the row for.
     """
-    markers = _load_private_markers()
-    if markers is None:
+    loaded = _load_marker_source()
+    if loaded is None:
         return {
             "status": "refused_sweep_unavailable",
             "markerClasses": [],
             "reason": (
-                "the private-marker source module could not be loaded; "
-                "refusing rather than reporting an unswept row as clean"
+                "the private-marker source module could not be loaded, or "
+                "is missing PRIVATE_MARKERS, THIRD_PARTY_ENGINE_MARKERS, or "
+                "OWN_BINARY_NAME; refusing rather than reporting an unswept "
+                "row as clean"
             ),
         }
+    markers, engine_markers, own_binary_name = loaded
     labeled_markers, unlabeled_count = _classify_markers(markers)
     if unlabeled_count:
         return {
@@ -996,11 +1001,18 @@ def publishability_control(row: dict) -> dict:
     for marker_lower, label in labeled_markers.items():
         if marker_lower in text:
             hit_classes.add(label)
-    # Own-binary exception: strip this project's own binary name BEFORE
-    # scanning for the third-party engine name it happens to contain as a
-    # substring (order matters -- see module docstring).
-    swept_text = text.replace(_OWN_BINARY_MARKER.lower(), "")
-    if _THIRD_PARTY_ENGINE_MARKER.lower() in swept_text:
+    # Own-binary exception: neutralise this project's own binary name with a
+    # NUL byte BEFORE scanning for the third-party engine names it happens
+    # to contain one of as a substring (order matters -- see module
+    # docstring). Replacing it with the empty string instead would splice
+    # the surviving fragments on either side of the removed name together
+    # into a NEW match that was never actually present -- the same trap
+    # ``scripts/validate_public_repository.py`` already fixed in its own
+    # ``_neutralize_own_binary_name``, which this mirrors. A NUL character
+    # cannot appear inside any marker, so substituting it breaks adjacency
+    # without manufacturing a new substring match.
+    swept_text = text.replace(own_binary_name.lower(), "\x00")
+    if any(marker.lower() in swept_text for marker in engine_markers):
         hit_classes.add(_THIRD_PARTY_ENGINE_CLASS_LABEL)
     if hit_classes:
         classes = sorted(hit_classes)
