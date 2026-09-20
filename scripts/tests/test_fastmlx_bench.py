@@ -206,6 +206,25 @@ def make_call_indexed_stream(
     return fn, state
 
 
+def make_prompt_keyed_stream(behaviors_by_prompt: dict):
+    """A responder that reads the request body ONCE and hands off to
+    ``behaviors_by_prompt[body["messages"][0]["content"]]`` -- the prompt-
+    set analogue of ``make_dispatch_responder`` (which keys off the
+    request's ``model`` instead): lets one fake server give a DIFFERENT,
+    individually-controlled streamed behavior to each prompt in a single
+    arm's multi-prompt set, which is what the pooled-pass-rate tests need
+    (a candidate/reference-only key can't distinguish two prompts sent to
+    the SAME model).
+    """
+
+    def responder(handler):
+        body = _read_request_body(handler)
+        prompt = body["messages"][0]["content"]
+        behaviors_by_prompt[prompt](handler)
+
+    return responder
+
+
 def make_body_capturing_stream(
     content_chunks: int,
     completion_tokens=None,
@@ -665,7 +684,7 @@ class FastmlxBenchTestCase(unittest.TestCase):
         base_url = self.start(responder)
 
         arm = FASTMLX_BENCH.measure_arm(
-            base_url, "candidate", "hi", 32, runs, None, 10.0, warmup,
+            base_url, "candidate", ["hi"], 32, runs, None, 10.0, warmup,
         )
 
         # (a) the warmup pass was actually sent: total requests == warmup + runs.
@@ -687,7 +706,7 @@ class FastmlxBenchTestCase(unittest.TestCase):
         base_url = self.start(responder)
 
         arm = FASTMLX_BENCH.measure_arm(
-            base_url, "candidate", "hi", 32, runs, None, 10.0, 0,
+            base_url, "candidate", ["hi"], 32, runs, None, 10.0, 0,
         )
 
         self.assertEqual(state["count"], runs)
@@ -733,6 +752,12 @@ class FastmlxBenchTestCase(unittest.TestCase):
             "--timeout", "10",
             "--warmup", str(warmup),
             "--drift-tolerance", "5.0",
+            # Pinned to a single prompt: this test is about warmup being
+            # per-measure_arm-call, not about the (unrelated) default
+            # 3-prompt-set axis -- with the default set, "one measured
+            # request" is 3 requests (one per prompt) and would make the
+            # counts below conflate the two concerns.
+            "--prompt", "hi",
             "--json",
         ]
         code, stdout, _ = self._run_main(argv)
@@ -782,7 +807,7 @@ class FastmlxBenchTestCase(unittest.TestCase):
             make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
         )
         FASTMLX_BENCH.measure_arm(
-            base_url, "candidate", "hi", 32, 2, None, 10.0, warmup=1, temperature=0.55,
+            base_url, "candidate", ["hi"], 32, 2, None, 10.0, warmup=1, temperature=0.55,
         )
         # warmup(1) + runs(2) = 3 requests total, every one at the SAME
         # temperature -- a warmup pass at a different temperature would warm
@@ -919,6 +944,337 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIn("runs", boundary)
         self.assertIn("warmup=2", boundary)
         self.assertIn("temperature=0.3", boundary)
+
+    # ------------------------------------------------------------------
+    # Design decisions 1-8: the default prompt set is now THREE prompts, a
+    # pass is one request PER PROMPT pooled to a single rate, --prompt is
+    # repeatable and REPLACES the default set, and the boundary states the
+    # new shape.
+    # ------------------------------------------------------------------
+    def test_default_run_issues_three_requests_per_pass_with_distinct_default_prompts(self):
+        self.assertEqual(len(FASTMLX_BENCH.DEFAULT_PROMPTS), 3)
+        captured_bodies: list = []
+        runs = 2
+        warmup = 1
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", str(runs),
+            "--warmup", str(warmup), "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+
+        # runs x 3 measured requests, plus warmup x 3 discarded requests.
+        self.assertEqual(len(captured_bodies), (warmup + runs) * 3)
+        prompts_sent = [body["messages"][0]["content"] for body in captured_bodies]
+        # Every request body carries one of the three DISTINCT default
+        # prompts -- never a single repeated prompt.
+        self.assertEqual(set(prompts_sent), set(FASTMLX_BENCH.DEFAULT_PROMPTS))
+
+        doc = json.loads(stdout)
+        candidate_arm = next(arm for arm in doc["arms"] if arm["model"] == "candidate")
+        # Per-request readings are retained for every MEASURED request only
+        # (warmup requests are sent but never kept as Readings): runs x 3.
+        self.assertEqual(len(candidate_arm["readings"]), runs * 3)
+        # warmupDiscarded is a PASS count, not a request count -- one
+        # discarded warmup PASS is one discarded request per prompt.
+        self.assertEqual(candidate_arm["warmupDiscarded"], warmup)
+
+    def test_max_tokens_default_is_256_in_request_body_and_boundary(self):
+        self.assertEqual(FASTMLX_BENCH.DEFAULT_MAX_TOKENS, 256)
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        self.assertTrue(captured_bodies)
+        self.assertTrue(all(body["max_tokens"] == 256 for body in captured_bodies))
+        doc = json.loads(stdout)
+        self.assertIn("maxTokens=256", doc["boundary"])
+
+    def test_repeated_prompt_flag_replaces_the_default_set_with_exactly_those_given(self):
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10",
+            "--prompt", "prompt A", "--prompt", "prompt B", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        prompts_sent = [body["messages"][0]["content"] for body in captured_bodies]
+        # Exactly the two given prompts, in the order given -- the default
+        # set is REPLACED, not merged into.
+        self.assertEqual(prompts_sent, ["prompt A", "prompt B"])
+        doc = json.loads(stdout)
+        self.assertIn("promptSet=custom-prompt-set", doc["boundary"])
+        self.assertIn("prompts=2", doc["boundary"])
+        self.assertIn(f"chars={len('prompt A')}/{len('prompt B')}", doc["boundary"])
+
+    def test_single_prompt_flag_yields_exactly_one_prompt(self):
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--prompt", "solo prompt", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        # A single --prompt still yields exactly ONE request per pass, not
+        # three -- existing single-prompt invocations keep working
+        # unchanged.
+        self.assertEqual(len(captured_bodies), 1)
+        self.assertEqual(captured_bodies[0]["messages"][0]["content"], "solo prompt")
+        doc = json.loads(stdout)
+        self.assertIn("prompts=1", doc["boundary"])
+
+    def test_pooled_pass_rate_is_not_the_mean_of_per_prompt_rates(self):
+        # Two prompts with deliberately DIFFERENT per-request decode
+        # intervals (small vs. large real sleeps -- see module docstring's
+        # timing note on this sandbox's sleep overshoot) but the SAME
+        # completion_tokens, so the pooled-vs-mean formulas diverge purely
+        # from the differing denominators, not from a confound in the
+        # numerators.
+        prompt_fast = "prompt-fast"
+        prompt_slow = "prompt-slow"
+        behaviors = {
+            prompt_fast: make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.02),
+            prompt_slow: make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=1.0),
+        }
+        base_url = self.start(make_prompt_keyed_stream(behaviors))
+
+        arm = FASTMLX_BENCH.measure_arm(
+            base_url, "candidate", [prompt_fast, prompt_slow], 32, 1, None, 10.0, warmup=0,
+        )
+        self.assertEqual(len(arm.readings), 2)
+        fast_reading, slow_reading = arm.readings
+        self.assertTrue(fast_reading.measurable)
+        self.assertTrue(slow_reading.measurable)
+
+        # The pooled formula: sum of numerators over sum of denominators --
+        # computed here from the SAME per-request facts the module itself
+        # observed (reading.completion_tokens, reading.elapsed_s), not from
+        # a hardcoded expectation that would be vulnerable to this
+        # sandbox's sleep-overshoot jitter.
+        pooled_expected = (
+            (fast_reading.completion_tokens - 1) + (slow_reading.completion_tokens - 1)
+        ) / (fast_reading.elapsed_s + slow_reading.elapsed_s)
+        mean_of_rates = (fast_reading.decode_tok_s + slow_reading.decode_tok_s) / 2.0
+
+        # Anti-vacuity: the two formulas must be numerically DIFFERENT in
+        # this fixture, or the assertions below wouldn't discriminate
+        # between them at all.
+        self.assertGreater(
+            abs(pooled_expected - mean_of_rates), 0.15 * mean_of_rates,
+            "fixture did not separate the pooled and mean-of-rates formulas enough to discriminate",
+        )
+
+        self.assertEqual(len(arm.pass_rates), 1)
+        self.assertAlmostEqual(arm.pass_rates[0], pooled_expected, places=6)
+        self.assertAlmostEqual(arm.median_decode_tok_s, pooled_expected, places=6)
+        # And it must NOT be the mean of the per-prompt rates.
+        self.assertGreater(abs(arm.median_decode_tok_s - mean_of_rates), 0.15 * mean_of_rates)
+
+    def test_pass_with_one_unmeasurable_request_is_unmeasurable_as_a_whole(self):
+        prompt_ok = "prompt-ok"
+        prompt_broken = "prompt-broken"
+        behaviors = {
+            prompt_ok: make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.02),
+            # A single-token completion is UNMEASURABLE (see
+            # test_single_token_reading_is_unmeasurable_not_zero).
+            prompt_broken: make_simple_stream(1, completion_tokens=1, inter_chunk_sleep=0.0),
+        }
+        base_url = self.start(make_prompt_keyed_stream(behaviors))
+
+        arm = FASTMLX_BENCH.measure_arm(
+            base_url, "candidate", [prompt_ok, prompt_broken], 32, 1, None, 10.0, warmup=0,
+        )
+        self.assertEqual(len(arm.readings), 2)
+        self.assertTrue(arm.readings[0].measurable)
+        self.assertFalse(arm.readings[1].measurable)
+
+        # The whole PASS is unmeasurable -- it must NOT be silently pooled
+        # from just its one measurable request, which would change the
+        # workload for this pass relative to its siblings.
+        self.assertEqual(arm.pass_rates, [None])
+        self.assertIsNone(arm.median_decode_tok_s)
+
+    def test_json_row_retains_every_per_request_reading_for_a_multi_prompt_pass(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "2",
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        candidate_arm = next(arm for arm in doc["arms"] if arm["model"] == "candidate")
+        # 2 measured passes x 3 prompts per pass = 6 per-request Readings
+        # retained -- nothing pooled away from the JSON row.
+        self.assertEqual(len(candidate_arm["readings"]), 2 * 3)
+        for reading in candidate_arm["readings"]:
+            self.assertIn("decodeTokS", reading)
+            self.assertIn("completionTokens", reading)
+
+    def test_measure_arm_refuses_a_bare_string_prompt(self):
+        # A bare str IS a Sequence[str], so without an explicit refusal this
+        # would quietly measure one single-character prompt per character and
+        # report a plausible rate for a workload nobody requested. Pinned
+        # because the failure is silent, not loud.
+        with self.assertRaises(TypeError) as caught:
+            FASTMLX_BENCH.measure_arm(
+                "http://127.0.0.1:1", "m", "hi", 8, 1, None, 1.0,
+            )
+        self.assertIn("sequence of prompts", str(caught.exception))
+
+    def test_boundary_states_prompt_count_and_lengths(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        boundary = doc["boundary"]
+        self.assertIn("promptSet=default-3-prompt-set", boundary)
+        self.assertIn("prompts=3", boundary)
+        expected_chars = "/".join(str(len(prompt)) for prompt in FASTMLX_BENCH.DEFAULT_PROMPTS)
+        self.assertIn(f"chars={expected_chars}", boundary)
+
+    # ------------------------------------------------------------------
+    # publishability_control: a whole-row, fail-closed publishability
+    # verdict. Every forbidden string below is built by CONCATENATION,
+    # never as a literal -- this test file is itself publicly projected,
+    # and a literal would trip the sweep it is testing (the same
+    # convention as scripts/validate_public_repository.py and this
+    # module's own PRIVATE_MARKERS handling).
+    # ------------------------------------------------------------------
+    def test_publishability_clean_row_is_publishable(self):
+        row = {
+            "schema": "fastmlx-bench-row-v1",
+            "baseUrl": "http://127.0.0.1:8080",
+            "boundary": "chip=Apple M3 Ultra (arm64)",
+            "controls": {"flags": {"listenerCmdline": None}},
+        }
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "publishable")
+        self.assertEqual(verdict["markerClasses"], [])
+        self.assertIsNone(verdict["reason"])
+
+    def test_publishability_private_network_address_in_base_url_is_withheld(self):
+        private_ip = "192" + ".168.1.50"
+        row = {"baseUrl": f"http://{private_ip}:8080"}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "withheld_marker_present")
+        self.assertEqual(verdict["markerClasses"], ["private-network-address"])
+        self.assertIsNotNone(verdict["reason"])
+
+    def test_publishability_absolute_user_path_in_listener_cmdline_is_withheld(self):
+        user_path = "/" + "Users/" + "operator/bin/server"
+        row = {"controls": {"flags": {"listenerCmdline": user_path}}}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "withheld_marker_present")
+        self.assertEqual(verdict["markerClasses"], ["absolute-user-path"])
+
+    def test_publishability_internal_account_name_via_host_label_is_withheld(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        host_label = "llm" + "bench-box3"
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--host-label", host_label, "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["publishable"]["status"], "withheld_marker_present")
+        self.assertEqual(doc["publishable"]["markerClasses"], ["internal-host-account"])
+
+    def test_publishability_own_binary_name_alone_is_publishable(self):
+        own_binary = "fastmlx" + "-serve"
+        row = {"controls": {"flags": {"listenerCmdline": f"{own_binary} --port 8080"}}}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "publishable")
+        self.assertEqual(verdict["markerClasses"], [])
+
+    def test_publishability_bare_third_party_engine_name_is_withheld(self):
+        third_party = "mlx" + "-serve"
+        row = {"controls": {"flags": {"listenerCmdline": f"{third_party} --port 8080"}}}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "withheld_marker_present")
+        self.assertEqual(verdict["markerClasses"], ["third-party-engine-name"])
+
+    def test_publishability_unlabeled_upstream_marker_refuses(self):
+        # Patched seam: an upstream marker source that carries a marker
+        # this module's own class-label map does not know about -- the
+        # drift guard must refuse rather than report a clean sweep, even
+        # though the row below has no markers at all.
+        unlabeled_marker = "some" + "-new-upstream-marker"
+        clean_row = {"baseUrl": "http://127.0.0.1:8080"}
+        with mock.patch.object(
+            FASTMLX_BENCH, "_load_private_markers", return_value=(unlabeled_marker,)
+        ):
+            verdict = FASTMLX_BENCH.publishability_control(clean_row)
+        self.assertEqual(verdict["status"], "refused_unclassified_marker")
+        self.assertEqual(verdict["markerClasses"], [])
+        self.assertIn("1", verdict["reason"])
+        # No self-leak even in the refusal path: the marker text itself is
+        # never named, only a count.
+        self.assertNotIn(unlabeled_marker, verdict["reason"])
+
+    def test_publishability_marker_source_unloadable_refuses(self):
+        clean_row = {"baseUrl": "http://127.0.0.1:8080"}
+        with mock.patch.object(FASTMLX_BENCH, "_load_private_markers", return_value=None):
+            verdict = FASTMLX_BENCH.publishability_control(clean_row)
+        self.assertEqual(verdict["status"], "refused_sweep_unavailable")
+        self.assertEqual(verdict["markerClasses"], [])
+        self.assertIsNotNone(verdict["reason"])
+
+    def test_publishability_verdict_never_leaks_the_matched_marker_text(self):
+        private_ip = "192" + ".168.1.99"
+        user_path = "/" + "Users/" + "operator"
+        row = {
+            "baseUrl": f"http://{private_ip}:8080",
+            "controls": {"flags": {"listenerCmdline": user_path}},
+        }
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        serialized = json.dumps(verdict)
+        self.assertNotIn(private_ip, serialized)
+        self.assertNotIn(user_path, serialized)
+        self.assertNotIn("192" + ".168.", serialized)
+        self.assertNotIn("/" + "Users/", serialized)
+
+    def test_publishability_withheld_verdict_does_not_change_exit_code(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        host_label = "llm" + "bench-box3"
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--host-label", host_label, "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["publishable"]["status"], "withheld_marker_present")
+        # The whole point of this test: a withheld ROW is still a valid
+        # MEASUREMENT -- the verdict is metadata and must never change the
+        # exit code (see module docstring / the decision doc).
+        self.assertEqual(code, 0)
+
+    def test_publishable_line_appears_in_text_output(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = ["--base-url", base_url, "--model", "candidate", "--runs", "1", "--timeout", "10"]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        self.assertIn("publishable: publishable", stdout)
 
     # ------------------------------------------------------------------
     def _run_main(self, argv: list):

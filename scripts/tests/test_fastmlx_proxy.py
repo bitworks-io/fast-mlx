@@ -2169,6 +2169,80 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------
+    # The defect this pins: ``_respond_buffered`` set ``bytes_out =
+    # len(body)`` BEFORE attempting the write, and its (BrokenPipeError,
+    # ConnectionResetError, OSError) clause used to just ``pass`` -- so a
+    # client that vanishes mid-write got logged as a clean delivery of the
+    # WHOLE body, with ``error`` left ``None``. This drives a real client
+    # that disconnects instead of reading a large buffered (Content-Length)
+    # response, and asserts on the LOGGED entry (the surface the defect
+    # corrupts), not on anything client-side -- the client is gone before
+    # it could observe a response either way.
+    # ------------------------------------------------------------------
+    def test_a_client_that_disconnects_mid_write_on_the_buffered_path_is_not_logged_as_delivered(self):
+        large_body = b"z" * (32 * 1024 * 1024)
+
+        def responder(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+            handler.send_header("Content-Length", str(len(large_body)))
+            handler.end_headers()
+            try:
+                handler.wfile.write(large_body)
+            except OSError:
+                pass  # the proxy closed its upstream connection once the client vanished.
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+
+        logged = []
+        logged_event = threading.Event()
+
+        def log_hook(entry):
+            logged.append(entry)
+            logged_event.set()
+
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+        # A shrunk receive window, exactly like ``_open_stalled_client``
+        # above, so the proxy's write does not complete in one shot before
+        # the close below has a chance to matter -- then the socket is
+        # closed outright (not merely left stalled) so the proxy's write
+        # fails with a vanished-client ``OSError``, not a budget timeout.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        sock.connect(("127.0.0.1", proxy.server_address[1]))
+        sock.sendall(b"GET /v1/big HTTP/1.1\r\nHost: x\r\n\r\n")
+        sock.close()
+
+        self.assertTrue(
+            logged_event.wait(timeout=15), "the disconnected request was never logged at all"
+        )
+        entry = logged[0]
+        self.assertIsNotNone(
+            entry.get("error"),
+            "a client that vanished mid-write must not be logged with error=None",
+        )
+        # Pin WHICH branch produced the error. A response-write-budget
+        # timeout also sets an error and also zeroes bytes_out, so asserting
+        # only "some error, fewer bytes" would be satisfied by the timeout
+        # path and this test would silently stop covering the vanished-client
+        # branch it exists for.
+        self.assertTrue(
+            entry["error"].startswith("client_write_failed:"),
+            "expected the vanished-client branch, got: " + repr(entry["error"]),
+        )
+        self.assertEqual(
+            entry["bytes_out"], 0,
+            "a write that did not complete contributes 0, matching the streamed path's "
+            "count-only-after-success convention",
+        )
+        self.assertFalse(
+            entry["streamed"], "this must be the buffered (Content-Length) path, not SSE, "
+            "for the fix under test to be exercised at all"
+        )
+
+    # ------------------------------------------------------------------
     # AC5: fd hygiene -- 50 sequential refusals, while one slot stays held,
     # must not grow the process's open-fd count at all. Kills a missing
     # ``shutdown_request`` on the refusal path: a status-only test is blind

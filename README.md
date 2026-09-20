@@ -424,14 +424,35 @@ token limit and the run count it was taken with, so a row is self-describing. Ro
 these defaults existed did not pin either knob.
 
 These are part — not all — of the method the published quality cards state. The cards are measured
-at temperature 0 with one warmup pass discarded and a median of 3, which this command's defaults now
-reproduce; they also use **3 prompts of 256 tokens**, where this command measures a single prompt
-and defaults to 128 tokens. Use `--prompt` and `--max-tokens` deliberately when you intend to
-compare a row against a card, and read a card's own `speedXStatus`, which states its full method.
+at temperature 0 with one warmup pass discarded and a median of 3, using 3 prompts of 256 tokens,
+which this command's defaults now reproduce on every one of those axes: `--prompt` is repeatable and
+defaults to a fixed 3-prompt set, and `--max-tokens` defaults to 256. A "pass" is one request per
+prompt in the set, pooled to a single rate as `sum(completionTokens - 1) / sum(lastChunk -
+firstChunk)` across the set's requests — the direct generalization of the single-request formula
+above, and every per-request reading a pass pools over is still kept in the row, not discarded.
+
+Two things still do not reproduce a card exactly. This command's 3 default prompts are its own fixed
+set, not the cards' own (unpublished) prompt text — a rate is sensitive to what is asked, not just
+how many tokens and how many prompts. And the cards do not state their own pooling arithmetic, so the
+formula above is this command's best-effort generalization, not one confirmed byte-for-byte against
+how a card's own number was produced. Use `--prompt` (repeatable) and `--max-tokens` deliberately
+when you intend to compare a row against a card using a different prompt set or length, and read a
+card's own `speedXStatus`, which states its full method.
 
 A row's `boundary` records the chip (for example `chip=Apple M3 Ultra (arm64)`) rather than the
 machine's hostname, so a row is publishable as measured. `--host-label` opts back in to naming a
 specific box, which makes that row internal.
+
+Every row also carries a computed `publishable` verdict, so the row states its own disposition
+instead of leaving it to be judged field by field. It scans the whole row — `baseUrl`, `boundary`,
+and the captured listener argv together — and reports either `publishable` or
+`withheld_marker_present` alongside the *classes* of marker it found (`absolute-user-path`,
+`private-network-address`, and so on). It names classes and never the matched text, since a verdict
+that quoted what it found would republish the very string it is withholding the row for. It is
+fail-closed in both directions: a marker it cannot classify, or a marker list it cannot load at
+all, makes it refuse rather than report a clean sweep. The verdict never changes the exit status —
+a row measured over a private network is a perfectly valid *measurement* that simply is not
+publishable — and it is a backstop over a known marker set, not a proof of publishability.
 
 Five controls each carry their own refusal reason: the token source must be the server's `usage`
 and not a chunk count; in ratio mode the reference arm must not have drifted between its two

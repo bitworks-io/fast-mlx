@@ -974,8 +974,20 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         except (socket.timeout, TimeoutError):
             error = _response_write_budget_exceeded_message()
             bytes_out = 0
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            # The client vanished mid-write. ``bytes_out`` was set to
+            # ``len(body)`` BEFORE the write for the happy path, so it must
+            # fall back to 0 here, matching ``_respond_streamed``'s
+            # count-only-after-success convention -- otherwise the single
+            # caller logs a failed delivery as a clean full-body success.
+            error = f"client_write_failed: {exc}"
+            bytes_out = 0
+            # Deliberately no ``_abort_client_connection()``: the exception
+            # proves the socket already failed, unlike the timeout branch
+            # where the connection is still alive and the RST is what makes
+            # the abort visible to the client. ``_respond_streamed``'s own
+            # vanished-client branch draws the same line.
+            return bytes_out, status, error
         if error is not None:
             self._abort_client_connection()
         return bytes_out, status, error

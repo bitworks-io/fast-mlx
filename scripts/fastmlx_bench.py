@@ -131,11 +131,37 @@ command can pass for free):
 Usage errors (bad/missing flags) exit 64 (EX_USAGE), never argparse's
 default of 2 -- this project reserves other exit codes for measurement
 outcomes, and a usage error must never be misread as one.
+
+Every row also carries a computed ``publishable`` verdict
+(``row["publishable"]``), from ``publishability_control``: it scans the
+row's own serialized JSON (excluding this field itself, computed last and
+attached after) against the public validator's ``PRIVATE_MARKERS``
+(``scripts/validate_public_repository.py``, loaded by file path at CALL
+time -- never at this module's own import time, so this command stays
+runnable when that sibling is absent; any load failure yields
+``refused_sweep_unavailable``, never a crash or a silent clean sweep).
+Each marker maps to a stable, publishable CLASS label (e.g.
+``private-network-address``), never the matched text itself -- a verdict
+that quoted what it found would republish the very string it is
+withholding the row for. A marker the imported source carries that this
+module has no label for makes the verdict REFUSE
+(``refused_unclassified_marker``) rather than report a clean sweep: a
+single source of truth that can silently grow past its consumer is not
+one. One further marker class, a third-party engine name that this
+project's OWN binary name (``fastmlx-serve``) happens to CONTAIN as a
+substring, is handled as a documented exception: occurrences of this
+project's own binary name are stripped from the scanned text FIRST, so a
+row naming only its own binary is still ``publishable``, while a row
+naming the bare third-party name is not. The verdict is metadata and
+NEVER changes the process exit code -- a row measured over the LAN is a
+perfectly valid measurement, only not a publishable one; see the five
+controls above for what can actually void a run.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import platform
 import statistics
@@ -146,6 +172,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional, Sequence
 
 
@@ -158,7 +185,28 @@ DEFAULT_PROMPT = (
     "In two or three sentences, describe how the water cycle moves water "
     "between the ocean, the atmosphere, and the land."
 )
-DEFAULT_MAX_TOKENS = 128
+# The published quality cards' method uses THREE prompts, not one -- see
+# DEFAULT_MAX_TOKENS's comment for the matching 256-token axis. These three
+# are FIXED and deterministic (never randomly sampled or drawn from a corpus
+# at run time): this is a TIMING workload, not a quality probe, so the
+# command's own reproducibility depends on every invocation sending the
+# exact same bytes. They are English and of broadly comparable length so
+# that no single prompt dominates a pass's pooled rate (see measure_arm's
+# pooling doc) by having a wildly different completion-length profile than
+# its siblings. ``--prompt`` (repeatable) replaces this whole set, never
+# merges into it -- see build_arg_parser's help text.
+DEFAULT_PROMPTS = (
+    DEFAULT_PROMPT,
+    "In two or three sentences, explain why the sky looks blue during the "
+    "day and can turn orange or red near sunset.",
+    "In two or three sentences, explain how a refrigerator keeps food cold "
+    "using a compression and evaporation cycle.",
+)
+# The published quality cards' method requests 256 completion tokens per
+# pass, not 128 -- this default is the matching axis to DEFAULT_PROMPTS'
+# three-prompt set, so the command's own default reproduces the cards'
+# method on both axes without the caller needing to pass either flag.
+DEFAULT_MAX_TOKENS = 256
 DEFAULT_RUNS = 3
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAGNITUDE_FLOOR = 25.0
@@ -216,6 +264,7 @@ class Reading:
         "token_source",
         "measurable",
         "unmeasurable_reason",
+        "elapsed_s",
     )
 
     def __init__(
@@ -226,6 +275,7 @@ class Reading:
         token_source: str,
         measurable: bool,
         unmeasurable_reason: Optional[str],
+        elapsed_s: float,
     ):
         self.decode_tok_s = decode_tok_s
         self.ttft_s = ttft_s
@@ -233,6 +283,15 @@ class Reading:
         self.token_source = token_source
         self.measurable = measurable
         self.unmeasurable_reason = unmeasurable_reason
+        # (t_last_chunk - t_first_chunk), kept even on an unmeasurable
+        # reading -- NOT part of to_json's public shape (decode_tok_s /
+        # completion_tokens already state everything a reader needs), but
+        # load-bearing internally: _pool_pass sums this across a pass's
+        # per-prompt readings to compute the pooled decode rate directly
+        # from the same numbers _consume_sse_stream already measured,
+        # rather than reconstructing it from decode_tok_s (which would
+        # divide, then a caller would multiply back out, for no reason).
+        self.elapsed_s = elapsed_s
 
     def to_json(self) -> dict:
         return {
@@ -248,7 +307,7 @@ class Reading:
 class ArmResult:
     """See ``Reading``'s docstring for why this is a plain class."""
 
-    __slots__ = ("model", "readings", "median_decode_tok_s", "warmup_discarded")
+    __slots__ = ("model", "readings", "median_decode_tok_s", "warmup_discarded", "pass_rates")
 
     def __init__(
         self,
@@ -256,6 +315,7 @@ class ArmResult:
         readings: List[Reading],
         median_decode_tok_s: Optional[float],
         warmup_discarded: int = 0,
+        pass_rates: Optional[List[Optional[float]]] = None,
     ):
         self.model = model
         self.readings = readings
@@ -264,6 +324,17 @@ class ArmResult:
         # taken -- NOT itself a Reading (see measure_arm): warmup passes
         # never enter ``readings`` or the median at all.
         self.warmup_discarded = warmup_discarded
+        # One pooled rate per MEASURED pass (``_pool_pass``'s output,
+        # ``None`` for an unmeasurable pass), in pass order -- NOT part of
+        # to_json's public shape (``readings`` already carries every
+        # per-request fact a reader needs). Load-bearing internally for
+        # ratio mode's bookend combination in run_bench: the reference
+        # arm's combined median must be taken over the two bookend
+        # measure_arm() calls' own PASS rates, not recomputed from pooled
+        # per-reading rates across a multi-prompt set (that would mix
+        # different prompts' individual rates into one median instead of
+        # each pass's own pooled rate).
+        self.pass_rates = list(pass_rates) if pass_rates is not None else []
 
     def to_json(self) -> dict:
         return {
@@ -360,6 +431,7 @@ def _consume_sse_stream(response, t_request_sent: float) -> Reading:
         token_source=token_source,
         measurable=measurable,
         unmeasurable_reason=unmeasurable_reason,
+        elapsed_s=elapsed,
     )
 
 
@@ -415,10 +487,45 @@ def stream_chat_completion(
         raise BenchError(f"could not reach {base_url}: {exc}")
 
 
+def _pool_pass(pass_readings: Sequence[Reading]) -> Optional[float]:
+    """Pools ONE pass's per-prompt ``Reading``s into a single pass rate:
+
+        passDecodeTokS = sum_i (completionTokens_i - 1) / sum_i elapsed_i
+
+    the exact generalisation of the single-request formula (the ``i`` = 1
+    case) -- summing numerators and denominators SEPARATELY before
+    dividing, never averaging the per-prompt rates themselves (that would
+    weight a short, fast prompt equally with a long, slow one instead of
+    weighting by actual decode time, and is a numerically DIFFERENT
+    quantity -- see this function's own test coverage for a fixture where
+    the two disagree).
+
+    A pass is measurable ONLY when every one of its per-prompt readings is
+    individually measurable (``Reading.measurable``) -- pooling from a
+    measurable subset would silently shrink the workload for just that one
+    pass relative to its siblings, which is exactly the kind of workload
+    drift this instrument exists to prevent (see module docstring's
+    --warmup/--temperature discussion for the same principle applied
+    elsewhere). Zero passed-in readings, or any unmeasurable one, makes the
+    whole pass unmeasurable: ``None``, never ``0.0``.
+    """
+    if not pass_readings or not all(reading.measurable for reading in pass_readings):
+        return None
+    numerator = sum(reading.completion_tokens - 1 for reading in pass_readings)
+    denominator = sum(reading.elapsed_s for reading in pass_readings)
+    if not (denominator > 0):
+        # Cannot occur given every reading passed its own measurable check
+        # (each individually requires elapsed_s > 0), but guarded the same
+        # fail-closed way as _consume_sse_stream's own measurability check
+        # rather than trusting that invariant silently.
+        return None
+    return numerator / denominator
+
+
 def measure_arm(
     base_url: str,
     model: str,
-    prompt: str,
+    prompts: Sequence[str],
     max_tokens: int,
     runs: int,
     api_key: Optional[str],
@@ -426,35 +533,66 @@ def measure_arm(
     warmup: int = 0,
     temperature: float = DEFAULT_TEMPERATURE,
 ) -> ArmResult:
-    """Measures one arm: ``warmup`` passes executed and discarded FIRST
-    (each one a full request/response, so a server that fails during
-    warmup raises exactly as it would for a measured pass -- see module
-    docstring's --warmup discussion), then ``runs`` measured passes.
+    """Measures one arm over ``prompts`` (the arm's whole prompt SET, in
+    order): ``warmup`` PASSES executed and discarded FIRST -- one request
+    PER PROMPT per pass (each request a full request/response, so a server
+    that fails during warmup raises exactly as it would for a measured
+    pass -- see module docstring's --warmup discussion) -- then ``runs``
+    measured passes, each likewise one request per prompt.
 
-    Warmup readings never enter ``readings`` or the median: a discarded
-    pass is not a Reading this module keeps at all, only a count.
+    A "pass" is the unit the published quality cards' method counts: one
+    request per prompt in the set, pooled to a single rate via
+    ``_pool_pass`` (see its docstring). The arm's ``readings`` still
+    retains EVERY per-request ``Reading`` from every measured pass, in
+    request order -- nothing is discarded or summarised away, so a reader
+    can see per-prompt variation directly; only the MEDIAN is computed over
+    pooled per-pass rates rather than per-reading ones.
 
-    ``temperature`` is passed identically to BOTH the warmup and the
-    measured passes: they must be the IDENTICAL workload, or a warmup at a
+    Warmup readings never enter ``readings`` or the median at all: a
+    discarded pass is not kept by this module, only counted.
+
+    ``temperature`` is passed identically to every request, warmup and
+    measured alike: they must be the IDENTICAL workload, or a warmup at a
     different temperature would warm the wrong thing (see
     DEFAULT_TEMPERATURE's comment on why sampling makes each pass a
     different-length completion).
     """
+    # ``prompts`` is a SET, and a bare ``str`` is itself a valid Sequence
+    # of single characters -- passing one would silently measure len(s)
+    # one-character prompts and return a plausible-looking rate for a
+    # workload nobody asked for. A measurement instrument must not have a
+    # silently-wrong input shape, so refuse it.
+    if isinstance(prompts, str):
+        raise TypeError(
+            "measure_arm takes a sequence of prompts, not a single string; "
+            "pass [prompt] rather than prompt"
+        )
     for _ in range(warmup):
-        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
-    readings = [
-        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
-        for _ in range(runs)
-    ]
-    # The median is over MEASURABLE readings only -- an unmeasurable
-    # reading's decode_tok_s is None and must never enter a median (it is
-    # not a 0.0 to average in, nor comparable to the measured values at
-    # all). Zero measurable readings means the arm's median is itself
-    # unmeasurable (None), not 0.0.
-    measurable_rates = [reading.decode_tok_s for reading in readings if reading.measurable]
-    median = statistics.median(measurable_rates) if measurable_rates else None
+        for prompt in prompts:
+            stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
+    readings: List[Reading] = []
+    pass_rates: List[Optional[float]] = []
+    for _ in range(runs):
+        pass_readings = [
+            stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
+            for prompt in prompts
+        ]
+        readings.extend(pass_readings)
+        pass_rates.append(_pool_pass(pass_readings))
+    # The median is over MEASURABLE PASSES only -- an unmeasurable pass's
+    # pooled rate is None and must never enter a median (not a 0.0 to
+    # average in, nor comparable to the measured values at all). Zero
+    # measurable passes means the arm's median is itself unmeasurable
+    # (None), not 0.0 -- same "unreachable is not zero" rule as a single
+    # reading's own decode_tok_s.
+    measurable_pass_rates = [rate for rate in pass_rates if rate is not None]
+    median = statistics.median(measurable_pass_rates) if measurable_pass_rates else None
     return ArmResult(
-        model=model, readings=readings, median_decode_tok_s=median, warmup_discarded=warmup
+        model=model,
+        readings=readings,
+        median_decode_tok_s=median,
+        warmup_discarded=warmup,
+        pass_rates=pass_rates,
     )
 
 
@@ -723,6 +861,160 @@ def flags_control(expect_pid: Optional[int]) -> dict:
 
 
 # ---------------------------------------------------------------------
+# Publishability verdict: a whole-row, fail-closed sweep for markers that
+# make a row internal-only. See module docstring for the design summary,
+# and docs/task-inbox/2026-09-20-DECISION-bench-row-publishability-verdict.md
+# for the decision this implements.
+#
+# Every marker below is built by CONCATENATION, never as a single literal:
+# this module is itself part of the public projection, so a literal
+# occurrence here would match the very scan it exists to drive (the same
+# convention as ``scripts/validate_public_repository.py``, which this
+# module's marker source is loaded from at call time -- see
+# ``_load_private_markers``).
+# ---------------------------------------------------------------------
+_MARKER_CLASS_LABELS: dict = {
+    marker.lower(): label
+    for marker, label in (
+        (("/" + "Users/"), "absolute-user-path"),
+        (("/" + "private/"), "absolute-user-path"),
+        (("192" + ".168."), "private-network-address"),
+        (("llm" + "bench"), "internal-host-account"),
+        (("passwordless" + " sudo"), "privilege-escalation-note"),
+        (("docs/" + "superpowers" + "/"), "internal-repository-path"),
+        (("spike/" + "scripts" + "/"), "internal-repository-path"),
+        (("BEGIN OPENSSH" + " PRIVATE KEY"), "private-key-material"),
+        (("BEGIN RSA" + " PRIVATE KEY"), "private-key-material"),
+    )
+}
+
+# The third-party engine name is its own marker class, not part of the
+# imported PRIVATE_MARKERS set -- it has a documented exception (the
+# own-binary substring trap below) that no other marker class needs, so it
+# is scanned separately rather than folded into the drift-guarded map.
+_THIRD_PARTY_ENGINE_MARKER = "mlx" + "-serve"
+_THIRD_PARTY_ENGINE_CLASS_LABEL = "third-party-engine-name"
+
+# This project's OWN binary name CONTAINS the third-party engine marker
+# above as a proper substring -- prefixing it is all it takes. Occurrences
+# of our own name are stripped from the scanned text before the
+# third-party scan runs -- see publishability_control's own-binary
+# exception.
+#
+# Note both operands below are built by CONCATENATION, and the comment
+# above deliberately does NOT spell either name out. An earlier draft of
+# this very comment illustrated the trap by quoting both names literally,
+# which put the bare third-party name into a publicly projected file --
+# the exact violation a previous cycle spent an increment scrubbing from
+# this file's docstring. The repository gitleaks run and the public
+# validator BOTH passed while it was present, because that name is not in
+# PRIVATE_MARKERS; only the publication sweep caught it. A comment
+# explaining a marker guard is still scanned text.
+_OWN_BINARY_MARKER = "fastmlx" + "-serve"
+
+
+def _load_private_markers() -> "Optional[tuple]":
+    """Loads ``PRIVATE_MARKERS`` from the sibling
+    ``scripts/validate_public_repository.py`` by file path, at CALL time --
+    never at this module's own import time, so ``fastmlx bench`` stays
+    runnable when that sibling script is missing or broken. ANY failure
+    (missing file, import error, a module with no ``PRIVATE_MARKERS``
+    attribute, an OSError reading the file) returns ``None`` rather than
+    raising -- ``publishability_control`` turns that into the fail-closed
+    ``refused_sweep_unavailable`` status, never a crash and never a silent
+    clean sweep.
+    """
+    try:
+        path = Path(__file__).resolve().parent / "validate_public_repository.py"
+        spec = importlib.util.spec_from_file_location(
+            "fastmlx_bench_private_markers_source", path
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        markers = getattr(module, "PRIVATE_MARKERS", None)
+        if not markers:
+            return None
+        return tuple(markers)
+    except Exception:
+        return None
+
+
+def _classify_markers(markers: "Sequence[str]") -> "tuple[dict, int]":
+    """Splits ``markers`` (case-insensitively) into a ``{marker_lower:
+    label}`` map of every marker this module CAN classify, plus a count of
+    markers it cannot -- the drift guard's own input (see
+    ``publishability_control``).
+    """
+    labeled: dict = {}
+    unlabeled_count = 0
+    for marker in markers:
+        label = _MARKER_CLASS_LABELS.get(marker.lower())
+        if label is None:
+            unlabeled_count += 1
+            continue
+        labeled[marker.lower()] = label
+    return labeled, unlabeled_count
+
+
+def publishability_control(row: dict) -> dict:
+    """A whole-row, fail-closed publishability verdict over ``row``,
+    scanned as ``json.dumps(row, sort_keys=True, default=str)`` -- ``row``
+    must NOT yet carry its own ``publishable`` key when this is called (see
+    ``run_bench``, which computes this LAST and attaches it after).
+
+    Returns ``{"status": ..., "markerClasses": [...], "reason": ... or
+    None}``. ``markerClasses`` is always sorted and de-duplicated, and
+    names stable publishable LABELS only -- never matched text, and never a
+    marker literal -- so neither this dict nor its JSON serialization ever
+    republishes the thing it is withholding the row for.
+    """
+    markers = _load_private_markers()
+    if markers is None:
+        return {
+            "status": "refused_sweep_unavailable",
+            "markerClasses": [],
+            "reason": (
+                "the private-marker source module could not be loaded; "
+                "refusing rather than reporting an unswept row as clean"
+            ),
+        }
+    labeled_markers, unlabeled_count = _classify_markers(markers)
+    if unlabeled_count:
+        return {
+            "status": "refused_unclassified_marker",
+            "markerClasses": [],
+            "reason": (
+                f"{unlabeled_count} marker(s) from the private-marker source "
+                "have no class label in this module; refusing rather than "
+                "reporting a clean sweep the label map cannot actually vouch for"
+            ),
+        }
+    text = json.dumps(row, sort_keys=True, default=str).lower()
+    hit_classes = set()
+    for marker_lower, label in labeled_markers.items():
+        if marker_lower in text:
+            hit_classes.add(label)
+    # Own-binary exception: strip this project's own binary name BEFORE
+    # scanning for the third-party engine name it happens to contain as a
+    # substring (order matters -- see module docstring).
+    swept_text = text.replace(_OWN_BINARY_MARKER.lower(), "")
+    if _THIRD_PARTY_ENGINE_MARKER.lower() in swept_text:
+        hit_classes.add(_THIRD_PARTY_ENGINE_CLASS_LABEL)
+    if hit_classes:
+        classes = sorted(hit_classes)
+        return {
+            "status": "withheld_marker_present",
+            "markerClasses": classes,
+            "reason": (
+                f"{len(classes)} marker class(es) present: " + ", ".join(classes)
+            ),
+        }
+    return {"status": "publishable", "markerClasses": [], "reason": None}
+
+
+# ---------------------------------------------------------------------
 # Row assembly.
 # ---------------------------------------------------------------------
 def _utc_now_iso() -> str:
@@ -756,11 +1048,20 @@ def _chip_identity() -> str:
     return brand or "unknown"
 
 
-def _boundary(args: argparse.Namespace, prompt: str, prompt_is_default: bool) -> str:
+def _boundary(args: argparse.Namespace, prompts: Sequence[str], prompt_is_default: bool) -> str:
+    # States the prompt COUNT and each prompt's own length (never the
+    # prompt text itself -- a boundary is a compact fingerprint of the
+    # workload, not the workload) so a row is readable as stating exactly
+    # which workload was measured, for either the default 3-prompt set or
+    # an operator-supplied one of any size (a single `--prompt` included).
+    prompt_set_label = (
+        f"default-{len(prompts)}-prompt-set" if prompt_is_default else "custom-prompt-set"
+    )
+    chars_desc = "/".join(str(len(prompt)) for prompt in prompts)
     boundary = (
         f"chip={_chip_identity()} ({platform.machine()}); "
-        f"promptSet={'default-fixed-prompt' if prompt_is_default else 'custom-prompt'} "
-        f"(chars={len(prompt)}); maxTokens={args.max_tokens}; runs={args.runs}; "
+        f"promptSet={prompt_set_label} (prompts={len(prompts)}; chars={chars_desc}); "
+        f"maxTokens={args.max_tokens}; runs={args.runs}; "
         f"warmup={args.warmup}; temperature={args.temperature}"
     )
     if args.host_label:
@@ -780,8 +1081,12 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     measured facts are never thrown away, only its ratio (or, for C-owner,
     the whole run).
     """
+    # ``--prompt`` is repeatable (``action="append"``): supplying it one or
+    # more times REPLACES the default 3-prompt set entirely with exactly
+    # the prompts given, in the order given -- a single `--prompt` yields a
+    # one-prompt set, same as before this module supported repeating it.
     prompt_is_default = args.prompt is None
-    prompt = args.prompt if args.prompt is not None else DEFAULT_PROMPT
+    prompts = list(args.prompt) if args.prompt is not None else list(DEFAULT_PROMPTS)
     port = urllib.parse.urlsplit(args.base_url).port
 
     first_reference: Optional[ArmResult] = None
@@ -794,24 +1099,25 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             # candidate so C-drift can tell a genuinely drifting server from
             # a stable one (see module docstring).
             first_reference = measure_arm(
-                args.base_url, args.reference_model, prompt, args.max_tokens,
+                args.base_url, args.reference_model, prompts, args.max_tokens,
                 args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             candidate = measure_arm(
-                args.base_url, args.model, prompt, args.max_tokens,
+                args.base_url, args.model, prompts, args.max_tokens,
                 args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             last_reference = measure_arm(
-                args.base_url, args.reference_model, prompt, args.max_tokens,
+                args.base_url, args.reference_model, prompts, args.max_tokens,
                 args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             combined_readings = first_reference.readings + last_reference.readings
-            # Same measurable-only filtering as measure_arm (see its
-            # comment): an unmeasurable reading's decode_tok_s is None and
-            # must never enter this median.
-            combined_measurable_rates = [
-                reading.decode_tok_s for reading in combined_readings if reading.measurable
-            ]
+            # Combined over the two bookends' own PASS rates (each already
+            # pooled per pass by measure_arm/_pool_pass), never recomputed
+            # from raw per-reading rates -- with a multi-prompt set, a
+            # per-reading median would mix different prompts' individual
+            # rates into one number instead of each pass's own pooled one.
+            combined_pass_rates = first_reference.pass_rates + last_reference.pass_rates
+            combined_measurable_rates = [rate for rate in combined_pass_rates if rate is not None]
             reference_median = (
                 statistics.median(combined_measurable_rates) if combined_measurable_rates else None
             )
@@ -824,11 +1130,12 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
                 # invocation warms up independently) -- the combined arm's
                 # count is their sum, not either one alone.
                 warmup_discarded=first_reference.warmup_discarded + last_reference.warmup_discarded,
+                pass_rates=combined_pass_rates,
             )
             arms = [candidate, reference_arm]
         else:
             candidate = measure_arm(
-                args.base_url, args.model, prompt, args.max_tokens,
+                args.base_url, args.model, prompts, args.max_tokens,
                 args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             arms = [candidate]
@@ -871,7 +1178,7 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
         "schema": SCHEMA,
         "generatedAt": _utc_now_iso(),
         "baseUrl": args.base_url,
-        "boundary": _boundary(args, prompt, prompt_is_default),
+        "boundary": _boundary(args, prompts, prompt_is_default),
         "arms": [arm.to_json() for arm in arms],
         "ratio": ratio,
         "controls": {
@@ -882,6 +1189,15 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             "flags": flags,
         },
     }
+    # Computed LAST, over the row as otherwise complete, and attached only
+    # after -- this ordering is the ONLY thing keeping the verdict out of
+    # its own scanned text; it is a calling convention, not a guard the
+    # function enforces (see its own docstring). This
+    # verdict is metadata: it is deliberately never added to
+    # refusal_reasons, so it never changes the exit code (see module
+    # docstring's own-exit-code paragraph and the decision doc this
+    # implements).
+    row["publishable"] = publishability_control(row)
 
     if refusal_reasons:
         for reason in refusal_reasons:
@@ -913,6 +1229,16 @@ def format_text(row: dict) -> str:
         reason = control.get("reason")
         suffix = f" ({reason})" if reason else ""
         lines.append(f"  {name}: {status}{suffix}")
+    publishable = row.get("publishable")
+    if publishable is not None:
+        parts = []
+        if publishable.get("reason"):
+            parts.append(f"({publishable['reason']})")
+        classes = publishable.get("markerClasses") or []
+        if classes:
+            parts.append("[" + ", ".join(classes) + "]")
+        pub_suffix = (" " + " ".join(parts)) if parts else ""
+        lines.append(f"  publishable: {publishable['status']}{pub_suffix}")
     lines.append(f"  boundary: {row['boundary']}")
     return "\n".join(lines)
 
@@ -951,8 +1277,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Model name requested for the measured (candidate) arm.",
     )
     parser.add_argument(
-        "--prompt", default=None,
-        help="Custom prompt to send instead of this module's fixed default prompt.",
+        "--prompt", action="append", default=None,
+        help=(
+            "Custom prompt to send instead of this module's fixed default "
+            "3-prompt set; repeatable -- each occurrence adds one prompt, "
+            "and ANY occurrence REPLACES the default set entirely with "
+            "exactly the prompt(s) given, in the order given (a single "
+            "--prompt yields a one-prompt set)."
+        ),
     )
     parser.add_argument(
         "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
