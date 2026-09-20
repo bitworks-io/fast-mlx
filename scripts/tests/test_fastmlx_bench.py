@@ -31,6 +31,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 
 BENCH_PATH = Path(__file__).resolve().parents[1] / "fastmlx_bench.py"
@@ -203,6 +204,32 @@ def make_call_indexed_stream(
         _write_done(handler)
 
     return fn, state
+
+
+def make_body_capturing_stream(
+    content_chunks: int,
+    completion_tokens=None,
+    captured_bodies: list = None,
+):
+    """A responder: same streamed shape as ``make_simple_stream`` (no inter-
+    chunk sleeps -- these tests care about the SENT request body, not
+    timing), but first appends the request's own decoded JSON body to
+    ``captured_bodies`` -- lets a test assert on exactly what
+    ``stream_chat_completion``/``measure_arm`` SENT (e.g. ``temperature``),
+    not just on what it returned.
+    """
+
+    def fn(handler):
+        if captured_bodies is not None:
+            captured_bodies.append(_read_request_body(handler))
+        _send_stream_headers(handler)
+        for i in range(content_chunks):
+            _write_sse(handler, _content_event(f"tok{i}"))
+        if completion_tokens is not None:
+            _write_sse(handler, _usage_event(completion_tokens))
+        _write_done(handler)
+
+    return fn
 
 
 class FastmlxBenchTestCase(unittest.TestCase):
@@ -719,6 +746,179 @@ class FastmlxBenchTestCase(unittest.TestCase):
         # bookend) -- design decision 1: EACH one performs its own warmup,
         # so the reference gets 2 * (warmup + runs), not 1 * it.
         self.assertEqual(reference_state["count"], 2 * (warmup + runs))
+
+    # ------------------------------------------------------------------
+    # --temperature: a timing instrument must hold its workload fixed (see
+    # module docstring) -- default is 0.0, an explicit value is honored,
+    # warmup and measured passes share exactly one temperature, and the row
+    # states it so a reading is self-describing.
+    # ------------------------------------------------------------------
+    def test_default_temperature_is_zero_and_present_in_request_body(self):
+        self.assertEqual(FASTMLX_BENCH.DEFAULT_TEMPERATURE, 0.0)
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=32, timeout=10
+        )
+        self.assertEqual(len(captured_bodies), 1)
+        self.assertIn("temperature", captured_bodies[0])
+        self.assertEqual(captured_bodies[0]["temperature"], 0.0)
+
+    def test_explicit_temperature_is_honored_in_request_body(self):
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=32, timeout=10, temperature=0.7,
+        )
+        self.assertEqual(captured_bodies[0]["temperature"], 0.7)
+
+    def test_warmup_and_measured_passes_share_the_same_temperature(self):
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        FASTMLX_BENCH.measure_arm(
+            base_url, "candidate", "hi", 32, 2, None, 10.0, warmup=1, temperature=0.55,
+        )
+        # warmup(1) + runs(2) = 3 requests total, every one at the SAME
+        # temperature -- a warmup pass at a different temperature would warm
+        # the wrong workload (it must be the identical workload as the
+        # measured passes, see design decision 2).
+        self.assertEqual(len(captured_bodies), 3)
+        self.assertTrue(all(body["temperature"] == 0.55 for body in captured_bodies))
+
+    def test_boundary_states_the_temperature(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=13, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--temperature", "0.3", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        self.assertIn("temperature=0.3", doc["boundary"])
+
+    def test_negative_temperature_exits_64(self):
+        base_url = self.start(make_simple_stream(2, completion_tokens=2))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--temperature", "-0.1", "--json",
+        ]
+        code, stdout, stderr = self._run_main(argv)
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        # Assert the REFUSAL REASON, not merely the flag name: argparse
+        # exits 64 for an UNRECOGNIZED flag too, so `assertIn("--temperature")`
+        # alone passes identically whether the validation exists or the flag
+        # was never added. Pinning the range message is what makes this test
+        # discriminate between those two outcomes.
+        self.assertIn("--temperature must be >= 0", stderr)
+        self.assertIn("-0.1", stderr)
+        self.assertNotIn("unrecognized", stderr)
+
+    def test_request_body_still_pins_stream_options_and_max_tokens(self):
+        # Existing-behaviour pin: adding --temperature must not disturb the
+        # other body fields C-tokens and the caller's own --max-tokens
+        # depend on.
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=17, timeout=10, temperature=0.7,
+        )
+        body = captured_bodies[0]
+        self.assertEqual(body["max_tokens"], 17)
+        self.assertTrue(body["stream_options"]["include_usage"])
+
+    # ------------------------------------------------------------------
+    # ``boundary`` records the CHIP, never the HOSTNAME -- see the module
+    # docstring's rationale. ``platform.node()`` returns a hostname, which
+    # must never leak into a row, publishable-by-construction or not;
+    # ``--host-label`` is the only opt-in way an operator can put
+    # box-identifying text into a row at all.
+    # ------------------------------------------------------------------
+    def test_boundary_records_chip_not_hostname(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = ["--base-url", base_url, "--model", "candidate", "--runs", "1", "--timeout", "10", "--json"]
+        # A sentinel that looks nothing like a chip brand string and
+        # everything like a real hostname -- patched onto the SHARED
+        # ``platform`` module (both this test file and the module under
+        # test resolve the same ``sys.modules["platform"]``), so if
+        # anything anywhere in the row's construction still called
+        # ``platform.node()``, this sentinel would surface in the output.
+        with mock.patch("platform.node", return_value="sentinel-node-value-must-not-appear"):
+            code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        # Checked against the WHOLE emitted row, not just the boundary
+        # field -- a defect that leaked the hostname into some other field
+        # (or kept a second, unremoved call site) would still be caught.
+        self.assertNotIn("sentinel-node-value-must-not-appear", stdout)
+        doc = json.loads(stdout)
+        self.assertIn("chip=", doc["boundary"])
+        self.assertIn(f"({FASTMLX_BENCH.platform.machine()})", doc["boundary"])
+
+    def test_host_label_flag_appends_to_boundary(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--host-label", "lab-a", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        self.assertIn("hostLabel=lab-a", doc["boundary"])
+
+    def test_no_host_label_omits_the_field_entirely(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
+        argv = ["--base-url", base_url, "--model", "candidate", "--runs", "1", "--timeout", "10", "--json"]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        # Absence must be the DEFAULT -- not merely an empty value, the
+        # field itself must not appear when the flag was never given.
+        self.assertNotIn("hostLabel", doc["boundary"])
+
+    def test_chip_identity_returns_unknown_when_sysctl_raises(self):
+        with mock.patch.object(FASTMLX_BENCH.subprocess, "run", side_effect=OSError("no sysctl")):
+            self.assertEqual(FASTMLX_BENCH._chip_identity(), "unknown")
+
+    def test_chip_identity_returns_unknown_on_nonzero_return_code(self):
+        fake_result = mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(FASTMLX_BENCH.subprocess, "run", return_value=fake_result):
+            self.assertEqual(FASTMLX_BENCH._chip_identity(), "unknown")
+
+    def test_chip_identity_returns_unknown_on_empty_stdout(self):
+        fake_result = mock.Mock(returncode=0, stdout="   \n")
+        with mock.patch.object(FASTMLX_BENCH.subprocess, "run", return_value=fake_result):
+            self.assertEqual(FASTMLX_BENCH._chip_identity(), "unknown")
+
+    def test_chip_identity_returns_unknown_on_timeout(self):
+        timeout_error = FASTMLX_BENCH.subprocess.TimeoutExpired(cmd=["sysctl"], timeout=5)
+        with mock.patch.object(FASTMLX_BENCH.subprocess, "run", side_effect=timeout_error):
+            self.assertEqual(FASTMLX_BENCH._chip_identity(), "unknown")
+
+    def test_boundary_still_states_max_tokens_runs_warmup_and_temperature(self):
+        # Existing-behaviour pin: swapping host= for chip= must not disturb
+        # any of the OTHER boundary fields other tests and operators
+        # depend on.
+        base_url = self.start(make_simple_stream(3, completion_tokens=13, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--timeout", "10", "--warmup", "2", "--temperature", "0.3", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        boundary = doc["boundary"]
+        self.assertIn("maxTokens", boundary)
+        self.assertIn("runs", boundary)
+        self.assertIn("warmup=2", boundary)
+        self.assertIn("temperature=0.3", boundary)
 
     # ------------------------------------------------------------------
     def _run_main(self, argv: list):

@@ -69,6 +69,40 @@ instrument report a measurement it did not honestly obtain. Every row's
 distinguishable from one taken without; rows published before this flag
 existed were effectively warmup=0.
 
+--temperature pins the sampling temperature sent with EVERY pass, warmup
+and measured alike, and defaults to 0.0. A timing instrument must hold its
+workload fixed; with sampling on, the server's own default is whatever it
+is, and completion length varies pass to pass -- measured against a real
+OpenAI-compatible endpoint, four IDENTICAL requests at the server's own
+default returned completion_tokens = 128, 78, 116, 128, and the same four
+requests at temperature 0 returned 124, 124, 124, 124. That matters because
+decodeTokS divides by an inter-token interval count that scales with
+completion length, so a SHORT completion reads SLOWER (fixed early-token
+overhead amortizes over fewer intervals) -- across a real cycle's readings,
+Pearson(completionTokens, decodeTokS) measured +0.825 and +0.603 within two
+separate arms. An unpinned temperature therefore makes the run-to-run
+spread measure sampling variance as much as server speed. Every row's
+``boundary`` records ``temperature=N`` for the same reason it records
+``warmup=N``: a row that does not state its sampling temperature is not
+self-describing. Rows published before this flag existed did not pin
+temperature at all and so carry sampling-driven spread that this flag did
+not yet exist to remove.
+
+Every row's ``boundary`` also records ``chip=<brand> (<arch>)`` -- e.g.
+``chip=Apple M3 Ultra (arm64)`` -- read via ``sysctl -n
+machdep.cpu.brand_string``, and NEVER a hostname. The standard library's
+``node()`` hostname lookup (formerly used here, via the ``platform``
+module) returns the machine's own HOSTNAME, which is internal
+infrastructure naming that makes a row unpublishable on its own, and is
+not even the fact a benchmark row needs -- the published quality cards
+describe their hardware by CHIP ("measured on Apple M3 Ultra"), never by
+machine name. ``--host-label TEXT`` is the
+deliberate, OPT-IN escape hatch for when an operator still needs to tell
+two boxes apart in an INTERNAL-only row: when given, it appends
+``hostLabel=<text>`` to the boundary. Its absence is the default -- a row
+is publishable by construction unless an operator explicitly forfeits that
+by passing ``--host-label``.
+
 Five controls, each an independently-failable field (never a boolean the
 command can pass for free):
 
@@ -134,6 +168,18 @@ DEFAULT_DRIFT_TOLERANCE = 0.05
 # of 3 passes" -- this default is what makes the command's own default
 # reproduce that method without requiring the caller to pass --warmup.
 DEFAULT_WARMUP = 1
+# A timing instrument must hold its workload fixed. With sampling on (a
+# nonzero temperature), every completion can be a different length --
+# measured on the fleet, four IDENTICAL requests against a real endpoint
+# returned completion_tokens = 128, 78, 116, 128 at the server's own
+# default, and 124, 124, 124, 124 with temperature pinned to 0. Since
+# decode_tok_s divides by (t_last_chunk - t_first_chunk), a SHORT
+# completion reads SLOWER (early-token overhead amortizes over fewer
+# inter-token intervals) -- so an unpinned temperature makes the median
+# measure sampling variance as much as server speed. 0.0 is the default
+# precisely because it is the only value that reproduces the SAME
+# completion length every pass.
+DEFAULT_TEMPERATURE = 0.0
 
 # sysexits.h EX_USAGE -- see _UsageErrorArgumentParser and the module
 # docstring for why this must never collide with argparse's own default.
@@ -324,6 +370,7 @@ def stream_chat_completion(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     api_key: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> Reading:
     """One streamed ``/v1/chat/completions`` request/response, resolved to
     exactly one ``Reading``. Raises ``BenchError`` (never crashes) on an
@@ -339,6 +386,11 @@ def stream_chat_completion(
         # Requested unconditionally: C-tokens depends on the server's own
         # accounting being available to ask for at all.
         "stream_options": {"include_usage": True},
+        # Always included, never conditional on a non-default value: a
+        # server sampling with its OWN default when this field is absent is
+        # exactly the length-varying-workload defect this flag exists to
+        # close (see DEFAULT_TEMPERATURE's comment).
+        "temperature": temperature,
     }
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if api_key:
@@ -372,6 +424,7 @@ def measure_arm(
     api_key: Optional[str],
     timeout: float,
     warmup: int = 0,
+    temperature: float = DEFAULT_TEMPERATURE,
 ) -> ArmResult:
     """Measures one arm: ``warmup`` passes executed and discarded FIRST
     (each one a full request/response, so a server that fails during
@@ -380,11 +433,17 @@ def measure_arm(
 
     Warmup readings never enter ``readings`` or the median: a discarded
     pass is not a Reading this module keeps at all, only a count.
+
+    ``temperature`` is passed identically to BOTH the warmup and the
+    measured passes: they must be the IDENTICAL workload, or a warmup at a
+    different temperature would warm the wrong thing (see
+    DEFAULT_TEMPERATURE's comment on why sampling makes each pass a
+    different-length completion).
     """
     for _ in range(warmup):
-        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout)
+        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
     readings = [
-        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout)
+        stream_chat_completion(base_url, model, prompt, max_tokens, api_key, timeout, temperature)
         for _ in range(runs)
     ]
     # The median is over MEASURABLE readings only -- an unmeasurable
@@ -670,13 +729,47 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _chip_identity() -> str:
+    """The CPU chip's own brand string (e.g. ``Apple M3 Ultra``), via
+    ``sysctl -n machdep.cpu.brand_string`` -- macOS-only, but this MUST
+    NEVER crash and MUST NEVER fall back to anything hostname-derived: the
+    defect this closes is exactly a hostname (the ``platform`` module's
+    ``node()`` lookup) leaking into a published row, so silently
+    reinstating a hostname as a fallback here would just reopen the same
+    defect one layer down. Any failure -- no ``sysctl`` on PATH (non-macOS), a
+    nonzero return code, a timeout, or empty stdout -- returns the literal
+    string ``"unknown"`` instead, the same fail-closed shape as
+    ``_listening_pid``/``_cmdline_for_pid`` above.
+    """
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    brand = result.stdout.strip()
+    return brand or "unknown"
+
+
 def _boundary(args: argparse.Namespace, prompt: str, prompt_is_default: bool) -> str:
-    return (
-        f"host={platform.node() or 'unknown'} ({platform.machine()}); "
+    boundary = (
+        f"chip={_chip_identity()} ({platform.machine()}); "
         f"promptSet={'default-fixed-prompt' if prompt_is_default else 'custom-prompt'} "
         f"(chars={len(prompt)}); maxTokens={args.max_tokens}; runs={args.runs}; "
-        f"warmup={args.warmup}"
+        f"warmup={args.warmup}; temperature={args.temperature}"
     )
+    if args.host_label:
+        # OPT-IN only -- see module docstring and --host-label's own help
+        # text: absence must be the default, and this must never default
+        # to anything machine-derived itself (that would just reintroduce
+        # the hostname defect through a second door).
+        boundary += f"; hostLabel={args.host_label}"
+    return boundary
 
 
 def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
@@ -702,15 +795,15 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             # a stable one (see module docstring).
             first_reference = measure_arm(
                 args.base_url, args.reference_model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout, args.warmup,
+                args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             candidate = measure_arm(
                 args.base_url, args.model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout, args.warmup,
+                args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             last_reference = measure_arm(
                 args.base_url, args.reference_model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout, args.warmup,
+                args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             combined_readings = first_reference.readings + last_reference.readings
             # Same measurable-only filtering as measure_arm (see its
@@ -736,7 +829,7 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
         else:
             candidate = measure_arm(
                 args.base_url, args.model, prompt, args.max_tokens,
-                args.runs, args.api_key, args.timeout, args.warmup,
+                args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
             arms = [candidate]
     except BenchError as error:
@@ -917,6 +1010,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"measured passes begin; 0 opts out (default: {DEFAULT_WARMUP})."
         ),
     )
+    parser.add_argument(
+        "--temperature", type=float, default=DEFAULT_TEMPERATURE,
+        help=(
+            "Sampling temperature sent with every pass, warmup and measured "
+            "alike; a timing instrument must hold its workload fixed, and "
+            "with sampling on, decodeTokS's length-sensitivity turns every "
+            f"reading into a different workload (default: {DEFAULT_TEMPERATURE})."
+        ),
+    )
+    parser.add_argument(
+        "--host-label", default=None,
+        help=(
+            "Opt-in free-text label identifying this box, appended to the "
+            "row's boundary as hostLabel=<text>; supplying this makes the "
+            "row INTERNAL-ONLY (default: not set, so the boundary records "
+            "only the chip, never a hostname)."
+        ),
+    )
     return parser
 
 
@@ -929,6 +1040,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         # must route through parser.error()'s exit-64 path (see
         # _UsageErrorArgumentParser), never a bare ValueError or exit 1.
         parser.error(f"--warmup must be >= 0 (got {args.warmup})")
+    if args.temperature < 0:
+        # Same shape as --warmup's check above: a negative sampling
+        # temperature is nonsensical, so it is a usage error, not a
+        # measurement outcome -- exit 64 via parser.error(), never a bare
+        # ValueError or exit 1.
+        parser.error(f"--temperature must be >= 0 (got {args.temperature})")
     code, row = run_bench(args)
     if row is not None:
         if args.json:

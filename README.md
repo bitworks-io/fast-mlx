@@ -409,10 +409,29 @@ is never folded into the decode rate. A completion of fewer than two tokens has 
 at all, so it is reported as unmeasurable with a reason rather than as `0.0`.
 
 By default one pass per arm is run and discarded before the measured passes begin (`--warmup 1`,
-`--runs 3`), which is the method the published quality cards state. A server's first pass after a
-cold start can read well below its steady rate, so discarding it is what makes a default run
-comparable to a card. `--warmup 0` opts out, and every row's `boundary` string records the warmup
-count it was taken with, so a row is self-describing.
+`--runs 3`), and every pass is sent an explicit `--temperature 0`. A timing instrument has to hold
+its workload fixed: with sampling left to the server's own default, four identical requests to one
+endpoint returned completion lengths of 128, 78, 116 and 128 tokens, and the same four at
+temperature 0 returned 124 every time. That matters because the rate divides by an inter-token
+interval count, so a shorter completion reads slower and the run-to-run spread ends up measuring
+sampling as much as serving. Pinning both knobs is what makes an arm's readings agree: on one
+measured endpoint the three readings moved from a 5.7% spread to 0.1%, while the median itself
+shifted by under half a percent. Warmup and a pinned temperature buy *reproducibility*, not a
+better headline number.
+
+`--warmup 0` opts out, and every row's `boundary` records the warmup count, the temperature, the
+token limit and the run count it was taken with, so a row is self-describing. Rows produced before
+these defaults existed did not pin either knob.
+
+These are part — not all — of the method the published quality cards state. The cards are measured
+at temperature 0 with one warmup pass discarded and a median of 3, which this command's defaults now
+reproduce; they also use **3 prompts of 256 tokens**, where this command measures a single prompt
+and defaults to 128 tokens. Use `--prompt` and `--max-tokens` deliberately when you intend to
+compare a row against a card, and read a card's own `speedXStatus`, which states its full method.
+
+A row's `boundary` records the chip (for example `chip=Apple M3 Ultra (arm64)`) rather than the
+machine's hostname, so a row is publishable as measured. `--host-label` opts back in to naming a
+specific box, which makes that row internal.
 
 Five controls each carry their own refusal reason: the token source must be the server's `usage`
 and not a chunk count; in ratio mode the reference arm must not have drifted between its two
