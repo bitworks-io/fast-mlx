@@ -286,6 +286,16 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         try await writeRequest(channel, body: requestBody(stream: false))
         let response = try await collectResponse(from: channel)
         await waitUntil { await recorder.evidence.count == 1 }
+        // Each of the three failed snapshots reports through `reportFailure`,
+        // which hands off to an UNAWAITED `Task` (see this test's own
+        // configuration above), so the failure count is not settled by the
+        // time the evidence record lands. Waiting on `evidence.count` alone
+        // therefore raced: on a loaded runner this read 2 of 3 and turned a
+        // real invariant into a flake. Wait on the quantity actually being
+        // asserted -- the same idiom the terminal-persistence test above
+        // uses. This does NOT weaken the assertion: `waitUntil` is bounded
+        // and XCTFails if the third failure never arrives.
+        await waitUntil { await recorder.failures.count == 3 }
 
         XCTAssertEqual(response.head.status, .ok)
         let recorded = await recorder.snapshot()
