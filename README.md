@@ -459,7 +459,8 @@ Behaviour to know:
   `--front-max-concurrent <N>` (`fastmlx serve` refuses at exit 2 for 0, a negative value, or a
   non-numeric one). The real aggregate memory bound is the PRODUCT of the two limits -- 64 x 64 MiB =
   4 GiB with both defaults -- not either alone. Two honest limits remain: a streaming/SSE response
-  holds its slot for the WHOLE generation, so the cap sizes plausible concurrency rather than request
+  holds its slot for the whole generation (bounded only by how long the client keeps draining it --
+  see the response-write bound below), so the cap sizes plausible concurrency rather than request
   rate; and `GET /fastmlx/provenance` cannot be exempted, since the path is not known at accept time,
   so an operator health poll consumes a slot and can be refused under saturation. The refusal itself
   is handled on the proxy's single accept thread and is therefore serialized -- size the ceiling
@@ -469,8 +470,32 @@ Behaviour to know:
   `suppressed_since_last_log`, so the true refusal rate is still recoverable from the log.
 - There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
   not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
-  JSON error that still carries the headers. Reading the CLIENT's own request (line/headers/body) is
-  bounded to 120 s of idle time.
+  JSON error that still carries the headers.
+- Reading the CLIENT's own request (line/headers/body) is bounded by wall clock, not by idle time.
+  A request gets 30 s to begin, and every byte received extends that deadline by `1/1024` s -- so a
+  client transferring at or above 1 KiB/s always stays ahead of it -- under a hard ceiling of 300 s
+  that no amount of data extends past. A client slower than that minimum rate has its connection
+  closed and its concurrency slot reclaimed. An idle timeout alone would not do this: a socket
+  timeout bounds one read, not a request, so a client pacing itself just inside one can hold a slot
+  for as long as it likes. Two consequences worth sizing against: a body near the 64 MiB limit needs
+  roughly 224 KiB/s to finish inside the 300 s ceiling, and a client on a link slower than 1 KiB/s is
+  refused rather than waited for. The deadline covers receiving a request only; the response side
+  has its own, different bound, below.
+- Writing the response back to the client is bounded by CUMULATIVE BLOCKED-WRITE TIME, not by a
+  transfer rate. A generation runs for as long as it runs and is never cut off for being slow; what
+  is bounded is the total wall clock the proxy's own writes spend blocked because the client is not
+  draining them. The budget is 30 s per response
+  (`fastmlx_proxy._CLIENT_RESPONSE_MAX_BLOCKED_SECONDS`); past it the client connection is reset and
+  the slot reclaimed, and the request log carries the reason. A rate floor would be the wrong
+  instrument here: an SSE generation is slow by nature, so a throughput minimum would refuse exactly
+  the clients this proxy exists to serve, whereas a client that is genuinely reading never leaves
+  the proxy's writes blocked at all, because the kernel send buffer absorbs each delta. The honest
+  cost to a legitimate client: once the kernel buffers are full, it must keep draining often enough
+  that no single stall, and no run of stalls within one response, totals 30 s. Without this bound the
+  hold was not merely long but unbounded, and the shape that exploits it is specific -- a client
+  that drains one whole write and then stalls resets the socket backstop every time, whereas a
+  client that dribbles single bytes, or reads nothing at all, is reaped by that backstop in about
+  two minutes.
 - The proxy binds its port before starting the engine. If the port is busy, the engine never starts
   (exit 3). The engine child runs in its own session, so a terminal Ctrl-C reaches it only once, via
   this launcher's own signal forwarding.

@@ -57,14 +57,113 @@ _NON_PRINTABLE_ASCII = re.compile(r"[^\x20-\x7e]")
 _UPSTREAM_CONNECT_TIMEOUT_SECONDS = 10
 _UPSTREAM_READ_CHUNK_BYTES = 65536
 
-# How long the handler waits for the CLIENT to finish sending a request
-# line/headers/body before giving up -- ``BaseHTTPRequestHandler.setup()``
-# applies its ``timeout`` class attribute straight to the request socket
-# (see ``ProvenanceProxyHandler.timeout`` below). This bounds only the
-# client-facing socket, never the upstream read (see
-# ``upstream_read_timeout`` on ``ProvenanceProxyServer``, which stays
-# unbounded by default for exactly the opposite reason).
+# ``BaseHTTPRequestHandler.setup()`` applies this straight to the request
+# socket (``self.connection.settimeout(self.timeout)``, see
+# ``ProvenanceProxyHandler.timeout`` below) the instant the socket is set
+# up. On its own this is NOT a bound on the whole request:
+# ``socket.settimeout`` bounds one blocking call, not a request or a
+# connection -- a client that delivers at least one byte before each
+# per-``recv`` timeout expires makes every ``recv`` succeed, so a bare
+# value here never bounds a client that paces itself just inside it (this
+# was, in fact, exactly this proxy's own defect on this path -- 64 such
+# sockets at a fraction of a byte per second each was a total outage of
+# every concurrency slot, forever). The actual fix is
+# ``_DeadlineBoundRfile`` (see ``ProvenanceProxyHandler.setup()`` and
+# ``_CLIENT_REQUEST_INITIAL_SECONDS`` below), which re-derives a proper
+# wall-clock deadline before every individual read. This constant is kept
+# for two narrower, still-real jobs ``_DeadlineBoundRfile`` does not cover:
+# the brief window between the socket being created and the wrapper being
+# installed, and the backstop timeout restored between reads (see
+# ``_DeadlineBoundRfile._raw_read1``) so that RESPONSE writes -- which the
+# request-receive deadline below must never bound (a streaming SSE
+# response legitimately holds its slot for the whole generation) -- are
+# still not literally unbounded forever.
 _CLIENT_IDLE_TIMEOUT_SECONDS = 120
+
+# ``_DeadlineBoundRfile`` (defined below, installed by
+# ``ProvenanceProxyHandler.setup()``) enforces an absolute, extendable
+# deadline on RECEIVING a request (request line, headers, body) --
+# Apache ``mod_reqtimeout``'s shape, expressed in the same
+# absolute-deadline idiom ``_refuse_over_capacity``'s drain loop already
+# uses below (compute the deadline once, re-derive each timeout from what
+# is left): a client that delivers bytes slower than
+# ``_CLIENT_REQUEST_MIN_BYTES_PER_SECOND`` cannot hold a concurrency slot
+# indefinitely by dribbling, the way a bare ``socket.settimeout`` (see
+# ``_CLIENT_IDLE_TIMEOUT_SECONDS`` above) could and did.
+#
+# Grace period, in seconds, for the FIRST bytes of a request to arrive
+# after the deadline is armed in ``setup()`` -- generous enough that a
+# legitimate client on a slow network is never refused just for being
+# slow to START a request.
+_CLIENT_REQUEST_INITIAL_SECONDS = 30
+
+# Every byte the handler actually reads off the client socket while
+# receiving a request extends the deadline by ``1 / this rate`` seconds --
+# so a client transferring at or above this rate always stays ahead of its
+# own deadline, and a client that dribbles slower than this never does, no
+# matter how it paces itself. 1 KiB/s is far below any legitimate client's
+# real transfer rate (even a slow mobile link clears this easily) and far
+# above what a dribbling attacker can sustain while trying to hold a slot
+# cheaply.
+_CLIENT_REQUEST_MIN_BYTES_PER_SECOND = 1024
+
+# Absolute ceiling, in seconds, past which no amount of received data can
+# extend the deadline further -- without this, a client that never dips
+# below the minimum rate could hold a slot forever just by staying exactly
+# at it. 300s comfortably covers the largest legitimate request body this
+# proxy accepts (``DEFAULT_MAX_REQUEST_BODY_BYTES`` = 64 MiB, which
+# crosses the wire in well under a minute on any real network) with wide
+# margin, while still being a finite bound on the worst case.
+_CLIENT_REQUEST_HARD_DEADLINE_SECONDS = 300
+
+# ``_respond_streamed``/``_respond_buffered`` relay the upstream response
+# body to the client with ``self.wfile.write(chunk); self.wfile.flush()``.
+# The only bound on any ONE of those writes used to be the handler's own
+# socket timeout (``_CLIENT_IDLE_TIMEOUT_SECONDS``) -- and, exactly like
+# ``_CLIENT_IDLE_TIMEOUT_SECONDS``'s documented gap on the REQUEST side
+# above, ``_respond_streamed``'s loop re-arms a FRESH one before every
+# chunk, so the total wall-clock time a client could hold its
+# concurrency slot by reading its response just slowly enough was
+# UNBOUNDED, and at the default concurrency cap that is a total outage
+# exactly like the request-side dribble this file already fixed once.
+#
+# The exploit shape here is NOT the request side's, and the difference
+# was established by measurement, not by symmetry. A client that dribbles
+# a BYTE at a time does NOT hold the slot: ``sendall`` does not re-arm
+# its timeout per internal send, so the CURRENT write never returns and
+# dies on the single backstop. Measured against this file before the fix:
+# a client that never reads at all was released after 123.6s, and one
+# reading 1 byte/second after 124.3s -- both simply the backstop.
+#
+# To actually reset the timer the client must let one whole write
+# COMPLETE -- drain a full ``_UPSTREAM_READ_CHUNK_BYTES`` -- and may then
+# stall again just under the backstop. Measured, that shape held its slot
+# for 400.9s and was still holding when the observation window ended, at
+# a cost to the attacker of about 3.3 KiB/s (the floor is nearer 64 KiB
+# per 120s). THAT is the unbounded case this budget closes.
+#
+# The metric here is deliberately CUMULATIVE BLOCKED-WRITE WALL-CLOCK
+# TIME, never a byte rate (do not copy
+# ``_CLIENT_REQUEST_MIN_BYTES_PER_SECOND``'s shape onto this side, even
+# though it looks like the natural mirror): a legitimate SSE generation
+# is slow by nature (tens of tokens/sec), so a throughput floor would
+# refuse exactly the clients this proxy exists to serve. A legitimate
+# client instead drains promptly -- the kernel send buffer absorbs each
+# delta as it arrives and the proxy's writes never actually block, no
+# matter how long the whole generation runs, because the byte RATE of a
+# slow-but-honest client is a property of the GENERATION, while the
+# blocked-write time is a property of whether the CLIENT is reading at
+# all. Blocked-write time separates a slow-but-honest client from one
+# that has stopped reading; a throughput floor cannot.
+#
+# Cumulative across the WHOLE response (every chunk in
+# ``_respond_streamed``'s loop shares one budget; ``_respond_buffered``'s
+# single write gets the whole budget to itself), re-derived before every
+# individual write the same way ``_DeadlineBoundRfile._raw_read1`` (see
+# above) re-derives its own read deadline -- without that, a single
+# blocked write would sit for the full ``_CLIENT_IDLE_TIMEOUT_SECONDS``
+# backstop before this budget is ever consulted.
+_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS = 30.0
 
 # Any header FROM UPSTREAM whose name starts with this prefix
 # (case-insensitive) is stripped before the proxy's own provenance headers
@@ -143,6 +242,21 @@ _REFUSAL_LOG_MIN_INTERVAL_SECONDS = 1.0
 
 def _sanitize_header_value(value: object) -> str:
     return _NON_PRINTABLE_ASCII.sub("", str(value))
+
+
+def _response_write_budget_exceeded_message() -> str:
+    # A module-level function (not a constant string) so it always reads
+    # the CURRENT value of ``_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS`` --
+    # tests monkeypatch that module attribute directly (see
+    # ``ProxyConcurrencyLimitTests``), and a value baked in at import time
+    # would silently go stale under that patch.
+    return (
+        "client did not drain the response within the "
+        f"{_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS}s cumulative blocked-write "
+        "budget (_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS) -- see that "
+        "constant's own comment for why this is wall-clock blocked time, "
+        "never a byte rate"
+    )
 
 
 def _connection_tokens(header_items) -> set:
@@ -231,6 +345,164 @@ def build_provenance_body(plan: dict) -> dict:
     }
 
 
+class _DeadlineBoundRfile:
+    """Wraps the real ``self.rfile`` (an ``io.BufferedReader`` over the
+    client socket) so every underlying read is bounded by the time
+    REMAINING before an absolute, per-connection deadline -- re-derived
+    fresh before each individual read, exactly the "compute the deadline
+    once, re-derive each timeout from what is left" idiom
+    ``_refuse_over_capacity``'s drain loop uses -- rather than a single
+    ``socket.settimeout`` value set once and reused for however many
+    underlying reads a caller's ``readline``/``read`` call happens to
+    need. That distinction is the entire defect this class exists to fix:
+    a timeout value set once and left in place lets a client that
+    dribbles one byte per underlying ``recv`` make EVERY one of them
+    individually succeed, however many there are and however long that
+    takes in total, because a per-call timeout is not a wall-clock budget
+    for a compound operation that loops internally.
+
+    ``readline``/``read`` are implemented here on top of ``read1`` --
+    deliberately never the base object's own ``readline``/``read``,
+    which would loop internally, out of this class's control, doing
+    however many raw reads a slowly-arriving line or body needs under a
+    single stale timeout value (the same mistake as above, one level
+    down). ``io.BufferedReader.read1(size)`` does AT MOST ONE underlying
+    raw read when its own buffer is empty (or zero, serving
+    already-buffered bytes for free without touching the socket at all)
+    -- which is what lets this class re-derive the timeout before EVERY
+    such underlying read.
+
+    Every byte actually received extends the deadline by
+    ``1 / _CLIENT_REQUEST_MIN_BYTES_PER_SECOND`` seconds, clamped to
+    never exceed an absolute hard ceiling computed once, from this
+    connection's own start (see ``_CLIENT_REQUEST_HARD_DEADLINE_SECONDS``
+    above). Once the deadline has passed, the NEXT read (never a
+    currently-blocked one -- there is none, by construction) raises
+    ``TimeoutError`` -- the same exception
+    ``BaseHTTPRequestHandler.handle_one_request`` already has an
+    ``except TimeoutError`` clause for, ending the request and releasing
+    this proxy's concurrency slot exactly as the plain idle timeout does
+    today for the shapes it already catches.
+
+    The client socket's own timeout is armed ONLY for the duration of
+    each individual ``read1`` call, and restored to the plain
+    ``_CLIENT_IDLE_TIMEOUT_SECONDS`` backstop immediately afterward in a
+    ``finally`` -- never left at the (possibly very small) request-receive
+    deadline remainder. That is what keeps RESPONSE writes (and any read
+    this class does not itself gate) unbound by the deadline above while
+    still not literally unbounded forever: a streaming SSE response
+    legitimately holds its slot for the whole generation (see
+    ``test_streaming_sse_response_holds_its_slot_for_the_whole_
+    generation``) and must never be cut off by this deadline.
+
+    Only the methods this proxy's own request-parsing path actually uses
+    are delegated: ``readline`` (``BaseHTTPRequestHandler.handle_one_
+    request``'s request-line read, and ``http.client.parse_headers``'s
+    header reads), ``read`` (this file's own
+    ``self.rfile.read(content_length)`` body read), ``readinto`` (kept
+    for any future/stdlib caller that might use it, though none in this
+    file's own call graph does today), and ``close``. Not a
+    ``socket.SocketIO`` subclass, deliberately: a thin delegating wrapper
+    around the real buffered reader is clearer than overriding raw-socket
+    internals.
+    """
+
+    def __init__(self, raw, connection: socket.socket, started_monotonic: float):
+        self._raw = raw
+        self._connection = connection
+        self._pushback = b""
+        # Computed ONCE, from this connection's own start -- no amount of
+        # extension below can ever push the deadline past this.
+        self._hard_deadline = started_monotonic + _CLIENT_REQUEST_HARD_DEADLINE_SECONDS
+        self._deadline = min(
+            started_monotonic + _CLIENT_REQUEST_INITIAL_SECONDS, self._hard_deadline
+        )
+
+    def _extend_deadline(self, bytes_received: int) -> None:
+        if bytes_received <= 0:
+            return
+        extended = self._deadline + (bytes_received / _CLIENT_REQUEST_MIN_BYTES_PER_SECOND)
+        self._deadline = min(extended, self._hard_deadline)
+
+    def _raw_read1(self, size: int) -> bytes:
+        """Exactly one underlying read (or zero, if already-buffered
+        bytes satisfy it), bounded by the time remaining before the
+        CURRENT deadline -- re-derived fresh on every call, never a
+        value computed by an earlier call and reused.
+        """
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "client did not finish sending its request (request "
+                "line/headers/body) within the request-receive deadline"
+            )
+        self._connection.settimeout(remaining)
+        try:
+            chunk = self._raw.read1(size)
+        finally:
+            # See the class docstring: restored to the plain backstop,
+            # never left at the deadline remainder, so writes that follow
+            # a read are never bound by it.
+            self._connection.settimeout(_CLIENT_IDLE_TIMEOUT_SECONDS)
+        self._extend_deadline(len(chunk))
+        return chunk
+
+    def _next_chunk(self, size: int) -> bytes:
+        if self._pushback:
+            chunk, self._pushback = self._pushback[:size], self._pushback[size:]
+            return chunk
+        return self._raw_read1(size)
+
+    def readline(self, size: int = -1) -> bytes:
+        limit = size if isinstance(size, int) and size >= 0 else (1 << 20)
+        line = bytearray()
+        while len(line) < limit:
+            chunk = self._next_chunk(min(8192, limit - len(line)))
+            if not chunk:
+                break  # EOF: the client closed before sending a newline.
+            newline_at = chunk.find(b"\n")
+            if newline_at == -1:
+                line += chunk
+                continue
+            line += chunk[: newline_at + 1]
+            leftover = chunk[newline_at + 1:]
+            if leftover:
+                # Belongs to whatever is read NEXT (the next header line,
+                # or the body) -- held here rather than discarded.
+                self._pushback = leftover + self._pushback
+            break
+        return bytes(line)
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            # Never used on this handler's client-facing rfile -- the
+            # only caller in this file is ``self.rfile.read(content_
+            # length)`` with a known, non-negative length (see
+            # ``_dispatch``). An unbounded read here would defeat the
+            # deadline this class exists to enforce, so it is refused
+            # outright rather than silently reading until EOF.
+            raise ValueError(
+                "_DeadlineBoundRfile.read() requires an explicit, "
+                "non-negative size"
+            )
+        data = bytearray()
+        while len(data) < size:
+            chunk = self._next_chunk(min(8192, size - len(data)))
+            if not chunk:
+                break  # EOF before `size` bytes arrived.
+            data += chunk
+        return bytes(data)
+
+    def readinto(self, b) -> int:
+        chunk = self._next_chunk(len(b))
+        n = len(chunk)
+        b[:n] = chunk
+        return n
+
+    def close(self) -> None:
+        self._raw.close()
+
+
 class ProvenanceProxyHandler(BaseHTTPRequestHandler):
     """Forwards every method/path/body to ``self.server``'s upstream
     unchanged, stamping the provenance headers onto every response.
@@ -249,12 +521,17 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     # ``BaseHTTPRequestHandler.setup()`` applies this straight to the
-    # request socket (``self.connection.settimeout(self.timeout)``) --
-    # bounds only how long the handler waits on the CLIENT for the
-    # request line/headers/body; a slow-but-alive upstream is a separate
-    # concern (``upstream_read_timeout`` on the server, unbounded by
-    # default). Without this, a client that opens a connection and never
-    # finishes sending its request ties up a handler thread forever.
+    # request socket (``self.connection.settimeout(self.timeout)``) the
+    # instant the socket is set up -- see ``_CLIENT_IDLE_TIMEOUT_SECONDS``
+    # above for why this value ALONE does not, and never did, bound how
+    # long the handler waits on the CLIENT for the request line/headers/
+    # body (a slow-but-alive upstream is a separate concern regardless --
+    # ``upstream_read_timeout`` on the server, unbounded by default). The
+    # actual per-request deadline is installed by ``setup()`` below,
+    # immediately after calling ``super().setup()``, by wrapping
+    # ``self.rfile`` in ``_DeadlineBoundRfile`` (see
+    # ``_CLIENT_REQUEST_INITIAL_SECONDS`` / ``_CLIENT_REQUEST_MIN_BYTES_
+    # PER_SECOND`` / ``_CLIENT_REQUEST_HARD_DEADLINE_SECONDS`` above).
     timeout = _CLIENT_IDLE_TIMEOUT_SECONDS
 
     # Identifies PROXY-GENERATED responses only (a 502/400/provenance
@@ -268,6 +545,28 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
 
     def version_string(self) -> str:
         return self.server_version
+
+    def setup(self) -> None:
+        """Identical to the base class, PLUS installing
+        ``_DeadlineBoundRfile`` around ``self.rfile`` immediately
+        afterward -- this is what actually bounds RECEIVING a request
+        (request line, headers, body) by wall-clock time (see
+        ``_CLIENT_REQUEST_INITIAL_SECONDS`` and friends above), rather
+        than the per-``recv`` ``self.timeout`` the base class alone
+        applies (see the comment on that class attribute for why that is
+        not sufficient by itself).
+
+        ``protocol_version = "HTTP/1.0"`` together with
+        ``close_connection = True`` on every response path in this
+        handler (see those definitions) means exactly one request is
+        ever handled per accepted connection here, so arming the deadline
+        once per connection, in ``setup()``, is equivalent to arming it
+        once per request -- there is no keep-alive iteration on this
+        handler that could reuse an already-expired deadline from an
+        earlier request on the same connection.
+        """
+        super().setup()
+        self.rfile = _DeadlineBoundRfile(self.rfile, self.connection, time.monotonic())
 
     def parse_request(self) -> bool:
         """Identical to the base class, PLUS answering the ``Expect:
@@ -555,6 +854,51 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             pass
         return len(body)
 
+    def _write_response_chunk(self, data: bytes, budget_remaining: float) -> float:
+        """Writes ``data`` (then flushes) to the client, with
+        ``self.connection``'s timeout re-derived from ``budget_remaining``
+        immediately before the write and restored to the plain
+        ``_CLIENT_IDLE_TIMEOUT_SECONDS`` backstop immediately after -- the
+        same idiom ``_DeadlineBoundRfile._raw_read1`` uses for reads (see
+        there), applied to writes for the reason documented on
+        ``_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS`` above.
+
+        Returns the wall-clock seconds this call spent inside
+        ``write``/``flush`` -- the caller accumulates this across every
+        chunk of one response to enforce the CUMULATIVE budget, not a
+        per-chunk one. Raises ``socket.timeout``/``TimeoutError`` if the
+        client did not drain within ``budget_remaining``, or
+        ``BrokenPipeError``/``ConnectionResetError``/``OSError`` if the
+        client vanished outright -- both are left for the caller to
+        handle (they mean different things: one is a slow client to
+        abort with an error, the other is an ordinary vanished client),
+        so neither is swallowed here.
+        """
+        # Clamped to a small POSITIVE floor, never passed through raw.
+        # ``socket.settimeout`` raises ``ValueError`` on a negative value
+        # and switches the socket to NON-BLOCKING mode on exactly 0.0 --
+        # and neither is caught by this method's callers, which handle
+        # ``socket.timeout`` and the vanished-client ``OSError``s only. A
+        # ``ValueError`` here would escape as an unhandled exception in
+        # the handler thread. ``_respond_streamed``'s own ``budget_
+        # remaining <= 0`` pre-check already prevents that call reaching
+        # here, but a guard whose removal crashes the thread should not
+        # be the only thing standing between the two (a mutation run
+        # confirmed that pre-check has no independent test coverage on
+        # its own; see this cycle's record).
+        self.connection.settimeout(max(budget_remaining, 0.001))
+        started = time.monotonic()
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        finally:
+            # Restored the instant this write is done, never left at the
+            # budget remainder -- nothing that runs after this write (the
+            # next upstream read, the next chunk's own budget-derived
+            # timeout) may ever inherit it.
+            self.connection.settimeout(_CLIENT_IDLE_TIMEOUT_SECONDS)
+        return time.monotonic() - started
+
     def _respond_buffered(
         self,
         status: int,
@@ -612,11 +956,29 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.close_connection = True
         self.end_headers()
+        # A single write, so it gets the WHOLE budget to itself (never a
+        # per-chunk fraction of it -- there is only one chunk here).
+        #
+        # Ordering matters on the except clauses below: ``socket.timeout``
+        # IS a subclass of ``OSError`` (``TimeoutError`` too, since
+        # Python 3.10 made ``socket.timeout`` an alias of it), so it MUST
+        # be caught by its own clause first -- if the generic
+        # ``(BrokenPipeError, ConnectionResetError, OSError)`` clause ran
+        # first it would swallow a genuine blocked-write-budget timeout
+        # and report it as an ordinary successful (or silently vanished)
+        # response, defeating this whole fix.
+        error: Optional[str] = None
+        bytes_out = len(body)
         try:
-            self.wfile.write(body)
+            self._write_response_chunk(body, _CLIENT_RESPONSE_MAX_BLOCKED_SECONDS)
+        except (socket.timeout, TimeoutError):
+            error = _response_write_budget_exceeded_message()
+            bytes_out = 0
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
-        return len(body), status, None
+        if error is not None:
+            self._abort_client_connection()
+        return bytes_out, status, error
 
     def _abort_client_connection(self) -> None:
         """Force a TCP RST to the client (SO_LINGER on, linger=0, then
@@ -666,6 +1028,13 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         bytes_out = 0
         streamed = False
         error: Optional[str] = None
+        # The CUMULATIVE blocked-write budget for the WHOLE response, not
+        # a fresh one per chunk (see ``_CLIENT_RESPONSE_MAX_BLOCKED_
+        # SECONDS`` above for why a per-chunk budget would not actually
+        # bound anything: a client dribbling its reads just fast enough
+        # to keep any ONE write under the budget could still hold its
+        # slot forever, exactly the request-side defect this mirrors).
+        budget_remaining = _CLIENT_RESPONSE_MAX_BLOCKED_SECONDS
         while True:
             try:
                 chunk = response.read1(_UPSTREAM_READ_CHUNK_BYTES)
@@ -681,9 +1050,28 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
                 break
             if not chunk:
                 break
+            if budget_remaining <= 0:
+                # The budget was already exhausted by an EARLIER chunk in
+                # this same response (see the ``except`` below for the
+                # other way this budget is spent: a single write blocking
+                # past what remained). Either way, no further write is
+                # attempted -- the client already proved it cannot keep
+                # up within the budget.
+                error = _response_write_budget_exceeded_message()
+                self._abort_client_connection()
+                break
             try:
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                budget_remaining -= self._write_response_chunk(chunk, budget_remaining)
+            except (socket.timeout, TimeoutError):
+                # Ordering matters here exactly as in ``_respond_buffered``
+                # (see its own comment): ``socket.timeout``/``TimeoutError``
+                # must be caught BEFORE the generic vanished-client clause
+                # below, which is also an ``OSError`` superclass match and
+                # would otherwise silently report this budget-exhaustion
+                # abort as an ordinary vanished-client disconnect.
+                error = _response_write_budget_exceeded_message()
+                self._abort_client_connection()
+                break
             except (BrokenPipeError, ConnectionResetError, OSError):
                 # The client vanished mid-stream: close the upstream
                 # connection promptly rather than draining it to nowhere.

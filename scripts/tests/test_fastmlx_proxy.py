@@ -16,6 +16,7 @@ import io
 import json
 import os
 import socket
+import socketserver
 import sys
 import threading
 import time
@@ -1216,6 +1217,16 @@ class ProxyRequestBodySizeLimitTests(unittest.TestCase):
         self.assertEqual(requests, ["/v1/chat/completions"], "only the allowed request reached upstream")
 
 
+class _HandlerAbort(BaseException):
+    """A stand-in for ``SystemExit``/``KeyboardInterrupt`` -- deliberately
+    a ``BaseException``, not an ``Exception`` subclass, so a handler that
+    raises it is NOT caught by ``socketserver.BaseServer.
+    process_request_thread``'s own ``except Exception:`` clause. See
+    ``ProxyConcurrencyLimitTests.test_handler_raising_a_base_exception_
+    does_not_leak_its_slot`` below for why that distinction is the point.
+    """
+
+
 class ProxyConcurrencyLimitTests(unittest.TestCase):
     """``ProvenanceProxyServer`` is a ``ThreadingHTTPServer`` with
     ``daemon_threads = True`` and, before this cap, NO bound at all on
@@ -1443,6 +1454,721 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
             self.assertEqual(resp.status, 200, f"sequential request {i} after release must be admitted")
 
     # ------------------------------------------------------------------
+    # Slot-unwind path 1: ``ThreadingMixIn.process_request`` itself can
+    # raise (``RuntimeError: can't start new thread``, under real
+    # thread-count/resource pressure) starting the handler thread, BEFORE
+    # ``process_request_thread`` ever runs -- so ITS ``finally`` never
+    # fires, and only ``process_request``'s own ``except BaseException``
+    # block (see its in-code comment) can release the slot and decrement
+    # the counter. A leaked slot here counts against the cap FOREVER.
+    # Discriminating quantities: the three 200s below (a leaked semaphore
+    # permit would turn one of them into a 503) and
+    # ``inflight_requests == 0`` (a missing counter decrement would leave
+    # it at 2) -- not merely "no exception escaped the test".
+    # ------------------------------------------------------------------
+    def test_failed_handler_thread_start_does_not_leak_its_slot(self):
+        def responder(handler):
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        handled_errors = []
+        # One Event per induced failure, set from INSIDE ``handle_error``
+        # (not from the raising function itself): ``handle_error`` runs
+        # strictly AFTER ``process_request``'s own except-block has
+        # already released the slot and decremented the counter for that
+        # connection (see the source's own comment on that except block),
+        # so waiting on these events -- rather than on the raise itself --
+        # is what makes the later assertions race-free instead of merely
+        # usually-true.
+        handled_events = [threading.Event(), threading.Event()]
+
+        def record_handle_error(request, client_address):
+            # Replaces the stdlib default (a traceback printed to
+            # stderr) with a recorded exception TYPE, so the test can
+            # assert exactly what reached ``_handle_request_noblock``'s
+            # own error handling instead of merely "did not crash".
+            idx = len(handled_errors)
+            handled_errors.append(sys.exc_info()[0])
+            if idx < len(handled_events):
+                handled_events[idx].set()
+
+        proxy.handle_error = record_handle_error
+
+        def flaky_process_request(self_server, request, client_address):
+            raise RuntimeError("can't start new thread")
+
+        with unittest.mock.patch.object(
+            socketserver.ThreadingMixIn, "process_request", new=flaky_process_request
+        ):
+            conn1 = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            self.assertTrue(
+                handled_events[0].wait(timeout=5),
+                "the first induced thread-start failure never reached handle_error",
+            )
+            conn1.close()
+
+            conn2 = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            self.assertTrue(
+                handled_events[1].wait(timeout=5),
+                "the second induced thread-start failure never reached handle_error",
+            )
+            conn2.close()
+
+        self.assertEqual(
+            len(handled_errors), 2,
+            f"expected exactly 2 errors reaching handle_error, got {len(handled_errors)}",
+        )
+        for exc_type in handled_errors:
+            self.assertIs(exc_type, RuntimeError, f"expected RuntimeError, got {exc_type}")
+
+        self.assertEqual(
+            proxy.inflight_requests, 0,
+            "inflight counter leaked across 2 induced thread-start failures: "
+            f"{proxy.inflight_requests} != 0",
+        )
+
+        for i in range(3):  # cap (2) + 1
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("POST", "/v1/chat/completions", body=b"{}")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                f"sequential request {i} after 2 induced thread-start failures must be "
+                "admitted -- a leaked slot would refuse it with 503 instead",
+            )
+
+    # ------------------------------------------------------------------
+    # Slot-unwind path 2: ``socketserver.BaseServer.process_request_thread``
+    # (reached via ``ThreadingMixIn.process_request_thread``'s own
+    # ``super()`` call) only catches ``Exception``, never
+    # ``BaseException`` -- so for a handler that raises something like
+    # ``SystemExit``/``KeyboardInterrupt``, the ONLY thing that releases
+    # this proxy's slot is this override's own ``finally``. Kills a
+    # version of the fix that caught only ``Exception`` (would leak on
+    # any ``BaseException``) or that moved the release after the
+    # ``super()`` call without a ``finally`` at all.
+    # ------------------------------------------------------------------
+    def test_handler_raising_a_base_exception_does_not_leak_its_slot(self):
+        def responder(handler):
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        dispatch_entered = threading.Event()
+
+        def aborting_do_post(self_handler):
+            dispatch_entered.set()
+            raise _HandlerAbort("induced base-exception abort")
+
+        recorded_exc_types = []
+        abort_seen = threading.Event()
+        original_excepthook = threading.excepthook
+
+        def record_excepthook(args):
+            recorded_exc_types.append(args.exc_type)
+            abort_seen.set()
+
+        threading.excepthook = record_excepthook
+        self.addCleanup(setattr, threading, "excepthook", original_excepthook)
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY.ProvenanceProxyHandler, "do_POST", new=aborting_do_post
+        ):
+            self._send_and_read(proxy.server_address[1], raw_request, timeout=5)
+            self.assertTrue(dispatch_entered.wait(timeout=5), "the aborting handler was never entered")
+
+        # ``threading.excepthook`` fires only AFTER this override's own
+        # ``finally`` (slot release, counter decrement) has already run
+        # -- the exception must propagate all the way out of
+        # ``process_request_thread`` before ``Thread._bootstrap_inner``'s
+        # bare ``except:`` invokes it -- so this wait is what makes the
+        # counter assertion below race-free.
+        self.assertTrue(
+            abort_seen.wait(timeout=5),
+            "threading.excepthook was never invoked for the induced BaseException",
+        )
+        self.assertEqual(
+            len(recorded_exc_types), 1,
+            f"expected exactly 1 thread exception, got {len(recorded_exc_types)}",
+        )
+        self.assertIs(
+            recorded_exc_types[0], _HandlerAbort,
+            f"expected _HandlerAbort, got {recorded_exc_types[0]}",
+        )
+
+        self.assertEqual(
+            proxy.inflight_requests, 0,
+            "inflight counter leaked after a BaseException from the handler: "
+            f"{proxy.inflight_requests} != 0",
+        )
+
+        for i in range(2):  # cap (1) + 1
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("POST", "/v1/chat/completions", body=b"{}")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                f"sequential request {i} after a BaseException from the handler must be "
+                "admitted -- a leaked slot would refuse it with 503 instead",
+            )
+
+    # ------------------------------------------------------------------
+    # Slot-unwind path 3: the handler raises an ORDINARY ``Exception``
+    # (``ValueError``) -- the shape ``socketserver.BaseServer.
+    # process_request_thread`` already catches internally, swallowing it
+    # and returning NORMALLY, before this override's own ``finally`` ever
+    # sees anything to unwind. NOT ``finally``-discriminating: because the
+    # stdlib itself already caught the exception, a release placed AFTER
+    # the ``super()`` call with no ``try/finally`` at all would ALSO run
+    # here, so this test alone cannot distinguish that from the correct
+    # ``finally``-based release the code actually uses (contrast with
+    # ``test_handler_raising_a_base_exception_does_not_leak_its_slot``
+    # above, which CAN make that distinction). Its value is guarding the
+    # documented behaviour -- an ordinary handler exception must not leak
+    # a slot -- and the inflight counter, not the ``finally`` mechanism.
+    # ------------------------------------------------------------------
+    def test_handler_raising_an_ordinary_exception_releases_its_slot(self):
+        def responder(handler):
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+        proxy.handle_error = lambda request, client_address: None  # expected; keep the log quiet
+
+        dispatch_entered = threading.Event()
+
+        def failing_do_post(self_handler):
+            dispatch_entered.set()
+            raise ValueError("induced ordinary exception")
+
+        # ``socketserver.BaseServer.process_request_thread``'s own
+        # ``shutdown_request`` (which closes the client's socket and ends
+        # ``_send_and_read`` below) runs INSIDE ``super().
+        # process_request_thread()``, strictly before this override's own
+        # ``finally`` decrements the counter -- so waiting only for the
+        # client socket to close would leave a real, if short, race
+        # against the counter update on a loaded machine. This thin
+        # wrapper around the REAL (possibly mutated) implementation adds
+        # only a completion signal; it changes nothing about slot/counter
+        # handling itself.
+        real_process_request_thread = FASTMLX_PROXY.ProvenanceProxyServer.process_request_thread
+        thread_finished = threading.Event()
+
+        def observed_process_request_thread(self_server, request, client_address):
+            try:
+                return real_process_request_thread(self_server, request, client_address)
+            finally:
+                thread_finished.set()
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY.ProvenanceProxyHandler, "do_POST", new=failing_do_post
+        ), unittest.mock.patch.object(
+            FASTMLX_PROXY.ProvenanceProxyServer, "process_request_thread", new=observed_process_request_thread
+        ):
+            # Whatever the client actually observes (a closed connection,
+            # a partial response, or nothing) is not asserted here -- the
+            # point under test is the slot, not the client-visible
+            # status; see the docstring above for why this test cannot be
+            # ``finally``-discriminating.
+            self._send_and_read(proxy.server_address[1], raw_request, timeout=5)
+            self.assertTrue(dispatch_entered.wait(timeout=5), "the failing handler was never entered")
+            self.assertTrue(thread_finished.wait(timeout=5), "the handler thread never finished")
+
+        self.assertEqual(
+            proxy.inflight_requests, 0,
+            "inflight counter leaked after an ordinary Exception from the handler: "
+            f"{proxy.inflight_requests} != 0",
+        )
+
+        for i in range(2):  # cap (1) + 1
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("POST", "/v1/chat/completions", body=b"{}")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                f"sequential request {i} after an ordinary Exception from the handler must "
+                "be admitted -- a leaked slot would refuse it with 503 instead",
+            )
+
+    # ------------------------------------------------------------------
+    # Documented behaviour, previously uncovered: a streaming (SSE)
+    # response holds its slot for the WHOLE generation, not just until
+    # headers are sent -- the cap counts in-flight streams, not completed
+    # requests. Anti-vacuity control: the mid-stream 503's error type is
+    # asserted exactly, so a 503 for any unrelated reason cannot pass.
+    # ------------------------------------------------------------------
+    def test_streaming_sse_response_holds_its_slot_for_the_whole_generation(self):
+        release_rest = threading.Event()
+
+        def responder(handler):
+            # The verification requests below are ordinary POSTs with a
+            # small declared body -- drained here like every other
+            # responder in this file does (``_read_request_body``), NOT
+            # because this SSE responder cares about the body, but
+            # because leaving it unread in the upstream's own kernel
+            # receive buffer at connection-close time makes the OS send a
+            # TCP RST instead of a clean FIN (the same RST-vs-FIN
+            # mechanism ``_refuse_over_capacity`` documents on the
+            # proxy's OWN client-facing socket) -- which the proxy's
+            # ``_respond_streamed`` correctly treats as an upstream
+            # failure and aborts the client connection for, an entirely
+            # different (and non-discriminating, for THIS test) failure
+            # mode from the one under test here.
+            _read_request_body(handler)
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(b"data: chunk1\n\n")
+            handler.wfile.flush()
+            self.assertTrue(release_rest.wait(timeout=10), "test never released the gate")
+            handler.wfile.write(b"data: chunk2\n\n")
+            handler.wfile.flush()
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        received_first = threading.Event()
+        stream_result = {}
+
+        def read_stream():
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=10)
+            conn.request("GET", "/v1/stream")
+            resp = conn.getresponse()
+            first = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1)
+            stream_result["first"] = first
+            received_first.set()
+            rest = resp.read()
+            stream_result["rest"] = rest
+            conn.close()
+
+        reader = threading.Thread(target=read_stream)
+        reader.start()
+        self.assertTrue(received_first.wait(timeout=5), "client never received the first SSE chunk")
+
+        # The sole slot is still held by the in-progress stream here -- a
+        # second connection while it is mid-generation must be refused,
+        # not merely eventually admitted.
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(
+            b" 503 ", response,
+            f"expected a 503 while the streaming response holds the sole slot; got: {response!r}",
+        )
+        body_json = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body_json["error"]["type"], "too_many_concurrent_requests")
+
+        release_rest.set()
+        reader.join(timeout=5)
+        self.assertEqual(stream_result["first"] + stream_result["rest"], b"data: chunk1\n\ndata: chunk2\n\n")
+
+        # The slot must have been released once the stream ended, not
+        # leaked for the rest of the process's life.
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=b"{}")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(
+            resp.status, 200,
+            "the slot must be released once the stream finished, not leaked",
+        )
+
+    # ------------------------------------------------------------------
+    # Shared helper for the two blocked-write-budget tests below: a client
+    # with a tiny ``SO_RCVBUF`` (set BEFORE ``connect`` -- the kernel must
+    # honor it for the connection's whole lifetime, not just from whenever
+    # a test happens to set it) that sends a complete request and then
+    # never reads a single byte of the response. Forces the proxy's own
+    # outbound writes to eventually block once its send buffer and the
+    # client's shrunk receive window both fill, without needing a real
+    # slow network to reproduce the defect.
+    # ------------------------------------------------------------------
+    def _open_stalled_client(self, port: int, raw_request: bytes) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+        sock.connect(("127.0.0.1", port))
+        sock.sendall(raw_request)
+        return sock
+
+    # ------------------------------------------------------------------
+    # This test covers the BOUNDED half of the defect, and says so
+    # precisely because an earlier draft of this comment did not. A client
+    # that never reads at all does NOT hold its slot forever: measured
+    # against the pre-fix code, it was released after 123.6s -- the
+    # ``_CLIENT_IDLE_TIMEOUT_SECONDS`` backstop doing its job. What this
+    # test pins is that the budget replaces that 123.6s with the budget,
+    # which is worth pinning on its own (two minutes of a scarce slot for
+    # zero attacker effort) but is NOT the unbounded case.
+    #
+    # The unbounded case needs a client that lets each write COMPLETE and
+    # then stalls, which resets the backstop every time; that is
+    # ``test_a_client_that_drains_one_chunk_then_stalls_...`` below.
+    # ``_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS`` is patched down to 2.0s
+    # here so this test completes in seconds.
+    # ------------------------------------------------------------------
+    def test_a_client_that_opens_a_stream_and_stops_reading_releases_its_concurrency_slot(self):
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY, "_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS", 2.0, create=True
+        ):
+
+            def responder(handler):
+                if handler.path != "/v1/stream":
+                    payload = b'{"ok":true}'
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.end_headers()
+                    handler.wfile.write(payload)
+                    return
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.end_headers()
+                chunk = b"data: " + b"x" * 65000 + b"\n\n"
+                try:
+                    for _ in range(500):
+                        handler.wfile.write(chunk)
+                        handler.wfile.flush()
+                except OSError:
+                    pass  # the proxy closed its upstream connection once it aborted the client.
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+
+            logged = []
+            aborted = threading.Event()
+
+            def log_hook(entry):
+                logged.append(entry)
+                if entry.get("error") and "blocked-write" in entry["error"]:
+                    aborted.set()
+
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+            stuck = self._open_stalled_client(
+                proxy.server_address[1], b"GET /v1/stream HTTP/1.1\r\nHost: x\r\n\r\n"
+            )
+            self.addCleanup(stuck.close)
+
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=5),
+                "the stalled stream was never even admitted",
+            )
+
+            self.assertTrue(
+                aborted.wait(timeout=10),
+                "the stalled stream's slot was never reclaimed on the blocked-write budget",
+            )
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 0, timeout=5),
+                "the slot was not released once the blocked-write budget was hit",
+            )
+
+            abort_entries = [e for e in logged if e.get("error") and "blocked-write" in e["error"]]
+            self.assertEqual(len(abort_entries), 1)
+            self.assertIn("2.0", abort_entries[0]["error"])
+
+            # The slot must be genuinely usable again, not merely freed.
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                "a second client must be able to use the reclaimed slot",
+            )
+
+    # ------------------------------------------------------------------
+    # A mutation run showed ``_respond_streamed``'s ``budget_remaining
+    # <= 0`` pre-check is NOT independently covered: deleting it alone
+    # left all three budget tests green, because the per-write timeout
+    # caught every case they exercise. That made it look redundant. It is
+    # not -- without it, ``settimeout`` would be handed a NEGATIVE value,
+    # which raises ``ValueError``, which nothing in the write path
+    # catches, so the handler thread would die with an unhandled
+    # exception instead of aborting the client cleanly.
+    #
+    # Rather than leave a guard whose removal is invisible to the suite,
+    # ``_write_response_chunk`` now clamps to a positive floor, and this
+    # test pins THAT directly -- so the crash class is covered by an
+    # assertion, not by the accident of another check running first.
+    # ------------------------------------------------------------------
+    def test_a_spent_write_budget_never_reaches_settimeout_as_a_negative(self):
+        real_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(real_socket.close)
+
+        handler = FASTMLX_PROXY.ProvenanceProxyHandler.__new__(
+            FASTMLX_PROXY.ProvenanceProxyHandler
+        )
+        handler.connection = real_socket
+        handler.wfile = io.BytesIO()
+
+        # A real socket, so the range being asserted is the OS's own and
+        # not a mock's willingness to accept anything.
+        with self.assertRaises(ValueError):
+            real_socket.settimeout(-0.5)
+
+        # Asserting on ``gettimeout()`` AFTER the call would prove
+        # nothing: ``_write_response_chunk``'s ``finally`` restores the
+        # backstop, so any post-call read is 120.0 whether the clamp
+        # exists or not. The value actually handed to ``settimeout``
+        # DURING the write is the only discriminating observation, so it
+        # is recorded as it happens.
+        applied = []
+
+        class RecordingConnection:
+            """Records every ``settimeout`` value and forwards it to a
+            REAL socket, so an out-of-range value still raises the OS's
+            own ``ValueError`` here rather than being quietly accepted by
+            a mock (a socket object's attributes are read-only, so this
+            cannot be done by patching one in place)."""
+
+            def __init__(self, sock):
+                self._sock = sock
+
+            def settimeout(self, value):
+                applied.append(value)
+                return self._sock.settimeout(value)
+
+        handler.connection = RecordingConnection(real_socket)
+
+        for spent in (-5.0, -0.001, 0.0):
+            with self.subTest(budget_remaining=spent):
+                applied.clear()
+                handler._write_response_chunk(b"x", spent)
+                self.assertTrue(applied, "settimeout was never called at all")
+                self.assertGreater(
+                    applied[0], 0.0,
+                    f"a spent budget ({spent}) reached settimeout as {applied[0]!r} -- "
+                    "negative raises ValueError, and 0.0 silently switches the socket "
+                    "to non-blocking",
+                )
+
+    # ------------------------------------------------------------------
+    # THE LOAD-BEARING TEST: the genuinely UNBOUNDED shape.
+    #
+    # Established by measurement against the pre-fix code, after the
+    # obvious guess was refuted. Dribbling one byte at a time does NOT
+    # hold the slot (released after 124.3s, i.e. just the backstop),
+    # because ``sendall`` does not re-arm its timeout per internal send --
+    # the CURRENT write simply never returns. To reset the backstop the
+    # client must let one whole write COMPLETE, then stall again. That
+    # shape held its slot for 400.9s and was still holding when the
+    # window closed, for about 3.3 KiB/s of attacker effort.
+    #
+    # Reproduced here at unit speed by shrinking BOTH clocks: the backstop
+    # down to 3.0s (so a 1.2s stall sits comfortably under it and keeps
+    # resetting it, exactly as a 119s stall does under the real 120s) and
+    # the budget down to 2.0s. Against the unfixed code this test hangs
+    # until its own assertion deadline; the budget is the only thing that
+    # ends it.
+    # ------------------------------------------------------------------
+    def test_a_client_that_drains_one_chunk_then_stalls_cannot_hold_its_slot_forever(self):
+        with contextlib.ExitStack() as patches:
+            patches.enter_context(unittest.mock.patch.object(
+                FASTMLX_PROXY, "_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS", 2.0, create=True))
+            # Both spellings matter: the module global is what
+            # ``_write_response_chunk`` restores after each write, while
+            # the handler's ``timeout`` class attribute was bound from it
+            # at import time and is what ``setup()`` applies to the
+            # socket. Patching only one leaves the other at 120s and the
+            # test would pass for the wrong reason.
+            patches.enter_context(unittest.mock.patch.object(
+                FASTMLX_PROXY, "_CLIENT_IDLE_TIMEOUT_SECONDS", 3.0))
+            patches.enter_context(unittest.mock.patch.object(
+                FASTMLX_PROXY.ProvenanceProxyHandler, "timeout", 3.0))
+
+            def responder(handler):
+                if handler.path != "/v1/stream":
+                    payload = b'{"ok":true}'
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.end_headers()
+                    handler.wfile.write(payload)
+                    return
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.end_headers()
+                chunk = b"data: " + b"x" * 65000 + b"\n\n"
+                try:
+                    for _ in range(500):
+                        handler.wfile.write(chunk)
+                        handler.wfile.flush()
+                except OSError:
+                    pass
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+
+            aborted = threading.Event()
+
+            def log_hook(entry):
+                if entry.get("error") and "blocked-write" in entry["error"]:
+                    aborted.set()
+
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+            stuck = self._open_stalled_client(
+                proxy.server_address[1], b"GET /v1/stream HTTP/1.1\r\nHost: x\r\n\r\n"
+            )
+            self.addCleanup(stuck.close)
+
+            stop = threading.Event()
+            self.addCleanup(stop.set)
+            drained = [0]
+
+            def drain_a_chunk_then_stall():
+                # Each pass drains a whole write's worth, which lets the
+                # proxy's current ``sendall`` RETURN -- that return is what
+                # resets the backstop. Then it stalls under the backstop.
+                stuck.settimeout(1.0)
+                while not stop.is_set():
+                    got = 0
+                    while got < 262144 and not stop.is_set():
+                        try:
+                            data = stuck.recv(65536)
+                        except (socket.timeout, OSError):
+                            break
+                        if not data:
+                            return
+                        got += len(data)
+                        drained[0] += len(data)
+                    stop.wait(1.2)
+
+            reader = threading.Thread(target=drain_a_chunk_then_stall, daemon=True)
+            reader.start()
+
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=5),
+                "the chunk-then-stall stream was never even admitted",
+            )
+            self.assertTrue(
+                aborted.wait(timeout=20),
+                "a client that drains one chunk and then stalls held its slot past the "
+                "cumulative blocked-write budget -- this is the unbounded shape, and the "
+                "backstop cannot end it because every completed write resets it",
+            )
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 0, timeout=5),
+                "the slot was not released once the blocked-write budget was hit",
+            )
+            self.assertGreater(
+                drained[0], 0,
+                "the client never drained anything, so this ran as the SILENT shape "
+                "(which the backstop alone would have ended) and proves nothing here",
+            )
+
+    # ------------------------------------------------------------------
+    # Same defect, ``_respond_buffered``'s path: a Content-Length upstream
+    # response routes ``_dispatch`` there instead, and its single
+    # ``self.wfile.write(body)`` call had the exact same unbounded
+    # exposure.
+    # ------------------------------------------------------------------
+    def test_a_slow_reading_client_on_the_buffered_path_releases_its_concurrency_slot(self):
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY, "_CLIENT_RESPONSE_MAX_BLOCKED_SECONDS", 2.0, create=True
+        ):
+            large_body = b"y" * (32 * 1024 * 1024)
+
+            def responder(handler):
+                if handler.path != "/v1/big":
+                    payload = b'{"ok":true}'
+                    handler.send_response(200)
+                    handler.send_header("Content-Type", "application/json")
+                    handler.send_header("Content-Length", str(len(payload)))
+                    handler.end_headers()
+                    handler.wfile.write(payload)
+                    return
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/octet-stream")
+                handler.send_header("Content-Length", str(len(large_body)))
+                handler.end_headers()
+                try:
+                    handler.wfile.write(large_body)
+                except OSError:
+                    pass  # the proxy closed its upstream connection once it aborted the client.
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+
+            logged = []
+            aborted = threading.Event()
+
+            def log_hook(entry):
+                logged.append(entry)
+                if entry.get("error") and "blocked-write" in entry["error"]:
+                    aborted.set()
+
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+            stuck = self._open_stalled_client(
+                proxy.server_address[1], b"GET /v1/big HTTP/1.1\r\nHost: x\r\n\r\n"
+            )
+            self.addCleanup(stuck.close)
+
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=10),
+                "the stalled buffered request was never even admitted",
+            )
+
+            self.assertTrue(
+                aborted.wait(timeout=15),
+                "the stalled buffered response's slot was never reclaimed on the "
+                "blocked-write budget",
+            )
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 0, timeout=5),
+                "the slot was not released once the blocked-write budget was hit",
+            )
+
+            abort_entries = [e for e in logged if e.get("error") and "blocked-write" in e["error"]]
+            self.assertEqual(len(abort_entries), 1)
+            self.assertIn("2.0", abort_entries[0]["error"])
+            self.assertFalse(abort_entries[0]["streamed"], "this is the buffered path, not SSE")
+
+            # The slot must be genuinely usable again, not merely freed.
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                "a second client must be able to use the reclaimed slot",
+            )
+
+    # ------------------------------------------------------------------
     # AC5: fd hygiene -- 50 sequential refusals, while one slot stays held,
     # must not grow the process's open-fd count at all. Kills a missing
     # ``shutdown_request`` on the refusal path: a status-only test is blind
@@ -1557,13 +2283,25 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         self.assertEqual(len(requests), 3)
 
     # ------------------------------------------------------------------
-    # Accept-loop liveness: a hostile over-cap client that triggers the
-    # refusal and then never reads its response must not delay a
-    # concurrent, well-behaved connection's own (503) response -- proves
-    # the ``settimeout``/``except OSError`` around the refusal write
-    # keeps the single accept thread from wedging behind it.
+    # Refusal delivery: a client that sends its over-cap request and then
+    # never reads the 503 response must still be REFUSED (503, correct
+    # error type) and have its socket closed rather than left to hang,
+    # and must not delay a concurrent, well-behaved connection's own
+    # (503) response.
+    #
+    # What this test does NOT prove, despite its predecessor's name: the
+    # accept-loop WEDGE class. The refusal body is 142 bytes, well under
+    # any socket's send-buffer size, so ``sendall`` cannot block on a
+    # non-reading client regardless of the write ``settimeout`` --
+    # deleting that timeout outright leaves this test green (confirmed by
+    # mutation during this test's own repair, see
+    # ``docs/task-inbox/2026-09-20-refusal-drain-loop-wedges-the-accept-
+    # thread.md``). The genuinely wedge-capable shape -- a client that
+    # keeps dribbling bytes so no per-``recv`` timeout or EOF ever fires
+    # -- is covered by ``test_paced_dribble_client_cannot_wedge_the_
+    # accept_loop`` below, not by this test.
     # ------------------------------------------------------------------
-    def test_hostile_client_that_never_reads_its_refusal_does_not_wedge_the_accept_loop(self):
+    def test_client_that_never_reads_its_refusal_is_still_refused_and_closed(self):
         upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
         proxy = self._start_proxy(upstream, max_concurrent_requests=2)
 
@@ -1577,10 +2315,9 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
 
         raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
         # Sends the request that triggers the 503, then never calls
-        # recv() at all -- if the refusal write ever blocked here without
-        # a timeout, every OTHER connection (including the well-behaved
-        # one below) would wedge behind it on the server's single accept
-        # thread.
+        # recv() at all -- a client shape this proxy must still refuse
+        # and close promptly, even though (see the docstring above) its
+        # small, fixed-size body cannot exercise the send-side wedge.
         hostile = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
         hostile.sendall(raw_request)
 
@@ -1935,6 +2672,376 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         gate.set()
         holder.join(timeout=5)
         self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # Shared helper for the request-receive-deadline tests below: polls
+    # ``proxy.inflight_requests`` (never sleeps a fixed guess) until it
+    # reaches ``expected`` or ``timeout`` elapses, returning the
+    # monotonic time the condition was FIRST observed (or ``None``).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wait_for_inflight(proxy, expected: int, timeout: float):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if proxy.inflight_requests == expected:
+                return time.monotonic()
+            time.sleep(0.01)
+        return None
+
+    # ------------------------------------------------------------------
+    # T-A (load-bearing regression test for the CONFIRMED defect): a
+    # client that dribbles ONE byte at a time, slower than
+    # ``_CLIENT_REQUEST_MIN_BYTES_PER_SECOND``, on the ADMITTED path
+    # (cap=1, so it holds the sole slot), must have its slot reclaimed
+    # once the request-receive deadline passes -- and a legitimate client
+    # queued behind that slot must then be served. Before the fix, this
+    # never happened: ``socket.settimeout`` bounds one ``recv``, not a
+    # request, so a client that delivers a byte before each per-``recv``
+    # timeout expires keeps the handler (and its concurrency slot) alive
+    # forever (see docs/task-inbox/2026-09-20-dribbling-client-holds-a-
+    # concurrency-slot-indefinitely.md for the full record and a 64-socket,
+    # ~0.53 B/s reproduction of a total proxy outage).
+    #
+    # Constants are scaled down by roughly 60x-200x from their real
+    # defaults (30s/1024 B/s/300s -> 0.5s/100 B/s/1.5s) so this test
+    # completes in a few seconds -- the per-``read1`` deadline
+    # recomputation this fix relies on is scale-invariant (see
+    # ``_DeadlineBoundRfile`` in fastmlx_proxy.py), the same way
+    # ``test_paced_dribble_client_cannot_wedge_the_accept_loop`` above
+    # scales ``_REFUSAL_DRAIN_DEADLINE_SECONDS``.
+    #
+    # REQUIRED CONTROL ARM: a SILENT client (opens a connection, sends the
+    # same partial request, then sends nothing more at all) must ALSO be
+    # reaped -- proving this test's own machinery, and the deadline
+    # mechanism itself, actually work on the shape the OLD per-recv
+    # timeout already handled. Without this control, the dribbler simply
+    # never being reaped could in principle be a broken harness rather
+    # than the mechanism under test.
+    # ------------------------------------------------------------------
+    def test_dribbling_client_on_the_admitted_path_cannot_hold_its_slot_forever(self):
+        with unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_INITIAL_SECONDS", 0.5), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_MIN_BYTES_PER_SECOND", 100), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_HARD_DEADLINE_SECONDS", 1.5), \
+             unittest.mock.patch.object(FASTMLX_PROXY.ProvenanceProxyHandler, "timeout", 1.5):
+            # The ``timeout`` class attribute is ALSO scaled down here (not
+            # just the three ``_CLIENT_REQUEST_*`` constants): it is baked
+            # onto ``ProvenanceProxyHandler`` at class-definition time from
+            # the real, unscaled ``_CLIENT_IDLE_TIMEOUT_SECONDS`` (120s), so
+            # on the UNFIXED code path (M1: the wrapper installation
+            # removed, see the implementation report) it is the ONLY thing
+            # governing this test's own CONTROL arm, and 120s would make
+            # that control unobservable inside this test's bounded waits.
+            # This patch is a no-op for the FIXED code's own outcome here
+            # (immediately superseded by ``_DeadlineBoundRfile`` on the
+            # first read either way).
+
+            def responder(handler):
+                payload = b"ok"
+                handler.send_response(200)
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                handler.wfile.write(payload)
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+            # Request line + ONE header, deliberately with NO terminating
+            # blank line -- the request is never complete.
+            partial_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+
+            # --- CONTROL: the SILENT shape (the old per-recv timeout's
+            # own documented target) must still be reaped by the new
+            # deadline. ---
+            silent = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            silent.sendall(partial_request)
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=2),
+                "CONTROL: the silent client's connection was never even admitted",
+            )
+            silent_freed_at = self._wait_for_inflight(proxy, 0, timeout=5)
+            silent.close()
+            self.assertIsNotNone(
+                silent_freed_at,
+                "CONTROL: the silent client was never reaped -- if this control fails, "
+                "the dribbler result below is not discriminating",
+            )
+
+            # --- ATTACK: the dribbler. One byte every 0.15s -- far slower
+            # than the scaled 100 B/s minimum (which would need one byte
+            # every 0.01s to keep pace) -- kept up for well longer than
+            # the scaled 1.5s hard ceiling.
+            dribbler = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            dribbler.sendall(partial_request)
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=2),
+                "the dribbler's connection was never even admitted",
+            )
+
+            stop_dribbling = threading.Event()
+
+            def dribble():
+                while not stop_dribbling.is_set():
+                    try:
+                        dribbler.sendall(b"z")
+                    except OSError:
+                        return
+                    stop_dribbling.wait(0.15)
+
+            dribble_thread = threading.Thread(target=dribble, daemon=True)
+            dribble_thread.start()
+
+            def _stop_dribbler():
+                stop_dribbling.set()
+                dribble_thread.join(timeout=5)
+                try:
+                    dribbler.close()
+                except OSError:
+                    pass
+
+            self.addCleanup(_stop_dribbler)
+
+            freed_at = self._wait_for_inflight(proxy, 0, timeout=5)
+            self.assertIsNotNone(
+                freed_at,
+                "ATTACK: the dribbling client on the ADMITTED path was never reaped -- "
+                "it held its concurrency slot indefinitely",
+            )
+            self.assertFalse(
+                stop_dribbling.is_set(),
+                "the dribbler must still be dribbling at the moment its slot is freed -- "
+                "otherwise the release could just be an ordinary close, not the deadline",
+            )
+
+            # The slot must be genuinely USABLE again, not merely counted
+            # as free: a legitimate client must be served.
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                "a legitimate client must be served once the dribbler's slot is freed",
+            )
+
+    # ------------------------------------------------------------------
+    # T-B (anti-vacuity control for T-A/the fix): an HONEST client that
+    # sends a large body SLOWLY but AT OR ABOVE
+    # ``_CLIENT_REQUEST_MIN_BYTES_PER_SECOND`` must get its normal
+    # response, even though its total transfer time exceeds
+    # ``_CLIENT_REQUEST_INITIAL_SECONDS``. Without this test, "refuse
+    # everything slow" (e.g. deleting the extension logic entirely) would
+    # pass T-A for the wrong reason -- see mutation M2 in the
+    # implementation report.
+    # ------------------------------------------------------------------
+    def test_client_at_or_above_minimum_rate_is_not_refused(self):
+        with unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_INITIAL_SECONDS", 1.0), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_MIN_BYTES_PER_SECOND", 200), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_HARD_DEADLINE_SECONDS", 10.0):
+
+            received = {}
+
+            def responder(handler):
+                received["body"] = _read_request_body(handler)
+                payload = b'{"ok":true}'
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                handler.wfile.write(payload)
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+            # 4 chunks of 250 bytes (1000 bytes total), spaced 1.0s apart
+            # -- 250 B/s, comfortably ABOVE the scaled 200 B/s minimum --
+            # sent over roughly 3s total, more than 3x the scaled 1.0s
+            # initial grace period, and still well inside the scaled 10s
+            # hard ceiling.
+            chunk = b"y" * 250
+            body = chunk * 4
+            sock = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=15)
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n"
+            )
+            started = time.monotonic()
+            for _ in range(4):
+                sock.sendall(chunk)
+                time.sleep(1.0)
+            elapsed_sending = time.monotonic() - started
+
+            response = b""
+            sock.settimeout(10)
+            try:
+                while True:
+                    piece = sock.recv(4096)
+                    if not piece:
+                        break
+                    response += piece
+            except socket.timeout:
+                pass
+            sock.close()
+
+            self.assertGreater(
+                elapsed_sending, 1.0,
+                "test setup error: this must exceed the scaled initial grace period "
+                "for the extension logic to actually be exercised",
+            )
+            self.assertIn(b" 200 ", response, f"an at-or-above-minimum-rate client must not be refused: {response!r}")
+            self.assertEqual(received["body"], body, "the full body must reach the upstream engine intact")
+
+    # ------------------------------------------------------------------
+    # T-C: the hard ceiling bounds even a client that never dips below
+    # the minimum rate -- without it, the extension rule in T-B would be
+    # unbounded (see mutation M3 in the implementation report).
+    # ------------------------------------------------------------------
+    def test_hard_ceiling_bounds_even_a_compliant_rate_client(self):
+        with unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_INITIAL_SECONDS", 0.3), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_MIN_BYTES_PER_SECOND", 50), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_HARD_DEADLINE_SECONDS", 1.0):
+
+            def responder(handler):
+                payload = b"ok"
+                handler.send_response(200)
+                handler.send_header("Content-Length", str(len(payload)))
+                handler.end_headers()
+                handler.wfile.write(payload)
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+            sock = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n")
+            connected_at = time.monotonic()
+            self.assertIsNotNone(
+                self._wait_for_inflight(proxy, 1, timeout=2),
+                "the compliant-rate client's connection was never even admitted",
+            )
+
+            stop_sending = threading.Event()
+
+            def keep_sending_at_compliant_rate():
+                # 15 bytes every 0.2s = 75 B/s, comfortably ABOVE the
+                # scaled 50 B/s minimum -- would extend the deadline
+                # forever if there were no hard ceiling.
+                while not stop_sending.is_set():
+                    try:
+                        sock.sendall(b"X-Pad: " + b"a" * 8)  # filler bytes, deliberately no newline
+                    except OSError:
+                        return
+                    stop_sending.wait(0.2)
+
+            sender = threading.Thread(target=keep_sending_at_compliant_rate, daemon=True)
+            sender.start()
+
+            def _stop_sender():
+                stop_sending.set()
+                sender.join(timeout=5)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            self.addCleanup(_stop_sender)
+
+            freed_at = self._wait_for_inflight(proxy, 0, timeout=5)
+            self.assertIsNotNone(
+                freed_at,
+                "a client that never dips below the minimum rate was never cut off -- "
+                "the hard ceiling appears to be missing or unbounded",
+            )
+            self.assertFalse(
+                stop_sending.is_set(),
+                "the client must still be sending at a compliant rate when its slot is freed",
+            )
+            elapsed = freed_at - connected_at
+            hard_deadline = FASTMLX_PROXY._CLIENT_REQUEST_HARD_DEADLINE_SECONDS
+            self.assertGreaterEqual(
+                elapsed, hard_deadline * 0.8,
+                f"cut off too EARLY ({elapsed:.3f}s) relative to the {hard_deadline}s hard "
+                "ceiling -- this must be the ceiling firing, not the initial grace period",
+            )
+            self.assertLess(
+                elapsed, hard_deadline + 2.0,
+                f"cut off too LATE ({elapsed:.3f}s) relative to the {hard_deadline}s hard ceiling",
+            )
+
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(
+                resp.status, 200,
+                "a legitimate client must be served once the compliant-rate client's "
+                "slot is freed by the hard ceiling",
+            )
+
+    # ------------------------------------------------------------------
+    # T-D: the request-receive deadline must NOT cut an SSE stream short
+    # -- it bounds RECEIVING the request only. Constants scaled SHORT so
+    # a stream whose generation deliberately outlasts the deadline must
+    # still complete successfully; reuses the existing gated-SSE fake-
+    # upstream pattern from
+    # ``test_streaming_sse_response_holds_its_slot_for_the_whole_
+    # generation`` above.
+    # ------------------------------------------------------------------
+    def test_sse_stream_is_not_cut_by_the_request_receive_deadline(self):
+        with unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_INITIAL_SECONDS", 0.2), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_MIN_BYTES_PER_SECOND", 1), \
+             unittest.mock.patch.object(FASTMLX_PROXY, "_CLIENT_REQUEST_HARD_DEADLINE_SECONDS", 0.5):
+
+            release_rest = threading.Event()
+
+            def responder(handler):
+                _read_request_body(handler)
+                handler.send_response(200)
+                handler.send_header("Content-Type", "text/event-stream")
+                handler.end_headers()
+                handler.wfile.write(b"data: chunk1\n\n")
+                handler.wfile.flush()
+                # Longer than the scaled 0.5s hard ceiling above -- if the
+                # deadline wrongly covered response generation, this
+                # would be cut off before chunk2 is ever sent.
+                self.assertTrue(release_rest.wait(timeout=10), "test never released the gate")
+                handler.wfile.write(b"data: chunk2\n\n")
+                handler.wfile.flush()
+
+            upstream = start_fake_upstream(responder)
+            self._servers.append(upstream)
+            proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+            received_first = threading.Event()
+            stream_result = {}
+
+            def read_stream():
+                conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=10)
+                conn.request("GET", "/v1/stream")
+                resp = conn.getresponse()
+                first = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1)
+                stream_result["first"] = first
+                received_first.set()
+                stream_result["rest"] = resp.read()
+                conn.close()
+
+            reader = threading.Thread(target=read_stream)
+            reader.start()
+            self.assertTrue(received_first.wait(timeout=5), "client never received the first SSE chunk")
+
+            time.sleep(1.0)  # well past the scaled 0.5s hard ceiling
+            release_rest.set()
+            reader.join(timeout=5)
+
+            self.assertEqual(
+                stream_result.get("first", b"") + stream_result.get("rest", b""),
+                b"data: chunk1\n\ndata: chunk2\n\n",
+                "the SSE stream must complete in full -- the request-receive deadline "
+                "must never bound response generation",
+            )
 
 
 class ProxyExpect100ContinueTests(unittest.TestCase):
