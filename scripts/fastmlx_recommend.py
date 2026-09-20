@@ -176,6 +176,19 @@ def _card_summary(card: Optional[dict]) -> Optional[dict]:
         if isinstance(speed_x, (int, float)) and not isinstance(speed_x, bool):
             summary["speedX"] = speed_x
         summary["speedXStatus"] = status
+    fit = benefit.get("fit")
+    if isinstance(fit, str) and fit:
+        # Named `benefitFit`, deliberately NOT `fit`: `row["fit"]` (see
+        # `build_row`) already holds the LIVE fit-check verdict dict
+        # (`verdict`/`context`) this host measured for this candidate at
+        # the requested context. A card's benefit.fit is a different fact
+        # -- a footprint and which Mac CLASSES the pack fits, read from the
+        # quality-card store. Two keys both named `fit` in one `--json`
+        # document would be exactly the mislabeling class this field
+        # exists to repair; keeping this independent of the speedXStatus
+        # branch above is deliberate too, since a card can carry a fit
+        # sentence with no measured speed at all (most published cards do).
+        summary["benefitFit"] = fit
     return summary
 
 
@@ -457,6 +470,22 @@ def _format_row_text(rank: int, row: dict) -> str:
         )
         if benefit_line:
             lines.append(f"    speed: {benefit_line}")
+
+        # Labelled `card fit:`, never a bare `fit:` -- the row HEAD above
+        # already prints `fit=<verdict> context=<n>`, THIS host's live
+        # measured verdict from the fit-check binary at the requested
+        # context. The card's sentence is a DIFFERENT fact (a footprint
+        # and which Mac classes the pack fits, read from the quality-card
+        # store) that can disagree with the head's verdict on this very
+        # row -- two bare "fit"s that can disagree is worse than the
+        # omission this repairs. `card fit:` attributes the sentence to
+        # its source instead of asserting a provenance ("sized from
+        # headers" or similar) the card's own sentence does not claim.
+        fit_line = launch.card_fit_line(
+            {"legible": {"benefit": {"fit": card.get("benefitFit")}}}
+        )
+        if fit_line:
+            lines.append(f"    card fit: {fit_line}")
 
     tail = f"    [{row['status']}]"
     if row.get("message"):

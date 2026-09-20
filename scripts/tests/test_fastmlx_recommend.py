@@ -59,6 +59,16 @@ SLOWDOWN_REPO = "example/SlowdownModel"
 SLOWDOWN_CARD_ID = "fixture-slowdown@test"
 SLOWDOWN_HEADLINE = "Slower mixed pack; near-lossless drift."
 
+# The cycle-106 defect this file's new tests pin: `legible.benefit.fit` (a
+# footprint + which Mac classes a pack fits) never survived into a
+# `recommend` row at all -- for FOUR of the six real published cards, `fit`
+# is the pack's ONLY benefit (their `speedX` is null), so those packs were
+# presented as pure cost with their entire upside dropped. Fit text below
+# is deliberately distinct from any headline/tier string already in this
+# file, so a clause split can never accidentally match the wrong text.
+PASS_FIT_TEXT = "20.7 GB — fits a 24 GB Mac"
+MIXED_SPEED_FIT_TEXT = "12.3 GB — fits an 18 GB Mac"
+
 # An hfPin-only NO_GO card (no repo at all), identifying a pulled pack only
 # through the revision a pull receipt records.
 PIN_ONLY_NO_GO_CARD_ID = "fixture-pin-only-no-go@test"
@@ -280,6 +290,23 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         code, stdout, stderr = self.run_main(argv + ["--json"])
         return code, json.loads(stdout), stderr
 
+    def write_manifest_with_card_fit(self, card_id: str, fit_text: str) -> Path:
+        """A manifest byte-identical to ``fixture_manifest()`` except that
+        one named card's ``legible.benefit.fit`` is set -- written to its
+        own file rather than mutating ``self.manifest_path`` so every other
+        test in this class keeps running against the unmodified fixture.
+        """
+        manifest = fixture_manifest()
+        found = False
+        for card in manifest["cards"]:
+            if card["id"] == card_id:
+                card.setdefault("legible", {}).setdefault("benefit", {})["fit"] = fit_text
+                found = True
+        assert found, f"no fixture card {card_id!r} to attach a fit clause to"
+        path = self.root / f"manifest-with-fit-{card_id.replace('@', '-')}.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
     # ------------------------------------------------------------------
     # Classification: recommended (PASS card, green fit).
     # ------------------------------------------------------------------
@@ -362,8 +389,10 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         card = doc["rows"][0]["card"]
         self.assertNotIn("speedX", card)
         self.assertNotIn("speedXStatus", card)
+        self.assertNotIn("benefitFit", card)
         _, stdout, _ = self.run_main(self.base_argv([model_dir]))
         self.assertNotIn("speed:", stdout)
+        self.assertNotIn("card fit:", stdout)
 
     # ------------------------------------------------------------------
     # Structural guard: the CLI helper must agree with the site renderer's
@@ -383,6 +412,116 @@ class FastmlxRecommendTestCase(unittest.TestCase):
             expected = build_public_site.quality_speed_line(benefit)
             actual = launch.card_benefit_line(card)
             self.assertEqual(actual, expected, msg=f"speedX={speed_x!r}")
+
+    # ------------------------------------------------------------------
+    # cycle-106: legible.benefit.fit must survive into a recommend row and
+    # render under its own "card fit: " clause, independent of speedX.
+    # ------------------------------------------------------------------
+    def test_text_row_shows_card_fit_clause(self):
+        manifest_path = self.write_manifest_with_card_fit(
+            MIXED_SPEED_CARD_ID, MIXED_SPEED_FIT_TEXT
+        )
+        model_dir = self.make_model_dir("mixed-speed-model", repo=MIXED_SPEED_REPO)
+        _, stdout, _ = self.run_main(
+            self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+        )
+        self.assertIn(f"card fit: {MIXED_SPEED_FIT_TEXT}", stdout)
+        # The "speed: " clause (everything between "speed: " and the next
+        # "card fit: " label) must not itself contain the fit text -- the
+        # same clause-separation guard test_fastmlx_launch.py:545 uses.
+        speed_clause = stdout.split("speed: ", 1)[1].split("card fit: ", 1)[0]
+        self.assertNotIn(MIXED_SPEED_FIT_TEXT, speed_clause)
+
+    def test_json_row_carries_benefit_fit(self):
+        manifest_path = self.write_manifest_with_card_fit(
+            MIXED_SPEED_CARD_ID, MIXED_SPEED_FIT_TEXT
+        )
+        model_dir = self.make_model_dir("mixed-speed-model", repo=MIXED_SPEED_REPO)
+        code, doc, _ = self.run_json(
+            self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["rows"][0]["card"]["benefitFit"], MIXED_SPEED_FIT_TEXT)
+
+    def test_fit_clause_independent_of_speedx(self):
+        # PASS_CARD_ID's benefit has speedX=None (see fixture_manifest) --
+        # four of the six real published cards look exactly like this: a
+        # fit clause with no measured speed at all. The clause must still
+        # render.
+        manifest_path = self.write_manifest_with_card_fit(PASS_CARD_ID, PASS_FIT_TEXT)
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        _, stdout, _ = self.run_main(
+            self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+        )
+        self.assertIn(f"card fit: {PASS_FIT_TEXT}", stdout)
+
+    def test_card_fit_clause_matches_launch_helper(self):
+        # Exact string equality against launch.card_fit_line, mirroring the
+        # cross-surface pin test_speed_direction_matches_site_renderer uses
+        # for the speed clause above.
+        launch = FASTMLX_RECOMMEND.launch
+        row = {
+            "name": "x",
+            "repo": None,
+            "revision": None,
+            "residency": "resident",
+            "fit": None,
+            "card": {
+                "id": "fixture-fit-helper@test",
+                "verdict": "PASS",
+                "tier": "Reference",
+                "benefitFit": MIXED_SPEED_FIT_TEXT,
+            },
+            "status": "recommended",
+            "message": None,
+            "accept_quality_flag": None,
+            "engineBuild": None,
+            "mtp": None,
+        }
+        text = FASTMLX_RECOMMEND._format_row_text(1, row)
+        expected = launch.card_fit_line(
+            {"legible": {"benefit": {"fit": MIXED_SPEED_FIT_TEXT}}}
+        )
+        actual = text.split("card fit: ", 1)[1].splitlines()[0]
+        self.assertEqual(actual, expected)
+
+    def test_fit_clause_is_distinguishable_from_host_verdict(self):
+        # The real repro: this HOST's live fit-check verdict (RED) and the
+        # card's own sentence ("fits a 24 GB Mac") are two different facts
+        # that can disagree on one row. Both must render, and the card
+        # sentence must appear ONLY under "card fit: ", never under a bare
+        # "fit="/"fit: " token.
+        card = FASTMLX_RECOMMEND._card_summary(
+            {
+                "id": "fixture-fit-mismatch@test",
+                "verdict": "NO_GO",
+                "legible": {
+                    "tier": "Noticeable",
+                    "headline": "About 1 word in 6 differs.",
+                    "benefit": {"fit": PASS_FIT_TEXT},
+                },
+            }
+        )
+        row = {
+            "name": "optiq-pack",
+            "repo": None,
+            "revision": None,
+            "residency": "resident",
+            "fit": {"verdict": "RED", "context": 262144},
+            "card": card,
+            "status": "does-not-fit",
+            "message": None,
+            "accept_quality_flag": None,
+            "engineBuild": None,
+            "mtp": None,
+        }
+        text = FASTMLX_RECOMMEND._format_row_text(1, row)
+        self.assertIn("fit=RED", text)
+        self.assertIn(f"card fit: {PASS_FIT_TEXT}", text)
+        # Everything before the "card fit: " label (the head + any speed
+        # clause) must not itself contain the card's fit sentence.
+        before_card_fit = text.split("card fit: ", 1)[0]
+        self.assertNotIn(PASS_FIT_TEXT, before_card_fit)
 
     # ------------------------------------------------------------------
     # opt-in: NO_GO card carries the exact accept flag.

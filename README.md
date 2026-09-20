@@ -223,6 +223,12 @@ slowdown rather than dressed up as a speedup, and a pack whose speed was never m
 engine says exactly that instead of showing a number. These are the same strings the published
 quality-guide page renders, so the CLI and the site cannot drift apart.
 
+A `recommend` row can show two different fit facts, labelled separately so they are never read as
+one claim: the head's `fit=<verdict> context=<n>` is *this host's* live measured verdict from the
+fit-check binary at the requested context, while `card fit:` is what the pack's quality card states
+about which Mac classes it fits (a footprint, not a live measurement) -- the two can disagree on the
+very same row.
+
 A pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
