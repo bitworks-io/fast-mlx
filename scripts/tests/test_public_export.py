@@ -244,8 +244,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # http.client), never names a third-party engine, and its tests drive a synthetic fake upstream on
 # an ephemeral loopback port rather than any real deployment.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 998,
-    "pathModeSha256": "c3a07e8821e2f937fb3bb742d62d692424536a842ae6b3b9434f18f6e593844f",
+    "pathCount": 1000,
+    "pathModeSha256": "2ddc32edb7e0bf5cb6de8b908a91e798a3a02a8012993afb107a10046a703fe1",
 }
 
 

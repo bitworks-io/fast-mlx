@@ -24,11 +24,13 @@ Subcommands:
   directly (the research engine, an escape hatch for an operator who wants
   to bypass the fit-check/quality-admission front door on purpose), same
   resolution and passthrough rules as ``capacity``.
+- ``fastmlx bench ...``     -> ``fastmlx_bench.main`` (measure decode
+  throughput against any OpenAI-compatible endpoint).
 
-``pull``'s own ``main`` has no subparser of its own (it is a bare
-``argparse.ArgumentParser`` with a positional pinned-reference argument), so
-this dispatcher strips the leading ``pull`` word before calling it. ``serve``
-and ``recommend`` each require their own subcommand word (they use
+``pull`` and ``bench`` each have no subparser of their own (each is a bare
+``argparse.ArgumentParser`` with its own positional/flag arguments), so this
+dispatcher strips the leading ``pull``/``bench`` word before calling it.
+``serve`` and ``recommend`` each require their own subcommand word (they use
 ``add_subparsers(..., required=True)``), so this dispatcher re-adds it --
 this is why ``fastmlx serve --model-path X`` behaves exactly like
 ``python3 scripts/fastmlx_launch.py serve --model-path X``, and likewise for
@@ -58,6 +60,7 @@ def _load_sibling_module(name: str, filename: str) -> ModuleType:
 _pull = _load_sibling_module("fastmlx_pull", "fastmlx_pull.py")
 _launch = _load_sibling_module("fastmlx_launch", "fastmlx_launch.py")
 _recommend = _load_sibling_module("fastmlx_recommend", "fastmlx_recommend.py")
+_bench = _load_sibling_module("fastmlx_bench", "fastmlx_bench.py")
 
 
 # The capacity-check binary this repository ships. Unlike
@@ -81,7 +84,7 @@ ENGINE_BINARY_NAME = _launch._BUILT_IN_ENGINE_BINARY_NAME
 # falls through to ``PATH``.
 _SIBLING_BIN_DIR = Path(__file__).resolve().parent.parent.parent / "bin"
 
-SUBCOMMANDS = ("pull", "serve", "recommend", "capacity", "engine")
+SUBCOMMANDS = ("pull", "serve", "recommend", "capacity", "engine", "bench")
 
 USAGE = """usage: fastmlx <subcommand> [args ...]
 
@@ -91,6 +94,7 @@ subcommands:
   recommend   rank local model packs that fit this host by measured quality
   capacity    run the capacity-check binary directly
   engine      run the Swift serving engine binary directly (escape hatch)
+  bench       measure decode throughput against any OpenAI-compatible endpoint
 
 Run "fastmlx <subcommand> --help" for subcommand-specific help.
 """
@@ -143,6 +147,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     if subcommand == "pull":
         _pull.main(rest)
+        return
+    if subcommand == "bench":
+        _bench.main(rest)
         return
     if subcommand == "serve":
         _launch.main(["serve", *rest])

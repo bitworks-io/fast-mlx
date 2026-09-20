@@ -71,6 +71,11 @@ class UsageAndDispatchTests(unittest.TestCase):
             FASTMLX.main(["pull", "--help"])
         fake_main.assert_called_once_with(["--help"])
 
+    def test_bench_routes_to_fastmlx_bench_main_with_bench_word_stripped(self):
+        with mock.patch.object(FASTMLX._bench, "main") as fake_main:
+            FASTMLX.main(["bench", "--base-url", "http://localhost:8080"])
+        fake_main.assert_called_once_with(["--base-url", "http://localhost:8080"])
+
 
 class SubcommandHelpEquivalenceTests(unittest.TestCase):
     """fastmlx <subcommand> --help must behave exactly like invoking the

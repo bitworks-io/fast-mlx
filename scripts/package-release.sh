@@ -183,13 +183,13 @@ cp -f "$METALLIB" "$STAGE_ROOT/bin/mlx.metallib"
 chmod +x "$STAGE_ROOT/bin/fastmlx-serve" "$STAGE_ROOT/bin/fastmlx-capacity"
 
 # The `fastmlx` tooling: a thin Python dispatcher (fastmlx.py) plus the sibling modules it loads
-# by file path (pull/launch/recommend/the front-mode proxy/the HF downloader/the two fit sizers).
-# All eight must stay siblings in the same directory -- fastmlx_launch.py loads fastmlx_pull.py
-# and fastmlx_proxy.py, fastmlx_recommend.py loads fastmlx_launch.py, fastmlx_pull.py loads
-# hf_pinned_snapshot_download.py, and fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py (via
-# importlib, resolving Path(__file__).resolve().parent), each resolving the sibling path relative
-# to its own __file__.
-for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
+# by file path (pull/launch/recommend/bench/the front-mode proxy/the HF downloader/the two fit
+# sizers). All nine must stay siblings in the same directory -- fastmlx_launch.py loads
+# fastmlx_pull.py and fastmlx_proxy.py, fastmlx_recommend.py loads fastmlx_launch.py,
+# fastmlx_pull.py loads hf_pinned_snapshot_download.py, and fastmlx_safetensors_fit.py loads
+# fastmlx_gguf_fit.py (via importlib, resolving Path(__file__).resolve().parent), each resolving
+# the sibling path relative to its own __file__.
+for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend fastmlx_bench hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
   cp -f "$REPO_ROOT/scripts/${name}.py" "$STAGE_ROOT/libexec/scripts/${name}.py"
 done
 # The two fit sizers are exec'd directly (fastmlx_launch.py's --fit-check-bin), unlike the other
@@ -345,6 +345,7 @@ class Fastmlx < Formula
     (libexec/"scripts").install "scripts/fastmlx_launch.py"
     (libexec/"scripts").install "scripts/fastmlx_proxy.py"
     (libexec/"scripts").install "scripts/fastmlx_recommend.py"
+    (libexec/"scripts").install "scripts/fastmlx_bench.py"
     (libexec/"scripts").install "scripts/hf_pinned_snapshot_download.py"
     (libexec/"scripts").install "scripts/fastmlx_gguf_fit.py"
     (libexec/"scripts").install "scripts/fastmlx_safetensors_fit.py"
