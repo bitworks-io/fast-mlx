@@ -1039,6 +1039,315 @@ class ProxyRequestValidationTests(unittest.TestCase):
         self.assertLessEqual(timeout, 300)
 
 
+class ProxyExpect100ContinueTests(unittest.TestCase):
+    """A client sending ``Expect: 100-continue`` must get an interim ``100
+    Continue`` promptly, not hang until ITS OWN timeout fires and it sends
+    the body unprompted anyway (curl's behavior: wait ~1s, then send). Root
+    cause: ``BaseHTTPRequestHandler.parse_request`` only calls
+    ``handle_expect_100`` when ``self.protocol_version >= "HTTP/1.1"`` --
+    since ``ProvenanceProxyHandler.protocol_version`` is pinned to
+    ``HTTP/1.0`` (deliberately, see the comment above that assignment), the
+    base class never even reaches ``handle_expect_100`` for ANY request,
+    regardless of what the client sent. See ``ProvenanceProxyHandler``'s own
+    ``parse_request``/``handle_expect_100`` overrides for the fix.
+    """
+
+    def setUp(self):
+        self._listeners = []
+        self._servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+            server._test_thread.join(timeout=5)
+        for listener in self._listeners:
+            listener.close()
+
+    def _start_upstream(self, handle_conn):
+        listener, _thread = _start_raw_socket_upstream(handle_conn)
+        self._listeners.append(listener)
+        return listener
+
+    def _start_proxy(self, upstream_port: int, **kwargs):
+        server = FASTMLX_PROXY.create_server(
+            "127.0.0.1", 0, "127.0.0.1", upstream_port, FIXTURE_PLAN, **kwargs
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        server._test_thread = thread
+        self._servers.append(server)
+        return server
+
+    # 1. A request with Expect: 100-continue AND a body must complete
+    #    promptly (well under curl's own 1s wait-then-send-anyway window),
+    #    and the 100 Continue interim line must arrive BEFORE the client
+    #    writes the body -- proven with a raw socket so the handshake
+    #    order is under this test's control, not http.client's.
+    def test_expect_100_continue_with_body_completes_promptly_and_in_order(self):
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            payload = b'{"ok":true}'
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+            )
+
+        listener = self._start_upstream(handle)
+        server = self._start_proxy(listener.getsockname()[1])
+
+        sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
+        sock.settimeout(5)
+        body = b'{"x":1}'
+        started = time.monotonic()
+        sock.sendall(
+            b"POST /v1/chat HTTP/1.1\r\n"
+            b"Host: x\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n"
+        )
+
+        # Read exactly the interim status line (up to its terminating
+        # blank line) BEFORE sending the body -- if the proxy never sends
+        # 100 Continue, this recv blocks until the 5s socket timeout,
+        # which the wall-clock assertion below would also catch, but the
+        # explicit read-before-write here is the ordering proof itself:
+        # the body is not written until the interim response is in hand.
+        interim = b""
+        while b"\r\n\r\n" not in interim:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            interim += chunk
+        interim_elapsed = time.monotonic() - started
+        self.assertIn(b"100 Continue", interim, "no 100 Continue interim response received")
+
+        sock.sendall(body)
+
+        response = b""
+        while b"\r\n\r\n" not in response or not response.endswith(b'{"ok":true}'):
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        total_elapsed = time.monotonic() - started
+        sock.close()
+
+        self.assertLess(
+            interim_elapsed, 0.5, "100 Continue interim response was not prompt"
+        )
+        self.assertLess(
+            total_elapsed, 0.5, "request did not complete promptly (curl's own hang window is ~1s)"
+        )
+        self.assertIn(b"200 OK", response)
+        self.assertIn(b'{"ok":true}', response)
+        # The FINAL response on THIS SAME request/connection -- the one
+        # that already went through the 100-continue handshake -- must
+        # still be framed HTTP/1.0, exactly like a request with no Expect
+        # header at all (see test_normal_request_without_expect_is_byte_
+        # identical for the no-Expect case). Answering the interim
+        # handshake must never leak into or alter the final response's own
+        # status line.
+        self.assertTrue(
+            response.startswith(b"HTTP/1.0 200 OK\r\n"),
+            f"final response framing changed after the 100-continue handshake: {response[:40]!r}",
+        )
+
+    # 2. Pin the exact interim status line this proxy emits. RFC 7231
+    #    ties 100 Continue to HTTP/1.1 semantics (a client is only
+    #    supposed to SEND Expect: 100-continue when it can handle an
+    #    HTTP/1.1 response), so the interim line's version token
+    #    intentionally reflects the CLIENT's own request version, not
+    #    ``protocol_version`` (the pin that governs only the FINAL
+    #    response's framing -- see the comment on ``handle_expect_100``
+    #    below for why the two are independent).
+    def test_interim_continue_line_is_pinned_http11(self):
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            payload = b"ok"
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(payload)).encode("ascii")
+                + b"\r\n\r\n" + payload
+            )
+
+        listener = self._start_upstream(handle)
+        server = self._start_proxy(listener.getsockname()[1])
+
+        sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
+        sock.settimeout(5)
+        body = b"x"
+        sock.sendall(
+            b"POST /v1/chat HTTP/1.1\r\n"
+            b"Host: x\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n"
+        )
+        interim = b""
+        while b"\r\n\r\n" not in interim:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            interim += chunk
+        sock.sendall(body)
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+        sock.close()
+
+        self.assertEqual(interim, b"HTTP/1.1 100 Continue\r\n\r\n")
+
+    # 3. Anti-regression: a normal request WITHOUT Expect: is byte-
+    #    identical to before this change -- same status line, same header
+    #    set, same framing. This is the invariant guarding the deliberate
+    #    HTTP/1.0 pin: the interim-response fix must be additive-only.
+    def test_normal_request_without_expect_is_byte_identical(self):
+        def responder(handler):
+            payload = b'{"ok":true}'
+            handler.send_response(201)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        server = FASTMLX_PROXY.create_server(
+            "127.0.0.1", 0, "127.0.0.1", upstream.server_address[1], FIXTURE_PLAN
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        server._test_thread = thread
+        self._servers.append(server)
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=b'{"x":1}',
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+
+        self.assertEqual(resp.status, 201)
+        self.assertEqual(resp.version, 10)  # HTTP/1.0, exactly as before this change
+        self.assertEqual(body, b'{"ok":true}')
+        self.assertEqual(resp.getheader("Content-Type"), "application/json")
+        self.assertEqual(resp.getheader("Content-Length"), str(len(body)))
+        self.assertIsNotNone(resp.getheader("X-FastMLX-Admission"))
+        # A second request on a NEW connection must see the exact same
+        # framing/header shape -- proves the fix has no per-connection
+        # state that could leak between requests.
+        conn.close()
+        conn2 = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn2.request("GET", "/v1/models")
+        resp2 = conn2.getresponse()
+        resp2.read()
+        self.assertEqual(resp2.version, 10)
+        conn2.close()
+
+    # 4. Expect: 100-continue with NO body (zero-length) must still
+    #    complete promptly, never hang waiting for a body that never
+    #    comes.
+    def test_expect_100_continue_with_no_body_does_not_hang(self):
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            payload = b"ok"
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(payload)).encode("ascii")
+                + b"\r\n\r\n" + payload
+            )
+
+        listener = self._start_upstream(handle)
+        server = self._start_proxy(listener.getsockname()[1])
+
+        sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
+        sock.settimeout(5)
+        started = time.monotonic()
+        sock.sendall(
+            b"GET /v1/models HTTP/1.1\r\n"
+            b"Host: x\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        elapsed = time.monotonic() - started
+        sock.close()
+
+        self.assertLess(elapsed, 0.5, "zero-length-body Expect: 100-continue must not hang")
+        self.assertIn(b"100 Continue", response)
+        self.assertIn(b"200 OK", response)
+        self.assertIn(b"ok", response)
+
+    # 5. RFC 7231 5.1.1: a server MUST NOT send a 100 (Continue) response
+    #    to a request from an HTTP/1.0 (or earlier) client, even when that
+    #    client sends an Expect header -- an HTTP/1.0 client is not
+    #    required to understand an interim 1xx response and could mis-
+    #    frame it as the final one. This is the CLIENT's own
+    #    ``request_version`` (stdlib ``self.request_version``), a THIRD
+    #    condition distinct from both the Expect-header check above and
+    #    ``protocol_version`` (the SERVER's own deliberate HTTP/1.0 pin,
+    #    see the comment on that assignment) -- see ``parse_request``'s
+    #    docstring for why this override keeps this one while dropping
+    #    ``protocol_version``.
+    def test_http10_client_sending_expect_gets_no_interim_continue(self):
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            payload = b"ok"
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(payload)).encode("ascii")
+                + b"\r\n\r\n" + payload
+            )
+
+        listener = self._start_upstream(handle)
+        server = self._start_proxy(listener.getsockname()[1])
+
+        sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5)
+        sock.settimeout(5)
+        body = b'{"x":1}'
+        started = time.monotonic()
+        # The full request, including body, in one write: an HTTP/1.0
+        # client is not obligated to wait for any interim response before
+        # sending its body, so this test never waits on one either -- the
+        # bound below is what catches a hang if the fix regresses.
+        sock.sendall(
+            b"POST /v1/chat HTTP/1.0\r\n"
+            b"Host: x\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+        )
+        response = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        elapsed = time.monotonic() - started
+        sock.close()
+
+        self.assertLess(
+            elapsed, 0.5,
+            "an HTTP/1.0 client with Expect: 100-continue must not hang -- the "
+            "absence of an interim response must not become a new hang",
+        )
+        self.assertNotIn(
+            b"100 Continue", response,
+            "RFC 7231 5.1.1 forbids a 100 (Continue) interim response to an "
+            "HTTP/1.0 client",
+        )
+        self.assertIn(b"200 OK", response)
+        self.assertIn(b"ok", response)
+
+
 class ProxyLogAtomicityTests(unittest.TestCase):
     """L8: the JSONL log line is written with a SINGLE stderr.write call
     (then flushed) -- two concurrent requests' lines must never be able to

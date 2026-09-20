@@ -1807,6 +1807,228 @@ class PublicDeploymentBehaviorTests(unittest.TestCase):
                     path, "receipt", offline.RAW_RECEIPT_LIMIT
                 )
 
+    def _main_argv_with_output(self, root: Path, output: Path) -> list[str]:
+        site = self.make_site(root)
+        return [
+            "--repository-root", str(REPOSITORY_ROOT),
+            "--site", str(site),
+            "--deployment-url", online.ACCEPTED_BASE_URL,
+            "--commit-sha", self.commit_sha,
+            "--workflow-run-id", str(self.run_id),
+            "--workflow-run-attempt", str(self.run_attempt),
+            "--output", str(output),
+        ]
+
+    def test_main_reports_refusal_reason_on_stderr_when_output_parent_is_symlinked(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real_target = root / "real-output-dir"
+            real_target.mkdir()
+            symlinked_parent = root / "linked-output-dir"
+            symlinked_parent.symlink_to(real_target, target_is_directory=True)
+            output = symlinked_parent / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            self.assertTrue(
+                stderr.getvalue().startswith("verify-public-deployment: refused: "),
+                stderr.getvalue(),
+            )
+            self.assertIn(
+                "output parent must be an existing non-symlink directory",
+                stderr.getvalue(),
+            )
+
+    def test_main_leaves_stdout_empty_when_refusing_symlinked_output_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real_target = root / "real-output-dir"
+            real_target.mkdir()
+            symlinked_parent = root / "linked-output-dir"
+            symlinked_parent.symlink_to(real_target, target_is_directory=True)
+            output = symlinked_parent / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+
+    def test_main_reports_invocation_error_reason_on_stderr(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = online.main([])
+
+        self.assertEqual(exit_code, 2)
+        self.assertTrue(
+            stderr.getvalue().startswith(
+                "verify-public-deployment: invocation error: "
+            ),
+            stderr.getvalue(),
+        )
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_main_reports_internal_error_reason_on_stderr_when_inventory_site_raises(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                online.validate_public_site, "validate", return_value=[]
+            ), mock.patch.object(
+                online, "inventory_site", side_effect=RuntimeError("sanitized boom")
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            stderr_value = stderr.getvalue()
+            self.assertTrue(
+                stderr_value.startswith(
+                    "verify-public-deployment: internal error: "
+                ),
+                stderr_value,
+            )
+            self.assertNotIn("during verification", stderr_value)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse(output.exists())
+
+    def test_main_reports_internal_error_during_verification_reason_on_stderr(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                online.validate_public_site, "validate", return_value=[]
+            ), mock.patch.object(
+                online,
+                "verify_public_deployment",
+                side_effect=RuntimeError("sanitized boom"),
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            stderr_value = stderr.getvalue()
+            self.assertTrue(
+                stderr_value.startswith(
+                    "verify-public-deployment: internal error during verification: "
+                ),
+                stderr_value,
+            )
+            # The two "internal error" categories share a common prefix;
+            # confirm the exact-category text discriminates them.
+            self.assertFalse(
+                stderr_value.startswith(
+                    "verify-public-deployment: internal error: "
+                ),
+                stderr_value,
+            )
+            self.assertEqual(stdout.getvalue(), "")
+            # The nested internal-error-receipt path must have run and
+            # written a receipt via the real (unmocked) writer.
+            self.assertTrue(output.exists())
+
+    def test_main_reports_could_not_write_receipt_reason_on_stderr_for_ordinary_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                online.validate_public_site, "validate", return_value=[]
+            ), mock.patch.object(
+                online,
+                "verify_public_deployment",
+                return_value=(1, {"result": "FAIL"}),
+            ), mock.patch.object(
+                online,
+                "write_receipt_exclusive",
+                side_effect=OSError("sanitized disk full"),
+            ) as write_mock, redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            stderr_value = stderr.getvalue()
+            self.assertTrue(
+                stderr_value.startswith(
+                    "verify-public-deployment: could not write receipt: "
+                ),
+                stderr_value,
+            )
+            self.assertEqual(stdout.getvalue(), "")
+            write_mock.assert_called_once()
+            self.assertFalse(output.exists())
+
+    def test_main_reports_could_not_write_receipt_reason_on_stderr_for_nested_internal_error_receipt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                online.validate_public_site, "validate", return_value=[]
+            ), mock.patch.object(
+                online,
+                "verify_public_deployment",
+                side_effect=RuntimeError("sanitized boom"),
+            ), mock.patch.object(
+                online,
+                "write_receipt_exclusive",
+                side_effect=OSError("sanitized disk full"),
+            ) as write_mock, redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            # Both the outer "internal error during verification" print and
+            # the nested "could not write receipt" print must fire, in order.
+            lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(lines), 2, stderr.getvalue())
+            self.assertTrue(
+                lines[0].startswith(
+                    "verify-public-deployment: internal error during verification: "
+                ),
+                lines[0],
+            )
+            self.assertTrue(
+                lines[1].startswith(
+                    "verify-public-deployment: could not write receipt: "
+                ),
+                lines[1],
+            )
+            self.assertEqual(stdout.getvalue(), "")
+            write_mock.assert_called_once()
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

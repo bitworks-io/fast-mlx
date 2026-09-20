@@ -19,6 +19,9 @@ from scripts.tests.test_fastmlx_launch import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+README = REPO_ROOT / "README.md"
+
 RECOMMEND_PATH = Path(__file__).resolve().parents[1] / "fastmlx_recommend.py"
 _SPEC = importlib.util.spec_from_file_location("fastmlx_recommend", RECOMMEND_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -442,6 +445,57 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(doc["rows"][0]["card"]["benefitFit"], MIXED_SPEED_FIT_TEXT)
+
+    # ------------------------------------------------------------------
+    # README drift pin: the --json field emitted by `_card_summary` for a
+    # card's own fit sentence must stay documented, under its REAL name --
+    # not a name hardcoded on both sides, which could drift with the code
+    # and still "pass". Derive the emitted key from a real _card_summary()
+    # call (diffing a card with legible.benefit.fit set against one
+    # without) so a future rename fails this test instead of silently
+    # leaving README.md describing a key `_card_summary` no longer emits.
+    # ------------------------------------------------------------------
+    def test_readme_documents_the_real_card_benefit_fit_key(self):
+        card_with_fit = {
+            "id": "readme-pin@test",
+            "verdict": "PASS",
+            "legible": {"benefit": {"fit": "fits a 24 GB Mac"}},
+        }
+        card_without_fit = {"id": "readme-pin@test", "verdict": "PASS", "legible": {}}
+        summary_with = FASTMLX_RECOMMEND._card_summary(card_with_fit)
+        summary_without = FASTMLX_RECOMMEND._card_summary(card_without_fit)
+        new_keys = set(summary_with) - set(summary_without)
+        self.assertEqual(
+            len(new_keys),
+            1,
+            msg=f"expected exactly one new key when only benefit.fit is set, got {new_keys}",
+        )
+        emitted_key = new_keys.pop()
+        readme_text = README.read_text(encoding="utf-8")
+        self.assertIn(
+            f"`{emitted_key}`",
+            readme_text,
+            msg=(
+                f"README.md must document the --json field `{emitted_key}` "
+                "(the name _card_summary currently emits for a card's own fit "
+                "sentence) so a --json consumer is not forced to read source"
+            ),
+        )
+        # It must also be documented as a fact DISTINCT from the row's own
+        # live fit-check verdict key -- not merged/aliased to plain `fit`.
+        # Clamp the window start at 0: a negative slice start would wrap to
+        # the END of README.md and assert against unrelated prose, which is a
+        # silent false pass rather than a failure.
+        mention = readme_text.index(f"`{emitted_key}`")
+        benefit_fit_paragraph = readme_text[max(0, mention - 200) : mention + 200]
+        self.assertIn(
+            "`fit`",
+            benefit_fit_paragraph,
+            msg=(
+                f"README.md's `{emitted_key}` documentation must call out the row's own "
+                "live `fit` verdict as the distinct fact it is not merged into"
+            ),
+        )
 
     def test_fit_clause_independent_of_speedx(self):
         # PASS_CARD_ID's benefit has speedX=None (see fixture_manifest) --

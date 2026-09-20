@@ -200,6 +200,98 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
     def version_string(self) -> str:
         return self.server_version
 
+    def parse_request(self) -> bool:
+        """Identical to the base class, PLUS answering the ``Expect:
+        100-continue`` handshake the base class itself never reaches here.
+
+        ``BaseHTTPRequestHandler.parse_request`` gates its own call to
+        ``self.handle_expect_100()`` on THREE conditions (see stdlib
+        ``http/server.py``): the ``Expect`` header itself, ``self.
+        protocol_version >= "HTTP/1.1"``, and ``self.request_version >=
+        "HTTP/1.1"``. This override reproduces the Expect check and the
+        ``request_version`` check, but DROPS the ``protocol_version`` one:
+
+        - ``protocol_version`` (dropped, deliberately): pinned to
+          ``"HTTP/1.0"`` above for the response-framing reason explained in
+          the comment on that assignment (see ``:170-180``), which makes
+          the base class's gate permanently false and its own Expect
+          handling simply dead code on this handler, for every request,
+          regardless of what the client sent. A client that sends
+          ``Expect: 100-continue`` (curl does this by default for any
+          request with a body) then waits for the interim response that
+          never arrives, and eventually times out and sends the body
+          anyway.
+        - ``request_version`` (kept): this is the CLIENT's own declared
+          HTTP version, not this server's framing pin, and RFC 7231 5.1.1
+          says a server MUST NOT send a ``100 (Continue)`` response to a
+          request from an HTTP/1.0 (or earlier) client -- such a client is
+          not required to understand an interim 1xx response and could
+          mis-frame it as the final one. Dropping ``protocol_version``
+          above must not also silently drop this independent,
+          client-version-based precondition.
+
+        This override calls the base implementation first (unchanged:
+        request-line parsing, header parsing, ``Connection`` handling), then
+        re-examines the same ``Expect``/``request_version`` pair WITHOUT the
+        ``protocol_version`` gate and answers it via
+        ``handle_expect_100()`` below. This happens before ``_dispatch``
+        reads the body (``self.rfile.read(content_length)``), which is what
+        makes the interim response actually useful rather than a race.
+        """
+        if not super().parse_request():
+            return False
+        if (self.headers.get("Expect", "").lower() == "100-continue"
+                and self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
+
+    def handle_expect_100(self) -> bool:
+        """Writes the ``100 Continue`` interim response and FLUSHES it,
+        then returns ``True`` to tell ``parse_request`` (see override
+        above) to keep processing the request.
+
+        This is safe under the ``protocol_version = "HTTP/1.0"`` pin
+        (see the comment on that assignment) precisely because an interim
+        1xx response is not "the response" that pin's reasoning is about:
+        it carries no ``Content-Length``, negotiates no persistence, and
+        is always followed by exactly one real, final response on the
+        same connection -- the framing contract described there is
+        entirely about that final response, which this method never
+        touches (contrast with the anti-regression test in
+        ``scripts/tests/test_fastmlx_proxy.py`` pinning that the final
+        response is byte-identical whether or not this method ran).
+        Using ``self.protocol_version`` for the FINAL response is what
+        keeps close-delimited framing simple; the interim line's own
+        version token is independent of that and is pinned to
+        ``HTTP/1.1`` instead, because RFC 7231 5.1.1 ties ``100
+        (Continue)`` to HTTP/1.1 semantics -- a client is only supposed to
+        send ``Expect: 100-continue`` when it can handle an HTTP/1.1
+        response, so ``HTTP/1.1 100 Continue`` is the correct token for
+        THIS line regardless of what the final response is framed as.
+
+        The explicit ``self.wfile.flush()`` below matches this proxy's own
+        convention in ``_respond_streamed`` (also flushed after every
+        ``write``): ``BaseHTTPRequestHandler.end_headers()`` /
+        ``flush_headers()`` write the buffered header bytes to ``wfile``
+        but never call ``flush()`` themselves, unlike
+        ``handle_one_request()``'s own trailing flush for a NORMAL
+        response. This handler's ``wfile`` happens to be unbuffered under
+        CPython's stdlib defaults (``StreamRequestHandler.wbufsize == 0``,
+        never overridden here), so ``write()`` alone already reaches the
+        socket immediately today -- the explicit flush is a defensive,
+        essentially free belt-and-suspenders call that keeps this method
+        correct even if that buffering default ever changed, not a fix for
+        an observed buffering delay in THIS stdlib version (confirmed by
+        mutation testing: removing it alone does not reproduce a hang).
+        """
+        try:
+            self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return False
+        return True
+
     def log_message(self, *args, **kwargs) -> None:  # noqa: D401
         # The stdlib default writes an access-log line straight to stderr;
         # this proxy does its own structured JSONL logging in `_log`

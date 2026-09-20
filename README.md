@@ -227,7 +227,10 @@ A `recommend` row can show two different fit facts, labelled separately so they 
 one claim: the head's `fit=<verdict> context=<n>` is *this host's* live measured verdict from the
 fit-check binary at the requested context, while `card fit:` is what the pack's quality card states
 about which Mac classes it fits (a footprint, not a live measurement) -- the two can disagree on the
-very same row.
+very same row. `recommend --json` carries the same two facts under two different keys: a row's own
+`fit` is this host's live verdict, and its `card` object's `benefitFit` is the card's fit sentence
+(`null` when the card has none) -- never merged into one `fit` key, and a `--json` consumer that only
+reads `fit` misses the card's own claim.
 
 A pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot

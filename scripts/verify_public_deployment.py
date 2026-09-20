@@ -1208,29 +1208,57 @@ def internal_error_receipt(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Exit codes are a fixed CI contract: every failing path below still
+    # returns 2 and the success path still returns `exit_code` unchanged.
+    # Do NOT split the exit codes to signal the failure category -- the
+    # category belongs in the stderr diagnostic message, not the exit code.
     argv = sys.argv[1:] if argv is None else argv
     try:
         arguments = parse_fixed_cli(argv)
         local = validate_local_inputs(arguments)
         inventory = inventory_site(local.site, local.commit_sha)
-    except (InvocationError, Refusal):
+    except InvocationError as exc:
+        print(f"verify-public-deployment: invocation error: {exc}", file=sys.stderr)
         return 2
-    except Exception:
+    except Refusal as exc:
+        print(f"verify-public-deployment: refused: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(
+            "verify-public-deployment: internal error: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 2
 
     try:
         exit_code, receipt = verify_public_deployment(local, inventory)
-    except Exception:
+    except Exception as exc:
+        print(
+            "verify-public-deployment: internal error during verification: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         try:
             receipt = internal_error_receipt(local, inventory)
             write_receipt_exclusive(local.output, receipt)
-        except Exception:
+        except Exception as inner_exc:
+            print(
+                "verify-public-deployment: could not write receipt: "
+                f"{type(inner_exc).__name__}: {inner_exc}",
+                file=sys.stderr,
+            )
             return 2
         return 2
 
     try:
         write_receipt_exclusive(local.output, receipt)
-    except Exception:
+    except Exception as exc:
+        print(
+            "verify-public-deployment: could not write receipt: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 2
     return exit_code
 
