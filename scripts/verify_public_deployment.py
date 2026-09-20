@@ -129,6 +129,19 @@ class InvocationError(Exception):
     """Invalid public CLI usage."""
 
 
+class HelpRequested(Exception):
+    """A standalone --help/-h request; not a failure.
+
+    Carries the argparse-generated help text so ``main`` can print it to
+    stdout and exit 0, without going through the fail-closed InvocationError
+    path (which prints to stderr and exits 2).
+    """
+
+    def __init__(self, help_text: str) -> None:
+        super().__init__(help_text)
+        self.help_text = help_text
+
+
 class RouteSubject(NamedTuple):
     source: str
     path: str
@@ -247,24 +260,7 @@ def _resolve_existing_directory(raw: str, label: str) -> Path:
     return path.resolve(strict=True)
 
 
-def parse_fixed_cli(argv: Sequence[str]) -> argparse.Namespace:
-    required_once = (
-        "--repository-root",
-        "--site",
-        "--deployment-url",
-        "--commit-sha",
-        "--workflow-run-id",
-        "--workflow-run-attempt",
-        "--output",
-    )
-    counts = {name: 0 for name in required_once}
-    for token in argv:
-        for name in required_once:
-            if token == name or token.startswith(name + "="):
-                counts[name] += 1
-    if any(count != 1 for count in counts.values()):
-        raise InvocationError("each required CLI argument must appear exactly once")
-
+def _build_fixed_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify the exact fast-mlx public GitHub Pages deployment.",
         allow_abbrev=False,
@@ -276,8 +272,46 @@ def parse_fixed_cli(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--workflow-run-id", required=True)
     parser.add_argument("--workflow-run-attempt", required=True)
     parser.add_argument("--output", required=True)
+    return parser
+
+
+def parse_fixed_cli(argv: Sequence[str]) -> argparse.Namespace:
+    argv_list = list(argv)
+    parser = _build_fixed_cli_parser()
+
+    # --help/-h must be checked before the exactly-once precheck below, and
+    # before argparse's own parse_args, so a bare usage request is honored
+    # rather than misreported as an "each required argument" violation.
+    if argv_list == ["--help"] or argv_list == ["-h"]:
+        raise HelpRequested(parser.format_help())
+    if "--help" in argv_list or "-h" in argv_list:
+        # Fail-closed by design: exiting 0 here would report success
+        # WITHOUT writing a receipt, which a CI caller could not
+        # distinguish from a verified deployment -- a false-green. Only a
+        # standalone help request (handled above) is a genuine usage ask.
+        raise InvocationError(
+            "--help/-h must be requested alone, not combined with other arguments"
+        )
+
+    required_once = (
+        "--repository-root",
+        "--site",
+        "--deployment-url",
+        "--commit-sha",
+        "--workflow-run-id",
+        "--workflow-run-attempt",
+        "--output",
+    )
+    counts = {name: 0 for name in required_once}
+    for token in argv_list:
+        for name in required_once:
+            if token == name or token.startswith(name + "="):
+                counts[name] += 1
+    if any(count != 1 for count in counts.values()):
+        raise InvocationError("each required CLI argument must appear exactly once")
+
     try:
-        return parser.parse_args(list(argv))
+        return parser.parse_args(argv_list)
     except SystemExit as exc:
         raise InvocationError("invalid CLI arguments") from exc
 
@@ -1212,11 +1246,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # returns 2 and the success path still returns `exit_code` unchanged.
     # Do NOT split the exit codes to signal the failure category -- the
     # category belongs in the stderr diagnostic message, not the exit code.
+    # The lone exception is a standalone --help/-h request: it prints usage
+    # to stdout and returns 0. It never reaches receipt-writing, so it
+    # cannot be mistaken by a CI caller for a verified deployment.
     argv = sys.argv[1:] if argv is None else argv
     try:
         arguments = parse_fixed_cli(argv)
         local = validate_local_inputs(arguments)
         inventory = inventory_site(local.site, local.commit_sha)
+    except HelpRequested as exc:
+        print(exc.help_text, end="")
+        return 0
     except InvocationError as exc:
         print(f"verify-public-deployment: invocation error: {exc}", file=sys.stderr)
         return 2

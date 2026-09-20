@@ -1966,6 +1966,21 @@ ENGINE_LIFELINE_GRACE_SECONDS_DEFAULT = 30.0
 # read by the guard itself (the guard only ever trusts its own `--grace`
 # argv value).
 _ENGINE_LIFELINE_GRACE_ENV_VAR = "_FASTMLX_ENGINE_LIFELINE_GRACE_SECONDS_INTERNAL"
+# A signal the OS itself writes a crash report for. The guard's own exit-
+# status mirroring (see `_engine_lifeline_guard` below) must NEVER
+# self-signal with one of these: that would make macOS write a SECOND
+# crash report, attributed to this guard's own `python3` process, lying
+# about what actually crashed. SIGTERM/SIGINT/SIGHUP (the only signals the
+# guard ever forwards) and SIGKILL are deliberately absent -- none of those
+# produce a crash report either way, so mirroring them is unchanged.
+_ENGINE_CRASH_SIGNALS = (
+    signal.SIGSEGV,
+    signal.SIGABRT,
+    signal.SIGBUS,
+    signal.SIGILL,
+    signal.SIGFPE,
+    signal.SIGTRAP,
+)
 
 
 def _engine_lifeline_grace_seconds() -> float:
@@ -2005,18 +2020,29 @@ def _engine_lifeline_guard(
     """The guard process's own body (see `_run_engine_lifeline_guard` for
     argv parsing). Spawns the engine as its OWN child -- no new session, so
     it shares this guard's process group/session, never the launcher's --
-    forwards SIGTERM/SIGINT/SIGHUP to it, and watches `lifeline_read_fd`
-    for EOF (the launcher's death, by any means including SIGKILL) to stop
-    an otherwise-orphaned engine itself: SIGTERM, a grace window, then
-    SIGKILL.
+    forwards SIGTERM/SIGINT/SIGHUP to it EXACTLY ONCE PER SIGNUM (a signal
+    received twice, e.g. once directly from `pkill -f fastmlx_launch`
+    matching this guard's own argv and once forwarded by the launcher,
+    reaches the engine only once -- see `forwarded_signums` below;
+    escalation, e.g. SIGINT then SIGTERM, still delivers both), and watches
+    `lifeline_read_fd` for EOF (the launcher's death, by any means
+    including SIGKILL) to stop an otherwise-orphaned engine itself:
+    SIGTERM, a grace window, then SIGKILL.
 
     Propagates the engine's own exit status exactly: a normal exit code is
-    returned as-is; a signal-killed engine is mirrored by resetting that
-    same signal to its default disposition and delivering it to this guard
-    process itself, so the LAUNCHER's own `wait()` on the guard continues
-    to see a negative signal-encoded return code exactly as it would have
-    watching the engine directly (see the exit-code mapping in
-    `_run_front_mode`, which is otherwise unchanged).
+    returned as-is. A signal-killed engine is normally mirrored by
+    resetting that same signal to its default disposition and delivering
+    it to this guard process itself, so the LAUNCHER's own `wait()` on the
+    guard continues to see a negative signal-encoded return code exactly
+    as it would have watching the engine directly (see the exit-code
+    mapping in `_run_front_mode`, which is otherwise unchanged) -- EXCEPT
+    for a crash signal (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE/SIGTRAP,
+    `_ENGINE_CRASH_SIGNALS`), which is never mirrored: this guard instead
+    returns a plain `128+signum` exit code (the same number
+    `_run_front_mode`'s mapping already produces for a signal-killed
+    child), so the OS writes exactly one crash report -- the engine's --
+    instead of a second one falsely attributed to this guard's own
+    `python3` process.
     """
     # Handlers go in BEFORE the engine exists: a stop the launcher forwards
     # while the engine is being spawned would otherwise meet the default
@@ -2024,12 +2050,26 @@ def _engine_lifeline_guard(
     # arrives before there is an engine is held and forwarded right after.
     engine_holder = {"engine": None}
     pending = []
+    # Signums already delivered to the engine, exactly once each -- shared
+    # between `_forward` and the pending-signal drain right after `popen`
+    # below, so a signal received twice (e.g. `pkill -f fastmlx_launch`
+    # matching this guard's own argv, on top of the launcher's own
+    # forwarding of the same signal) reaches the engine only once. Kept as
+    # LOCAL state inside this function, never on the engine object itself:
+    # `_watch_lifeline` below stops the engine directly (`terminate()`/
+    # `kill()`), never through `_forward`, and must never consult -- or be
+    # blocked by -- this set. Per-signum, not a blanket "a stop was already
+    # sent": escalation (e.g. SIGINT then SIGTERM) must still deliver BOTH.
+    forwarded_signums = set()
 
     def _forward(signum, _frame):
         engine = engine_holder["engine"]
         if engine is None:
             pending.append(signum)
             return
+        if signum in forwarded_signums:
+            return
+        forwarded_signums.add(signum)
         try:
             engine.send_signal(signum)
         except OSError:
@@ -2045,6 +2085,9 @@ def _engine_lifeline_guard(
         return 3
     engine_holder["engine"] = engine
     for signum in pending:
+        if signum in forwarded_signums:
+            continue
+        forwarded_signums.add(signum)
         try:
             engine.send_signal(signum)
         except OSError:
@@ -2076,6 +2119,26 @@ def _engine_lifeline_guard(
     if returncode >= 0:
         return returncode
     sig = -returncode
+    if sig in _ENGINE_CRASH_SIGNALS:
+        # A crash signal must never be mirrored onto this guard: macOS
+        # writes a crash report for whichever process a crash signal
+        # actually kills, so self-signalling here (the non-crash path
+        # below) would produce a SECOND report, attributed to this guard's
+        # own `python3` process -- a lie about what crashed. Report the
+        # engine's death as a normal (non-signalled) exit instead, encoded
+        # the same 128+signum the shell/os convention uses for a
+        # signal-killed exit status -- `_run_front_mode`'s own mapping
+        # (otherwise unchanged) already treats that as the final exit code
+        # for anything that isn't a requested stop.
+        try:
+            name = signal.Signals(sig).name
+        except ValueError:  # pragma: no cover - sig is always a known Signals member here
+            name = str(sig)
+        print(
+            f"fastmlx serve: engine died from {name} ({sig})",
+            file=sys.stderr,
+        )
+        return 128 + sig
     try:
         # A signal this guard never installed a handler for (e.g. SIGKILL,
         # which the engine dies to when this guard's own lifeline-watch

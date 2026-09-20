@@ -2029,6 +2029,81 @@ class PublicDeploymentBehaviorTests(unittest.TestCase):
             write_mock.assert_called_once()
             self.assertFalse(output.exists())
 
+    def test_help_alone_prints_usage_to_stdout_and_exits_zero(self) -> None:
+        required_flags = (
+            "--repository-root",
+            "--site",
+            "--deployment-url",
+            "--commit-sha",
+            "--workflow-run-id",
+            "--workflow-run-attempt",
+            "--output",
+        )
+        for argv in (["--help"], ["-h"]):
+            with self.subTest(argv=argv):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = online.main(argv)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(stderr.getvalue(), "")
+                help_text = stdout.getvalue()
+                for flag in required_flags:
+                    with self.subTest(argv=argv, flag=flag):
+                        self.assertIn(flag, help_text)
+
+    def test_help_mixed_with_valid_arguments_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output) + ["--help"]
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            stderr_value = stderr.getvalue()
+            self.assertTrue(
+                stderr_value.startswith(
+                    "verify-public-deployment: invocation error: "
+                ),
+                stderr_value,
+            )
+            self.assertIn("alone", stderr_value)
+            self.assertEqual(stdout.getvalue(), "")
+            # Anti-false-green control: exiting 0 here would report success
+            # without writing a receipt, which a CI caller could not
+            # distinguish from a genuinely verified deployment.
+            self.assertFalse(output.exists())
+
+    def test_duplicate_required_argument_still_refuses_with_original_message(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            output = root / "receipt.json"
+            argv = self._main_argv_with_output(root, output) + [
+                "--site",
+                str(root),
+            ]
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = online.main(argv)
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                "verify-public-deployment: invocation error: "
+                "each required CLI argument must appear exactly once\n",
+            )
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

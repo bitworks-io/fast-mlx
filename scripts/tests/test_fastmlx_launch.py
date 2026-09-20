@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -2094,6 +2095,48 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
                 self.assertEqual(result, expected)
 
     # ------------------------------------------------------------------
+    # F4 CRITICAL TRAP -- the guard's crash-signal fix must not move the
+    # exit-status contract `_run_front_mode` maps: a crash still reaches
+    # front mode as `child.wait()` returning a plain (non-negative)
+    # 128+signum -- the guard's new own encoding, see
+    # `_engine_lifeline_guard` -- and must still end up 139 for SIGSEGV; a
+    # forwarded SIGTERM still reaches front mode the OLD way, as a negative
+    # signal-encoded `wait()` return (the guard self-signalled, unchanged
+    # for non-crash signals), and must still end up 143.
+    # ------------------------------------------------------------------
+    def test_front_mode_exit_contract_unchanged_for_crash_and_forwarded_stop(self):
+        front_port = _free_tcp_port()
+        upstream_port = _free_tcp_port()
+        original_term = signal.getsignal(signal.SIGTERM)
+        original_int = signal.getsignal(signal.SIGINT)
+        self.addCleanup(signal.signal, signal.SIGTERM, original_term)
+        self.addCleanup(signal.signal, signal.SIGINT, original_int)
+
+        # (1) a crash: the guard (per its new F4 fix) returns a plain,
+        # non-negative 128+SIGSEGV -- no signal killed the GUARD itself.
+        plan = _minimal_front_plan(front_port, upstream_port)
+        crash_child = _FakeChild(128 + signal.SIGSEGV)
+        result = FASTMLX_LAUNCH._run_front_mode(
+            [], plan, popen=lambda argv, child=crash_child, **kwargs: child
+        )
+        self.assertEqual(result, 139)
+
+        # (2) a requested stop: the guard mirrors SIGTERM onto itself
+        # (unchanged, non-crash path), so front mode's own `wait()` sees
+        # the OLD negative signal-encoded return.
+        class _StoppedChild(_FakeChild):
+            def wait(self):
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                return self._wait_return
+
+        plan = _minimal_front_plan(front_port, upstream_port)
+        stopped_child = _StoppedChild(-signal.SIGTERM)
+        result = FASTMLX_LAUNCH._run_front_mode(
+            [], plan, popen=lambda argv, child=stopped_child, **kwargs: child
+        )
+        self.assertEqual(result, 143)
+
+    # ------------------------------------------------------------------
     # L7: the engine child is started in its OWN session (start_new_session
     # =True), not the launcher's process group -- a terminal Ctrl-C (which
     # sends SIGINT to the whole foreground process group) must reach the
@@ -2541,6 +2584,264 @@ class EngineLifelineGuardTests(unittest.TestCase):
             self.assertIn("front mode could not start the engine", stderr)
         finally:
             os.close(lifeline_write_fd)
+
+    # ------------------------------------------------------------------
+    # F2 -- exactly-once forwarding per signum: `pkill -f fastmlx_launch`
+    # matches this guard's own argv too (see `_stop_leftover_engine_group`'s
+    # docstring), so a real stop can reach the guard's SIGTERM handler
+    # twice. The engine must only ever be told to stop once for each of
+    # those deliveries, not once per delivery -- a second SIGTERM arriving
+    # mid-graceful-shutdown is the path that can abort an orderly release
+    # of a large wired-memory allocation.
+    # ------------------------------------------------------------------
+    def test_guard_forwards_a_repeated_signal_to_the_engine_only_once(self):
+        class FakeEngine:
+            def __init__(self):
+                self.signals_received = []
+
+            def send_signal(self, signum):
+                self.signals_received.append(signum)
+
+            def wait(self):
+                # Two SIGTERMs land on the guard AFTER the engine exists --
+                # e.g. once from `pkill -f fastmlx_launch` and once
+                # forwarded by the launcher.
+                os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        engine_holder = []
+
+        def popen_returns_fake_engine(_argv):
+            engine = FakeEngine()
+            engine_holder.append(engine)
+            return engine
+
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in watched}
+        read_fd, write_fd = os.pipe()
+        try:
+            code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                read_fd, 1.0, ["engine"], popen=popen_returns_fake_engine
+            )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            os.close(write_fd)
+        self.assertEqual(code, 0)
+        self.assertEqual(engine_holder[0].signals_received, [signal.SIGTERM])
+
+    # ------------------------------------------------------------------
+    # F2 -- the same dedupe must apply to the PRE-SPAWN `pending` drain: a
+    # signal received twice before the engine exists must still reach it
+    # only once once it does, proving the dedupe state is shared between
+    # `_forward` and the drain rather than being a half-applied fix.
+    # ------------------------------------------------------------------
+    def test_guard_dedupes_a_repeated_signal_received_before_the_engine_exists(self):
+        received = []
+
+        class FakeEngine:
+            def send_signal(self, signum):
+                received.append(signum)
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        def popen_delivers_pending_sigterm_twice(_argv):
+            # Both signals land on the guard while it is still inside
+            # `popen` (i.e. before `engine_holder["engine"]` is set), so
+            # both go through the `pending` list, not `_forward`'s
+            # already-spawned branch.
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return FakeEngine()
+
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in watched}
+        read_fd, write_fd = os.pipe()
+        try:
+            code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                read_fd, 1.0, ["engine"], popen=popen_delivers_pending_sigterm_twice
+            )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            os.close(write_fd)
+        self.assertEqual(code, 0)
+        self.assertEqual(received, [signal.SIGTERM])
+
+    # ------------------------------------------------------------------
+    # F2 -- escalation must survive the per-signum dedupe: SIGINT then
+    # SIGTERM are two DIFFERENT signums, so both must still reach the
+    # engine, in order -- the fix must never collapse to "a stop was
+    # already sent" once any signal has been forwarded.
+    # ------------------------------------------------------------------
+    def test_guard_still_escalates_a_different_signal(self):
+        class FakeEngine:
+            def __init__(self):
+                self.signals_received = []
+
+            def send_signal(self, signum):
+                self.signals_received.append(signum)
+
+            def wait(self):
+                os.kill(os.getpid(), signal.SIGINT)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        engine_holder = []
+
+        def popen_returns_fake_engine(_argv):
+            engine = FakeEngine()
+            engine_holder.append(engine)
+            return engine
+
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in watched}
+        read_fd, write_fd = os.pipe()
+        try:
+            code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                read_fd, 1.0, ["engine"], popen=popen_returns_fake_engine
+            )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            os.close(write_fd)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            engine_holder[0].signals_received, [signal.SIGINT, signal.SIGTERM]
+        )
+
+    # ------------------------------------------------------------------
+    # F2 CRITICAL TRAP -- the lifeline path (`_watch_lifeline` calling
+    # `engine.terminate()`/`kill()` directly, never through `_forward`)
+    # must keep stopping an orphaned engine even after a signal was
+    # already forwarded to it: dedupe state must live inside `_forward`/
+    # the drain, never on the engine object, or a SIGKILLed launcher would
+    # stop stopping its engine -- regressing cycle 103's headline fix.
+    # ------------------------------------------------------------------
+    def test_lifeline_watch_still_stops_the_engine_after_a_signal_was_forwarded(self):
+        class FakeEngine:
+            def __init__(self):
+                self.signals_received = []
+                self.terminated = False
+
+            def send_signal(self, signum):
+                self.signals_received.append(signum)
+
+            def wait(self):
+                # A SIGTERM is forwarded (and deduped) first, then this
+                # blocks until the lifeline watcher (running on its own
+                # thread) terminates the engine, exactly as an orphaned
+                # engine would once the launcher's write end closes.
+                os.kill(os.getpid(), signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while not self.terminated and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return 0
+
+            def poll(self):
+                return 0 if self.terminated else None
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                pass
+
+        engine_holder = []
+
+        def popen_returns_fake_engine(_argv):
+            engine = FakeEngine()
+            engine_holder.append(engine)
+            return engine
+
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in watched}
+        read_fd, write_fd = os.pipe()
+
+        def close_write_end_shortly():
+            time.sleep(0.2)
+            os.close(write_fd)
+
+        closer = threading.Thread(target=close_write_end_shortly, daemon=True)
+        closer.start()
+        try:
+            code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                read_fd, 1.0, ["engine"], popen=popen_returns_fake_engine
+            )
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+            closer.join(timeout=2)
+        self.assertEqual(code, 0)
+        self.assertTrue(engine_holder[0].terminated, "lifeline watch never terminated the engine")
+        self.assertEqual(engine_holder[0].signals_received, [signal.SIGTERM])
+
+    # ------------------------------------------------------------------
+    # F4 -- a crash signal (SIGSEGV et al.) must never be mirrored onto
+    # this guard: it must instead return the same 128+signum encoding
+    # `_run_front_mode` already produces for a signal-killed child, name
+    # the signal and that the ENGINE (not the guard) died from it on
+    # stderr, and never self-signal (which would write a SECOND, false
+    # crash report attributed to this guard's own `python3` process).
+    # ------------------------------------------------------------------
+    def test_crash_signal_returns_128_plus_signum_without_self_signalling(self):
+        class FakeEngine:
+            def send_signal(self, signum):
+                pass
+
+            def wait(self):
+                return -signal.SIGSEGV
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        read_fd, write_fd = os.pipe()
+        stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(stderr):
+                code = FASTMLX_LAUNCH._engine_lifeline_guard(
+                    read_fd, 1.0, ["engine"], popen=lambda _argv: FakeEngine()
+                )
+        finally:
+            os.close(write_fd)
+        self.assertEqual(code, 128 + signal.SIGSEGV)
+        self.assertIn("SIGSEGV", stderr.getvalue())
+        self.assertIn("engine", stderr.getvalue().lower())
 
 
 class CardMatchingHelperTests(unittest.TestCase):

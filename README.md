@@ -473,6 +473,17 @@ Behaviour to know:
   3), so a supervisor such as launchd may need one or two restarts to come back up. Residual: if
   the launcher and the guard are SIGKILLed together (for example `pkill -9 -f fastmlx`), the engine
   keeps running; stop it by its port.
+- The guard forwards each signal to the engine exactly once per signal number, even though
+  `pkill -f fastmlx_launch` matches the guard's own argv too (so a real stop can otherwise land on
+  the guard's handler twice — once from `pkill`, once forwarded by the launcher). A second SIGTERM
+  arriving mid-shutdown is the path that can abort an orderly release of a large wired-memory
+  allocation, so it is suppressed; escalating to a different signal (SIGINT, then SIGTERM) still
+  reaches the engine both times.
+- If the engine dies from a crash signal (SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE, or SIGTRAP), the
+  guard reports it as a plain `128 + signal` exit and prints one line to stderr naming the engine and
+  the signal — it does not mirror the crash signal onto itself. Mirroring it would make macOS write a
+  second crash report for the guard's own `python3` process, misattributing the crash. The launcher's
+  own final exit code is unaffected: a crashed engine still yields, for example, 139 for SIGSEGV.
 - One JSON line per request goes to stderr (request id, method, path without query, status, bytes,
   whether streamed, and an `error` field when the upstream failed mid-response), written as a single
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
