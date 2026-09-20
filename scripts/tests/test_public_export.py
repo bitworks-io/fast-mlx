@@ -1747,5 +1747,173 @@ class PublicExportTests(unittest.TestCase):
                 failures,
             )
 
+    def test_validator_third_party_engine_marker_can_fire_for_each_marker(self) -> None:
+        # Reference the validator's own concatenation-built constant rather
+        # than re-spelling any marker here; this test file is itself part of
+        # the public projection the validator scans.
+        markers = validate_public_repository.THIRD_PARTY_ENGINE_MARKERS
+        for index, marker in enumerate(markers):
+            with self.subTest(marker_index=index):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    tainted_file = root / f"tainted-{index}.txt"
+                    tainted_file.write_text(
+                        f"reference to {marker} appears here\n",
+                        encoding="utf-8",
+                    )
+
+                    failures = (
+                        validate_public_repository.validate_no_third_party_engine_marker(
+                            root
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            f"tainted-{index}.txt" in failure
+                            for failure in failures
+                        ),
+                        failures,
+                    )
+
+    def test_validator_third_party_engine_marker_fires_on_path(self) -> None:
+        marker = validate_public_repository.THIRD_PARTY_ENGINE_MARKERS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tainted_dir = root / marker
+            tainted_dir.mkdir()
+            (tainted_dir / "note.txt").write_text(
+                "nothing forbidden in this file's content\n", encoding="utf-8"
+            )
+
+            failures = validate_public_repository.validate_no_third_party_engine_marker(
+                root
+            )
+            self.assertTrue(
+                any(
+                    "projected path contains a third-party engine name" in failure
+                    for failure in failures
+                ),
+                failures,
+            )
+
+    def test_validator_third_party_engine_marker_clean_tree_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "clean.txt").write_text("nothing to see here\n", encoding="utf-8")
+
+            self.assertEqual(
+                validate_public_repository.validate_no_third_party_engine_marker(root),
+                [],
+            )
+
+    def test_validator_third_party_engine_marker_allows_own_binary_name(self) -> None:
+        own_binary_name = validate_public_repository.OWN_BINARY_NAME
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content_file = root / "content.txt"
+            content_file.write_text(
+                f"built the {own_binary_name} binary\n", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                validate_public_repository.validate_no_third_party_engine_marker(root),
+                [],
+            )
+
+            own_named_dir = root / "Sources" / own_binary_name
+            own_named_dir.mkdir(parents=True)
+            (own_named_dir / "Main.swift").write_text(
+                "// entry point\n", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                validate_public_repository.validate_no_third_party_engine_marker(root),
+                [],
+            )
+
+    def test_validator_third_party_engine_marker_strip_cannot_splice(self) -> None:
+        # If the implementation stripped the own-binary name with the empty
+        # string instead of a NUL character, the "om" and "lx" fragments on
+        # either side would become adjacent and read as the first marker.
+        # This is the discriminating test for that regression.
+        own_binary_name = validate_public_repository.OWN_BINARY_NAME
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spliced_file = root / "spliced.txt"
+            spliced_file.write_text(f"om{own_binary_name}lx\n", encoding="utf-8")
+
+            self.assertEqual(
+                validate_public_repository.validate_no_third_party_engine_marker(root),
+                [],
+            )
+
+    def test_validator_third_party_engine_marker_failures_do_not_leak_marker_text(
+        self,
+    ) -> None:
+        markers = validate_public_repository.THIRD_PARTY_ENGINE_MARKERS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, marker in enumerate(markers):
+                (root / f"tainted-{index}.txt").write_text(
+                    f"reference to {marker} appears here\n", encoding="utf-8"
+                )
+
+            failures = validate_public_repository.validate_no_third_party_engine_marker(
+                root
+            )
+            self.assertTrue(failures)
+            for failure in failures:
+                for marker in markers:
+                    self.assertNotIn(marker, failure)
+
+    def test_third_party_engine_marker_set_is_pinned_independently(self) -> None:
+        # Every other test in this file iterates THIRD_PARTY_ENGINE_MARKERS
+        # as given, so none of them would notice the tuple shrinking back to
+        # a single name or being reordered -- that would leave the gate
+        # measuring nothing. This test's expected value is built here, by
+        # concatenation, at DIFFERENT split points than
+        # scripts/validate_public_repository.py uses for the same five
+        # names, so it is a genuinely independent expectation and not a copy
+        # of the module-under-test's own expression.
+        expected_markers = (
+            "om" + "lx",
+            "m" + "lx-serve",
+            "MTP" + "LX",
+            "DeepS" + "pec",
+            "DeepSeek-V4-P" + "ro-DSpark",
+        )
+        expected_own_binary_name = "fastmlx-se" + "rve"
+
+        actual_markers = validate_public_repository.THIRD_PARTY_ENGINE_MARKERS
+        actual_casefolded = tuple(
+            sorted(marker.casefold() for marker in actual_markers)
+        )
+        expected_casefolded = tuple(
+            sorted(marker.casefold() for marker in expected_markers)
+        )
+
+        # assertTrue on a pre-computed boolean, NOT assertEqual/assertTupleEqual:
+        # unittest's tuple-equality failure message prints both sequences in
+        # full, which would republish the marker names in a failing run's
+        # output. Report counts only.
+        self.assertTrue(
+            len(actual_markers) == 5,
+            f"THIRD_PARTY_ENGINE_MARKERS must hold exactly 5 markers, found "
+            f"{len(actual_markers)}",
+        )
+        self.assertTrue(
+            actual_casefolded == expected_casefolded,
+            "THIRD_PARTY_ENGINE_MARKERS drifted from its pinned, independently "
+            f"constructed expectation: expected {len(expected_casefolded)} "
+            f"casefolded markers, found {len(actual_casefolded)}",
+        )
+        self.assertTrue(
+            validate_public_repository.OWN_BINARY_NAME.casefold()
+            == expected_own_binary_name.casefold(),
+            "OWN_BINARY_NAME drifted from its pinned, independently "
+            "constructed expectation",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

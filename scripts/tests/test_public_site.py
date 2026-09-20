@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import html
 import html.parser
+import io
 import json
 import re
 import shutil
@@ -4958,6 +4960,90 @@ class PublicSiteTests(unittest.TestCase):
         self.assertTrue(other_family_cards, "expected at least one non-Flash-Next card")
         for card in other_family_cards:
             self.assertNotIn("engineBuild", card["provenance"], card["id"])
+
+
+class ArgparseUsageErrorExitCodeTests(unittest.TestCase):
+    """A bad CLI invocation (unknown flag, missing required positional) must
+    exit 64 (EX_USAGE), never argparse's own default of 2 -- this script's
+    main() already returns 2 for a real RED "not a directory" refusal (see
+    ExitCodeContractTests below), so a mistyped flag must never be
+    indistinguishable from that refusal.
+
+    validate_public_site.py has exactly one CLI argument (the required
+    positional `site`, no `choices=` on anything), so there is no "bad
+    choice" usage-error kind to exercise here -- unlike scripts with
+    `--residency`-style enum flags (see fastmlx_gguf_fit.py's
+    ArgparseUsageErrorExitCodeTests), this validator has nothing for
+    argparse to reject as an invalid choice.
+    """
+
+    def test_unknown_flag_exits_64(self) -> None:
+        # argparse reports the usage error on stderr; captured so it does not
+        # read as a real error in the shared suite log (same reason as
+        # ExitCodeContractTests._silenced below).
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                validate_public_site.parse_arguments(["--bogus-flag", "x"])
+        self.assertEqual(context.exception.code, 64)
+
+    def test_missing_required_site_argument_exits_64(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                validate_public_site.parse_arguments([])
+        self.assertEqual(context.exception.code, 64)
+
+
+class TopLevelArgumentHelpTextTests(unittest.TestCase):
+    """validate_public_site.py has no subparsers -- pin the top-level `site`
+    argument's help= text instead, so it cannot silently disappear."""
+
+    def test_site_argument_help_text_is_pinned(self) -> None:
+        help_text = validate_public_site.build_arg_parser().format_help()
+        self.assertIn("generated site directory", help_text)
+
+
+class ExitCodeContractTests(unittest.TestCase):
+    """Anti-vacuity: proves the usage-error exit-64 change above did not
+    flatten main()'s own pre-existing exit codes together. A test that only
+    asserted 64 would still pass even if every code became 64."""
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _silenced():
+        # main() reports each failure on stdout. The failure-path test below
+        # provokes ~86 of them, every one prefixed "FAIL:", straight into the
+        # shared suite log -- where they read as real test failures and blunt
+        # any grep that scans that log for a verdict. The exit code is what
+        # these tests assert; the reporting text is not.
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            yield buffer
+
+    def test_success_path_exits_0(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            with self._silenced():
+                exit_code = validate_public_site.main([str(output)])
+            self.assertEqual(exit_code, 0)
+
+    def test_validation_failure_path_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            (output / "research/index.html").unlink()
+            with self._silenced():
+                exit_code = validate_public_site.main([str(output)])
+            self.assertEqual(exit_code, 1)
+
+    def test_not_a_directory_path_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "does-not-exist"
+            with self._silenced():
+                exit_code = validate_public_site.main([str(missing)])
+            self.assertEqual(exit_code, 2)
 
 
 if __name__ == "__main__":

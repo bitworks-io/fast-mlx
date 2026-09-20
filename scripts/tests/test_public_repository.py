@@ -187,6 +187,37 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             failures,
         )
 
+    def test_validate_calls_third_party_engine_marker_check(self) -> None:
+        # This proves validate() actually WIRES
+        # validate_no_third_party_engine_marker in, not just that the
+        # function works when called directly (every other marker test in
+        # scripts/tests/test_public_export.py calls it directly and would
+        # stay green even if validate() never called it at all). The marker
+        # lands in README.md's content, not a new path, so the identity
+        # manifest's path/mode seal -- which write_identity_fixture already
+        # satisfies -- stays intact. The fixture is NOT otherwise clean:
+        # measured, it returns unrelated "missing required public file"
+        # failures on its own. That is why this asserts on the PRESENCE of
+        # the third-party failure class and never on the failure count.
+        marker = validate_public_repository.THIRD_PARTY_ENGINE_MARKERS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            self.write_identity_fixture(repository)
+            (repository / "README.md").write_text(
+                f"# Fixture\n\nreference to {marker} appears here\n",
+                encoding="utf-8",
+            )
+
+            failures = validate_public_repository.validate(repository)
+
+        self.assertTrue(
+            any(
+                "contains a third-party engine name" in failure
+                for failure in failures
+            ),
+            failures,
+        )
+
     def test_public_validator_rejects_extra_candidate_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory)

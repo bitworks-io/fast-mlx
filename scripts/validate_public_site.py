@@ -2466,10 +2466,36 @@ class HomeCurrentCycleCollector(html.parser.HTMLParser):
                 break
 
 
-def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+# sysexits.h EX_USAGE: argparse's own ArgumentParser.error() exits 2, which
+# this script's own main() reserves for a real RED "not a directory"
+# refusal (see main()). A bad invocation -- an unknown flag or a missing
+# required positional -- must never be misread as that refusal.
+_EXIT_USAGE_ERROR = 64
+
+
+class _UsageErrorArgumentParser(argparse.ArgumentParser):
+    """Same as ``argparse.ArgumentParser``, except a usage error exits 64
+    (EX_USAGE) instead of argparse's default of 2 -- see the comment above
+    ``_EXIT_USAGE_ERROR`` for why.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(_EXIT_USAGE_ERROR, f"{self.prog}: error: {message}\n")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = _UsageErrorArgumentParser(description=__doc__)
     parser.add_argument("site", type=Path, help="generated site directory")
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
 
 
 def resolve_target(site: Path, page: Path, raw_link: str) -> Optional[Path]:

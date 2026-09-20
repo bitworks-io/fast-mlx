@@ -31,6 +31,26 @@ PRIVATE_MARKERS: Tuple[str, ...] = (
 # single literal string.
 INTERNAL_FAMILY_MARKER = "Qwen" + "4Exp"
 
+# Third-party engine names are assembled by concatenation for the same
+# reason INTERNAL_FAMILY_MARKER above is: this script is itself part of the
+# public projection it validates, so a literal occurrence here would match
+# its own scan on every future publish. Do not "tidy" any of these into a
+# single literal string.
+THIRD_PARTY_ENGINE_MARKERS: Tuple[str, ...] = (
+    "o" + "mlx",
+    "mlx" + "-serve",
+    "MT" + "PLX",
+    "Deep" + "Spec",
+    "DeepSeek-V4" + "-Pro-DSpark",
+)
+
+# This project's own binary name legitimately contains one of the markers
+# above ("mlx" + "-serve") as a proper substring. Occurrences of our own
+# name are neutralised out of the scanned text before the third-party-engine
+# scan runs, so the gate does not flag the project's own tooling on every
+# publish.
+OWN_BINARY_NAME = "fastmlx" + "-serve"
+
 APACHE_2_LICENSE_SHA256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
 REQUIRED_NOTICE_LINES: Tuple[str, ...] = (
     "fast-mlx",
@@ -292,6 +312,42 @@ def validate_no_internal_family_marker(repository: Path) -> List[str]:
     return failures
 
 
+def _neutralize_own_binary_name(text: str) -> str:
+    # Replacing the own-binary name with the empty string can splice two
+    # otherwise-harmless fragments together into a NEW false-positive match
+    # (the text on either side of the removed name becomes adjacent and can
+    # spell a marker that was never actually present). A NUL character
+    # cannot appear inside any marker, so substituting it breaks adjacency
+    # without manufacturing a new substring match.
+    return text.replace(OWN_BINARY_NAME, "\x00")
+
+
+def validate_no_third_party_engine_marker(repository: Path) -> List[str]:
+    failures: List[str] = []
+    markers = tuple(marker.casefold() for marker in THIRD_PARTY_ENGINE_MARKERS)
+    for path in repository.rglob("*"):
+        relative = path.relative_to(repository)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        relative_text = _neutralize_own_binary_name(relative.as_posix().casefold())
+        if any(marker in relative_text for marker in markers):
+            failures.append(
+                f"projected path contains a third-party engine name: {relative}"
+            )
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        content_text = _neutralize_own_binary_name(text.casefold())
+        if any(marker in content_text for marker in markers):
+            failures.append(
+                f"projected file contains a third-party engine name: {relative}"
+            )
+    return failures
+
+
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repository", type=Path, help="exported candidate root")
@@ -307,6 +363,7 @@ def validate(repository: Path) -> List[str]:
 
     failures.extend(validate_public_identity_manifest(repository))
     failures.extend(validate_no_internal_family_marker(repository))
+    failures.extend(validate_no_third_party_engine_marker(repository))
 
     license_path = repository / "LICENSE"
     if license_path.is_file():
