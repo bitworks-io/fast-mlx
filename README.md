@@ -447,6 +447,14 @@ Behaviour to know:
 - The proxy speaks HTTP/1.0 to clients and closes the connection after each response (no keep-alive).
 - A request with a chunked body gets 411; send a `Content-Length` body instead. A negative or
   non-numeric `Content-Length` gets 400 immediately, without attempting to read it.
+- A request whose declared `Content-Length` exceeds the configured limit gets 413, refused before
+  a single body byte is read -- the check is on the header value alone, never on what is actually
+  sent. The default limit is 64 MiB (`fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES`), well above any
+  legitimate chat/completions body and well below what threatens a serve host holding tens of GiB of
+  wired weights; override it with `--front-max-body-bytes <BYTES>` (`fastmlx serve` refuses at exit 2
+  for 0, a negative value, or a non-numeric one). This bounds a SINGLE request's own buffer, not the
+  aggregate memory many concurrent requests could hold across `ThreadingHTTPServer`'s daemon threads
+  at once, each just under the limit.
 - There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
   not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
   JSON error that still carries the headers. Reading the CLIENT's own request (line/headers/body) is

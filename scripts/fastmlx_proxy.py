@@ -71,6 +71,25 @@ _CLIENT_IDLE_TIMEOUT_SECONDS = 120
 # or duplicate them (see L5 in the front-mode review).
 _PROVENANCE_HEADER_PREFIX = "x-fastmlx-"
 
+# Default ceiling on a SINGLE request's DECLARED ``Content-Length``, refused
+# in ``_dispatch`` before a single body byte is read (see the check there).
+# There is otherwise no upper bound at all: the value comes straight off the
+# client's own header, and ``--front-host`` accepts any bind address (a
+# supported, documented topology, not only loopback) in front of a serve
+# host that holds tens of GiB of wired model weights -- an unbounded read is
+# a denial-of-service surface, not just a correctness one.
+#
+# 64 MiB is sized far above any legitimate chat/completions body and far
+# below what threatens the host: the largest supported context (262144
+# tokens) is on the order of 1 MB of text even before token-vs-character
+# compression is accounted for, and a request layering in several
+# base64-encoded images stays well under this ceiling too. This bounds ONE
+# request's own buffer, never the AGGREGATE memory many concurrent
+# ``ThreadingHTTPServer`` daemon threads could hold at once each just under
+# the limit -- that is a different, unaddressed threat model (see the
+# README).
+DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+
 
 def _sanitize_header_value(value: object) -> str:
     return _NON_PRINTABLE_ASCII.sub("", str(value))
@@ -344,6 +363,25 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
                 )
                 self._log(request_id, self.command, path_only, 400, 0.0, bytes_out, False, None)
                 return
+
+        # Refused on the DECLARED size ALONE, before ``self.rfile.read(...)``
+        # below touches a single body byte -- reading first and rejecting
+        # after would already have paid the exact memory cost this check
+        # exists to avoid (see ``DEFAULT_MAX_REQUEST_BODY_BYTES`` above for
+        # why an unbounded read matters on this host). ``content_length`` is
+        # already known non-negative here (the block above refused a
+        # negative/non-numeric header first), so this is a plain compare of
+        # two non-negative integers, no sign surprises.
+        if content_length > self.server.max_request_body_bytes:
+            bytes_out = self._send_json_error(
+                413,
+                f"request body of {content_length} bytes exceeds the configured "
+                f"limit of {self.server.max_request_body_bytes} bytes",
+                "request_body_too_large",
+                request_id,
+            )
+            self._log(request_id, self.command, path_only, 413, 0.0, bytes_out, False, None)
+            return
         body = self.rfile.read(content_length) if content_length else b""
 
         # Sent via ``putrequest``/``putheader`` below (never a ``dict(...)``,
@@ -657,6 +695,7 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         plan: dict,
         upstream_connect_timeout: float = _UPSTREAM_CONNECT_TIMEOUT_SECONDS,
         upstream_read_timeout: Optional[float] = None,
+        max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         log_hook: Optional[Callable[[dict], None]] = None,
     ):
         super().__init__(server_address, handler_cls)
@@ -671,6 +710,11 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         # no basis of its own for guessing a shorter number.
         self.upstream_connect_timeout = upstream_connect_timeout
         self.upstream_read_timeout = upstream_read_timeout
+        # Read by ``_dispatch`` BEFORE it reads any body byte -- see
+        # ``DEFAULT_MAX_REQUEST_BODY_BYTES`` for why this exists and why 64
+        # MiB is the default a caller (``fastmlx_launch.py``'s
+        # ``--front-max-body-bytes``) can override.
+        self.max_request_body_bytes = max_request_body_bytes
         self.provenance_headers = build_provenance_headers(plan)
         self.provenance_body = build_provenance_body(plan)
         # Called synchronously, once per request, right after the JSONL log
@@ -689,6 +733,7 @@ def create_server(
     plan: dict,
     upstream_connect_timeout: float = _UPSTREAM_CONNECT_TIMEOUT_SECONDS,
     upstream_read_timeout: Optional[float] = None,
+    max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     log_hook: Optional[Callable[[dict], None]] = None,
 ) -> ProvenanceProxyServer:
     """Construct (bind + listen, not yet serving) the proxy server. Raises
@@ -704,5 +749,6 @@ def create_server(
         plan,
         upstream_connect_timeout,
         upstream_read_timeout,
+        max_request_body_bytes,
         log_hook,
     )

@@ -1912,6 +1912,73 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
                 self.assertEqual(plan["front"]["port"], 9090)
 
     # ------------------------------------------------------------------
+    # --front-max-body-bytes: the proxy's ceiling on a single request's
+    # declared Content-Length (see fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_
+    # BYTES). 0, a negative count, and a non-numeric string are all
+    # equally nonsensical as a body-size ceiling and must all refuse at
+    # exit 2 with a named reason -- the SAME LaunchRefusal fail-closed
+    # style as every other front-mode argument check above, never
+    # argparse's own "invalid int value" usage error.
+    # ------------------------------------------------------------------
+    def test_front_max_body_bytes_invalid_values_are_refused(self):
+        # The expected substring differs per case ("not an integer" vs.
+        # "positive number of bytes") DELIBERATELY: both are unique to this
+        # feature's own ``LaunchRefusal`` message text, unlike a bare
+        # ``self.assertIn("--front-max-body-bytes", stderr)`` would be --
+        # argparse's own "unrecognized arguments: --front-max-body-bytes 0"
+        # usage error (if the flag were not registered at all) ALSO
+        # contains the flag name and would make a weaker assertion here
+        # pass for entirely the wrong reason.
+        cases = {
+            "zero": ("0", "positive number of bytes"),
+            "negative": ("-1", "positive number of bytes"),
+            "non-numeric": ("abc", "not an integer"),
+        }
+        for label, (value, expected_text) in cases.items():
+            with self.subTest(label=label, value=value):
+                argv = self.base_args(
+                    **{
+                        "--model-repo": PASS_REPO,
+                        "--context": "2048",
+                        "--front-port": "9090",
+                        "--front-max-body-bytes": value,
+                    }
+                ) + ["--dry-run"]
+                code, _, stderr = self.run_main(argv)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("--front-max-body-bytes", stderr)
+                self.assertIn(expected_text, stderr)
+
+    # ------------------------------------------------------------------
+    # A valid --front-max-body-bytes reaches fastmlx_proxy.create_server:
+    # asserted on the actual plumbed keyword value, not merely that the
+    # process started -- an implementation that validated the flag but
+    # never threaded it through would pass a weaker assertion here.
+    # ------------------------------------------------------------------
+    def test_front_max_body_bytes_valid_value_reaches_create_server(self):
+        argv = self.base_args(
+            **{
+                "--model-repo": PASS_REPO,
+                "--context": "2048",
+                "--front-port": "9090",
+                "--front-max-body-bytes": "12345",
+            }
+        )
+        captured = {}
+
+        def recording_create_server(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            raise OSError("address already in use")
+
+        with patch.object(
+            FASTMLX_LAUNCH.fastmlx_proxy, "create_server", side_effect=recording_create_server
+        ):
+            code, _, stderr = self.run_main(argv)
+
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(captured["kwargs"].get("max_request_body_bytes"), 12345)
+
+    # ------------------------------------------------------------------
     # Ordering: the proxy must bind FIRST -- a bind failure must never
     # start (and then have to kill) the engine child at all.
     # ------------------------------------------------------------------

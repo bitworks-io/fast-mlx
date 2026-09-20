@@ -1392,6 +1392,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # binds; the engine itself always binds loopback in front mode.
     serve.add_argument("--front-port", type=int, default=None)
     serve.add_argument("--front-host", default="127.0.0.1")
+    # Deliberately NOT ``type=int``: argparse's own conversion would refuse
+    # a non-numeric value with its own "invalid int value" usage error, a
+    # different shape than the ``LaunchRefusal`` fail-closed style every
+    # other front-mode argument check below uses. Left a plain string here
+    # and parsed/validated in `_run_serve` instead, so 0, a negative count,
+    # and a non-numeric string all refuse through the SAME named-reason
+    # path (see the validation block below `front_mode`).
+    serve.add_argument("--front-max-body-bytes", default=None)
     return parser
 
 
@@ -1771,6 +1779,11 @@ def _run_serve(args, passthrough_args: list) -> int:
     # never depend on (or leak) the substituted argv, the same reason the
     # residency passthrough guard above runs before the fit check.
     front_mode = args.front_port is not None
+    # Set even outside front mode (and before any front-mode refusal below
+    # can fire) so the value passed to ``_run_front_mode`` at the bottom of
+    # this function is always defined, never a NameError on a path this
+    # variable's own ``if front_mode:`` guard never dropped into.
+    max_request_body_bytes = fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES
     if front_mode and args.front_port == args.port:
         raise LaunchRefusal(
             2,
@@ -1823,6 +1836,31 @@ def _run_serve(args, passthrough_args: list) -> int:
                     "a host/port the --front-port proxy does not expect, letting a "
                     "client bypass the proxy entirely; remove it -- front mode "
                     "already fixes the engine's host and port",
+                )
+
+        # --front-max-body-bytes: the proxy's own ceiling on a single
+        # request's DECLARED Content-Length (see
+        # ``fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES``). Refused here,
+        # in the SAME LaunchRefusal fail-closed style as every other
+        # front-mode argument check above, rather than left for
+        # ``fastmlx_proxy.create_server`` to reject deep inside the bind
+        # call -- 0, a negative count, and a non-numeric string are all
+        # equally nonsensical as a body-size ceiling and all get exactly
+        # one named reason, never a raw ``ValueError`` traceback.
+        if args.front_max_body_bytes is not None:
+            try:
+                max_request_body_bytes = int(args.front_max_body_bytes)
+            except ValueError:
+                raise LaunchRefusal(
+                    2,
+                    f"--front-max-body-bytes {args.front_max_body_bytes!r} is not "
+                    "an integer number of bytes",
+                )
+            if max_request_body_bytes <= 0:
+                raise LaunchRefusal(
+                    2,
+                    "--front-max-body-bytes must be a positive number of bytes, "
+                    f"got {max_request_body_bytes}",
                 )
 
     # --- engine argv ---------------------------------------------------
@@ -1917,7 +1955,7 @@ def _run_serve(args, passthrough_args: list) -> int:
     print(admitted_line, file=sys.stderr)
 
     if front_mode:
-        return _run_front_mode(final_argv, plan)
+        return _run_front_mode(final_argv, plan, max_request_body_bytes=max_request_body_bytes)
 
     os.execv(engine_bin_abs, final_argv)
     return 0  # pragma: no cover - unreachable, os.execv never returns on success
@@ -2218,7 +2256,12 @@ def _stop_leftover_engine_group(guard_pid: int, grace_seconds: float) -> None:
     except (ProcessLookupError, PermissionError):
         pass
 
-def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int:
+def _run_front_mode(
+    final_argv: list,
+    plan: dict,
+    popen=subprocess.Popen,
+    max_request_body_bytes: int = fastmlx_proxy.DEFAULT_MAX_REQUEST_BODY_BYTES,
+) -> int:
     """Front mode's orchestration: bind the proxy, THEN start the engine as
     a CHILD process (never exec'd -- this process must stay alive to run
     the proxy), forward SIGTERM/SIGINT to the child, and exit non-zero once
@@ -2239,6 +2282,11 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
     arrives in the (short) window between installing the handler and the
     child existing is remembered and forwarded the instant the child does
     exist, rather than being silently dropped.
+
+    ``max_request_body_bytes`` is plumbed straight to
+    ``fastmlx_proxy.create_server`` -- ``_run_serve`` has already validated
+    it (``--front-max-body-bytes``, 0/negative/non-numeric all refused
+    before this function is ever called), so it is trusted as-is here.
     """
     front = plan["front"]
     front_host = front["host"]
@@ -2251,7 +2299,14 @@ def _run_front_mode(final_argv: list, plan: dict, popen=subprocess.Popen) -> int
     upstream_port = int(front["upstream"].rsplit(":", 1)[1])
 
     try:
-        server = fastmlx_proxy.create_server(front_host, front_port, upstream_host, upstream_port, plan)
+        server = fastmlx_proxy.create_server(
+            front_host,
+            front_port,
+            upstream_host,
+            upstream_port,
+            plan,
+            max_request_body_bytes=max_request_body_bytes,
+        )
     except OSError as exc:
         print(
             f"fastmlx serve: front proxy could not bind {front_host}:{front_port}: {exc}",

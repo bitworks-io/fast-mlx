@@ -1039,6 +1039,182 @@ class ProxyRequestValidationTests(unittest.TestCase):
         self.assertLessEqual(timeout, 300)
 
 
+class ProxyRequestBodySizeLimitTests(unittest.TestCase):
+    """There is no upper bound on a client-declared ``Content-Length``
+    otherwise: the serve host holds tens of GiB of wired model weights, and
+    ``--front-host`` accepts any bind address (README documents non-loopback
+    as a supported topology), so an unbounded body read is a
+    denial-of-service surface. Every test here injects a SMALL
+    ``max_request_body_bytes`` via ``create_server(...)`` so the suite never
+    actually sends anything close to the real 64 MiB default -- the limit
+    itself, not its production magnitude, is what is under test.
+    """
+
+    def setUp(self):
+        self._servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+            server._test_thread.join(timeout=5)
+
+    def _start_upstream_counting_requests(self):
+        requests = []
+
+        def responder(handler):
+            requests.append(handler.path)
+            payload = b'{"ok":true}'
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        return upstream, requests
+
+    def _start_proxy(self, upstream, **kwargs):
+        server = start_proxy(FIXTURE_PLAN, "127.0.0.1", upstream.server_address[1], **kwargs)
+        self._servers.append(server)
+        return server
+
+    def _send_and_read(self, port: int, raw_request: bytes) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        sock.sendall(raw_request)
+        sock.settimeout(5)
+        response = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except socket.timeout:
+            pass
+        sock.close()
+        return response
+
+    # ------------------------------------------------------------------
+    # T1: an over-limit declared Content-Length gets 413, never reaches
+    # upstream, and the error names both the declared size and the
+    # configured limit.
+    # ------------------------------------------------------------------
+    def test_over_limit_content_length_returns_413_and_never_reaches_upstream(self):
+        upstream, requests = self._start_upstream_counting_requests()
+        proxy = self._start_proxy(upstream, max_request_body_bytes=10)
+        body = b"x" * 11
+        raw_request = (
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+        )
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+
+        self.assertIn(b" 413 ", response)
+        body_json = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body_json["error"]["type"], "request_body_too_large")
+        self.assertIn("11", body_json["error"]["message"])
+        self.assertIn("10", body_json["error"]["message"])
+        self.assertEqual(requests, [], "an over-limit request must never reach the upstream engine")
+
+    # ------------------------------------------------------------------
+    # T2 (load-bearing): the refusal is on the DECLARED Content-Length, not
+    # on what was actually read. A client that declares a huge body but
+    # sends almost none of it must still get 413 promptly -- an
+    # implementation that reads (or waits to read) the body before checking
+    # would instead hang here until the 120 s client idle timeout, which
+    # this test's own 5 s socket timeout and elapsed-time bound would catch
+    # as a failure rather than as a slow pass.
+    # ------------------------------------------------------------------
+    def test_refusal_never_reads_a_declared_body_that_was_never_sent(self):
+        upstream, requests = self._start_upstream_counting_requests()
+        proxy = self._start_proxy(upstream, max_request_body_bytes=1024)
+        # Ten million bytes declared, ZERO of them actually sent -- only the
+        # request line and headers cross the wire.
+        raw_request = (
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: 10000000\r\n\r\n"
+        )
+        started = time.monotonic()
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed, 5,
+            "a body that was never sent must never be waited on -- the "
+            "refusal is on the DECLARED Content-Length alone",
+        )
+        self.assertIn(b" 413 ", response)
+        body_json = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body_json["error"]["type"], "request_body_too_large")
+        self.assertEqual(requests, [])
+
+    # ------------------------------------------------------------------
+    # T3: a large-but-legitimate body UNDER an injected small limit still
+    # relays 200 with every X-FastMLX-* header intact.
+    # ------------------------------------------------------------------
+    def test_body_under_limit_relays_200_with_provenance_headers(self):
+        upstream, requests = self._start_upstream_counting_requests()
+        proxy = self._start_proxy(upstream, max_request_body_bytes=4096)
+        body = b"y" * 4000
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=body)
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp_body, b'{"ok":true}')
+        self.assertEqual(requests, ["/v1/chat/completions"])
+        headers = headers_dict(resp)
+        for name in (
+            "X-FastMLX-Admission",
+            "X-FastMLX-Card",
+            "X-FastMLX-Fit",
+            "X-FastMLX-Residency",
+            "X-FastMLX-Engine-Build",
+            "X-FastMLX-MTP",
+            "X-FastMLX-Request-Id",
+        ):
+            self.assertIsNotNone(headers.get(name), f"missing {name}")
+
+    # ------------------------------------------------------------------
+    # T4: the boundary is exact. ``limit`` bytes is allowed; ``limit + 1``
+    # is refused.
+    # ------------------------------------------------------------------
+    def test_boundary_is_exact_limit_allowed_limit_plus_one_refused(self):
+        upstream, requests = self._start_upstream_counting_requests()
+        proxy = self._start_proxy(upstream, max_request_body_bytes=16)
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=b"z" * 16)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200, "exactly `limit` bytes must be allowed")
+
+        # A raw socket, not ``http.client``, for the over-limit half: the
+        # proxy closes the connection as soon as it sends the 413, and
+        # sending the whole (tiny, 17-byte) request in one ``sendall`` call
+        # up front -- the same pattern ``test_over_limit_content_length_...``
+        # uses above -- means there is no partial-write/early-close race for
+        # ``http.client``'s own two-step (headers, then body) send to lose.
+        over_limit_body = b"z" * 17
+        raw_request = (
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Length: 17\r\n\r\n" + over_limit_body
+        )
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(b" 413 ", response, "`limit + 1` bytes must be refused")
+        body_json = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body_json["error"]["type"], "request_body_too_large")
+
+        self.assertEqual(requests, ["/v1/chat/completions"], "only the allowed request reached upstream")
+
+
 class ProxyExpect100ContinueTests(unittest.TestCase):
     """A client sending ``Expect: 100-continue`` must get an interim ``100
     Continue`` promptly, not hang until ITS OWN timeout fires and it sends
