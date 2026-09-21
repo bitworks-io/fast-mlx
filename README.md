@@ -600,6 +600,28 @@ Behaviour to know:
   second, since an unbounded synchronous write per refused connection would itself be an
   attacker-driven disk-fill and a cost on that same accept thread; each emitted line carries
   `suppressed_since_last_log`, so the true refusal rate is still recoverable from the log.
+- Every refusal's stderr/`log_hook` line also carries `inflight`, `max_concurrent`, `peak_inflight`,
+  and `refusals_total`; an ordinary (non-refusal) request's line carries a single `inflight` field.
+  All four are **stderr-only telemetry that requires host access to read** -- none of them is ever
+  added to a client-visible response. In particular, `GET /fastmlx/provenance`'s JSON body and the
+  503 refusal body/headers deliberately never carry any of this: a live, pollable saturation gauge in
+  a body an unauthenticated remote client can read would let an attacker size a slow-loris attack to
+  the exact minimum connection count and confirm a distributed attack is landing without a single
+  request ever being refused -- the one change to this feature that would make its security posture
+  worse. Reading these fields correctly requires three things an operator must not skip:
+  - `inflight` on a refusal line **can be less than `max_concurrent`** -- the failed semaphore
+    acquire and the counter read happen under different locks, so a handler can release its slot in
+    the gap between them. A line reading `inflight: 61, max_concurrent: 64` is not a bug.
+  - The ordinary-request `inflight` is sampled at **response completion, not arrival** (it is written
+    just before the request's own slot is released), and it counts the request being logged itself --
+    a single sequential request logs `inflight: 1`, not 0. For a long streamed/SSE response this
+    describes the state at the END of that generation, not when the client connected.
+  - `peak_inflight` is **per-process and never resets** -- after a launcher restart it reads 0 again,
+    so a low value must never be read as "this process has never come close to saturating" if the
+    process is young. `refusals_total` is the converse: monotonic and cumulative for the process's
+    whole life, counted for every refusal even when its own stderr line is suppressed by the
+    once-per-second rate limit above -- it is the field that can recover the true refusal count if a
+    stderr line is ever lost or rotated, which `suppressed_since_last_log` alone cannot do.
 - There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
   not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
   JSON error that still carries the headers.

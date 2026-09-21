@@ -1123,10 +1123,30 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         }
         if error is not None:
             entry["error"] = error
+        server = getattr(self, "server", None)
+        # The LEADING indicator entirely absent before this field: unlike
+        # ``_log_capacity_refusal``'s ``inflight`` (only ever seen once a
+        # 503 has already happened), this fires on every ordinary request
+        # too, so an operator watching stderr sees "60/64 and climbing"
+        # BEFORE any refusal exists. Two semantics that make the number
+        # read wrong if forgotten:
+        #   (1) it COUNTS the request being logged -- this method runs
+        #       before ``ProvenanceProxyServer.process_request_thread``'s
+        #       own ``finally`` decrements the counter for this same
+        #       request -- so a single sequential request logs
+        #       ``inflight: 1``, not 0.
+        #   (2) it is sampled at response COMPLETION, not arrival -- for a
+        #       long streamed (SSE) response this call happens at the END
+        #       of that whole generation, so the value describes "what
+        #       else was in flight when this response finished", not
+        #       "when this request showed up".
+        # ``None`` if ``server``/the attribute is unavailable (mirrors the
+        # ``log_hook`` lookup just below). stderr-only, like every other
+        # field this feature adds -- never a client-visible header or body.
+        entry["inflight"] = getattr(server, "inflight_requests", None) if server is not None else None
         line = json.dumps(entry)
         sys.stderr.write(line + "\n")
         sys.stderr.flush()
-        server = getattr(self, "server", None)
         log_hook = getattr(server, "log_hook", None) if server is not None else None
         if log_hook is not None:
             log_hook(entry)
@@ -1188,7 +1208,16 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         # Guards both counters below -- read by tests (``peak_inflight_
         # requests`` is the anti-vacuity check that the cap was actually
         # REACHED, not merely never exceeded) and written from whichever
-        # thread currently owns a slot.
+        # thread currently owns a slot. INVARIANT: nothing may ever block
+        # while holding this lock -- it is a leaf lock, and every critical
+        # section that takes it (here and in ``process_request``/
+        # ``process_request_thread`` below) is 2-4 arithmetic statements,
+        # no I/O, no nested lock acquisition. The moment an edit puts I/O
+        # (a log write, a network call, anything that can stall) under
+        # this lock, the single accept thread gains its first real wedge:
+        # every other connection's admission decision depends on
+        # ``process_request`` returning promptly, and that method takes
+        # this same lock on every accepted request.
         self._inflight_lock = threading.Lock()
         self.inflight_requests = 0
         self.peak_inflight_requests = 0
@@ -1203,6 +1232,18 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         self._refusal_log_lock = threading.Lock()
         self._refusal_log_last_emitted_monotonic: Optional[float] = None
         self._refusal_log_suppressed_since_last_emit = 0
+        # Monotonic count of EVERY refusal since this server started,
+        # incremented once per refusal regardless of whether that
+        # refusal's own line is emitted to stderr (see
+        # ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS`` above) -- unlike
+        # ``_refusal_log_suppressed_since_last_emit``, which RESETS on
+        # every emitted line, this never resets, so it is the only field
+        # that can recover the true cumulative refusal count if a stderr
+        # line is ever lost or rotated. stderr-only telemetry: never
+        # reaches an unauthenticated client (see ``_log_capacity_refusal``
+        # for the rest of the new counters and why none of them may ever
+        # be added to ``build_provenance_body`` or the 503 body itself).
+        self._refusals_total = 0
 
     def process_request(self, request, client_address) -> None:
         """Non-blocking admission gate in front of ``ThreadingMixIn``'s own
@@ -1220,7 +1261,23 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         exhaustion shape this cap exists to prevent in the first place.
         """
         if not self._slots.acquire(blocking=False):
-            self._refuse_over_capacity(request, client_address)
+            # Captured HERE, in the SAME ``_inflight_lock`` acquisition, at
+            # the instant the acquire failed -- not later, inside
+            # ``_log_capacity_refusal`` after ``_refuse_over_capacity``'s
+            # own post-503 drain loop (budgeted up to
+            # ``_REFUSAL_DRAIN_DEADLINE_SECONDS``, measured at ~52ms for
+            # the silent-client shape). A handler on another thread can
+            # release its slot during that drain, so reading the counters
+            # after it would report a number from a different accept-
+            # thread cycle than the refusal it claims to describe. See
+            # ``_log_capacity_refusal`` for the rest of this field's
+            # semantics (it can legitimately be less than the cap).
+            with self._inflight_lock:
+                inflight_at_refusal = self.inflight_requests
+                peak_at_refusal = self.peak_inflight_requests
+            self._refuse_over_capacity(
+                request, client_address, inflight_at_refusal, peak_at_refusal
+            )
             self.shutdown_request(request)
             return
         with self._inflight_lock:
@@ -1260,7 +1317,9 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
                 self.inflight_requests -= 1
             self._slots.release()
 
-    def _refuse_over_capacity(self, request, client_address) -> None:
+    def _refuse_over_capacity(
+        self, request, client_address, inflight_at_refusal: int, peak_at_refusal: int
+    ) -> None:
         """Writes a complete HTTP/1.0 503 response directly on ``request``
         (the raw accepted socket) and logs it -- there is no
         ``ProvenanceProxyHandler`` instance for a refused connection at
@@ -1268,6 +1327,14 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         even starts), so this builds the same JSON error shape
         ``ProvenanceProxyHandler._send_json_error`` would by hand instead
         of being able to reuse it.
+
+        ``inflight_at_refusal``/``peak_at_refusal`` are passed down from
+        ``process_request``, which captured them at the instant the
+        semaphore acquire failed -- never re-read in here, since this
+        method's own post-503 drain loop below can run for up to
+        ``_REFUSAL_DRAIN_DEADLINE_SECONDS`` and another thread can release
+        its slot during that window (see ``process_request``'s own comment
+        for why that ordering is load-bearing).
 
         TRAP this exists to guard against: this write happens on
         ``serve_forever``'s own single accept thread (see
@@ -1391,9 +1458,15 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
                     switched_to_nonblocking = True
         except OSError:
             pass
-        self._log_capacity_refusal(request_id, len(body))
+        self._log_capacity_refusal(request_id, len(body), inflight_at_refusal, peak_at_refusal)
 
-    def _log_capacity_refusal(self, request_id: str, bytes_out: int) -> None:
+    def _log_capacity_refusal(
+        self,
+        request_id: str,
+        bytes_out: int,
+        inflight_at_refusal: int,
+        peak_at_refusal: int,
+    ) -> None:
         # Same JSONL schema ``ProvenanceProxyHandler._log`` writes (see
         # there) -- NOT reused directly, since that is an instance method
         # on a handler that is never constructed for a refused connection
@@ -1411,7 +1484,47 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
             "bytes_out": bytes_out,
             "streamed": False,
             "error": "too_many_concurrent_requests",
+            # Captured by ``process_request`` at the instant the semaphore
+            # acquire failed, not re-read here -- see its own comment and
+            # ``_refuse_over_capacity``'s docstring. Because that capture
+            # and the failed acquire are two different locks (never
+            # atomic with each other), a legitimate line CAN read e.g.
+            # ``inflight=61`` against ``max_concurrent=64``: a handler on
+            # another thread released its slot between the failed acquire
+            # and the capture. That is not a bug -- do not "fix" it by
+            # clamping or asserting equality with ``max_concurrent``.
+            # Also never clamped to 0 if negative: a permanently negative
+            # value is the visible symptom of a latent double-release
+            # elsewhere, and clamping would hide exactly the defect this
+            # field exists to surface. stderr-only: never added to
+            # ``build_provenance_body`` (see that function's own
+            # docstring) -- a live, pollable gauge in a body returned to
+            # unauthenticated remote clients would be a real-time
+            # saturation and traffic-analysis oracle.
+            "inflight": inflight_at_refusal,
+            # Always ``self.max_concurrent_requests``, never a literal --
+            # this is what lets an operator relate ``inflight``/
+            # ``peak_inflight`` to the cap actually CONFIGURED for this
+            # process (a caller can override the 64 default).
+            "max_concurrent": self.max_concurrent_requests,
+            # Same capture-time semantics as ``inflight`` above.
+            # Per-PROCESS and never reset for this server's whole life --
+            # after a launcher restart this starts back at 0, so a low
+            # value here must never be read as "this process has never
+            # come close to saturating" if the process is young.
+            "peak_inflight": peak_at_refusal,
         }
+        # Monotonic, cumulative, incremented once per refusal regardless
+        # of whether THIS line is the one that gets emitted below (see
+        # ``_refusals_total``'s own comment in ``__init__``). Under the
+        # SAME ``_refusal_log_lock`` used for the rate-limit decision
+        # further down -- no new lock -- acquired here, separately and
+        # first, so the incremented value is already in ``entry`` before
+        # ``log_hook`` (unconditional, see below) sees it.
+        with self._refusal_log_lock:
+            self._refusals_total += 1
+            entry["refusals_total"] = self._refusals_total
+
         # ``log_hook`` fires UNCONDITIONALLY, once per refusal, exactly as
         # before -- it is an in-process, optional, test-only observability
         # callback (see its own docstring in ``__init__``) whose cost is

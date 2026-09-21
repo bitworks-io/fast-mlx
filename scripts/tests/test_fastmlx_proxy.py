@@ -3131,6 +3131,251 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
                 "must never bound response generation",
             )
 
+    # ------------------------------------------------------------------
+    # M1 (capture-point regression, the load-bearing test of this group):
+    # a refusal's ``inflight`` MUST be the value ``process_request``
+    # captured at the instant its semaphore acquire failed, never a later
+    # ``self.inflight_requests`` read taken inside ``_log_capacity_
+    # refusal`` -- that method only runs AFTER ``_refuse_over_capacity``'s
+    # own post-503 drain loop, which can run for up to
+    # ``_REFUSAL_DRAIN_DEADLINE_SECONDS`` (measured at ~52ms for exactly
+    # this silent-client shape), and another thread releasing its slot
+    # during that window would otherwise be misattributed to a refusal
+    # that happened before the release.
+    #
+    # Proof shape: a SILENT client -- opens a connection and sends
+    # nothing at all, ever -- triggers ``process_request``'s failed
+    # acquire the moment its TCP handshake completes (accept() does not
+    # require any application byte), then sits parked in the drain
+    # loop's blocking ``recv``. Once a fixed pause has given the accept
+    # thread ample time to have already captured its counters and
+    # entered that blocking ``recv`` (a sub-millisecond synchronous
+    # prefix in real time -- 200ms is a large multiple of it, not a
+    # tight race), the test releases the holder, THEN closes the silent
+    # socket to end the drain via EOF. This ordering is deterministic,
+    # not merely usually-true: the capture (correct code) or the leak-
+    # through read (mutated code) cannot occur any earlier than the
+    # already-elapsed pause, and the holder release cannot occur any
+    # later than immediately after it -- so the correct code must log
+    # ``inflight: 1`` and the mutation described above must log
+    # ``inflight: 0``. ``_REFUSAL_DRAIN_DEADLINE_SECONDS`` is patched
+    # larger purely so this ordering never has to race a loaded CI
+    # runner's scheduler; the mechanism under test (capture-before-drain,
+    # not the deadline's magnitude) is unaffected by that value, the same
+    # way other tests in this file scale timing constants for
+    # determinism (see ``test_dribbling_client_on_the_admitted_path_
+    # cannot_hold_its_slot_forever``'s own comment on scale invariance).
+    # ------------------------------------------------------------------
+    def test_refusal_inflight_is_captured_at_failed_acquire_not_after_drain(self):
+        # ``log_hook`` also fires for the HOLDER's own ordinary 200
+        # completion (``ProvenanceProxyHandler._log`` shares the same
+        # hook -- see its own comment) -- and that 200 entry is logged
+        # the moment ``gate.set()`` below releases it, which is BEFORE
+        # this test ever closes the silent socket that ends the drain.
+        # A single undifferentiated ``logged_event``/``logged[0]`` would
+        # therefore let this test's assertions run against the HOLDER's
+        # entry instead of the refusal's, passing vacuously regardless of
+        # which value ``_log_capacity_refusal`` actually used -- exactly
+        # the trap this comment exists to name. So this test tracks the
+        # 503 entry specifically, by status, never by list position or
+        # "the first/only thing logged".
+        logged = []
+        refusal_logged_event = threading.Event()
+
+        def log_hook(entry):
+            logged.append(entry)
+            if entry.get("status") == 503:
+                refusal_logged_event.set()
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+        holder_results = {}
+        holder = threading.Thread(
+            target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder")
+        )
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        with unittest.mock.patch.object(FASTMLX_PROXY, "_REFUSAL_DRAIN_DEADLINE_SECONDS", 5.0):
+            silent = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=10)
+            self.addCleanup(silent.close)
+
+            # Generous pause: the accept thread's failed-acquire capture
+            # and 503 write are synchronous, in-process, and require no
+            # I/O wait (the silent client never sends anything, so there
+            # is nothing for the accept thread to wait on except this
+            # pause itself) -- 200ms is a large multiple of that real
+            # cost, not a tight deadline.
+            time.sleep(0.2)
+
+            # The holder's slot is released only NOW -- strictly after
+            # the pause above, so strictly after the accept thread has
+            # already captured its counters (correct code) or is already
+            # parked waiting to make its later, post-drain read (mutated
+            # code).
+            gate.set()
+            holder.join(timeout=5)
+            self.assertEqual(holder_results["holder"][0], 200)
+
+            # End the drain now (EOF) instead of waiting out the full
+            # patched deadline -- the release above already happened
+            # before this, which is the only ordering this test needs.
+            silent.close()
+
+        self.assertTrue(
+            refusal_logged_event.wait(timeout=10), "the refusal was never logged via log_hook"
+        )
+        refusal_entries = [entry for entry in logged if entry.get("status") == 503]
+        self.assertEqual(
+            len(refusal_entries), 1,
+            f"expected exactly one 503 refusal log entry, got {len(refusal_entries)}: {logged!r}",
+        )
+        self.assertEqual(
+            refusal_entries[0]["inflight"], 1,
+            "inflight must reflect the state AT THE FAILED ACQUIRE (the holder still held "
+            f"its slot then), not the state after the drain (already released): {refusal_entries[0]}",
+        )
+
+    # ------------------------------------------------------------------
+    # M3: ``refusals_total`` must count EVERY refusal, not only the ones
+    # whose stderr line survives the 1s rate limit. Uses ``log_hook``
+    # (fires unconditionally per refusal, never rate-limited -- see its
+    # own comment in ``_log_capacity_refusal``) so this test never has to
+    # fight ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS``.
+    # ------------------------------------------------------------------
+    def test_refusals_total_counts_every_refusal_not_only_emitted_ones(self):
+        logged = []
+        logged_lock = threading.Lock()
+
+        def log_hook(entry):
+            with logged_lock:
+                logged.append(entry)
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1, log_hook=log_hook)
+
+        holder_results = {}
+        holder = threading.Thread(
+            target=self._drive_request, args=(proxy.server_address[1], holder_results, "holder")
+        )
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the sole slot was never occupied")
+
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            # All 20 refusals below land well inside a single
+            # ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS`` (1s) window -- only
+            # the FIRST gets an emitted stderr line (asserted below), but
+            # every one of them must still bump ``refusals_total``.
+            self._drive_refusal_burst(proxy, 20)
+
+        self.assertEqual(
+            len(self._stderr_jsonl_lines(stderr_buffer)), 1,
+            "test setup assumption violated: all 20 refusals must land inside one rate-limit window",
+        )
+        self.assertEqual(len(logged), 20)
+        self.assertGreaterEqual(
+            logged[-1].get("refusals_total", 0), 20,
+            f"refusals_total must count every refusal, not only the emitted one: {logged[-1]}",
+        )
+
+        gate.set()
+        holder.join(timeout=5)
+        self.assertEqual(holder_results["holder"][0], 200)
+
+    # ------------------------------------------------------------------
+    # M5: the normal-path ``inflight`` gauge ``ProvenanceProxyHandler.
+    # _log`` writes must be read BEFORE ``ProvenanceProxyServer.
+    # process_request_thread``'s own ``finally`` decrements the counter
+    # for the very request being logged -- a single sequential request
+    # therefore must log ``inflight: 1`` (itself), never 0.
+    # ------------------------------------------------------------------
+    def test_normal_path_inflight_counts_the_logged_request_itself(self):
+        logged = []
+        logged_event = threading.Event()
+
+        def log_hook(entry):
+            logged.append(entry)
+            logged_event.set()
+
+        def responder(handler):
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2, log_hook=log_hook)
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=b"{}")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+
+        self.assertTrue(logged_event.wait(timeout=5), "the request was never logged via log_hook")
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(
+            logged[0]["inflight"], 1,
+            f"a single sequential request must log inflight=1 (itself), not 0: {logged[0]}",
+        )
+
+    # ------------------------------------------------------------------
+    # M6: a refusal's ``max_concurrent`` must always be ``self.
+    # max_concurrent_requests`` for THIS server, never a literal --
+    # constructed with a non-default cap (3) so the field would be green
+    # by construction if it were hardcoded to the 64 default.
+    # ------------------------------------------------------------------
+    def test_refusal_max_concurrent_reflects_the_configured_cap_not_a_literal(self):
+        logged = []
+        logged_event = threading.Event()
+
+        def log_hook(entry):
+            logged.append(entry)
+            logged_event.set()
+
+        upstream, requests, gate, arrived = self._start_gated_upstream(expected_arrivals=3)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=3, log_hook=log_hook)
+
+        results = {}
+        holders = [
+            threading.Thread(target=self._drive_request, args=(proxy.server_address[1], results, i))
+            for i in range(3)
+        ]
+        for t in holders:
+            t.start()
+        for ev in arrived:
+            self.assertTrue(ev.wait(timeout=5))
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(b" 503 ", response)
+        self.assertTrue(logged_event.wait(timeout=5), "the refusal was never logged via log_hook")
+
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(
+            logged[0]["max_concurrent"], 3,
+            f"max_concurrent must reflect this server's configured cap (3), not a literal: {logged[0]}",
+        )
+        # Semantics 1 (see the ``inflight`` field's own comment in
+        # ``fastmlx_proxy.py``): the failed acquire and this counter read
+        # are different locks, so a legitimate refusal can read less than
+        # the cap -- only the range is asserted here, never exact
+        # equality, which would be flaky by construction.
+        self.assertGreaterEqual(logged[0]["inflight"], 1)
+        self.assertLessEqual(logged[0]["inflight"], 3)
+
+        gate.set()
+        for t in holders:
+            t.join(timeout=5)
+        for i in range(3):
+            self.assertEqual(results[i][0], 200)
+
 
 class ProxyExpect100ContinueTests(unittest.TestCase):
     """A client sending ``Expect: 100-continue`` must get an interim ``100
