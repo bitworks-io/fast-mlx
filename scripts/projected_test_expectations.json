@@ -4,11 +4,12 @@
     "host": "Apple silicon, 24 GiB",
     "date": "2026-09-17",
     "method": "python3 scripts/export_public_repository.py --development-projection (967 files); each target built individually and its .xctest bundle run directly via this gate (scripts/run_projected_test_suites.py). The 2565-test / 75-failure predecessor baseline had been corroborated three independent ways (swift test --filter, direct xcrun xctest, and this gate), all agreeing. This re-baseline is the same gate re-run after an exclusion change; the gate CORRECTLY reported MISMATCH against the old baseline first (a drop in failures fails too, by design), and these numbers are what it then measured. Total: 2519 tests, 0 failures across all 8 targets.",
-    "scope": "The 8 MLX-free projected test targets only. SpikeCoreTests, FastMLXHarnessTests, ExactPrefixMLXTests, SpikeServingAdaptersTests (MLX/Metal targets) and the vendored MLXLMTests package are not covered here."
+    "scope": "The 8 MLX-free projected test targets only. SpikeCoreTests, FastMLXHarnessTests, ExactPrefixMLXTests, SpikeServingAdaptersTests (MLX/Metal targets) and the vendored MLXLMTests package are not covered here.",
+    "_amendments": "2026-09-21 (cycle 128): ServingCoreTests 721 -> 726. NOT a re-baseline -- one target, one number, hand-confirmed rather than regenerated. The delta is exactly the 5 test methods added to OpenAIChatCompletionsTests.swift for the add_generation_prompt / continue_final_message split (4 covering the honored add_generation_prompt field, 1 covering the continue_final_message 400). Reconciled three ways before editing: counting the added `func test` methods in the diff (5), a local `swift test --filter ServingCoreTests` run (726), and the CI gate's own measurement on the failing run 35628846476 (726, expected 721). `skipped` stays 2 and every other target is untouched. The 2026-09-17 provenance above still describes how the other seven targets' numbers were obtained."
   },
   "targets": {
     "ServingCoreTests": {
-      "tests": 721,
+      "tests": 726,
       "skipped": 2,
       "failures": 0,
       "swift_testing": {"tests": 0, "failures": 0}
