@@ -38,7 +38,8 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         let templateMessages: [[String: any Sendable]] = messages.map { message in
             var dict: [String: any Sendable] = [
@@ -68,18 +69,34 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             return dict
         }
         let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { $0.raw.asObjectSendable }
-        var additionalContext: [String: any Sendable]? = nil
-        if enableThinking != nil || reasoningEffort != nil {
-            var context: [String: any Sendable] = [:]
-            if let enableThinking { context["enable_thinking"] = enableThinking }
-            if let reasoningEffort { context["reasoning_effort"] = reasoningEffort }
-            additionalContext = context
-        }
+        var context: [String: any Sendable] = [:]
+        if let enableThinking { context["enable_thinking"] = enableThinking }
+        if let reasoningEffort { context["reasoning_effort"] = reasoningEffort }
+        // `MLXLMCommon.Tokenizer` (the vendored bridge protocol `tokenizer` is typed as, per
+        // `scalarServingTokenizerWithChatTemplateOverride`'s doc comment below) exposes only the
+        // `applyChatTemplate(messages:tools:additionalContext:)` requirement, which forwards to the
+        // swift-transformers `Tokenizers.Tokenizer` overload that hardcodes `addGenerationPrompt:
+        // true` — there is no reachable overload on this existential that takes
+        // `addGenerationPrompt` as a real parameter, and no accessor to the underlying
+        // `Tokenizers.Tokenizer` instance the adapter macro wraps (it is a private stored property
+        // of a macro-local type). `additionalContext["add_generation_prompt"]` is therefore the
+        // only channel this boundary exposes, and it reaches the SAME Jinja context key the real
+        // parameter would set (`Tokenizer.swift`'s `context["add_generation_prompt"] =
+        // .boolean(addGenerationPrompt)`, overwritten by the `additionalContext` merge loop
+        // immediately after) — not a workaround, the one path available.
+        //
+        // Set UNCONDITIONALLY (never left to the vendored bridge's own hardcoded `true`) so `nil`
+        // resolving to `true` is this function's own explicit decision, not an accident of what the
+        // bridge happens to default to today: `nil` MUST mean `true` (this server's behavior before
+        // `addGenerationPrompt` existed — see `OpenAIChatCompletionRequest.addGenerationPrompt`'s
+        // doc comment), and pinning it here means a future change to the bridge's own default can
+        // never silently change this codec's behavior out from under it.
+        context["add_generation_prompt"] = addGenerationPrompt ?? true
         do {
             return try tokenizer.applyChatTemplate(
                 messages: templateMessages,
                 tools: toolSpecs,
-                additionalContext: additionalContext)
+                additionalContext: context)
         } catch {
             // The served model ships its own chat template, and that template is the ONLY
             // authority on message-ordering/content constraints (e.g. "system must be first") —
@@ -1164,7 +1181,8 @@ public func loadScalarServingModel(
         messages: configuration.startupMessages,
         tools: [],
         enableThinking: nil,
-        reasoningEffort: nil)
+        reasoningEffort: nil,
+        addGenerationPrompt: nil)
     guard !startupPrompt.isEmpty else {
         throw ScalarServingModelLoadError.emptyStartupPrompt
     }

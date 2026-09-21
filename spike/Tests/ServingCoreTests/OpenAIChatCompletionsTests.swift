@@ -741,6 +741,64 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         XCTAssertEqual(plain.promptInput, .chat)
     }
 
+    // MARK: - `add_generation_prompt` (HONORED, never ignored) / `continue_final_message` (hard 400)
+
+    func testAddGenerationPromptFalseDecodesAndIsNeverIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"add_generation_prompt":false}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.addGenerationPrompt, false)
+        XCTAssertFalse(request.ignoredFields.contains("unknown:add_generation_prompt"))
+        XCTAssertFalse(request.ignoredFields.contains("add_generation_prompt"))
+    }
+
+    func testAddGenerationPromptTrueDecodes() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"add_generation_prompt":true}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.addGenerationPrompt, true)
+        XCTAssertFalse(request.ignoredFields.contains("unknown:add_generation_prompt"))
+    }
+
+    func testAddGenerationPromptAbsentDecodesToNil() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}]}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertNil(request.addGenerationPrompt)
+    }
+
+    func testAddGenerationPromptNonBooleanIsRejected() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"add_generation_prompt":"yes"}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "add_generation_prompt")
+    }
+
+    // `continue_final_message` is a semantic prefill/continuation flag this server cannot honor (the
+    // vendored tokenizer has no continuation support) — a hard 400, not a silent no-op. See
+    // `semanticallyUnsupportedTopLevelKeys`'s doc comment.
+    func testContinueFinalMessageIsRejectedWithSpecificMessageAndParam() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"continue_final_message":true}
+        """
+        do {
+            _ = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTFail("Expected OpenAIServingError")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.type, .invalidRequest)
+            XCTAssertEqual(error.openAIError.message, "Unsupported field: continue_final_message")
+            XCTAssertEqual(error.openAIError.param, "continue_final_message")
+        } catch {
+            XCTFail("Expected OpenAIServingError, got \(error)")
+        }
+    }
+
     func testSSETerminalChunkCanCarryExactUsage() throws {
         let finish = OpenAIChatCompletionChunk(
             id: "chatcmpl-test",

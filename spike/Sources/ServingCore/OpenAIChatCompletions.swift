@@ -167,6 +167,15 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var parallelToolCalls: Bool?
     /// Qwen3 thinking-mode control (nil = server default).
     public var enableThinking: Bool?
+    /// HF-style `add_generation_prompt` control (nil = server default, which behaves exactly like
+    /// `true`: an assistant generation turn is opened at the end of the rendered prompt, unchanged
+    /// from this server's behavior before this field existed). `false` renders the messages WITHOUT
+    /// opening that trailing generation turn — the shape an assistant-prefill client needs to append
+    /// its own partial assistant turn before continuing generation. HONORED (never listed in
+    /// `ignoredFields`) — see `decodeStrict`'s `add_generation_prompt` handling and
+    /// `MLXScalarTextCodec.render`'s plumbing to the real `Tokenizer.applyChatTemplate(addGenerationPrompt:)`
+    /// parameter.
+    public var addGenerationPrompt: Bool?
     /// Nucleus sampling threshold (nil = server default; validated by ServingSamplingPolicy).
     public var topP: Double?
     /// Top-k sampling cutoff (nil = unset; validated by ServingSamplingPolicy).
@@ -220,6 +229,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         toolChoice: OpenAIToolChoice = .none,
         parallelToolCalls: Bool? = nil,
         enableThinking: Bool? = nil,
+        addGenerationPrompt: Bool? = nil,
         topP: Double? = nil,
         topK: Int? = nil,
         minP: Double? = nil,
@@ -245,6 +255,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.toolChoice = toolChoice
         self.parallelToolCalls = parallelToolCalls
         self.enableThinking = enableThinking
+        self.addGenerationPrompt = addGenerationPrompt
         self.topP = topP
         self.topK = topK
         self.minP = minP
@@ -284,6 +295,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             "tool_choice",
             "parallel_tool_calls",
             "enable_thinking",
+            "add_generation_prompt",
             "top_p",
             "top_k",
             "min_p",
@@ -347,6 +359,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let toolChoice = try OpenAIToolDecoding.decodeToolChoice(root["tool_choice"], hasTools: !tools.isEmpty)
         let parallelToolCalls = try optionalBool(root["parallel_tool_calls"], param: "parallel_tool_calls")
         let enableThinking = try optionalBool(root["enable_thinking"], param: "enable_thinking")
+        let addGenerationPrompt = try optionalBool(
+            root["add_generation_prompt"], param: "add_generation_prompt")
 
         let topP = try optionalDouble(root["top_p"], param: "top_p")
         let topK = try optionalTopK(root["top_k"])
@@ -437,6 +451,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             toolChoice: toolChoice,
             parallelToolCalls: parallelToolCalls,
             enableThinking: resolvedEnableThinking,
+            addGenerationPrompt: addGenerationPrompt,
             topP: topP,
             topK: topK,
             minP: minP,
@@ -1536,12 +1551,22 @@ private func rejectUnknownKeys(in object: [String: Any], allowed: Set<String>, p
 /// request non-text response modalities, `prediction` supplies a speculative-decoding hint tied to a
 /// specific predicted completion, `web_search_options` wires a built-in tool this server never
 /// implements, and `functions`/`function_call` are the legacy (pre-`tools`) function-calling contract
-/// that this server never supported alongside the modern `tools`/`tool_choice` API. Silently accepting
-/// any of these would produce a response the caller explicitly asked for but never receives, so they
-/// stay a hard 400 (`Unsupported field: <key>`) even under the lenient-unknown-top-level-key policy in
-/// `rejectUnknownTopLevelKeys` below.
+/// that this server never supported alongside the modern `tools`/`tool_choice` API. `continue_final_message`
+/// is a distinct case: it is a semantic assistant-prefill/continuation flag (HF `text-generation`/vLLM
+/// convention — render the prompt through the LAST message, an assistant turn, WITHOUT closing it, so
+/// generation continues that turn rather than opening a new one) that this server cannot honor because
+/// the vendored `swift-transformers` tokenizer has no continuation support at all (only
+/// `add_generation_prompt`, which this server DOES honor — see `OpenAIChatCompletionRequest.addGenerationPrompt`).
+/// Silently ignoring `continue_final_message` would be actively dangerous, not merely a no-op: the
+/// caller believes it prefilled the assistant's response and is asking the model to continue that
+/// exact text, but the server would instead render a brand-new assistant turn and return a
+/// completion the caller never asked for, at a 200 the caller has no reason to distrust. Silently
+/// accepting any of these keys would produce a response the caller explicitly asked for but never
+/// receives, so they all stay a hard 400 (`Unsupported field: <key>`) even under the
+/// lenient-unknown-top-level-key policy in `rejectUnknownTopLevelKeys` below.
 private let semanticallyUnsupportedTopLevelKeys: Set<String> = [
     "audio", "modalities", "prediction", "web_search_options", "functions", "function_call",
+    "continue_final_message",
 ]
 
 /// Lenient TOP-LEVEL-only counterpart to `rejectUnknownKeys`: real OpenAI SDK clients and agent

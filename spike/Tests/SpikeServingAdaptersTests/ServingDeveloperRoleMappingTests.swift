@@ -175,7 +175,8 @@ final class ServingDeveloperRoleMappingTests: XCTestCase {
                 ],
                 tools: [],
                 enableThinking: nil,
-                reasoningEffort: nil))
+                reasoningEffort: nil,
+                addGenerationPrompt: nil))
 
         let rendered = try XCTUnwrap(box.rendered)
         XCTAssertEqual(occurrenceCount(of: "<|im_start|>system", in: rendered), 1)
@@ -209,7 +210,8 @@ final class ServingDeveloperRoleMappingTests: XCTestCase {
                 ],
                 tools: [],
                 enableThinking: nil,
-                reasoningEffort: nil))
+                reasoningEffort: nil,
+                addGenerationPrompt: nil))
 
         let rendered = try XCTUnwrap(box.rendered)
         XCTAssertEqual(occurrenceCount(of: "<|im_start|>system", in: rendered), 2)
@@ -266,7 +268,8 @@ final class ServingDeveloperRoleMappingTests: XCTestCase {
                 ],
                 tools: [],
                 enableThinking: nil,
-                reasoningEffort: nil))
+                reasoningEffort: nil,
+                addGenerationPrompt: nil))
 
         let rendered = try XCTUnwrap(box.rendered)
         XCTAssertTrue(rendered.contains("mid"))

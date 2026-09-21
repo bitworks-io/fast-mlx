@@ -66,7 +66,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
             messages: request.messages,
             tools: request.tools,
             enableThinking: false,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
         let disabledThinkingPrompt = tokenizer.decode(
             tokenIds: disabledThinkingIDs, skipSpecialTokens: false)
 
@@ -133,7 +134,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
             messages: request.messages,
             tools: request.tools,
             enableThinking: true,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
         let enabledThinkingPrompt = tokenizer.decode(
             tokenIds: enabledThinkingIDs, skipSpecialTokens: false)
 
@@ -258,7 +260,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
         do {
             _ = try codec.render(
                 messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
-                reasoningEffort: nil)
+                reasoningEffort: nil,
+                addGenerationPrompt: nil)
             XCTFail("expected the stock template's non-leading system guard to raise")
         } catch {
             caught = error
@@ -290,7 +293,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
 
         let tokens = try codec.render(
             messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
         let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
 
         XCTAssertEqual(
@@ -325,7 +329,7 @@ final class Qwen3TemplateRenderTests: XCTestCase {
 
         let tokens = try codec.render(
             messages: [OpenAIChatMessage(role: .user, text: "just a user turn")],
-            tools: [], enableThinking: nil, reasoningEffort: nil)
+            tools: [], enableThinking: nil, reasoningEffort: nil, addGenerationPrompt: nil)
         let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
 
         XCTAssertEqual(occurrenceCount(of: "<|im_start|>system", in: rendered), 0)
@@ -441,7 +445,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
         // directly against a toy excerpt of the same guard.
         let tokens = try codec.render(
             messages: request.messages, tools: request.tools, enableThinking: false,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
         let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
 
         // The tool schema block is present exactly once.
@@ -549,7 +554,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
         do {
             _ = try codec.render(
                 messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
-                reasoningEffort: nil)
+                reasoningEffort: nil,
+                addGenerationPrompt: nil)
             XCTFail("expected the stock template's non-leading system guard to raise")
         } catch {
             caught = error
@@ -577,7 +583,8 @@ final class Qwen3TemplateRenderTests: XCTestCase {
 
         let tokens = try codec.render(
             messages: nonLeadingSystemMessages(), tools: [], enableThinking: nil,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
         let rendered = overriddenTokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
 
         XCTAssertEqual(

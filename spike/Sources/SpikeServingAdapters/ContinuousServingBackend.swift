@@ -289,7 +289,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             tools: activeTools,
             enableThinking: request.resolvedEnableThinking(
                 disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive),
-            reasoningEffort: request.reasoningEffort)
+            reasoningEffort: request.reasoningEffort,
+            addGenerationPrompt: request.addGenerationPrompt)
         guard !promptTokens.isEmpty else {
             throw ContinuousServingBackendError.emptyRenderedPrompt
         }

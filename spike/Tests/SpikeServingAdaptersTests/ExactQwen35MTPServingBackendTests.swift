@@ -530,7 +530,8 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         promptTokens
     }

@@ -1885,7 +1885,8 @@ private struct RouteObservationFixtureCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         guard let text = messages.last?.text else {
             throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: 0)

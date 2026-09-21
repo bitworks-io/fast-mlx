@@ -315,7 +315,8 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
                 tools: [],
                 enableThinking: request.resolvedEnableThinking(
                     disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive),
-                reasoningEffort: request.reasoningEffort)
+                reasoningEffort: request.reasoningEffort,
+                addGenerationPrompt: request.addGenerationPrompt)
         } catch {
             guard acceptingRequests else {
                 throw ExactQwen35MTPServingBackendError.shuttingDown

@@ -946,7 +946,8 @@ private struct LoadedProductionRouteFixtureCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         guard let text = messages.last?.text,
             let prompt = promptByText[text]
@@ -1025,7 +1026,8 @@ private struct ProductionRouteFixtureCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         [1]
     }

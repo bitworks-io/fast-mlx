@@ -4391,12 +4391,26 @@ class BuiltinSizerCombinedRequirementRefusalTests(unittest.TestCase):
 class BuiltinSizersEmitNoContextCeilingTests(unittest.TestCase):
     """Pins the assumption the up-front --context refusal depends on.
 
+    This is a DECIDED invariant, not a pending gap. Emitting a context
+    ceiling from a built-in sizer was evaluated and REJECTED in cycle 128
+    (2026-09-21); see
+    docs/task-inbox/2026-09-21-DECISION-builtin-sizer-context-ceiling-REJECTED.md.
+    In short: context is not a variable in these sizers' arithmetic at all
+    (weight_bytes + kv_reserve_bytes), so "inverting" it yields bytes, not
+    tokens; producing tokens would require porting the seven-way Swift KV
+    geometry model into Python, where a single formula is already measured
+    wrong for 5 of 14 catalog models -- including our own production
+    qwen4_exp. Nothing revalidates a derived context before execv, so a
+    plausible-but-wrong ceiling is a runtime OOM rather than a clean refusal.
+
     If this test fails, a built-in sizer has started emitting a context
-    ceiling. Do NOT adjust this test to match. Remove or rework the
-    up-front --context requirement in scripts/fastmlx_launch.py (search
-    for _builtin_sizer_missing_requirements) so `fastmlx serve` derives
-    the context from the ceiling instead of refusing, and only then
-    update this test.
+    ceiling. Do NOT adjust this test to match, and do NOT treat the failure
+    as permission to proceed -- reopen the decision record first. Only if
+    that record is superseded should you rework the up-front --context
+    requirement in scripts/fastmlx_launch.py (search for
+    _builtin_sizer_missing_requirements) so `fastmlx serve` derives the
+    context from the ceiling instead of refusing, and only then update
+    this test.
     """
 
     def setUp(self):

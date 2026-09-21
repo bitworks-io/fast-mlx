@@ -130,7 +130,8 @@ private func runLoadedExactQwen35MTPBackendProof(
         messages: messages,
         tools: [],
         enableThinking: nil,
-        reasoningEffort: nil)
+        reasoningEffort: nil,
+        addGenerationPrompt: nil)
 
     let normalControl = try await runScalarControl(
         pair: pair,
@@ -583,7 +584,8 @@ private func runTimedScalarControl(
         messages: messages,
         tools: [],
         enableThinking: nil,
-        reasoningEffort: nil)
+        reasoningEffort: nil,
+        addGenerationPrompt: nil)
     let cache = context.model.newCache(parameters: parameters)
     let (stream, task) = try generateTokensTask(
         input: LMInput(tokens: MLXArray(promptTokens)),
@@ -844,7 +846,8 @@ private struct TokenizerBackedScalarServingTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         var additionalContext: [String: any Sendable] = [:]
         if let enableThinking {
@@ -853,6 +856,9 @@ private struct TokenizerBackedScalarServingTextCodec: ScalarServingTextCodec {
         if let reasoningEffort {
             additionalContext["reasoning_effort"] = reasoningEffort
         }
+        // Mirrors `MLXScalarTextCodec.render`'s convention: `nil` means `true`, set explicitly
+        // rather than left to the bridge's own hardcoded default.
+        additionalContext["add_generation_prompt"] = addGenerationPrompt ?? true
         return try tokenizer.applyChatTemplate(
             messages: messages.map {
                 ["role": $0.role.rawValue, "content": $0.text]

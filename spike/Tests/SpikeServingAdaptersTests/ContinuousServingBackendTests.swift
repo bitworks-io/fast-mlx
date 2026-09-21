@@ -2210,7 +2210,8 @@ private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         renderGate?.wait()
         guard let text = messages.last?.text,

@@ -1086,7 +1086,8 @@ private struct LogprobFixtureScalarTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         promptTokens
     }
@@ -1113,7 +1114,8 @@ private struct FixtureScalarTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         renderCounter?.increment()
         return tools.isEmpty ? promptTokens : promptTokens + extraPromptTokensWhenToolsPresent
@@ -1138,7 +1140,8 @@ private struct RawTextFixtureScalarTextCodec: ScalarServingTextCodec {
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         renderCounter.increment()
         return chatPromptTokens

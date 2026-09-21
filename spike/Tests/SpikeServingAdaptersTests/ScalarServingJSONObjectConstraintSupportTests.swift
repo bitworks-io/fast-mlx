@@ -307,7 +307,7 @@ final class ScalarServingJSONObjectConstraintSupportTests: XCTestCase {
 private struct UnusedScalarServingTextCodec: ScalarServingTextCodec {
     func render(
         messages: [OpenAIChatMessage], tools: [OpenAIToolSpec], enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?, addGenerationPrompt: Bool?
     ) throws -> [Int] {
         XCTFail("render should not be called by capability-composition tests")
         return []

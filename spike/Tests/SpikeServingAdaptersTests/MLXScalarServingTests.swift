@@ -49,7 +49,8 @@ final class MLXScalarServingTests: XCTestCase {
             ],
             tools: [],
             enableThinking: nil,
-            reasoningEffort: nil)
+            reasoningEffort: nil,
+            addGenerationPrompt: nil)
 
         XCTAssertEqual(tokens, [41, 42])
     }
@@ -1878,9 +1879,13 @@ private struct FixtureTokenizer: Tokenizer {
             ("user", "user text"),
             ("assistant", "assistant text"),
         ]
+        // `additionalContext` is no longer `nil` here: `MLXScalarTextCodec.render` now always
+        // threads `add_generation_prompt` through it (see that method's doc comment on why —
+        // `nil` addGenerationPrompt resolves to `true`, matching this call site's `nil` argument).
         guard messages.count == expected.count,
             tools == nil,
-            additionalContext == nil
+            additionalContext?.count == 1,
+            additionalContext?["add_generation_prompt"] as? Bool == true
         else {
             throw FixtureTokenizerError.unexpectedMessages
         }

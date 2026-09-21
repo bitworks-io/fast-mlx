@@ -457,7 +457,8 @@ public func loadContinuousServingModel(
         messages: configuration.startupMessages,
         tools: [],
         enableThinking: nil,
-        reasoningEffort: nil)
+        reasoningEffort: nil,
+        addGenerationPrompt: nil)
     guard !startupPrompt.isEmpty else {
         throw ContinuousServingModelLoadError.emptyStartupPrompt
     }

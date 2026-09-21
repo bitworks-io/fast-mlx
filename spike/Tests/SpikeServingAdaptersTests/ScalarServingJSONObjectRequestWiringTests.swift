@@ -280,7 +280,7 @@ private struct ConstraintCapturingDecoder: Decoder {
 private struct FixtureCodec: ScalarServingTextCodec {
     func render(
         messages: [OpenAIChatMessage], tools: [OpenAIToolSpec], enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?, addGenerationPrompt: Bool?
     ) throws -> [Int] {
         [10]
     }

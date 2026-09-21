@@ -53,11 +53,17 @@ public protocol ScalarServingDetokenizer {
 }
 
 public protocol ScalarServingTextCodec: Sendable {
+    /// `addGenerationPrompt: nil` MUST behave exactly like `true` — see
+    /// `OpenAIChatCompletionRequest.addGenerationPrompt`'s doc comment. Deliberately NOT given a
+    /// protocol-extension default: every conformer (production codec and every test fixture) must
+    /// confront this parameter directly, so a future conformer cannot silently ignore the flag the
+    /// way the wire field itself was ignored before this parameter existed.
     func render(
         messages: [OpenAIChatMessage],
         tools: [OpenAIToolSpec],
         enableThinking: Bool?,
-        reasoningEffort: String?
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int]
     /// Tokenizes a legacy `/v1/completions` raw-text prompt with NO chat template applied. The
     /// default implementation below fails closed (`completions_unsupported`) so every codec that has
@@ -488,7 +494,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 request,
                 codec: codec,
                 tools: activeTools,
-                enableThinking: resolvedEnableThinking)
+                enableThinking: resolvedEnableThinking,
+                addGenerationPrompt: request.addGenerationPrompt)
             guard !rendered.isEmpty else {
                 throw ScalarServingBackendError.emptyRenderedPrompt
             }
@@ -524,7 +531,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 request,
                 codec: codec,
                 tools: activeTools,
-                enableThinking: resolvedEnableThinking)
+                enableThinking: resolvedEnableThinking,
+                addGenerationPrompt: request.addGenerationPrompt)
         }
         let renderedPromptTokens = promptTokens ?? []
         guard !renderedPromptTokens.isEmpty else {
@@ -596,7 +604,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         _ request: OpenAIChatCompletionRequest,
         codec: any ScalarServingTextCodec,
         tools: [OpenAIToolSpec],
-        enableThinking: Bool?
+        enableThinking: Bool?,
+        addGenerationPrompt: Bool?
     ) throws -> [Int] {
         switch request.promptInput {
         case .chat:
@@ -604,7 +613,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 messages: request.messages,
                 tools: tools,
                 enableThinking: enableThinking,
-                reasoningEffort: request.reasoningEffort)
+                reasoningEffort: request.reasoningEffort,
+                addGenerationPrompt: addGenerationPrompt)
         case .rawText(let prompt):
             return try codec.encode(rawText: prompt)
         }

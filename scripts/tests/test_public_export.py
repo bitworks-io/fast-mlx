@@ -243,9 +243,18 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # path, competitor/engine product name, or credential; the proxy is stdlib-only (http.server /
 # http.client), never names a third-party engine, and its tests drive a synthetic fake upstream on
 # an ephemeral loopback port rather than any real deployment.
+# 2026-09-21, 1000 -> 1001: adds
+# spike/Tests/SpikeServingAdaptersTests/ChatTemplateGenerationPromptRenderTests.swift, the
+# real-tokenizer proof that `add_generation_prompt` reaches the chat template. Conscious decision to
+# publish: the file was read in full and contains no private host, IP, username, absolute
+# machine-local path, competitor/engine product name, or credential. It locates its tokenizer
+# ONLY through the FASTMLX_QWEN3_TOKENIZER_DIR environment variable -- the same idiom the already
+# published Qwen3TemplateRenderTests.swift uses -- so no local path is baked in, and it skips
+# cleanly on any checkout (including CI) where that variable is unset. All of its assertions are
+# relational (length/prefix/equality over token arrays), never a hardcoded vocabulary ID.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1000,
-    "pathModeSha256": "2ddc32edb7e0bf5cb6de8b908a91e798a3a02a8012993afb107a10046a703fe1",
+    "pathCount": 1001,
+    "pathModeSha256": "87cf3a88311194dc157efa8c3cdd5ddb0ce128fe06020c3fb27e27b6850c9c88",
 }
 
 
