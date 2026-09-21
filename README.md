@@ -411,6 +411,23 @@ overridable by `--force`) on a mismatch. The example profiles under `examples/en
 intentionally omit `engineBuild` — an asserted commit there would be false for every operator's
 own build of the engine they front.
 
+**You do not have to write a profile at all for a release install.** When no profile declares
+`engineBuild.commit`, `fastmlx serve` derives this launch's build from the release tarball's own
+top-level `provenance.json` — the one `scripts/package-release.sh` stages next to `bin/`. It is used
+only when every one of these holds, and otherwise the launch stays `undeclared` exactly as before:
+the engine binary sits at `<root>/bin/<name>` with a readable `<root>/provenance.json`;
+`source_dirty` is `false`; `source_commit` is a 40-hex sha; and **the binary's actual sha256 equals
+the `engine_binary_sha256` that file records**. That last condition is what makes the derived commit
+mean something — `provenance.json` is a sibling text file, not a seal, so a binary swapped out after
+packaging must not inherit the record's claim. A build from a dirty tree, a binary that does not
+match, a non-release layout, or a missing or malformed `provenance.json` all derive nothing rather
+than guess. Derivation never refuses: it either produces a commit or leaves the launch undeclared.
+An operator-declared `engineBuild.commit` always wins over a derived one.
+
+`fastmlx recommend` does **not** derive: it execs nothing and resolves no engine binary, so it has
+nothing to hash. It still reports `undeclared` for a card measured on a fast-mlx build, even where
+`fastmlx serve` on the same install now reports `match`.
+
 A card is measured with the engine run one way. When the launch's final engine argv adds `--mtp`
 (multi-token prediction), `serve` and `recommend` report whether the card was checked under that flag
 (`mtp=` on the admitted line, `mtp` in the dry-run plan and recommend rows). The status is one of

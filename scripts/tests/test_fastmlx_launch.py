@@ -3950,6 +3950,343 @@ class EngineBuildTestCase(unittest.TestCase):
         self.assertIn("undeclared", ctx.exception.message)
 
 
+# ---------------------------------------------------------------------
+# Engine build DERIVATION from a release tree's own provenance.json, with
+# NO operator-written --engine-profile engineBuild.commit at all -- see
+# `derive_engine_build_from_release`. A release-layout engine binary lives
+# at <root>/bin/<name>, with a sibling <root>/provenance.json (exactly the
+# shape scripts/package-release.sh stages; see write_release_provenance).
+# ---------------------------------------------------------------------
+def write_release_engine_binary(
+    root: Path, name: str = "fastmlx-serve", content: bytes = b"#!/bin/sh\nexit 0\n"
+) -> Path:
+    bin_dir = root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    path = bin_dir / name
+    path.write_bytes(content)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def write_release_provenance(
+    root: Path,
+    *,
+    source_commit=None,
+    source_dirty=False,
+    engine_binary_sha256=None,
+    raw_text: str = None,
+    omit: bool = False,
+) -> Path:
+    """Write <root>/provenance.json in the shape
+    scripts/package-release.sh emits it. ``raw_text``, when given, is
+    written verbatim (malformed-JSON fixture); ``omit`` skips writing the
+    file at all (missing-provenance fixture).
+    """
+    path = root / "provenance.json"
+    if omit:
+        return path
+    if raw_text is not None:
+        path.write_text(raw_text, encoding="utf-8")
+        return path
+    document = {"source_commit": source_commit, "source_dirty": source_dirty}
+    if engine_binary_sha256 is not None:
+        document["engine_binary_sha256"] = engine_binary_sha256
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+class EngineBuildDerivationTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.manifest_path = write_engine_build_card_manifest(self.root)
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def base_args(self, engine_bin: Path, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(engine_bin),
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def last_json_line(stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        return json.loads(lines[-1])
+
+    # (1) The headline: no --engine-profile engineBuild.commit at all, but a
+    # correctly-formed release layout whose provenance.json names the SAME
+    # commit the card was measured on -- match, reachable with NO operator
+    # action.
+    def test_release_layout_derives_match_with_no_operator_action(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "match")
+        self.assertEqual(plan["engineBuild"]["launch"], EB_CARD_COMMIT)
+
+    # (2) source_dirty: true -> undeclared, notice printed.
+    def test_dirty_source_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=True,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+        self.assertIsNone(plan["engineBuild"]["launch"])
+
+    # (2b) source_dirty is checked with `is not False`, so anything that is
+    # not literally the bool False fails closed the same way True does --
+    # including a truthy/falsy non-bool and an absent key. Covered
+    # explicitly because the identity comparison is the ONLY thing standing
+    # between "unexpected shape" and "treated as a clean build": `== False`
+    # would accept 0, and `not source_dirty` would accept a missing key.
+    def test_non_bool_or_absent_source_dirty_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        documents = {
+            "zero": {
+                "source_commit": EB_CARD_COMMIT,
+                "source_dirty": 0,
+                "engine_binary_sha256": actual_sha256,
+            },
+            "string-false": {
+                "source_commit": EB_CARD_COMMIT,
+                "source_dirty": "false",
+                "engine_binary_sha256": actual_sha256,
+            },
+            "null": {
+                "source_commit": EB_CARD_COMMIT,
+                "source_dirty": None,
+                "engine_binary_sha256": actual_sha256,
+            },
+            "absent": {
+                "source_commit": EB_CARD_COMMIT,
+                "engine_binary_sha256": actual_sha256,
+            },
+        }
+        for label, document in documents.items():
+            with self.subTest(source_dirty=label):
+                write_release_provenance(
+                    self.root, raw_text=json.dumps(document)
+                )
+                argv = self.base_args(
+                    engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+                ) + ["--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 0, stderr)
+                plan = self.last_json_line(stdout)
+                self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (3) engine_binary_sha256 present but wrong -> undeclared, and the run
+    # is NOT refused.
+    def test_binary_sha256_mismatch_stays_undeclared_and_does_not_refuse(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        wrong_sha256 = ("0" if actual_sha256[0] != "0" else "1") + actual_sha256[1:]
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=wrong_sha256,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (4) provenance.json absent -> undeclared (today's behaviour, unchanged).
+    def test_missing_provenance_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        write_release_provenance(self.root, omit=True)
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (5) provenance.json malformed JSON -> undeclared, no traceback, no
+    # refusal.
+    def test_malformed_provenance_json_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        write_release_provenance(self.root, raw_text="{not-json")
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (6) source_commit missing / not 40-hex -> undeclared.
+    def test_source_commit_missing_or_malformed_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        for source_commit in (None, "TOOSHORTORUPPERCASE"):
+            with self.subTest(source_commit=source_commit):
+                write_release_provenance(
+                    self.root,
+                    source_commit=source_commit,
+                    source_dirty=False,
+                    engine_binary_sha256=actual_sha256,
+                )
+                argv = self.base_args(
+                    engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+                ) + ["--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 0, stderr)
+                plan = self.last_json_line(stdout)
+                self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (7) engine_binary_sha256 missing -> undeclared.
+    def test_missing_binary_sha256_stays_undeclared(self):
+        engine_bin = write_release_engine_binary(self.root)
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=None,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (8) Precedence: an operator-declared engineBuild.commit in the engine
+    # profile wins over a well-formed, sha-verified release provenance.json
+    # that names a DIFFERENT commit.
+    def test_profile_declared_commit_wins_over_derivation(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        profile_path = write_engine_build_profile(
+            self.root, "declared-profile", commit=EB_OTHER_COMMIT
+        )
+        argv = self.base_args(
+            engine_bin,
+            **{
+                "--model-repo": EB_PASS_REPO,
+                "--context": "2048",
+                "--engine-profile": str(profile_path),
+            },
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["launch"], EB_OTHER_COMMIT)
+        self.assertEqual(plan["engineBuild"]["status"], "mismatch")
+
+    # (9) The engine binary is NOT inside a `bin/` parent directory -> the
+    # layout guard alone forces undeclared, even with a well-formed sibling
+    # provenance.json right next to it.
+    def test_engine_binary_outside_bin_dir_stays_undeclared(self):
+        engine_bin = self.root / "fastmlx-serve"
+        engine_bin.write_bytes(b"#!/bin/sh\nexit 0\n")
+        engine_bin.chmod(engine_bin.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "undeclared")
+
+    # (10) A card whose commit differs from a successfully DERIVED commit ->
+    # mismatch, with the notice naming both short shas.
+    def test_derived_commit_mismatch_names_both_short_shas(self):
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_LAUNCH._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_OTHER_COMMIT,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_args(
+            engine_bin, **{"--model-repo": EB_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(EB_CARD_COMMIT[:12], stderr)
+        self.assertIn(EB_OTHER_COMMIT[:12], stderr)
+        self.assertIn("transfer unmeasured", stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["engineBuild"]["status"], "mismatch")
+        self.assertEqual(plan["engineBuild"]["launch"], EB_OTHER_COMMIT)
+
+
+# Part 1 (scripts/package-release.sh's new provenance.json keys:
+# engine_binary_sha256 / capacity_binary_sha256) is covered by the real
+# release-packaging harness in scripts/tests/test_release_package.py
+# (test_provenance_binary_sha256_fields_match_the_staged_binaries), which
+# builds an actual tarball and asserts each recorded digest equals the
+# real sha256 of the staged binary bytes -- not re-covered here.
+
+
 class ResidencyTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

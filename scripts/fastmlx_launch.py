@@ -1228,6 +1228,98 @@ def _sha256_file(path: str) -> str:
     return hasher.hexdigest()
 
 
+def derive_engine_build_from_release(engine_bin_abs: str) -> Optional[dict]:
+    """Derive this launch's own engine-build commit from a
+    ``scripts/package-release.sh``-staged release tree, with NO
+    operator-written ``--engine-profile engineBuild.commit`` at all.
+
+    Every quality card measured on fast-mlx's OWN Swift engine (never a
+    third-party ``--engine-profile``) previously showed the "undeclared --
+    transfer unmeasured" notice on EVERY launch forever: nothing upstream of
+    this function ever knew the commit the ``fastmlx-serve`` binary being
+    exec'd was built from unless an operator hand-wrote it into a profile.
+    A release tarball already carries that fact -- ``provenance.json``,
+    staged as a sibling of ``bin/`` -- so this reads it back, but only when
+    EVERY one of the following holds; any failure returns ``None`` (stays
+    "undeclared", the same honest fail-open ``card_engine_build_commit`` and
+    ``card_flag_transfer_mtp`` already use elsewhere in this module -- an
+    underivable build is never a refusal, only a fact this launch cannot
+    assert).
+
+    1. ``engine_bin_abs`` is an absolute path whose parent directory is
+       named ``bin``, with a readable ``provenance.json`` at
+       ``<parent-of-bin>/provenance.json`` -- exactly the layout
+       ``package-release.sh`` stages (``<root>/bin/fastmlx-serve`` next to
+       ``<root>/provenance.json``). Anything else (no ``bin/`` parent, no
+       sibling file, unreadable) is not a release install this function
+       recognizes, so it derives nothing rather than guessing at a
+       differently-shaped install.
+    2. The file parses as JSON and the top level is a dict -- a malformed
+       or unexpected shape is treated as absent, never as a crash.
+    3. ``source_dirty`` is present and is exactly the bool ``False``. A
+       dirty tree's ``source_commit`` names the checkout the build started
+       from, not the exact bytes that came out of it -- an uncommitted
+       change could be anywhere in what got compiled, so a dirty build
+       stays undeclared rather than asserting a commit the binary may not
+       faithfully represent. A missing key or a non-bool is refused the
+       same way (fails closed on an unexpected shape, not just on ``True``).
+    4. ``source_commit`` is a string matching ``_LOWERCASE_HEX40_RE`` -- the
+       same shape ``engineBuild.commit`` is validated to when an operator
+       writes it into a profile by hand (see
+       ``_validate_engine_build_profile``), so a derived commit is never
+       looser than a declared one.
+    5. ``engine_binary_sha256`` is a string matching
+       ``_LOWERCASE_HEX64_RE``.
+    6. The ACTUAL sha256 of the file at ``engine_bin_abs`` (via
+       ``_sha256_file``) equals that ``engine_binary_sha256``. This is what
+       makes the derivation honest rather than a bare assertion:
+       ``provenance.json`` is only a sibling TEXT file, sitting next to the
+       binary, not sealed to it -- nothing stops a binary at
+       ``bin/fastmlx-serve`` from being swapped out after packaging while
+       ``provenance.json`` is left untouched. Recomputing and comparing the
+       hash of the binary ACTUALLY BEING EXEC'D is what ties the recorded
+       commit to the bytes running this launch, the same reason an
+       operator-declared ``engineBuild.binarySha256`` is independently
+       verified against the resolved binary rather than trusted as an
+       assertion (see the ``expected_binary_sha256`` check in
+       ``_run_serve``).
+
+    Returns ``{"commit": <40-hex>, "binarySha256": <64-hex>}`` on success.
+    Never raises (``OSError``/``json.JSONDecodeError``/an unexpected type
+    are all just another way to fail closed to ``None``) and never calls
+    ``LaunchRefusal`` -- an underivable build is simply "undeclared", the
+    existing honest outcome this whole module already surfaces for a
+    profile that declares no commit at all.
+    """
+    try:
+        bin_dir = os.path.dirname(engine_bin_abs)
+        if not os.path.isabs(engine_bin_abs) or os.path.basename(bin_dir) != "bin":
+            return None
+        provenance_path = os.path.join(os.path.dirname(bin_dir), "provenance.json")
+        with open(provenance_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        if not isinstance(document, dict):
+            return None
+        source_dirty = document.get("source_dirty")
+        if source_dirty is not False:
+            return None
+        source_commit = document.get("source_commit")
+        if not isinstance(source_commit, str) or not _LOWERCASE_HEX40_RE.fullmatch(
+            source_commit
+        ):
+            return None
+        engine_binary_sha256 = document.get("engine_binary_sha256")
+        if not isinstance(
+            engine_binary_sha256, str
+        ) or not _LOWERCASE_HEX64_RE.fullmatch(engine_binary_sha256):
+            return None
+        if _sha256_file(engine_bin_abs) != engine_binary_sha256:
+            return None
+        return {"commit": source_commit, "binarySha256": engine_binary_sha256}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def _resolve_fit_check_bin_value(bin_value: str, path: str) -> str:
     """Resolve a `fitCheck.bin` value to an argv[0] string.
 
@@ -1426,6 +1518,32 @@ def _resolve_executable(value: str) -> Optional[str]:
             return str(candidate.resolve())
         return None
     return shutil.which(value)
+
+
+def _guarded_engine_bin_abs_for_engine_build_derivation(
+    args, is_built_in_profile: bool
+) -> Optional[str]:
+    """The same engine-binary resolution ``_run_serve`` performs lower down
+    (``--engine-bin``, or the built-in engine name for the built-in
+    profile), but computed early and GUARDED to never raise -- used only to
+    feed ``derive_engine_build_from_release`` before the quality-card
+    lookup, which needs a candidate commit sooner than the engine binary is
+    otherwise resolved.
+
+    This deliberately does NOT raise the "--engine-bin is required" /
+    "engine binary not found" ``LaunchRefusal``s the real resolution below
+    raises: those refusals must keep firing in their EXISTING position (the
+    tests pin their ordering and exit codes), so an engine-build derivation
+    attempt that cannot even resolve a candidate binary just yields no
+    candidate here -- the real refusal, if any, still fires later, from the
+    unchanged code path.
+    """
+    engine_bin_value = args.engine_bin
+    if engine_bin_value is None:
+        if not is_built_in_profile:
+            return None
+        engine_bin_value = _BUILT_IN_ENGINE_BINARY_NAME
+    return _resolve_executable(engine_bin_value)
 
 
 _RESIDENCY_FLAG = "--residency"
@@ -1933,7 +2051,31 @@ def _run_serve(args, passthrough_args: list) -> int:
     # for any profile that does not declare one) -- resolved this early
     # because the quality-card lookup below (`resolve_card`) needs it to
     # disambiguate a pack with more than one card, never to filter one.
+    #
+    # An operator-declared engineBuild.commit in the profile ALWAYS wins
+    # and is used unchanged -- derivation only fills the gap when the
+    # profile declares no commit at all (including the built-in profile,
+    # whose engineBuild is always None). Derivation is attempted through a
+    # GUARDED, never-raising local resolution
+    # (`_guarded_engine_bin_abs_for_engine_build_derivation`) rather than
+    # hoisting the real `_resolve_executable`/`--engine-bin` resolution
+    # from its existing position further down: several tests pin the exact
+    # ordering and exit codes of the refusals between here and there (the
+    # residency, fit-check, and quality-card admission checks), and hoisting
+    # would make an "engine binary not found" refusal fire before all of
+    # them instead of after. `derive_engine_build_from_release` itself never
+    # raises either -- an underivable build is simply left "undeclared",
+    # the same honest outcome a profile declaring no commit already
+    # produces.
     launch_engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
+    if launch_engine_build_commit is None:
+        candidate_engine_bin_abs = _guarded_engine_bin_abs_for_engine_build_derivation(
+            args, is_built_in_profile
+        )
+        if candidate_engine_bin_abs is not None:
+            derived_engine_build = derive_engine_build_from_release(candidate_engine_bin_abs)
+            if derived_engine_build is not None:
+                launch_engine_build_commit = derived_engine_build["commit"]
     # Whether this launch's final argv carries the exact token `--mtp` --
     # resolved this early (pre-substitution; see `_final_argv_preview`) so
     # the quality-card `--mtp` status below can be computed before the

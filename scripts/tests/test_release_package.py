@@ -258,6 +258,12 @@ class ReleasePackageTests(unittest.TestCase):
             assert extracted is not None
             return json.loads(extracted.read().decode("utf-8"))
 
+    def _read_tarball_member_bytes(self, tarball: Path, member_path: str) -> bytes:
+        with tarfile.open(tarball, "r:gz") as tar:
+            extracted = tar.extractfile(tar.getmember(member_path))
+            assert extracted is not None
+            return extracted.read()
+
     # --- layout / packaging basics ------------------------------------------------------------
 
     def test_tarball_layout(self) -> None:
@@ -1013,6 +1019,53 @@ class ReleasePackageTests(unittest.TestCase):
 
             self.assertIsNone(provenance["source_commit"])
             self.assertFalse(provenance["source_dirty"])
+
+    # --- provenance: engine_binary_sha256 / capacity_binary_sha256 -----------------------------
+    # These digests are what lets `fastmlx serve` derive its own engine-build commit from a
+    # release install with no operator-written --engine-profile at all (see
+    # fastmlx_launch.py's derive_engine_build_from_release): source_commit alone names a
+    # checkout, not the bytes actually shipped, so the digest is what makes that commit
+    # trustworthy for the staged fastmlx-serve binary specifically.
+    def test_provenance_binary_sha256_fields_match_the_staged_binaries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            version = "testver"
+            self.run_package_script(
+                stage_dir,
+                out_dir,
+                version=version,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+            )
+            tarball, _ = self._tarball_paths(out_dir, version=version)
+            provenance = self._read_provenance(tarball, version=version)
+
+            for field in ("engine_binary_sha256", "capacity_binary_sha256"):
+                self.assertIn(field, provenance)
+                self.assertRegex(provenance[field], r"^[0-9a-f]{64}$")
+
+            top_dir = f"fastmlx-{version}-arm64-macos"
+            serve_bytes = self._read_tarball_member_bytes(
+                tarball, f"{top_dir}/bin/fastmlx-serve"
+            )
+            capacity_bytes = self._read_tarball_member_bytes(
+                tarball, f"{top_dir}/bin/fastmlx-capacity"
+            )
+            # The load-bearing assertion: each recorded digest equals the ACTUAL sha256 of the
+            # staged binary bytes extracted from the tarball -- asserting only that the key
+            # exists would pass against a hardcoded or stale value.
+            self.assertEqual(
+                provenance["engine_binary_sha256"], hashlib.sha256(serve_bytes).hexdigest()
+            )
+            self.assertEqual(
+                provenance["capacity_binary_sha256"], hashlib.sha256(capacity_bytes).hexdigest()
+            )
 
     # --- sampled-MTP attestation: opt-in, family-neutral, no default minimum ------------------
 

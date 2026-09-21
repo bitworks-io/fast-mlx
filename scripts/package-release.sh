@@ -17,8 +17,13 @@
 # This script only STAGES artifacts locally. It does not create a tap repo, push a GitHub
 # release, or publish anything -- publication is human-gated.
 #
-# Every staged tarball carries a top-level provenance.json recording the source commit and
-# whether the tree was dirty. Sampled-MTP build attestation is opt-in and family-neutral: pass
+# Every staged tarball carries a top-level provenance.json recording the source commit, whether
+# the tree was dirty, and the sha256 of each staged binary (engine_binary_sha256,
+# capacity_binary_sha256) -- the digests let `fastmlx serve` derive its own engine-build commit
+# from a release install with no operator-written --engine-profile at all (see
+# fastmlx_launch.py's derive_engine_build_from_release), verified against the actual binary bytes
+# rather than trusted from the sibling text file alone. Sampled-MTP build attestation is opt-in
+# and family-neutral: pass
 # --sampled-mtp-minimum-commit <sha> to record whether the source commit descends from that
 # minimum, and --require-sampled-mtp (only valid together with the minimum flag) to make the
 # script refuse (non-zero exit) to package a build that cannot back that claim. Neither flag has
@@ -182,6 +187,15 @@ cp -f "$CAPACITY_BINARY" "$STAGE_ROOT/bin/fastmlx-capacity"
 cp -f "$METALLIB" "$STAGE_ROOT/bin/mlx.metallib"
 chmod +x "$STAGE_ROOT/bin/fastmlx-serve" "$STAGE_ROOT/bin/fastmlx-capacity"
 
+# Hashed AFTER staging (the staged copy is what a downloaded tarball actually execs) so
+# provenance.json's binary digests describe the exact bytes an operator's tarball ships, not
+# whatever transient path $BINARY/$CAPACITY_BINARY pointed at during the build. fastmlx serve's
+# engine-build derivation (fastmlx_launch.py's derive_engine_build_from_release) treats
+# engine_binary_sha256 as the one fact that makes source_commit trustworthy for the shipped
+# fastmlx-serve -- a mismatch there means the binary was swapped after packaging.
+ENGINE_BINARY_SHA256="$(shasum -a 256 "$STAGE_ROOT/bin/fastmlx-serve" | awk '{print $1}')"
+CAPACITY_BINARY_SHA256="$(shasum -a 256 "$STAGE_ROOT/bin/fastmlx-capacity" | awk '{print $1}')"
+
 # The `fastmlx` tooling: a thin Python dispatcher (fastmlx.py) plus the sibling modules it loads
 # by file path (pull/launch/recommend/bench/the front-mode proxy/the HF downloader/the two fit
 # sizers). All nine must stay siblings in the same directory -- fastmlx_launch.py loads
@@ -225,7 +239,9 @@ PROVENANCE_JSON="{
   \"source_commit\": $SOURCE_COMMIT_JSON,
   \"source_dirty\": $SOURCE_DIRTY,
   \"version\": \"$VERSION\",
-  \"built_at\": \"$BUILT_AT\""
+  \"built_at\": \"$BUILT_AT\",
+  \"engine_binary_sha256\": \"$ENGINE_BINARY_SHA256\",
+  \"capacity_binary_sha256\": \"$CAPACITY_BINARY_SHA256\""
 if [ -n "$SAMPLED_MTP_MIN_COMMIT" ]; then
   PROVENANCE_JSON="$PROVENANCE_JSON,
   \"sampled_mtp_minimum_commit\": \"$SAMPLED_MTP_MIN_COMMIT\",
