@@ -368,9 +368,11 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let seed = try optionalInt64(root["seed"], param: "seed")
 
         let topLevelReasoningEffort = try optionalReasoningEffort(root["reasoning_effort"], param: "reasoning_effort")
-        let (kwargsEnableThinking, kwargsReasoningEffort) = try decodeChatTemplateKwargs(root["chat_template_kwargs"])
+        let (kwargsEnableThinking, kwargsReasoningEffort, kwargsAddGenerationPrompt, chatTemplateKwargsIgnoredFields) =
+            try decodeChatTemplateKwargs(root["chat_template_kwargs"])
         let resolvedEnableThinking = enableThinking ?? kwargsEnableThinking
         let resolvedReasoningEffort = topLevelReasoningEffort ?? kwargsReasoningEffort
+        let resolvedAddGenerationPrompt = addGenerationPrompt ?? kwargsAddGenerationPrompt
 
         let presencePenalty = try optionalPresencePenalty(root["presence_penalty"])
         let frequencyPenalty = try optionalFrequencyPenalty(root["frequency_penalty"])
@@ -437,6 +439,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         if responseFormatIgnoredPresent { ignoredFields.append("response_format") }
         if logitBiasPresent { ignoredFields.append("logit_bias") }
         ignoredFields.append(contentsOf: unknownTopLevelKeys)
+        ignoredFields.append(contentsOf: chatTemplateKwargsIgnoredFields)
         ignoredFields.sort()
 
         return OpenAIChatCompletionRequest(
@@ -451,7 +454,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             toolChoice: toolChoice,
             parallelToolCalls: parallelToolCalls,
             enableThinking: resolvedEnableThinking,
-            addGenerationPrompt: addGenerationPrompt,
+            addGenerationPrompt: resolvedAddGenerationPrompt,
             topP: topP,
             topK: topK,
             minP: minP,
@@ -2224,10 +2227,27 @@ private func decodeStreamOptions(_ raw: Any?, stream: Bool) throws -> Bool {
     return try optionalBool(object["include_usage"], param: "stream_options.include_usage") ?? false
 }
 
-/// Decodes the Qwen `chat_template_kwargs` passthrough dict, extracting only the
-/// `enable_thinking` / `reasoning_effort` fields we understand. Other keys are ignored.
-private func decodeChatTemplateKwargs(_ raw: Any?) throws -> (enableThinking: Bool?, reasoningEffort: String?) {
-    guard let raw, !(raw is NSNull) else { return (nil, nil) }
+/// Decodes the Qwen-style `chat_template_kwargs` dict. Despite the name suggesting an arbitrary
+/// passthrough, this is deliberately an ALLOWLIST-FORWARD, not a passthrough: only keys the server
+/// already understands (`enable_thinking`, `reasoning_effort`, `add_generation_prompt`) are decoded
+/// and forwarded, so no new caller-controlled variable ever reaches the Jinja template context (see
+/// `docs/task-inbox/2026-09-21-chat-template-kwargs-drops-unknown-keys.md`, Gap 1, for the rejected
+/// full-passthrough alternative and why it needs its own shadowing/coercion review before it ships).
+///
+/// Every other key is a VISIBLE drop, not a silent one: unrecognized keys are returned as
+/// `"chat_template_kwargs:<key>"` entries for the caller to append to `ignoredFields`, using the
+/// same sanitize-and-cap discipline as `rejectUnknownTopLevelKeys` (never echoing a raw key that
+/// fails `isValidUnknownTopLevelKeyName`, capped at 16 entries plus one trailing `<more>` sentinel).
+///
+/// Keys in `semanticallyUnsupportedTopLevelKeys` (e.g. `continue_final_message`) are refused here
+/// too, with the same message/param shape as the top-level refusal, one layer down
+/// (`chat_template_kwargs.<key>`). Refusing a key at the top level while silently dropping the
+/// identical key one layer down would be exactly the defect class this function removes, so the
+/// refusal set is shared — not copied — from the top-level source of truth.
+private func decodeChatTemplateKwargs(
+    _ raw: Any?
+) throws -> (enableThinking: Bool?, reasoningEffort: String?, addGenerationPrompt: Bool?, ignoredFields: [String]) {
+    guard let raw, !(raw is NSNull) else { return (nil, nil, nil, []) }
     guard let object = raw as? [String: Any] else {
         throw OpenAIServingError.invalidRequest(
             "chat_template_kwargs must be an object", param: "chat_template_kwargs")
@@ -2235,5 +2255,30 @@ private func decodeChatTemplateKwargs(_ raw: Any?) throws -> (enableThinking: Bo
     let enableThinking = try optionalBool(object["enable_thinking"], param: "chat_template_kwargs.enable_thinking")
     let reasoningEffort = try optionalReasoningEffort(
         object["reasoning_effort"], param: "chat_template_kwargs.reasoning_effort")
-    return (enableThinking, reasoningEffort)
+    let addGenerationPrompt = try optionalBool(
+        object["add_generation_prompt"], param: "chat_template_kwargs.add_generation_prompt")
+
+    let allowed: Set<String> = ["enable_thinking", "reasoning_effort", "add_generation_prompt"]
+    var ignoredFields: [String] = []
+    var hasInvalidKeyName = false
+    for key in object.keys.sorted() where !allowed.contains(key) {
+        if semanticallyUnsupportedTopLevelKeys.contains(key) {
+            let param = "chat_template_kwargs.\(key)"
+            throw OpenAIServingError.invalidRequest("Unsupported field: \(param)", param: param)
+        }
+        if isValidUnknownTopLevelKeyName(key) {
+            ignoredFields.append("chat_template_kwargs:\(key)")
+        } else {
+            hasInvalidKeyName = true
+        }
+    }
+    if hasInvalidKeyName {
+        ignoredFields.append("chat_template_kwargs:<invalid-key>")
+    }
+    if ignoredFields.count > 16 {
+        ignoredFields = Array(ignoredFields.prefix(16))
+        ignoredFields.append("chat_template_kwargs:<more>")
+    }
+
+    return (enableThinking, reasoningEffort, addGenerationPrompt, ignoredFields)
 }

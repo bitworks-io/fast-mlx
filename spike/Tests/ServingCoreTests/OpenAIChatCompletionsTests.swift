@@ -799,6 +799,142 @@ final class OpenAIChatCompletionsTests: XCTestCase {
         }
     }
 
+    // MARK: - `chat_template_kwargs` allowlist-forward + visible-drop (Gap 1)
+
+    // Test 1: `chat_template_kwargs.add_generation_prompt` decodes into the top-level field, and is
+    // never recorded as an ignored/dropped key (it is honored, not discarded).
+    func testChatTemplateKwargsAddGenerationPromptDecodesAndIsNeverIgnored() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"add_generation_prompt":false}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.addGenerationPrompt, false)
+        XCTAssertFalse(
+            request.ignoredFields.contains { $0.contains("add_generation_prompt") })
+    }
+
+    // Test 2: precedence is top-level-wins, proven in BOTH directions so a single-direction pass
+    // cannot hide an accidental "last write wins" or "kwargs wins" implementation.
+    func testChatTemplateKwargsAddGenerationPromptPrecedenceTopLevelWinsBothDirections() throws {
+        let topTrueKwargsFalse = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "add_generation_prompt":true,"chat_template_kwargs":{"add_generation_prompt":false}}
+        """
+        let requestA = try OpenAIChatCompletionRequest.decodeStrict(from: Data(topTrueKwargsFalse.utf8))
+        XCTAssertEqual(requestA.addGenerationPrompt, true)
+
+        let topFalseKwargsTrue = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "add_generation_prompt":false,"chat_template_kwargs":{"add_generation_prompt":true}}
+        """
+        let requestB = try OpenAIChatCompletionRequest.decodeStrict(from: Data(topFalseKwargsTrue.utf8))
+        XCTAssertEqual(requestB.addGenerationPrompt, false)
+    }
+
+    // Test 3: absent at both levels stays nil (no default is invented).
+    func testChatTemplateKwargsAddGenerationPromptAbsentBothLevelsDecodesToNil() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"chat_template_kwargs":{}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertNil(request.addGenerationPrompt)
+    }
+
+    // Test 4: same type validation as the top-level field applies inside `chat_template_kwargs`.
+    func testChatTemplateKwargsAddGenerationPromptNonBooleanIsRejected() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"add_generation_prompt":"yes"}}
+        """
+        XCTAssertOpenAIError(
+            try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)),
+            type: .invalidRequest,
+            param: "chat_template_kwargs.add_generation_prompt")
+    }
+
+    // Test 5: an unrecognized `chat_template_kwargs` key is a VISIBLE drop, not a silent one. This is
+    // the test that reproduces Gap 1 (`docs/task-inbox/2026-09-21-chat-template-kwargs-drops-unknown-keys.md`)
+    // and must fail against today's decoder before the fix lands.
+    func testChatTemplateKwargsUnknownKeyIsRecordedAsVisibleIgnoredField() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"bos_token":"x"}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["chat_template_kwargs:bos_token"])
+    }
+
+    // Test 6: a key that is a hard 400 at the top level (`semanticallyUnsupportedTopLevelKeys`) is
+    // refused the same way one layer down inside `chat_template_kwargs` — refusing at the top level
+    // while silently dropping the identical key here would be the same defect class re-introduced.
+    func testChatTemplateKwargsContinueFinalMessageIsRejectedWithSpecificMessageAndParam() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"continue_final_message":true}}
+        """
+        do {
+            _ = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+            XCTFail("Expected OpenAIServingError")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.type, .invalidRequest)
+            XCTAssertEqual(
+                error.openAIError.message,
+                "Unsupported field: chat_template_kwargs.continue_final_message")
+            XCTAssertEqual(error.openAIError.param, "chat_template_kwargs.continue_final_message")
+        } catch {
+            XCTFail("Expected OpenAIServingError, got \(error)")
+        }
+    }
+
+    // Test 7: an invalid-shaped key (contains a comma, which would otherwise corrupt the
+    // comma-joined diagnostic log line) collapses into the sentinel, and the raw key text never
+    // appears anywhere in `ignoredFields`.
+    func testChatTemplateKwargsInvalidShapedKeyCollapsesToSentinelNotRawKey() throws {
+        let rawKey = "bad,key"
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"\(rawKey)":"x"}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.ignoredFields, ["chat_template_kwargs:<invalid-key>"])
+        XCTAssertFalse(request.ignoredFields.contains { $0.contains(rawKey) })
+    }
+
+    // Test 8: more than 16 unrecognized keys caps at 16 entries plus one trailing `<more>` sentinel,
+    // mirroring `rejectUnknownTopLevelKeys`'s cap discipline exactly.
+    func testChatTemplateKwargsOverSixteenUnknownKeysCapsWithMoreSentinel() throws {
+        let junkKeys = (0..<20).map { "junk_key_\($0)" }
+        let kwargsObject = junkKeys.map { "\"\($0)\":\"x\"" }.joined(separator: ",")
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{\(kwargsObject)}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        // `ignoredFields` is sorted alongside every other ignored-field source (see the `.sort()`
+        // at the decoder's return site), so the `<more>` sentinel is not necessarily last.
+        XCTAssertEqual(request.ignoredFields.count, 17)
+        XCTAssertTrue(request.ignoredFields.contains("chat_template_kwargs:<more>"))
+        XCTAssertEqual(
+            request.ignoredFields.filter { $0 != "chat_template_kwargs:<more>" }.count, 16)
+        for entry in request.ignoredFields where entry != "chat_template_kwargs:<more>" {
+            XCTAssertTrue(entry.hasPrefix("chat_template_kwargs:junk_key_"))
+        }
+    }
+
+    // Test 9 (regression): the two previously-supported `chat_template_kwargs` keys still decode
+    // correctly and add NO `ignoredFields` entries now that unknown-key handling has changed.
+    func testChatTemplateKwargsEnableThinkingAndReasoningEffortStillDecodeWithNoIgnoredFields() throws {
+        let body = """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],\
+        "chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"low"}}
+        """
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        XCTAssertEqual(request.enableThinking, false)
+        XCTAssertEqual(request.reasoningEffort, "low")
+        XCTAssertTrue(request.ignoredFields.isEmpty)
+    }
+
     func testSSETerminalChunkCanCarryExactUsage() throws {
         let finish = OpenAIChatCompletionChunk(
             id: "chatcmpl-test",
